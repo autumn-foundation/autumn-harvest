@@ -1,12 +1,12 @@
 //! Falsifiable-proxy integration tests for activity outcome counters (issue #528).
 //!
-//! Verifies that `harvest.activity.attempts{outcome}` and
-//! `harvest.activity.retries` are emitted at the correct call sites
-//! in `MetricsRecorder`, with low-cardinality labels and no `execution.id`.
+//! `harvest.activity.attempts{outcome}` and `harvest.activity.retries` fire at
+//! the right `MetricsRecorder` call sites. Their labels have low cardinality
+//! and carry no `execution.id`.
 //!
-//! These are unit-level tests (no DB / testcontainers required) that exercise
-//! the `MetricsRecorder` trait methods directly — mirroring the pattern in
-//! `tests/activity_failure_tests.rs` for `record_activity_failed`.
+//! These tests need no database. They call the `MetricsRecorder` methods
+//! directly, as `tests/activity_failure_tests.rs` does for
+//! `record_activity_failed`.
 
 use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, NoOpMetrics};
 use std::sync::Arc;
@@ -119,8 +119,6 @@ fn trait_is_object_safe_with_new_methods() {
 // K successes, F terminal failures, R retries — the issue's falsifiable proxy.
 // ---------------------------------------------------------------------------
 
-/// Simulates K successes: `record_activity_attempt(outcome=completed)` fired K times.
-/// `record_activity_retried` is NOT fired for successful attempts.
 #[test]
 fn k_successes_emit_k_completed_attempts_no_retries() {
     const K: usize = 5;
@@ -147,8 +145,6 @@ fn k_successes_emit_k_completed_attempts_no_retries() {
     );
 }
 
-/// Simulates F terminal failures: each terminal failure fires
-/// `record_activity_attempt(outcome=failed)` AND `record_activity_failed`.
 #[test]
 fn f_terminal_failures_emit_f_failed_attempts_and_f_failure_records() {
     const F: usize = 3;
@@ -176,22 +172,16 @@ fn f_terminal_failures_emit_f_failed_attempts_and_f_failure_records() {
     );
 }
 
-/// Simulates R scheduled retries: each retry fires `record_activity_retried`
-/// AND `record_activity_attempt(outcome=failed)` (the per-attempt failure).
-/// The harvest.activity.failed counter (terminal failures only) is NOT fired
-/// for retried attempts — that fires only on exhaustion.
+/// `harvest.activity.failed` counts terminal failures only, so a retried
+/// attempt does not fire it.
 #[test]
 fn r_retries_emit_r_retried_and_r_failed_attempts_no_terminal_failure() {
     const R: usize = 4;
     let metrics = RecordingActivityMetrics::default();
 
     for _ in 0..R {
-        // Per-attempt failure recorded (attempt failed → will retry)
         metrics.record_activity_attempt("charge_card", "billing", ActivityStatus::Failed);
-        // Retry scheduled
         metrics.record_activity_retried("charge_card", "billing");
-        // Note: record_activity_failed is NOT called for retried attempts —
-        // it fires only on terminal failure (retry exhaustion / non-retryable).
     }
 
     assert_eq!(
@@ -211,8 +201,6 @@ fn r_retries_emit_r_retried_and_r_failed_attempts_no_terminal_failure() {
     );
 }
 
-/// Full scenario: K=3 successes, F=2 terminal failures, R=4 retries.
-/// Verifies the complete outcome trio with correct counts.
 #[test]
 fn k_successes_f_failures_r_retries_all_labelled_by_activity_type() {
     const K: usize = 3;
@@ -221,18 +209,15 @@ fn k_successes_f_failures_r_retries_all_labelled_by_activity_type() {
 
     let metrics = RecordingActivityMetrics::default();
 
-    // K successful final attempts
     for _ in 0..K {
         metrics.record_activity_attempt("charge_card", "billing", ActivityStatus::Completed);
     }
 
-    // R retried attempts (failed attempt → retry scheduled, no terminal failure)
     for _ in 0..R {
         metrics.record_activity_attempt("charge_card", "billing", ActivityStatus::Failed);
         metrics.record_activity_retried("charge_card", "billing");
     }
 
-    // F terminal failures (failed attempt + terminal failure record, no retry)
     for _ in 0..F {
         metrics.record_activity_attempt("charge_card", "billing", ActivityStatus::Failed);
         metrics.record_activity_failed("charge_card", "", "Transient", false);
@@ -257,7 +242,7 @@ fn k_successes_f_failures_r_retries_all_labelled_by_activity_type() {
         "harvest.activity.retries == R"
     );
 
-    // Existing harvest.activity.failed unchanged: fires only on terminal failure
+    // `harvest.activity.failed` still fires only on a terminal failure.
     assert_eq!(
         metrics.terminal_failure_count("charge_card"),
         F,
@@ -271,23 +256,20 @@ fn outcome_label_has_bounded_cardinality() {
     let outcomes = [ActivityStatus::Completed, ActivityStatus::Failed];
     let strings: Vec<&str> = outcomes.iter().map(|s| s.as_str()).collect();
 
-    // Exactly two bounded values; no execution.id, activity.id, etc.
     assert_eq!(strings.len(), 2);
     assert!(strings.contains(&"completed"));
     assert!(strings.contains(&"failed"));
 }
 
-/// AC3: execution.id is NOT a parameter — verifies by construction.
+/// AC3: `execution.id` is not a parameter. These calls would not compile if
+/// one were required.
 #[test]
 fn execution_id_is_not_a_parameter_of_new_activity_counters() {
     let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
-    // Both calls take only (activity_name, queue) or (activity_name, queue, outcome).
-    // If execution.id were required, these would not compile.
     rec.record_activity_attempt("act", "q", ActivityStatus::Completed);
     rec.record_activity_retried("act", "q");
 }
 
-/// Verifies that the two metrics are independent across different activity types.
 #[test]
 fn counters_are_labelled_per_activity_type() {
     let metrics = RecordingActivityMetrics::default();
@@ -305,7 +287,6 @@ fn counters_are_labelled_per_activity_type() {
     assert_eq!(metrics.retry_count("charge_card"), 2);
 }
 
-/// Counter records are never shared across concurrent callers (thread-safety).
 #[test]
 fn counters_are_thread_safe() {
     use std::thread;

@@ -143,8 +143,8 @@ impl Settings {
         // `sqlite,postgres,redis_pg`. Assay #13 pre-registers the `postgres`
         // arm only, and this assay's containment plan does not start Redis.
         // A default invocation would panic on the `redis_pg` arm's
-        // connection attempt before printing a summary or a CV. Found by a
-        // fourth round of Codex review on PR #1761.
+        // connection attempt before printing a summary or a CV.
+        // Found in review of PR #1761.
         let arms = env_string("ASSAY10_ARMS", "postgres")
             .split(',')
             .filter_map(Arm::parse)
@@ -152,7 +152,7 @@ impl Settings {
         Self {
             // Defaults point at assay13, not the inherited assay10 name, and
             // at this assay's own pre-registered shape (depth 1000, n=6) —
-            // not 0010's. Found by Codex review on PR #1761. With only
+            // not 0010's. Found in review of PR #1761. With only
             // `ASSAY10_DATABASE_URL` overridden, the old defaults reset one
             // database (`assay10`) while querying another. Running with no
             // depth/rep overrides at all silently graded a different
@@ -427,7 +427,7 @@ async fn reset_database(settings: &Settings) {
 /// residency this condition exists to preserve. A `TRUNCATE`-based warm run
 /// would still fault in a brand-new, empty file every repetition. That is
 /// no better, for the mechanism this assay tests, than `reset_database`'s
-/// drop/recreate. Found by Codex review on PR #1761. `VACUUM (TRUNCATE
+/// drop/recreate. Found in review of PR #1761. `VACUUM (TRUNCATE
 /// FALSE)` afterward reclaims the deleted rows' space in place, on that
 /// same relfilenode, without shrinking the file. The next repetition's
 /// reseed then reuses already-resident pages, instead of extending the
@@ -439,8 +439,7 @@ async fn reset_database(settings: &Settings) {
 /// the same "brand-new, empty file" outcome the paragraph above rules out
 /// `TRUNCATE` for, just reached by a different route. Confirmed directly
 /// against this apparatus's own database: a table at 159 pages went to 0
-/// pages after `DELETE` + plain `VACUUM`. Found by a third round of Codex
-/// review on PR #1761.
+/// pages after `DELETE` + plain `VACUUM`. Found in review of PR #1761.
 async fn truncate_database(settings: &Settings) {
     let mut conn = connect(&settings.database_url).await;
     conn.batch_execute(
@@ -875,8 +874,8 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     // recorded zero live rows, a moment before this seed inserted a
     // thousand. Without this step, the two conditions hand the claim
     // query's planner different statistics for the same logical backlog.
-    // That confound is not what this assay's own grading is about. Found
-    // by a third round of Codex review on PR #1761.
+    // That confound is not what this assay's own grading is about.
+    // Found in review of PR #1761.
     connect(&settings.database_url)
         .await
         .batch_execute("ANALYZE;")
@@ -1123,7 +1122,7 @@ async fn main() {
     // setting is every repetition's setting. A probe taken *before* the
     // loop cannot make that guarantee, reset first or not: a cold
     // repetition drops and recreates the very database being probed.
-    // Found by an eighth round of Codex review on PR #1761. Two earlier
+    // Found in review of PR #1761. Two earlier
     // attempts at a pre-loop probe each left a version of this same gap.
     let (fsync, synchronous_commit) = {
         let mut conn = connect(&settings.database_url).await;
@@ -1154,8 +1153,8 @@ async fn main() {
 
     // Refuse to grade a different shape against this assay's own decision
     // lines. Assay #13 pre-registered depth 1000, n=6; those lines say
-    // nothing about any other depth or repetition count. Found by Codex
-    // review on PR #1761.
+    // nothing about any other depth or repetition count.
+    // Found in review of PR #1761.
     if settings.workflows != 1000 || settings.reps != 6 {
         println!(
             "* **Not graded.** Backlog {} workflows, {} reps is not assay #13's pre-registered \
@@ -1169,14 +1168,14 @@ async fn main() {
     // replayed on every workflow task, so a different one changes both
     // throughput and variance. This section would otherwise still print
     // assay #13's verdict against it. Compared on the parsed value,
-    // not the raw text, since `{ }` and `{}` are the same workload. Found
-    // by a fourth round of Codex review on PR #1761.
+    // not the raw text, since `{ }` and `{}` are the same workload.
+    // Found in review of PR #1761.
     // Refuse to grade an unregistered durability setting the same way.
     // Every prior number in this report ran under `fsync=off`,
     // `synchronous_commit=off`. A server left at ordinary defaults changes
     // both throughput and variance. This section would otherwise still
     // print a verdict against lines measured under the other setting.
-    // Found by a fifth round of Codex review on PR #1761.
+    // Found in review of PR #1761.
     if fsync != "off" || synchronous_commit != "off" {
         println!(
             "* **Not graded.** `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}` \
@@ -1207,8 +1206,8 @@ async fn main() {
     // A repetition that failed correctness or was excluded from `rates`
     // means fewer than the pre-registered six measurements went into the CV
     // below. Grading on the survivors alone, silently, would print a
-    // precise-looking verdict from an incomplete registered run. Found by
-    // Codex review on PR #1761.
+    // precise-looking verdict from an incomplete registered run.
+    // Found in review of PR #1761.
     if !all_correct {
         println!(
             "* **Not graded.** {} of {} repetitions passed correctness; assay #13 pre-registered \

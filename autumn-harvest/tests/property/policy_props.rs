@@ -103,7 +103,6 @@ proptest! {
         prop_assert!(none_d <= max);
         prop_assert!(equal_d <= max);
 
-        // None jitter is exactly the base delay.
         prop_assert_eq!(none_d, base, "None jitter changed the delay");
 
         // Full jitter: [0, base].

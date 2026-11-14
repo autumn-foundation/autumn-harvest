@@ -1,11 +1,10 @@
 //! No-DB wiring tests for the activity circuit breaker (issue #369).
 //!
-//! Verifies that a [`CircuitBreakerPolicy`] declared on an `ActivityInfo`
-//! (as the `#[activity(circuit_breaker = ...)]` macro emits) is picked up by the
-//! [`HandlerRegistry`] and exposed through the registry the worker dispatch
-//! path and the management API both consult. The breaker state-machine logic
-//! itself is unit-tested in `src/circuit_breaker.rs`; the full dispatch +
-//! replay-safety path is covered by the testcontainers e2e suite.
+//! Verifies that the [`HandlerRegistry`] picks up a [`CircuitBreakerPolicy`]
+//! declared on an `ActivityInfo`, as `#[activity(circuit_breaker = ...)]` emits.
+//! The worker dispatch path and the management API both read that registry.
+//! `src/circuit_breaker.rs` unit-tests the breaker state machine. The
+//! testcontainers e2e suite covers the full dispatch and replay-safety path.
 
 // The worker `HandlerRegistry` is gated behind the `db` feature; constructing
 // it needs no live database, only the type.
@@ -147,9 +146,9 @@ fn force_open_and_close_through_shared_registry() {
     ));
 }
 
-/// Local activities bypass the dispatch path the breaker is enforced on, so a
-/// breaker declared on one must not be tracked (it would appear configured in
-/// the admin API yet never trip). The `#[activity]` macro rejects this at
+/// Local activities bypass the dispatch path that enforces the breaker. So a
+/// breaker declared on one must not be tracked: it would appear configured in
+/// the admin API yet never trip. The `#[activity]` macro rejects this at
 /// compile time; the registry filter is the defensive guard for hand-built
 /// `ActivityInfo`s, which this test exercises directly.
 #[test]

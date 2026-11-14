@@ -1,24 +1,23 @@
 #![cfg(feature = "db")]
 //! Core SQL coverage for the cross-shard lineage batch loaders (issue #621).
 //!
-//! The recursive lineage walk fans out level-by-level, so the per-level query
-//! must accept the WHOLE frontier at once (`parent_id = ANY($1)`) rather than
-//! one query per parent — otherwise a 200-node tree across 8 shards costs
-//! ~1600 round trips and blows the p95 < 500 ms success metric.
+//! The recursive lineage walk fans out level by level. So the per-level query
+//! takes the WHOLE frontier at once (`parent_id = ANY($1)`), not one query per
+//! parent. Otherwise a 200-node tree across 8 shards costs ~1600 round trips
+//! and breaks the p95 < 500 ms success metric.
 //!
 //! Two helpers are covered:
 //!
-//! - [`load_workflow_children_batch`] — the frontier fetch. Deterministic
-//!   `started_at ASC, id ASC` ordering so a `max_nodes` truncation always drops
-//!   the same rows, and a `limit` so a pathological fan-out cannot pull an
-//!   unbounded result set into memory.
-//! - [`load_parents_with_children`] — the bounded existence probe that lets the
-//!   walk name *precisely* which leaf nodes have dropped subtrees, instead of
-//!   conservatively naming every unexpanded leaf (issue #621: "no silent cap —
-//!   the dropped subtrees are named by their parent `execution_id`").
+//! - [`load_workflow_children_batch`] — the frontier fetch. The order
+//!   `started_at ASC, id ASC` makes a `max_nodes` truncation drop the same rows
+//!   each time. A `limit` keeps a pathological fan-out out of memory.
+//! - [`load_parents_with_children`] — the bounded existence probe. It lets the
+//!   walk name exactly which leaf nodes have dropped subtrees, not every
+//!   unexpanded leaf. Issue #621: "no silent cap — the dropped subtrees are
+//!   named by their parent `execution_id`".
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly; otherwise a fresh testcontainers Postgres is booted with
+//! against it directly. Otherwise a fresh testcontainers Postgres boots with
 //! the full migration bundle.
 
 use autumn_harvest::models::NewWorkflowExecution;
@@ -150,9 +149,8 @@ const fn root_spec(workflow_id: &str) -> InsertSpec<'_> {
     }
 }
 
-/// The frontier fetch must accept MANY parents in one query — that batching is
-/// the whole reason the recursive walk is O(depth × shards) instead of
-/// O(nodes × shards).
+/// The frontier fetch must accept MANY parents in one query. That batching
+/// makes the recursive walk O(depth × shards), not O(nodes × shards).
 #[tokio::test]
 async fn batch_loader_returns_children_of_every_frontier_parent_in_one_query() {
     let (url, _guard) = setup_db().await;
@@ -186,8 +184,8 @@ async fn batch_loader_returns_children_of_every_frontier_parent_in_one_query() {
     assert_eq!(a1_row.shard_id, 0);
 }
 
-/// An empty frontier must not hit the database at all (the walk calls this
-/// once per shard per level and a level can legitimately be empty).
+/// An empty frontier must not hit the database. The walk calls this once per
+/// shard per level, and a level can be empty.
 #[tokio::test]
 async fn batch_loader_returns_empty_without_querying_for_empty_frontier() {
     let (url, _guard) = setup_db().await;
@@ -270,10 +268,10 @@ async fn batch_loader_reports_await_mode_and_parent_close_policy() {
     );
 }
 
-/// The existence probe answers "which of these leaves actually have children?"
-/// so a `max_depth`/`max_nodes` truncation names ONLY parents whose subtrees
-/// were genuinely dropped — never a childless leaf (a false positive would send
-/// an operator chasing a subtree that does not exist).
+/// The existence probe answers "which of these leaves have children?".
+/// A `max_depth`/`max_nodes` truncation then names ONLY parents whose subtrees
+/// were dropped, never a childless leaf. A false positive sends an operator
+/// after a subtree that does not exist.
 #[tokio::test]
 async fn existence_probe_names_only_parents_that_actually_have_children() {
     let (url, _guard) = setup_db().await;
@@ -298,8 +296,8 @@ async fn existence_probe_names_only_parents_that_actually_have_children() {
     );
 }
 
-/// The probe must be DISTINCT — a parent with 500 children yields one id, not
-/// 500 — so naming dropped subtrees stays bounded by frontier size.
+/// The probe must be DISTINCT: a parent with 500 children yields one id, not
+/// 500. So the list of dropped subtrees stays bounded by frontier size.
 #[tokio::test]
 async fn existence_probe_is_distinct_per_parent() {
     let (url, _guard) = setup_db().await;

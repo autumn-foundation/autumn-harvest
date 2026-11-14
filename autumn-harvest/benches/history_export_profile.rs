@@ -2,12 +2,11 @@
 //! harness for `autumn_harvest::history_export::export_history`. This is the
 //! archival-export path. `retention.rs`'s reclamation sweep calls it once per
 //! retiring execution, before deleting its row (issue #524/#698/#772/#798).
-//! The same function is also re-exported at the crate root as public API.
+//! The crate root also re-exports it as public API.
 //! Wall-clock timing is not admissible evidence on this (shared-vCPU)
-//! machine. Every number this harness produces evidence for is a
-//! deterministic instruction count (`valgrind --tool=callgrind`) or
-//! allocation count/bytes (`valgrind --tool=dhat`). Both are reproducible
-//! bit-for-bit on any machine.
+//! machine. Use instruction counts (`valgrind --tool=callgrind`) and
+//! allocation counts/bytes (`valgrind --tool=dhat`). Both repeat bit for
+//! bit on any machine.
 //!
 //! # Workload
 //!

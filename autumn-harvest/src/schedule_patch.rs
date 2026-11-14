@@ -17,12 +17,12 @@ use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule};
 /// Nullable columns use a double-`Option` — the outer `None` means
 /// "unchanged", `Some(None)` means "clear to NULL", `Some(Some(v))` sets `v`.
 ///
-/// The schedule's workflow type is deliberately absent: it is not editable
-/// (changing it is semantically a different schedule).
+/// The patch cannot change the workflow type. A schedule of another type is
+/// a different schedule.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowSchedulePatch {
-    /// New schedule cadence. Changing it recomputes `next_run_at` anchored
-    /// at now — elapsed slots are never retroactively fired.
+    /// New schedule cadence. A change recomputes `next_run_at` from now, and
+    /// no elapsed slot fires.
     pub schedule: Option<Schedule>,
     /// New JSON input passed to every scheduled run.
     pub input: Option<serde_json::Value>,

@@ -2,10 +2,10 @@
 //!
 //! Requires features: `unified-dag-execution` + `testing`.
 //!
-//! These tests verify that when `unified-dag-execution` is enabled, `#[dag]`
-//! emits a shadow `__autumn_workflow_info_{name}()` companion whose handler
-//! walks the `DagDefinition` level by level, dispatches activities through
-//! `ctx.execute_activity_raw`, and evaluates trigger rules deterministically.
+//! With `unified-dag-execution` enabled, `#[dag]` emits a shadow
+//! `__autumn_workflow_info_{name}()` companion. Its handler walks the
+//! `DagDefinition` level by level and dispatches activities through
+//! `ctx.execute_activity_raw`. It evaluates trigger rules deterministically.
 
 #![allow(clippy::unused_async)]
 
@@ -148,9 +148,9 @@ fn dag_info_backward_compat_still_works() {
 // RED-PHASE TEST 3 — lowered handler replays a fully-successful linear DAG
 // ---------------------------------------------------------------------------
 
-/// The lowered workflow handler must walk both execution levels, call
-/// `execute_activity_raw` for each task, and complete without divergence when
-/// the history records successful completions for both activities.
+/// The lowered workflow handler walks both execution levels and calls
+/// `execute_activity_raw` for each task. With successful completions for both
+/// activities in history, it completes without divergence.
 #[tokio::test]
 async fn lowered_handler_replays_linear_dag_all_success() {
     let id_extract = ActivityExecId::new();
@@ -548,8 +548,8 @@ async fn lowered_handler_wraps_scalar_workflow_input_with_conf_and_dag_task() {
 }
 
 /// `HarvestBuilder::dags()` must auto-register a `WorkflowInfo` for every
-/// unified DAG (one whose `workflow_handler` is populated by the macro) so the
-/// runtime can route new starts through the workflow execution path.
+/// unified DAG, one whose `workflow_handler` the macro populates. The runtime
+/// then routes new starts through the workflow execution path.
 #[test]
 fn builder_dags_auto_registers_workflow_info() {
     use autumn_harvest::builder::HarvestBuilder;
@@ -686,10 +686,10 @@ fn compile_dag_catalog_rejects_duplicate_unified_dag_names() {
 // STEP 3 — trigger routing: unified DAGs must not require a classic catalog entry
 // ---------------------------------------------------------------------------
 
-/// When `unified-dag-execution` is on, a DAG that was promoted to the workflow
-/// execution path must be recognisable purely from the workflow registry — the
-/// scheduler's `DagCatalog` (classic path) will not contain it (Step 2 ensures
-/// `compile_dag_catalog` skips unified DAGs). The management API validates a
+/// With `unified-dag-execution` on, the workflow registry alone must identify
+/// a DAG promoted to the workflow execution path. The scheduler's `DagCatalog`
+/// (classic path) does not contain it. Step 2 makes `compile_dag_catalog`
+/// skip unified DAGs. The management API validates a
 /// separate DAG registration marker before this workflow handler can run.
 ///
 /// This test constructs a minimal `HandlerRegistry` that mirrors what
@@ -1009,9 +1009,9 @@ async fn condition_true_branch_schedules_activity() {
             activity_id: id_score,
             output: json!({"fraud_score": 0.95}), // high → manual_review wins
         },
-        // Level 1 task-index order: idx 1 (manual_review) → Run (pushed to futures),
-        // then idx 2 (auto_approve) → SkipByCondition → dag_skip:2 marker emitted
-        // synchronously before join_all awaits the futures.
+        // Level 1 task-index order: idx 1 (manual_review) → Run (pushed to futures).
+        // Then idx 2 (auto_approve) → SkipByCondition. Its dag_skip:2 marker is
+        // emitted synchronously before join_all awaits the futures.
         // So the marker comes BEFORE manual_review's ActivityScheduled in history.
         WorkflowEvent::MarkerRecorded {
             name: "dag_skip:2".into(),
@@ -1093,7 +1093,6 @@ async fn condition_skip_propagates_and_alldone_join_still_fires() {
         outcome.result
     );
 
-    // Verify exactly three dag_skip markers in the event history
     let skip_marker_count = outcome.events().iter().filter(|e| {
         matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
     }).count();
@@ -1146,9 +1145,9 @@ async fn condition_flip_is_reported_as_nondeterminism() {
             activity_id: id_score,
             output: json!({"fraud_score": 0.95}), // high score → manual_review condition TRUE
                                                   // But history has dag_skip:1 → history says it was condition-false.
-                                                  // Replaying with the same code will NOT skip (condition is true for 0.95),
-                                                  // so the replayer will try to schedule manual_review but find dag_skip:1
-                                                  // marker at cursor → Diverged → NonDeterministic.
+                                                  // Replaying with the same code does NOT skip (condition is true for 0.95).
+                                                  // The replayer tries to schedule manual_review but finds the dag_skip:1
+                                                  // marker at the cursor → Diverged → NonDeterministic.
         },
         // Marker says manual_review was skipped — but our condition says it should run.
         WorkflowEvent::MarkerRecorded {
@@ -1275,11 +1274,11 @@ async fn condition_branch_replay_sweep_1000() {
                 activity_id: id_score,
                 output: json!({"fraud_score": score}),
             },
-            // Which branch gets the skip marker depends on the score
-            // For low score: marker for manual_review (idx 1) before auto_approve
-            // For high score: manual_review runs first, then marker for auto_approve (idx 2)
-            // Build in the same order as the macro generates (task index order within a level)
-            // Level 1 has tasks [1=manual_review, 2=auto_approve] in order
+            // The score decides which branch gets the skip marker.
+            // Low score: marker for manual_review (idx 1) before auto_approve.
+            // High score: manual_review runs first, then marker for auto_approve (idx 2).
+            // Build in the macro's order: task index order within a level.
+            // Level 1 has tasks [1=manual_review, 2=auto_approve] in order.
         ];
 
         // Append level-1 events in task-index order (1 then 2).

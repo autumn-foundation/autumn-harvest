@@ -74,7 +74,6 @@ impl AgentModel for ReaderModel {
     }
 }
 
-/// The reply to `request`.
 fn reply(request: &ChatRequest) -> ChatResponse {
     if is_pass(request) {
         return text(&pass_facts(request));
@@ -156,7 +155,6 @@ fn question(said: &str) -> Option<&str> {
     said.strip_prefix(ASK)?.strip_suffix('?')
 }
 
-/// The text of the last user message.
 fn last_user_text(request: &ChatRequest) -> Option<String> {
     request
         .messages
@@ -191,7 +189,6 @@ fn last_notes(request: &ChatRequest) -> Option<String> {
         })
 }
 
-/// The request offers the tool `name`.
 fn offers(request: &ChatRequest, name: &str) -> bool {
     request.tools.iter().any(|tool| tool.name == name)
 }

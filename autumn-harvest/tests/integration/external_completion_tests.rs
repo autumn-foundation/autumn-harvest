@@ -392,7 +392,6 @@ async fn context_execute_activity_external_emits_unique_token() {
     let WorkflowCommand::ScheduleExternalActivity { token, .. } = &cmds[0] else {
         panic!("expected ScheduleExternalActivity");
     };
-    // Token must be a valid UUID (non-nil).
     assert_ne!(*token, ExternalActivityToken::nil());
 
     handle.abort();
@@ -592,7 +591,6 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
     else {
         panic!("expected ScheduleExternalActivity");
     };
-    // Crucially, the token and activity_id must match what's already in history.
     assert_eq!(*emitted_token, token, "token must be reused from history");
     assert_eq!(
         *emitted_id, activity_id,
@@ -645,10 +643,10 @@ async fn context_execute_activity_external_detects_non_determinism() {
 
 #[tokio::test]
 async fn context_double_complete_is_idempotent_replay() {
-    // Simulates the "double-complete" scenario at the replay layer:
-    // if ActivityCompletedExternally is already in history, a second call to
-    // execute_activity_external returns the same recorded output without
-    // suspending or emitting new commands.
+    // The "double-complete" scenario at the replay layer. With
+    // `ActivityCompletedExternally` in history, a replayed call to
+    // `execute_activity_external` returns the recorded output. It neither
+    // suspends nor emits new commands.
     let activity_id = ActivityExecId::new();
     let token = ExternalActivityToken::new();
     let output = serde_json::json!({"approved": true});
@@ -678,7 +676,7 @@ async fn context_double_complete_is_idempotent_replay() {
 
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
-    // First call — replays from history.
+    // The call replays from history.
     let result1 = ctx
         .execute_activity_external("approve_expense", Value::Null, "approvals", 86400)
         .await;

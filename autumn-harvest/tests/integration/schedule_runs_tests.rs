@@ -7,11 +7,13 @@
 )]
 //! Per-schedule run-history read helpers + origin attribution — issue #534.
 //!
-//! Verifies that `start_or_load_workflow_execution` persists the dispatch
-//! `origin`, that `list_schedule_runs` returns a schedule's runs newest-first
-//! with state/origin filtering and keyset pagination, and that
-//! `schedule_run_state_summary` counts only `scheduled`-origin runs (so a
-//! backfill or manual fire never inflates the cadence failure ratio).
+//! Verifies three things:
+//!
+//! - `start_or_load_workflow_execution` persists the dispatch `origin`.
+//! - `list_schedule_runs` returns a schedule's runs newest-first, with
+//!   state/origin filtering and keyset pagination.
+//! - `schedule_run_state_summary` counts only `scheduled`-origin runs. So a
+//!   backfill or manual fire never inflates the cadence failure ratio.
 
 use autumn_harvest::execution::{
     ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER, ORIGIN_SCHEDULED, ScheduleRunQuery, list_schedule_runs,

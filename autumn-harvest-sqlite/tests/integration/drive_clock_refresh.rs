@@ -1,23 +1,20 @@
 //! Regression tests for the public drivers re-reading the wall clock **once per
-//! decision cycle** (`run_until_blocked` / `poll_once`, Codex #1069 P2,
-//! runtime.rs:~361).
+//! decision cycle** (`run_until_blocked` / `poll_once`, issue #1069).
 //!
-//! Before the fix the public `run_until_blocked` captured `Utc::now()` a single
-//! time and reused that timestamp for every internal `drive_one_cycle`. When a
-//! cycle consumed real wall-clock time — e.g. a 2-second activity body ran before
-//! the workflow armed a timer in a later cycle — a timer scheduled after the
-//! activity was persisted with an absolute deadline relative to the START of the
-//! outer call rather than its true arm instant. A `timer(1s)` following a 2s
-//! activity therefore stored `fire_at = call_start + 1s`, already ~1s in the past
-//! by the time it was armed, so it fired immediately on the next poll instead of
-//! waiting ~1s from when it was armed. The public drivers now re-read the clock at
-//! the start of each cycle; the `_as_of` seams keep a caller-fixed timestamp for
-//! deterministic simulation.
+//! The public `run_until_blocked` once captured `Utc::now()` a single time. It
+//! reused that timestamp for every internal `drive_one_cycle`. A cycle can use real
+//! time, for example a 2-second activity body before a timer arms in a later cycle.
+//! That timer's absolute deadline then counted from the START of the outer call, not
+//! from its arm instant. A `timer(1s)` after a 2s activity stored
+//! `fire_at = call_start + 1s`. That was already ~1s in the past when it armed. So
+//! it fired on the next poll instead of ~1s after it armed. The public drivers now
+//! re-read the clock at the start of each cycle. The `_as_of` seams keep a
+//! caller-fixed timestamp for deterministic simulation.
 //!
-//! These tests are fully deterministic (no sleeping): one drives cycle-by-cycle
-//! via the `_as_of` seam with manually advanced timestamps, the other injects an
-//! advancing clock (`set_clock`) to prove the *public* `run_until_blocked` path
-//! refreshes per cycle.
+//! These tests are fully deterministic and never sleep. One drives cycle by cycle
+//! through the `_as_of` seam with manually advanced timestamps. The other injects an
+//! advancing clock (`set_clock`). It proves that the *public* `run_until_blocked`
+//! path refreshes per cycle.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -51,8 +48,8 @@ fn timer_fire_at(path: &std::path::Path, exec: ExecutionId) -> i64 {
 }
 
 /// Run one activity ("work"), THEN arm a 1-second durable timer, then complete.
-/// The activity precedes the timer specifically so that — in a real drive — the
-/// timer is armed in a *later* cycle than the one the outer call started in.
+/// The activity comes first, so in a real drive the timer arms in a *later* cycle
+/// than the one the outer call started in.
 #[workflow]
 async fn activity_then_timer(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
     ctx.execute_activity_raw("work", json!(n), "default")
@@ -72,12 +69,11 @@ fn register(rt: &mut SqliteRuntime) {
     );
 }
 
-/// Concept lock via the deterministic `_as_of` seam (no clock injection): driving
-/// cycle-by-cycle with manually advanced timestamps — simulating ~2s elapsing
-/// during the activity — the timer armed in the LATER cycle anchors its absolute
-/// deadline to that cycle's `now` (arm instant), never to the earlier call-start
-/// instant. This locks the underlying `drive_one_cycle` arm behavior the public
-/// per-cycle refresh depends on.
+/// Concept lock through the deterministic `_as_of` seam, with no clock injection.
+/// The test drives cycle by cycle and advances the timestamp ~2s during the
+/// activity. The timer armed in the LATER cycle anchors its deadline to that
+/// cycle's `now`, never to the call-start instant. This locks the
+/// `drive_one_cycle` arm behavior that the public per-cycle refresh depends on.
 #[tokio::test]
 async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_start() {
     let (_dir, path) = temp_db();
@@ -111,8 +107,8 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
         "timer must anchor to its true arm instant (t0+2s + 1s), not the drive's start"
     );
 
-    // At the arm instant (t0+2s) the true deadline (t0+3s) has NOT passed, so the
-    // run stays blocked on the timer — it must not fire ~1s early.
+    // At the arm instant (t0+2s) the true deadline (t0+3s) has NOT passed. The run
+    // stays blocked on the timer and must not fire ~1s early.
     let state = rt.run_until_blocked_as_of(exec, t_arm).await.unwrap();
     assert!(
         matches!(state, RunState::WaitingTimer),
@@ -130,12 +126,11 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
     );
 }
 
-/// Red→green proof for the actual finding: the PUBLIC `run_until_blocked` re-reads
-/// the wall clock per cycle. An injected clock returns t0 on its first read and
-/// t0+2s on every read after (simulating a 2s activity between cycle 1 and cycle
-/// 2). With the per-cycle refresh, the timer armed in cycle 2 anchors to t0+2s
-/// (deadline t0+3s); with the pre-fix single read it would anchor to t0 (deadline
-/// t0+1s) and fire immediately on the very next poll.
+/// Proof that the PUBLIC `run_until_blocked` re-reads the wall clock per cycle.
+/// An injected clock returns t0 on its first read and t0+2s on every later read.
+/// That simulates a 2s activity between cycle 1 and cycle 2. With the per-cycle
+/// refresh, the timer armed in cycle 2 anchors to t0+2s (deadline t0+3s). A single
+/// read would anchor it to t0 (deadline t0+1s), and it would fire on the next poll.
 #[tokio::test]
 async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
     let (_dir, path) = temp_db();
@@ -143,9 +138,8 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
     register(&mut rt);
     let exec = rt.start_workflow("activity_then_timer", json!(7)).unwrap();
 
-    // Advancing clock: read #1 (the activity cycle) returns t0; every later read
-    // (the arm cycle onward) returns t0 + 2s. A once-captured `Utc::now()` (the
-    // pre-fix behavior) would collapse this to a single t0 for the whole call.
+    // Advancing clock: read #1 (the activity cycle) returns t0. Every later read
+    // returns t0 + 2s. A once-captured `Utc::now()` would see t0 for the whole call.
     let t0: DateTime<Utc> = DateTime::from_timestamp(6_000_000, 0).unwrap();
     let two_s_later = t0 + chrono::Duration::seconds(2);
     let reads = Arc::new(AtomicUsize::new(0));
@@ -172,20 +166,18 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
         reads.load(Ordering::SeqCst)
     );
 
-    // THE assertion that distinguishes fixed from buggy: the timer is anchored to
-    // its arm-cycle clock (t0+2s + 1s = t0+3s), NOT the call-start clock (which
-    // pre-fix would give t0+1s).
+    // THE assertion that tells fixed from buggy. The timer anchors to its arm-cycle
+    // clock (t0+2s + 1s = t0+3s), NOT the call-start clock (t0+1s).
     assert_eq!(
         timer_fire_at(&path, exec),
         two_s_later.timestamp_millis() + 1000,
         "the timer's deadline must reflect the per-cycle (arm-instant) clock, not the call start"
     );
 
-    // Direct manifestation of the bug: a poll at the arm instant (t0+2s) must find
-    // the timer still pending. Pre-fix, `fire_at` would be t0+1s — already overdue
-    // at t0+2s — so this poll would fire it immediately and complete the run ~1s
-    // early. (The injected clock is anchored to the same t0 epoch as this
-    // `_as_of` instant, so the comparison is coherent.)
+    // A poll at the arm instant (t0+2s) must find the timer still pending. With the
+    // bug, `fire_at` is t0+1s, already overdue at t0+2s. This poll would fire it and
+    // complete the run ~1s early. The injected clock and this `_as_of` instant share
+    // the t0 epoch, so the comparison is coherent.
     let state = rt.run_until_blocked_as_of(exec, two_s_later).await.unwrap();
     assert!(
         matches!(state, RunState::WaitingTimer),

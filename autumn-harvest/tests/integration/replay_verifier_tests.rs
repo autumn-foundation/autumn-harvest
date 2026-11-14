@@ -1,9 +1,10 @@
 //! Integration tests for `ReplayVerifier` — the batch CI replay gate (issue #251).
 //!
-//! These tests exercise the three scenarios described in the acceptance criteria:
-//! (a) always-pass fixture
-//! (b) fixture that fails because the handler has reordered activities
-//! (c) fixture for an unregistered workflow name (harness error)
+//! These tests exercise the three acceptance-criteria scenarios:
+//!
+//! - (a) an always-pass fixture;
+//! - (b) a fixture that fails because the handler has reordered activities;
+//! - (c) a fixture for an unregistered workflow name (harness error).
 //!
 //! Run with:
 //! ```bash

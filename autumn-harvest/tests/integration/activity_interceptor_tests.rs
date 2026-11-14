@@ -5,8 +5,8 @@
 //! loop (harness modelled on `panic_containment_tests.rs`), proving the on-worker
 //! contract:
 //!
-//! - An interceptor wraps a **regular** activity: it observes the invocation
-//!   exactly once, its result transform is what gets *recorded* in the
+//! - An interceptor wraps a **regular** activity. It observes the invocation
+//!   exactly once. Its result transform is *recorded* in the
 //!   `ActivityCompleted` event and returned to the workflow.
 //! - On **replay** of a completed activity the interceptor is NOT re-invoked
 //!   (the executor reads recorded events; handlers/interceptors never run in
@@ -18,9 +18,9 @@
 //!   (issue #782): terminal `ActivityFailed` with `error_type = "HandlerPanic"`,
 //!   the worker process survives, no poison-pill / DLQ row.
 //! - An interceptor returning `Err` **participates in the normal retry path**
-//!   with no special-casing — retried per the activity's `RetryPolicy`, then a
-//!   terminal `ActivityFailed` carrying the interceptor's error, identical to a
-//!   handler error (regular activity failures write no DLQ row by design).
+//!   with no special-casing. It is retried per the activity's `RetryPolicy`.
+//!   Then a terminal `ActivityFailed` carries the interceptor's error, like a
+//!   handler error. Regular activity failures write no DLQ row by design.
 //! - A **zero-interceptor** control run (regular + local activity) completes
 //!   normally — the default path is unchanged.
 //! - **Registration order**: first-registered interceptor is the OUTERMOST
@@ -28,13 +28,14 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
-//! the full migration set. Each test uses a unique `ExecutionId`, a **unique task queue**
-//! (its worker polls only that queue, and its workflow + activity tasks all land
-//! on it — activities are dispatched onto `ctx.queue_name()`, never a shared
-//! `"default"`), and its own per-registry recorder captured by the interceptor
-//! instance. That makes the suite robust to a shared `HARVEST_TEST_DATABASE_URL`
-//! run in parallel: no worker can cross-claim another test's tasks (FIX 5 / S3),
-//! and no process-global state or cross-test scrubbing is required.
+//! the full migration set. Each test uses a unique `ExecutionId` and a **unique
+//! task queue**. Its worker polls only that queue, and its workflow + activity
+//! tasks all land on it. Activities go to `ctx.queue_name()`, never a shared
+//! `"default"`. Each test also has its own per-registry recorder, captured by
+//! the interceptor instance. So the suite is robust to a shared
+//! `HARVEST_TEST_DATABASE_URL` run in parallel. No worker can cross-claim
+//! another test's tasks, and no process-global state or cross-test scrubbing
+//! is required.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -156,10 +157,10 @@ impl ActivityInterceptor for PanicInterceptor {
 
 /// Interceptor that always returns Err (counting attempts), never calling next.
 ///
-/// Uses a `Mutex<usize>` rather than `AtomicUsize` deliberately: `diesel_async`'s
+/// Uses a `Mutex<usize>`, not `AtomicUsize`, deliberately. `diesel_async`'s
 /// `RunQueryDsl::load` has a blanket impl on `Arc<T>` that shadows
-/// `AtomicUsize::load` at method resolution, so `attempts.load(..)` would resolve
-/// to the diesel query method in this file's import scope.
+/// `AtomicUsize::load` at method resolution. So in this file's import scope,
+/// `attempts.load(..)` would resolve to the diesel query method.
 struct ErrorInterceptor {
     attempts: Arc<Mutex<usize>>,
 }
@@ -251,12 +252,12 @@ impl ActivityInterceptor for InputInjectInterceptor {
     }
 }
 
-/// Maps the chain's `Ok` result to `Err` AFTER calling `next` (issue #680 Codex
-/// P2). For a transactional activity the inner handler has already sealed its
-/// `ActivityCompleted` + task-COMPLETED atomically before `next.run` returns, so
-/// this error transform is silently discarded from history — the point of the
-/// consistency fix is that metrics / circuit-breaker must reflect the committed
-/// (sealed) outcome, NOT this discarded post-`next` `Err`.
+/// Maps the chain's `Ok` result to `Err` AFTER calling `next` (issue #680).
+/// For a transactional activity, the inner handler seals its
+/// `ActivityCompleted` + task-COMPLETED atomically before `next.run` returns.
+/// So history silently discards this error transform. The consistency fix
+/// makes metrics / circuit-breaker reflect the committed (sealed) outcome, NOT
+/// this discarded post-`next` `Err`.
 struct OkToErrInterceptor;
 impl ActivityInterceptor for OkToErrInterceptor {
     fn intercept<'a>(
@@ -279,19 +280,19 @@ impl ActivityInterceptor for OkToErrInterceptor {
 // Handlers (benign — interceptors carry the behaviour under test).
 // ---------------------------------------------------------------------------
 
-/// Regular activity: echoes its input. Also records "handler" into an optional
-/// shared log for the ordering test.
+/// Regular activity: echoes its input. It records nothing, so the ordering test
+/// asserts only the markers of the interceptors.
 fn echo_activity(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
 }
 
 /// Transactional activity: seals `ActivityCompleted { output: input }` + task
 /// COMPLETED atomically via `ctx.run_transactional`, then returns the committed
-/// value (issue #680 Codex P2 fixture). A benign `SELECT 1` proves the
-/// transaction's connection is usable; the closure returning `Ok(input)` records
-/// `input` as the committed output. Because the seal happens inside the user's
-/// transaction — BEFORE any outer interceptor regains control from `next.run` —
-/// an outer interceptor cannot alter the recorded outcome.
+/// value (issue #680 fixture). A benign `SELECT 1` proves the transaction's
+/// connection is usable. The closure returns `Ok(input)`, which records `input`
+/// as the committed output. The seal happens inside the user's transaction,
+/// BEFORE any outer interceptor regains control from `next.run`. So an outer
+/// interceptor cannot alter the recorded outcome.
 fn txn_commit_activity(
     ctx: &autumn_harvest::ActivityContext,
     input: serde_json::Value,
@@ -332,10 +333,10 @@ fn echo_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) 
 
 /// Workflow: run one regular activity, return its (interceptor-transformed) result.
 ///
-/// Activities are dispatched onto the workflow's own task queue
-/// (`ctx.queue_name()`) rather than a hardcoded `"default"`, so a per-test
-/// unique queue (FIX 5 / S3) isolates every task this run produces and the suite
-/// is robust to a shared `HARVEST_TEST_DATABASE_URL` run in parallel.
+/// Activities go to the workflow's own task queue (`ctx.queue_name()`), not a
+/// hardcoded `"default"`. So a per-test unique queue isolates every task this
+/// run produces. The suite is then robust to a shared
+/// `HARVEST_TEST_DATABASE_URL` run in parallel.
 fn wf_one_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         let queue = ctx.queue_name().to_string();
@@ -417,9 +418,9 @@ fn build_registry(
     )
 }
 
-/// Like [`build_registry`] but wires a capturing [`MetricsRecorder`] so a test
-/// can assert exactly which activity outcome the worker recorded (issue #680
-/// Codex P2 — proving metrics reflect the committed transactional outcome).
+/// Like [`build_registry`] but wires a capturing [`MetricsRecorder`]. A test
+/// can then assert exactly which activity outcome the worker recorded. This
+/// proves that metrics reflect the committed transactional outcome (issue #680).
 fn build_registry_with_telemetry(
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -540,8 +541,8 @@ async fn seed_workflow(
 }
 
 /// Like [`seed_workflow`] but attaches ambient context headers (issue #481) to
-/// the execution row, so the engine propagates them into every activity task's
-/// `context_headers` and an interceptor can read them via `ctx.header(..)`.
+/// the execution row. The engine propagates them into the `context_headers` of
+/// every activity task. An interceptor reads them via `ctx.header(..)`.
 async fn seed_workflow_with_headers(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -903,15 +904,15 @@ async fn interceptor_not_reinvoked_on_replay() {
 
     // Independently EVIDENCE the intervening replay from the durable, append-only
     // history rather than inferring it from the coroutine model. The workflow
-    // suspends after emitting each `ScheduleActivity` command and cannot emit the
-    // NEXT one until it is re-driven (replayed from the top) after the prior
-    // activity completes. So `ActivityScheduled(echo2)` appearing in history
-    // AFTER `ActivityCompleted(echo)` proves the workflow was re-driven in a
-    // second workflow-task cycle — a cycle that necessarily replayed
-    // WorkflowStarted + ActivityScheduled(echo) + ActivityCompleted(echo) before
-    // producing ActivityScheduled(echo2). The interceptor count staying at
-    // exactly 2 (asserted above), across that proven replay of a completed
-    // activity, is the property under test: replay does not re-invoke interceptors.
+    // suspends after it emits each `ScheduleActivity` command. It emits the NEXT
+    // one only when it is re-driven (replayed from the top) after the prior
+    // activity completes. `ActivityScheduled(echo2)` in history AFTER
+    // `ActivityCompleted(echo)` proves a second workflow-task cycle. That cycle
+    // necessarily replayed WorkflowStarted + ActivityScheduled(echo) +
+    // ActivityCompleted(echo) before it produced ActivityScheduled(echo2). The
+    // interceptor count stays at exactly 2 (asserted above) across that replay
+    // of a completed activity. That is the property under test: replay does not
+    // re-invoke interceptors.
     let history = load_history(&url, exec_id).await;
     let echo_completed_idx = history
         .iter()
@@ -927,16 +928,16 @@ async fn interceptor_not_reinvoked_on_replay() {
          replay cycle in which the interceptor was NOT re-invoked; history={history:?}"
     );
 
-    // Structural note (AC4): the deterministic replay engine — WorkflowReplayer
-    // in `src/testing.rs` — has NO way to invoke an interceptor at all. It never
-    // executes activity handlers (it reads recorded ActivityCompleted/Failed
-    // events; see the module doc there), and interceptors live exclusively on the
-    // worker dispatch path (`process_activity_task` / `run_local_activity_inline`
-    // in `worker.rs`), reachable only through a HandlerRegistry the replayer never
-    // constructs. A pure-replayer fixture therefore cannot even register an
-    // interceptor to count zero invocations — the property is guaranteed by
-    // construction, and this DB test additionally proves a real worker replay
-    // cycle does not re-invoke one.
+    // Structural note (AC4): the deterministic replay engine (WorkflowReplayer
+    // in `src/testing.rs`) has NO way to invoke an interceptor at all. It never
+    // executes activity handlers. It reads recorded ActivityCompleted/Failed
+    // events (see the module doc there). Interceptors live only on the worker
+    // dispatch path (`process_activity_task` / `run_local_activity_inline` in
+    // `worker.rs`). Only a HandlerRegistry reaches them, and the replayer never
+    // constructs one. So a pure-replayer fixture cannot even register an
+    // interceptor to count zero invocations. The property holds by
+    // construction. This DB test also proves a real worker replay cycle does
+    // not re-invoke one.
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,9 +1228,9 @@ async fn registration_order_is_outermost_first_end_to_end() {
     let exec_id = seed_workflow(&mut conn, "wf_order", serde_json::json!({"v": 7}), queue).await;
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    // The handler just echoes (the module-level `echo_activity`). We can't inject
-    // a "handler" marker through the fn pointer easily, so the ordering is
-    // asserted purely on the interceptors' before/after markers, which is
+    // The handler just echoes (the module-level `echo_activity`). A "handler"
+    // marker is hard to inject through the fn pointer. So the ordering is
+    // asserted purely on the before/after markers of the interceptors. That is
     // sufficient to prove i1 is OUTERMOST (its before is first, after is last).
     let registry = build_registry(
         vec![wf_info("wf_order", wf_one_activity)],
@@ -1266,7 +1267,7 @@ async fn registration_order_is_outermost_first_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8 (FIX 2 / AC6) — an interceptor's retryable Err feeds the per-activity
+// Test 8 (AC6) — an interceptor's retryable Err feeds the per-activity
 // circuit breaker EXACTLY like a handler error, with no special-casing.
 // ---------------------------------------------------------------------------
 
@@ -1278,13 +1279,13 @@ async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
     let exec_id = seed_workflow(&mut conn, "wf_cb_int", serde_json::json!({"v": 8}), queue).await;
 
     // failure_threshold = 2: two retryable failures trip the breaker. A generous
-    // retry budget (5) lets a THIRD dispatch attempt occur — which the now-open
-    // breaker short-circuits BEFORE the interceptor chain runs, terminating the
-    // activity with the typed CircuitOpen failure. The ONLY source of failures
-    // feeding the breaker is the interceptor (it returns Err without calling
-    // `next`, so the handler never runs), so a trip proves interceptor errors
-    // flow through `handle_activity_result` -> CircuitBreaker::on_result
-    // identically to a handler error.
+    // retry budget (5) lets a THIRD dispatch attempt occur. The open breaker
+    // short-circuits it BEFORE the interceptor chain runs. That terminates the
+    // activity with the typed CircuitOpen failure. The interceptor is the ONLY
+    // source of failures that feed the breaker. It returns Err without calling
+    // `next`, so the handler never runs. So a trip proves that interceptor
+    // errors flow through `handle_activity_result` -> CircuitBreaker::on_result
+    // like a handler error.
     let attempts = Arc::new(Mutex::new(0usize));
     let registry = build_registry(
         vec![wf_info("wf_cb_int", wf_one_activity)],
@@ -1318,10 +1319,10 @@ async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
     assert_eq!(execution.state, "FAILED");
 
     // The breaker trips solely from interceptor errors: threshold=2 ⇒ the
-    // interceptor is invoked on exactly the first two attempts. The third
-    // dispatch is short-circuited by the open breaker BEFORE the chain runs
-    // (interceptors sit after the circuit-breaker admit gate), so the count is
-    // never inflated to 3.
+    // interceptor is invoked on exactly the first two attempts. The open
+    // breaker short-circuits the third dispatch BEFORE the chain runs, because
+    // interceptors sit after the circuit-breaker admit gate. So the count never
+    // reaches 3.
     assert_eq!(
         *attempts.lock().unwrap(),
         2,
@@ -1358,7 +1359,7 @@ async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9 (FIX 3 / AC8) — an interceptor reads a context header (#481)
+// Test 9 (AC8) — an interceptor reads a context header (#481)
 // propagated end-to-end into the activity's ActivityContext.
 // ---------------------------------------------------------------------------
 
@@ -1367,9 +1368,9 @@ async fn interceptor_reads_propagated_context_header() {
     let (url, _container) = setup_db().await;
     let queue = "q-header-int";
     let mut conn = connect(&url).await;
-    // Seed the execution with an ambient context header; the engine propagates
-    // it into every activity task's context_headers, so the interceptor's
-    // `ctx.header(..)` observes it without any per-activity plumbing.
+    // Seed the execution with an ambient context header. The engine propagates
+    // it into the context_headers of every activity task. So the interceptor's
+    // `ctx.header(..)` observes it without per-activity plumbing.
     let exec_id = seed_workflow_with_headers(
         &mut conn,
         "wf_one_activity",
@@ -1411,7 +1412,7 @@ async fn interceptor_reads_propagated_context_header() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 10 (FIX 6 / AC2) — an interceptor INPUT transform is genuinely seen by
+// Test 10 (AC2) — an interceptor INPUT transform is genuinely seen by
 // the handler through the real worker path (recorded ActivityCompleted output).
 // ---------------------------------------------------------------------------
 
@@ -1428,11 +1429,11 @@ async fn interceptor_input_transform_reaches_handler_end_to_end() {
     )
     .await;
 
-    // The interceptor injects a field into the input BEFORE calling next; the
-    // echo handler returns whatever input it received. So the recorded
-    // ActivityCompleted.output reflecting the injected field proves the handler
-    // genuinely computed over the interceptor-transformed input through the real
-    // worker dispatch path (not merely a result transform).
+    // The interceptor injects a field into the input BEFORE calling next. The
+    // echo handler returns whatever input it received. The recorded
+    // ActivityCompleted.output then holds the injected field. That proves the
+    // handler computed over the interceptor-transformed input through the real
+    // worker dispatch path, not merely a result transform.
     let registry = build_registry(
         vec![wf_info("wf_one_activity", wf_one_activity)],
         vec![act_info("echo", echo_activity, false, None)],
@@ -1467,17 +1468,17 @@ async fn interceptor_input_transform_reaches_handler_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 11 (issue #680 Codex P2 — load-bearing) — an OUTER interceptor that maps
-// a transactional activity's committed Ok → Err must NOT trip the circuit
-// breaker and must NOT record the attempt as Failed. A transactional activity
-// seals its own `ActivityCompleted` + task-COMPLETED atomically inside the
-// user's transaction; the interceptor's error transform is discarded from
-// history, so metrics + the circuit breaker must reflect the committed (sealed)
-// outcome, not the discarded post-`next` Err.
+// Test 11 (issue #680, load-bearing) — an OUTER interceptor maps a
+// transactional activity's committed Ok → Err. That must NOT trip the circuit
+// breaker or record the attempt as Failed. A transactional activity seals its
+// own `ActivityCompleted` + task-COMPLETED atomically inside the user's
+// transaction. History discards the interceptor's error transform. So metrics
+// + the circuit breaker must reflect the committed (sealed) outcome, not the
+// discarded post-`next` Err.
 //
-// Pre-fix this FAILS: the worker consumed the post-interceptor `Err`, so the
-// breaker tripped and metrics recorded Failed on an outcome history records as
-// ActivityCompleted — a real observability/history divergence NEW to
+// Pre-fix this FAILS. The worker consumed the post-interceptor `Err`. So the
+// breaker tripped, and metrics recorded Failed where history records
+// ActivityCompleted. That observability/history divergence is NEW to
 // interceptors.
 // ---------------------------------------------------------------------------
 
@@ -1604,10 +1605,10 @@ async fn interceptor_error_transform_on_transactional_activity_does_not_trip_bre
 }
 
 // ---------------------------------------------------------------------------
-// Test 12 (issue #680 Codex P2) — an OUTER interceptor's Ok→Ok′ result
-// transform on a transactional activity is observably IGNORED: history keeps
-// the committed value V (not V′), the workflow observes V, and metrics record
-// Completed. This documents that an interceptor observes but cannot transform a
+// Test 12 (issue #680) — an OUTER interceptor's Ok→Ok′ result transform on a
+// transactional activity is observably IGNORED. History keeps the committed
+// value V (not V′), the workflow observes V, and metrics record Completed.
+// This documents that an interceptor observes but cannot transform a
 // self-sealed transactional outcome; history == metrics == breaker all reflect V.
 // ---------------------------------------------------------------------------
 

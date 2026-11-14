@@ -36,8 +36,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-// ── DB setup ─────────────────────────────────────────────────────────────────
-
 async fn connect(url: &str) -> AsyncPgConnection {
     <AsyncPgConnection as diesel_async::AsyncConnection>::establish(url)
         .await
@@ -62,8 +60,6 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
         .expect("migrations");
     (conn, Some(container))
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn unique_queue(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
@@ -172,8 +168,6 @@ async fn assert_scheduled_at_matches_delay_on_db_clock(
     );
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn requeue_for_retry_computes_scheduled_at_on_the_db_clock() {
     let (mut conn, _c) = setup_db().await;
@@ -274,11 +268,6 @@ async fn requeue_workflow_task_for_quota_retry_computes_scheduled_at_on_the_db_c
     assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
 }
 
-/// A zero delay must land at (not after) the database's own `NOW()`.
-///
-/// `make_interval(secs => 0)` is a no-op. This needs no special case in
-/// production code. The earlier host-side padding fix needed one: it had to
-/// carve zero out, or strand a queue-pause reset (issue #1389).
 /// A retry-budget deferral (issue #1793) must wait on Postgres's clock. A
 /// host clock that trails Postgres would make the deferred row due at once.
 /// The worker would then claim and defer it again in a loop.
@@ -303,6 +292,11 @@ async fn defer_claimed_retry_for_budget_computes_scheduled_at_on_the_db_clock() 
     assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
 }
 
+/// A zero delay must land at (not after) the database's own `NOW()`.
+///
+/// `make_interval(secs => 0)` is a no-op. This needs no special case in
+/// production code. The earlier host-side padding fix needed one: it had to
+/// carve zero out, or strand a queue-pause reset (issue #1389).
 #[tokio::test]
 async fn requeue_for_retry_zero_delay_computes_scheduled_at_on_the_db_clock() {
     let (mut conn, _c) = setup_db().await;

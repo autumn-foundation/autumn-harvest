@@ -1,8 +1,8 @@
 //! Postgres-backed task queue with `SKIP LOCKED` claiming.
 //!
-//! Workers poll their assigned queues via [`claim_task()`] which atomically
-//! moves a `PENDING` row to `RUNNING` using `FOR UPDATE SKIP LOCKED` --
-//! no two workers will ever claim the same task.
+//! Workers poll their assigned queues via [`claim_task()`]. It atomically
+//! moves a `PENDING` row to `RUNNING` with `FOR UPDATE SKIP LOCKED`, so no two
+//! workers claim the same task.
 
 use crate::schema::harvest_task_queue_ext;
 use crate::table_split::SetExt;
@@ -477,10 +477,6 @@ mod claim_window {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TaskType
-// ---------------------------------------------------------------------------
-
 /// Discriminator for the kind of task enqueued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
@@ -566,23 +562,23 @@ pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTim
 /// * `EnqueueParams::new` backdates an immediate task's `scheduled_at` to
 ///   `NOW() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` so it stays claimable under the
 ///   `scheduled_at <= NOW()` predicate even when host and Postgres clocks differ
-///   slightly. Its real eligibility is the insert time `created_at` (the later of
-///   the two), so a promptly-served immediate task reports ~0 — the backdating is
-///   dropped without a fixed-allowance subtraction.
-/// * A genuinely *delayed* or *retried* task sets `scheduled_at` to an explicit
-///   future instant (`>= created_at`, e.g. `requeue_for_retry` uses `NOW() + delay`),
-///   so `GREATEST` selects `scheduled_at` and the full wait is reported with no
-///   discount. The prior fixed-allowance subtraction under-reported these by up to
-///   the allowance and could hide work genuinely over the SLO (issue #501 review).
+///   slightly. Its real eligibility is the insert time `created_at`, the later
+///   of the two. So a promptly served immediate task reports ~0. The backdating
+///   drops out with no fixed-allowance subtraction.
+/// * A *delayed* or *retried* task sets `scheduled_at` to an explicit future
+///   instant (`>= created_at`; `requeue_for_retry` uses `NOW() + delay`). So
+///   `GREATEST` selects `scheduled_at` and reports the full wait. The prior
+///   fixed-allowance subtraction under-reported these by up to the allowance. It
+///   could hide work over the SLO (issue #501 review).
 ///
 /// `created_at` is `None` only for rows enqueued before the column was added; those
 /// fall back to `scheduled_at` (best available) until they drain.
 ///
-/// **Clock discipline:** `claimed_at` must be a **Postgres** timestamp (e.g. the
-/// task's `started_at`, stamped by `claim_task`), so this whole expression is
-/// computed in one clock and a host/Postgres skew cannot leak in. The worker then
-/// adds the host-**monotonic** local wait (permit acquisition + setup, measured
-/// with `Instant::elapsed`) to this value — never `Utc::now()`, which would mix the
+/// **Clock discipline:** `claimed_at` must be a **Postgres** timestamp, such as
+/// the task's `started_at` that `claim_task` stamps. So this whole expression
+/// uses one clock, and a host/Postgres skew cannot leak in. The worker then adds
+/// the host-**monotonic** local wait to this value: permit acquisition and setup,
+/// measured with `Instant::elapsed`. It never adds `Utc::now()`, which mixes the
 /// host wall clock with the Postgres eligibility timestamps (issue #501 review).
 #[must_use]
 pub fn schedule_to_start_secs(
@@ -624,30 +620,30 @@ impl std::fmt::Display for TaskType {
 /// Namespace prefix for a *dynamic* per-key activity rate-limit bucket stored in
 /// `harvest_rate_limit_buckets`.
 ///
-/// Distinct from a *static* [`EnqueueParams::rate_limit_key`] (a bare activity
-/// name or an author-supplied `rate_limit_key` string) and from the throttle
-/// bucket prefix (`start-throttle:`), so a dynamic per-tenant bucket can never
-/// collide with either.
+/// It differs from a *static* [`EnqueueParams::rate_limit_key`] and from the
+/// throttle bucket prefix (`start-throttle:`). A static key is a bare activity
+/// name or an author-supplied `rate_limit_key` string. So a dynamic per-tenant
+/// bucket never collides with either.
 pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
 
-/// Maximum length (bytes) of any single *component* (the normalized expression
-/// or the resolved value) of a dynamic per-key bucket key before it is replaced
-/// with a stable hash (issue #699, btree-PK safety).
+/// Maximum bytes of one dynamic bucket-key component before a hash replaces it
+/// (issue #699, btree-PK safety).
 ///
-/// The composite key is the PRIMARY KEY of `harvest_rate_limit_buckets`. A
-/// pathologically large component — a giant tenant id or non-scalar field
-/// serialized to JSON in `resolved`, or a very long dot-path / hand-built
-/// `ActivityInfo.rate_limit_key` in the expression — would exceed the Postgres
-/// btree PK size limit (~2704 bytes) and abort the enqueue transaction in a
-/// retry loop, wedging the workflow. Bounding *both* components keeps the whole
-/// composite key provably well under that limit (≤ ~530 bytes) while leaving
-/// ordinary short values human-readable.
+/// A component is the normalized expression or the resolved value. The
+/// composite key is the PRIMARY KEY of `harvest_rate_limit_buckets`. A huge
+/// component can exceed the Postgres btree PK size limit (~2704 bytes). Examples
+/// are a giant tenant id or a non-scalar field serialized to JSON in `resolved`.
+/// A very long dot-path or hand-built `ActivityInfo.rate_limit_key` does the
+/// same in the expression. The enqueue transaction then aborts in a retry loop
+/// and wedges the workflow. Bounding *both* components keeps the composite key
+/// provably under that limit (≤ ~530 bytes). Ordinary short values stay
+/// human-readable.
 const MAX_KEY_COMPONENT_LEN: usize = 256;
 
-/// Bound a single dynamic-key component to at most [`MAX_KEY_COMPONENT_LEN`]
-/// bytes (issue #699, btree-PK safety) with **structurally disjoint** literal
-/// and hash encodings so a literal value can never coincide with a hash
-/// encoding (issue #699 review, Codex P2):
+/// Bound one dynamic-key component to [`MAX_KEY_COMPONENT_LEN`] bytes (issue #699).
+///
+/// The literal and hash encodings are **structurally disjoint**, so a literal
+/// value never coincides with a hash encoding (issue #699 review):
 ///
 /// - A value within the bound is emitted as a **length-tagged literal**:
 ///   `L{byte_len}:{value}` (starts with `L`, self-delimiting).
@@ -655,25 +651,24 @@ const MAX_KEY_COMPONENT_LEN: usize = 256;
 ///   SHA-256** digest: `H{64hex}` (starts with `H`, fixed 65 bytes).
 ///
 /// The digest is the full 256-bit SHA-256 of the component's UTF-8 bytes,
-/// hex-encoded. This is deliberately a *cryptographic* digest rather than the
-/// 64-bit `seahash` this originally used: the component is tenant-influenced
-/// input (a resolved per-execution value, or a hand-built
-/// `ActivityInfo.rate_limit_key`), so two distinct oversized values sharing a
-/// 64-bit digest would silently share a `dyn-rate` bucket — the `L`/`H` tags
-/// fix *format* collisions, not *digest* collisions. SHA-256 makes a digest
-/// collision computationally infeasible, so distinct oversized components get
-/// distinct buckets in practice.
+/// hex-encoded. It is a *cryptographic* digest, not the 64-bit `seahash` used
+/// before. The component is tenant-influenced input: a resolved per-execution
+/// value, or a hand-built `ActivityInfo.rate_limit_key`. Two oversized values
+/// that share a 64-bit digest would silently share a `dyn-rate` bucket. The
+/// `L`/`H` tags fix *format* collisions, not *digest* collisions. SHA-256 makes
+/// a digest collision infeasible, so distinct oversized components get distinct
+/// buckets in practice.
 ///
-/// The `L`/`H` first-byte tags make the two forms provably disjoint: a short
-/// literal whose value happens to be a 65-byte string beginning with `H`
-/// followed by 64 hex characters encodes to `L65:H…`, which can never equal a
-/// hash encoding `H…`. Without the tag, `h:{digest}` was itself a valid short
-/// literal, so a long value hashing to digest `D` and a short literal value
-/// equal to the string `h:{D}` produced the same component — cross-tenant
-/// bucket sharing without a hash collision. Applied to both the expression and
-/// the resolved value so neither can blow the composite PK size, and so the
-/// whole composite key is injective (each component is self-delimiting: an
-/// `L{len}:{len-bytes}` literal or a fixed-width `H{64hex}` hash).
+/// The `L`/`H` first-byte tags make the two forms provably disjoint. Take a
+/// short literal that is a 65-byte string: `H`, then 64 hex characters. It
+/// encodes to `L65:H…`, which never equals a hash encoding `H…`. Without the
+/// tag, `h:{digest}` was itself a valid short literal. A long value with digest
+/// `D` and the short literal `h:{D}` then gave the same component. That is
+/// cross-tenant bucket sharing without a hash collision. Both the expression
+/// and the resolved value use this bound, so neither can blow the composite PK
+/// size. The composite key is also injective, because each component is
+/// self-delimiting: an `L{len}:{len-bytes}` literal or a fixed-width `H{64hex}`
+/// hash.
 fn bound_key_component(component: &str) -> String {
     if component.len() > MAX_KEY_COMPONENT_LEN {
         use sha2::{Digest, Sha256};
@@ -690,83 +685,83 @@ fn bound_key_component(component: &str) -> String {
     }
 }
 
-/// Marker for the *resolved-value* component of a dynamic per-key bucket key
-/// when the key expression could **not** be resolved from the workflow input
-/// (missing field / null / non-object input), i.e. `resolve_concurrency_key`
-/// returned `None`.
+/// Marker for the *resolved-value* component of an unresolved dynamic bucket key.
 ///
-/// Structurally disjoint from every [`bound_key_component`] output (which always
-/// begins with `L` or `H`), so the *unresolved* fallback bucket
-/// `dyn-rate:{expr}:U` can never coincide with a *resolved* bucket — in
-/// particular with `dyn-rate:{expr}:L0:`, which is a legitimately-resolved
-/// **empty-string** tenant (`Some("")`). The previous `.unwrap_or_default()` at
-/// the call site collapsed both `None` (unresolved / missing / malformed input)
-/// and `Some("")` (a real empty-string tenant) onto the same `L0:` bucket,
-/// cross-throttling malformed/missing executions against a legitimate empty
-/// tenant (issue #699 review, Codex round-5 P2, worker.rs:4720).
+/// It applies when `resolve_concurrency_key` returns `None`: a missing field,
+/// null, or non-object input.
+///
+/// Every [`bound_key_component`] output begins with `L` or `H`, so this marker
+/// is structurally disjoint from all of them. The *unresolved* fallback bucket
+/// `dyn-rate:{expr}:U` thus never coincides with a *resolved* bucket. This
+/// includes `dyn-rate:{expr}:L0:`, a legitimately resolved **empty-string**
+/// tenant (`Some("")`). The previous `.unwrap_or_default()` at the call site
+/// collapsed two values onto the same `L0:` bucket. One is `None` (unresolved
+/// / missing / malformed input). The other is `Some("")` (a real empty-string
+/// tenant). That cross-throttled malformed/missing executions against a
+/// legitimate empty tenant (issue #699, worker.rs:4720).
 const UNRESOLVED_RESOLVED_MARKER: &str = "U";
 
 /// Build the token-bucket key for a *dynamic* per-key activity rate limit
 /// (issue #699).
 ///
-/// The key is namespaced by both the dot-path *expression* and the resolved
-/// per-execution *value* — `dyn-rate:{expr_component}:{resolved_component}` — so
-/// that activities declaring the same expression share one bucket per resolved
-/// value (matching the static limiter's "same key → shared bucket → must agree
-/// on rps" rule), while distinct tenants get independent buckets. `resolved` is
-/// `None` for an execution whose key expression could not be resolved (missing /
-/// null / non-object input); it encodes as the distinct
-/// [`UNRESOLVED_RESOLVED_MARKER`] (`U`), giving one shared fallback bucket per
-/// expression (`dyn-rate:{expr}:U`) so an unkeyed execution is still bounded
-/// rather than unbounded. Crucially, that unresolved bucket is **distinct** from
-/// `Some("")` — a legitimately-resolved empty-string tenant — which buckets
-/// under `L0:` (`dyn-rate:{expr}:L0:`); the `U`/`L`-tag disjointness stops a
-/// malformed/missing input from cross-throttling a real empty-string tenant
-/// (issue #699 review, Codex round-5 P2).
+/// The key is `dyn-rate:{expr_component}:{resolved_component}`. It names both
+/// the dot-path *expression* and the resolved per-execution *value*.
+/// Activities that declare the same expression share one bucket per resolved
+/// value. This matches the static limiter's "same key → shared bucket → must
+/// agree on rps" rule. Distinct tenants get independent buckets.
 ///
-/// `key_expr` is normalized by stripping a leading `input.` (issue #699 review):
+/// `resolved` is `None` when the key expression does not resolve: missing,
+/// null or non-object input. It encodes as the distinct
+/// [`UNRESOLVED_RESOLVED_MARKER`] (`U`). That gives one shared fallback bucket
+/// per expression (`dyn-rate:{expr}:U`), so an unkeyed execution stays bounded.
+/// That unresolved bucket is **distinct** from `Some("")`, a legitimately
+/// resolved empty-string tenant under `L0:` (`dyn-rate:{expr}:L0:`). The
+/// `U`/`L`-tag disjointness stops a malformed or missing input from
+/// cross-throttling a real empty-string tenant (issue #699).
+///
+/// The key strips a leading `input.` from `key_expr` (issue #699 review).
 /// `resolve_concurrency_key` treats `"input.tenant_id"` and `"tenant_id"` as the
-/// same field, so the two spellings must resolve to the same bucket — the strip
-/// here mirrors the strip in [`crate::builder`]'s dynamic-key validation.
+/// same field, so the two spellings must resolve to the same bucket. The strip
+/// mirrors the strip in [`crate::builder`]'s dynamic-key validation.
 ///
 /// *Both* the normalized `expr` and the `resolved` value are byte-length-bounded
-/// ([`MAX_KEY_COMPONENT_LEN`], via [`bound_key_component`]): a component whose
-/// UTF-8 byte length exceeds the bound is replaced with a stable, collision-
-/// resistant SHA-256 digest so a pathological value — an oversized resolved
-/// tenant id *or* a very
-/// long dot-path / hand-built `ActivityInfo.rate_limit_key` expression — can
-/// never blow the btree PK size limit and wedge the enqueue transaction. The
-/// byte-length check matches the Postgres btree PK limit (which is byte-based)
-/// and is O(1) on the hot enqueue path. With both components bounded the whole
-/// composite key is provably ≤ ~530 bytes regardless of the macro or a
-/// hand-built `ActivityInfo`.
+/// ([`MAX_KEY_COMPONENT_LEN`], via [`bound_key_component`]). A stable,
+/// collision-resistant SHA-256 digest replaces a component over the bound. So
+/// an oversized resolved tenant id never blows the btree PK size limit and
+/// wedges the enqueue transaction. Nor does a very long dot-path or hand-built
+/// `ActivityInfo.rate_limit_key` expression. The byte-length check matches the
+/// byte-based Postgres btree PK limit. It is O(1) on the hot enqueue path.
+/// With both components bounded, the composite key is provably
+/// ≤ ~530 bytes, whatever the macro or a hand-built `ActivityInfo` supplies.
 ///
-/// The key is **injective by construction**: the `expr` component is emitted by
-/// [`bound_key_component`] as either a length-tagged literal `L{len}:{bytes}`
-/// (self-delimiting: after the `L`, the decimal `len` up to the next `:` says
-/// exactly how many bytes follow) or a fixed-width hash `H{64hex}`, and the
-/// `resolved` component is either the same (`Some`) or the single-byte
+/// The key is **injective by construction**. [`bound_key_component`] emits the
+/// `expr` component as a length-tagged literal `L{len}:{bytes}` or a
+/// fixed-width hash `H{64hex}`. The literal is self-delimiting: after the `L`,
+/// the decimal `len` up to the next `:` says how many bytes follow. The
+/// `resolved` component is the same (`Some`) or the single-byte
 /// [`UNRESOLVED_RESOLVED_MARKER`] (`U`, for `None`). The `L`/`H`/`U` first-byte
-/// tags are structurally disjoint, so a literal value equal to a hash's
-/// encoding never collides with that hash, an unresolved `U` bucket never
-/// collides with any resolved `L`/`H` bucket (in particular `Some("")`'s `L0:`),
-/// and a `:` inside `expr` (a dot-path can address a JSON key containing `:`) or
-/// inside `resolved` can never split ambiguously: the pair `(expr, resolved)`
-/// maps to exactly one key and vice-versa, whether either component passed
-/// through unchanged or was hashed. Without this self-delimiting encoding,
-/// `key="a"` + resolved `"b:c"` and `key="a:b"` + resolved `"c"` would both
-/// flatten to `dyn-rate:a:b:c` — two distinct exprs sharing one bucket, so their
-/// (independently validated, possibly different) rps configs would collide
-/// first-writer-wins.
+/// tags are structurally disjoint. So:
+///
+/// - a literal value equal to a hash's encoding never collides with that hash;
+/// - an unresolved `U` bucket never collides with a resolved `L`/`H` bucket,
+///   such as the `L0:` of `Some("")`;
+/// - a `:` inside `expr` or `resolved` never splits ambiguously. A dot-path can
+///   address a JSON key that contains `:`.
+///
+/// The pair `(expr, resolved)` maps to exactly one key and back, hashed or not.
+/// Without this encoding, `key="a"` + resolved `"b:c"` and `key="a:b"` +
+/// resolved `"c"` both flatten to `dyn-rate:a:b:c`. Two distinct exprs then
+/// share one bucket. Their rps configs are validated independently and can
+/// differ, so they collide first-writer-wins.
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    // The expr component is self-delimiting (`L{len}:{bytes}` or `H{16hex}`);
+    // The expr component is self-delimiting (`L{len}:{bytes}` or `H{64hex}`);
     // the resolved component is either the same (`Some`) or the disjoint
     // single-byte `U` marker (`None`, unresolved). `None` (missing/null/
-    // non-object input) is kept DISTINCT from `Some("")` (a legitimately-
-    // resolved empty-string tenant, which encodes as `L0:`) so the two never
-    // share a bucket -- issue #699 review, Codex round-5 P2. The whole composite
+    // non-object input) is kept DISTINCT from `Some("")`. That is a
+    // legitimately-resolved empty-string tenant, which encodes as `L0:`. So
+    // the two never share a bucket (issue #699). The whole composite
     // key stays injective (the `L`/`H`/`U` first-byte tags are disjoint).
     let resolved_component = resolved.map_or_else(
         || UNRESOLVED_RESOLVED_MARKER.to_string(),
@@ -778,10 +773,6 @@ pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String
         resolved_component,
     )
 }
-
-// ---------------------------------------------------------------------------
-// EnqueueParams
-// ---------------------------------------------------------------------------
 
 /// Parameters for enqueuing a new task onto the work queue.
 #[derive(Debug, Clone)]
@@ -839,12 +830,13 @@ pub struct EnqueueParams {
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     pub context_headers: Option<serde_json::Value>,
-    /// Worker session this activity belongs to (issue #606). When `Some`,
-    /// combined with [`Self::sticky_worker_id`] the claim query **hard-pins**
-    /// this row to that worker -- unlike ordinary sticky routing, it never
-    /// fails over to a different worker even after the sticky lease expires,
-    /// since the session's local state only exists on that one worker.
-    /// `None` for an ordinary (non-session) activity.
+    /// Worker session this activity belongs to (issue #606).
+    ///
+    /// When `Some`, the claim query **hard-pins** this row to
+    /// [`Self::sticky_worker_id`]. Unlike ordinary sticky routing, it never
+    /// fails over to another worker, even after the sticky lease expires. The
+    /// session's local state exists only on that one worker. `None` for an
+    /// ordinary (non-session) activity.
     pub session_id: Option<Uuid>,
     /// `true` only for the first workflow task of a freshly admitted run
     /// (issue #1824). The workflow start path sets it. Every other path
@@ -2406,62 +2398,66 @@ macro_rules! claim_full_scan_fallback_sql {
     };
 }
 
-// NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
-// exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
-// and drift-locked literally to
-// `queue_pause::queue_pause_anti_join("harvest_task_queue")`. Measurement
-// (docs/performance.md) showed the planner re-probing `harvest_queue_pauses`
-// once for every *candidate row* it walked while sorting toward `LIMIT 1` —
-// not once per claim as the module doc for issue #619 assumes — accounted for
-// ~99% of this query's buffer touches at a 10k-row backlog. `paused_queues`
-// below pre-filters the (already `$2`-bounded) pause table into one small
-// array in a `MATERIALIZED` CTE — evaluated once, not once per row — and the
-// per-row check becomes a plain array-membership test with identical
-// semantics: a queue is excluded from `candidate` iff it has an active pause
-// row, exactly as before. This is deliberately NOT textually drift-locked to
-// `queue_pause::queue_pause_anti_join` any more; see
-// `claim_query_excludes_every_paused_queue_via_a_prefiltered_array` below for
-// the shape this is held to instead, and
+// NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): this replaced the
+// per-row correlated `NOT EXISTS` of the queue-pause exclusion. That text was
+// embedded verbatim and drift-locked literally to
+// `queue_pause::queue_pause_anti_join("harvest_task_queue")`.
+// Measurement (docs/performance.md) showed the planner re-probing
+// `harvest_queue_pauses` once per *candidate row* on its sort toward
+// `LIMIT 1`. It was not once per claim, as the module doc for issue #619
+// assumes. Those probes were ~99% of the buffer touches of this query at a
+// 10k-row backlog. `paused_queues` below pre-filters the `$2`-bounded pause
+// table into one small array in a `MATERIALIZED` CTE. That CTE runs once, not
+// once per row. The per-row check is then a plain array-membership test with
+// identical semantics. A queue leaves `candidate` iff it has an active pause
+// row, as before. On purpose, this is no longer textually drift-locked to
+// `queue_pause::queue_pause_anti_join`.
+// `claim_query_excludes_every_paused_queue_via_a_prefiltered_array` below
+// holds its shape instead.
 // `tests/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
-// for the DB-backed equivalence proof.
+// is the DB-backed equivalence proof.
 //
 // NOTE (issue #247 / Ledger perf pass, buffers -96.9% idle / -98.4% under
-// contention @10k): `docs/performance.md`'s per-gate cost table flagged
-// `concurrency_key` as "the one genuinely expensive predicate on the claim
-// path" at +644% even with contention deliberately minimised (a cap high
-// enough to never block). The candidate-side gate used to be a per-row
-// correlated `SELECT COUNT(*) FROM harvest_task_queue inner_q WHERE
+// contention @10k): this rewrote the candidate-side concurrency gate. The
+// per-gate cost table of `docs/performance.md` flagged `concurrency_key` as
+// "the one genuinely expensive predicate on the claim path". It cost +644%
+// even with contention deliberately minimised, under a cap high enough to
+// never block.
+// The old gate was a per-row correlated `SELECT COUNT(*) FROM harvest_task_queue inner_q WHERE
 // inner_q.concurrency_key = harvest_task_queue.concurrency_key AND
 // inner_q.task_type = harvest_task_queue.task_type AND inner_q.state =
-// 'RUNNING' AND inner_q.worker_id IS NOT NULL` — re-evaluated once per
-// candidate row the sort walks (the same `loops=N` shape the queue-pause fix
-// above closed), and its cost compounds with the size of the RUNNING
-// population sharing that row's key, since `COUNT(*)` cannot short-circuit.
+// 'RUNNING' AND inner_q.worker_id IS NOT NULL`. It ran once per candidate
+// row that the sort walks. That is the `loops=N` shape the queue-pause fix
+// above closed. Its cost also grew with the RUNNING population that shares
+// the key of the row, since `COUNT(*)` cannot short-circuit.
+//
 // `concurrency_pending_keys` below narrows to the `(concurrency_key,
-// task_type)` pairs actually present among this queue set's currently-due
-// PENDING rows -- `scheduled_at <= NOW()` mirrors `candidate`'s own filter,
-// so the aggregate below never pays for a key whose only PENDING rows are
-// scheduled in the future, which `candidate` could never select regardless
-// (a queue holding a large future-dated backfill alongside a few due rows
-// must not scan/dedupe the whole backfill on every claim) -- and
-// `concurrency_running_counts`
-// aggregates the RUNNING population for exactly those pairs into one
-// `MATERIALIZED` lookup table, evaluated once per claim rather than once per
-// row. The per-row check becomes a `COALESCE(single-row lookup, 0) < cap`
-// comparison with identical semantics to the original `COUNT(*) < cap` —
-// `COALESCE(..., 0)` reproduces the correlated subquery's implicit zero for a
-// key with no matching RUNNING rows (`concurrency_running_counts` never
-// materializes a zero-count row; `GROUP BY` only emits groups that exist).
+// task_type)` pairs of the currently due PENDING rows of this queue set. Its
+// `scheduled_at <= NOW()` mirrors the filter of `candidate`. So the
+// aggregate never pays for a key whose only PENDING rows are in the future,
+// which `candidate` can never select. A queue with a large future-dated
+// backfill beside a few due rows must not scan and dedupe the whole backfill
+// on every claim. `concurrency_running_counts` aggregates the RUNNING
+// population for exactly those pairs into one `MATERIALIZED` lookup table.
+// It runs once per claim, not once per row.
+//
+// The per-row check becomes `COALESCE(single-row lookup, 0) < cap`. Its
+// semantics are identical to the original `COUNT(*) < cap`.
+// `COALESCE(..., 0)` reproduces the implicit zero of the correlated subquery
+// for a key with no RUNNING rows. `concurrency_running_counts` never
+// materializes a zero-count row, because `GROUP BY` emits only groups that
+// exist.
+//
 // The `claimed` CTE has its own recheck under `pg_try_advisory_xact_lock`.
 // It runs the same correlated subquery on the one candidate only. It is not
 // rewritten, on purpose. It runs at most once per claim, so it carries none
 // of the cost this fix addresses. It still reads the snapshot of the claim
-// statement, which predates the lock. `release_claim_if_over_cap` repeats the count after the claim, in a
-// fresh snapshot, so the cap holds through commit. See
-// `claim_query_concurrency_gate_matches_the_authoritative_recheck` below for
-// the shape this pre-filter is held to, and
-// `tests/integration/concurrency_key_tests.rs` for the DB-backed correctness
-// proof (issue #247's own suite, unmodified by this rewrite).
+// statement, which predates the lock. `release_claim_if_over_cap` repeats
+// the count after the claim, in a fresh snapshot, so the cap holds through
+// commit. `claim_query_concurrency_gate_matches_the_authoritative_recheck`
+// below holds the shape of this pre-filter.
+// `tests/integration/concurrency_key_tests.rs` is the DB-backed correctness
+// proof. It is the suite of issue #247, which this rewrite left unmodified.
 /// The task-claim query — extracted as a `const fn` (mirroring the
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
@@ -2483,18 +2479,18 @@ macro_rules! claim_full_scan_fallback_sql {
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
 /// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
 /// `$6` ineligible activities. The queue-pause exclusion (issue #619) needs no
-/// new bind — it reuses `$2`, pre-filtering `harvest_queue_pauses` to the
-/// worker's own polled queues once via `paused_queues` rather than probing it
-/// once per candidate row (see the `NOTE` above `claim_task_query` for why).
+/// new bind. It reuses `$2`: `paused_queues` pre-filters `harvest_queue_pauses`
+/// once to the polled queues of the worker. It does not probe the table once
+/// per candidate row. The `NOTE` above `claim_task_query` says why.
 /// That `$2` bound also caps `paused_queues`' array width at the worker's own
 /// polled-queue count, typically single digits. A fleet-wide operator pause
 /// of many queues does not widen it for a typical worker — see issue #1215.
 ///
-/// The per-activity-type pause (issue #807) needs no bind either: unlike
-/// `paused_queues` there is no natural bound to pre-filter by — a worker's
-/// polled queues say nothing about which activity types are held — so
+/// The per-activity-type pause (issue #807) needs no bind either. Unlike
+/// `paused_queues`, it has no natural bound to pre-filter by. The polled
+/// queues of a worker say nothing about which activity types are held. So
 /// `paused_activities` reads the whole table. It is `MATERIALIZED` for the
-/// same reason `paused_queues` is — evaluated once per claim, never once per
+/// same reason as `paused_queues`: it runs once per claim, never once per
 /// candidate row.
 ///
 /// **That unbounded width has a measured cost, not only a theoretical one.**
@@ -2513,24 +2509,24 @@ macro_rules! claim_full_scan_fallback_sql {
 /// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,
 /// not defensive noise.** `activity_name` is `NULL` for workflow tasks, and in
 /// SQL `NULL = ANY(array)` is `NULL` — so `NOT (activity_name = ANY(...))` is
-/// `NULL`, which is not `TRUE`, which excludes the row. Without the guard a
-/// single paused activity would silently stop every *workflow* task in the
-/// fleet from being claimed: a total orchestration outage produced by a
-/// surgical containment control. Pinned by
+/// `NULL`, which is not `TRUE`, which excludes the row. Without the guard,
+/// one paused activity silently stops the claim of every *workflow* task in
+/// the fleet. A surgical containment control then causes a total
+/// orchestration outage. Pinned by
 /// `claim_query_activity_pause_gate_never_holds_workflow_tasks`.
 ///
-/// The per-key concurrency gate (issue #247) needs no new bind either:
+/// The per-key concurrency gate (issue #247) needs no new bind either.
 /// `concurrency_pending_keys` and `concurrency_running_counts` derive their
-/// bound entirely from columns already on `harvest_task_queue` (see the `NOTE`
-/// above `claim_task_query` for why this was rewritten and what it replaced).
+/// bound from columns already on `harvest_task_queue`. The `NOTE` above
+/// `claim_task_query` says why this was rewritten and what it replaced.
 /// Both are `MATERIALIZED` for the same "evaluated once per claim" reason as
 /// `paused_queues`/`paused_activities`. `concurrency_running_counts` is
-/// intentionally scoped to `WHERE t.concurrency_key IN (SELECT ... FROM
-/// concurrency_pending_keys)` rather than aggregating the whole RUNNING
-/// population: a deployment can have many more distinct `concurrency_key`
-/// values with RUNNING work than this queue set's current PENDING backlog
-/// touches, and the aggregate must not pay for keys this claim attempt cannot
-/// possibly select.
+/// scoped to `WHERE t.concurrency_key IN (SELECT ... FROM
+/// concurrency_pending_keys)` on purpose. It does not aggregate the whole
+/// RUNNING population. A deployment can have many more distinct
+/// `concurrency_key` values with RUNNING work than the current PENDING
+/// backlog of this queue set touches. The aggregate must not pay for keys
+/// this claim attempt cannot select.
 // The body is one SQL statement, built with `concat!`. The line count is the
 // query's, not control flow's. `claim_task` carried the same allow before this
 // query was extracted for shape-testing.
@@ -2766,9 +2762,8 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
 ///
 /// `Some((shard_id, generation))` when this process pinned a generation for the
-/// shard this connection serves; `None` — the overwhelmingly common case —
-/// when DR fencing was never enabled, which is what keeps the unfenced claim
-/// path byte-for-byte unchanged.
+/// shard this connection serves. `None`, the common case, when DR fencing was
+/// never enabled. That keeps the unfenced claim path byte-for-byte unchanged.
 fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(Vec<i32>, Vec<i64>)> {
     use crate::replication::FenceRegistry;
 
@@ -2795,41 +2790,41 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(Vec<i32>, Vec<
 /// The claim query with the cross-region DR write-authority fence spliced in
 /// (issue #954).
 ///
-/// Identical to [`claim_task_query`] plus one `fence` CTE cross-joined into
-/// `candidate`, so a worker whose pinned generation no longer matches the
+/// It is [`claim_task_query`] plus one `fence` CTE cross-joined into
+/// `candidate`. A worker whose pinned generation no longer matches the
 /// database selects **zero** candidates and cannot claim work. Binds
-/// `$7` shard id and `$8` pinned generation on top of the base query's
-/// `$1..$6`.
+/// `$7` shard id and `$8` pinned generation after the `$1..$6` of the base
+/// query.
 ///
 /// # Why a splice rather than a second literal
 ///
 /// The base query is ~130 lines of load-bearing SQL whose every gate is pinned
 /// by a test. Copying it would fork those guarantees the first time either
-/// copy is edited. Splicing derives the fenced form from the base, so the
+/// copy is edited. Splicing derives the fenced form from the base. So the
 /// pause gates, build routing, sticky/session pins and ordering are the *same*
-/// text by construction — asserted by
-/// `fenced_claim_query_preserves_every_unfenced_gate`.
+/// text by construction. `fenced_claim_query_preserves_every_unfenced_gate`
+/// asserts it.
 ///
 /// # Why `MATERIALIZED`, and where the barrier actually comes from
 ///
 /// `MATERIALIZED` makes the probe run exactly once per claim rather than being
 /// inlined into the candidate scan's per-row predicate. It reads one page of a
-/// one-row-per-shard table, and on a generation mismatch the plan short-circuits
-/// before `harvest_task_queue` is touched at all (measured: 7 buffers against
-/// 890 on the matching path).
+/// one-row-per-shard table. On a generation mismatch the plan short-circuits
+/// before it touches `harvest_task_queue` (measured: 7 buffers against 890 on
+/// the matching path).
 ///
 /// The probe is a **plain read**, deliberately not `SELECT ... FOR SHARE`. The
-/// commit-order barrier comes from the `ACCESS SHARE` table lock Postgres takes
-/// for the read automatically: [`crate::replication::bump_generation`] holds
-/// `ACCESS EXCLUSIVE` on the same table, which conflicts, so it cannot commit
-/// while this claim transaction is open and a claim starting afterwards reads
-/// the new generation and matches nothing.
+/// commit-order barrier comes from the `ACCESS SHARE` table lock that Postgres
+/// takes for the read. [`crate::replication::bump_generation`] holds the
+/// conflicting `ACCESS EXCLUSIVE` on the same table. So it cannot commit while
+/// this claim transaction is open. A claim that starts afterwards reads the new
+/// generation and matches nothing.
 ///
-/// A shared *row* lock would have been the obvious choice and is the wrong one:
-/// there is exactly one row per shard and every claim in the fleet touches it,
-/// so two concurrent `FOR SHARE` holders force a `MultiXactId` — a
-/// `XLOG_MULTIXACT_CREATE_ID` WAL record plus SLRU traffic per claim, and the
-/// same 8 KB heap page dirtied fleet-wide on every claim. See
+/// A shared *row* lock looks obvious but is wrong. There is exactly one row per
+/// shard, and every claim in the fleet touches it. So two concurrent
+/// `FOR SHARE` holders force a `MultiXactId`. That costs an
+/// `XLOG_MULTIXACT_CREATE_ID` WAL record plus SLRU traffic per claim. It also
+/// dirties the same 8 KB heap page fleet-wide on every claim. See
 /// `bump_generation` for the full argument.
 #[must_use]
 pub fn claim_task_query_fenced() -> &'static str {
@@ -3284,9 +3279,9 @@ pub async fn claim_task_with_slots(
 ///
 /// `$1` is [`CLAIM_SLOT_LOCK_CLASS`], `$2` the slot count and `$3` the
 /// first slot to try. The key is [`claim_slot_lock_key`]. The table tag is
-/// an uncorrelated subquery, so Postgres reads it once per statement. The statement tries each slot once, from `$3`, and stops at the
-/// first lock that it gets. So it holds at most one slot. It returns that
-/// slot.
+/// an uncorrelated subquery, so Postgres reads it once per statement. The
+/// statement tries each slot once, from `$3`, and stops at the first lock that
+/// it gets. So it holds at most one slot. It returns that slot.
 ///
 /// The lock call is in `WHERE`, with `LIMIT 1` and no `ORDER BY`. The
 /// executor then tests rows one at a time and stops after the first match.
@@ -3375,14 +3370,14 @@ async fn claim_task_one_statement(
     // only for the single selected candidate and re-verify the cap. The
     // re-check reads the snapshot of the claim statement, which predates the
     // lock. `release_claim_if_over_cap` counts again after the claim, in a
-    // fresh snapshot, to close that gap. If the advisory lock fails
-    // (another worker holds it) or the re-check shows the cap is now
-    // saturated, the UPDATE matches 0 rows and the transaction commits with no
-    // change; the PENDING row is immediately available for the next poll.
+    // fresh snapshot, to close that gap. The advisory lock can fail because
+    // another worker holds it. The re-check can find the cap saturated. Then
+    // the UPDATE matches 0 rows, and the transaction commits with no change.
+    // The PENDING row is free for the next poll at once.
     //
-    // Acquiring the lock only for the final candidate (not during broad
-    // filtering) means a worker never transiently holds locks for keys it will
-    // not actually claim, keeping throughput high under contention.
+    // The lock is taken only for the final candidate, not during broad
+    // filtering. So a worker never holds locks for keys it does not claim,
+    // which keeps throughput high under contention.
     //
     // The partial index harvest_task_queue_concurrency_key_running makes the
     // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
@@ -3394,42 +3389,44 @@ async fn claim_task_one_statement(
     // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
     // A NULL value (or 0, which the builder normalizes to None) disables aging.
     //
-    // Circuit-breaker rate limiting (issue #369, $5 = the static set of activity
-    // names that have a circuit-breaker policy): for these activities the
-    // rate-limit *gate* and token *debit* are BOTH skipped at claim time. Rate
-    // limiting is instead enforced authoritatively at dispatch, gated on the real
-    // `on_dispatch` decision in process_activity_task: a genuine downstream call
-    // atomically consumes a token (`try_consume_rate_limit_token`, rescheduling
-    // if none is available) while a `CircuitOpen` short-circuit consumes nothing.
+    // Circuit-breaker rate limiting (issue #369): `$5` is the static set of
+    // activity names with a circuit-breaker policy. For these activities the
+    // claim skips BOTH the rate-limit *gate* and the token *debit*. Dispatch
+    // enforces the rate limit authoritatively instead. It gates on the real
+    // `on_dispatch` decision in process_activity_task. A genuine downstream
+    // call atomically consumes a token (`try_consume_rate_limit_token`). It
+    // reschedules when no token is available. A `CircuitOpen` short-circuit
+    // consumes nothing.
     //
-    // This avoids the claim-vs-dispatch staleness race: the breaker state is
-    // in-process and can change between claim and dispatch, so any claim-time
-    // rate-limit decision keyed on breaker phase is necessarily approximate.
-    // Moving it to dispatch lets short-circuits stay claimable at full speed
-    // during an outage (no gate) while guaranteeing a real call never runs
-    // without a token (authoritative debit). Non-circuit rate-limited activities
-    // are unaffected — they gate and debit at claim as before.
+    // This avoids the claim-vs-dispatch staleness race. The breaker state is
+    // in-process and can change between claim and dispatch. So a claim-time
+    // rate-limit decision keyed on breaker phase is always approximate. At
+    // dispatch, short-circuits stay claimable at full speed during an outage
+    // (no gate). A real call still never runs without a token (authoritative
+    // debit). Non-circuit rate-limited activities gate and debit at claim, as
+    // before.
     //
     // The concurrency cap is never bypassed: a real call must always respect
     // `max_concurrent`.
     //
-    // Known limitation — safe-side rate-limit token leak under concurrency
-    // contention (pre-existing, shared with the static-rate path; issue #699
-    // review, #9): the `rate_limit_debit` CTE debits a token whenever the
-    // candidate's bucket has one, but the `claimed` UPDATE can still match 0 rows
-    // if a per-key concurrency (`concurrency_key`) advisory-lock race is lost or
-    // the re-checked cap is now saturated. In that case the token is spent but
-    // the task is NOT claimed. This is SAFE-SIDE (it over-throttles: the
-    // protective invariant "a real call always holds a token" is never violated —
-    // the leak only ever *reduces* dispatch below budget, never allows a claim
-    // without a token), bounded (at most one token per lost claim attempt), and
-    // self-healing (the bucket refills at `refill_rate`, so a leaked token is
-    // recovered within one refill interval). Fixing it would require moving the
-    // debit inside the `claimed` UPDATE's success condition — a change to this
-    // hot-path CTE for a pre-existing, harmless-direction edge — so it is
-    // deliberately left as-is; a scoped follow-up may revisit it. It applies
-    // identically to a task carrying both a per-key concurrency cap and any rate
-    // limit (static #332 or dynamic per-key #699).
+    // Known limitation: a safe-side rate-limit token leak under concurrency
+    // contention. It is pre-existing, and the static-rate path shares it
+    // (issue #699 review, #9). The `rate_limit_debit` CTE debits a token
+    // whenever the bucket of the candidate has one. The `claimed` UPDATE can
+    // still match 0 rows. That happens when a `concurrency_key` advisory-lock
+    // race is lost, or the re-checked cap is now saturated. The token is then
+    // spent, but the task is NOT claimed.
+    //
+    // This is SAFE-SIDE, because it over-throttles. The invariant "a real call
+    // always holds a token" always holds. The leak only *reduces* dispatch
+    // below budget and never allows a claim without a token. It is bounded: at
+    // most one token per lost claim attempt. It is self-healing: the bucket
+    // refills at `refill_rate`, so one refill interval recovers a leaked token.
+    // A fix must move the debit inside the success condition of the `claimed`
+    // UPDATE. That changes this hot-path CTE for a harmless-direction edge, so
+    // it stays as-is on purpose. A scoped follow-up may revisit it. The same
+    // applies to a task with both a per-key concurrency cap and any rate limit
+    // (static #332 or dynamic per-key #699).
     //
     // Pause gating (issue #383): workflow tasks whose execution is in the
     // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
@@ -3439,28 +3436,28 @@ async fn claim_task_one_statement(
     // workflow-author cooperation required. In-flight activity tasks are not
     // `task_type = 'workflow'` and so continue to run to completion.
     //
-    // Worker-session hard pin (issue #606): a row with a non-NULL `session_id`
-    // is claimable *only* by its `sticky_worker_id` -- unlike the ordinary
-    // sticky gate above, this condition ignores `sticky_until` entirely, so a
-    // session member activity never fails over to a different worker even
-    // after the (purely bookkeeping) sticky lease expires. The session's
-    // local state (a downloaded file, GPU memory, ...) only exists on the
-    // host worker, so failover would silently produce wrong results rather
-    // than a safe-but-slow retry.
+    // Worker-session hard pin (issue #606): only its `sticky_worker_id` can
+    // claim a row with a non-NULL `session_id`. Unlike the ordinary sticky
+    // gate above, this condition ignores `sticky_until`. So a session member
+    // activity never fails over to another worker, even after the purely
+    // bookkeeping sticky lease expires. The local state of the session, such
+    // as a downloaded file or GPU memory, exists only on the host worker. A
+    // failover would silently produce wrong results, not a safe-but-slow
+    // retry.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     // The claim and the authoritative queue-pause re-check run in ONE
-    // explicitly-`READ COMMITTED` transaction (issue #619 round-17 review).
+    // explicitly-`READ COMMITTED` transaction (issue #619).
     //
     // # Why one transaction
     //
-    // As two autocommit statements, the claim commits on its own. If the
-    // re-check then fails — a transient connection error, a statement
-    // cancellation, a pool timeout — the `?` propagates while the task is
-    // already `RUNNING` with its `attempt` consumed and **no** worker holding
-    // it. Recovery is worse than it first looks: the poison-pill reclaimer
-    // (issue #367) only reclaims `RUNNING` rows whose `worker_id` has no live
-    // `harvest_workers` heartbeat, and this worker is alive and still
+    // As two autocommit statements, the claim commits on its own. The re-check
+    // can then fail on a transient connection error, a statement cancellation
+    // or a pool timeout. The `?` then propagates while the task is already
+    // `RUNNING`, with its `attempt` consumed and **no** worker holding it.
+    // Recovery is worse than it first looks. The poison-pill reclaimer (issue
+    // #367) only reclaims `RUNNING` rows whose `worker_id` has no live
+    // `harvest_workers` heartbeat. This worker is alive and still
     // heartbeating, so it never qualifies. An activity configured with neither
     // `start_to_close` nor `heartbeat_timeout` would therefore stay stranded
     // for as long as the worker lives. Inside a transaction, a re-check error
@@ -3469,29 +3466,30 @@ async fn claim_task_one_statement(
     //
     // # Why the isolation level is pinned rather than inherited
     //
-    // The round-2 contract — *a pause committed before the re-check begins
-    // always wins* — depends entirely on the re-check getting a **fresh**
-    // snapshot. Under `READ COMMITTED` each statement takes its own snapshot,
-    // so that holds inside a transaction exactly as it did across two
-    // autocommit statements. Under `REPEATABLE READ` it does **not**: both
-    // statements would share the transaction's single snapshot and the
-    // re-check could never observe a pause committed after the claim began,
-    // silently reinstating the very P1 this re-check exists to close.
+    // The pause contract is *a pause committed before the re-check begins
+    // always wins*. It depends entirely on a **fresh** snapshot for the
+    // re-check. Under `READ COMMITTED` each statement takes its own snapshot.
+    // So the contract holds inside a transaction exactly as it did across two
+    // autocommit statements. Under `REPEATABLE READ` it does **not**. Both
+    // statements would share the transaction's single snapshot. The re-check
+    // could then never observe a pause committed after the claim began. A
+    // claim would then silently run on a paused queue, which is the very bug
+    // this re-check exists to close.
     //
-    // Two autocommit statements were immune to that by construction (each is
-    // its own single-statement transaction, snapshotted at statement start
-    // whatever the isolation level), so wrapping them without pinning would
-    // hand an operator a way to disable the guarantee from outside the code —
-    // a `default_transaction_isolation = repeatable read` set on the database
-    // or the role. `build_transaction().read_committed()` emits the level on
-    // the `BEGIN` itself, so the guarantee travels with the query.
+    // Two autocommit statements were immune to that by construction. Each is
+    // its own single-statement transaction, with a snapshot at statement start
+    // whatever the isolation level. A wrap without a pin would let an operator
+    // disable the guarantee from outside the code. A
+    // `default_transaction_isolation = repeatable read` on the database or the
+    // role would do it. `build_transaction().read_committed()` emits the level
+    // on the `BEGIN` itself, so the guarantee travels with the query.
     //
     // # Cost
     //
-    // The claim's `FOR UPDATE SKIP LOCKED` row locks (and its rate-limit
-    // bucket lock) are now held for one extra indexed primary-key `UPDATE`
-    // against the row this transaction already locked. Competing claimers
-    // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
+    // The `FOR UPDATE SKIP LOCKED` row locks and the rate-limit bucket lock of
+    // the claim now last one extra indexed primary-key `UPDATE`. That `UPDATE`
+    // hits the row this transaction already locked. Competing claimers
+    // `SKIP LOCKED` past that row anyway, since it is `RUNNING` either way. So
     // the added contention is the duration of a single PK probe.
     //
     // # Claim slots
@@ -4511,45 +4509,45 @@ async fn apply_post_claim_rechecks(
     task: TaskQueueItem,
     worker_id: &str,
 ) -> HarvestResult<ClaimOutcome> {
-    // Commit-order barrier (issue #619). The re-check below
-    // reads a snapshot taken *before* this transaction commits, so on its own
-    // it cannot stop a pause from committing — and being acknowledged to the
-    // operator — in the window between that snapshot and our COMMIT. Taking
-    // the *shared* mode of the key `pause_queue` takes exclusively makes that
-    // impossible: a pause cannot commit while any claim holds it, so a claim
-    // can only ever commit *before* the hold is acknowledged.
+    // Commit-order barrier (issue #619). The re-check below reads a snapshot
+    // taken *before* this transaction commits. On its own, it cannot stop a
+    // pause that commits between that snapshot and this COMMIT. The operator
+    // would also see that pause acknowledged. `pause_queue` takes the key
+    // exclusively, and this takes its *shared* mode. That makes the window
+    // impossible. A pause cannot commit while any claim holds the key. So a
+    // claim can only commit *before* the hold is acknowledged.
     //
-    // It must be the `try` variant and it must be here rather than before the
-    // claim: the queue is not known until a task is in hand, so this path
-    // holds task rows and then wants the lock, the inverse of `resume_queue`'s
-    // advisory-then-rows order. A blocking acquire would be an ABBA deadlock;
-    // a failed `try` simply means a pause or resume is committing right now,
-    // so we give the claim back and let the next poll re-decide against
-    // committed state. See `queue_pause::try_lock_queue_for_claim`.
+    // It must be the `try` variant, and it must be here, not before the
+    // claim. The queue is unknown until a task is in hand. So this path holds
+    // task rows and then wants the lock. That is the inverse of the
+    // advisory-then-rows order of `resume_queue`. A blocking acquire would be
+    // an ABBA deadlock. A failed `try` means a pause or resume is committing
+    // now. The claim goes back, and the next poll re-decides against committed
+    // state. See `queue_pause::try_lock_queue_for_claim`.
     let lock = crate::queue_pause::try_lock_queue_for_claim(shared, &task.queue_name);
 
     // Authoritative queue-pause re-check (issue #619). The anti-join in the
-    // claim above is evaluated against that statement's snapshot, so a pause
-    // committing while the claim was in flight is invisible to it and the task
-    // would be dispatched into the very outage the hold exists to ride out.
-    // This is a *separate statement* and so takes a fresh snapshot (guaranteed
-    // by the pinned `READ COMMITTED` above), releasing the claim back to
-    // `PENDING` if the queue is now held. Holding the shared queue lock above
-    // makes its verdict authoritative *through commit* rather than only as of
-    // its own snapshot. See `queue_pause::release_claim_if_queue_paused` for
-    // why an exclusive lock inside the claim itself was rejected: it would
-    // serialize all claims for a queue and defeat `SKIP LOCKED`.
+    // claim above reads the snapshot of that statement. It cannot see a pause
+    // that commits while the claim is in flight. The task would then go into
+    // the very outage the hold exists to ride out. This is a *separate
+    // statement*, so it takes a fresh snapshot. The pinned `READ COMMITTED`
+    // above guarantees that. It releases the claim back to `PENDING` if the
+    // queue is now held. The shared queue lock above makes its verdict
+    // authoritative *through commit*, not only as of its own snapshot.
+    // `queue_pause::release_claim_if_queue_paused` says why an exclusive lock
+    // inside the claim was rejected. It would serialize all claims for a
+    // queue and defeat `SKIP LOCKED`.
     let queue_paused =
         crate::queue_pause::release_claim_if_queue_paused(shared, task.id, worker_id);
 
-    // Authoritative activity-pause re-check (issue #807). Same reasoning as the
-    // queue-pause re-check directly above: the `paused_activities` pre-filter
-    // in the claim is evaluated against that statement's snapshot, so a pause
-    // committing while the claim was in flight is invisible to it. This is a
+    // Authoritative activity-pause re-check (issue #807). The reasoning
+    // matches the queue-pause re-check above. The `paused_activities`
+    // pre-filter in the claim reads the snapshot of that statement. It cannot
+    // see a pause that commits while the claim is in flight. This is a
     // separate statement and therefore takes a fresh snapshot.
     //
-    // Gated on `task_type`. An activity pause can never hold a workflow task,
-    // so a workflow task pays no extra statement on the hot claim path. The
+    // Gated on `task_type`. An activity pause never holds a workflow task, so
+    // a workflow task pays no extra statement on the hot claim path. The
     // guard is not merely an optimization: it makes the added cost fall only on
     // the rows the feature can actually hold.
     //
@@ -5467,7 +5465,6 @@ pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uu
 const PENDING_HINT_READ_CHUNK: usize = 1_000;
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Worker-pool scaling signals
 // ---------------------------------------------------------------------------
 
@@ -5592,9 +5589,10 @@ pub struct ConcurrencyKeyStats {
 pub struct ConcurrencyWorkflowStrategy {
     /// The workflow type name.
     pub workflow_name: String,
-    /// Effective `on_conflict` strategy for new starts of this workflow type:
-    /// `"defer"` (wait for a slot) or `"cancel_running"` (latest-wins — cancel
-    /// the oldest running run(s) and admit the newcomer).
+    /// Effective `on_conflict` strategy for new starts of this workflow type.
+    ///
+    /// `"defer"` waits for a slot. `"cancel_running"` is latest-wins: it
+    /// cancels the oldest running run(s) and admits the newcomer.
     ///
     /// A workflow whose registered `WorkflowInfo` declares no concurrency
     /// policy reports `defer`, matching what the start path resolves.
@@ -5634,9 +5632,9 @@ pub struct ConcurrencyKeyWorkflow {
 
 /// SQL for [`concurrency_key_stats`].
 ///
-/// Named (rather than inlined) so the drift guard can read BOTH this and
-/// [`CONCURRENCY_ATTRIBUTION_SQL`] and assert they share the same row filter —
-/// checking only one side could not detect drift in the other.
+/// Named, not inlined, so the drift guard can read BOTH this and
+/// [`CONCURRENCY_ATTRIBUTION_SQL`]. It asserts they share the same row filter.
+/// A check of one side alone cannot detect drift in the other.
 const CONCURRENCY_STATS_SQL: &str = "SELECT \
              concurrency_key AS key, \
              task_type, \
@@ -5739,9 +5737,9 @@ pub async fn concurrency_key_workflows(
 
 /// SQL for [`concurrency_key_workflows`].
 ///
-/// Named (rather than inlined) so a unit test can assert it shares
-/// [`concurrency_key_stats`]'s row filter — the two are separate statements
-/// and would otherwise be free to drift.
+/// Named, not inlined, so a unit test can assert it shares the row filter of
+/// [`concurrency_key_stats`]. The two are separate statements and could
+/// otherwise drift.
 const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
              t.concurrency_key AS key, \
              t.task_type, \
@@ -6821,14 +6819,15 @@ pub async fn cancel_open_tasks_for_execution(
 /// A loser that a recorded fork holds is already `CANCELLED` with the hold
 /// mark of issue #2000. It counts as open here.
 ///
-/// Returns `Some((activity_name, queue_name))` if a still-open row was
-/// transitioned to `CANCELLED` (the caller should then record a synthetic
-/// terminal event for it so replay never re-observes it as in-progress, and
-/// can use the returned name/queue to record activity-outcome metrics);
-/// returns `None` if the row was already terminal by the time this ran (a
-/// genuine completion raced the cancellation) — the caller must **not**
-/// record a synthetic terminal in that case, since a real one already exists
-/// (or is about to be appended by the in-flight completion write).
+/// Returns `Some((activity_name, queue_name))` if a still-open row moved to
+/// `CANCELLED`. The caller should then record a synthetic terminal event for
+/// it, so replay never sees it as in-progress again. The caller can use the
+/// returned name and queue to record activity-outcome metrics.
+///
+/// Returns `None` if the row was already terminal, because a genuine
+/// completion raced the cancellation. The caller must **not** record a
+/// synthetic terminal then. A real one already exists, or the in-flight
+/// completion write is about to append it.
 ///
 /// # Errors
 ///
@@ -7241,41 +7240,42 @@ pub const fn oldest_pending_ages_query() -> &'static str {
 /// Returns the age in seconds of the oldest currently-*claimable* eligible task
 /// per queue.
 ///
-/// Mirrors the part of [`claim_task`]'s eligibility predicate that determines
+/// It mirrors the part of the [`claim_task`] eligibility predicate that says
 /// whether a worker is *supposed* to pick a task up: `state = 'PENDING' AND
-/// scheduled_at <= NOW()`, **excluding** (a) tasks whose `schedule_to_close_at`
-/// deadline has already elapsed (issue #378) — `claim_task` skips them too, so a
-/// past-deadline row awaiting the timeout scanner is not claimable and counting
-/// its age would page for work no worker may start; (b) workflow tasks whose
-/// execution is `PAUSED` (issue #383) — a paused execution's parked task is
-/// intentionally not claimable, so counting its age would inflate the saturation
-/// signal and fire false alerts until the workflow is resumed; (c) rate-limited
-/// activity tasks whose token bucket is currently below one token (issue #369) —
-/// `claim_task` skips these until tokens refill, so counting their age would page
-/// for *intended* throttling on a deliberately rate-limited queue (circuit-breaker
-/// activities in `circuit_breaker_activities` skip the claim-time rate-limit gate
-/// entirely, so they are exempt from this exclusion exactly as in `claim_task`); and
-/// (d) tasks behind a saturated per-key concurrency cap (issue #247) — `claim_task`
-/// refuses every worker while `COUNT(RUNNING) >= concurrency_cap`, so a capped hot
-/// tenant's deferred rows are not claimable and counting their age would page for
-/// *intended* fair-share capping until an in-flight task for that key finishes.
+/// scheduled_at <= NOW()`. It **excludes**:
 ///
-/// The age is measured from each task's *true* eligibility,
+/// - (a) Tasks whose `schedule_to_close_at` deadline has elapsed (issue #378).
+///   `claim_task` skips them too. A past-deadline row that awaits the timeout
+///   scanner is not claimable. Its age would page for work no worker may start.
+/// - (b) Workflow tasks whose execution is `PAUSED` (issue #383). The parked
+///   task of a paused execution is not claimable, on purpose. Its age would
+///   inflate the saturation signal and fire false alerts until resume.
+/// - (c) Rate-limited activity tasks whose token bucket holds less than one
+///   token (issue #369). `claim_task` skips these until tokens refill. Their
+///   age would page for *intended* throttling on a rate-limited queue. The
+///   activities in `circuit_breaker_activities` skip the claim-time rate-limit
+///   gate. So they are exempt from this exclusion, exactly as in `claim_task`.
+/// - (d) Tasks behind a saturated per-key concurrency cap (issue #247).
+///   `claim_task` refuses every worker while `COUNT(RUNNING) >= concurrency_cap`.
+///   So the deferred rows of a capped hot tenant are not claimable. Their age
+///   would page for *intended* fair-share capping until an in-flight task for
+///   that key finishes.
+///
+/// The age runs from the *true* eligibility of each task,
 /// `GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))` (see
-/// [`schedule_to_start_secs`]): an immediate task's backdated `scheduled_at` is
-/// corrected to its `created_at` insert time so it reports ~0, while a delayed/retried
-/// task's explicit future `scheduled_at` is used verbatim (no fixed discount that
-/// would under-report a real over-SLO wait). Pre-upgrade rows with NULL `created_at`
-/// fall back to `scheduled_at`. Clamped to `0`.
+/// [`schedule_to_start_secs`]). The backdated `scheduled_at` of an immediate
+/// task becomes its `created_at` insert time, so it reports ~0. A delayed or
+/// retried task uses its explicit future `scheduled_at` verbatim. A fixed
+/// discount would under-report a real over-SLO wait. Pre-upgrade rows with NULL
+/// `created_at` fall back to `scheduled_at`. Clamped to `0`.
 ///
-/// (The finer-grained claim filters — build-id, sticky routing, capabilities — are
-/// deliberately *not* mirrored here: those gate *which worker* may claim, not whether
-/// the task is work no worker at all may start, so they belong to worker-coverage
-/// signals rather than the queue-age gauge.)
+/// The finer-grained claim filters are deliberately *not* mirrored here:
+/// build-id, sticky routing and capabilities. They gate *which worker* may
+/// claim, not whether any worker may start the task. So they belong to
+/// worker-coverage signals, not to the queue-age gauge.
 ///
-/// Only queues that have at least one eligible task appear in the result; the
-/// sampler is responsible for resetting the gauge to `0` for queues with no
-/// eligible tasks.
+/// Only queues with at least one eligible task appear in the result. The
+/// sampler resets the gauge to `0` for queues with no eligible tasks.
 ///
 /// # Errors
 ///
@@ -7445,12 +7445,11 @@ async fn write_heartbeat(
 /// [`requeue_workflow_task_with_backoff`] (every workflow-task backoff).
 /// Each caller adds its own `scheduled_at`.
 ///
-/// `treat_none_as_null = true` is required: Diesel's default `AsChangeset`
-/// behavior treats a `None` field as "omit this column from `SET`" rather
-/// than "set it to `NULL`", which would silently stop `worker_id`,
-/// `started_at`, and `last_heartbeat_at` from ever being cleared on requeue
-/// (the pre-refactor code used explicit `.eq(None::<T>)` per column, which
-/// is unaffected by this default and was correct).
+/// `treat_none_as_null = true` is required. By default, Diesel `AsChangeset`
+/// reads a `None` field as "omit this column from `SET`", not "set it to
+/// `NULL`". Then a requeue would silently never clear `worker_id`,
+/// `started_at` and `last_heartbeat_at`. The pre-refactor code used explicit
+/// `.eq(None::<T>)` per column. That form ignores this default and was correct.
 #[derive(AsChangeset)]
 #[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
 struct PendingRequeueChangeset {
@@ -7464,7 +7463,7 @@ struct PendingRequeueChangeset {
     /// ran it). Keeps the counter measuring *consecutive* capability misses,
     /// the same semantics `crash_strikes` above has.
     capability_misses: i32,
-    /// Issue #804 (round 6): cleared alongside `capability_misses` so the
+    /// Issue #804: cleared alongside `capability_misses`, so that the
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
@@ -7656,8 +7655,9 @@ impl StickyRelease {
 /// - `wake_requested` is cleared. A wake captured mid-cycle must not cut the
 ///   backoff short. The next claim replays the full history and finds it.
 /// - `activity_name` is cleared. A timer-and-signal race can leave a stale
-///   `mixed_signal_suspension` sentinel (issues #476, #600). It would match the wake-forward arm of `primary_repend_workflow_task_query`.
-///   An unrelated wake would then reset `scheduled_at` to now (issues #603,
+///   `mixed_signal_suspension` sentinel (issues #476, #600). It would match
+///   the wake-forward arm of `primary_repend_workflow_task_query`. An
+///   unrelated wake would then reset `scheduled_at` to now (issues #603,
 ///   #1391).
 /// - `timer_fires_at` is cleared. A backoff is not a timer wake, so the marker
 ///   must not name a stale timer when the row is due again (issue #1402).
@@ -8024,8 +8024,8 @@ pub struct RetryActivityOutcome {
     /// Only meaningful when `advanced` is `false`. `true` means the task was
     /// already claimable before this call (genuine idempotent no-op). `false`
     /// means a concurrent worker claimed the task between the SELECT and the
-    /// UPDATE — the task is now `RUNNING`, so the caller's goal (retry it) is
-    /// already achieved.
+    /// UPDATE. The task is now `RUNNING`, so the goal of the caller (retry it)
+    /// is already achieved.
     pub already_eligible: bool,
 }
 
@@ -8122,10 +8122,10 @@ pub async fn force_retry_activity_now(
     // that same clock. The row is claimable as soon as the next statement
     // starts, so it needs no skew allowance (issue #1807).
     //
-    // Advance scheduled_at. Only update if still PENDING (guards a concurrent
-    // claim race — a worker that claimed the row between our SELECT and this
-    // UPDATE would have set state='RUNNING'; the WHERE clause then matches 0
-    // rows and we return advanced=false rather than silently succeeding).
+    // Update only if still PENDING. This guards a concurrent claim race. A
+    // worker that claimed the row between the SELECT and this UPDATE has set
+    // state='RUNNING'. The WHERE clause then matches 0 rows, and this returns
+    // advanced=false rather than silently succeeding.
     let advanced = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::id.eq(task_id))
@@ -8172,10 +8172,10 @@ pub async fn force_retry_activity_now(
 /// Shared `SET` clause for the **clean-continuation** re-pend paths
 /// ([`reschedule_task`] and [`defer_rate_limited_task`]).
 ///
-/// "Clean continuation" means the claiming worker resolved a handler and either
+/// "Clean continuation" means the claiming worker resolved a handler. It then
 /// suspended cleanly, hit a retryable error, or reached the dispatch-time
-/// rate-limit gate — i.e. it made progress without crashing. Both consecutive-
-/// failure streak counters therefore reset here:
+/// rate-limit gate. So it made progress without crashing. Both
+/// consecutive-failure streak counters therefore reset here:
 ///
 /// * `crash_strikes` — the poison-pill quarantine threshold measures
 ///   *consecutive* worker crashes (issue #367).
@@ -8197,7 +8197,7 @@ struct CleanContinuationChangeset {
     last_heartbeat_at: Option<chrono::DateTime<Utc>>,
     crash_strikes: i32,
     capability_misses: i32,
-    /// Issue #804 (round 6): cleared alongside `capability_misses` so the
+    /// Issue #804: cleared alongside `capability_misses`, so that the
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
@@ -8307,12 +8307,12 @@ pub async fn reschedule_task(
 /// Defer a `RUNNING` task back to `PENDING` for a rate-limit retry **without
 /// counting it as an attempt** (issue #369).
 ///
-/// Used by the dispatch-time rate-limit gate for circuit-breaker activities:
-/// when no token is available the handler never runs, so [`claim_task`]'s
-/// `attempt + 1` increment must be undone — otherwise repeated deferrals would
-/// silently drain the retry budget and DLQ the task before it ever executed.
-/// Otherwise mirrors [`reschedule_task`] (clean continuation: resets the
-/// poison-pill crash streak and re-notifies the queue).
+/// The dispatch-time rate-limit gate for circuit-breaker activities uses it.
+/// With no token available, the handler never runs. So this undoes the
+/// `attempt + 1` of [`claim_task`]. Otherwise repeated deferrals would silently
+/// drain the retry budget and DLQ the task before it ever ran. The rest mirrors
+/// [`reschedule_task`]. It is a clean continuation: it resets the poison-pill
+/// crash streak and re-notifies the queue.
 ///
 /// This write is not fenced. The activity owner uses
 /// [`defer_claimed_rate_limited_task`] instead.
@@ -8410,25 +8410,25 @@ async fn announce_deferred_task(
 /// `attempt`.
 ///
 /// The `phase` selects between three literal statements rather than binding
-/// flags, mirroring [`park_workflow_task_query`]. Taking the phase itself —
-/// rather than the two booleans it implies — keeps
-/// [`crate::error::CapabilityMissPhase`] the single source of truth and makes
-/// the one incoherent combination (clear the crash strikes *and* restore the
-/// attempt) unrepresentable. The two clauses it governs:
+/// flags, mirroring [`park_workflow_task_query`]. It takes the phase itself,
+/// not the two booleans it implies. That keeps
+/// [`crate::error::CapabilityMissPhase`] the single source of truth. It also
+/// makes the one incoherent combination unrepresentable: clear the crash
+/// strikes *and* restore the attempt. The two clauses it governs:
 ///
 /// - **`crash_strikes = 0`** only when the miss was detected *after* the
 ///   workflow body ran to a conclusion
-///   ([`crate::error::CapabilityMissPhase::clears_crash_strikes`]): issue
-///   #367's counter counts the worker processes a task has killed, so a
-///   pre-/mid-handler miss ran nothing and is not evidence about it. Zeroing
-///   unconditionally would let an incapable claim landing between two capable
-///   crashes reset the streak every time, so `poison_pill_threshold` is never
-///   reached in a heterogeneous fleet (Codex round-12 P1). No variant ever
+///   ([`crate::error::CapabilityMissPhase::clears_crash_strikes`]). The
+///   counter of issue #367 counts the worker processes a task has killed. A
+///   pre-/mid-handler miss ran nothing and is not evidence about it. Suppose
+///   an incapable claim lands between two capable crashes. An unconditional
+///   zero resets the streak every time, so a heterogeneous fleet never reaches
+///   `poison_pill_threshold`. No variant ever
 ///   *increments* it, which is what AC4 actually requires.
 /// - **`attempt = GREATEST(attempt - 1, 0)`** only when the handler was never
-///   reached ([`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]):
-///   `attempt` is both the retry budget and the "first dispatch?" signal
-///   `record_workflow_started` reads, and once the handler has begun, the start
+///   reached ([`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]).
+///   `attempt` is both the retry budget and the "first dispatch?" signal that
+///   `record_workflow_started` reads. Once the handler has begun, the start
 ///   metric has already fired. See that predicate for the full argument.
 ///
 /// One statement, guarded on the claim: `state = 'RUNNING' AND worker_id = $2
@@ -8441,25 +8441,25 @@ async fn announce_deferred_task(
 ///
 /// - **The backoff is computed from the DB clock** (`NOW() + make_interval`),
 ///   not the host clock. `claim_task` compares `scheduled_at` against Postgres
-///   `NOW()`, and this module already tolerates up to
-///   [`IMMEDIATE_SCHEDULE_SKEW_SECS`] of host/DB skew — which would swallow the
-///   first three backoffs whole. Unlike an ordinary retry (where firing early
-///   is harmless), the backoff is the only thing spacing redeliveries out
-///   across a rolling deploy, so it must not be defeatable by clock skew.
+///   `NOW()`. This module already tolerates up to
+///   [`IMMEDIATE_SCHEDULE_SKEW_SECS`] of host/DB skew. That skew would swallow
+///   the first three backoffs whole. For an ordinary retry, an early fire is
+///   harmless. Here the backoff alone spaces redeliveries out across a rolling
+///   deploy, so clock skew must not defeat it.
 /// - **`error` is left entirely untouched.** A capability miss is not a task
-///   failure — the handler never ran — so the column reserved for real failure
+///   failure, because the handler never ran. So the column for real failure
 ///   reporting must not carry an infrastructure diagnostic. Two surfaces read
-///   it and would both be misled: `ActivityContext::previous_failure()` (which
-///   an author branches on) and, more sharply, the issue #773 `/stack`
-///   endpoint, which renders any non-null `error` on a pending activity as a
-///   `last_failure`. Because the release also restores `attempt` to `0` (an
+///   it and would both be misled. One is `ActivityContext::previous_failure()`,
+///   which an author branches on. The sharper one is the issue #773 `/stack`
+///   endpoint. It renders any non-null `error` on a pending activity as a
+///   `last_failure`. The release also restores `attempt` to `0`. An
 ///   activity-task miss is always [`crate::error::CapabilityMissPhase::BeforeHandler`],
-///   so the round-17 phase gate never withholds the restoration here), that
-///   would report a failure at an otherwise-unreachable `attempt: 0` for an
-///   activity that never executed — violating #773 AC3 ("a never-failed
-///   pending activity omits `last_failure`") and making a blameless deploy
-///   skew look like an application bug on the one surface whose runbook
-///   question is "why is this activity retrying?". The diagnostic still
+///   so the phase gate never withholds the restoration here. So `/stack` would
+///   report a failure at an otherwise-unreachable `attempt: 0` for an
+///   activity that never executed. That violates #773 AC3 ("a never-failed
+///   pending activity omits `last_failure`"). It also makes a blameless deploy
+///   skew look like an application bug. That surface's runbook question is
+///   "why is this activity retrying?". The diagnostic still
 ///   reaches the operator through the release's `tracing::info!` and the
 ///   `harvest.task.capability_miss` counter.
 #[must_use]
@@ -8467,13 +8467,13 @@ pub const fn release_task_for_capability_miss_query(
     phase: crate::error::CapabilityMissPhase,
 ) -> &'static str {
     // Both clauses derive from `phase`, so the arms below cover exactly the
-    // three reachable combinations. `AfterHandler` is the only phase that
-    // clears the crash strikes, and `BeforeHandler` the only one that restores
-    // the attempt, so "clear AND restore" cannot be constructed.
+    // three reachable combinations. Only `AfterHandler` clears the crash
+    // strikes. Only `BeforeHandler` restores the attempt. So "clear AND
+    // restore" cannot be constructed.
     if phase.clears_crash_strikes() {
         // AfterHandler: the body reached a conclusion on this worker, so the
-        // #367 crash streak is genuinely broken -- and the start metric has
-        // already fired, so `attempt` stays put.
+        // #367 crash streak is genuinely broken. The start metric has already
+        // fired, so `attempt` stays put.
         "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
@@ -8571,37 +8571,36 @@ pub const fn release_task_for_capability_miss_query(
     }
 }
 
-/// Release a claimed task back to `PENDING` because this worker has **no
-/// handler registered** for its workflow/activity type, so a capable peer can
-/// claim it (issue #804).
+/// Release a claimed task to `PENDING` when this worker has **no handler** for it.
 ///
-/// This is the always-on capability floor underneath build-id routing (#171):
-/// SKIP LOCKED has no capability filter, so any worker polling a queue can
-/// claim any task on it. Terminally failing the run because the *wrong* worker
-/// picked it up turns a routine rolling deploy or a heterogeneous worker pool
-/// into lost executions; releasing it costs the task one backoff interval.
+/// A capable peer can then claim it (issue #804). This is the always-on
+/// capability floor under build-id routing (#171). SKIP LOCKED has no
+/// capability filter, so any worker that polls a queue can claim any task on
+/// it. A terminal failure because the *wrong* worker picked the run up loses
+/// executions. A routine rolling deploy or a heterogeneous worker pool would
+/// trigger it. A release costs the task one backoff interval.
 ///
 /// Semantics, and why each differs from a plain reschedule:
 ///
 /// - **`attempt` is restored only when the handler was never reached**
 ///   (`GREATEST(attempt - 1, 0)`, gated by
-///   [`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]) —
-///   [`claim_task`] increments it on claim, and a pre-handler miss ran nothing,
-///   so it must not drain the retry budget (the exact bug issue #369 fixed for
-///   rate-limit deferrals). Once the handler has *begun*, `record_workflow_started`
-///   has already fired for this execution, and restoring `attempt` would make
-///   the next capable claim look like a first dispatch and emit that counter a
-///   second time (Codex round-17 P2). Every activity-task miss is
-///   pre-handler, so the budget is still always restored where it is a budget.
+///   [`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]).
+///   [`claim_task`] increments it on claim. A pre-handler miss ran nothing, so
+///   it must not drain the retry budget. Issue #369 fixed that exact bug for
+///   rate-limit deferrals. Once the handler has *begun*, `record_workflow_started`
+///   has already fired for this execution. Restoring `attempt` would then make
+///   the next capable claim look like a first dispatch. That claim would emit
+///   the counter a second time. Every activity-task miss is pre-handler, so the
+///   budget is still always restored where it is a budget.
 /// - **`crash_strikes` is never incremented, and is reset only when the handler
-///   ran** (`clear_crash_strikes`) — the poison-pill threshold (#367) measures
-///   *consecutive* crashes, so only a dispatch that watched the body reach a
-///   conclusion without dying is evidence the streak is broken. A pre-/mid-handler
-///   miss ran nothing and leaves the column alone: zeroing it would let an
-///   incapable claim landing between two capable crashes launder the task's
-///   history forever (Codex round-12 P1). Either way the release takes the row
-///   out of `RUNNING` with `worker_id NULL`, so the orphan reclaimer — the only
-///   writer that *increments* the column — cannot see it at all.
+///   ran** (`clear_crash_strikes`). The poison-pill threshold (#367) measures
+///   *consecutive* crashes. Only a dispatch that saw the body reach a
+///   conclusion without dying proves the streak is broken. A pre-/mid-handler
+///   miss ran nothing and leaves the column alone. Zeroing it would let an
+///   incapable claim between two capable crashes launder the history of the
+///   task forever. Either way, the release takes the row out of `RUNNING` with
+///   `worker_id NULL`. The orphan reclaimer is the only writer that
+///   *increments* the column, and it cannot see the row at all.
 /// - **`capability_misses` is incremented** — the only counter a capability
 ///   miss advances. It bounds the bounce; the caller escalates at
 ///   `WorkerConfig::capability_miss_max_redeliveries`.
@@ -8618,39 +8617,38 @@ pub const fn release_task_for_capability_miss_query(
 /// so waking pollers early would be pure noise (mirrors
 /// [`requeue_workflow_task_nd_blocked`]).
 ///
-/// `phase` is the miss's [`crate::error::CapabilityMissPhase`], which governs
-/// both conditional clauses — see [`release_task_for_capability_miss_query`]
-/// for why a pre-/mid-handler miss must leave issue #367's counter alone and
-/// why a post-handler miss must leave `attempt` alone.
+/// `phase` is the [`crate::error::CapabilityMissPhase`] of the miss. It
+/// governs both conditional clauses. [`release_task_for_capability_miss_query`]
+/// says why a pre-/mid-handler miss must leave the counter of issue #367 alone.
+/// It also says why a post-handler miss must leave `attempt` alone.
 ///
-/// Returns `Some(distinct_miss_workers)` when this worker's claim was actually
-/// released, carrying the **post-update** cardinality of
-/// `capability_miss_workers` as this statement committed it. `None` means the
-/// row was already taken by something else (e.g. an orphan reclaim won the
-/// race) and the caller must treat the task as no longer its own.
+/// Returns `Some(distinct_miss_workers)` when the claim of this worker was
+/// released. It carries the **post-update** cardinality of
+/// `capability_miss_workers` as this statement committed it. `None` means
+/// something else already took the row, such as an orphan reclaim that won the
+/// race. The caller must then treat the task as no longer its own.
 ///
-/// The count is returned by the `UPDATE` rather than derived from the caller's
-/// earlier read because the two can genuinely disagree (Codex round-36 P2).
-/// `observe_miss_and_fleet` snapshots the array before the release; a peer
-/// restarting onto a capable build then runs
-/// [`invalidate_capability_miss_evidence_for_worker`], which `array_remove`s
+/// The `UPDATE` returns the count, because the earlier read of the caller can
+/// disagree with it. `observe_miss_and_fleet` snapshots the array before the
+/// release. A peer that restarts onto a capable build then runs
+/// [`invalidate_capability_miss_evidence_for_worker`]. That `array_remove`s
 /// its own id from exactly these `RUNNING` rows. This statement appends the
-/// claimant to the *post-invalidation* array, so a snapshot-derived number
-/// over-reports: `{A,B}` + claimant `C` reads as 3 while the row actually holds
-/// `{B,C}`. Reporting what the write produced makes the rollout diagnostic true
-/// by construction instead of by a timing assumption.
+/// claimant to the *post-invalidation* array. So a snapshot-derived number
+/// over-reports: `{A,B}` + claimant `C` reads as 3, while the row holds
+/// `{B,C}`. The count of what the write produced makes the rollout diagnostic
+/// true by construction, not by a timing assumption.
 ///
 /// `claim_crash_strikes` is the `crash_strikes` value the dispatcher observed
-/// when it claimed the row, and is what makes this release apply to **that**
-/// claim rather than merely to that *worker* (Codex round-37 P1).
+/// when it claimed the row. It makes this release apply to **that** claim, not
+/// merely to that *worker*.
 /// [`crate::poison_pill::requeue_orphan`] hands an orphaned row back as
-/// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing stops
-/// the same worker from winning it again — so a `(state, worker_id)` guard also
-/// matches that *new* claim. Releasing it would re-`PENDING` a row whose
-/// replacement handler is already running, inviting a second concurrent claim
-/// of the same task and rolling back an `attempt` that belongs to the new
-/// dispatch. `crash_strikes` is the right discriminator because the requeue
-/// that creates the race is what bumps it; the terminal escalation guard
+/// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`. Nothing stops the
+/// same worker from winning it again. So a `(state, worker_id)` guard also
+/// matches that *new* claim. A release would then re-`PENDING` a row whose
+/// replacement handler is already running. That invites a second concurrent
+/// claim of the same task. It also rolls back an `attempt` of the new
+/// dispatch. `crash_strikes` is the right discriminator, because the requeue
+/// that creates the race bumps it. The terminal escalation guard
 /// ([`claim_still_held_for_update`]) already keys on it.
 ///
 /// `claim.attempt` is the `attempt` value of that claim. It closes the other
@@ -8720,44 +8718,43 @@ pub const fn reset_capability_misses_after_inline_progress_query() -> &'static s
 }
 
 /// Start the capability-miss budget clean because this dispatch made durable
-/// inline progress (issue #804, Codex round-20 P1).
+/// inline progress (issue #804).
 ///
-/// `capability_misses` / `capability_miss_workers` describe **one frontier** —
-/// the position the workflow is currently stuck at, and therefore the single
+/// `capability_misses` / `capability_miss_workers` describe **one frontier**.
+/// That is the position where the workflow is stuck now. So it names the single
 /// handler a claiming worker must register to move it. The park-time reset
-/// ([`park_workflow_task_sticky_query`]) already encodes that: a park is proof a
+/// ([`park_workflow_task_sticky_query`]) already encodes that. A park proves a
 /// capable worker handled the row, so the next deploy starts with a full budget.
 ///
 /// A workflow task can advance through several local-activity frontiers in ONE
-/// dispatch, though: `process_workflow_task` runs them inline in a loop and only
-/// parks on a *non*-local suspension. Each completion is appended durably, so
-/// the frontier moves permanently — but nothing parked, so the counters kept
-/// describing the frontier that is now behind us. Worker A missing local
-/// activity X and worker B later missing local activity Y then read as "two
-/// distinct workers missed this task", the registry confirms both are live, and
-/// the run is failed terminally even though A may register Y. That conclusion is
-/// the exact opposite of the truth, which is the failure mode issue #804 exists
-/// to prevent.
+/// dispatch, though. `process_workflow_task` runs them inline in a loop. It
+/// parks only on a *non*-local suspension. Each completion is appended
+/// durably, so the frontier moves permanently. But nothing parked, so the
+/// counters still describe the frontier that is now passed. Suppose worker A
+/// misses local activity X, and worker B later misses local activity Y. That
+/// reads as "two distinct workers missed this task". The registry confirms
+/// both are live, and the run fails terminally, even though A may register Y.
+/// That conclusion is the exact opposite of the truth. Issue #804 exists to
+/// prevent this failure mode.
 ///
-/// Resetting here cannot be used to release forever: a *completed* local
-/// activity resolves from history on the next replay
-/// (`HistoryMatch::Matched`) and emits no command, so a given frontier can make
-/// inline progress at most once, and a workflow has a bounded number of
-/// local-activity call sites (itself bounded by the history hard cap). The
-/// budget therefore becomes "per frontier" rather than "per task", which is what
-/// it always meant.
+/// This reset cannot release forever. A *completed* local activity resolves
+/// from history on the next replay (`HistoryMatch::Matched`) and emits no
+/// command. So a given frontier can make inline progress at most once. A
+/// workflow has a bounded number of local-activity call sites, and the history
+/// hard cap bounds that too. The budget thus becomes "per frontier", not "per
+/// task", which is what it always meant.
 ///
 /// This reset covers the frontier moves a *dispatch* makes. A third mover needs
-/// no reset at all: newly INGESTED history (a due timer fire, a pending signal,
-/// an external delta appended by `prepare_workflow_task_with_cache` before the
-/// capability gate) can move the frontier with no park and no inline progress
-/// in between. That one is handled by keying the evidence to the missed handler
-/// (`capability_miss_handler`, Codex round-46 P1) rather than by resetting: the
-/// counters simply do not apply to a handler they were not recorded against, so
-/// a stale key needs no cleanup. It also makes THIS reset belt-and-braces for
-/// the inline case — a row left keyed to a retired frontier reads as a fresh
-/// budget either way — while the reset keeps its independent job of clearing
-/// the absolute-ceiling count, which the key alone does not touch.
+/// no reset at all: newly INGESTED history. A due timer fire, a pending signal,
+/// or an external delta that `prepare_workflow_task_with_cache` appends before
+/// the capability gate can move the frontier. No park and no inline progress
+/// come between. The evidence key on the missed handler
+/// (`capability_miss_handler`) handles that one, not a reset. The counters
+/// simply do not apply to a handler they were not recorded against. So a stale
+/// key needs no cleanup. It also makes THIS reset belt-and-braces for the
+/// inline case. A row left keyed to a retired frontier reads as a fresh budget
+/// either way. The reset keeps its own job: it clears the absolute-ceiling
+/// count, which the key alone does not touch.
 ///
 /// # Errors
 ///
@@ -8781,36 +8778,36 @@ pub async fn reset_capability_misses_after_inline_progress(
 /// `const fn` so its shape is unit-testable without a database.
 ///
 /// Deliberately touches **only** `capability_miss_workers`. `capability_misses`
-/// is a true historical count of how many times this frontier was released, and
-/// it backs the ungated absolute ceiling
-/// (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`) that bounds the release loop even
-/// when no fleet evidence is available. Decrementing it here would remove that
-/// bound; removing one stale ID only ever weakens the *fleet* evidence, which
-/// biases toward releasing rather than terminally failing.
+/// is a true historical count of the releases of this frontier. It backs the
+/// ungated absolute ceiling (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`). That
+/// ceiling bounds the release loop even with no fleet evidence available. A
+/// decrement here would remove that bound. The removal of one stale ID only
+/// weakens the *fleet* evidence. That biases toward a release, not a terminal
+/// failure.
 /// **Actionable rows only.** `complete_task` does not clear
 /// `capability_miss_workers`, so a queue with real history accumulates terminal
 /// rows still naming past missers. Rewriting those is pure cost: a terminal task
 /// is never redelivered and never escalated, so its array cannot influence any
-/// decision. Worse, it is cost paid on the *startup* path — this runs in the
-/// same transaction as `register_worker`, so the worker is not published to the
-/// fleet until it finishes, and the `queue_name` indexes are partial to pending
-/// rows (Codex round-35 P2). The `state` filter bounds the scan to the rows the
-/// evidence can actually affect.
+/// decision. Worse, the cost is on the *startup* path. This runs in the same
+/// transaction as `register_worker`, so the worker is not published to the
+/// fleet until it finishes. The `queue_name` indexes are partial to pending
+/// rows. The `state` filter bounds the scan to the rows the evidence can
+/// actually affect.
 ///
 /// # The empty-array guard is load-bearing
 ///
 /// `capability_miss_workers <> '{}'` reads as redundant next to the membership
-/// test, and is not: it is the predicate that
-/// `idx_harvest_tq_capability_miss_workers` is partial on, and Postgres's
-/// implication prover cannot derive it from `$1 = ANY(...)`. Drop the conjunct
-/// and the index stops matching, silently returning this statement to the full
-/// backlog scan it exists to avoid — measured on a 200k-row backlog as
-/// `Index Scan` / 9 buffers / 1.7 ms versus `Seq Scan` / 3848 buffers / 83 ms
-/// (Codex round-39 P2). Pinned by
+/// test, but it is not. `idx_harvest_tq_capability_miss_workers` is partial on
+/// this predicate. The Postgres implication prover cannot derive it from
+/// `$1 = ANY(...)`. Drop the conjunct
+/// and the index stops matching. This statement then silently returns to the
+/// full backlog scan it exists to avoid. On a 200k-row backlog that measured
+/// `Index Scan` / 9 buffers / 1.7 ms versus `Seq Scan` / 3848 buffers / 83 ms.
+/// Pinned by
 /// `dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan`.
 ///
-/// It is correctness-neutral in its own right: a row that has recorded no miss
-/// cannot name `$1`, so the guard never changes which rows are updated.
+/// On its own, it is correctness-neutral. A row with no recorded miss cannot
+/// name `$1`, so the guard never changes which rows are updated.
 #[must_use]
 pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -8822,33 +8819,34 @@ pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static 
 }
 
 /// Drop a worker ID's stale capability-miss evidence because that ID has just
-/// (re-)registered (issue #804, Codex round-26 P1).
+/// (re-)registered (issue #804).
 ///
-/// `capability_miss_workers` stores **bare worker IDs**, and
-/// [`crate::workers::register_worker`] upserts on `worker_id` — refreshing
-/// `started_at` and `build_id` — so a worker that restarts with the *same*
-/// configured `worker_id` but a *new* build carrying the previously-missing
-/// handler is indistinguishable, by ID alone, from the old incapable instance.
+/// `capability_miss_workers` stores **bare worker IDs**.
+/// [`crate::workers::register_worker`] upserts on `worker_id` and refreshes
+/// `started_at` and `build_id`. A worker can restart with the *same*
+/// configured `worker_id` but a *new* build that has the missing handler. By
+/// ID alone, it is indistinguishable from the old incapable instance.
 ///
 /// The harm is a false terminal failure at exactly the wrong moment. Once the
-/// persisted release budget is spent, another incapable claimant reads the live
-/// fleet, sees the restarted worker's ID already covered by the stale evidence,
-/// derives [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`], and
-/// escalates — terminally failing the execution just as the capable build
-/// arrives, which is the precise outcome issue #804 exists to prevent.
+/// persisted release budget is spent, another incapable claimant reads the
+/// live fleet. It sees the ID of the restarted worker already covered by the
+/// stale evidence. It derives
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
+/// escalates. The execution fails terminally just as the capable build
+/// arrives. Issue #804 exists to prevent precisely that outcome.
 ///
-/// Clearing the ID's evidence on re-registration restores the truth: the
-/// restarted instance has *not* been observed to miss this frontier, so the
-/// fleet is no longer "all missed" and the task is released for it to claim.
+/// Clearing the evidence of the ID on re-registration restores the truth. Nobody
+/// has seen the restarted instance miss this frontier. So the fleet is no
+/// longer "all missed", and the task is released for it to claim.
 ///
 /// # Trade-off
 ///
 /// A worker crash-looping on the same *incapable* build also clears its own
 /// evidence on each restart, so the `AllLiveWorkersMissed` total bound stops
-/// applying to it. That case is still bounded — by the ungated absolute ceiling
-/// on `capability_misses`, which this function never decrements — and the
-/// degradation is deliberately in the safe direction: prefer holding a task over
-/// terminally failing an execution a deploy could still rescue (AC1).
+/// applying to it. The ungated absolute ceiling on `capability_misses` still
+/// bounds that case, and this function never decrements it. The degradation is
+/// deliberately in the safe direction. It prefers to hold a task rather than
+/// fail an execution that a deploy could still rescue (AC1).
 ///
 /// Scoped by `queue_name` so a worker only invalidates evidence on queues it
 /// actually polls.
@@ -8856,18 +8854,18 @@ pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static 
 /// # Deliberately not ownership-guarded
 ///
 /// Unlike every other writer of these columns, this statement has no
-/// `state = 'RUNNING' AND worker_id = $n` clause: it must reach a row **another
-/// worker is currently processing**, because that is exactly the row whose
-/// decision the stale evidence would poison. A worker holding a claim taken
-/// before this restart would otherwise still weigh the old instance as
-/// incapable and terminally fail the run (issue #804, Codex round-27 P1).
+/// `state = 'RUNNING' AND worker_id = $n` clause. It must reach a row that
+/// **another worker is processing now**. The stale evidence would poison
+/// exactly the decision on that row. Otherwise a worker with a claim from
+/// before this restart still weighs the old instance as incapable. It then
+/// fails the run terminally (issue #804).
 ///
-/// That makes this the one writer that can change the columns between a claim
-/// and its miss, which is why the decision path re-reads them through
-/// [`read_capability_miss_state`] rather than trusting the claim-time snapshot.
-/// The re-read is safe in one direction by construction: this statement only
-/// ever *removes* entries, so a fresher read can only weaken the fleet evidence
-/// and therefore only bias toward releasing.
+/// So this is the one writer that can change the columns between a claim and
+/// its miss. That is why the decision path re-reads them through
+/// [`read_capability_miss_state`], not the claim-time snapshot. The re-read is
+/// safe in one direction by construction. This statement only *removes*
+/// entries. So a fresher read can only weaken the fleet evidence, and only
+/// bias toward a release.
 ///
 /// # Errors
 ///
@@ -8893,20 +8891,20 @@ pub async fn invalidate_capability_miss_evidence_for_worker(
 /// shape is unit-testable without a database.
 ///
 /// Ownership-guarded (`state = 'RUNNING' AND worker_id = $2`) for the same
-/// reason the release statement is: a row a concurrent poison-pill reclaim or
-/// operator action already took out from under this dispatch is not ours to
-/// decide about, and returning its counters would let this worker escalate a
-/// claim it no longer holds.
+/// reason as the release statement. A concurrent poison-pill reclaim or an
+/// operator action can take the row from this dispatch. This dispatch then
+/// has no say about that row. If the statement returned its counters, this
+/// worker could escalate a claim it no longer holds.
 #[must_use]
 pub const fn read_capability_miss_state_query() -> &'static str {
     // `$3` is the frontier this dispatch is missing (`{kind}:{name}`, from
-    // `MissingHandler::frontier_key`). When it differs from the one the row
-    // records, the stored counters are evidence about a frontier that is now
-    // behind us, and charging their spend to a frontier no peer has ever been
-    // offered is what terminally fails a run the fleet can still finish
-    // (issue #804, Codex round-46 P1). Zeroing here rather than in the caller
-    // keeps the comparison ATOMIC with the read: the row cannot change frontier
-    // between deciding which counters apply and reading them.
+    // `MissingHandler::frontier_key`). It can differ from the one the row
+    // records. The stored counters are then evidence about an earlier frontier.
+    // No peer has ever been offered the current frontier. Charging their spend
+    // to it terminally fails a run that the fleet can still finish (issue
+    // #804). Zeroing here and not in the caller keeps the comparison ATOMIC
+    // with the read. The row cannot change frontier between deciding which
+    // counters apply and reading them.
     //
     // `IS DISTINCT FROM` (not `<>`) so a `NULL` handler — no frontier recorded
     // yet — reads as a mismatch and therefore as a full budget.
@@ -8922,12 +8920,12 @@ pub const fn read_capability_miss_state_query() -> &'static str {
 }
 
 /// The task's capability-miss counters **as they stand now**, for the
-/// release-vs-escalate decision (issue #804, Codex round-27 P1).
+/// release-vs-escalate decision (issue #804).
 ///
-/// Returns `None` when the row is no longer claimed by `worker_id` — a
-/// concurrent reclaim or operator action took it — which the caller treats as
-/// "decide on what we last saw", since the release that follows is itself
-/// ownership-guarded and will no-op.
+/// Returns `None` when `worker_id` no longer holds the row, because a
+/// concurrent reclaim or operator action took it. The caller then decides on
+/// the state it last saw. That is safe, because the release that follows is
+/// itself ownership-guarded and does nothing.
 ///
 /// # Errors
 ///
@@ -8961,18 +8959,18 @@ pub async fn read_capability_miss_state(
 
 /// Whether `task_id` is still `RUNNING` under **this exact claim**, taking the
 /// row's lock so the answer stays true until the caller's transaction commits
-/// (issue #804, Codex round-31 P1).
+/// (issue #804).
 ///
 /// # Why the claim, not just the worker
 ///
 /// A poison-pill requeue (`poison_pill::requeue_orphan`) sets the row back to
-/// `PENDING` with `worker_id = NULL` and a bumped `crash_strikes`, and dispatch
-/// is concurrent — so the **same** worker can re-claim the row while its
+/// `PENDING` with `worker_id = NULL` and a bumped `crash_strikes`. Dispatch is
+/// concurrent. So the **same** worker can re-claim the row while its
 /// escalation coroutine for the *previous* attempt is still in flight. A guard
-/// on `(state, worker_id)` alone passes in that case and terminally fails the
-/// NEW attempt's task on the OLD attempt's evidence. `crash_strikes` is the
-/// discriminator `poison_pill::quarantine_orphan` itself uses for exactly this,
-/// so the guard is a claim token rather than a worker token.
+/// on `(state, worker_id)` alone then passes. It fails the task of the NEW
+/// attempt terminally, on the evidence of the OLD attempt.
+/// `poison_pill::quarantine_orphan` uses `crash_strikes` as the discriminator
+/// for exactly this. So the guard is a claim token, not a worker token.
 ///
 /// The stuck-running requeue (`poison_pill::requeue_stuck_task`) leaves
 /// `crash_strikes` unchanged, so `crash_strikes` alone misses that path. The
@@ -8982,22 +8980,22 @@ pub async fn read_capability_miss_state(
 ///
 /// # Why `SKIP LOCKED` rather than a blocking wait
 ///
-/// Deadlock avoidance, not throughput. This crate's `harvest_task_queue` lock
-/// order is **execution row → task row**, but `poison_pill::quarantine_orphan`
-/// takes the task row first and then reaches the execution row (through the
-/// dead-letter FK and `fail_owning_workflow`). A blocking `FOR UPDATE` here
-/// would let an escalating dispatcher hold the execution row while waiting for
-/// the task row that a quarantine already holds while waiting for the execution
-/// row — a genuine ABBA cycle, on precisely the pair of paths that race (a
-/// worker whose heartbeat has gone stale escalating a task the reclaimer is
-/// quarantining).
+/// Deadlock avoidance, not throughput. The `harvest_task_queue` lock order of
+/// this crate is **execution row → task row**. But
+/// `poison_pill::quarantine_orphan` takes the task row first. It then reaches
+/// the execution row through the dead-letter FK and `fail_owning_workflow`.
+/// With a blocking `FOR UPDATE` here, an escalating dispatcher could hold the
+/// execution row and wait for the task row. A quarantine could hold that task
+/// row and wait for the execution row. That is a genuine ABBA cycle. It is on
+/// precisely the pair of paths that race: a worker with a stale heartbeat
+/// escalates a task that the reclaimer is quarantining.
 ///
-/// `SKIP LOCKED` removes the waiting edge entirely: this transaction never
-/// blocks on the task row, so it can never be part of a lock cycle. A row
-/// another transaction holds simply reads as "not ours right now", which the
-/// caller treats exactly like a lost claim — it withdraws and releases, and the
-/// escalation is re-decided on the next redelivery. Withdrawing is always the
-/// safe direction.
+/// `SKIP LOCKED` removes the waiting edge entirely. This transaction never
+/// blocks on the task row, so it can never be part of a lock cycle. A row that
+/// another transaction holds reads as "not held by this claim now". The caller
+/// treats that exactly like a lost claim. It withdraws and releases, and the
+/// next redelivery re-decides the escalation. Withdrawing is always the safe
+/// direction.
 ///
 /// # The bounded wait after a skip (issue #2252)
 ///
@@ -9121,55 +9119,52 @@ async fn set_local_lock_timeout(conn: &mut AsyncPgConnection, value: &str) -> Ha
 /// SQL for [`release_suspended_workflow_claim`]. Extracted as a `const fn` so
 /// its `WHERE` clause is unit-testable without a database.
 ///
-/// Deliberately mirrors [`primary_repend_workflow_task_query`]'s column list
-/// (refresh `created_at` for the schedule-to-start latency metric, preserve
-/// rather than clear sticky affinity, clear the `activity_name` sentinel) --
-/// this is "the task made no progress, try it again", not "this worker is
-/// incapable" (contrast [`release_task_for_capability_miss_query`], which
-/// deliberately clears sticky affinity because the worker it releases FROM
-/// was just found unable to run the handler at all).
+/// Deliberately mirrors the column list of
+/// [`primary_repend_workflow_task_query`]. It refreshes `created_at` for the
+/// schedule-to-start latency metric. It preserves sticky affinity rather than
+/// clearing it. It clears the `activity_name` sentinel. This means "the task
+/// made no progress, try it again", not "this worker is incapable". Contrast
+/// [`release_task_for_capability_miss_query`]. It clears sticky affinity on
+/// purpose, because the worker it releases FROM cannot run the handler at all.
 ///
-/// Resets `capability_misses = 0, capability_miss_workers = '{}'` (Codex
-/// review round 2 of #1182), matching [`park_workflow_task_sticky_query`]'s
-/// established `reset_capability_misses = true` precedent rather than
-/// [`release_task_for_capability_miss_query`]'s (which always *increments*
-/// it, since that release specifically records THIS worker's own
-/// incapability). This function's caller reaches it only after
-/// `handle_suspended_workflow`'s handler dispatch has already run -- the
-/// same "reached only after the handler lookup succeeded" condition that
-/// makes every park caller except [`crate::worker::requeue_parent_on_
-/// transient_ingest_conflict`] a proof of capability -- so a release here is
-/// unconditionally proof-of-capability too, and stale evidence from a prior,
-/// genuinely incapable worker must not survive it: leaving it would let the
-/// next dispatcher's capability-miss decision undercount the live,
-/// unaccounted fleet by one, based on a peer this exact release just proved
-/// wrong.
+/// Resets `capability_misses = 0, capability_miss_workers = '{}'` (issue
+/// #1182). That matches the `reset_capability_misses = true` precedent of
+/// [`park_workflow_task_sticky_query`]. It does not match
+/// [`release_task_for_capability_miss_query`], which always *increments* the
+/// count. That release records the incapability of THIS worker. The caller of
+/// this function reaches it only after the handler dispatch of
+/// `handle_suspended_workflow` has run. The same condition makes every park
+/// caller a proof of capability, except
+/// [`crate::worker::requeue_parent_on_transient_ingest_conflict`]. So a
+/// release here is always proof of capability too. Stale evidence from an
+/// earlier, genuinely incapable worker must not survive it. Otherwise the
+/// capability-miss decision of the next dispatcher undercounts the live,
+/// unaccounted fleet by one. It would rest on a peer that this release just
+/// proved wrong.
 ///
-/// Preserves `activity_name` for an activity row (Codex review round 2 of
-/// #1184): this release is now also reached for an activity task's ambiguous
-/// claim (via `release_terminal_workflow_claim`, issue #1184), and
-/// `activity_name` identifies which handler a re-dispatch must invoke --
-/// clearing it unconditionally left a released activity row unclaimable by
-/// any worker (`process_activity_task` treats a missing name as malformed).
-/// Uses the same `CASE WHEN task_type = 'workflow' THEN NULL ELSE
-/// activity_name END` guard `park_workflow_task_query`/`_sticky_query`
-/// already established for exactly this: a no-op for a workflow row (whose
-/// `activity_name` is already `NULL`), and load-bearing for an activity one.
+/// Preserves `activity_name` for an activity row (issue #1184). An activity
+/// task's ambiguous claim also reaches this release (via
+/// `release_terminal_workflow_claim`). `activity_name` identifies which handler
+/// a re-dispatch must invoke. An unconditional clear left a released activity
+/// row unclaimable by any worker (`process_activity_task` treats a missing name
+/// as malformed). It uses the `CASE WHEN task_type = 'workflow' THEN NULL ELSE
+/// activity_name END` guard of `park_workflow_task_query`/`_sticky_query`.
+/// That guard does nothing on a workflow row, whose `activity_name` is
+/// already `NULL`. On an activity row it is load-bearing.
 ///
-/// Also resets `crash_strikes = 0` (Codex review round 4 of #1182): the
+/// Also resets `crash_strikes = 0` (issue #1182). The
 /// `WHERE ... AND crash_strikes = $3` guard above still pins the update to
-/// the exact claim-time snapshot (so a concurrent poison-pill reclaim that
-/// bumped the strike count in the meantime is correctly treated as "the
-/// claim moved" rather than silently overwritten), but the value the row is
-/// set *to* must not carry that snapshot forward. This dispatch attempt ran
-/// the handler to a conclusion on this worker -- it just couldn't confirm
-/// ownership afterward, not that the process crashed -- so the issue #367
-/// crash streak this row was accumulating is genuinely broken, exactly the
-/// same "the body reached a conclusion on this worker" justification
-/// [`release_task_for_capability_miss_query`]'s `AfterHandler` phase already
-/// uses to reset the same column for the same reason. Leaving a stale count
-/// in place would let an unrelated, already-resolved crash history count
-/// against a task that just proved itself dispatchable.
+/// the exact claim-time snapshot. So a concurrent poison-pill reclaim that
+/// bumped the strike count is treated as "the claim moved", and is not
+/// silently overwritten. But the value the row is set *to* must not carry
+/// that snapshot forward. This dispatch attempt ran the handler to a
+/// conclusion on this worker. It only could not confirm ownership afterward.
+/// The process did not crash. So the issue #367 crash streak of this row is
+/// genuinely broken. The `AfterHandler` phase of
+/// [`release_task_for_capability_miss_query`] resets the same column on the same justification:
+/// the body reached a conclusion on this worker. A stale count would let an
+/// unrelated, already-resolved crash history count against a task that just
+/// proved itself dispatchable.
 ///
 /// Also guards on `attempt = $4` (issue #1806). A stuck-task requeue keeps
 /// `crash_strikes`, so the same worker can claim the row again with an equal
@@ -9205,57 +9200,54 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
      RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
-/// Release a still-claimed, but replay-suspended-empty-handed, workflow task
-/// back to `PENDING` for a fresh dispatch attempt (issue #1182 follow-up,
-/// Codex review).
+/// Release a still-claimed, replay-suspended-empty-handed workflow task to `PENDING`.
 ///
-/// [`claim_still_held_for_update`]'s `SKIP LOCKED` guard cannot distinguish a
-/// genuine ownership transfer from a concurrent, *unrelated* lock holder
-/// (e.g. [`wake_workflow_task`]'s `wake_requested` fallback UPDATE, which
-/// touches this exact row for a moment while a sibling event wakes the same
-/// execution) merely contending for the row at that instant -- both read back
-/// as "not ours right now". Treating the second case identically to the first
-/// -- doing nothing -- strands the row: it stays `RUNNING` under a worker who
-/// has already moved on (this dispatch already returned, having made its
-/// "no terminal decision" call), and nothing else ever re-claims a `RUNNING`
-/// row, so it sits forever until an unrelated poison-pill/heartbeat sweep
-/// eventually notices.
+/// The task gets a fresh dispatch attempt (issue #1182 follow-up).
 ///
-/// This is called only *after* the entire enclosing persistence transaction
-/// -- the one that holds the execution row's `FOR UPDATE` lock for its whole
-/// duration -- has rolled back, in response to
+/// The `SKIP LOCKED` guard of [`claim_still_held_for_update`] cannot tell a
+/// genuine ownership transfer from a concurrent, *unrelated* lock holder. An
+/// example is the `wake_requested` fallback UPDATE of [`wake_workflow_task`].
+/// It touches this exact row for a moment while a sibling event wakes the same
+/// execution. Both cases read back as "not held by this claim now". If the
+/// second case also does nothing, the row is stranded. It stays `RUNNING`
+/// under a worker that has moved on. This dispatch already returned, after
+/// its "no terminal decision" call. Nothing else ever re-claims a `RUNNING`
+/// row. So it sits until an unrelated poison-pill/heartbeat sweep notices.
+///
+/// The enclosing persistence transaction holds the execution row's
+/// `FOR UPDATE` lock for its whole duration. This is called only *after* that
+/// entire transaction has rolled back, in response to
 /// [`crate::error::HarvestError::SuspendedClaimAmbiguous`] propagating out of
 /// [`crate::worker::fail_suspended_workflow_if_still_claimed`] with `?`
-/// (Codex review round 2 of #1182). A nested `SAVEPOINT` release inside that
-/// transaction does not release the execution row, so this release has to
-/// wait for the *outermost* transaction to end, not merely
-/// [`crate::worker::commit_terminal_failure_if_still_claimed`]'s own internal
-/// one. Once it has, this call therefore never holds the execution row while
-/// waiting for the task row: it is a single, standalone task-row lock
-/// acquisition, so it cannot participate in the execution-row/task-row ABBA
-/// cycle `SKIP LOCKED` exists to avoid there (see
-/// [`claim_still_held_for_update`]'s doc comment) -- there is no *second*
-/// lock for it to be the other half of.
+/// (issue #1182). A nested `SAVEPOINT` release inside that transaction does
+/// not release the execution row. So this release must wait for the
+/// *outermost* transaction to end. The inner transaction of
+/// [`crate::worker::commit_terminal_failure_if_still_claimed`] is not enough.
+/// After that, this call never holds the execution row while it waits for the
+/// task row. It is a single, standalone task-row lock acquisition. So it
+/// cannot join the execution-row/task-row ABBA cycle that `SKIP LOCKED`
+/// avoids there (see [`claim_still_held_for_update`]). It holds no *second*
+/// lock to be the other half of a cycle.
 ///
-/// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
-/// behind whatever transiently holds the row instead of skipping it, then
-/// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
+/// Deliberately **not** `FOR UPDATE SKIP LOCKED`. A plain `UPDATE` blocks
+/// behind whatever holds the row for a moment, and does not skip it. It then
+/// re-evaluates its `WHERE` clause against the *post-commit* state of the row. If
 /// ownership genuinely moved in the interim, the guard no longer matches. The
 /// guard checks `worker_id`, `crash_strikes` and `attempt`, as
 /// [`claim_still_held_for_update`] does. This call then updates nothing, and
 /// the new owner keeps the row, exactly as if this call never ran. If
 /// ownership did not move, the row is released. The same write clears
 /// `wake_requested`, so a wake that landed in the contention window is
-/// reconciled rather than silently lost. This mirrors the established, doubly-reviewed
-/// [`release_task_for_capability_miss`] fallback -- the pattern this crate
-/// already relies on whenever a `SKIP LOCKED` guard's ambiguous "not ours"
-/// answer needs an authoritative, blocking follow-up -- but touches none of
-/// that function's capability-miss-specific bookkeeping columns, since the
-/// handler here DID run; it simply made no replay-significant progress.
+/// reconciled rather than silently lost. This mirrors the established
+/// [`release_task_for_capability_miss`] fallback. This crate uses that pattern
+/// whenever the ambiguous "not ours" answer of a `SKIP LOCKED` guard needs an
+/// authoritative, blocking follow-up. But it touches none of the
+/// capability-miss bookkeeping columns of that function. The handler here DID
+/// run. It only made no replay-significant progress.
 ///
-/// Returns `true` when a row was actually released, `false` when the claim
-/// had genuinely moved by the time this ran (a legitimate outcome, not an
-/// error -- the new owner is responsible for the row).
+/// Returns `true` when a row was released. Returns `false` when the claim had
+/// genuinely moved by the time this ran. That is a legitimate outcome, not an
+/// error: the new owner is responsible for the row.
 ///
 /// # Errors
 ///
@@ -9273,17 +9265,16 @@ pub async fn release_suspended_workflow_claim(
 /// [`release_suspended_workflow_claim`] under a name that does not imply
 /// suspension.
 ///
-/// For issue #1184's broader set of ordinary terminal-write guards
-/// (complete/fail/pause-park). Identical query, identical "still-ours ->
-/// release for a fresh attempt, already-moved -> no-op" contract: the
-/// handler ran to a real conclusion this cycle (a completion, a failure, or
-/// a park) either way, so the same crash-strikes/capability-miss reset the
-/// #1182 release performs is equally warranted here -- see
-/// [`release_suspended_workflow_claim_query`]'s doc comment for why that reset
-/// is safe and correct. Mirrors the existing
+/// It serves the broader set of ordinary terminal-write guards of issue #1184
+/// (complete/fail/pause-park). The query and the contract are identical:
+/// "still-ours -> release for a fresh attempt, already-moved -> no-op". The
+/// handler ran to a real conclusion this cycle either way: a completion, a
+/// failure or a park. So the crash-strikes/capability-miss reset of the #1182
+/// release is equally warranted here.
+/// [`release_suspended_workflow_claim_query`] says why that reset is safe and
+/// correct. This mirrors the
 /// [`park_workflow_task`]/[`park_workflow_task_preserving_capability_misses`]
-/// pair, which likewise share one `_inner` implementation under two
-/// call-site-appropriate names.
+/// pair, which also share one `_inner` implementation under two names.
 ///
 /// # Errors
 ///
@@ -9324,9 +9315,10 @@ async fn release_workflow_claim_inner(
 
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
 ///
-/// When both fields are set, the task is pinned to `worker_id` for `timeout`
-/// so the worker's in-process LRU cache can service follow-up replays without
-/// reloading history from Postgres. A `None` hint leaves the task unpinned.
+/// When both fields are set, the task is pinned to `worker_id` for `timeout`.
+/// The in-process LRU cache of the worker can then serve follow-up replays
+/// without reloading history from Postgres. A `None` hint leaves the task
+/// unpinned.
 #[derive(Debug, Clone, Copy)]
 pub struct StickyHint<'a> {
     pub worker_id: &'a str,
@@ -9453,24 +9445,23 @@ pub async fn set_task_sticky_affinity(
 
 /// Mark a running workflow task as parked while it waits on an external event.
 ///
-/// Parked tasks stay in `RUNNING` state so they remain attached to the same
-/// workflow execution, but their worker ownership and start timestamp are cleared
-/// so wake-up paths can distinguish them from actively executing workflow tasks.
+/// Parked tasks stay in `RUNNING` state, so they remain attached to the same
+/// workflow execution. Their worker ownership and start timestamp are cleared.
+/// So wake-up paths can tell them from actively executing workflow tasks.
 ///
 /// If `sticky` is supplied, the row is pinned to the given worker for the
-/// configured duration. This lets the next wake-up preferentially land back on
-/// the worker that just produced the park -- the same worker whose in-process
-/// LRU cache holds the workflow state.
+/// configured duration. The next wake-up then tends to land back on the worker
+/// that produced the park. The in-process LRU cache of that worker holds the
+/// workflow state.
 ///
-/// Returns `true` when a wake was requested for this row (via
-/// `wake_workflow_task`'s dropped-wake fallback) while it was still claimed
-/// and mid-processing -- i.e. a wake raced this park. The `wake_requested`
-/// flag is atomically read and cleared as part of the same UPDATE that parks
-/// the row, so this can never miss a wake that lands in the gap between a
-/// caller's own terminal-state check and this call. Callers that care about
-/// dropped wakes should treat `true` the same as an already-observed terminal
-/// sibling and immediately re-wake via [`wake_workflow_task`] rather than
-/// leaving the row parked to wait for a wake that already happened.
+/// Returns `true` when a wake raced this park. The dropped-wake fallback of
+/// `wake_workflow_task` requested it while the row was still claimed and
+/// mid-processing. The same UPDATE that parks the row atomically reads and
+/// clears the `wake_requested` flag. So this never misses a wake between the
+/// terminal-state check of a caller and this call. A caller that cares about
+/// dropped wakes should treat `true` like an already-observed terminal
+/// sibling. It should re-wake at once via [`wake_workflow_task`]. A parked row
+/// would otherwise wait for a wake that already happened.
 ///
 /// # Errors
 ///
@@ -9489,17 +9480,17 @@ pub async fn park_workflow_task(
 /// [`crate::worker::requeue_parent_on_transient_ingest_conflict`] (issue #779)
 /// parks from inside the wake-event ingest, which runs *before* the handler
 /// lookup in `process_workflow_task`. A worker with no handler for the type
-/// reaches it too, so zeroing the capability-miss accounting there would
+/// reaches it too. A zero of the capability-miss accounting there would
 /// restart the redelivery budget on a path that proves nothing about
-/// capability — weakening the escalation bound the release contract depends on.
+/// capability. That weakens the escalation bound the release contract needs.
 ///
-/// The preservation is expressed as the *absence* of the two SET assignments in
-/// the same statement that parks the row, so the row is never observably
-/// zeroed. Restoring the values in a follow-up UPDATE would be wrong: the park
-/// commits in autocommit mode, so a peer can claim the freshly-parked row and
-/// record its own miss (or a capable peer can park and legitimately reset it)
-/// in the gap, and no single-statement merge of two whole snapshots is monotone
-/// against both of those.
+/// The preservation is the *absence* of the two SET assignments in the same
+/// statement that parks the row. So the row is never observably zeroed. A
+/// restore in a follow-up UPDATE would be wrong. The park commits in
+/// autocommit mode. In the gap, a peer can claim the freshly parked row and
+/// record its own miss. A capable peer can also park and legitimately reset
+/// it. No single-statement merge of two whole snapshots is monotone against
+/// both of those.
 ///
 /// # Errors
 ///
@@ -9528,14 +9519,13 @@ async fn park_workflow_task_inner(
         had_wake_requested: bool,
     }
 
-    // Use raw SQL so `sticky_until` is computed from Postgres `NOW()` -- the
-    // same clock used by `wake_workflow_task` and `claim_task` -- and so the
-    // pre-update `wake_requested` value can be captured atomically in the same
-    // statement that clears it. A `candidate` CTE locks the row with
-    // `FOR UPDATE` and reads its current `wake_requested` before the `updated`
-    // CTE clears it; doing this as a SELECT-then-UPDATE in two round trips
-    // would race with `wake_workflow_task`'s fallback UPDATE in exactly the
-    // gap this mechanism exists to close.
+    // Raw SQL computes `sticky_until` from Postgres `NOW()`, the clock of
+    // `wake_workflow_task` and `claim_task`. It also captures the pre-update
+    // `wake_requested` value atomically in the statement that clears it. A
+    // `candidate` CTE locks the row with `FOR UPDATE` and reads its current
+    // `wake_requested`. The `updated` CTE then clears it. A SELECT-then-UPDATE
+    // in two round trips would race with the fallback UPDATE of
+    // `wake_workflow_task`, in exactly the gap this mechanism closes.
     //
     // Chaos: kill/delay between the pre-park liveness check and the park's
     // atomic UPDATE — the #601 lost-wake window a concurrent wake can land in
@@ -9557,10 +9547,10 @@ async fn park_workflow_task_inner(
             .map_err(crate::error::database_error)?
     } else {
         // No sticky hint: clear any stale affinity left by a previous worker
-        // that ran with sticky routing enabled. Without this, wake_workflow_task
-        // would refresh sticky_until from the stored sticky_timeout column and
-        // re-pin the execution to the old worker even though the current worker
-        // is running with sticky routing disabled.
+        // that ran with sticky routing enabled. Otherwise wake_workflow_task
+        // refreshes sticky_until from the stored sticky_timeout column. It
+        // then re-pins the execution to the old worker, although the current
+        // worker runs with sticky routing disabled.
         diesel::sql_query(park_workflow_task_query(reset_capability_misses))
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .cache_prepared()
@@ -9580,20 +9570,19 @@ async fn park_workflow_task_inner(
 /// Atomically read **and clear** a workflow task's `wake_requested` flag
 /// (issue #950).
 ///
-/// [`park_workflow_task`] already does this as part of the same statement that
-/// parks the row, but the timer sub-path of a suspension parks via
-/// [`reschedule_task`] (`RUNNING` → `PENDING @ fires_at`), which does not touch
-/// the flag. A wake that landed on the still-claimed row *before* this
-/// transaction took its lock is recorded only as `wake_requested = TRUE`, and
-/// would otherwise be silently discarded by the reschedule — leaving the task
-/// asleep until its deadline even though the event it was waiting for already
-/// arrived. The generalized mixed-batch persist path calls this so the flag is
-/// honoured on the reschedule sub-path too.
+/// [`park_workflow_task`] already does this in the statement that parks the
+/// row. But the timer sub-path of a suspension parks via [`reschedule_task`]
+/// (`RUNNING` → `PENDING @ fires_at`), which does not touch the flag. A wake
+/// can land on the still-claimed row *before* this transaction takes its lock.
+/// It is then recorded only as `wake_requested = TRUE`. The reschedule would
+/// silently discard it. The task would sleep until its deadline, although its
+/// event already arrived. The generalized mixed-batch persist path calls this,
+/// so the reschedule sub-path honours the flag too.
 ///
-/// A wake landing *after* this call blocks on the row lock this statement takes
-/// and is re-evaluated against the committed row, where
-/// [`primary_repend_workflow_task_query`]'s `mixed_signal_suspension` arm pulls
-/// the `PENDING` row forward — so no wake can fall between the two.
+/// A wake that lands *after* this call blocks on the row lock of this
+/// statement. It is then re-evaluated against the committed row. There the
+/// `mixed_signal_suspension` arm of [`primary_repend_workflow_task_query`]
+/// pulls the `PENDING` row forward. So no wake can fall between the two.
 ///
 /// Returns `true` only when the flag was set; `false` both when it was already
 /// clear and when the task row no longer exists.
@@ -9651,30 +9640,30 @@ const fn take_wake_requested_query() -> &'static str {
 /// `wake_requested` before clearing it) is unit-testable without a database.
 ///
 /// Parking resets `capability_misses` (issue #804). A workflow task row is
-/// long-lived — it is reused for the entire execution — and parking is the
-/// dominant suspension path (activity, signal, child workflow, mutex; only a
-/// timer suspension goes through [`reschedule_task`]). Nearly every caller is
-/// reached only AFTER the handler lookup in `process_workflow_task` succeeded,
-/// so a park is proof that a capable worker handled this row and the
-/// consecutive-miss budget must start clean. Without this the counter would be
-/// cumulative over the execution's whole life, so a long-lived entity workflow
-/// would escalate during a later, unrelated deploy while a capable worker is
-/// demonstrably live. `primary_repend_workflow_task_query` needs no equivalent
-/// reset: the parked state it matches is produced only here.
+/// long-lived, because the entire execution reuses it. Parking is the dominant
+/// suspension path: activity, signal, child workflow and mutex. Only a timer
+/// suspension goes through [`reschedule_task`]. Nearly every caller runs only
+/// AFTER the handler lookup in `process_workflow_task` succeeded. So a park
+/// proves that a capable worker handled this row, and the consecutive-miss
+/// budget must start clean. Otherwise the counter accumulates over the whole
+/// life of the execution. A long-lived entity workflow would then escalate
+/// during a later, unrelated deploy, while a capable worker is demonstrably
+/// live. `primary_repend_workflow_task_query` needs no equivalent reset. Only
+/// this statement produces the parked state it matches.
 ///
-/// **One caller is *not* proof of capability** and therefore passes
-/// `reset_capability_misses = false`:
+/// **One caller is *not* proof of capability**, so it passes
+/// `reset_capability_misses = false`.
 /// [`crate::worker::requeue_parent_on_transient_ingest_conflict`] (issue #779)
 /// parks from inside the wake-event ingest, which runs *before* the handler
-/// lookup. A worker with no handler for the type can reach it, so letting it
-/// zero the counter would restart the consecutive-miss budget on a path that
-/// proves nothing — weakening the escalation bound the release contract depends
-/// on. Preserving is expressed as the *absence* of the two SET assignments in
-/// this same statement rather than a follow-up restore UPDATE, because the park
-/// commits in autocommit mode: a peer can claim the freshly-parked row and
-/// record its own miss — or a capable peer can park and legitimately reset it —
-/// before a second statement lands, and no single-statement merge of two whole
-/// snapshots is monotone against both.
+/// lookup. A worker with no handler for the type can reach it. A zero of the
+/// counter there would restart the consecutive-miss budget on a path that
+/// proves nothing. That weakens the escalation bound the release contract
+/// needs. The preservation is the *absence* of the two SET assignments in this
+/// same statement, not a follow-up restore UPDATE. The park commits in
+/// autocommit mode. Before a second statement lands, a peer can claim the
+/// freshly parked row and record its own miss. A capable peer can also park
+/// and legitimately reset it. No single-statement merge of two whole snapshots
+/// is monotone against both.
 const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'static str {
     if reset_capability_misses {
         "WITH candidate AS ( \
@@ -9774,10 +9763,10 @@ const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str
 /// rows (e.g. timer-scheduled tasks) are intentionally excluded. If no parked
 /// workflow task exists, this is a no-op.
 ///
-/// If the parked row carries a `sticky_timeout`, `sticky_until` is refreshed
-/// to `NOW() + sticky_timeout` so the pinned worker gets a fresh grace period
+/// If the parked row carries a `sticky_timeout`, `sticky_until` becomes
+/// `NOW() + sticky_timeout`. So the pinned worker gets a fresh grace period
 /// each time the task becomes claimable. Rows without a stored timeout keep
-/// their existing `sticky_until` value (which will simply expire if stale).
+/// their existing `sticky_until` value, which simply expires if stale.
 ///
 /// # Errors
 ///
@@ -9788,20 +9777,19 @@ pub async fn wake_workflow_task(
 ) -> HarvestResult<()> {
     let mut repended = primary_repend_workflow_task(conn, exec_id).await?;
 
-    // Dropped-wake fix: if no row was parked and re-pended above, the target
-    // workflow task may currently be claimed and mid-processing (state =
-    // 'RUNNING', worker_id IS NOT NULL) rather than parked -- e.g. an
-    // in-flight decision cycle that dispatched a fan-out and is still
-    // executing when a sibling child completes moments later. The UPDATE
-    // above cannot re-pend such a row because it does not match the "parked"
-    // WHERE clause yet, so this wake would otherwise be silently dropped with
-    // no durable trace, forcing the in-flight cycle to park and wait for a
-    // wake that already happened and is gone (recovered only by a later,
-    // unrelated wake or the next poll-interval sweep). Fall back to marking
-    // the row `wake_requested = TRUE`; `park_workflow_task` atomically reads
-    // and clears this flag when the in-flight cycle later parks, and re-pends
-    // immediately instead of actually parking if it was set -- closing the
-    // race without this call ever blocking or retrying.
+    // Dropped-wake fix: this covers the case where no row was parked and
+    // re-pended above. The target workflow task may then be claimed and
+    // mid-processing (state = 'RUNNING', worker_id IS NOT NULL), not parked.
+    // An example is an in-flight decision cycle that dispatched a fan-out and
+    // still runs when a sibling child completes. The UPDATE above cannot
+    // re-pend such a row, because it does not match the "parked" WHERE clause
+    // yet. So this wake would be silently dropped, with no durable trace. The
+    // in-flight cycle would park and wait for a wake that is already gone.
+    // Only a later, unrelated wake or the next poll-interval sweep would
+    // recover it. So fall back to marking the row `wake_requested = TRUE`.
+    // `park_workflow_task` atomically reads and clears this flag when the
+    // in-flight cycle later parks. If it was set, it re-pends at once instead
+    // of parking. That closes the race, and this call never blocks or retries.
     if repended.is_empty() {
         let fallback_updated = diesel::sql_query(wake_requested_fallback_query())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -9811,28 +9799,28 @@ pub async fn wake_workflow_task(
             .map_err(crate::error::database_error)?;
 
         if fallback_updated == 0 {
-            // Closes a residual race (PR #901 review): if `park_workflow_task`'s
-            // `candidate SELECT ... FOR UPDATE` already locked this row before the
-            // fallback UPDATE above ran, the fallback blocks on that row lock
-            // rather than skipping it outright (its WHERE clause matched the row's
-            // pre-park, still-owned snapshot). Once the park commits, Postgres
-            // re-checks the fallback's WHERE clause against the just-committed row
-            // -- which now has `worker_id = NULL` -- so it no longer matches and
-            // `wake_requested` is silently never set, even though a park the wake
-            // raced against just committed a parked row that is this exact wake's
-            // target. Retry the primary re-pend query once: if the row is now
-            // genuinely parked (the common outcome of that exact race), this
-            // catches it directly instead of depending on `wake_requested`.
+            // Closes a residual race (PR #901 review). The
+            // `candidate SELECT ... FOR UPDATE` of `park_workflow_task` can lock
+            // this row before the fallback UPDATE above runs. The fallback then
+            // blocks on that row lock and does not skip it. Its WHERE clause
+            // matched the pre-park, still-owned snapshot of the row. Once the
+            // park commits, Postgres re-checks that WHERE clause against the
+            // just-committed row. That row now has `worker_id = NULL`, so it no
+            // longer matches. `wake_requested` is then silently never set. Yet
+            // the park that the wake raced just committed the parked target
+            // row of this wake. So retry the primary re-pend query once. The
+            // row is usually parked now, the common outcome of that race. The
+            // retry catches it directly, without `wake_requested`.
             repended = primary_repend_workflow_task(conn, exec_id).await?;
         }
     }
 
-    // A workflow task may already be PENDING with an elapsed `scheduled_at` —
-    // e.g. a timer fired while the execution was PAUSED (issue #383), so the
-    // task was enqueued but never re-pended by the UPDATE above. Such a task is
-    // immediately claimable once the execution is RUNNING again, but no fresh
-    // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
-    // next poll interval. Notify those queues too so resume re-arms promptly.
+    // A workflow task may already be PENDING with an elapsed `scheduled_at`.
+    // For example, a timer fired while the execution was PAUSED (issue #383).
+    // The task was enqueued, but the UPDATE above never re-pended it. It is
+    // claimable at once when the execution is RUNNING again. But no fresh
+    // NOTIFY went out for it, so a LISTEN-based worker sleeps until the next
+    // poll interval. Notify those queues too, so resume re-arms promptly.
     let already_due: Vec<PendingHintRow> = diesel::sql_query(
         "SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue \
          WHERE workflow_exec_id = $1 \
@@ -9884,20 +9872,21 @@ pub async fn wake_workflow_task(
     Ok(())
 }
 
-/// Runs [`wake_workflow_task`]'s primary re-pend `UPDATE`: resets a parked
-/// (or elapsed mixed-signal-suspension) workflow task row for `exec_id` back
-/// to `PENDING` and returns the queue names of any rows it touched. Extracted
-/// so the dropped-wake fallback below can retry it after losing the
-/// `park_workflow_task` row-lock race.
+/// Runs the primary re-pend `UPDATE` of [`wake_workflow_task`].
 ///
-/// `created_at` is refreshed to `clock_timestamp()` (the wake instant): this
-/// re-pends an *old* parked workflow task with a freshly backdated
-/// `scheduled_at` (= now - skew), so without refreshing `created_at` the
-/// schedule-to-start eligibility floor `GREATEST(scheduled_at, created_at)`
-/// would pick the backdated wake timestamp (the stale insert-time `created_at`
-/// is older) and report ~skew seconds of phantom latency for an immediately
-/// claimed follow-up task (issue #501 review). The wake instant is this cycle's
-/// true eligibility, so an immediately-served wake correctly reports ~0.
+/// It resets a parked (or elapsed mixed-signal-suspension) workflow task row
+/// for `exec_id` back to `PENDING`. It returns a `PendingHintRow` for each row
+/// it touched. It is a separate function so the dropped-wake fallback can retry
+/// it after it loses the `park_workflow_task` row-lock race.
+///
+/// `created_at` becomes `clock_timestamp()`, the wake instant. This re-pends
+/// an *old* parked workflow task with a freshly backdated `scheduled_at`
+/// (= now - skew). The stale insert-time `created_at` is older than that. So
+/// without a fresh `created_at`, the floor `GREATEST(scheduled_at, created_at)`
+/// picks the backdated wake timestamp. An immediately claimed follow-up task
+/// would then report ~skew seconds of phantom latency (issue #501 review). The
+/// wake instant is the true eligibility of this cycle. So a wake served at once
+/// correctly reports ~0.
 ///
 /// Also clears `timer_fires_at` (issue #1402). A signal, child, or
 /// external handoff woke this row, not whatever timer last armed it.
@@ -10051,11 +10040,10 @@ pub async fn session_has_other_live_tasks(
 /// override may live before it is force-expired, regardless of the caller's
 /// requested `ttl_secs` (issue #945).
 ///
-/// A ceiling, not a floor: a request with `ttl_secs` above this is rejected
-/// `400` rather than silently clamped down, so an operator's intended expiry
-/// is never silently shortened without their knowledge. 24 hours is long
-/// enough to bridge a shift change but short enough that a forgotten override
-/// cannot silently outlive an incident it was meant to mitigate.
+/// A ceiling, not a floor: a request with `ttl_secs` above this gets `400`.
+/// It is not clamped, so an operator's expiry is never shortened in silence.
+/// 24 hours bridges a shift change. A forgotten override still cannot outlive
+/// the incident it was meant to mitigate.
 pub const MAX_PACING_OVERRIDE_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// Renders the effective per-second token refill rate expression for a
@@ -10064,14 +10052,11 @@ pub const MAX_PACING_OVERRIDE_TTL_SECS: i64 = 24 * 60 * 60;
 ///
 /// Renders `COALESCE(CASE WHEN {alias}.override_expires_at > NOW() THEN
 /// {alias}.override_refill_rate ELSE NULL END, {alias}.refill_rate)`.
-/// `alias` qualifies every column reference, so this composes into any query
-/// aliasing the bucket table (`"b"` in the claim-time gates) or the bare table
-/// name itself (`"harvest_rate_limit_buckets"`, for the single-table
-/// statements that reference no alias). An expired or absent override
-/// (`override_expires_at` is `NULL` or not strictly in the future) falls
-/// through to the declared baseline `refill_rate` -- a plain `> NOW()`
-/// comparison evaluated fresh on every access, so reverting needs no
-/// background sweeper and no operator action.
+/// `alias` qualifies every column reference. Pass `"b"` for the claim-time
+/// gates, or `"harvest_rate_limit_buckets"` for single-table statements.
+/// An override whose `override_expires_at` is `NULL` or not strictly in the
+/// future falls through to the baseline `refill_rate`. The `> NOW()` check
+/// runs on every access, so a revert needs no sweeper and no operator action.
 #[must_use]
 pub fn effective_refill_rate_expr(alias: &str) -> String {
     format!(
@@ -10089,21 +10074,15 @@ pub fn effective_burst_expr(alias: &str) -> String {
     )
 }
 
-/// Renders the piecewise token-accrual expression -- the token budget that
-/// has accrued since `last_refilled_at` -- honoring a TTL'd operator
-/// override that may have EXPIRED partway through the elapsed interval
-/// (issue #945 review, P1).
+/// Renders the tokens accrued since `last_refilled_at` (issue #945).
 ///
-/// A naive `elapsed * effective_refill_rate` (applying "whichever rate is
-/// effective right now" to the WHOLE elapsed interval) is wrong once an
-/// override has expired with no intervening write to settle the bucket: it
-/// retroactively applies the (now-reverted) baseline rate to the portion of
-/// the interval the override was still throttling, producing a phantom
-/// instant refill the moment the TTL lapses. This instead splits the
-/// accrual into two segments at the override's expiry -- or, when there is
-/// no override at all, collapses the split point to `last_refilled_at` so
-/// segment 1 is empty and the whole formula degenerates to the pre-#945
-/// flat-rate shape:
+/// A TTL'd override can expire partway through the elapsed interval.
+/// A naive `elapsed * effective_refill_rate` applies the current rate to the
+/// whole interval. After an unsettled expiry, that applies the baseline rate
+/// to time the override still throttled. The result is a phantom instant
+/// refill the moment the TTL lapses. This expression splits the accrual at the expiry.
+/// With no override, the split point is `last_refilled_at`, segment 1 is
+/// empty, and the formula is the pre-#945 flat-rate shape:
 ///
 /// ```text
 /// EB      := COALESCE(override_expires_at, last_refilled_at)
@@ -10112,13 +10091,12 @@ pub fn effective_burst_expr(alias: &str) -> String {
 /// accrued := seg1 + seg2
 /// ```
 ///
-/// Segment 1 accrues at the override's rate (if any) up to the earlier of
-/// "now" and the override's expiry; segment 2 accrues at the always-baseline
-/// rate for whatever remains after that boundary. The `COALESCE(...,
-/// last_refilled_at)` in `EB` is load-bearing: `LEAST`/`GREATEST` ignore a
-/// NULL argument rather than propagating it, so comparing a genuinely-absent
-/// `override_expires_at` directly against `last_refilled_at` would silently
-/// double-count the elapsed interval across both segments.
+/// Segment 1 accrues at the override's rate up to the earlier of now and the
+/// expiry. Segment 2 accrues at the baseline rate after that boundary.
+/// The `COALESCE(..., last_refilled_at)` in `EB` is load-bearing.
+/// `LEAST`/`GREATEST` ignore a NULL argument instead of propagating it.
+/// Without the `COALESCE`, an absent `override_expires_at` counts the elapsed
+/// interval in both segments.
 #[must_use]
 fn token_accrual_expr(alias: &str) -> String {
     format!(
@@ -10130,11 +10108,10 @@ fn token_accrual_expr(alias: &str) -> String {
 /// Renders the full available-tokens expression for a
 /// `harvest_rate_limit_buckets` row (issue #945).
 ///
-/// `LEAST(effective_burst, tokens + token_accrual)`, composing
-/// [`effective_burst_expr`] and [`token_accrual_expr`] so every call site --
-/// the claim-time gate, the dispatch-time debit, the refund, the
-/// throttled-key check, and the operator gauge -- derives the identical,
-/// override-expiry-aware formula and can never drift.
+/// `LEAST(effective_burst, tokens + token_accrual)`, from
+/// [`effective_burst_expr`] and [`token_accrual_expr`]. The claim-time gate,
+/// the dispatch-time debit, the refund, the throttled-key check and the
+/// operator gauge all use it, so their formulas cannot drift.
 #[must_use]
 pub fn effective_available_tokens_expr(alias: &str) -> String {
     format!(
@@ -10169,9 +10146,8 @@ pub struct EffectiveRateLimit {
 /// `COALESCE(CASE WHEN override_expires_at > NOW() THEN override_x ELSE NULL
 /// END, x)` formula in pure Rust (issue #945).
 ///
-/// Each field falls back to the declared baseline independently: an operator
-/// may override only `refill_rate` (or only `burst`) and the other continues
-/// to read from the baseline even while the override is active.
+/// Each field falls back to the baseline independently. An override of only
+/// `refill_rate` or only `burst` leaves the other at its baseline.
 #[must_use]
 pub fn resolve_effective_rate_limit(
     refill_rate: f64,
@@ -10197,23 +10173,19 @@ pub fn resolve_effective_rate_limit(
     }
 }
 
-/// Detects cross-shard pacing disagreement among a set of already-resolved
-/// [`EffectiveRateLimit`] snapshots for one key (issue #945 review, rounds
-/// 4-5).
+/// Detects cross-shard pacing disagreement in resolved
+/// [`EffectiveRateLimit`] snapshots for one key (issue #945).
 ///
-/// `true` when either (a) shards disagree on whether an override is
-/// currently active, or (b) every reachable shard agrees "active" but their
-/// *resolved effective* `refill_rate`/`burst` differ.
+/// `true` when shards disagree on whether an override is active. Also `true`
+/// when every reachable shard agrees "active" but the resolved
+/// `refill_rate`/`burst` differ.
 ///
-/// Comparing only the raw `override_refill_rate`/`override_burst` columns
-/// (rounds 1-4's approach) is insufficient: the separate, permanent `POST
-/// /admin/rate-limits/{key}` route (issue #332) can leave shards with
-/// divergent persisted *baselines* after a partial multi-shard fan-out, so
-/// two shards can carry byte-identical override columns yet enforce
-/// genuinely different effective pacing once an omitted override field
-/// falls back to each shard's own (diverged) baseline. Comparing the
-/// resolved [`EffectiveRateLimit`] instead closes that gap by construction
-/// -- it is the exact value each shard's dispatch path actually enforces.
+/// The raw `override_refill_rate`/`override_burst` columns are not enough.
+/// A partial fan-out of `POST /admin/rate-limits/{key}` (issue #332) can
+/// leave shards with diverged baselines. Two shards with identical override
+/// columns then enforce different pacing when an omitted override field
+/// falls back to the diverged baseline of each shard. The resolved [`EffectiveRateLimit`] is the
+/// value each shard enforces, so comparing it closes that gap by construction.
 #[must_use]
 pub fn pacing_shards_disagree(effective: &[EffectiveRateLimit]) -> bool {
     let any_active = effective.iter().any(|e| e.override_active);
@@ -10222,12 +10194,9 @@ pub fn pacing_shards_disagree(effective: &[EffectiveRateLimit]) -> bool {
         return true;
     }
     let active: Vec<&EffectiveRateLimit> = effective.iter().filter(|e| e.override_active).collect();
-    // Deterministic exact f64 comparison — both sides are either
-    // byte-identical copies of one resolved DB column or genuinely
-    // different persisted values (no arithmetic happens on either side that
-    // could introduce imprecision), so an epsilon fuzz would be both
-    // unnecessary and wrong: an operator diagnosing cross-shard drift wants
-    // ANY divergence flagged, however small.
+    // Exact f64 comparison. Both sides are copies of persisted DB values with
+    // no arithmetic, so no imprecision exists. An epsilon would hide drift,
+    // and an operator wants every divergence flagged.
     #[allow(clippy::float_cmp)]
     let disagrees = |a: &EffectiveRateLimit, b: &EffectiveRateLimit| {
         a.refill_rate != b.refill_rate || a.burst != b.burst
@@ -10245,15 +10214,14 @@ pub fn pacing_shards_disagree(effective: &[EffectiveRateLimit]) -> bool {
 /// `rate_limit_key`. **Cardinality contract (team convention, ADR-0001 §7):** the
 /// caller ([`crate::worker::Worker::emit_throttle_metrics`]) feeds each returned
 /// value into [`crate::telemetry::MetricsRecorder::record_rate_limit_throttled`],
-/// which uses it as a metric label. Since a dynamic per-key bucket key
-/// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
-/// resolved key must never become a label; the activity name is bounded by the
-/// registered activity set, so it is what we return and label by.
+/// which uses it as a metric label. A dynamic key
+/// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, so
+/// it must never become a label. The registered activity set bounds the
+/// activity name, so the function returns that.
 ///
-/// Honors a live TTL'd rate-limit override (issue #945) via
-/// [`effective_available_tokens_expr`), so raising a limit's effective rate
-/// stops it reporting "throttled" here even though the declared baseline row is
-/// unchanged.
+/// Honors a live TTL'd override (issue #945) via
+/// [`effective_available_tokens_expr`]. A raised effective rate stops the
+/// "throttled" report even though the baseline row is unchanged.
 ///
 /// # Errors
 ///
@@ -10292,25 +10260,22 @@ pub async fn check_throttled_keys(
 
 /// Atomically consume one rate-limit token from `key`'s bucket at dispatch time.
 ///
-/// Returns `true` if a token was available and debited (the caller may proceed
-/// with the real downstream call), or `false` if no token could be reserved and
-/// the caller must defer (e.g. reschedule the task) rather than run the call.
+/// Returns `true` if a token was debited and the caller may make the call.
+/// Returns `false` if no token was reserved, and the caller must defer.
 ///
-/// Used by the circuit breaker (issue #369): activities with a breaker skip the
-/// claim-time rate-limit gate and debit entirely (see [`claim_task`]); their rate
-/// limiting is enforced *here*, gated on the authoritative `on_dispatch`
-/// decision, so a `CircuitOpen` short-circuit consumes no token while a genuine
-/// call atomically reserves one. The check-and-debit is a single UPDATE so two
-/// concurrent dispatches cannot both reserve the last token.
+/// Used by the circuit breaker (issue #369). Activities with a breaker skip the
+/// claim-time rate-limit gate and debit (see [`claim_task`]). Their limit is
+/// enforced here, after the authoritative `on_dispatch` decision. So a
+/// `CircuitOpen` short-circuit consumes no token, and a real call reserves one.
+/// The check-and-debit is one UPDATE, so two dispatches cannot both reserve the
+/// last token.
 ///
-/// **Fails closed:** returns `false` both when the bucket is empty *and* when the
-/// bucket row is missing. Because the claim-time gate is skipped for these
-/// activities, this is the sole rate-limit enforcement point; treating a missing
-/// bucket as "allow" would let a configured limit run unthrottled if bucket
-/// auto-registration failed or the row was deleted. A `rate_limit_key` is only
-/// set when a limit is configured (so a bucket should exist), and deferring until
-/// it does matches the old claim-time gate, which also would not admit the task
-/// without a bucket row.
+/// **Fails closed:** returns `false` when the bucket is empty or missing.
+/// This is the sole enforcement point for these activities. Treating a missing
+/// bucket as "allow" lets a limit run unthrottled if registration failed or
+/// the row was deleted. A `rate_limit_key` is set only with a configured
+/// limit, so a bucket should exist. The old claim-time gate also refused a task
+/// with no bucket row.
 ///
 /// Mirrors the claim-time debit math (apply pending refill, then `-1.0`).
 ///
@@ -10327,14 +10292,11 @@ pub async fn try_consume_rate_limit_token(
         debited: bool,
     }
 
-    // A single conditional UPDATE: the row is debited only if a token is
-    // available. `RETURNING`/`EXISTS` reports whether the debit happened; a
-    // missing bucket row or an empty bucket both yield `debited = false`.
+    // A missing bucket row and an empty bucket both yield `debited = false`.
     //
-    // Honors a live TTL'd override (issue #945) via
-    // [`effective_available_tokens_expr`] -- the sole rate-limit enforcement
-    // point for circuit-breaker activities, so an operator override must take
-    // effect here with no worker restart.
+    // Honors a live TTL'd override (issue #945). This is the sole enforcement
+    // point for circuit-breaker activities, so an override must take effect
+    // here with no worker restart.
     let effective_tokens = effective_available_tokens_expr("harvest_rate_limit_buckets");
     let outcome: Option<Outcome> = diesel::sql_query(format!(
         "WITH debited AS ( \
@@ -10354,25 +10316,9 @@ pub async fn try_consume_rate_limit_token(
     .optional()
     .map_err(crate::error::database_error)?;
 
-    // Fail closed: only proceed when a token was actually reserved.
     Ok(outcome.is_some_and(|o| o.debited))
 }
 
-/// Return one rate-limit token previously reserved by
-/// [`try_consume_rate_limit_token`] (capped at burst).
-///
-/// Used by the circuit breaker (issue #369) on the rare path where a token was
-/// reserved for a genuine call that then turns out not to run — e.g. the activity
-/// already has a terminal event, or the task row stopped being `RUNNING`
-/// (cancelled/timed out concurrently) between the reservation and appending
-/// `ActivityStarted`. Refunding keeps the bucket accurate (a call that never
-/// happened consumes no token), symmetric with a short-circuit reserving nothing.
-/// Mirrors the debit math (apply pending refill, then `+1.0`). A missing bucket
-/// row is a no-op.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
 /// A distinct claimable-pending demand: how many claimable pending tasks share a
 /// `(queue_name, required_capabilities, required_build_id)` triple.
 ///
@@ -10380,15 +10326,14 @@ pub async fn try_consume_rate_limit_token(
 /// `Some(json)` for tasks that `claim_task` only lets a capability-matching
 /// worker take. `required_build_id` is `None` for build-unrouted tasks and
 /// `Some(id)` for tasks that `claim_task` only lets a build-matching (or
-/// compatible/legacy) worker take. The stranded-work sampler uses this to
-/// detect a queue that looks covered (a worker polls it) but carries a task no
-/// covering worker can actually claim — because of its labels OR its build.
+/// compatible/legacy) worker take. The stranded-work sampler uses this to find
+/// a polled queue with a task that no polling worker can claim. The cause is
+/// the labels or the build of the task.
 ///
-/// `sticky_owner` is `Some(worker_id)` when the row is currently held by an
-/// **unexpired** sticky lease (issue #235): `claim_task` lets only that worker
-/// claim it until `sticky_until` passes, so coverage must check that specific
-/// owner's liveness rather than any worker on the queue. `None` means the row is
-/// freely claimable by the general pool (no lease, or the lease has expired).
+/// `sticky_owner` is `Some(worker_id)` when an unexpired sticky lease holds the
+/// row (issue #235). Only that worker can claim it until `sticky_until`, so
+/// coverage checks the liveness of that owner. `None` means the general pool
+/// can claim the row (no lease, or an expired lease).
 ///
 /// `activity_name` carries the row's activity (NULL for workflow tasks). It lets
 /// [`apply_activity_requirements`] back-fill `required_capabilities` for activity
@@ -10417,28 +10362,22 @@ pub struct ClaimablePendingDemand {
 #[must_use]
 pub fn claimable_pending_demand_query() -> String {
     // `sticky_owner` is NULL unless an unexpired lease binds the row to a
-    // specific worker; the CASE mirrors claim_task's sticky predicate (a row
-    // with sticky_until <= NOW() or NULL is freely claimable). It is both
-    // selected and repeated in GROUP BY.
+    // worker. The CASE mirrors the sticky predicate of claim_task.
     let sticky_owner_expr = "CASE WHEN tq.sticky_worker_id IS NOT NULL \
                                   AND tq.sticky_until IS NOT NULL \
                                   AND tq.sticky_until > NOW() \
                              THEN tq.sticky_worker_id ELSE NULL END";
 
-    // Issue #619: a paused queue's backlog is deliberately held, not stalled,
-    // so it must not surface as unmet demand (which would drive a false
-    // worker-capacity alert during the hold). Generated from the shared
-    // renderer, correlated against this query's `tq` alias.
+    // Issue #619: a paused queue's backlog is held, not stalled. As unmet
+    // demand it would drive a false worker-capacity alert during the hold.
     let queue_pause_gate = crate::queue_pause::queue_pause_anti_join("tq");
-    // Issue #807: identically, a paused activity type's backlog is held rather
-    // than stalled. The rendered anti-join carries `task_type = 'activity'`, and
-    // that predicate is REQUIRED, not redundant: a workflow row's
-    // `activity_name` is not reliably NULL -- the engine stamps the
-    // `'mixed_signal_suspension'` sentinel into that very column -- so
-    // NULL-safety alone would leave this query silently under-reporting demand
-    // whenever an activity happened to share that sentinel's name. See
-    // `activity_pause::activity_pause_anti_join`, and the shape assertion in
-    // `claim_gate_mirrors_carry_the_activity_pause_predicate` below.
+    // Issue #807: a paused activity type's backlog is held in the same way.
+    // The `task_type = 'activity'` predicate in the anti-join is required.
+    // The engine stamps the `'mixed_signal_suspension'` sentinel into a
+    // workflow row's `activity_name`, so that column is not reliably NULL.
+    // Without the predicate, this query under-reports demand when an activity
+    // shares the sentinel name. See `activity_pause::activity_pause_anti_join`
+    // and `claim_gate_mirrors_carry_the_activity_pause_predicate`.
     let activity_pause_gate = crate::activity_pause::activity_pause_anti_join("tq");
     // Issue #945: honors a live TTL'd override so this coverage/demand read
     // never disagrees with what `claim_task` (below) will actually admit.
@@ -10500,15 +10439,15 @@ pub fn claimable_pending_demand_query() -> String {
 ///   - concurrency-cap saturation (the per-key `RUNNING` count is already at the
 ///     cap, so the row is throttled — the same recheck subquery `claim_task`
 ///     uses); and
-///   - rate-limit exhaustion (the non-circuit bucket has no token), with the
-///     **circuit-breaker exemption**: activities in `circuit_breaker_activities`
-///     skip the rate-limit gate at claim, so they remain claimable even with an
-///     empty bucket and are still counted.
+///   - rate-limit exhaustion (the non-circuit bucket has no token). The
+///     **circuit-breaker exemption** applies: activities in
+///     `circuit_breaker_activities` skip the claim-time rate-limit gate, so
+///     they stay claimable with an empty bucket and are still counted.
 ///
-/// An unexpired sticky lease (`sticky_worker_id` set, `sticky_until > NOW()`) is
-/// surfaced as `ClaimablePendingDemand::sticky_owner` rather than excluded, so
-/// the coverage check can require that specific owner to be live (a row leased to
-/// a stale worker is not claimable by anyone else until the lease expires).
+/// An unexpired sticky lease is reported as
+/// `ClaimablePendingDemand::sticky_owner`, not excluded. The coverage check
+/// then requires that owner to be live. Nobody else can claim a row leased to
+/// a stale worker until the lease expires.
 ///
 /// `circuit_breaker_activities` is the static set of activity names with a
 /// circuit-breaker policy (`CircuitBreakerRegistry::tracked_activity_names`),
@@ -10563,11 +10502,10 @@ pub async fn claimable_pending_demand_by_queue(
 /// worker that does not satisfy the *registered* `requires` of that activity
 /// (its ineligible-activities gate, `$6`). Queue rows from legacy or manual
 /// enqueues may carry NULL `required_capabilities` even when the activity has
-/// requirements. To reproduce the gate in coverage, for each demand whose
-/// `required_capabilities` is `None` and whose `activity_name` has an entry in
-/// `activity_requirements`, the activity's requirements are written into
-/// `required_capabilities` so the downstream label-match coverage check applies
-/// the same gate. Demands that already carry a snapshot, or whose activity
+/// requirements. This function reproduces the gate for coverage. A demand with
+/// `None` `required_capabilities` gets the requirements of its activity from
+/// `activity_requirements`. The label-match coverage check then applies the
+/// same gate. Demands that already carry a snapshot, or whose activity
 /// declares no `requires`, are left unchanged.
 ///
 /// `activity_requirements` maps `activity_name` → the JSON encoding of its
@@ -10593,13 +10531,25 @@ pub fn apply_activity_requirements<S: std::hash::BuildHasher>(
     }
 }
 
+/// Return one rate-limit token reserved by [`try_consume_rate_limit_token`],
+/// capped at burst.
+///
+/// The circuit breaker (issue #369) calls this on the rare path where a
+/// reserved call does not run. Examples: the activity already has a terminal
+/// event. Or a concurrent cancel or timeout moved the task row out of
+/// `RUNNING` between the reservation and the append of `ActivityStarted`.
+/// A call that never happened then consumes no token, like a short-circuit.
+/// Mirrors the debit math (apply pending refill, then `+1.0`). A missing
+/// bucket row is a no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
-    // Honors a live TTL'd override (issue #945): the refund caps at the
-    // *effective* burst and re-applies pending accrual via the same
-    // piecewise, override-expiry-aware formula every other reader/writer
-    // uses (issue #945 review, P1) -- so a refund can never push tokens
-    // above what the override currently allows, nor retroactively apply a
-    // reverted rate across a lapsed TTL.
+    // Honors a live TTL'd override (issue #945). The refund caps at the
+    // effective burst and uses the same piecewise accrual as every other
+    // reader and writer. So a refund never exceeds what the override allows,
+    // and never applies a reverted rate across a lapsed TTL.
     let effective_burst = effective_burst_expr("harvest_rate_limit_buckets");
     let accrual = token_accrual_expr("harvest_rate_limit_buckets");
     diesel::sql_query(format!(
@@ -10617,14 +10567,14 @@ pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) ->
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
-/// `INSERT … ON CONFLICT (key) DO NOTHING` with the initial `tokens = burst`, so
-/// a rate change across a deploy never silently resets a live bucket, preceded by
-/// the conditional `last_registered_at` touch described on
-/// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]. Shared by
-/// the static activity-limiter startup registration and the dynamic per-key
-/// enqueue path (issue #699) so the fail-closed `EXISTS` gate in [`claim_task`]
-/// (and the dispatch-time [`try_consume_rate_limit_token`]) always has a bucket
-/// row to read, matching [`crate::throttle`]'s bucket-ensure exactly.
+/// `INSERT … ON CONFLICT (key) DO NOTHING` with the initial `tokens = burst`.
+/// So a rate change across a deploy never resets a live bucket. The
+/// conditional `last_registered_at` touch on
+/// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`] runs first. Static startup
+/// registration and the dynamic per-key enqueue path (issue #699) share it.
+/// The fail-closed `EXISTS` gate in [`claim_task`] and
+/// [`try_consume_rate_limit_token`] then always has a bucket row to read.
+/// It matches the bucket-ensure of [`crate::throttle`] exactly.
 ///
 /// # Errors
 ///
@@ -10648,50 +10598,47 @@ pub async fn ensure_rate_limit_bucket(
 /// How stale a bucket's `last_registered_at` must be before
 /// [`ensure_rate_limit_bucket`] refreshes it (issue #1127).
 ///
-/// This is a *concurrency interlock*, not a heartbeat. The idle-bucket GC picks
-/// its victims with `SELECT ... FOR UPDATE SKIP LOCKED`, so it skips any bucket
-/// row locked by an in-flight transaction — but `INSERT ... ON CONFLICT (key)
-/// DO NOTHING` takes **no** lock on the conflicting row. That leaves a real (if
-/// narrow) race: an enqueue whose transaction had not committed when the sweep
-/// took its snapshot is invisible to the sweep's dependent anti-joins, so its
-/// bucket can be collected out from under it — and both the claim-time gate and
-/// [`try_consume_rate_limit_token`] fail *closed* on a missing row, with nothing
-/// to re-register it. Stranded forever.
+/// This is a *concurrency interlock*, not a heartbeat. The idle-bucket GC
+/// picks victims with `SELECT ... FOR UPDATE SKIP LOCKED`. It skips a bucket
+/// row that an in-flight transaction locks. But `INSERT ... ON CONFLICT (key)
+/// DO NOTHING` takes **no** lock on the conflicting row. That leaves a narrow
+/// race. The anti-joins of the sweep cannot see an enqueue that had not
+/// committed at its snapshot, so the sweep can collect that bucket. The
+/// claim-time gate and [`try_consume_rate_limit_token`] fail *closed* on a
+/// missing row, and nothing re-registers it. The task is stranded forever.
 ///
 /// The fix is a **conditional** `UPDATE ... WHERE key = $1 AND <row is stale>`
 /// run ahead of the insert in the same statement. A plain `UPDATE` locks only
 /// the rows its qualification matches, so:
 ///
-/// - a bucket registered within this interval — the hot path, every enqueue of
-///   a rate-limited activity — matches nothing, and is neither written **nor
-///   locked**. `ON CONFLICT DO UPDATE` would have been wrong here: Postgres
-///   locks the conflicting row *before* evaluating the `DO UPDATE`'s `WHERE`,
-///   so even a no-op touch would hold an exclusive row lock for the whole
-///   (long) decision transaction, stalling any concurrent `claim_task` debit of
-///   the same bucket and making two enqueues that touch the same two buckets in
-///   opposite order deadlock;
-/// - a bucket stale enough for the GC to consider — which it always is, since
-///   this interval is far shorter than
-///   [`crate::retention::MIN_RATE_LIMIT_BUCKET_RETENTION`] — is locked and
-///   refreshed, so the ensure and the sweep serialise: the sweep skips a locked
-///   row, and an ensure that lost the race re-inserts the bucket behind the
-///   delete.
+/// - a bucket registered within this interval matches nothing, and is neither
+///   written **nor locked**. That is the hot path: every enqueue of a
+///   rate-limited activity. `ON CONFLICT DO UPDATE` is wrong here. Postgres
+///   locks the conflicting row *before* it evaluates the `WHERE` of
+///   `DO UPDATE`. So even a no-op touch holds an exclusive row lock for the
+///   whole (long) decision transaction. That stalls a concurrent
+///   `claim_task` debit of the bucket. Two enqueues that touch the same two
+///   buckets in opposite order then deadlock;
+/// - a bucket stale enough for the GC to consider is locked and refreshed.
+///   This interval is far shorter than
+///   [`crate::retention::MIN_RATE_LIMIT_BUCKET_RETENTION`], so every such
+///   bucket is also stale enough for the touch. The ensure and the sweep then serialise. The sweep
+///   skips a locked row, and an ensure that lost the race re-inserts the
+///   bucket behind the delete.
 ///
-/// Even so, the ensure loop in `worker.rs` sorts its bucket keys before
-/// registering them, so the rare stale-path locks are always taken in one
-/// deterministic order (the same precaution the quota advisory locks take,
-/// issue #946).
+/// The ensure loop in `worker.rs` also sorts its bucket keys before it
+/// registers them. So the rare stale-path locks always come in one order, as
+/// with the quota advisory locks (issue #946).
 pub const RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS: u32 = 300;
 
 /// The statement behind [`ensure_rate_limit_bucket`].
 ///
-/// Split out so the touch semantics (see
-/// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]) are unit-assertable without a
-/// database: the touch writes **only** `last_registered_at`, never a live
-/// bucket's `tokens`, declared `refill_rate`/`burst`, or operator override —
-/// and deliberately not `updated_at` either, which stays what it was before
-/// issue #1127, the "an operator or config write changed this bucket" stamp
-/// that `GET /admin/rate-limits` reports.
+/// Split out so a unit test can assert the touch semantics (see
+/// [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]) without a database. The touch
+/// writes **only** `last_registered_at`. It never writes `tokens`,
+/// `refill_rate`/`burst` or an operator override. It also leaves `updated_at`
+/// alone. That column stays the "an operator or config write changed this
+/// bucket" stamp that `GET /admin/rate-limits` reports.
 #[must_use]
 fn ensure_rate_limit_bucket_sql() -> String {
     format!(
@@ -10719,33 +10666,31 @@ fn ensure_rate_limit_bucket_sql() -> String {
 /// activity name, an author-supplied static `rate_limit_key` — is bounded by
 /// the registry: one bucket per declared activity, forever.
 ///
-/// This one list is checked against **both** cardinality decisions in the
-/// subsystem, which are the same judgement seen from two sides: these families
-/// may never become a metric label ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`], one
-/// series per tenant forever) and these families are the only ones the
-/// idle-bucket GC collects (one row per tenant forever). A bounded static key
-/// is deliberately NOT collectable: it is re-registered only at worker startup,
-/// so collecting one would stall the next enqueue behind the fail-closed claim
-/// gate until a restart — whereas both families here re-register in the same
-/// transaction as the work that needs them. That is also why both prefixes are
-/// *reserved* against static `rate_limit_key` squatting
-/// ([`crate::builder::validate_activity_rate_limits`]): a static key inside one
-/// of these namespaces would be collectable but not re-registerable.
+/// This one list drives **both** cardinality decisions of the subsystem.
+/// They are one judgement seen from two sides. These families never become a
+/// metric label ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`]), which would add one
+/// series per tenant. They are also the only families the idle-bucket GC
+/// collects, since each adds one row per tenant. A bounded static key is NOT
+/// collectable. Only worker startup re-registers it, so collecting it stalls
+/// the next enqueue behind the fail-closed claim gate until a restart. Both
+/// families here re-register in the transaction of the work that needs them.
+/// So both prefixes are *reserved* against static `rate_limit_key` squatting
+/// ([`crate::builder::validate_activity_rate_limits`]). A static key in one of
+/// these namespaces is collectable but not re-registerable.
 ///
-/// The entries are the separator-terminated forms of [`DYNAMIC_RATE_PREFIX`]
-/// and [`crate::throttle::THROTTLE_BUCKET_PREFIX`] — the constants the two key
-/// builders actually format with — pinned to them by
-/// `unbounded_prefixes_track_the_real_key_builders`, so renaming either
-/// constant fails the build's tests rather than silently making this sweep
-/// match nothing in production.
+/// The entries are [`DYNAMIC_RATE_PREFIX`] and
+/// [`crate::throttle::THROTTLE_BUCKET_PREFIX`] with their separator. The key
+/// builders format with those constants.
+/// `unbounded_prefixes_track_the_real_key_builders` pins the link, so a
+/// rename fails a test instead of making this sweep match nothing.
 pub const UNBOUNDED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "start-throttle:"];
 
 /// Classify a bucket key into its unbounded family, or `None` when the key is
 /// a bounded static one (issue #1127).
 ///
 /// The returned name is the prefix without its `:` separator
-/// (`"dyn-rate"` / `"start-throttle"`) and is bounded by construction, so it is
-/// safe to use as a metric label — unlike the key itself.
+/// (`"dyn-rate"` / `"start-throttle"`). It is bounded by construction, so it
+/// is safe as a metric label, unlike the key itself.
 #[must_use]
 pub fn unbounded_rate_limit_key_family(key: &str) -> Option<&'static str> {
     UNBOUNDED_RATE_LIMIT_KEY_PREFIXES
@@ -10757,21 +10702,19 @@ pub fn unbounded_rate_limit_key_family(key: &str) -> Option<&'static str> {
 /// Maximum `DELETE` batches the idle-bucket sweep issues per shard per tick
 /// (issue #1127).
 ///
-/// A bounded budget per tick, mirroring
-/// [`crate::partition::SweepOptions::max_drops`]: the first sweep of a table
-/// that has been growing for months must not turn one janitor tick into an
-/// open-ended delete loop holding a pooled connection. Successive ticks
-/// converge — at the stock `batch_size` of 1000 this is 50k buckets per shard
-/// per tick.
+/// A bounded budget per tick, like
+/// [`crate::partition::SweepOptions::max_drops`]. The first sweep of a table
+/// that grew for months must not hold a pooled connection in an open-ended
+/// delete loop. Successive ticks converge. At the stock `batch_size` of 1000
+/// this is 50k buckets per shard per tick.
 pub const MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK: usize = 50;
 
 /// The shared candidate predicates behind the idle-bucket sweep and its
 /// dry-run preview (issue #1127), against the bucket table aliased `b`.
 ///
-/// Every safety guard lives here, and the reason each is evaluated inside the
-/// sweep's own statement rather than resolved by an earlier `SELECT` is that a
-/// bucket can be debited concurrently: predicates evaluated in a separate
-/// statement would already be stale by the time the delete ran.
+/// Every safety guard lives here. Each runs inside the statement of the sweep,
+/// not in an earlier `SELECT`, because a bucket can be debited concurrently.
+/// A predicate from a separate statement is stale by the time the delete runs.
 ///
 /// - **Family scope** — only the unbounded families
 ///   ([`UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`]). A bounded static key is not
@@ -10784,16 +10727,16 @@ pub const MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK: usize = 50;
 ///   ([`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]), and `created_at` covers a
 ///   bucket registered but never used. `GREATEST` ignores NULLs, so a
 ///   pre-#1127 row with no `last_registered_at` simply ages out on the others.
-/// - **No operator baseline** — a bucket whose permanent baseline an operator
-///   wrote through `POST /admin/rate-limits/{key}` (issue #332) carries
-///   `baseline_set_at` and is exempt: collecting it would revert a deliberate
-///   clamp to the code-declared rate the next time that key was used.
-/// - **Fullness** — effective available tokens at or above the effective burst,
-///   derived from the *same* [`effective_available_tokens_expr`] /
-///   [`effective_burst_expr`] the debit path uses, so the test can never drift
-///   from the math it protects. Deleting a partially drained bucket would hand
-///   out free capacity, because re-registration resets `tokens = burst`. With
-///   this, delete + re-register is token-neutral by construction.
+/// - **No operator baseline** — an operator baseline written through
+///   `POST /admin/rate-limits/{key}` (issue #332) sets `baseline_set_at`.
+///   Such a bucket is exempt. Collecting it reverts a deliberate clamp to the
+///   code-declared rate on the next use of the key.
+/// - **Fullness** — effective available tokens at or above the effective
+///   burst. The debit path uses the *same* [`effective_available_tokens_expr`]
+///   and [`effective_burst_expr`], so the test cannot drift from that math.
+///   Deleting a partially drained bucket would hand out free capacity,
+///   because re-registration resets `tokens = burst`. With this, delete +
+///   re-register is token-neutral by construction.
 /// - **No live override** — a TTL'd operator override (issue #945) would be
 ///   silently destroyed by a delete.
 /// - **No live dependent** — a non-terminal `harvest_task_queue` row or any
@@ -10836,44 +10779,41 @@ fn idle_rate_limit_bucket_predicates() -> String {
 /// - **`FOR UPDATE SKIP LOCKED`** — never block a concurrent claim's debit, and
 ///   never collect a bucket an in-flight enqueue has touched (the interlock
 ///   described on [`RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]). Postgres
-///   re-evaluates the row-local predicates against any version committed
-///   between the scan and the lock, so a bucket debited in that window is
-///   dropped from the batch rather than collected.
-/// - **`DELETE ... USING victims`** rather than `WHERE key IN (SELECT ...)`:
-///   the `LIMIT` blocks sublink pull-up, so the `IN` form lets the planner hash
-///   the subplan and sequentially scan the whole bucket table to apply it —
-///   measured at ~60% of a batch's cost on a 200k-row table, and unstable
-///   across sizes. The `USING` join is a deterministic primary-key lookup per
-///   victim, which also shortens how long the batch holds row locks that a
-///   concurrent debit must block on.
+///   re-evaluates the row-local predicates against a version committed between
+///   the scan and the lock. So a bucket debited in that window leaves the batch.
+/// - **`DELETE ... USING victims`** rather than `WHERE key IN (SELECT ...)`.
+///   The `LIMIT` blocks sublink pull-up. With the `IN` form, the planner
+///   hashes the subplan and scans the whole bucket table. That measured ~60% of
+///   a batch's cost on a 200k-row table, and was unstable across sizes. The
+///   `USING` join is one primary-key lookup per victim. It also shortens how
+///   long the batch holds row locks that a concurrent debit waits on.
 ///
 /// Takes a keyset cursor (`$3`, an exclusive lower bound on `key`) for the same
 /// reason the preview does, though not for the same failure.
 ///
-/// Deleting what it counted does let the sweep make progress without one — but
+/// Deleting what it counted does let the sweep make progress without one, but
 /// only past the rows it *removed*. Rows the predicates RETAIN stay where they
-/// are, so every batch re-walks the whole retained prefix ahead of its victims,
-/// re-evaluating the fullness arithmetic and both anti-joins over it, up to
-/// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`] times a tick (issue #1127, Codex
-/// review round 4). Measured with 200k retained buckets sorting ahead of 50k
-/// collectable ones: 6,737 ms for a 50-batch tick without the cursor, 2,622 ms
-/// with it, for the same 50,000 deletions — and the gap widens with the
-/// retained prefix, on exactly the large tables this pass exists to serve.
+/// are. So every batch re-walks the whole retained prefix ahead of its victims.
+/// It re-evaluates the fullness arithmetic and both anti-joins over it, up to
+/// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`] times a tick (issue #1127).
+/// The test had 200k retained buckets sorting ahead of 50k collectable ones.
+/// For the same 50,000 deletions, a 50-batch tick took 6,737 ms without the
+/// cursor and 2,622 ms with it. The gap widens with the retained prefix, on exactly
+/// the large tables this pass exists to serve.
 ///
-/// The cost is that a row skipped by `SKIP LOCKED` below the cursor waits for
-/// the next tick rather than the next batch, which is the right trade for a
-/// periodic best-effort pass.
+/// The cost: a row that `SKIP LOCKED` skips below the cursor waits for the
+/// next tick, not the next batch. That is the right trade for a periodic
+/// best-effort pass.
 ///
-/// The deletion is wrapped in a CTE so the statement can end in
-/// `SELECT ... ORDER BY key`, which is not decoration: a `DELETE ... RETURNING`
-/// has no defined row order, and the caller needs the page's boundary key to
-/// advance the cursor. Taking it in SQL rather than in Rust also makes the
+/// A CTE wraps the deletion so the statement can end in
+/// `SELECT ... ORDER BY key`. A `DELETE ... RETURNING` has no defined row
+/// order, and the caller needs the boundary key of the page to advance the
+/// cursor. Taking it in SQL rather than in Rust also makes the
 /// boundary obey the DATABASE's collation. Rust's `str` comparison is bytewise;
-/// a database in a locale-aware collation orders differently (under
+/// a database in a locale-aware collation orders differently. Under
 /// `en-US-x-icu`, `dyn-rate:t:a` sorts BEFORE `dyn-rate:t:B`, the reverse of
-/// their bytes), so a Rust-side `max()` could sit below the true boundary and
-/// hand the next page rows this one already returned (issue #1127, Codex review
-/// round 5).
+/// their bytes. So a Rust-side `max()` could sit below the true boundary and
+/// hand the next page rows that this one already returned (issue #1127).
 #[must_use]
 fn idle_rate_limit_bucket_sweep_sql() -> String {
     let predicates = idle_rate_limit_bucket_predicates();
@@ -10898,18 +10838,17 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
 /// The read-only twin of [`idle_rate_limit_bucket_sweep_sql`], used under
 /// `dry_run` (issue #1127).
 ///
-/// The same predicates by construction — both are rendered from
-/// [`idle_rate_limit_bucket_predicates`] — with no `FOR UPDATE` and no
-/// `DELETE`, so an operator can preview exactly what the pass would collect
-/// before letting it run. That affordance matters more here than for the
-/// sibling passes: this one is on by default and only destroys.
+/// Both render [`idle_rate_limit_bucket_predicates`], so the predicates are
+/// the same by construction. With no `FOR UPDATE` and no `DELETE`, an
+/// operator can preview what the pass would collect. That matters more here
+/// than for the sibling passes: this one is on by default and only destroys.
 ///
 /// Takes a keyset cursor (`$3`, an exclusive lower bound on `key`) that the
-/// sweep does not need. A real pass pages by *deleting* what it counted; a
-/// preview removes nothing, so without a cursor it would re-read the same first
-/// batch forever and could only ever forecast `batch_size` — under-reporting by
-/// up to [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]× against the pass it is
-/// supposed to predict (issue #1127, Codex review round 1 P2).
+/// sweep does not need. A real pass pages by *deleting* what it counted. A
+/// preview removes nothing. Without a cursor it would re-read the same first
+/// batch forever and could only forecast `batch_size`. It would under-report
+/// by up to [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]× against the pass it is
+/// supposed to predict (issue #1127).
 #[must_use]
 fn idle_rate_limit_bucket_preview_sql() -> String {
     let predicates = idle_rate_limit_bucket_predicates();
@@ -10924,16 +10863,15 @@ fn idle_rate_limit_bucket_preview_sql() -> String {
 
 /// Collect inert per-tenant rate-limit buckets on one shard (issue #1127).
 ///
-/// Deletes buckets in the unbounded key families that have been idle since
-/// `cutoff` and are provably safe to remove — see
-/// [`idle_rate_limit_bucket_predicates`] for each guard and why it is there.
-/// Returns the number collected per family (`"dyn-rate"` / `"start-throttle"`),
-/// which are bounded names safe to use as a metric label.
+/// Deletes buckets in the unbounded key families that are idle since `cutoff`
+/// and provably safe to remove. [`idle_rate_limit_bucket_predicates`] lists
+/// each guard and its reason. Returns the count per family (`"dyn-rate"` /
+/// `"start-throttle"`). Those names are bounded, so they are safe as a label.
 ///
-/// With `preview` set, nothing is deleted: the identical predicates are run as
-/// a read-only `SELECT`, paged by a keyset cursor over `key`, and the counts
-/// describe what a real pass *would* collect under the same per-tick budget.
-/// That is what `dry_run` uses.
+/// With `preview` set, nothing is deleted. The same predicates run as a
+/// read-only `SELECT`, paged by a keyset cursor over `key`. The counts give
+/// what a real pass *would* collect under the same per-tick budget.
+/// `dry_run` uses this.
 ///
 /// Shard-local by construction: it takes one shard's connection and every
 /// dependent it consults (`harvest_task_queue`, `harvest_start_throttle`) lives
@@ -10968,9 +10906,8 @@ pub async fn sweep_idle_rate_limit_buckets(
         idle_rate_limit_bucket_sweep_sql()
     };
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    // Keyset cursor over `key`, used by BOTH shapes: the preview would otherwise
-    // re-read its first batch forever, and the sweep would re-walk the retained
-    // prefix ahead of its victims once per batch.
+    // Both shapes use the cursor. Without it, the preview re-reads its first
+    // batch forever. The sweep re-walks the retained prefix once per batch.
     let mut cursor = String::new();
 
     for _ in 0..MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK {
@@ -10982,19 +10919,16 @@ pub async fn sweep_idle_rate_limit_buckets(
             .await
             .map_err(crate::error::database_error)?;
         let swept = rows.len();
-        // The LAST row, because both statements end in `ORDER BY key` and so
-        // hand back the page in the DATABASE's collation order. Deriving the
-        // boundary here instead — `rows.iter().max()` — would compare bytewise,
-        // which is a different order under any locale-aware collation, and a
-        // boundary below the page's true end re-serves rows the next page
-        // already returned.
+        // The LAST row: both statements end in `ORDER BY key`, so the page
+        // comes in the collation order of the database. `rows.iter().max()`
+        // compares bytewise, which differs under a locale-aware collation.
+        // A boundary below the true end of the page re-serves rows.
         if let Some(last) = rows.last() {
             cursor.clone_from(&last.key);
         }
         for row in rows {
-            // A key that no longer classifies cannot happen (the SQL filters on
-            // the same prefix list), but counting it under a synthesised label
-            // would be worse than not counting it.
+            // The SQL filters on the same prefix list, so every key classifies.
+            // A synthesised label for a key that does not is worse than no count.
             if let Some(family) = unbounded_rate_limit_key_family(&row.key) {
                 *counts.entry(family.to_string()).or_insert(0) += 1;
             }
@@ -11260,20 +11194,18 @@ pub async fn sweep_terminal_tasks_into(
 }
 
 /// `WHERE` clause that excludes *unbounded* rate-limit key families from the
-/// per-key gauge sampler (issue #699 review, #1).
+/// per-key gauge sampler (issue #699).
 ///
-/// **Cardinality rule (ADR-0001 §7):** the per-key token/refill GAUGES are
-/// emitted with the bucket `key` as a metric LABEL. A caller-controlled /
-/// per-execution-resolved key family — dynamic per-key limits
-/// (`dyn-rate:{expr}:{tenant}`, #699) and start throttles
-/// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant
-/// input, so labelling by it would create one time-series per tenant. The
-/// idle-bucket GC (issue #1127) bounds the *table*, not this: a bucket still
-/// outlives its traffic by the GC's idle window, and a Prometheus series
-/// outlives the bucket that created it, so the cardinality argument is
-/// unchanged. Those families are excluded here; their per-tenant bucket state
-/// is observable via `GET /admin/rate-limits`, not metrics. Bounded static keys
-/// (bare activity names / author strings) keep their per-key gauges.
+/// **Cardinality rule (ADR-0001 §7):** the per-key token/refill GAUGES use
+/// the bucket `key` as a metric LABEL. Two key families embed unbounded
+/// tenant input: dynamic per-key limits (`dyn-rate:{expr}:{tenant}`, #699)
+/// and start throttles (`start-throttle:{workflow}:{tenant}`, #607).
+/// Labelling by them creates one time-series per tenant. The idle-bucket GC
+/// (issue #1127) bounds the *table*, not the series. A bucket outlives its
+/// traffic by the idle window of the GC. A Prometheus series outlives its
+/// bucket. So the cardinality argument still holds. This filter excludes those
+/// families. `GET /admin/rate-limits` shows their per-tenant state. Bounded
+/// static keys (bare activity names / author strings) keep their gauges.
 pub const RATE_LIMIT_GAUGE_SAMPLER_FILTER: &str =
     "WHERE key NOT LIKE 'dyn-rate:%' AND key NOT LIKE 'start-throttle:%'";
 
@@ -11292,7 +11224,7 @@ pub struct RateLimitBucketSample {
 }
 
 /// Sample all *bounded-key* rate-limit buckets on one shard for the per-key gauge
-/// sampler (issue #699 review, #1).
+/// sampler (issue #699).
 ///
 /// Deliberately excludes the unbounded per-tenant key families
 /// ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`]) so a resolved per-tenant key can never
@@ -11300,9 +11232,9 @@ pub struct RateLimitBucketSample {
 /// ([`crate::worker`]'s rate-limit sampler) aggregates across shards and forwards
 /// each row's `key` to the token/refill gauges.
 ///
-/// Projects the *effective* refill rate/tokens (issue #945) -- a bucket under a
-/// live TTL'd override reports the override's values here, not the declared
-/// baseline, so this gauge reflects what dispatch is actually enforcing.
+/// Projects the *effective* refill rate/tokens (issue #945). A bucket under a
+/// live TTL'd override reports the override values, not the baseline. So the
+/// gauge shows what dispatch enforces.
 ///
 /// # Errors
 ///
@@ -11326,11 +11258,9 @@ pub async fn sample_rate_limit_buckets(
 
 /// Bound on representative task/execution ids returned per queue.
 ///
-/// Used by [`pending_queue_demand_by_queue_name`] (issue #774 AC3), mirroring
-/// [`crate::execution::REACHABILITY_SAMPLE_CAP`]'s pattern with a *separate*
-/// constant deliberately not shared across the two unrelated domains — a
-/// future change to the workflow-reachability cap must not silently also
-/// change the queue-coverage cap.
+/// Used by [`pending_queue_demand_by_queue_name`] (issue #774 AC3). It follows
+/// [`crate::execution::REACHABILITY_SAMPLE_CAP`] but is a *separate* constant.
+/// A change to the workflow-reachability cap must not also change this cap.
 pub const QUEUE_COVERAGE_SAMPLE_CAP: usize = 5;
 
 /// One queue's fleet-wide `PENDING` demand on a single shard: how many tasks
@@ -11354,30 +11284,25 @@ pub struct PendingQueueDemand {
 /// The `pending_queue_demand_by_queue_name` query — extracted so the real
 /// call site and the sample-cap drift guard test share one source of truth.
 ///
-/// Deliberately **not** [`claimable_pending_demand_query`]: this is the
-/// literal, unfiltered "does anything have PENDING work on this queue" signal
-/// issue #774 asks for (queue coverage), not the claim-eligible-right-now
-/// signal `claimable_pending_demand_by_queue` computes for worker-capacity
-/// concerns (issue #522/#531/#742, explicitly out of scope here). Filtering
-/// by concurrency cap / rate-limit / `schedule_to_close` expiry would hide a
-/// genuinely-uncovered queue behind an unrelated, separately-alerted
-/// condition.
+/// Deliberately **not** [`claimable_pending_demand_query`]. Issue #774 asks
+/// for the unfiltered "does this queue have PENDING work" signal, for queue
+/// coverage. `claimable_pending_demand_by_queue` computes claim eligibility
+/// for worker capacity (issues #522/#531/#742, out of scope here). A filter on
+/// concurrency cap, rate limit or `schedule_to_close` expiry would hide an
+/// uncovered queue behind an unrelated condition with its own alert.
 ///
-/// Samples are drawn via a `LEFT JOIN LATERAL ... LIMIT N`, **not** a full
-/// `ARRAY_AGG(...)[1:N]` slice (issue #774 review): the `[1:N]` form only
-/// bounds the *returned* array — Postgres must still materialize a
-/// transition array covering every `PENDING` row in the queue before
-/// slicing it, so a heavily stranded queue (exactly the failure mode this
-/// operational gate exists to surface) would make the query's memory use
-/// scale with the full backlog. A `LIMIT`-bounded lateral subquery lets the
-/// planner use a bounded top-N heap sort instead, so per-queue sampling
-/// work stays proportional to `QUEUE_COVERAGE_SAMPLE_CAP`, not to backlog
-/// size. Each lateral subquery mirrors the original ordering/filtering
-/// exactly: `sample_task_ids` takes the first `QUEUE_COVERAGE_SAMPLE_CAP`
-/// pending rows by `(scheduled_at, id)`; `sample_execution_ids` takes the
-/// first `QUEUE_COVERAGE_SAMPLE_CAP` *non-null* `workflow_exec_id`s in that
-/// same order (a task row can have a `NULL` `workflow_exec_id`, so this is
-/// filtered independently rather than derived from the task sample).
+/// Samples come from a `LEFT JOIN LATERAL ... LIMIT N`, **not** an
+/// `ARRAY_AGG(...)[1:N]` slice (issue #774). The `[1:N]` form bounds only
+/// the *returned* array. Postgres still builds an array of every `PENDING`
+/// row in the queue before the slice. A heavily stranded queue is the failure
+/// this gate exists to surface, and its memory use would scale with the
+/// backlog. A `LIMIT`-bounded lateral subquery allows a bounded top-N heap
+/// sort. So sampling work scales with `QUEUE_COVERAGE_SAMPLE_CAP`, not the
+/// backlog. `sample_task_ids` takes the first `QUEUE_COVERAGE_SAMPLE_CAP`
+/// pending rows by `(scheduled_at, id)`. `sample_execution_ids` takes the first
+/// `QUEUE_COVERAGE_SAMPLE_CAP` *non-null* `workflow_exec_id`s in that order.
+/// A task row can have a `NULL` `workflow_exec_id`, so that sample is filtered
+/// on its own, not derived from the task sample.
 #[must_use]
 pub const fn pending_queue_demand_query() -> &'static str {
     "SELECT q.queue_name, \
@@ -11510,7 +11435,7 @@ pub async fn pending_queue_demand_by_queue_name(
 /// only ever runs for a candidate that already cleared the concurrency
 /// gate.
 ///
-/// A fourth bug, also caught in this session's review (Codex): the batch
+/// A fourth bug, also caught in this session's review: the batch
 /// scan's `schedule_to_close_at > NOW()` filter uses `NOW()`, frozen at
 /// transaction start. A deadline that passes in REAL time while an
 /// earlier candidate is still being tried would incorrectly still read
@@ -12626,9 +12551,9 @@ mod tests {
 
     /// `GET /admin/concurrency` is a `free_form` contract route, so the
     /// `contract_regression` cross-check cannot catch a drift in this shape.
-    /// Pin it here: a sampler-shaped row (no registry, so no attribution) must
-    /// serialize byte-identically to the pre-#811 wire form, and an
-    /// admin-shaped row must carry the strategy an operator reads.
+    /// So this test pins it. A sampler-shaped row has no registry and no
+    /// attribution, and must serialize byte-identically to the pre-#811 form.
+    /// An admin-shaped row must carry the strategy an operator reads.
     #[test]
     fn concurrency_key_stats_serializes_workflows_only_when_populated() {
         let sampler_shaped = ConcurrencyKeyStats {
@@ -12708,21 +12633,19 @@ mod tests {
         );
     }
 
-    /// The attribution query must select exactly the same live rows the stats
-    /// query counts, or a key could report a workflow it has no live task for
-    /// (or omit the one it does). Pin the shared predicate textually — the two
-    /// are separate `sql_query` strings that can silently drift.
+    /// The attribution query must select the same live rows the stats query
+    /// counts. Otherwise a key can report a workflow with no live task, or
+    /// omit a workflow that has one. The two are separate `sql_query` strings that can drift, so
+    /// this test pins the shared predicate textually.
     #[test]
     fn concurrency_attribution_query_matches_the_stats_row_filter() {
-        // The two are separate `sql_query` string literals, so they are free to
-        // drift. Assert the shared predicate fragments are present in BOTH --
-        // checking only the attribution side would pass even if the STATS side
-        // changed, which is exactly the drift this guard exists to catch.
+        // Check BOTH sides. A check of only the attribution side passes when
+        // the STATS side drifts, which is the drift this guard catches.
         //
-        // The attribution query aliases `harvest_task_queue` as `t` (it joins
-        // the executions table), so strip that alias before comparing; the
-        // predicates are otherwise character-identical. Fragment-level rather
-        // than whole-statement so reformatting is not brittle.
+        // The attribution query aliases `harvest_task_queue` as `t`, so strip
+        // that alias first. The predicates are otherwise character-identical.
+        // Fragments, not whole statements, so reformatting does not break the
+        // test.
         let stats = CONCURRENCY_STATS_SQL.replace("t.", "");
         let attribution = CONCURRENCY_ATTRIBUTION_SQL.replace("t.", "");
         for fragment in [
@@ -12741,10 +12664,8 @@ mod tests {
             );
         }
 
-        // Both must group by the same key dimensions, or a key could report a
-        // workflow it has no live task for (or omit the one it does). The
-        // attribution query adds `workflow_name` (that is the whole point), so
-        // assert the shared prefix rather than equality.
+        // Both must group by the same key dimensions. The attribution query
+        // adds `workflow_name`, so assert the shared prefix, not equality.
         assert!(stats.contains("GROUP BY concurrency_key, task_type"));
         assert!(
             attribution.contains("GROUP BY concurrency_key, task_type, e.workflow_name"),
@@ -12754,10 +12675,9 @@ mod tests {
 
     // ── Issue #774: queue coverage — pending-demand query ───────────────────
 
-    /// The hot query embeds two `LEFT JOIN LATERAL ... LIMIT N` sample
-    /// subqueries (task ids, execution ids); both must stay bound to
-    /// `QUEUE_COVERAGE_SAMPLE_CAP` since Diesel `sql_query` cannot
-    /// interpolate the const directly.
+    /// The query has two `LEFT JOIN LATERAL ... LIMIT N` sample subqueries.
+    /// Both must stay bound to `QUEUE_COVERAGE_SAMPLE_CAP`, because the const
+    /// is not interpolated into the literal.
     #[test]
     fn pending_queue_demand_sql_sample_limits_match_the_cap() {
         let sql = pending_queue_demand_query();
@@ -12772,15 +12692,12 @@ mod tests {
         );
     }
 
-    /// Regression guard for the review-flagged unbounded
-    /// `ARRAY_AGG(...)[1:N]` pattern (issue #774 review): a `[1:N]` slice
-    /// only bounds the *returned* array, not the transition-array memory
-    /// Postgres must first build over every `PENDING` row in the queue --
-    /// exactly the failure mode (a queue stranded with thousands of
-    /// unclaimed tasks) this operational gate exists to surface. Each
-    /// sample must come from its own `LIMIT`-bounded lateral subquery
-    /// instead, so a `LEFT JOIN LATERAL` (not a bare `ARRAY_AGG` slice) is
-    /// what actually appears in the query.
+    /// Regression guard for the unbounded `ARRAY_AGG(...)[1:N]` pattern
+    /// (issue #774). A `[1:N]` slice bounds only the *returned* array.
+    /// Postgres still builds the array over every `PENDING` row in the queue.
+    /// A queue stranded with thousands of tasks is the failure this gate
+    /// surfaces. So each sample must come from a `LIMIT`-bounded
+    /// `LEFT JOIN LATERAL` subquery.
     #[test]
     fn pending_queue_demand_sql_bounds_samples_via_lateral_limit_not_full_array_agg() {
         let sql = pending_queue_demand_query();
@@ -12813,17 +12730,16 @@ mod tests {
     // ── Queue pause: claim gate + its mirrors (issue #619) ──────────────────
 
     /// The hot claim path pre-filters `harvest_queue_pauses` into one small
-    /// array (`paused_queues`, evaluated once via `MATERIALIZED`) instead of
-    /// embedding the shared `queue_pause_anti_join` literal, which the
-    /// planner was re-probing once per *candidate row* rather than once per
-    /// claim — see the `NOTE` above `claim_task_query` and
-    /// `docs/performance.md` for the measured buffer cost this replaced.
+    /// array, `paused_queues`, evaluated once via `MATERIALIZED`. The shared
+    /// `queue_pause_anti_join` literal made the planner re-probe once per
+    /// *candidate row*, not once per claim. The `NOTE` above
+    /// `claim_task_query` and `docs/performance.md` give the measured cost.
     ///
     /// This is therefore a deliberate, evidence-backed exception to "every
-    /// mirror embeds the shared predicate verbatim" — pinned to the new shape
-    /// (not the old literal) so a future refactor can't silently regress back
-    /// to the per-row form without this test catching the shape change, and
-    /// so a reviewer sees exactly what invariant replaces the drift-lock.
+    /// mirror embeds the shared predicate verbatim". The test pins the new
+    /// shape, not the old literal. So a future refactor cannot silently go back
+    /// to the per-row form without this test catching the shape change. A
+    /// reviewer also sees exactly what invariant replaces the drift-lock.
     #[test]
     fn claim_query_excludes_every_paused_queue_via_a_prefiltered_array() {
         let sql = claim_task_query();
@@ -12851,9 +12767,9 @@ mod tests {
         );
     }
 
-    /// Both queries that document "mirrors every claim-time gate" must mirror
-    /// the pause gate too — otherwise a deliberately-held backlog surfaces as
-    /// unmet demand / a stale oldest-pending age and drives a false alert.
+    /// Both queries that "mirror every claim-time gate" must mirror the pause
+    /// gate too. Otherwise a held backlog shows as unmet demand or a stale
+    /// oldest-pending age, and drives a false alert.
     #[test]
     fn claim_gate_mirrors_carry_the_queue_pause_predicate() {
         assert!(
@@ -12907,12 +12823,11 @@ mod tests {
     /// The per-activity pause gate must use the same pre-filtered-array shape
     /// the queue gate was rewritten to, never a per-row correlated subquery.
     ///
-    /// The `NOTE` above [`claim_task_query`] records that the correlated form
-    /// accounted for ~99% of this query's buffer touches at a 10k-row backlog,
-    /// because the planner re-probes the pause table once per *candidate row*
-    /// walked while sorting toward `LIMIT 1`. An activity pause is enforced on
-    /// the same scan, so it inherits the same cost model — and the same
-    /// prohibition.
+    /// The `NOTE` above [`claim_task_query`] records the cost of the
+    /// correlated form: ~99% of buffer touches at a 10k-row backlog. The
+    /// planner re-probes the pause table once per *candidate row* on the way
+    /// to `LIMIT 1`. An activity pause runs on the same scan, so the same cost
+    /// and the same prohibition apply.
     #[test]
     fn claim_query_excludes_paused_activities_via_a_prefiltered_array() {
         let sql = claim_task_query();
@@ -12980,21 +12895,20 @@ mod tests {
             1,
             "the by-id form has one candidate scan"
         );
-        // The probe must stay a PLAIN read. A shared row lock here would make
-        // every claim in the fleet a `MultiXactId` producer on the single
-        // one-row-per-shard table; the barrier comes from `bump_generation`'s
-        // ACCESS EXCLUSIVE table lock conflicting with the ACCESS SHARE this
-        // read takes implicitly. See `claim_task_query_fenced`.
+        // The probe must stay a PLAIN read. A shared row lock would make every
+        // claim in the fleet a `MultiXactId` producer on the one-row-per-shard
+        // table. The barrier is the ACCESS EXCLUSIVE lock of `bump_generation`,
+        // which conflicts with the implicit ACCESS SHARE of this read. See
+        // `claim_task_query_fenced`.
         assert!(
             !fenced.contains("FOR SHARE"),
             "the fence probe must not take a row lock: {fenced}"
         );
     }
 
-    /// Undoing the splice must leave the original query untouched — i.e. the
-    /// two strings really are the same query, so every other guarantee proved
-    /// about `claim_task_query()` (pause gates, build routing, ordering)
-    /// transfers to the fenced form for free.
+    /// Undoing the splice must give back the original query. Then every
+    /// guarantee proved for `claim_task_query()` (pause gates, build routing,
+    /// ordering) also holds for the fenced form.
     #[test]
     fn fenced_claim_query_preserves_every_unfenced_gate() {
         let base = claim_task_query();
@@ -13353,15 +13267,13 @@ mod tests {
     ///
     /// `harvest_task_queue.activity_name` is `Nullable<Text>`: workflow tasks
     /// carry `NULL`. In SQL, `NULL = ANY(array)` is `NULL`, and `NOT NULL` is
-    /// `NULL` — which is not `TRUE`, so a bare
-    /// `NOT (activity_name = ANY(paused))` silently filters out **every
-    /// workflow task in the fleet** the instant any one activity is paused.
-    /// That is a total orchestration outage produced by a surgical containment
-    /// control — the exact inverse of this feature's purpose.
+    /// `NULL`, which is not `TRUE`. So a bare `NOT (activity_name = ANY(paused))`
+    /// filters out **every workflow task in the fleet** once one activity is
+    /// paused. A surgical containment control then causes a total outage.
     ///
-    /// The `$6` capability-miss gate already defends against this with a
-    /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
-    /// pins the same defence onto the pause gate so it can never be dropped.
+    /// The `$6` capability-miss gate has a
+    /// `task_type != 'activity' OR activity_name IS NULL` prefix against this.
+    /// This test pins the same defence onto the pause gate.
 
     #[test]
     fn claim_query_activity_pause_gate_never_holds_workflow_tasks() {
@@ -13396,10 +13308,10 @@ mod tests {
         );
     }
 
-    /// Both queries that document "mirrors every claim-time gate" must mirror
-    /// the activity-pause gate too, or a deliberately-held backlog surfaces as
-    /// unmet demand / a stale oldest-pending age and drives a false capacity
-    /// alert during exactly the incident the hold exists for.
+    /// Both queries that "mirror every claim-time gate" must mirror the
+    /// activity-pause gate too. Otherwise a held backlog shows as unmet demand
+    /// or a stale oldest-pending age. That drives a false capacity alert during
+    /// the incident the hold exists for.
     #[test]
     fn claim_gate_mirrors_carry_the_activity_pause_predicate() {
         assert!(
@@ -13413,12 +13325,11 @@ mod tests {
                 .contains(&crate::activity_pause::activity_pause_anti_join("tq")),
             "claimable_pending_demand_by_queue must mirror the activity-pause gate"
         );
-        // Pin the `task_type` scoping explicitly, not just via the renderer:
-        // these are read paths with no behavioural test asserting their
-        // predicate shape, so a contributor "simplifying" the guard away (on
-        // the mistaken belief that a workflow row's `activity_name` is always
-        // NULL) would otherwise reintroduce the `mixed_signal_suspension`
-        // sentinel hazard here with CI still green.
+        // Pin the `task_type` scoping explicitly, not only via the renderer.
+        // No behavioural test asserts the predicate shape of these read paths.
+        // A workflow row's `activity_name` is not always NULL. Removing the
+        // guard brings back the `mixed_signal_suspension` sentinel hazard,
+        // with CI still green.
         let scoping = format!(
             "task_type = '{}'",
             crate::activity_pause::ACTIVITY_TASK_TYPE
@@ -13435,22 +13346,19 @@ mod tests {
 
     // ── Per-key concurrency: claim gate + its recheck (issue #247) ──────────
 
-    /// The candidate-side concurrency gate must resolve via the pre-filtered
+    /// The candidate-side concurrency gate must use the pre-filtered
     /// `concurrency_running_counts` lookup, never the old per-row correlated
-    /// `COUNT(*)` subquery -- see the `NOTE` above `claim_task_query` for the
-    /// measured cost (`docs/performance.md`'s per-gate cost table: +644% even
-    /// with contention deliberately minimised, since a candidate-side subquery
-    /// re-runs once per row the sort walks toward `LIMIT 1`) that motivated
-    /// the rewrite.
+    /// `COUNT(*)` subquery. The `NOTE` above `claim_task_query` gives the
+    /// measured cost: +644% in `docs/performance.md`, even at low contention.
+    /// A candidate-side subquery re-runs once per row the sort walks toward
+    /// `LIMIT 1`.
     ///
-    /// The `claimed` CTE's own authoritative, advisory-lock-guarded recheck is
-    /// deliberately NOT rewritten (see the `NOTE`): it already runs at most
-    /// once per claim, so a single, fresh, serializable-under-the-lock read is
-    /// both cheap and correctness-critical there -- reusing the pre-filtered
-    /// snapshot instead would let a race the advisory lock exists to close
-    /// slip through on a stale count. This test pins that the recheck remains
-    /// the untouched correlated form, so a future refactor cannot silently
-    /// collapse the two into one shared (and no-longer-fresh) lookup.
+    /// The advisory-lock-guarded recheck in the `claimed` CTE is NOT
+    /// rewritten (see the `NOTE`). It runs at most once per claim, so one
+    /// fresh read under the lock is cheap and correctness-critical. A reuse of
+    /// the pre-filtered snapshot would give a stale count. That would let
+    /// through the race the advisory lock exists to close. This test pins the recheck to the
+    /// correlated form, so a refactor cannot merge the two lookups.
     #[test]
     fn claim_query_concurrency_gate_matches_the_authoritative_recheck() {
         let sql = claim_task_query();
@@ -13510,11 +13418,9 @@ mod tests {
              must be gone from the candidate scan entirely; got:\n{sql}"
         );
 
-        // The `claimed` CTE's authoritative recheck is a SEPARATE,
-        // deliberately-untouched, single-row re-evaluation -- pinned here so
-        // a future refactor cannot silently fold it into the same
-        // pre-filtered (and therefore stale-by-the-time-the-lock-is-held)
-        // lookup the candidate scan uses above.
+        // The authoritative recheck in `claimed` is a SEPARATE single-row
+        // read. A refactor must not fold it into the pre-filtered lookup,
+        // which is stale by the time the lock is held.
         assert!(
             sql.contains(
                 "SELECT COUNT(*) FROM harvest_task_queue recheck \
@@ -13535,12 +13441,10 @@ mod tests {
         );
     }
 
-    /// The concurrency-key gate must appear exactly once in the pre-filter
-    /// scan and exactly once in the authoritative recheck -- two occurrences
-    /// of `concurrency_running_counts`/`concurrency_pending_keys` total (one
-    /// CTE definition plus one reference each), mirroring
-    /// `queue_pause_gate_appears_once_in_the_claim_candidate_scan`'s "no
-    /// accidental duplication" intent for this gate's two-CTE shape.
+    /// `concurrency_running_counts` and `concurrency_pending_keys` each appear
+    /// twice: one CTE definition and one reference.
+    /// Like `queue_pause_gate_appears_once_in_the_claim_candidate_scan`, this
+    /// guards against accidental duplication.
     #[test]
     fn concurrency_gate_ctes_are_defined_and_referenced_exactly_once_each() {
         let sql = claim_task_query();
@@ -14944,12 +14848,13 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_none_unresolved_is_distinct_from_empty_string_tenant() {
-        // Regression (issue #699 review, Codex round-5 P2): `None` (the key
-        // expression could NOT be resolved -- missing / null / non-object input)
-        // must NOT share a bucket with `Some("")` (a legitimately-resolved
-        // empty-string tenant). The previous `.unwrap_or_default()` at the call
-        // site collapsed both onto the same `L0:` bucket, cross-throttling
-        // malformed/missing executions against a real empty tenant.
+        // Regression (issue #699): `None` must NOT share a bucket with
+        // `Some("")`. `None` means the key expression could NOT be resolved
+        // (missing / null / non-object input). `Some("")` is a
+        // legitimately-resolved empty-string tenant. The previous
+        // `.unwrap_or_default()` at the call site collapsed both onto the same
+        // `L0:` bucket. That cross-throttled malformed/missing executions
+        // against a real empty tenant.
         let unresolved = dynamic_rate_bucket_key("input.tenant_id", None);
         // The unresolved fallback encodes with the distinct `U` marker.
         assert_eq!(unresolved, "dyn-rate:L9:tenant_id:U");
@@ -14974,11 +14879,10 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_is_injective_across_colon_containing_components() {
-        // Regression (issue #699 review, Codex P2): before the self-delimiting
-        // length-tagged component encoding, a `:` inside `key_expr` (a dot-path
-        // can address a JSON key containing `:`) or inside `resolved` could
-        // collide two genuinely distinct `(expr, resolved)` pairs onto one
-        // bucket string. Both of these used to flatten to `dyn-rate:a:b:c`.
+        // Regression (issue #699): before the length-tagged encoding, a `:` in
+        // `key_expr` or `resolved` could collide two distinct pairs onto one
+        // bucket string. A dot-path can address a JSON key that contains `:`.
+        // Both of these used to flatten to `dyn-rate:a:b:c`.
         assert_eq!(
             dynamic_rate_bucket_key("a", Some("b:c")),
             "dyn-rate:L1:a:L3:b:c"
@@ -14995,12 +14899,11 @@ mod tests {
 
     #[test]
     fn bound_key_component_literal_never_collides_with_a_hash_encoding() {
-        // Regression (issue #699 review, Codex P2): the `L`/`H` first-byte tags
-        // make the literal and hash encodings structurally disjoint. A short
-        // literal whose *value* is exactly a hash's string encoding must NOT
-        // collide with that hash — the pre-fix `h:{digest}` hash form was itself
-        // a valid short literal, so a long value hashing to digest `D` and a
-        // short literal value equal to `h:{D}` produced the same component.
+        // Regression (issue #699): the `L`/`H` first-byte tags make the
+        // literal and hash encodings disjoint. A short literal equal to the
+        // string encoding of a hash must NOT collide with that hash. The old
+        // `h:{digest}` hash form was itself a valid short literal. So a long
+        // value with digest `D` and the literal `h:{D}` gave the same component.
         let long = "x".repeat(300);
         let hash_form = bound_key_component(&long); // `H{64hex}` (long > 256)
         assert!(
@@ -15085,10 +14988,10 @@ mod tests {
 
     #[test]
     fn reserved_prefixes_match_the_collectable_families() {
-        // The GC may only collect namespaces that are RESERVED against static
-        // `rate_limit_key` squatting: a static key inside one would be
-        // collectable but re-registered only at worker startup, stranding every
-        // task enqueued in between behind the fail-closed claim gate.
+        // The GC may only collect namespaces RESERVED against static
+        // `rate_limit_key` squatting. Only worker startup re-registers a
+        // static key. Collecting one strands every task enqueued in between
+        // behind the fail-closed claim gate.
         assert_eq!(
             UNBOUNDED_RATE_LIMIT_KEY_PREFIXES,
             crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
@@ -15110,11 +15013,10 @@ mod tests {
 
     #[test]
     fn gauge_sampler_filter_excludes_exactly_the_collectable_families() {
-        // The gauge sampler's exclusion list and the GC's inclusion list are
-        // the SAME cardinality judgement (issue #699 review #1, issue #1127):
-        // a family in one and not the other would either grow a metric series
-        // per tenant forever or grow the table per tenant forever. Checked in
-        // BOTH directions, so "exactly" is what is actually asserted.
+        // The exclusion list of the gauge sampler and the inclusion list of
+        // the GC are the SAME cardinality judgement (issues #699, #1127).
+        // A family in only one list grows a metric series or a table row per
+        // tenant forever. The check runs in BOTH directions.
         for prefix in UNBOUNDED_RATE_LIMIT_KEY_PREFIXES {
             assert!(
                 RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains(&format!("NOT LIKE '{prefix}%'")),
@@ -15142,9 +15044,9 @@ mod tests {
 
     #[test]
     fn unbounded_rate_limit_key_family_rejects_bounded_static_keys() {
-        // A bare activity name / author-supplied static key is BOUNDED (one
-        // per registered activity) and is re-registered only at worker
-        // startup, so it must never be classified as collectable.
+        // A bare activity name or static key is BOUNDED, one per registered
+        // activity. Only worker startup re-registers it, so it is never
+        // collectable.
         assert_eq!(unbounded_rate_limit_key_family("send_email"), None);
         assert_eq!(unbounded_rate_limit_key_family("billing.charge"), None);
         // Near-miss prefixes must not be swept up.
@@ -15168,9 +15070,9 @@ mod tests {
     #[test]
     fn idle_bucket_sweep_sql_guards_every_live_dependent() {
         let sql = idle_rate_limit_bucket_sweep_sql();
-        // A PENDING/RUNNING task referencing the bucket: both the claim-time
-        // gate and `try_consume_rate_limit_token` fail CLOSED on a missing row,
-        // so deleting one would strand the task with nothing to re-register it.
+        // A PENDING/RUNNING task that references the bucket. The claim-time
+        // gate and `try_consume_rate_limit_token` fail CLOSED on a missing
+        // row, so a delete strands the task with nothing to re-register it.
         // The whole fragment, not just the table name — an `EXISTS` in place of
         // `NOT EXISTS` inverts the guard while still mentioning the table.
         assert!(sql.contains(
@@ -15231,17 +15133,17 @@ mod tests {
 
     #[test]
     fn ensure_rate_limit_bucket_touches_only_a_stale_row() {
-        // The GC skips buckets locked by a concurrent ensure. `ON CONFLICT DO
-        // NOTHING` takes no lock on the existing row, so an enqueue whose
-        // transaction had not yet committed when the sweep took its snapshot
-        // could be stranded behind the fail-closed claim gate.
+        // The GC skips buckets that a concurrent ensure locks. `ON CONFLICT
+        // DO NOTHING` takes no lock on the existing row. So an enqueue that
+        // had not committed at the sweep snapshot can be stranded behind the
+        // fail-closed claim gate.
         //
         // The touch must be a CONDITIONAL `UPDATE`, never `ON CONFLICT DO
-        // UPDATE`: Postgres locks the conflicting row BEFORE evaluating a
-        // `DO UPDATE`'s `WHERE`, so even a no-op touch would hold an exclusive
-        // row lock for the whole decision transaction — stalling a concurrent
-        // claim's debit of the same bucket. A plain `UPDATE` locks only rows
-        // its qualification matches, so a fresh bucket is neither written nor
+        // UPDATE`. Postgres locks the conflicting row BEFORE it evaluates the
+        // `WHERE` of `DO UPDATE`. So even a no-op touch holds an exclusive row
+        // lock for the whole decision transaction. That stalls a concurrent
+        // debit of the bucket. A plain `UPDATE` locks only rows its
+        // qualification matches, so a fresh bucket is neither written nor
         // locked.
         let sql = ensure_rate_limit_bucket_sql();
         assert!(
@@ -15291,9 +15193,9 @@ mod tests {
             "the candidate selection must neither block a concurrent debit nor \
              collect a bucket an in-flight enqueue holds"
         );
-        // `DELETE ... USING`, not `WHERE key IN (SELECT ...)`: the LIMIT blocks
-        // sublink pull-up, so the IN form lets the planner hash the subplan and
-        // sequentially scan the whole bucket table per batch.
+        // `DELETE ... USING`, not `WHERE key IN (SELECT ...)`. The LIMIT
+        // blocks sublink pull-up. With the IN form, the planner hashes the
+        // subplan and scans the whole bucket table per batch.
         assert!(sql.contains("DELETE FROM harvest_rate_limit_buckets d USING victims v"));
         assert!(!sql.contains("WHERE key IN ("));
         assert!(
@@ -15319,10 +15221,10 @@ mod tests {
                 "the dry-run preview must not contain `{mutating}`"
             );
         }
-        // BOTH shapes page by keyset over the same ordering. The preview would
-        // otherwise re-read its first batch forever (it deletes nothing) and the
-        // sweep would re-walk its retained prefix once per batch, re-running the
-        // anti-joins over rows it has already decided to keep.
+        // BOTH shapes page by keyset over the same ordering. Otherwise the
+        // preview, which deletes nothing, re-reads its first batch forever.
+        // The sweep re-walks its retained prefix once per batch, and re-runs
+        // the anti-joins over rows it already keeps.
         for (label, sql) in [("preview", preview.as_str()), ("sweep", sweep.as_str())] {
             assert!(
                 sql.contains("AND b.key > $3"),
@@ -15333,11 +15235,10 @@ mod tests {
                 "the {label}'s cursor is only sound over that ordering"
             );
         }
-        // ...and each must HAND BACK its page in that order, so the caller takes
-        // the boundary from the last row. Deriving it in Rust instead would
-        // compare bytewise, a different order under any locale-aware database
-        // collation, and a boundary below the page's true end re-serves rows the
-        // next page already returned.
+        // ...and each must HAND BACK its page in that order, so the caller
+        // takes the boundary from the last row. Rust compares bytewise, which
+        // differs under a locale-aware collation. A boundary below the true end
+        // of the page re-serves rows.
         assert!(
             preview.trim_end().ends_with("LIMIT $2"),
             "the preview's ORDER BY/LIMIT is what orders its page: {preview}"
@@ -15479,13 +15380,10 @@ mod tests {
     fn effective_available_tokens_expr_composes_burst_and_refill_rate() {
         let rendered = effective_available_tokens_expr("b");
         assert!(rendered.starts_with("LEAST("));
-        // Contains both sub-expressions verbatim -- this is the drift-lock
-        // property every claim-gate/debit/refund/gauge SQL site relies on:
-        // any hand-copied occurrence of the burst formula or of the
-        // piecewise token-accrual formula must be an exact substring of what
-        // these two helpers independently render, or the containment
-        // assertions elsewhere (which mirror the actual SQL sites) would
-        // fail.
+        // Contains both sub-expressions verbatim. Every claim-gate, debit,
+        // refund and gauge SQL site relies on this drift-lock. The containment
+        // assertions elsewhere fail unless each copy of the burst or accrual
+        // formula is an exact substring of what these helpers render.
         assert!(rendered.contains(&effective_burst_expr("b")));
         assert!(rendered.contains(&token_accrual_expr("b")));
         assert_eq!(
@@ -15503,47 +15401,40 @@ mod tests {
 
     #[test]
     fn token_accrual_expr_splits_accrual_at_the_override_expiry_not_the_whole_interval() {
-        // The bug this formula fixes (issue #945 review, P1): a naive
-        // `elapsed * effective_refill_rate` applies "whichever rate is
-        // effective right now" to the WHOLE elapsed interval, so an override
-        // that expired partway through the interval retroactively refills at
-        // the (now-reverted) baseline rate for the portion it was still
-        // supposed to be throttling. The fix must be genuinely piecewise:
-        // segment 1 accrues at the override's rate (if any) only up to the
-        // earlier of "now" and the override's expiry; segment 2 accrues at
-        // the *always-baseline* rate -- never a CASE-WHEN-on-expiry rate --
-        // for whatever remains after that boundary.
+        // The bug this formula fixes (issue #945): a naive
+        // `elapsed * effective_refill_rate` applies the current rate to the
+        // WHOLE elapsed interval. An override that expired partway through
+        // then refills at the baseline rate for time it still throttled.
+        // The fix is piecewise. Segment 1 accrues at the override's rate up to
+        // the earlier of now and the expiry. Segment 2 accrues at the
+        // *always-baseline* rate after that boundary, with no CASE on expiry.
         let rendered = token_accrual_expr("b");
 
-        // Segment 1's boundary collapses to `last_refilled_at` when there is
-        // no override (`COALESCE(b.override_expires_at, b.last_refilled_at)`),
-        // which is what makes an unset override degenerate segment 1 to zero
-        // duration rather than double-counting the interval.
+        // With no override, the boundary of segment 1 collapses to
+        // `last_refilled_at`. So segment 1 has zero duration and the interval
+        // is not counted twice.
         assert!(
             rendered.contains("LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW())"),
             "segment 1 must be bounded by the override's expiry (or, absent \
              one, last_refilled_at) rather than the whole elapsed interval; \
              got:\n{rendered}"
         );
-        // Segment 1 accrues at the override's rate when active.
         assert!(
             rendered.contains("COALESCE(b.override_refill_rate, b.refill_rate)"),
             "segment 1 must accrue at the override's rate when one is set; \
              got:\n{rendered}"
         );
-        // Segment 2 accrues at the plain baseline rate -- critically, NOT a
-        // `CASE WHEN override_expires_at > NOW()` conditional, since the
-        // whole point of segment 2 is "the portion of the interval AFTER
-        // the override lapsed always used the baseline rate."
+        // Segment 2 accrues at the plain baseline rate, NOT behind a
+        // `CASE WHEN override_expires_at > NOW()`. Segment 2 is the time
+        // after the override lapsed, which always used the baseline rate.
         assert!(
             rendered.ends_with("* b.refill_rate"),
             "segment 2 must accrue at the plain baseline rate with no \
              conditional wrapping; got:\n{rendered}"
         );
-        // Both segments are floored at zero so a boundary ordering that
-        // would otherwise go negative (e.g. an override already expired
-        // before last_refilled_at) contributes nothing rather than
-        // subtracting from the other segment.
+        // Both segments are floored at zero. A negative segment, such as an
+        // override that expired before last_refilled_at, then adds nothing
+        // and does not subtract from the other segment.
         assert_eq!(
             rendered.matches("GREATEST(0, EXTRACT(EPOCH FROM").count(),
             2,
@@ -15554,10 +15445,9 @@ mod tests {
 
     #[test]
     fn effective_expr_helpers_qualify_by_the_given_alias() {
-        // The un-aliased single-table call sites (`try_consume_rate_limit_token`,
-        // `refund_rate_limit_token`, `sample_rate_limit_buckets`) qualify every
-        // column with the bare table name -- Postgres permits qualifying an
-        // UPDATE/SELECT target by its own name even without an explicit alias.
+        // The single-table call sites (`try_consume_rate_limit_token`,
+        // `refund_rate_limit_token`, `sample_rate_limit_buckets`) qualify each
+        // column with the bare table name. Postgres permits that with no alias.
         let rendered = effective_available_tokens_expr("harvest_rate_limit_buckets");
         assert!(rendered.contains("harvest_rate_limit_buckets.override_expires_at"));
         assert!(rendered.contains("harvest_rate_limit_buckets.tokens"));
@@ -15723,13 +15613,12 @@ mod tests {
 
     #[test]
     fn pacing_shards_disagree_active_but_diverged_baseline_disagrees() {
-        // Round-5 P2 (the finding this test locks in): both shards carry
-        // the SAME override -- refill_rate = 5.0 explicitly overridden,
-        // burst left unset (falls back to baseline) -- but a partial
-        // legacy `POST /admin/rate-limits/{key}` fan-out (issue #332) left
-        // shard B's persisted BASELINE burst diverged from shard A's. The
-        // raw override columns are byte-identical on both shards; only the
-        // *resolved effective* burst differs.
+        // Both shards carry the SAME override: refill_rate = 5.0 explicitly
+        // overridden, burst left unset (falls back to baseline). But a
+        // partial legacy `POST /admin/rate-limits/{key}` fan-out (issue #332)
+        // left shard B's persisted BASELINE burst diverged from shard A's.
+        // The raw override columns are byte-identical on both shards. Only
+        // the *resolved effective* burst differs.
         let shard_a = resolve_effective_rate_limit(
             50.0,
             20.0, // baseline burst
@@ -15747,11 +15636,10 @@ mod tests {
             Utc::now(),
         );
         assert_eq!(shard_a.override_active, shard_b.override_active);
-        // Raw override columns agree (both Some(5.0), None) -- a
-        // comparison over raw columns alone would report no disagreement.
-        // Exact f64 comparison is intentional: both sides fall back to a
-        // deliberately-diverged literal baseline burst (20.0 vs 30.0), not
-        // an arithmetic result subject to float imprecision.
+        // Raw override columns agree (both Some(5.0), None), so a comparison
+        // over raw columns alone reports no disagreement. Exact f64 comparison
+        // is intended. Both sides are literal baselines (20.0 vs 30.0), not
+        // arithmetic results.
         #[allow(clippy::float_cmp)]
         {
             assert_ne!(shard_a.burst, shard_b.burst); // 20.0 vs 30.0
@@ -15776,12 +15664,10 @@ mod tests {
 
     #[test]
     fn pacing_shards_disagree_ignores_inactive_rows_effective_values() {
-        // An inactive shard's `EffectiveRateLimit` reports the declared
-        // baseline (not an override), so two inactive shards with
-        // different baselines must NOT be flagged as "override
-        // disagreement" -- that is a pre-existing, out-of-scope legacy-POST
-        // baseline-consistency concern, not what this endpoint's
-        // incident-response "is my override consistent?" check answers.
+        // An inactive shard reports the declared baseline, not an override.
+        // So two inactive shards with different baselines are NOT an
+        // "override disagreement". Baseline consistency after a legacy POST is
+        // out of scope. This check answers "is my override consistent?".
         let a = EffectiveRateLimit {
             refill_rate: 5.0,
             burst: 10.0,
@@ -15833,10 +15719,10 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_bounds_oversized_expr_component() {
-        // Regression (issue #699 review, Codex P2): an unbounded expression (a
-        // very long dot-path, or a hand-built `ActivityInfo.rate_limit_key`)
-        // must not be able to overflow the composite btree PRIMARY KEY and abort
-        // the enqueue transaction. The expr component is now bounded/hashed too.
+        // Regression (issue #699): an unbounded expression must not overflow
+        // the btree PRIMARY KEY and abort the enqueue transaction. Examples
+        // are a long dot-path or a hand-built `ActivityInfo.rate_limit_key`.
+        // The expr component is now bounded/hashed too.
         let big_expr = "a".repeat(5000);
         let bounded = dynamic_rate_bucket_key(&big_expr, Some("acme"));
         // The expr component is the fixed-width hash `H{64hex}` (collision-
@@ -15999,10 +15885,10 @@ mod tests {
         );
     }
 
-    /// [`take_wake_requested`]'s SQL must read `wake_requested` under the row
-    /// lock and return the **pre-update** value, exactly like the park queries —
-    /// a plain `UPDATE ... RETURNING wake_requested` would return the
-    /// just-cleared `FALSE` and silently swallow every wake it exists to catch.
+    /// The SQL of [`take_wake_requested`] must read `wake_requested` under the
+    /// row lock and return the **pre-update** value, like the park queries.
+    /// A plain `UPDATE ... RETURNING wake_requested` returns the cleared
+    /// `FALSE`, and swallows every wake it exists to catch.
     #[test]
     fn take_wake_requested_query_captures_the_flag_before_clearing_it() {
         let sql = take_wake_requested_query();
@@ -16021,11 +15907,11 @@ mod tests {
             "must return the PRE-update value (from the candidate CTE), not the \
              just-cleared post-update value",
         );
-        // Deliberately NOT filtered on `state = 'RUNNING'` (unlike the park
-        // queries): this runs from inside the persist transaction against a row
-        // this worker already holds claimed, and on the reschedule sub-path it is
-        // called either side of the `RUNNING` -> `PENDING` transition. Scoped to
-        // workflow rows so it can never touch an activity task.
+        // Deliberately NOT filtered on `state = 'RUNNING'`, unlike the park
+        // queries. It runs in the persist transaction on a row this worker
+        // holds. The reschedule sub-path calls it on either side of the
+        // `RUNNING` -> `PENDING` transition. The workflow scope keeps it off
+        // activity tasks.
         assert!(
             sql.contains("task_type = 'workflow'"),
             "must be scoped to workflow task rows",
@@ -16107,7 +15993,7 @@ mod tests {
     /// Durable inline progress moves the frontier, so the budget it carried
     /// belongs to a handler the run no longer needs. Same reset the park path
     /// performs, at the other point a workflow task demonstrably advances
-    /// (issue #804, Codex round-20 P1).
+    /// (issue #804).
     #[test]
     fn inline_progress_reset_clears_both_capability_miss_columns() {
         let sql = reset_capability_misses_after_inline_progress_query();
@@ -16123,10 +16009,10 @@ mod tests {
         );
     }
 
-    /// The reset may only ever rewrite the row this dispatch still holds. A
-    /// concurrent poison-pill reclaim (or an operator action) can take the claim
-    /// mid-dispatch; refunding the budget on a row now owned by someone else
-    /// would hand a fresh budget to a frontier that never advanced.
+    /// The reset may only rewrite the row this dispatch still holds. A
+    /// poison-pill reclaim or an operator action can take the claim
+    /// mid-dispatch. A refund on a row that another worker owns gives a fresh
+    /// budget to a frontier that never advanced.
     #[test]
     fn inline_progress_reset_is_guarded_on_this_workers_claim() {
         let sql = reset_capability_misses_after_inline_progress_query();
@@ -16141,22 +16027,22 @@ mod tests {
     }
 
     /// Retiring a frontier must NOT clear the consecutive-failure strike
-    /// counters (issue #804, Codex round-24 P2 — declined, and pinned here so
-    /// the decline is enforced rather than only argued).
+    /// counters (issue #804). A proposal to clear them was declined. This test
+    /// enforces the decline, so that it is not only argued.
     ///
-    /// Every dispatch of a task that completes one local activity and then
-    /// kills its worker reaches this statement first, so a `crash_strikes = 0`
-    /// here would land on the crashing dispatch too.
-    /// `poison_pill::reclaim_orphaned_tasks` increments from the row's *current*
-    /// value, so the counter could never exceed `1` and the default
-    /// `poison_pill_threshold` of 3 would be unreachable — for the entire class
-    /// of poison that crashes after making some progress. The same holds for
-    /// #494's timeout strike and #782's panic strike, which live off-row but
-    /// are gated by the same `CapabilityMissPhase` rule.
+    /// A task can complete one local activity and then kill its worker. Each
+    /// such dispatch reaches this statement first. So a `crash_strikes = 0`
+    /// here would also land on the crashing dispatch.
+    /// `poison_pill::reclaim_orphaned_tasks` increments from the *current*
+    /// value of the row. The counter could then never exceed `1`. The default
+    /// `poison_pill_threshold` of 3 would be unreachable for poison that
+    /// crashes after some progress. The same holds for the timeout strike of
+    /// #494 and the panic strike of #782. They live off-row, but the same
+    /// `CapabilityMissPhase` rule gates them.
     ///
-    /// The counters are only ever preserved here, never incremented, so AC4
-    /// holds; genuine progress clears them by the intended route, the clean
-    /// continuation, which fires when the body carries forward to a suspension
+    /// This statement only preserves the counters, never increments them, so
+    /// AC4 holds. Real progress clears them by the intended route, the clean
+    /// continuation. That fires when the body carries forward to a suspension
     /// instead of stalling at a later frontier.
     #[test]
     fn inline_progress_reset_never_launders_a_crash_strike() {
@@ -16167,9 +16053,8 @@ mod tests {
              crash happens AFTER it, so zeroing here caps the counter at 1 for \
              any task that crashes post-progress: {sql}"
         );
-        // Belt and braces: the statement's whole SET clause is the two
-        // capability columns, so no other streak state can be swept in by a
-        // future edit either.
+        // Belt and braces: the whole SET clause is the two capability columns,
+        // so a future edit cannot sweep in other streak state.
         let set = sql
             .split("SET ")
             .nth(1)
@@ -16186,8 +16071,7 @@ mod tests {
     /// upserts on `worker_id` and refreshes `started_at`/`build_id`. But
     /// `capability_miss_workers` stores bare IDs, so the new — possibly capable
     /// — instance is indistinguishable from the old incapable one. Removing
-    /// exactly that ID on re-registration restores the truth (issue #804, Codex
-    /// round-26 P1).
+    /// exactly that ID on re-registration restores the truth (issue #804).
     #[test]
     fn registration_invalidates_only_that_workers_miss_evidence() {
         let sql = invalidate_capability_miss_evidence_for_worker_query();
@@ -16210,10 +16094,10 @@ mod tests {
 
     /// `capability_misses` is a true historical count of releases and backs the
     /// **ungated** absolute ceiling that bounds the release loop when no fleet
-    /// evidence is available. Decrementing it here would remove the only bound
-    /// that still applies to a worker crash-looping on the same incapable build
-    /// (which now clears its own evidence on every restart), turning a bounded
-    /// degradation into an unbounded release loop.
+    /// evidence is available. A worker can crash-loop on the same incapable
+    /// build, and it clears its own evidence on every restart. This count is
+    /// the only bound left for it. A decrement here makes the release loop
+    /// unbounded.
     #[test]
     fn registration_invalidation_never_refunds_the_release_budget() {
         let sql = invalidate_capability_miss_evidence_for_worker_query();
@@ -16234,10 +16118,9 @@ mod tests {
         );
     }
 
-    /// A worker only observes — and therefore may only invalidate evidence on —
-    /// the queues it actually polls. An unscoped statement would let a worker on
-    /// one queue hand a fresh `AllLiveWorkersMissed` reprieve to a task on a
-    /// queue it will never claim from.
+    /// A worker observes only the queues it polls, so it may invalidate
+    /// evidence only on those. An unscoped statement lets a worker give a fresh
+    /// `AllLiveWorkersMissed` reprieve to a task on a queue it never claims from.
     #[test]
     fn registration_invalidation_is_scoped_to_the_workers_queues() {
         let sql = invalidate_capability_miss_evidence_for_worker_query();
@@ -16248,15 +16131,16 @@ mod tests {
     }
 
     /// The one writer of these columns that is deliberately NOT ownership-
-    /// guarded, and must stay that way (issue #804, Codex round-27 P1).
+    /// guarded, and must stay that way (issue #804).
     ///
-    /// The row whose decision stale evidence poisons is precisely the one
-    /// another worker is *already processing*: it claimed before this restart,
-    /// so its snapshot still lists the old incapable instance. Adding a
+    /// Stale evidence poisons the decision of a row that another worker is
+    /// *already processing*. That worker claimed before this restart, so its
+    /// snapshot still lists the old incapable instance. Adding a
     /// `state = 'RUNNING' AND worker_id = ...` guard here — the reflex, since
-    /// every sibling writer has one — would skip exactly that row and leave the
-    /// round-26 terminal failure intact. The claim-vs-write race it creates is
-    /// answered on the read side instead, by `read_capability_miss_state`.
+    /// every sibling writer has one — would skip exactly that row. That worker
+    /// would still count the old instance as incapable and terminally fail the
+    /// run. The read side answers the claim-vs-write race instead, through
+    /// `read_capability_miss_state`.
     #[test]
     fn registration_invalidation_must_reach_rows_under_an_active_claim() {
         let sql = invalidate_capability_miss_evidence_for_worker_query();
@@ -16286,12 +16170,11 @@ mod tests {
     }
 
     /// The re-read must apply the row's counters only when they are evidence
-    /// about the handler this dispatch is actually stuck on (issue #804, Codex
-    /// round-46 P1).
+    /// about the handler this dispatch is actually stuck on (issue #804).
     ///
-    /// Doing the comparison in SQL rather than in the caller keeps it ATOMIC
-    /// with the read: the row cannot change frontier between deciding which
-    /// counters apply and reading them.
+    /// The comparison runs in SQL, not in the caller, so it is ATOMIC with the
+    /// read. The row cannot change frontier between the choice of counters and
+    /// the read.
     #[test]
     fn miss_state_read_is_keyed_to_the_frontier() {
         let sql = read_capability_miss_state_query();
@@ -16300,9 +16183,9 @@ mod tests {
             "the read must compare the row's recorded frontier against the one \
              this dispatch is missing: {sql}"
         );
-        // `IS DISTINCT FROM`, never `<>`: a NULL handler must read as a
-        // mismatch (a fresh budget), and `<> $3` is NULL -- neither branch --
-        // for a NULL left side.
+        // `IS DISTINCT FROM`, never `<>`. A NULL handler must read as a
+        // mismatch, which gives a fresh budget. For a NULL left side, `<> $3`
+        // is NULL, which takes neither branch.
         assert!(
             !sql.contains("capability_miss_handler <> $3")
                 && !sql.contains("capability_miss_handler != $3"),
@@ -16319,18 +16202,17 @@ mod tests {
 
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {
-        // `capability_misses` counts CONSECUTIVE misses: a task a capable
-        // worker has actually processed must start its next deploy with a full
-        // budget. Parking is the dominant success path for a workflow task
-        // (claim -> run a decision cycle -> suspend on an activity/timer/
-        // signal), and it is only ever reached AFTER the handler lookup in
-        // `process_workflow_task` succeeded — so a park is proof a capable
-        // worker handled this row.
+        // `capability_misses` counts CONSECUTIVE misses. A task that a capable
+        // worker processed must start its next deploy with a full budget.
+        // Parking is the main success path for a workflow task: claim, run a
+        // decision cycle, then suspend. A park comes only AFTER the handler
+        // lookup in `process_workflow_task` succeeds. So a park proves that a
+        // capable worker handled this row.
         //
-        // Without this, a long-lived execution that absorbed k misses during
-        // one deploy carries them forever and escalates after only `budget - k`
-        // misses during the next — failing a healthy run during a routine
-        // deploy, which is the exact outcome issue #804 exists to prevent.
+        // Without this, an execution that absorbed k misses in one deploy keeps
+        // them. It escalates after only `budget - k` misses in the next deploy.
+        // That fails a healthy run in a routine deploy, which issue #804
+        // exists to prevent.
         for sql in [
             park_workflow_task_query(true),
             park_workflow_task_sticky_query(true),
@@ -16350,9 +16232,8 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_is_ownership_guarded() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
@@ -16392,7 +16273,7 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_restores_the_attempt_only_before_the_handler() {
-        // Issue #804 Codex round-17 P2. `attempt` does double duty on a workflow
+        // Issue #804. `attempt` does double duty on a workflow
         // row: it is the retry budget AND the "is this the first dispatch?"
         // signal `record_workflow_started` reads. Restoring it is required when
         // nothing ran, and wrong once the start metric has already fired.
@@ -16425,20 +16306,19 @@ mod tests {
     }
 
     /// The release must report the cardinality **its own `UPDATE` produced**,
-    /// not the one the caller read beforehand (issue #804, Codex round-36 P2).
+    /// not the one the caller read beforehand (issue #804).
     ///
     /// `observe_miss_and_fleet` reads `capability_miss_workers` and derives
     /// `distinct_after` from that snapshot. Between that read and this `UPDATE`,
     /// a peer restarting onto a capable build runs
     /// `invalidate_capability_miss_evidence_for_worker`, which `array_remove`s
     /// its own id from exactly these `RUNNING` rows. The `UPDATE` then appends
-    /// the claimant to the *post-invalidation* array, so the durable set can be
-    /// smaller than the snapshot predicted — `{A,B}` + claimant `C` is logged as
-    /// 3 even though `A` was invalidated first and the row actually holds
-    /// `{B,C}`.
+    /// the claimant to the *post-invalidation* array. So the durable set can be
+    /// smaller than the snapshot predicted. `{A,B}` + claimant `C` logs as 3,
+    /// but `A` was invalidated first and the row holds `{B,C}`.
     ///
-    /// Returning the count from the statement that wrote it is the only way the
-    /// number is true by construction rather than by a timing assumption.
+    /// Only the count from the statement that wrote it is true by
+    /// construction, not by a timing assumption.
     #[test]
     fn capability_miss_release_returns_the_cardinality_it_committed() {
         for phase in [
@@ -16480,21 +16360,20 @@ mod tests {
     }
 
     /// The release must be guarded on the **claim epoch**, not just the claim's
-    /// worker id (issue #804, Codex round-37 P1).
+    /// worker id (issue #804).
     ///
     /// `poison_pill::requeue_orphan` hands an orphaned row back to the pool as
     /// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing
     /// stops the *same* worker from winning it again. A guard keyed on
-    /// `(state, worker_id)` alone therefore matches that **new** claim, so a
-    /// stale dispatcher's release would re-`PENDING` a row whose replacement
-    /// handler is already running — inviting a second concurrent claim and
-    /// duplicate side effects, and decrementing an `attempt` that belongs to
-    /// the new dispatch.
+    /// `(state, worker_id)` alone would match that **new** claim. A stale
+    /// release would then re-`PENDING` a row whose replacement handler already
+    /// runs. That invites a second concurrent claim and duplicate side effects.
+    /// It also decrements an `attempt` that belongs to the new dispatch.
     ///
     /// `crash_strikes` is the discriminator because the requeue that creates
-    /// this race is the thing that bumps it. The terminal escalation guard
-    /// ([`claim_still_held_for_update`]) already keys on it for exactly
-    /// this reason; the release is the far more common path and must match.
+    /// this race bumps it. The terminal escalation guard
+    /// ([`claim_still_held_for_update`]) keys on it for the same reason. The
+    /// release is the far more common path and must match.
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {
         for phase in [
@@ -16565,19 +16444,18 @@ mod tests {
     }
 
     /// The release may only clear `crash_strikes` when the handler actually ran
-    /// (issue #804 x #367, Codex round-12 P1).
+    /// (issue #804 x #367).
     ///
     /// `crash_strikes` is issue #367's evidence that a task keeps killing the
     /// worker process that runs it. A pre-/mid-handler capability miss ran
-    /// nothing, so it is not evidence of anything -- and zeroing on it lets an
-    /// incapable claim landing between two capable crashes reset the streak
-    /// every time, so `poison_pill_threshold` is never reached in a
-    /// heterogeneous fleet and the poison task crashes replacement workers
-    /// indefinitely.
+    /// nothing, so it is no evidence. An incapable claim between two capable
+    /// crashes would reset the streak each time. In a heterogeneous fleet,
+    /// `poison_pill_threshold` is then never reached. The poison task then
+    /// crashes replacement workers indefinitely.
     ///
-    /// Scoped to the `SET` clause: since round 37 the `WHERE` clause *reads*
-    /// `crash_strikes` as the claim-epoch discriminator
-    /// ([`capability_miss_release_is_guarded_on_the_claim_epoch`]), which is a
+    /// Scoped to the `SET` clause. The `WHERE` clause *reads* `crash_strikes`
+    /// as the claim-epoch discriminator
+    /// ([`capability_miss_release_is_guarded_on_the_claim_epoch`]). That is a
     /// different concern and does not weaken this one. The invariant here is
     /// that the release must not **write** the column.
     #[test]
@@ -16604,9 +16482,8 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_increments_the_capability_counter() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
@@ -16619,10 +16496,10 @@ mod tests {
                  RUNNING under a live worker that orphan reclamation skips \
                  (issue #804, Codex round-22 P2)",
             );
-            // The saturating increment is the SAME-frontier arm: a release that
-            // lands on a different handler than the row records restarts at 1
-            // rather than inheriting a prior frontier's spend (Codex round-46
-            // P1). Both arms are pinned so neither can be dropped alone.
+            // The saturating increment is the SAME-frontier arm. A release that
+            // lands on a different handler than the row records restarts at 1.
+            // It does not inherit a prior frontier's spend (issue #804). Both
+            // arms are pinned, so that neither can be dropped alone.
             assert!(
                 sql.contains("WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1"),
                 "a miss on a NEW frontier must start its budget at 1, not \
@@ -16641,18 +16518,16 @@ mod tests {
         }
     }
 
-    /// The distinct-worker set must grow **idempotently** (issue #804 round 6).
+    /// The distinct-worker set must grow **idempotently** (issue #804).
     ///
-    /// The budget is consumed per distinct worker precisely so that one
-    /// incapable worker cannot exhaust it by repeatedly winning the claim race
-    /// on its own released row. A blind `array_append` would defeat that: the
-    /// same worker would add an entry per bounce and the set would grow past
-    /// the budget just as fast as the plain counter did.
+    /// The budget is consumed per distinct worker. So one incapable worker
+    /// cannot exhaust it by winning the claim race on its own released row.
+    /// A blind `array_append` defeats that. The same worker adds an entry per
+    /// bounce, and the set grows as fast as the plain counter did.
     #[test]
     fn capability_miss_release_query_appends_the_worker_only_once() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
@@ -16675,37 +16550,19 @@ mod tests {
         }
     }
 
-    /// The release must leave the task row's `error` column **untouched**.
-    ///
-    /// `error` is the failure-reporting channel for a task that genuinely ran
-    /// and failed. The issue #773 `/stack` surface renders it verbatim as a
-    /// `last_failure` on any pending activity, with `error_type: "Error"` and
-    /// the row's raw `attempt`. A capability miss never ran the handler AND
-    /// restores `attempt` to `0`, so writing the diagnostic there fabricates a
-    /// failure that did not happen, at an otherwise-unreachable `attempt: 0`,
-    /// and makes a blameless deploy skew indistinguishable from a real
-    /// application failure on the exact surface whose runbook question is "why
-    /// is this activity retrying?".
-    ///
-    /// Issue #773 AC3 states the invariant directly: a never-failed pending
-    /// activity omits `last_failure` entirely. The diagnostic reaches the
-    /// operator through the `tracing::info!` on release and the
-    /// `harvest.task.capability_miss` counter, so nothing is lost by keeping
-    /// it out of a column reserved for real failures.
     /// The pre-lookup park must preserve the miss accounting *atomically*.
     ///
-    /// `park_workflow_task` zeroes `capability_misses`, which is proof-backed
+    /// `park_workflow_task` zeroes `capability_misses`. That is proof-backed
     /// for every caller except the issue #779 transient-ingest-conflict
-    /// re-drive, which runs before the handler lookup. That caller must keep the
-    /// accounting — and it must do so by simply not writing those columns in the
-    /// park statement itself, never by restoring them afterwards. The park
-    /// commits in autocommit mode (`process_workflow_task` opens its transaction
-    /// much later), so between a zeroing park and any follow-up restore a peer
-    /// can claim the freshly-parked row and record its own miss, or a capable
-    /// peer can park and legitimately reset it — and no single-statement merge of
-    /// two whole snapshots is monotone against both of those. Omitting the SET
-    /// assignments closes the window by construction: the row is never
-    /// observably zeroed at all.
+    /// re-drive, which runs before the handler lookup. That caller must keep
+    /// the accounting. It does so by not writing those columns in the park
+    /// statement, never by restoring them afterwards. The park commits in
+    /// autocommit mode, and `process_workflow_task` opens its transaction much
+    /// later. Between a zeroing park and a restore, a peer can claim the row
+    /// and record its own miss. A capable peer can also park and reset it.
+    /// No single-statement merge of two whole snapshots is monotone against
+    /// both. Omitting the SET assignments closes the window by construction:
+    /// the row is never observably zeroed at all.
     #[test]
     fn park_preserving_capability_misses_never_writes_the_miss_columns() {
         for sql in [
@@ -16729,11 +16586,26 @@ mod tests {
         }
     }
 
+    /// The release must leave the task row's `error` column **untouched**.
+    ///
+    /// `error` is the failure-reporting channel for a task that ran and
+    /// failed. The issue #773 `/stack` surface renders it verbatim as a
+    /// `last_failure` on any pending activity, with `error_type: "Error"` and
+    /// the raw `attempt` of the row. A capability miss never ran the handler
+    /// AND restores `attempt` to `0`. Writing the diagnostic there fabricates a
+    /// failure at an otherwise-unreachable `attempt: 0`. A blameless deploy
+    /// skew then looks like a real application failure. It does so on the
+    /// surface whose runbook question is "why is this activity retrying?".
+    ///
+    /// Issue #773 AC3 states the invariant directly: a never-failed pending
+    /// activity omits `last_failure` entirely. The operator sees the
+    /// diagnostic through the `tracing::info!` on release and the
+    /// `harvest.task.capability_miss` counter. So nothing is lost by keeping
+    /// it out of a column reserved for real failures.
     #[test]
     fn capability_miss_release_query_never_writes_the_error_column() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
@@ -16748,16 +16620,15 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_unpins_sticky_so_a_peer_can_claim() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
-            // Without this the row stays pinned to the very worker that just
-            // proved it cannot run it, so no peer can claim it and the task
-            // bounces on one worker straight to escalation.
+            // Without this, the row stays pinned to the worker that proved it
+            // cannot run it. No peer can claim it, and the task bounces on one
+            // worker straight to escalation.
             assert!(sql.contains("sticky_worker_id = NULL"));
             assert!(sql.contains("sticky_until = NULL"));
             assert!(sql.contains("sticky_timeout = NULL"));
@@ -16766,9 +16637,8 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_clears_the_claim_columns() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
@@ -16786,16 +16656,15 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_clears_the_sentinel_on_workflow_rows_only() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
+        // Check BOTH literal variants. The crash-strike flag selects between
+        // two statements, and a shared clause pinned in one only can drift.
         for sql in [
             release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
-            // A stale `mixed_signal_suspension` sentinel left in `activity_name` on
-            // a WORKFLOW row lets an unrelated wake reset `scheduled_at` to now and
-            // bypass the backoff (the issue #603 fix). On an ACTIVITY row
+            // A stale `mixed_signal_suspension` sentinel in the `activity_name`
+            // of a WORKFLOW row lets an unrelated wake reset `scheduled_at` to
+            // now and bypass the backoff (issue #603). On an ACTIVITY row,
             // `activity_name` is load-bearing and must survive the release.
             assert!(
                 sql.contains(
@@ -16849,16 +16718,14 @@ mod tests {
         assert!(!debug.contains("\"scheduled_at\""));
     }
 
-    /// Issue #804: reaching the shared pending-requeue path PROVES the claiming
-    /// worker was capable (it resolved a handler and ran it), so the
-    /// consecutive-capability-miss counter must reset to 0 there — exactly the
-    /// "consecutive" semantics `crash_strikes` already has on the same
-    /// changeset.
+    /// Issue #804: the shared pending-requeue path PROVES the claiming worker
+    /// was capable, because it resolved and ran a handler. So the
+    /// consecutive-capability-miss counter resets to 0 there. `crash_strikes`
+    /// has the same "consecutive" semantics on this changeset.
     ///
-    /// Without the reset the counter would accumulate across unrelated,
-    /// perfectly healthy retries and eventually escalate a task with
-    /// `no_capable_worker:` even though every claim after the first found a
-    /// handler — the false-escalation failure mode.
+    /// Without the reset, the counter accumulates across healthy retries.
+    /// It then escalates a task with `no_capable_worker:` although every
+    /// claim after the first found a handler. That is the false escalation.
     #[test]
     fn pending_requeue_changeset_resets_the_capability_miss_counter() {
         use crate::schema::harvest_task_queue::dsl;
@@ -16867,9 +16734,9 @@ mod tests {
 
         let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
 
-        // The VALUE is the whole point: a non-zero reset would silently make the
-        // counter cumulative and escalate healthy runs on a later deploy. A
-        // column-presence assertion alone survives a `0 -> 7` mutation.
+        // Check the VALUE. A non-zero reset makes the counter cumulative and
+        // escalates healthy runs on a later deploy. A column-presence check
+        // alone survives a `0 -> 7` mutation.
         assert_eq!(
             changeset.capability_misses, 0,
             "the shared pending-requeue changeset must reset capability_misses to 0 \
@@ -16887,16 +16754,16 @@ mod tests {
         );
     }
 
-    /// Issue #804: the clean-continuation path (`reschedule_task`, and
-    /// `defer_rate_limited_task` layered on top of it) also proves capability —
-    /// the worker resolved a handler and either suspended cleanly or reached
-    /// the dispatch-time rate-limit gate. Both must reset the counter.
+    /// Issue #804: the clean-continuation path also proves capability. That is
+    /// `reschedule_task`, and `defer_rate_limited_task` on top of it. The
+    /// worker resolved a handler, then suspended cleanly or reached the
+    /// dispatch-time rate-limit gate. Both must reset the counter.
     ///
-    /// The false-escalation this guards: worker A (no handler) releases
-    /// (misses = 1), worker B (capable) claims but defers on a rate limit, A
-    /// claims again (misses = 2)… After `capability_miss_max_redeliveries`
-    /// such interleavings the task escalates with `no_capable_worker:` even
-    /// though a capable worker claimed it on every other poll.
+    /// The false escalation this guards: worker A (no handler) releases
+    /// (misses = 1). Capable worker B claims but defers on a rate limit. A
+    /// claims again (misses = 2), and so on. After
+    /// `capability_miss_max_redeliveries` such rounds, the task escalates with
+    /// `no_capable_worker:`. Yet a capable worker claimed it on every other poll.
     #[test]
     fn clean_continuation_changeset_resets_crash_and_capability_counters() {
         use crate::schema::harvest_task_queue::dsl;
@@ -16905,9 +16772,8 @@ mod tests {
 
         let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
 
-        // Assert the VALUES, not just that the columns appear: a `0 -> n`
-        // mutation is invisible to a column-presence check but silently makes
-        // both counters cumulative rather than consecutive.
+        // Assert the VALUES, not only the columns. A column-presence check
+        // misses a `0 -> n` mutation, which makes both counters cumulative.
         assert_eq!(
             changeset.capability_misses, 0,
             "capability-miss streak must reset to 0 on a clean continuation (issue #804)"
@@ -16975,22 +16841,21 @@ mod tests {
         );
     }
 
-    /// Issue #782: `requeue_workflow_task_after_panic` must generate a `SET`
-    /// clause that (a) resets the shared pending-requeue columns (`state` →
-    /// PENDING, `crash_strikes` bound so the poison-pill reclaimer never trips,
-    /// `worker_id`/`started_at`/`last_heartbeat_at` nulled) and (b) clears the
-    /// sticky affinity, `wake_requested`, and stale `activity_name` columns —
-    /// mirroring the ND-block re-pend so a panicking workflow task is deferred
-    /// purely by `scheduled_at` and re-claimable by any worker.
+    /// Issue #782: the `SET` clause of `requeue_workflow_task_after_panic` must
+    /// reset the shared pending-requeue columns. `state` becomes PENDING,
+    /// `crash_strikes` is bound so the poison-pill reclaimer never trips, and
+    /// `worker_id`/`started_at`/`last_heartbeat_at` are nulled. It must also
+    /// clear the sticky affinity, `wake_requested` and the stale
+    /// `activity_name`. Like the ND-block re-pend, a panicking workflow task is
+    /// then deferred only by `scheduled_at`, and any worker can claim it.
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
         let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
         let sql = workflow_backoff_sql(changeset, Duration::seconds(5), Some(StickyRelease::new()));
 
-        // Every column is emitted as a bound parameter (`= $N`) by
-        // `debug_query`, mirroring the sibling `pending_requeue_changeset`
-        // shape test — the sticky/activity_name columns bind `None` (SQL NULL)
-        // rather than rendering a literal `NULL`.
+        // `debug_query` emits every column as a bound parameter (`= $N`), as
+        // in the `pending_requeue_changeset` shape test. The sticky and
+        // activity_name columns bind `None` (SQL NULL), not a literal `NULL`.
         for column in [
             "state",
             "crash_strikes",
@@ -17041,7 +16906,7 @@ mod tests {
     /// pins this so a future edit cannot silently drop either clear and
     /// reopen issue #1391 or its #603 sibling.
     ///
-    /// Also pins the Codex-review fix (issue #1589): `scheduled_at` must be
+    /// Also pins the fix for issue #1589: `scheduled_at` must be
     /// computed via Postgres's own `clock_timestamp()`, not bound as a
     /// host-computed literal. A trailing worker host clock must not be
     /// able to bind an already-past deadline.

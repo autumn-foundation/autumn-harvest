@@ -34,10 +34,10 @@ pub fn activities() -> Vec<ActivityInfo> {
 ///
 /// Demonstrates issue #227: returning `ActivityFailure::non_retryable(...)`
 /// short-circuits the retry policy on a permanently-invalid input. The
-/// `RetryPolicy::exponential(3, …)` would normally allow three attempts;
-/// the typed `non_retryable` flag wins over the policy and routes the
-/// task straight to the DLQ on attempt 1 — proving that authors no longer
-/// need to register every fail-fast error string in `non_retryable_errors`.
+/// `RetryPolicy::exponential(3, …)` would allow three attempts. The typed
+/// `non_retryable` flag wins and routes the task to the DLQ on attempt 1.
+/// So authors need not register every fail-fast error string in
+/// `non_retryable_errors`.
 #[activity(
     start_to_close = "10s",
     retry = RetryPolicy::exponential(3, Duration::from_millis(100)),

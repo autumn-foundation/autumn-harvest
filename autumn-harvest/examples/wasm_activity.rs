@@ -7,10 +7,10 @@
 //! Every Harvest activity is a Rust `#[activity]` compiled into the worker. A
 //! team whose business logic lives in another language must rewrite it in Rust or
 //! stand up a second service. This spike runs an activity implemented as a
-//! **WebAssembly module** inside the existing worker — sandboxed, resource-metered,
-//! and content-hash hot-swappable — dispatched through the *standard* task-queue
-//! path (JSON in, JSON out, honouring queue/retry/start-to-close like a native
-//! activity).
+//! **WebAssembly module** inside the existing worker. It is sandboxed,
+//! resource-metered, and content-hash hot-swappable. It goes through the
+//! *standard* task-queue path: JSON in, JSON out, and queue/retry/start-to-close
+//! honoured like a native activity.
 //!
 //! ## The embedder API — one builder call
 //!
@@ -42,9 +42,9 @@
 //! 1. **JSON round-trip** through an echo guest (deny-all caps).
 //! 2. **A capability GRANT** — a guest importing `env::now_millis` runs only when
 //!    `allow_clock` is granted.
-//! 3. **A sandbox DENIAL** — a guest importing `env::fs_read` (filesystem access is
-//!    never grantable in this spike) is denied at instantiation as a non-retryable
-//!    `SandboxDenied`, without touching the host.
+//! 3. **A sandbox DENIAL** — a guest importing `env::fs_read` is denied at
+//!    instantiation as a non-retryable `SandboxDenied`, without touching the
+//!    host. Filesystem access is never grantable in this spike.
 //!
 //! Run with: `cargo run -p autumn-harvest --features wasm-activities --example wasm_activity`
 
@@ -55,10 +55,11 @@ use autumn_harvest::wasm_activities::{
 };
 use autumn_harvest::wasm_store::WasmActivityRegistration;
 
-/// Echo guest (no imports), loaded from the shared guests directory so this
-/// example runs the SAME bytes the integration tests and `wasm-guests/README.md`
-/// point at (issue #965 review — each site previously carried its own inline
-/// copy, leaving the documented guest unreferenced and free to drift).
+/// Echo guest (no imports), loaded from the shared guests directory.
+///
+/// This example runs the SAME bytes that the integration tests and
+/// `wasm-guests/README.md` point at (issue #965). An inline copy per site would
+/// leave the documented guest unreferenced and free to drift.
 ///
 /// `run` returns `packed(in_ptr, in_len)`, so the host reads back the exact JSON
 /// bytes it wrote. A bump allocator serves `alloc`.

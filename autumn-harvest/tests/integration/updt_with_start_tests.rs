@@ -1,7 +1,7 @@
 //! Tests for `update_with_start` core API (issue #479).
 //!
-//! Covers the struct shape, outcome fields, and (with the `db` feature) the
-//! full matrix of reuse-policy × prior-state combinations for the atomic
+//! Covers the struct shape and outcome fields. With the `db` feature it also
+//! covers the full reuse-policy × prior-state matrix of the atomic
 //! start-or-attach + update-admission primitive.
 
 // ── Type-level tests (always run, DB feature required for execution types) ───
@@ -449,7 +449,6 @@ mod db_tests {
         let ns = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
         let update_id = UpdateId::from_uuid(uuid::Uuid::new_v5(&ns, idem_key.as_bytes()));
 
-        // Build params with idempotency key.
         let mut params = make_params(
             "cart",
             "cart-idem",

@@ -1,11 +1,11 @@
 //! Integration tests for `GET /admin/schedules/{id}/runs` (issue #534).
 //!
-//! Seeds workflow executions attributed to a schedule with the three dispatch
-//! origins (`scheduled`/`backfill`/`manual_trigger`) and asserts the endpoint
-//! lists them newest-first, filters by state, paginates by keyset cursor, merges
-//! across shards (flagging an unavailable shard as `partial`, never 500), and
-//! reports a cadence summary that counts only `scheduled`-origin runs — the
-//! "zero conflation" guarantee from the issue's success metric.
+//! Seeds executions of a schedule with the three dispatch origins
+//! (`scheduled`/`backfill`/`manual_trigger`). The endpoint lists them
+//! newest-first, filters by state, and paginates by keyset cursor. It merges
+//! across shards and flags an unavailable shard as `partial`, never 500. Its
+//! cadence summary counts only `scheduled`-origin runs. That is the "zero
+//! conflation" guarantee from the issue's success metric.
 
 use std::collections::BTreeMap;
 
@@ -355,7 +355,6 @@ async fn runs_ordered_by_slot_across_page_boundary() {
     }
     // expected_by_slot already in slot-DESC order (10,9,8,7,6).
 
-    // Page through with limit=2 and stitch the pages together.
     let mut collected: Vec<String> = Vec::new();
     let mut uri = format!("/admin/schedules/{sid}/runs?limit=2");
     loop {
@@ -524,7 +523,6 @@ async fn state_filter_and_newest_first_ordering() {
     )
     .await;
 
-    // Newest-first overall.
     let (_, all) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
     let times: Vec<&str> = all["runs"]
         .as_array()
@@ -536,7 +534,6 @@ async fn state_filter_and_newest_first_ordering() {
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(times, sorted, "runs are newest-first");
 
-    // Filter to FAILED + TIMED_OUT.
     let (_, filtered) = get_json(
         &app,
         &format!("/admin/schedules/{sid}/runs?state=FAILED&state=TIMED_OUT"),
@@ -688,11 +685,9 @@ async fn one_shard_down_is_partial_not_500() {
 
 #[tokio::test]
 async fn schedule_on_down_shard_is_indeterminate_not_404() {
-    // issue #762 review: a schedule that genuinely EXISTS but whose owning shard is
-    // unreachable must be reported as INDETERMINATE (503), never as a definitive 404
-    // (which would lie about existence). Mirrors `one_shard_down_is_partial_not_500`
-    // but seeds the schedule on the DOWN shard so the existence lookup can't resolve
-    // it while a shard is unreachable.
+    // Issue #762: a schedule that EXISTS on an unreachable shard is INDETERMINATE
+    // (503). A definitive 404 would lie about existence. Unlike
+    // `one_shard_down_is_partial_not_500`, this seeds the schedule on the DOWN shard.
     let ((url0, url1), _c) = setup_two_shards().await;
     let sid = Uuid::new_v4();
     // Schedule lives on shard 1, which we will make unreachable.
@@ -719,27 +714,24 @@ async fn schedule_on_down_shard_is_indeterminate_not_404() {
 
 #[tokio::test]
 async fn lookup_error_on_earlier_shard_still_resolves_on_later_shard() {
-    // issue #762 review (finding 2): a per-shard schedule-lookup ERROR (as opposed
-    // to an unreachable connection) on an earlier-queried shard must NOT
+    // Issue #762: a schedule-lookup query ERROR on an earlier shard must NOT
     // short-circuit the request with a blanket 503. The existence scan continues,
-    // so a schedule living on a *later* healthy shard is still resolved (200).
+    // so a schedule on a *later* healthy shard still resolves (200).
     //
-    // Shard 0's database is created but never migrated, so its `harvest_schedules`
-    // SELECT errors ("relation does not exist") — the connection acquires fine, it
-    // is the query that fails, exercising the new `Err(_) => continue` arm rather
-    // than the acquire-failure arm. Shard 1 is healthy and owns the schedule.
+    // Shard 0's database is never migrated, so its `harvest_schedules` SELECT
+    // errors ("relation does not exist"). The connection acquires; the query
+    // fails. That exercises the `Err(_) => continue` arm, not the acquire-failure
+    // arm. Shard 1 is healthy and owns the schedule.
     //
-    // NB: the router-known-but-poolless shard case (finding 1) funnels into the
-    // same `any_shard_unreachable` flag + `resolve_not_found_outcome` decision
-    // (existence gate) AND, since the fan-out now iterates the same
-    // `expected_shards` set, into an unavailable run observation (fan-out) — but
-    // neither can be modelled here: `build_app` installs no runtime, so
-    // `api_state` has no router and `expected_shards` reduces to the live pool
-    // keys. Those paths are covered by the pure unit tests
-    // `resolve_not_found_outcome_*` and
+    // NB: a router-known shard with no pool reaches the same
+    // `any_shard_unreachable` flag and `resolve_not_found_outcome` decision. The
+    // fan-out iterates the same `expected_shards` set, so it also gives an
+    // unavailable run observation. This test cannot model either case.
+    // `build_app` installs no runtime, so `api_state` has no router and
+    // `expected_shards` is only the live pool keys. The unit tests `resolve_not_found_outcome_*` and
     // `observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete`
-    // in `api.rs`. The fan-out's query-error → `partial` path is covered
-    // end-to-end by `one_shard_down_is_partial_not_500`.
+    // in `api.rs` cover those paths. `one_shard_down_is_partial_not_500` covers
+    // the fan-out's query-error → `partial` path end-to-end.
     let container = Postgres::default()
         .with_tag("16")
         .start()

@@ -58,7 +58,6 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     };
 
-    // First parameter must be ctx: &WorkflowContext.
     if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
@@ -232,10 +231,8 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Characterization tests: signature-validation error paths ────────────────
 //
-// Sibling of `query.rs`'s/`update.rs`'s tests of the same name -- pins
-// `signal_macro`'s current rejection message for `first_param_is_ctx` before
-// that check routes through the already-shared
-// `attr_util::first_param_is_ctx_type`.
+// Pins the rejection message of `signal_macro` for a bad first parameter.
+// `query.rs` and `update.rs` hold sibling tests of the same name.
 #[cfg(test)]
 mod signature_validation_characterization_tests {
     use super::signal_macro;
@@ -279,11 +276,10 @@ mod stub_path_resolution_characterization_tests {
         full[start..end].trim()
     }
 
-    /// Pins the exact stub-`use` tokens `signal_macro` emits for each shape
-    /// of `workflow = "..."` path. See `query.rs`/`update.rs`'s identical
-    /// sibling tests. All three handler macros resolve a `workflow` path to
-    /// a stub `use` the same way. That derivation is moving to a single
-    /// `WorkflowPath::nested_stub_use_tokens`.
+    /// Pins the exact stub-`use` tokens that `signal_macro` emits for each
+    /// shape of `workflow = "..."` path. All three handler macros resolve a
+    /// `workflow` path the same way, so `query.rs` and `update.rs` hold
+    /// identical sibling tests.
     #[test]
     fn stub_use_tokens_pinned_per_path_shape() {
         assert_eq!(

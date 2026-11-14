@@ -7,10 +7,9 @@
 //! effects **dangling**. Reserve inventory, charge the card, allocate a
 //! shipment — then the label printer 500s. The DAG fails, and the inventory is
 //! still held, the customer is still charged, the shipment slot is still
-//! allocated. Until now the only way to undo that was to abandon the `#[dag]`
-//! surface entirely and hand-write a `#[workflow]` around
-//! [`Saga`](autumn_harvest::saga::Saga) — losing the graph you actually wanted
-//! to declare.
+//! allocated. Until now the only undo was to abandon the `#[dag]` surface and
+//! hand-write a `#[workflow]` around [`Saga`](autumn_harvest::saga::Saga). That
+//! lost the graph you wanted to declare.
 //!
 //! ## The solution: `.compensate(…)`
 //!
@@ -27,15 +26,15 @@
 //! | Method                        | Effect                                                     |
 //! |-------------------------------|------------------------------------------------------------|
 //! | `.compensate(undo_fn)`        | Typed — the name is derived from the fn item, so typo-proof |
-//! | `.compensate_named("undo")`   | Escape hatch when the fn item isn't in scope                |
+//! | `.compensate_named("undo")`   | Escape hatch when the fn item is not in scope               |
 //!
-//! ## What runs, and what doesn't
+//! ## What runs, and what does not
 //!
 //! On a terminal DAG failure (`Err("one or more DAG tasks failed")`) the engine
 //! unwinds **only** the nodes that BOTH succeeded AND declare a compensator, in
-//! reverse topological (LIFO) order. A node that was skipped (trigger rule or
-//! `.condition(…)`), never reached, or that failed itself is never compensated —
-//! only a *successful* forward step has an effect to undo.
+//! reverse topological (LIFO) order. The engine never compensates a node that
+//! was skipped (trigger rule or `.condition(…)`), never reached, or failed
+//! itself. Only a *successful* forward step has an effect to undo.
 //!
 //! A compensator receives the fixed envelope
 //! `{"dag_compensate": <node>, "input": <the node's resolved forward input>,
@@ -246,9 +245,9 @@ mod tests {
     /// Forward node → (ledger resource it commits (`None` = no side effect),
     /// the key of the DISTINCT output blob it returns).
     ///
-    /// Each node returns a different payload so an envelope assertion can only
-    /// pass if the engine carried THAT node's recorded output (a single shared
-    /// blob would make every `output` assertion pass regardless).
+    /// Each node returns a different payload. So an envelope assertion passes
+    /// only if the engine carried THAT node's recorded output. A single shared
+    /// blob would make every `output` assertion pass regardless.
     const RESOURCES: [(&str, Option<&str>, &str); 5] = [
         ("reserve_inventory", Some("inventory"), "reservation_id"),
         ("charge_payment", Some("payment"), "charge_id"),
@@ -285,8 +284,8 @@ mod tests {
     }
 
     /// Build a test env whose forward activities credit a ledger resource and
-    /// whose compensators debit it, with `failing_node` returning an error
-    /// (`None` = every node succeeds). A net-zero ledger at the end means zero
+    /// whose compensators debit it. `failing_node` returns an error (`None` =
+    /// every node succeeds). A net-zero ledger at the end means zero
     /// uncompensated side effects.
     fn env_with_ledger(ledger: &Ledger, failing_node: Option<&'static str>) -> WorkflowTestEnv {
         let mut env = WorkflowTestEnv::new();
@@ -450,8 +449,8 @@ mod tests {
     ///
     /// A failing DAG's handler returns `Err("one or more DAG tasks failed")`, and
     /// its history ends in a terminal `WorkflowFailed`. Since issue #952 a replay
-    /// that reproduces that failure is a clean replay — `ReplaySucceeded` with the
-    /// reproduced error in `ReplayReport::failure_message()`, which is precisely
+    /// that reproduces that failure is a clean replay: `ReplaySucceeded`, with the
+    /// reproduced error in `ReplayReport::failure_message()`. That means
     /// "reproduced the same terminal error with ZERO divergence". Pinning the
     /// exact error rules out a failure for some other reason.
     #[tokio::test]
@@ -468,10 +467,6 @@ mod tests {
         );
 
         let report = outcome.replay_check(handler).await;
-        // Issue #952: the history ends in a terminal `WorkflowFailed`, so a replay
-        // that reproduces the same failure is a CLEAN replay and the error is read
-        // through `failure_message()`. The assertion is unchanged in substance:
-        // the ORIGINAL DAG error, deterministically, never a divergence.
         assert_eq!(
             report.failure_message(),
             Some("one or more DAG tasks failed"),

@@ -81,7 +81,7 @@ pub async fn deliver_webhook(
         })?;
 
     let Some(sub) = subs.into_iter().find(|s| s.id == input.subscription_id) else {
-        // If subscription is not active or deleted, fail fast and don't retry,
+        // If subscription is not active or deleted, fail fast and do not retry,
         // but write a failed delivery log for auditability before returning.
         let attempt = ctx.attempt();
         let log = WebhookDeliveryLog {

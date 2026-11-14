@@ -918,7 +918,6 @@ impl JsonSchema {
         self
     }
 
-    /// The verdict on one answer.
     fn check(&self, answer: &str) -> Verdict {
         let value: serde_json::Value = match serde_json::from_str(unfenced(answer.trim())) {
             Ok(value) => value,
@@ -1015,8 +1014,6 @@ mod tests {
             .map(|(draw, verdict)| (DrawId::new(draw), verdict))
             .collect()
     }
-
-    // ── FiniteF64 and Verdict ───────────────────────────────────────────────
 
     #[test]
     fn a_finite_value_refuses_nan_and_both_infinities() {
@@ -1119,8 +1116,6 @@ mod tests {
         }
     }
 
-    // ── select ──────────────────────────────────────────────────────────────
-
     #[test]
     fn a_very_low_score_beats_a_reject() {
         let input = draws(vec![(0, reject()), (1, score(-1e300))]);
@@ -1221,8 +1216,6 @@ mod tests {
         }
     }
 
-    // ── ScoreInput ──────────────────────────────────────────────────────────
-
     #[test]
     fn an_input_from_a_run_holds_the_task_answer_stop_and_tools() {
         let task = AgentTask::new("What is 2 + 2?");
@@ -1277,8 +1270,6 @@ mod tests {
                 .tool("", "?")
         );
     }
-
-    // ── scorers and run_score ───────────────────────────────────────────────
 
     /// A model that answers each call with the same text and usage.
     #[derive(Debug)]

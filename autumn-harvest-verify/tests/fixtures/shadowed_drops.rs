@@ -4,18 +4,18 @@
 //!   rustc --crate-type lib --edition 2024 --emit=mir \
 //!         -o shadowed_drops.mir shadowed_drops.rs
 //!
-//! Drop glue is a call the user never wrote and MIR never spells out: the only
-//! trace of it is a `drop(_4)` terminator on a place whose type has a user
+//! Drop glue is a call the user never wrote and MIR never spells out. Its only
+//! trace is a `drop(_4)` terminator on a place whose type has a user
 //! `impl Drop`. The glue is looked up by the type's LAST segment, so
-//! `clean::Guard` and `ambient::Guard` answer to the same key — and a lookup
-//! that insists on exactly one answer then finds none and treats the drop as
-//! inert, which silently drops the wall-clock read and the command emission in
+//! `clean::Guard` and `ambient::Guard` answer to the same key. A lookup that
+//! insists on exactly one answer then finds none and treats the drop as inert.
+//! That silently drops the wall-clock read and the command emission in
 //! `ambient::Guard::drop` on the floor.
 //!
 //! The same fixture is also analyzed with **no source root**, which is how a
 //! pre-emitted `.mir` file is analyzed. Every `<impl at FILE:L:C>` header is
-//! then unreadable, so nothing says these `::drop` bodies are `Drop` impls at
-//! all; the drop must become a `drop-glue` boundary, never a silent `proven`.
+//! then unreadable. So nothing says these `::drop` bodies are `Drop` impls at
+//! all, and the drop must become a `drop-glue` boundary, never a silent `proven`.
 //!
 //! `WorkflowContext` is a stand-in for the real `autumn_harvest::WorkflowContext`
 //! (see `format_and_outparams.rs`), and each workflow-like fn has the

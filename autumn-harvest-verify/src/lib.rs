@@ -1,13 +1,13 @@
 //! `harvest-verify`: a semantic, MIR-level determinism verifier for
 //! `#[workflow]` functions (issue #962, R&D prototype).
 //!
-//! The analyzer consumes the textual MIR that **stable** `rustc --emit=mir`
-//! produces, builds an interprocedural call graph with generic substitution,
-//! and runs a three-kind taint analysis (`Value`, `Order`, `Control`) from
-//! non-deterministic sources to `WorkflowContext` command sinks. Every
-//! `#[workflow]` fn receives exactly one of three verdicts:
+//! The analyzer reads the textual MIR that **stable** `rustc --emit=mir`
+//! produces. It builds an interprocedural call graph with generic
+//! substitution. It runs a three-kind taint analysis (`Value`, `Order`,
+//! `Control`) from non-deterministic sources to `WorkflowContext` command
+//! sinks. Every `#[workflow]` fn receives exactly one of three verdicts:
 //! [`Verdict::ProvenDeterministic`], [`Verdict::NondeterminismFound`] or
-//! [`Verdict::Unknown`] — never a binary answer that hides an analysis
+//! [`Verdict::Unknown`]. It never gives a binary answer that hides an analysis
 //! boundary.
 //!
 //! See `docs/rnd/determinism-static-analysis.md` (feasibility report) and
@@ -154,8 +154,10 @@ pub struct Cli {
     pub check_structure: Option<std::path::PathBuf>,
 }
 
-/// CLI entry: parses `argv` (tolerating the `harvest-verify` subcommand token cargo inserts),
-/// runs the tool and returns the process exit code (0 clean, 1 findings, 2 tool error).
+/// CLI entry: parses `argv`, runs the tool and returns the process exit code.
+///
+/// The parser tolerates the `harvest-verify` subcommand token that cargo
+/// inserts. Exit codes: 0 clean, 1 findings, 2 tool error.
 #[must_use]
 pub fn cli_main(argv: Vec<String>) -> i32 {
     use clap::Parser as _;
@@ -270,7 +272,6 @@ fn check_structure(path: &std::path::Path, format: Format, strict: bool) -> i32 
     i32::from(reports.iter().any(|r| failed(r.verdict)) || (strict && reports.is_empty()))
 }
 
-/// Write the structure manifest of `report` to `path`.
 fn write_structure(path: &std::path::Path, report: &Report) -> Result<()> {
     let manifest = report.structure.clone().unwrap_or_default();
     let json = serde_json::to_string_pretty(&manifest).map_err(|e| Error::Io {
@@ -285,7 +286,7 @@ fn write_structure(path: &std::path::Path, report: &Report) -> Result<()> {
 
 /// Validate the inputs the CLI owns, then hand off to [`verify`].
 fn run(cli: &Cli) -> Result<Report> {
-    // Fail on a bad allowlist or model *before* spending minutes in cargo: a
+    // Fail on a bad allowlist or model *before* spending minutes in cargo. A
     // tool error the user can fix in a second should be reported in a second.
     if let Some(path) = &cli.allowlist {
         Allowlist::load(path)?;
@@ -328,10 +329,9 @@ fn run(cli: &Cli) -> Result<Report> {
 
 /// Emit MIR for `build` and return the files, without analyzing them.
 ///
-/// The debug half of the driver: it is what a `harvest-verify` run does before
-/// any parsing happens, and it is exercised on its own by the (ignored) driver
-/// smoke test so a cargo-integration break is distinguishable from an analysis
-/// break.
+/// The debug half of the driver: what a `harvest-verify` run does before any
+/// parsing. The (ignored) driver smoke test runs it on its own. So a
+/// cargo-integration break is distinguishable from an analysis break.
 ///
 /// # Errors
 /// See [`driver::emit_mir`].

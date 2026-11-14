@@ -9,10 +9,9 @@
 //!
 //! ## What it does
 //!
-//! `subscription_renewal` models one subscription entity: charge the
-//! customer, wait 30 days for the next billing cycle, then loop forever via
-//! `continue_as_new` — unless a `cancel` signal has arrived, in which case
-//! the loop stops.
+//! `subscription_renewal` models one subscription entity. It charges the
+//! customer, waits 30 days for the next billing cycle, then loops forever via
+//! `continue_as_new`. A `cancel` signal stops the loop.
 //!
 //! ## Dispatch timing (read this before copying the pattern)
 //!
@@ -23,8 +22,8 @@
 //!
 //! - **before this run even starts** (delivered via `signal-with-start`, or
 //!   staged before the first workflow task) needs a flush point before the
-//!   first `cancelled.load(...)` check, since nothing else has run between
-//!   registration and that check. `ctx.system_now()` is that flush point.
+//!   first `cancelled.load(...)` check. Nothing else runs between registration
+//!   and that check. `ctx.system_now()` is that flush point.
 //!   It is a cheap deterministic primitive call, not an activity or a
 //!   timer, so it adds no extra compute or latency. On its first live
 //!   call it does add one event to durable history. Budget for that cost
@@ -32,8 +31,8 @@
 //!   flush point, the first check always reads `false`, even for a
 //!   signal already recorded in history;
 //! - **while the workflow is waiting on the timer** is observed the moment
-//!   the timer resolves — the `ctx.timer(...)` call itself is the flush
-//!   point, so the second `cancelled.load(...)` check needs no extra call.
+//!   the timer resolves. The `ctx.timer(...)` call itself is the flush point.
+//!   So the second `cancelled.load(...)` check needs no extra call.
 //!
 //! See `autumn-harvest/examples/signal_handlers_subscription.rs` for the
 //! full dispatch-timing contract and its own `system_now()` flush-point
@@ -50,10 +49,11 @@ pub struct SubscriptionState {
     pub cycles: u32,
 }
 
-/// A downstream idempotency key, plus the cycle number it applies to. See
-/// playbook step 4 in the migration guide: every side-effecting activity
-/// call needs its own caller-supplied key, derived from state already in
-/// history, so a retried attempt cannot charge the card twice.
+/// A downstream idempotency key, plus the cycle number it applies to.
+///
+/// Playbook step 4 in the migration guide: every side-effecting activity call
+/// needs its own caller-supplied key, derived from state already in history.
+/// So a retried attempt cannot charge the card twice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChargeRequest {
     pub idempotency_key: String,
@@ -96,9 +96,9 @@ async fn subscription_renewal(
     // Derive the key from `subscription_id`, not from `ctx.workflow_id()` or
     // the execution id. Playbook step 4 in the migration guide needs a key
     // the caller supplies before routing the request to either engine.
-    // `subscription_id` is that key: it names the same subscription on both
-    // sides of a dual-run cutover, no matter which engine's own internal id
-    // the request happens to carry.
+    // `subscription_id` is that key. It names the same subscription on both
+    // sides of a dual-run cutover, whatever engine-internal id the request
+    // carries.
     let idempotency_key = format!("{}-cycle-{}", state.subscription_id, state.cycles);
     let _: () = ctx
         .execute_activity(
@@ -321,11 +321,10 @@ mod tests {
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
-        // Every suspending call in this path (the activity, then the
-        // timer) is already resolved by the recorded history above, so
-        // this replay never touches a live oneshot channel. Bound it
-        // anyway, for the same defense-in-depth reason as the pre-start
-        // test above.
+        // The recorded history above resolves every suspending call in this
+        // path: the activity, then the timer. So this replay never touches a
+        // live oneshot channel. Bound it anyway, for the same defense in
+        // depth as the pre-start test above.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             subscription_renewal(
@@ -396,9 +395,9 @@ mod tests {
     /// after a re-route between engines during a dual-run cutover. A
     /// retried charge would then slip through under the fresh key and
     /// double-charge the customer. `WorkflowTestEnv` leaves
-    /// `ctx.workflow_id()` as an empty string by default, so a regression
-    /// to that derivation would produce `"-cycle-0"`, not the asserted
-    /// `"sub-42-cycle-0"`, and this test would catch it.
+    /// `ctx.workflow_id()` as an empty string by default. So a regression to
+    /// that derivation produces `"-cycle-0"`, not the asserted
+    /// `"sub-42-cycle-0"`, and this test catches it.
     #[tokio::test]
     async fn idempotency_key_is_derived_from_subscription_id_not_workflow_identity() {
         let seen_key: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));

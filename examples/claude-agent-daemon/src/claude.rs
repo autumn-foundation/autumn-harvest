@@ -556,23 +556,6 @@ fn http_failure(status: StatusCode, body: &str) -> String {
     .into_error_payload()
 }
 
-/// Why this reply cannot be used, when it cannot.
-///
-/// The two checks here exist for what comes AFTER this turn. The blocks are
-/// replayed into the next request, and the calls reach the approval gate.
-///
-/// A turn stopped at the OUTPUT CAP has neither. The loop drops its calls and
-/// ends the session under `max_tokens`. A reply cut off inside a block is
-/// therefore a finished session rather than a failed one. Refusing it turned
-/// a billed answer into a non-retryable failure, and the session ended FAILED
-/// where the loop would have ended it with a report.
-///
-/// The narrowing is to that ONE stop reason, and not to every reason that
-/// ends the session. An `end_turn` also ends it, and its report carries the
-/// answer. A text block this example accepted unchecked would be defaulted to
-/// nothing by `parse_reply`. The report would then show an EARLIER turn's
-/// text as a clean finish. `max_tokens` names the session incomplete, so it
-/// claims nothing a damaged block could falsify.
 /// Every semantic rule a model reply must satisfy, as ONE test.
 ///
 /// The rules have TWO readers. A reply is tested when it arrives, and a
@@ -653,6 +636,23 @@ pub fn projects_its_content(reply: &TurnReply) -> bool {
     reply.stop_reason == crate::session::STOP_REFUSAL && !says_something(&derived.text)
 }
 
+/// Why this reply cannot be used, when it cannot.
+///
+/// The two checks here exist for what comes AFTER this turn. The blocks are
+/// replayed into the next request, and the calls reach the approval gate.
+///
+/// A turn stopped at the OUTPUT CAP has neither. The loop drops its calls and
+/// ends the session under `max_tokens`. A reply cut off inside a block is
+/// therefore a finished session rather than a failed one. Refusing it turned
+/// a billed answer into a non-retryable failure, and the session ended FAILED
+/// where the loop would have ended it with a report.
+///
+/// The narrowing is to that ONE stop reason, and not to every reason that
+/// ends the session. An `end_turn` also ends it, and its report carries the
+/// answer. A text block this example accepted unchecked would be defaulted to
+/// nothing by `parse_reply`. The report would then show an EARLIER turn's
+/// text as a clean finish. `max_tokens` names the session incomplete, so it
+/// claims nothing a damaged block could falsify.
 pub fn malformed_reply(reply: &TurnReply) -> Option<&'static str> {
     if reply.stop_reason == crate::session::STOP_MAX_TOKENS {
         return None;

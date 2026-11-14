@@ -178,13 +178,11 @@ async fn empty_upstream_collection_mapping() {
             input: dag_task_input("list_items"),
             queue: "default".into(),
         },
-        // Upstream output is empty array
         WorkflowEvent::ActivityCompleted {
             activity_id: id_list,
             output: json!([]),
         },
         // process_item is skipped (N = 0).
-        // aggregate_items receives an empty array []
         WorkflowEvent::ActivityScheduled {
             activity_id: id_agg,
             name: "aggregate_items".into(),

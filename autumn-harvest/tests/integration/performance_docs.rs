@@ -1,17 +1,18 @@
 //! Guards that keep `docs/performance.md`'s prose tied to its own tables.
 //!
-//! That page is the published baseline for attributing claim-path costs, and
-//! its narrative quotes percentages, sample counts and multipliers that are
-//! supposed to be read straight off the tables above them. Twice now the
-//! tables were regenerated from a fresh benchmark run while the surrounding
-//! prose kept the previous run's figures — the second time badly enough that
-//! two scenarios swapped which was slower. Nothing caught either drift,
-//! because a stale number in prose still renders perfectly.
+//! That page is the published baseline for attributing claim-path costs. Its
+//! narrative quotes percentages, sample counts and multipliers from the tables
+//! above them. Twice the tables were regenerated from a fresh benchmark run
+//! while the prose kept the previous run's figures. The second time, two
+//! scenarios swapped which was slower. Nothing caught either drift, because a
+//! stale number in prose still renders perfectly.
 //!
 //! These tests make the tables authoritative. They parse the published tables
-//! out of the Markdown and assert that (a) each table's own percentage column
-//! is arithmetically consistent with its own latency column, and (b) every
-//! per-gate bullet quotes the figure the table publishes for that gate.
+//! out of the Markdown and assert two things:
+//!
+//! - each table's percentage column agrees arithmetically with its latency
+//!   column;
+//! - every per-gate bullet quotes the figure the table publishes for that gate.
 //!
 //! Deliberately *not* covered: the reproducibility paragraph and the
 //! "earlier revision" narrative, which quote other runs on purpose and say so.
@@ -22,9 +23,8 @@ use std::path::{Path, PathBuf};
 
 /// `<repo>`, i.e. the parent of `CARGO_MANIFEST_DIR` (`<repo>/autumn-harvest`).
 ///
-/// Three guards now need to reach files outside the crate (the published page,
-/// the changelog fragment, and the two overview READMEs), so the walk up lives
-/// here rather than being spelled out at each call site.
+/// Several guards read files outside the crate: the published page, the
+/// changelog fragment and the two overview READMEs. So the walk up lives here.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -38,17 +38,16 @@ fn performance_doc_path() -> PathBuf {
 
 /// Marker opening the released performance narrative in the shipped-work record.
 ///
-/// This prose has been chased across three homes by routine maintenance, and
-/// each move broke these guards: it began in
-/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`, which the 0.6.0
-/// collation sweep folded away and deleted; it then lived in `CLAUDE.md`'s
-/// phase list, which `562c781` removed when it cut that file down to workflow
-/// instructions. It now lives in `docs/shipped-work.md`, whose header says it
-/// is guard-referenced and must not be collated or condensed.
+/// Routine maintenance moved this prose across three homes, and each move broke
+/// these guards. It began in `docs/changelog.d/pr-786-claim-throughput-benchmark.md`.
+/// The 0.6.0 collation sweep folded that file away and deleted it. It then
+/// lived in `CLAUDE.md`'s phase list. `562c781` removed it when it cut that
+/// file down to workflow instructions. It now lives in
+/// `docs/shipped-work.md`. That file's header says it is guard-referenced and
+/// must not be collated or condensed.
 ///
-/// The *verbatim* entry is the one these guards need — a condensed bullet no
-/// longer carries the per-gate figures they cross-check, which is why
-/// `CHANGELOG.md` cannot serve as the source.
+/// These guards need the *verbatim* entry. A condensed bullet no longer carries
+/// the per-gate figures they cross-check. So `CHANGELOG.md` cannot be the source.
 const RELEASED_PERF_ENTRY_MARKER: &str =
     "- **Tooling** — Task-claim / enqueue throughput benchmark";
 
@@ -58,9 +57,9 @@ fn shipped_work_path() -> PathBuf {
 
 /// The released performance narrative, extracted from the shipped-work record.
 ///
-/// Scoped to the single entry rather than handing the guards the whole file:
-/// several of them ban a superseded phrasing, and an unscoped read would let an
-/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
+/// Scoped to the single entry, not the whole file. Several guards ban a
+/// superseded phrasing. In an unscoped read, an unrelated entry elsewhere in a
+/// 10 000-line file could trip or mask a check.
 fn released_perf_entry() -> String {
     let text = read_normalized(&shipped_work_path());
     let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
@@ -79,13 +78,12 @@ fn released_perf_entry() -> String {
 
 /// Read a file with line endings normalised to `\n`.
 ///
-/// Every structural helper below locates boundaries with `\n`-anchored needles
-/// (`"\n}\n"` for a top-level item's closing brace, `"\n\n"` for a paragraph
-/// break, `"\n### "` for a section break). A Windows checkout hands those
-/// helpers `\r\n`, so each needle silently misses and the test fails with a
-/// "file must define X" panic that has nothing to do with the file's contents.
-/// Normalising once here keeps the helpers platform-agnostic rather than
-/// spreading `\r?` handling across each of them.
+/// The structural helpers below find boundaries with `\n`-anchored needles:
+/// `"\n}\n"` closes a top-level item, `"\n\n"` breaks a paragraph and
+/// `"\n### "` breaks a section. A Windows checkout gives them `\r\n`. Each
+/// needle then misses, and the test fails with an unrelated "file must define
+/// X" panic. Normalising once here keeps every helper platform-agnostic, with
+/// no `\r?` handling in each one.
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -98,31 +96,29 @@ fn read_performance_doc() -> String {
 
 /// Collapse every run of whitespace to a single space.
 ///
-/// Guards that require a *phrase* to be present must survive the Markdown being
-/// re-wrapped: a hard wrap inserted between two words of the phrase makes a
-/// plain `contains` miss, and the failure reads as "the correction is absent"
-/// when the correction is right there. Round 35 hit exactly that on its own
-/// fix, so the normalisation lives here rather than being a per-guard quirk.
+/// A guard that requires a *phrase* must survive a re-wrap of the Markdown. A
+/// hard wrap between two words of the phrase makes a plain `contains` miss. The
+/// failure then reads as "the correction is absent" when it is present. A guard
+/// has already tripped on its own fix this way. So the normalisation lives here.
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Does `haystack` state `phrase` in its own voice, rather than quoting it?
 ///
-/// Several guards in this module ban a specific superseded phrasing. Every one
-/// of them, written naively as `haystack.contains(phrase)`, failed on the very
-/// text that *fixed* the thing it guards — because a retraction has to
-/// reproduce the claim it retracts in order to name it. That has now happened
-/// three times (the round-23 keyword ban, the round-26 changelog guard, and the
-/// round-28 `all_gates` guard), so the distinction lives here rather than being
-/// re-derived inline a fourth time.
+/// Several guards in this module ban a specific superseded phrasing. Each one,
+/// written naively as `haystack.contains(phrase)`, failed on the very text
+/// that *fixed* the thing it guards. A retraction has to reproduce the claim it
+/// retracts in order to name it. That has happened three times: the keyword
+/// ban, the changelog guard and the `all_gates` guard. So the distinction lives
+/// here, not re-derived inline a fourth time.
 ///
-/// The signal is the character immediately preceding the phrase: a retraction
-/// reads `... does not support a "predicates are a rounding error" reading`,
-/// while an assertion runs straight on from prose. Straight and curly quotes
-/// both count, since Markdown prose mixes them — as does a backtick, because a
-/// Markdown code span is quoting too: a guard that lists the words it bans has
-/// to write them down, and it writes them as `` `floor` ``.
+/// The signal is the character just before the phrase. A retraction reads
+/// `... does not support a "predicates are a rounding error" reading`. An
+/// assertion runs straight on from prose. Straight and curly quotes both
+/// count, since Markdown prose mixes them. A backtick counts too, because a
+/// code span also quotes. A guard that lists its banned words writes them as
+/// `` `floor` ``.
 fn asserted_in_own_voice(haystack: &str, phrase: &str) -> bool {
     haystack.match_indices(phrase).any(|(idx, _)| {
         let before = haystack[..idx].chars().next_back();
@@ -264,9 +260,9 @@ fn gate_table_percentages_agree_with_its_own_latency_column() {
 
 /// The per-gate bullets under "What each row exercises" must quote the table.
 ///
-/// This is the exact drift a reviewer caught twice: the table was regenerated
-/// and these bullets were not, leaving the page asserting two different costs
-/// for the same scenario a hundred lines apart.
+/// A reviewer caught this drift twice. The table was regenerated and these
+/// bullets were not. The page then asserted two different costs for the same
+/// scenario a hundred lines apart.
 #[test]
 fn per_gate_bullets_quote_the_published_gate_table() {
     let doc = read_performance_doc();
@@ -355,9 +351,9 @@ fn top_level_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
 
 /// True when `needle` appears in `haystack` as a whole identifier.
 ///
-/// Plain `contains` is not enough here: `release_claim` is a prefix of
-/// `release_claim_if_queue_paused`, so a doc that named only the longer call
-/// would look like it had named both.
+/// Plain `contains` is not enough. `release_claim` is a prefix of
+/// `release_claim_if_queue_paused`. A doc that named only the longer call would
+/// look like it named both.
 fn mentions_identifier(haystack: &str, needle: &str) -> bool {
     haystack.match_indices(needle).any(|(idx, _)| {
         let after = haystack[idx + needle.len()..].chars().next();
@@ -390,10 +386,9 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
     let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
-    // `claim_task_on_shard`, not `claim_task`: issue #954 made the latter a thin
-    // wrapper that delegates, so the claim transaction — and every statement
-    // this guard exists to keep the docs honest about — lives in the former.
-    // The guard follows the transaction, which is what it was always about.
+    // `claim_task_on_shard`, not `claim_task`. Issue #954 made `claim_task` a
+    // thin wrapper that delegates. So the claim transaction and its statements
+    // live in `claim_task_on_shard`, and the guard follows the transaction.
     let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
         .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
     // Issue #1312 moved the post-claim re-checks into a helper that the
@@ -435,11 +430,11 @@ fn claim_transaction_statements_are_all_named_in_the_docs() {
 
 /// The enqueue caveat must defer to the one authoritative window definition.
 ///
-/// The page described the throughput denominator in two places and they
-/// disagreed: the caveat claimed it spanned "warmup and task spawn/join" while
-/// the hygiene bullet correctly described a barrier-to-completion span that
-/// excludes everything outside the worker closures. Restating the endpoints in
-/// two voices is what let them drift, so the caveat now links instead.
+/// The page described the throughput denominator in two places, and they
+/// disagreed. The caveat claimed it spanned "warmup and task spawn/join". The
+/// hygiene bullet correctly described a barrier-to-completion span. That span
+/// excludes everything outside the worker closures. Two statements of the
+/// endpoints let them drift, so the caveat now links instead.
 #[test]
 fn enqueue_throughput_caveat_defers_to_the_authoritative_window_definition() {
     let doc = read_performance_doc();
@@ -476,16 +471,15 @@ fn enqueue_throughput_caveat_defers_to_the_authoritative_window_definition() {
 
 /// The structural helpers must survive a CRLF checkout.
 ///
-/// Every helper above locates boundaries with `\n`-anchored needles. Git checks
-/// this repository out with CRLF on Windows, so reading a file raw hands those
-/// helpers `\r\n` and each needle silently misses — surfacing as a bogus "file
-/// must define X" panic. That is exactly what happened: the guards passed on
-/// Linux and macOS and failed only on `Test (windows-latest)`.
+/// Every helper above finds boundaries with `\n`-anchored needles. Git checks
+/// this repository out with CRLF on Windows. A raw read then gives the helpers
+/// `\r\n`, and each needle misses with a bogus "file must define X" panic. The
+/// guards once passed on Linux and macOS and failed only on
+/// `Test (windows-latest)`.
 ///
-/// This test reproduces the platform difference *on every platform* by writing
-/// a fixture with explicit CRLF. If `read_normalized` is ever simplified back to
-/// a plain `read_to_string`, this fails in the ordinary Linux test run rather
-/// than waiting for Windows CI to notice.
+/// This test writes a fixture with explicit CRLF, so it reproduces the
+/// difference *on every platform*. If `read_normalized` becomes a plain
+/// `read_to_string` again, the ordinary Linux test run fails.
 #[test]
 fn structural_helpers_survive_crlf_line_endings() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -548,13 +542,13 @@ fn structural_helpers_survive_crlf_line_endings() {
 
 /// The page must not attribute the `paused_rows` +1% to the predicate itself.
 ///
-/// `double_backlog` controls for *total* rows, not for the population that
-/// reaches the sort: the PAUSED anti-join is a `WHERE` predicate, so it removes
-/// half the table before the `ORDER BY` in `paused_rows` and removes nothing in
-/// the control (20 000 rows sorted vs 10 000). The +1% is therefore the probe
-/// cost minus the sort saving — two effects with opposite signs that this
-/// measurement cannot separate — and the page said "the anti-join is free" for
-/// several revisions on the strength of it.
+/// `double_backlog` controls for *total* rows, not for the rows that reach the
+/// sort. The PAUSED anti-join is a `WHERE` predicate. In `paused_rows` it
+/// removes half the table before the `ORDER BY`. In the control it removes
+/// nothing, so the control sorts 20 000 rows against 10 000. The +1% is the
+/// probe cost minus the sort saving. This measurement cannot separate those two
+/// opposite effects. On the strength of it, the page said "the anti-join is
+/// free" for several revisions.
 ///
 /// The claim reads so naturally that it came back once already after being
 /// narrowed. This pins the narrowing: the page must keep the subsection that
@@ -596,19 +590,18 @@ fn the_paused_rows_delta_is_not_attributed_to_the_predicate() {
     }
 }
 
-/// The sticky-routing `CASE` key is *sufficient* to force `Seq Scan` + `Sort`,
-/// but issue #1177 shows it is not *necessary*: with the `CASE` removed
-/// entirely from `ORDER BY` and `idx_harvest_tq_poll` forced via planner
-/// hints, adding any single one of the query's other residual `WHERE`
-/// predicates — including several with zero actual selectivity —
-/// independently reproduces the identical collapse.
+/// The sticky-routing `CASE` key is *sufficient* to force `Seq Scan` + `Sort`.
 ///
-/// Read on its own, [the plan](#the-plan)'s original wording ("the claim
-/// query's `ORDER BY` leads with a non-indexable `CASE` expression, so
-/// `idx_harvest_tq_poll` cannot serve the ordering") invites the natural next
-/// step of "drop the `CASE`, get the cheap plan back". Issue #1177 exists
-/// because that reading does not survive a reproduction. This pins the
-/// correction so the CASE-is-sufficient reading cannot silently return.
+/// Issue #1177 shows that it is not *necessary*. Remove the `CASE` from
+/// `ORDER BY` and force `idx_harvest_tq_poll` with planner hints. Then any one
+/// of the query's other residual `WHERE` predicates reproduces the same
+/// collapse. Several of them have zero actual selectivity.
+///
+/// [The plan](#the-plan)'s original wording read: "the claim query's `ORDER BY`
+/// leads with a non-indexable `CASE` expression, so `idx_harvest_tq_poll`
+/// cannot serve the ordering". On its own, it invites "drop the `CASE`, get the
+/// cheap plan back". A reproduction disproved that reading (issue #1177). This
+/// pins the correction, so the CASE-is-sufficient reading cannot return.
 #[test]
 fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
     let doc = read_performance_doc();
@@ -700,17 +693,16 @@ fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
 
 /// These guards must actually execute on a docs-only pull request.
 ///
-/// The whole point of this file is to catch prose that drifts from the tables
-/// in `docs/performance.md`. The change most likely to cause that drift is a
-/// pull request that edits *only* that file — and that is precisely the one CI
-/// used to skip: the `changes` job classifies `docs/**` as `code=false`, and
-/// every step of the `test` matrix is gated on `code == 'true'`. The `lint`
-/// job runs ungated, but its Clippy invocation only *compiles* this file.
+/// This file catches prose that drifts from the tables in
+/// `docs/performance.md`. A pull request that edits *only* that file is the
+/// likeliest cause of drift. CI used to skip exactly that pull request. The
+/// `changes` job classifies `docs/**` as `code=false`. Every step of the
+/// `test` matrix is gated on `code == 'true'`. The `lint` job runs ungated, but
+/// its Clippy invocation only *compiles* this file.
 ///
-/// So for three rounds these guards could not have fired on the change class
-/// they were written for. The fix is a `cargo test` step in the ungated `lint`
-/// job; this asserts that step is there and has not acquired a condition that
-/// would put it back behind the same gate.
+/// So for three rounds these guards could not fire on their target change
+/// class. The fix is a `cargo test` step in the ungated `lint` job. This test
+/// asserts that the step exists and has no condition that gates it again.
 #[test]
 fn performance_guards_run_on_docs_only_changes() {
     let workflow = read_normalized(
@@ -720,9 +712,9 @@ fn performance_guards_run_on_docs_only_changes() {
             .join(".github/workflows/ci.yml"),
     );
 
-    // The step must exist, and must name this module as its filter — a step
-    // that ran some *other* test would satisfy a looser check while leaving
-    // these guards just as unexecuted.
+    // The step must exist and must name this module as its filter. A step that
+    // ran some *other* test would pass a looser check and leave these guards
+    // unexecuted.
     let step = workflow
         .lines()
         .find(|line| line.contains("--test integration performance_docs::"))
@@ -773,20 +765,19 @@ fn performance_guards_run_on_docs_only_changes() {
 /// The changelog fragment must not publish superseded figures.
 ///
 /// The fragment is collated into the public `CHANGELOG.md`, so its opening
-/// entry *is* the release note. Rounds of review appended corrections to the
-/// end of it as a development diary — which left the headline still quoting an
-/// earlier run's numbers and the attribution that was later retracted, roughly
-/// ninety thousand characters before the retraction. A reader of the collated
-/// changelog meets the superseded claim first and may never reach the fix.
+/// entry *is* the release note. Rounds of review appended corrections to its
+/// end as a development diary. The headline still quoted an earlier run's
+/// numbers and the later-retracted attribution. The retraction came roughly
+/// ninety thousand characters later. A reader meets the superseded claim first
+/// and may never reach the fix.
 ///
-/// So this pins the fragment against the same tables `docs/performance.md`
-/// publishes: the figures it quotes must be the current ones, and the rejected
-/// isolated-cost reading must not appear as an assertion anywhere in it.
+/// So this pins the fragment against the tables `docs/performance.md`
+/// publishes. Its figures must be the current ones. The rejected isolated-cost
+/// reading must not appear as an assertion anywhere in it.
 ///
-/// This guard lives here rather than beside the changelog because
-/// `docs/changelog.d/**` is also classified `code=false` — a changelog-only
-/// edit is exactly the kind of change that skips the gated test matrix, and the
-/// ungated lint step runs *this* module.
+/// This guard lives here, not beside the changelog. `docs/changelog.d/**` is
+/// also classified `code=false`, so a changelog-only edit skips the gated test
+/// matrix. The ungated lint step runs *this* module.
 #[test]
 fn changelog_fragment_quotes_the_published_figures() {
     let doc = read_performance_doc();
@@ -804,11 +795,10 @@ fn changelog_fragment_quotes_the_published_figures() {
     // off the table rather than hardcoding it.
     //
     // Scoped to the sentence that introduces the control, NOT to the whole
-    // fragment: the figure also appears in the appended round-by-round diary,
-    // so a bare `fragment.contains(..)` is satisfied by a *correct* mention in
-    // the diary while the *leading* entry — the part that becomes the release
-    // note — still quotes a superseded run. That is exactly the drift this
-    // guards, so an unscoped check would pass through it. (Verified: it did.)
+    // fragment. The figure also appears in the appended round-by-round diary.
+    // A correct mention there satisfies a bare `fragment.contains(..)`. The
+    // *leading* entry, which becomes the release note, could still quote a
+    // superseded run. An unscoped check passes that drift, and it once did.
     let published = format!("+{}%", control.delta_pct);
     let intro = fragment
         .find("ClaimGate::DoubleBacklog")
@@ -846,11 +836,11 @@ fn changelog_fragment_quotes_the_published_figures() {
 
 /// The harness docs must name the statistic the gate actually asserts.
 ///
-/// The gate switched from p99 to p50 — deliberately, because the headline
-/// scenario oversubscribes the box and the tail measures the run queue rather
-/// than the claim path. The shared harness's module docs kept describing a p99
-/// gate, so a maintainer reading the harness first would calibrate or relax the
-/// budget against a statistic nothing asserts.
+/// The gate deliberately switched from p99 to p50. The headline scenario
+/// oversubscribes the box, so the tail measures the run queue, not the claim
+/// path. The shared harness's module docs still described a p99 gate. A
+/// maintainer who read the harness first would tune the budget against a
+/// statistic that nothing asserts.
 #[test]
 fn harness_docs_name_the_asserted_statistic() {
     let harness = read_normalized(
@@ -904,27 +894,24 @@ fn truncated_sample_counts_in_prose_match_the_table() {
 
 /// Every unquoted value in `ci.yml` must be a legal YAML plain scalar.
 ///
-/// This exists because the guard above — which asserts the `performance_docs`
-/// step is present, ungated, and in the right job — passed happily while the
-/// workflow file was **not valid YAML at all**, so GitHub loaded no jobs and
-/// every run failed instantly. A guard that asserts a CI step exists is
-/// worthless if the file containing it cannot be parsed; the step was there,
-/// correct, and dead.
+/// The guard above asserts that the `performance_docs` step is present,
+/// ungated and in the right job. It passed while the workflow file was **not
+/// valid YAML at all**. GitHub loaded no jobs, and every run failed instantly.
+/// A guard that asserts a CI step is worthless if its file cannot be parsed.
+/// The step was there, correct, and dead.
 ///
-/// The specific trap: a plain (unquoted) YAML scalar may not contain a colon
-/// that the parser reads as a mapping separator — either `: ` mid-value, or a
-/// trailing `:` at end of line. The step this module added ended in
-/// `performance_docs::`, so YAML saw a mapping indicator and rejected the file
-/// with "mapping values are not allowed here". Quoting the value fixes it.
+/// The trap: a plain (unquoted) YAML scalar may not contain a colon that the
+/// parser reads as a mapping separator. That is `: ` mid-value or a trailing
+/// `:` at end of line. The step this module added ended in
+/// `performance_docs::`. YAML rejected the file with "mapping values are not
+/// allowed here". Quoting the value fixes it.
 ///
-/// This is a targeted rule, not a YAML parser, and it is named for what it
-/// checks rather than for "the workflow is valid". It is the right rule for
-/// *this* file specifically: `ci.yml` is dominated by long shell one-liners,
-/// and cargo test filters (`module::`), URLs (`https://`) and time expressions
-/// are exactly the values that acquire colons. A full parse would need a YAML
-/// dependency on the core crate, and the only one already in the lockfile is
-/// both deprecated and reachable solely through `autumn-web`, which this crate
-/// does not depend on.
+/// This is a targeted rule, not a YAML parser, and its name says what it
+/// checks. It suits *this* file: `ci.yml` is mostly long shell one-liners.
+/// Cargo test filters (`module::`), URLs (`https://`) and time expressions are
+/// the values that acquire colons. A full parse needs a YAML dependency on the
+/// core crate. The only one in the lockfile is deprecated. It is reachable only
+/// through `autumn-web`, which this crate does not depend on.
 #[test]
 fn ci_yaml_plain_scalars_do_not_contain_a_mapping_colon() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -953,10 +940,9 @@ fn ci_yaml_plain_scalars_do_not_contain_a_mapping_colon() {
         // that flagged it too would forbid the correct spelling.
         let quoted = (value.starts_with('"') && value.ends_with('"') && value.len() > 1)
             || (value.starts_with('\'') && value.ends_with('\'') && value.len() > 1);
-        // Block scalars (`|`, `>`, and their chomping/indent variants) are not
-        // plain scalars at all — their content lines are opaque to the parser's
-        // mapping rules, which is why every long multi-line `run:` in this file
-        // is already safe.
+        // Block scalars (`|`, `>` and their chomping/indent variants) are not
+        // plain scalars. The parser's mapping rules do not apply to their
+        // content lines. So every long multi-line `run:` in this file is safe.
         let block = value.starts_with('|') || value.starts_with('>');
         if quoted || block {
             continue;
@@ -984,19 +970,18 @@ fn ci_yaml_plain_scalars_do_not_contain_a_mapping_colon() {
 /// The benchmark's *generated report* must not republish the retracted
 /// attribution either.
 ///
-/// Round 24 narrowed the claim in `docs/performance.md`; round 26 found the
-/// changelog's leading entry still carried it; this covers the third surface —
-/// the note `benches/claim_bench.rs` prints under its per-gate table. That note
-/// is arguably the worst place for it to survive: the doc is read once, but the
-/// bench output is what someone pastes into a PR when they regenerate the
-/// numbers, so a stale interpretation there propagates into new writing.
+/// One fix narrowed the claim in `docs/performance.md`. A later one found that
+/// the changelog's leading entry still carried it. This test covers the third
+/// surface: the note `benches/claim_bench.rs` prints under its per-gate table.
+/// That note is arguably the worst place for it to survive. The doc is read
+/// once, but someone pastes the bench output into a PR when they regenerate
+/// the numbers. So a stale interpretation there propagates into new writing.
 ///
-/// Scoped to `println!` string content rather than the whole file: the source
-/// may freely *discuss* the retraction in comments (this fix does), and a guard
-/// that could not tell an explanation from an assertion would forbid explaining
-/// it — the same self-trip that
-/// [`changelog_fragment_quotes_the_published_figures`] hit and solves by
-/// quote-detection.
+/// Scoped to `println!` string content, not the whole file. The source may
+/// *discuss* the retraction in comments, and this fix does. A guard that cannot
+/// tell an explanation from an assertion would forbid the explanation.
+/// [`changelog_fragment_quotes_the_published_figures`] hit the same self-trip
+/// and solves it by quote detection.
 #[test]
 fn the_bench_report_does_not_republish_the_retracted_attribution() {
     let bench =
@@ -1039,18 +1024,17 @@ fn the_bench_report_does_not_republish_the_retracted_attribution() {
 
 /// Every database await in the benchmark must sit under a wall-clock ceiling.
 ///
-/// The benchmark advertises `HARVEST_BENCH_SCENARIO_SECS` as the bound on how
-/// long any one phase may take, and the scenario runners honour it — but the
-/// *report-only* paths (the version line in the header, the `EXPLAIN` section)
-/// originally connected and queried with no deadline at all. A server that
-/// accepted provisioning and then stopped answering would hang the process
-/// there, outside every scenario, with the advertised ceiling never consulted.
-/// Same class as the scenario-path bounds added in earlier rounds; this is the
-/// corner that takes no measurement and so was easy to overlook.
+/// The benchmark advertises `HARVEST_BENCH_SCENARIO_SECS` as the bound on any
+/// one phase, and the scenario runners honour it. The *report-only* paths (the
+/// header's version line, the `EXPLAIN` section) once queried with no deadline.
+/// A server that accepted provisioning and then stopped answering would hang
+/// the process there, outside every scenario. The advertised ceiling would
+/// never be consulted. Earlier rounds bounded the scenario paths. This corner takes no
+/// measurement, so it was easy to overlook.
 ///
-/// Checked textually rather than by types: the fix is "the call is wrapped",
-/// which is a syntactic property, and a type-level version would mean wrapping
-/// the whole `db` module in a deadline-carrying newtype for one benchmark.
+/// Checked textually, not by types. The fix ("the call is wrapped") is a
+/// syntactic property. A type-level check would need a deadline-carrying
+/// newtype around the whole `db` module for one benchmark.
 #[test]
 fn every_bench_database_await_is_bounded() {
     let bench =
@@ -1093,20 +1077,20 @@ fn every_bench_database_await_is_bounded() {
 
 /// The `all_gates` delta must not be published as a bound on predicate cost.
 ///
-/// `all_gates` seeds the same PAUSED ballast `paused_rows` does, so it scans
-/// 20 000 rows but sorts only 10 000, while its would-be `double_backlog`
-/// comparand sorts 20 000. Comparing them charges the row for every predicate
-/// while crediting it with half the sort — the same confound round 24 retracted
-/// for `paused_rows`. Round 35: not a *floor* either. A floor is a lower bound,
-/// and adding the sort saving back to derive one assumes the difference
-/// decomposes into predicate cost plus sort cost; the scenarios also filter to
-/// different post-filter populations and can reach different plans, so it does
-/// not. The comparison bounds nothing in either direction.
+/// `all_gates` seeds the same PAUSED ballast as `paused_rows`. It scans 20 000
+/// rows but sorts only 10 000. Its would-be `double_backlog` comparand sorts
+/// 20 000. Comparing them charges the row for every predicate while crediting
+/// it with half the sort. That is the same confound already retracted for
+/// `paused_rows`. It is not a *floor* either. A floor is a lower bound. Adding
+/// the sort saving back to derive one assumes that the difference decomposes
+/// into predicate cost plus sort cost. It does not. The scenarios also filter
+/// to different post-filter populations and can reach different plans. The
+/// comparison bounds nothing in either direction.
 ///
 /// This is a separate guard from
 /// [`the_paused_rows_delta_is_not_attributed_to_the_predicate`] because the two
-/// claims failed independently: the `paused_rows` attribution was retracted a
-/// full round before anyone noticed `all_gates` rested on the identical
+/// claims failed independently. The `paused_rows` attribution was retracted
+/// well before anyone noticed that `all_gates` rested on the identical
 /// comparison.
 #[test]
 fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
@@ -1133,9 +1117,9 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
     // And the correction must be present, so the claim cannot simply be deleted
     // and leave the reader to draw the retracted conclusion from the table.
     //
-    // Round 35: this used to require the phrase "floor, not a bound". That was
-    // itself the retracted claim — a floor *is* a lower bound — so the guard
-    // was mandating the error it existed to prevent. Requiring the *direction-
+    // This used to require the phrase "floor, not a bound". That was itself
+    // the retracted claim, because a floor *is* a lower bound. So the guard
+    // mandated the error it existed to prevent. Requiring the *direction-
     // free* conclusion instead is what [`the_all_gates_figure_is_not_published_
     // as_a_directional_bound`] then enforces the other half of.
     assert!(
@@ -1150,21 +1134,20 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
 /// The two overview files and the bench's own docs must not claim to price
 /// *every* claim-path predicate.
 ///
-/// The harness measures five. The other five — `schedule_to_close`, worker
-/// sessions, queue pauses, capability labels and sticky routing — are evaluated
-/// on every claim but sit on their cheapest null/empty path in every scenario
-/// here, so they are exercised rather than measured.
+/// The harness measures five. The other five are `schedule_to_close`, worker
+/// sessions, queue pauses, capability labels and sticky routing. Every claim
+/// evaluates them, but every scenario here keeps them on their cheapest
+/// null/empty path. So they are exercised, not measured.
 ///
-/// This is the same overclaim round 28 retracted in `docs/performance.md`, one
-/// level out. It matters more here than on the page: an overview is what a
-/// reader sees *before* deciding whether to open the page, so "each predicate"
-/// invites precisely the "predicates are a rounding error" conclusion — and it
-/// does so one step further from the caveats that would have stopped them.
+/// This is the same overclaim already retracted in `docs/performance.md`, one
+/// level out. It matters more here than on the page. A reader sees an overview
+/// *before* deciding whether to open the page. So "each predicate" invites
+/// precisely the "predicates are a rounding error" conclusion. It does so one
+/// step further from the caveats that would have stopped them.
 ///
-/// It also covers the bench source, because the first pass at this fix
-/// corrected only the two files the review named and left the identical wording
-/// in the module doc and on `gate_breakdown` — the doc comment of the function
-/// that does the measuring.
+/// It also covers the bench source. The first pass at this fix corrected only
+/// the two files the review named. It left the same wording in the module doc
+/// and on `gate_breakdown`, the function that does the measuring.
 #[test]
 fn overview_docs_do_not_claim_complete_predicate_coverage() {
     // Quoted occurrences are exempt for the same reason as elsewhere in this
@@ -1206,26 +1189,25 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
 /// The released entry's *current-behavior* description must not promise a
 /// pid-liveness guarantee the sweep no longer offers.
 ///
-/// Round 5 removed the pid veto from `sweep_step` outright, making the
-/// server-visible lease the sole liveness authority — precisely because a
-/// containerised run records pid 1, pid 1 is alive everywhere, and the veto
-/// therefore skipped every stale database a previous container run had left
-/// behind. The opening description still told operators the sweep skips a
-/// database "whose owning pid is still alive", which is both untrue and
-/// reassuring in the wrong direction: an operator reading it would expect a
-/// live-but-leaseless run to be protected from reclamation.
+/// A fix removed the pid veto from `sweep_step` outright. The server-visible
+/// lease became the sole liveness authority. A containerised run records
+/// pid 1, and pid 1 is alive everywhere. So the veto skipped every stale
+/// database that a previous container run had left behind. The opening
+/// description still said the sweep skips a database "whose owning pid is still
+/// alive". That is untrue, and it reassures in the wrong direction. An operator
+/// would expect a live but leaseless run to be safe from reclamation.
 ///
 /// Scoped to the text *before* the first `Post-review hardening` section, and
 /// that scoping is the substance of the test. The released entry embeds a
-/// round-by-round narrative in which "the local pid check is kept" is a true
-/// statement about round 2, later superseded; banning the phrase everywhere
-/// would forbid the entry from recording its own history. The prefix is the
-/// part that speaks in the present tense about shipped behaviour.
+/// step-by-step narrative. In it, "the local pid check is kept" is a true
+/// statement about an early step, later superseded. Banning the phrase
+/// everywhere would forbid the entry from recording its own history. The
+/// prefix is the part that speaks in the present tense about shipped behaviour.
 ///
-/// The sibling guard below catches a *retracted conclusion*; this one catches a
+/// The sibling guard below catches a *retracted conclusion*. This one catches a
 /// *retracted mechanism*. Neither the figure checks nor the own-voice check can
-/// see either, because in both cases the prose is internally consistent and
-/// only disagrees with the code.
+/// see either. In both cases the prose is internally consistent and disagrees
+/// only with the code.
 #[test]
 fn the_released_entry_does_not_promise_pid_liveness_protection() {
     let fragment = released_perf_entry();
@@ -1272,17 +1254,17 @@ fn the_released_entry_does_not_promise_pid_liveness_protection() {
 /// `all_gates` bound.
 ///
 /// Scoped to the leading entry, not the whole fragment, and the distinction is
-/// the whole point. The fragment is collated into the public `CHANGELOG.md`, so
-/// its first top-level bullet *is* the released claim; the round-by-round diary
-/// appended below it legitimately records what was believed at each stage and
-/// then corrected, and a guard that forbade the superseded wording anywhere
-/// would forbid the diary from recording the correction at all.
+/// the whole point. The fragment is collated into the public `CHANGELOG.md`.
+/// So its first top-level bullet *is* the released claim. The round-by-round
+/// diary below it records what was believed at each stage and then corrected.
+/// A guard that forbade the superseded wording anywhere would forbid that
+/// record.
 ///
-/// This is the second time this exact drift has occurred (round 26 was the
-/// first) and the existing `changelog_fragment_quotes_the_published_figures`
-/// did not catch it, because that guard checks the *figures* the entry quotes
-/// against the published tables. Here the figure was right and the *conclusion*
-/// drawn from it was withdrawn — a class the figure check cannot see.
+/// This exact drift has now occurred twice. The existing
+/// `changelog_fragment_quotes_the_published_figures` did not catch it. That
+/// guard checks the *figures* the entry quotes against the published tables.
+/// Here the figure was right, but the *conclusion* drawn from it was withdrawn.
+/// The figure check cannot see that class.
 #[test]
 fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
     let fragment = released_perf_entry();
@@ -1317,32 +1299,31 @@ fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
 
 /// `+28%` must not be published as a bound in *either* direction.
 ///
-/// Round 28 retracted "the surviving bound on combined predicate cost" and
-/// round 29 replaced it with "a floor, not a bound" — but a floor **is** a
-/// lower bound, so that wording restated the retracted claim in the one
-/// direction it was still tempting to keep, and contradicted the "cannot bound
-/// in either direction" conclusion sitting a few lines below it.
+/// One fix retracted "the surviving bound on combined predicate cost". The
+/// next one replaced it with "a floor, not a bound". But a floor **is** a lower
+/// bound. So that wording restated the retracted claim in the one direction it
+/// was still tempting to keep. It also contradicted the "cannot bound in
+/// either direction" conclusion a few lines below it.
 ///
-/// The reasoning that produced it does not hold either: adding the unmeasured
-/// sort saving back to the difference assumes the difference decomposes into
-/// predicate cost plus sort cost. It does not — the two scenarios also filter
-/// to different post-filter populations and can reach different plans, so
-/// there is neither a measured term to add back nor an established direction
-/// for the bias.
+/// The reasoning behind it does not hold either. Adding the unmeasured sort
+/// saving back assumes the difference decomposes into predicate cost plus sort
+/// cost. It does not. The two scenarios also filter to different post-filter
+/// populations and can reach different plans. So there is no measured term to add back and
+/// no established direction for the bias.
 ///
-/// Scoped to a window around each `28%` rather than to the whole file, because
-/// the enqueue-throughput column *is* a genuine floor (it divides every row,
-/// warmup included, by the whole wall clock — an arithmetic property of one
-/// measurement, not a cross-scenario comparison) and must stay sayable.
+/// Scoped to a window around each `28%`, not the whole file. The
+/// enqueue-throughput column *is* a genuine floor, and it must stay sayable. It
+/// divides every row, warmup included, by the whole wall clock. That is an
+/// arithmetic property of one measurement, not a cross-scenario comparison.
 #[test]
 fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
     // Every phrasing that asserts a *direction* for the bias. "at least" and
     // "no lower than" are included because they are how the same claim reads
     // once the word "floor" is gone.
     /// How much text either side of a `28%` counts as "about that figure".
-    /// Wide enough to cover the sentence it sits in and its neighbour, narrow
-    /// enough that the enqueue-throughput floor — a different claim, hundreds
-    /// of lines away — stays sayable.
+    /// It covers the sentence and its neighbour. It is narrow enough that the
+    /// enqueue-throughput floor, a different claim hundreds of lines away, stays
+    /// sayable.
     const WINDOW: usize = 400;
 
     const DIRECTIONAL: [&str; 6] = [
@@ -1354,10 +1335,9 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
         "conservative",
     ];
 
-    // Pairs of (label, already-extracted text) rather than (label, path): the
-    // released entry is one item inside a long shipped-work record, so handing
-    // this loop that whole file would let an unrelated entry's "28%" trip — or
-    // mask — the scan below.
+    // Pairs of (label, already-extracted text), not (label, path). The released
+    // entry is one item in a long shipped-work record. With the whole file, an
+    // unrelated entry's "28%" could trip or mask the scan below.
     for (label, source) in [
         (
             "docs/performance.md",
@@ -1368,10 +1348,9 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
             released_perf_entry(),
         ),
     ] {
-        // A character window, not a line window: `docs/performance.md` is hard
-        // wrapped at ~78 columns while the released entry is a single
-        // 40 000-character line, so any line-based span is either too small for
-        // one document or the whole of the other.
+        // A character window, not a line window. `docs/performance.md` is hard
+        // wrapped at ~78 columns. The released entry is one 40 000-character line.
+        // So any line-based span is too small for one or the whole of the other.
         let text = collapse_ws(&source);
         for (idx, _) in text.match_indices("28%") {
             let lo = idx.saturating_sub(WINDOW);
@@ -1386,10 +1365,9 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
                 .unwrap_or(idx);
             let window = &text[lo..hi];
             for banned in DIRECTIONAL {
-                // Quoted occurrences are exempt, by the same rule the rest of
-                // this module uses: a retraction has to reproduce the claim it
-                // retracts in order to name it, and the diary below records
-                // exactly that. See [`asserted_in_own_voice`].
+                // Quoted occurrences are exempt, as in the rest of this module.
+                // A retraction must reproduce the claim to name it, and the
+                // diary below records exactly that. See [`asserted_in_own_voice`].
                 assert!(
                     !asserted_in_own_voice(window, banned),
                     "{label} describes the `all_gates` +28% comparison as \
@@ -1412,18 +1390,17 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
 /// the published table currently carries.
 ///
 /// The existing `changelog_fragment_quotes_the_published_figures` pins exactly
-/// one number — the control's multiplier — because that was the figure the
-/// round-26 drift turned on. It therefore did not notice that the leading
-/// entry's "per-gate attribution (AC2)" list had gone stale in *all five* of its
-/// figures when round 22 regenerated the tables from a fresh run: the diary
-/// recorded the regeneration, the page carried the new numbers, and the entry
-/// that becomes the release note kept the old ones. Two of them had even swapped
-/// rank with each other, so the release note published an ordering the page
-/// explicitly says does not reproduce.
+/// one number, the control's multiplier. An earlier drift turned on that
+/// figure. So the guard did not notice a later regeneration of the tables from
+/// a fresh run. It left the leading entry's "per-gate attribution (AC2)" list
+/// stale in *all five* of its figures. The diary recorded the regeneration and
+/// the page carried the new numbers. The entry that becomes the release note
+/// kept the old ones. Two of them had even swapped rank. So the release note
+/// published an ordering that the page says does not reproduce.
 ///
-/// Rather than pin a sixth specific number, this reads every gate name the
-/// leading entry mentions alongside a percentage and checks that percentage
-/// against the table. A future regeneration cannot leave any of them behind.
+/// This does not pin a sixth number. It reads each gate name that the leading
+/// entry quotes with a percentage, and checks that percentage against the
+/// table. A future regeneration cannot leave any of them behind.
 #[test]
 fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
     let doc = read_performance_doc();
@@ -1475,29 +1452,27 @@ fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
 /// Every millisecond figure the changelog's headline findings quote must still
 /// appear somewhere on the published page.
 ///
-/// The per-gate guard above covers the AC2 list. Auditing that fix turned up
-/// that the *same* round-22 regeneration had also left findings (1) and (4)
-/// behind — the release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms) and
-/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s, while the page's
-/// own sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
-/// ~4 600 enqueues/s. So the drift was never specific to the gate list; it was
+/// The per-gate guard above covers the AC2 list. An audit of that fix found
+/// that the *same* regeneration had also left findings (1) and (4) behind. The
+/// release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms). It also claimed
+/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s. The page's own
+/// sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
+/// ~4 600 enqueues/s. So the drift was never specific to the gate list. It was
 /// the whole headline.
 ///
-/// A containment check rather than a table parse, deliberately: the headline is
-/// prose that quotes figures from several tables (the sweep, the enqueue sweep,
-/// the plan's buffer counts), and a parser per table would have to be extended
-/// every time the prose cites a new one — the same instance-by-instance trap
-/// that let this survive. Requiring each quoted figure to appear *somewhere* on
-/// the page needs no such extension: regenerating any table drops its old
-/// values off the page, and the stale quote fails here.
+/// A containment check, not a table parse, on purpose. The headline quotes
+/// figures from several tables: the sweep, the enqueue sweep and the plan's
+/// buffer counts. A parser per table needs an extension for each new citation.
+/// That instance-by-instance trap let this drift survive. Requiring each quoted
+/// figure *somewhere* on the page needs no extension. A regenerated table drops
+/// its old values, and the stale quote fails here.
 ///
-/// Scoped to the two regions that summarise *current* measurements — the
-/// headline findings and the gate's budget rationale — rather than the whole
-/// entry. The entry also narrates superseded runs on purpose ("an earlier
-/// revision ... read ~2 900 ms instead of ~300 ms"), and the page publishes that
-/// history deliberately, so a whole-entry sweep would fail on text that is
-/// correct. The excluded region is narrative about the past; these two are
-/// claims about the present.
+/// Scoped to the two regions that summarise *current* measurements: the
+/// headline findings and the gate's budget rationale. The entry also narrates
+/// superseded runs on purpose ("an earlier revision ... read ~2 900 ms instead
+/// of ~300 ms"). The page publishes that history deliberately. So a
+/// whole-entry sweep would fail on correct text. The excluded region describes
+/// the past. These two regions make claims about the present.
 #[test]
 fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
     let doc = read_performance_doc();
@@ -1516,9 +1491,9 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
 
     // The budget sentence quotes the reference p50 the gate is derived from, so
     // it goes stale on exactly the same regeneration. It sat outside the
-    // headline block and drifted independently: round 5 widened the reference
-    // to a 200-234 ms range and the entry kept quoting a flat "234 ms", which
-    // by then also contradicted the entry's own corrected headline.
+    // headline block and drifted independently. A fix widened the reference to
+    // a 200-234 ms range, and the entry kept quoting a flat "234 ms". By then
+    // that also contradicted the entry's own corrected headline.
     let budget_start = leading
         .find("fails the build when")
         .expect("the leading entry must state the gate's budget");
@@ -1577,17 +1552,17 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
 /// The `ClaimGate` variant docs must not resurrect the anti-join attribution.
 ///
 /// `docs/performance.md` retracted the reading that `PausedRows -
-/// DoubleBacklog` isolates the `NOT EXISTS` predicate: the anti-join is a
-/// `WHERE` predicate, so it runs before the `ORDER BY` and `PausedRows` feeds
-/// half as many rows to the sort as its control does. The delta is the probe
-/// cost *minus* that sort saving — two effects with opposite signs, whose net
-/// sign flips between runs.
+/// DoubleBacklog` isolates the `NOT EXISTS` predicate. The anti-join is a
+/// `WHERE` predicate, so it runs before the `ORDER BY`. `PausedRows` feeds half
+/// as many rows to the sort as its control. The delta is the probe cost *minus*
+/// that sort saving. The two effects have opposite signs, and the net sign
+/// flips between runs.
 ///
-/// The enum docs are a second surface for that claim, and a worse one:
-/// `comparand()` is what the report generator pairs rows by, so a maintainer
-/// republishing a run reads the attribution from here, not from the page.
-/// Round 35 was this same shape — a retraction that landed in the docs and
-/// left a stale assertion somewhere else.
+/// The enum docs are a second surface for that claim, and a worse one. The
+/// report generator pairs rows by `comparand()`. A maintainer who republishes a
+/// run reads the attribution from here, not from the page.
+/// The "floor, not a bound" correction had this same shape: a retraction that
+/// landed in the docs and left a stale assertion somewhere else.
 #[test]
 fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
     let harness = read_normalized(

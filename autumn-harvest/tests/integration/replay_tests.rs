@@ -78,7 +78,6 @@ fn two_step_suspend_workflow<'a>(
             .await
             .map_err(|e| e.to_string())?;
 
-        // This second call will suspend if not in history
         let r2 = ctx
             .execute_activity_raw("step_2", Value::Null, "default")
             .await
@@ -207,7 +206,6 @@ async fn replay_detects_non_determinism() {
 async fn version_gate_routes_code_paths_with_marker() {
     let exec_id = ExecutionId::new();
 
-    // History with a version marker recording version 2
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -237,7 +235,6 @@ async fn version_gate_routes_code_paths_with_marker() {
 async fn version_gate_new_execution_returns_max() {
     let exec_id = ExecutionId::new();
 
-    // Only WorkflowStarted, no marker — past end of history
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
@@ -250,7 +247,7 @@ async fn version_gate_new_execution_returns_max() {
 
     match outcome {
         WorkflowOutcome::Completed { output, .. } => {
-            // max_version = 3 for our versioned_workflow
+            // `versioned_workflow` has `max_version = 3`.
             assert_eq!(output, serde_json::json!({"version": 3}));
         }
         other => panic!("expected Completed with version 3, got {other:?}"),
@@ -264,7 +261,6 @@ async fn workflow_suspends_mid_execution() {
     let exec_id = ExecutionId::new();
     let id1 = ActivityExecId::new();
 
-    // History only has the first activity completed
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -289,7 +285,7 @@ async fn workflow_suspends_mid_execution() {
 
     match outcome {
         WorkflowOutcome::Suspended { commands } => {
-            // The second activity call should have emitted a ScheduleActivity command
+            // The second activity call emits a `ScheduleActivity` command.
             assert_eq!(commands.len(), 1, "expected exactly 1 pending command");
             assert!(
                 matches!(
@@ -848,8 +844,8 @@ fn non_deterministic_await_condition_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         ctx.await_condition(|| {
-            // Predicate evaluates to false on replay, causing early suspension,
-            // but the history has a timer event that expects us to have proceeded.
+            // The predicate is false on replay, so the workflow suspends early. The
+            // history holds a timer event that expects the workflow to go on.
             false
         })
         .await
@@ -869,9 +865,9 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
 
     let exec_id = ExecutionId::new();
 
-    // History claims we completed the condition and started a timer.
-    // But on replay, the condition returns false, so the workflow suspends.
-    // The history matcher should catch this divergence and fail the replay.
+    // History holds a met condition and a started timer. On replay the
+    // condition returns false, so the workflow suspends. The history matcher
+    // must catch this divergence and fail the replay.
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -907,7 +903,7 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
 
     match report.status {
         ReplayStatus::NonDeterminismDetected { .. } => {
-            // Success! The replayer detected that the workflow suspended early / diverged.
+            // The replayer detects the early suspension.
         }
         other => panic!("expected ReplayStatus::NonDeterminismDetected, got {other:?}"),
     }

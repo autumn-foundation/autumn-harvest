@@ -4,9 +4,9 @@
 //! **Mechanism.** `Control`. `helpers::hot_path()` is
 //! `ROUND.load(SeqCst) % 2 == 0` on a `static AtomicUsize`. Both branches emit
 //! the same two commands with byte-identical arguments; only the **sequence**
-//! differs. That alone diverges replay, because history is an ordered log —
-//! which is exactly why the verdict has to be about the command *sequence*, not
-//! about argument values.
+//! differs. That alone diverges replay, because history is an ordered log.
+//! So the verdict must be about the command *sequence*, not about argument
+//! values.
 //!
 //! **Launder.** No argument anywhere is tainted, so a value-only taint model
 //! reports nothing. Syntactically: HVG007 needs `.lock()` on an uppercase

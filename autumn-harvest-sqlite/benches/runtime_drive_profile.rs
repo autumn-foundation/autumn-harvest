@@ -1,10 +1,10 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `SqliteRuntime`'s end-to-end decision-cycle driver
-//! (`run_until_blocked`) -- the SQLite-backend analogue of
-//! `autumn-harvest/benches/replay_profile.rs` (issue #135's replay budget),
-//! but measuring a full *drive* (repeated replay + persist + inline
-//! activity execution across N decision cycles), not one single
-//! `replay_from_events` pass over a pre-built history.
+//! Deterministic instruction/allocation-count profiling harness for
+//! `run_until_blocked`, the decision-cycle driver of `SqliteRuntime`.
+//!
+//! It is the SQLite-backend analogue of `autumn-harvest/benches/replay_profile.rs`
+//! (the replay budget of issue #135). It measures a full *drive*: repeated
+//! replay, persist, and inline activity execution across N decision cycles. It
+//! does not measure one `replay_from_events` pass over a pre-built history.
 //!
 //! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
 //! binary is not measured with `cargo bench` / criterion timing. It is driven
@@ -12,25 +12,23 @@
 //! `valgrind --tool=dhat` (allocation counts/bytes), which are deterministic
 //! across runs.
 //!
-//! `harness = false` + its own `main()` -- same shape as
-//! `autumn-harvest/benches/replay_profile.rs` -- so the compiled artifact is
-//! a plain executable a profiler can be pointed at directly.
+//! `harness = false` and its own `main()` match the shape of
+//! `autumn-harvest/benches/replay_profile.rs`. So the compiled artifact is a
+//! plain executable that a profiler can run directly.
 //!
 //! # Workload
 //!
-//! `sequential_workflow(ctx, n)` calls `ctx.execute_activity_raw` `n` times,
-//! sequentially, each with a distinct `format!("activity_{i}")` name and a
-//! realistic ~230-byte JSON payload (the same `activity_payload` shape
-//! `replay_profile_support.rs` uses) as both the scheduled input and the
-//! completed output. Both the per-iteration name formatting and the payload
-//! shape deliberately mirror `replay_profile_support.rs::sequential_workflow`
-//! exactly, so this is the SAME workload issue #135 budgets for the Postgres
-//! replay path, driven through `SqliteRuntime::run_until_blocked` end-to-end
-//! (start -> N decision cycles -> completion) rather than through a single
-//! `replay_from_events` call over a pre-built history. Each decision cycle
-//! re-loads and re-replays the ENTIRE history accumulated so far (this
-//! backend has no warm-cache / delta-load path), so this is the realistic
-//! full-run cost, not a single-cycle slice.
+//! `sequential_workflow(ctx, n)` calls `ctx.execute_activity_raw` `n` times in
+//! sequence. Each call has a distinct `format!("activity_{i}")` name. A
+//! realistic ~230-byte JSON payload (the `activity_payload` shape of
+//! `replay_profile_support.rs`) is both the scheduled input and the output.
+//! The name formatting and the payload shape mirror
+//! `replay_profile_support.rs::sequential_workflow` exactly. So this is the
+//! SAME workload that issue #135 budgets for the Postgres replay path. Here it
+//! runs through `SqliteRuntime::run_until_blocked` end-to-end (start -> N
+//! decision cycles -> completion). Each decision cycle re-loads and re-replays
+//! the ENTIRE history so far. This backend has no warm-cache / delta-load path.
+//! So this is the realistic full-run cost, not a single-cycle slice.
 //!
 //! `SQLITE_RUNTIME_PROFILE_N` (default `100`) sets the activity count.
 //! `SQLITE_RUNTIME_PROFILE_REPS` (default `1`) repeats the whole
@@ -78,16 +76,11 @@ fn activity_payload(i: usize) -> Value {
     })
 }
 
-// The `#[workflow]` macro references the workflow's input parameter, so a
-// deliberately-loop-only body reads fine here; kept explicit for clarity.
-//
-// The per-iteration `format!("activity_{i}")` name (rather than a constant
-// string) deliberately mirrors
+// The per-iteration `format!("activity_{i}")` name mirrors
 // `autumn-harvest/benches/replay_profile_support.rs::sequential_workflow`
-// exactly -- a constant name would understate the "author code re-executes
-// on every replay cycle" cost this harness is explicitly compared against
-// (issue #135), since the real comparison workload re-formats a distinct
-// name string on every replay pass too.
+// exactly. That workload re-formats a distinct name on every replay pass too.
+// A constant name would understate the "author code re-executes on every
+// replay cycle" cost that issue #135 compares against.
 #[workflow]
 async fn sequential_workflow(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
     let n: usize = usize::try_from(n).unwrap_or(0);

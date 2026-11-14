@@ -1,37 +1,37 @@
 //! Scoped API tokens + rotation for the Harvest management API (issue #942).
 //!
 //! A small, Postgres-only bearer-credential layer. It does **not** build an
-//! identity provider: it mints an opaque high-entropy secret, stores only its
-//! SHA-256 hash, and derives verb-level scopes from the **already-test-enforced**
-//! [`autumn_harvest::audit::CLASSIFIED_ROUTES`] classification — the exact
-//! promotion-from-audit-to-authz mechanism the read-only operator role (#776)
-//! introduced. It reuses that route-class enforcement rather than forking a
-//! second route taxonomy.
+//! identity provider. It mints an opaque high-entropy secret and stores only
+//! its SHA-256 hash. Verb-level scopes come from the **already-test-enforced**
+//! [`autumn_harvest::audit::CLASSIFIED_ROUTES`] classification. The read-only
+//! operator role (#776) introduced that promotion from audit to authz. This
+//! layer reuses it and does not fork a second route taxonomy.
 //!
 //! # Wire format
 //!
 //! A token secret is `hvst_<base64url(32 random bytes)>`. The `hvst_` prefix is
-//! the credential-namespace discriminator: a bearer that does not start with it
-//! is ignored entirely (it is the embedder's own credential), so token auth
-//! **composes with** — never replaces — an `api_with_auth` middleware (AC7).
+//! the credential-namespace discriminator. A bearer without it is the
+//! embedder's own credential and is ignored. So token auth **composes with**
+//! an `api_with_auth` middleware and never replaces it (AC7).
 //!
 //! # Secret hygiene (AC2)
 //!
 //! The plaintext secret is returned **exactly once** at creation ([`MintResult`])
 //! and never persists at rest — only `token_hash = hex(SHA256(secret))` is
 //! stored, UNIQUE-indexed. Verification hashes the presented secret and does one
-//! indexed `SELECT`; there is **no in-Rust hash comparison** (a 256-bit random
-//! hash is not an iterable timing oracle), so no constant-time-compare crate is
-//! needed. [`TokenView`] is a metadata-only DTO that structurally cannot hold
-//! the hash or secret (the #695 redaction-view pattern), and [`MintResult`] and
-//! [`autumn_harvest::models::NewApiToken`] redact the secret/hash in `Debug`.
+//! indexed `SELECT`. There is **no in-Rust hash comparison**, and a 256-bit
+//! random hash is not an iterable timing oracle. So no constant-time-compare
+//! crate is needed. [`TokenView`] is a metadata-only DTO that structurally
+//! cannot hold the hash or secret (the #695 redaction-view pattern).
+//! [`MintResult`] and [`autumn_harvest::models::NewApiToken`] redact the
+//! secret/hash in `Debug`.
 //!
 //! # Scope enforcement (AC3/AC4)
 //!
 //! A `read` token reaches every [`autumn_harvest::audit::RouteClass::ReadOnly`]/`PublicSafe` route and
 //! is denied **403** on every mutating route. The decision is
-//! [`deny_readonly_mutation`] over [`crate::api::classify_route`] — the single
-//! source of truth — which **fails closed**: an unclassified path resolves to
+//! [`deny_readonly_mutation`] over [`crate::api::classify_route`], the single
+//! source of truth. It **fails closed**: an unclassified path resolves to
 //! `Mutating` and is denied to a `read` token.
 //!
 //! A `mutate` token is denied **403** on the
@@ -44,8 +44,8 @@
 //! There is **no grant cache**: every request re-queries `harvest_api_tokens`,
 //! so revocation and expiry take effect on the very next request (bounded TTL =
 //! 0). Zero-downtime rotation is create-a-replacement → cut callers over →
-//! revoke the old, over the existing create/revoke routes (the CLI's
-//! `harvest token rotate` is a client-side convenience over the create route).
+//! revoke the old, over the existing create/revoke routes. The CLI's
+//! `harvest token rotate` is a client-side convenience over the create route.
 
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
@@ -62,10 +62,10 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use autumn_harvest::HarvestResult;
-// The token secret helpers live in CORE (`autumn_harvest::api_token`) as the
-// single source of truth (issue #942): the offline `harvest token bootstrap`
-// CLI mints/hashes with these exact functions, so an offline-seeded token
-// authenticates byte-for-byte identically to one minted via the route below.
+// The token secret helpers live in CORE (`autumn_harvest::api_token`), the
+// single source of truth (issue #942). The offline `harvest token bootstrap`
+// CLI mints and hashes with the same functions. So an offline-seeded token
+// authenticates exactly like one minted via the route below.
 pub(crate) use autumn_harvest::api_token::{hash_secret, looks_like_harvest_token, mint_secret};
 use autumn_harvest::audit::{HEADER_ACTOR, deny_readonly_mutation};
 use autumn_harvest::models::{ApiToken, NewApiToken};
@@ -78,15 +78,16 @@ use crate::api::{
 
 /// The audit-actor namespace reserved for genuinely token-authenticated
 /// requests (issue #942, AC6). Only the valid-token path may set an actor in
-/// this namespace; any inbound `x-harvest-actor` claiming it on a non-token
-/// request is stripped so a caller admitted by some other means cannot forge a
+/// this namespace. A non-token request loses any inbound `x-harvest-actor`
+/// that claims it. So a caller admitted by other means cannot forge a
 /// token-namespaced audit actor.
 pub(crate) const TOKEN_ACTOR_PREFIX: &str = "token:";
 
-/// Debounce window for the best-effort `last_used_at` bump. A token whose
-/// `last_used_at` is newer than this is not re-touched, so a high-rate client
-/// (the intended CI-fleet use case) does not turn every read into a write or
-/// double the pool-checkout pressure.
+/// Debounce window for the best-effort `last_used_at` bump, in seconds.
+///
+/// A token whose `last_used_at` is newer than this is not re-touched. So a
+/// high-rate client, the intended CI-fleet use case, does not turn every read
+/// into a write or double the pool-checkout pressure.
 const LAST_USED_DEBOUNCE_SECS: i64 = 60;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -146,10 +147,10 @@ pub(crate) struct TokenPrincipal {
 
 /// Metadata-only response DTO for `GET /admin/tokens` (issue #942, AC2).
 ///
-/// **Structurally cannot hold the hash or secret** — [`from_row`](Self::from_row)
-/// destructures [`ApiToken`] exhaustively (no `..`), the #695 redaction guard, so
-/// adding a secret-bearing column to `ApiToken` is a compile error here until it
-/// is deliberately omitted.
+/// **Structurally cannot hold the hash or secret.** [`from_row`](Self::from_row)
+/// destructures [`ApiToken`] exhaustively (no `..`), the #695 redaction guard.
+/// So a new secret-bearing column on `ApiToken` is a compile error here until
+/// it is deliberately omitted.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TokenView {
     pub id: Uuid,
@@ -227,11 +228,6 @@ impl std::fmt::Debug for MintResult {
 }
 
 // ── Expiry helper (pure) ──────────────────────────────────────────────────────
-//
-// `mint_secret` / `hash_secret` / `looks_like_harvest_token` (and `TOKEN_PREFIX`)
-// live in `autumn_harvest::api_token` (the single source of truth, shared with
-// the offline bootstrap CLI): the three used here are re-exported via the
-// `pub(crate) use` above.
 
 /// Whether a token with the given (optional) expiry is expired at `now` (AC5).
 ///
@@ -431,12 +427,14 @@ pub(crate) struct ScopeDeniedToken;
 /// Reserve the `token:` audit-actor namespace on a pass-through request.
 ///
 /// Strips any inbound `x-harvest-actor` header whose value begins with
-/// [`TOKEN_ACTOR_PREFIX`], so a caller admitted by some *other* means (a session
-/// admin, or any request under an embedder admin boundary) cannot forge a
-/// token-namespaced audit actor and impersonate a minted token (issue #942,
-/// AC6). Non-`token:` actor values — the embedder's legitimate actor mechanism —
-/// pass through untouched. This only runs inside [`enforce_token_scope`], which
-/// is installed solely under [`crate::HarvestPlugin::enable_api_tokens`], so a
+/// [`TOKEN_ACTOR_PREFIX`] (issue #942, AC6). A caller admitted by some *other*
+/// means then cannot forge a token-namespaced audit actor and impersonate a
+/// minted token. Such a caller is a session admin, or any request under an
+/// embedder admin boundary. Non-`token:` actor values, the embedder's
+/// legitimate actor mechanism, pass through untouched.
+///
+/// This runs only inside [`enforce_token_scope`]. Only
+/// [`crate::HarvestPlugin::enable_api_tokens`] installs that layer. So a
 /// default (token-disabled) deployment is byte-for-byte unchanged (AC7).
 fn strip_reserved_actor(request: &mut Request) {
     let reserved = request
@@ -457,16 +455,20 @@ fn strip_reserved_actor(request: &mut Request) {
 /// innermost): embedder auth mw → **this layer** → per-route `require_admin` →
 /// handler.
 ///
-/// On a valid token it (1) sets a [`TokenPrincipal`] extension so `require_admin`
-/// admits the request, and (2) strips any inbound `x-harvest-actor` and injects
-/// `token:{id}` so every audited mutation is attributed to the token, and no
-/// caller can spoof a different actor (AC6). A `read` token attempting a
-/// mutating route, or a `mutate` token attempting an admin-only route, is
-/// denied 403 here, before any handler runs. The deny is audited.
+/// On a valid token it does two things:
 ///
-/// On the pass-through path (no/invalid `hvst_` bearer) it still reserves the
-/// `token:` audit-actor namespace via [`strip_reserved_actor`], so a non-token
-/// caller admitted by other means cannot forge a token-namespaced audit actor.
+/// 1. It sets a [`TokenPrincipal`] extension, so `require_admin` admits the
+///    request.
+/// 2. It strips any inbound `x-harvest-actor` and injects `token:{id}`. So
+///    the token owns every audited mutation, and no caller can spoof a
+///    different actor (AC6).
+///
+/// A `read` token on a mutating route, or a `mutate` token on an admin-only
+/// route, is denied 403 here, before any handler runs. The deny is audited.
+///
+/// The pass-through path (no/invalid `hvst_` bearer) still reserves the
+/// `token:` audit-actor namespace via [`strip_reserved_actor`]. So a non-token
+/// caller cannot forge a token-namespaced audit actor.
 pub async fn enforce_token_scope(
     State(api_state): State<HarvestApiState>,
     mut request: Request,
@@ -564,11 +566,10 @@ pub async fn enforce_token_scope(
     }
 
     // Best-effort `last_used_at` bump, OFF the request critical path AND
-    // debounced: the token row we just looked up carries `last_used_at`, so we
-    // only spawn the (second-connection) UPDATE when it is NULL or older than
-    // `LAST_USED_DEBOUNCE_SECS`. In the common repeated-request case this skips
-    // the write entirely — no extra pool checkout, no read-turned-into-write
-    // amplification for a high-rate token client.
+    // debounced. The token row already carries `last_used_at`. The
+    // second-connection UPDATE spawns only when it is NULL or older than
+    // `LAST_USED_DEBOUNCE_SECS`. A repeated request skips the write: no extra
+    // pool checkout, and no read turned into a write for a high-rate client.
     let now = Utc::now();
     let stale = token
         .last_used_at
@@ -608,19 +609,19 @@ pub(crate) async fn require_token_for_non_public(request: Request, next: Next) -
 /// The class gate for a **known-mutating** generated MCP tool route under token
 /// auth (issue #942, mirrors [`crate::api::enforce_read_only_mcp_mutation`]).
 ///
-/// The generated MCP tool routes are registered app-level (outside the nested
-/// management router that [`enforce_token_scope`] wraps), so a `read`-scoped
-/// token would otherwise reach a mutating tool. This layer verifies the bearer
-/// and hard-denies a valid `read` token `403`. A non-`hvst_` bearer / no bearer
-/// passes through (the embedder or `require_admin` governs).
+/// The generated MCP tool routes are registered app-level, outside the nested
+/// management router that [`enforce_token_scope`] wraps. Without this layer, a
+/// `read`-scoped token would reach a mutating tool. This layer verifies the
+/// bearer and hard-denies a valid `read` token `403`. A non-`hvst_` bearer or
+/// no bearer passes through, and the embedder or `require_admin` governs.
 ///
-/// **Provided but NOT auto-installed.** Because the generated MCP tool routes
-/// live outside the nested management router, [`crate::HarvestPlugin::enable_api_tokens`]
-/// does **not** wire this layer onto them — `build_tool_route` installs only the
-/// #776 `enforce_read_only_mcp_mutation`. An embedder that wants token scopes to
-/// extend to app-level MCP tool routes must install this helper on the mutating
-/// tool routes manually. Absent that, token scopes do not govern MCP tools
-/// (embedder auth does).
+/// **Provided but NOT auto-installed.** The generated MCP tool routes live
+/// outside the nested management router.
+/// [`crate::HarvestPlugin::enable_api_tokens`] does **not** wire this layer
+/// onto them. `build_tool_route` installs only the #776
+/// `enforce_read_only_mcp_mutation`. For token scopes on app-level MCP tool
+/// routes, an embedder installs this helper on the mutating tool routes.
+/// Otherwise, embedder auth governs MCP tools, not token scopes.
 pub async fn enforce_token_scope_mcp_mutation(
     State(api_state): State<HarvestApiState>,
     request: Request,

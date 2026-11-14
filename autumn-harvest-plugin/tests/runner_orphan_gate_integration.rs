@@ -1,19 +1,17 @@
-//! Issue #1128: the **standalone** `HarvestRunner::start` embedder path runs the
-//! same boot-time orphaned-workflow-type reachability gate the plugin boot path
-//! got in #700/PR #1109.
+//! Issue #1128: the **standalone** `HarvestRunner::start` path runs the boot-time
+//! orphaned-workflow-type gate. The plugin boot path got it in #700/PR #1109.
 //!
 //! Before this, a standalone deployment could boot with orphaned non-terminal
-//! executions (a workflow type with in-flight runs but no registered handler)
-//! entirely unflagged — the same latent leak the #700 P1 fix closed for the
-//! plugin. These tests drive the REAL entry point (`HarvestRunner::start`), not
-//! the decision helper, so they pin the wiring and not just the policy.
+//! executions, unflagged. An orphan is a workflow type with in-flight runs but
+//! no registered handler. These tests drive the REAL entry point
+//! (`HarvestRunner::start`), so they pin the wiring and not just the policy.
 //!
 //! What is pinned here:
 //!
 //! - `fail` + a seeded orphan → `start` returns `Err`, **and** the orphan's
 //!   claimable task row is untouched (`PENDING`, unclaimed, no `WorkflowFailed`
-//!   event) — the deterministic analogue of "the gate ran before any worker
-//!   could claim it", asserted with `worker_enabled = true`.
+//!   event). With `worker_enabled = true`, that shows the gate ran before any
+//!   worker could claim the row.
 //! - `warn` / `off` + the same orphan → `start` returns `Ok`.
 //! - `fail` + a clean fleet → `start` returns `Ok`.
 //! - a multi-shard standalone deployment finds an orphan on a **non-zero**
@@ -151,9 +149,8 @@ fn build_test_pool(database_url: &str) -> DbPool {
     build_test_pool_sized(database_url, 4)
 }
 
-/// A pool tagged by its `max_size`, so a specific pool is identifiable through
-/// `status().max_size` without opening a connection — the trick
-/// `gate_no_global_install.rs` uses to tell two pools apart.
+/// A pool tagged by its `max_size`. `status().max_size` then identifies the
+/// pool without a connection, as in `gate_no_global_install.rs`.
 fn build_test_pool_sized(database_url: &str, max_size: usize) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
@@ -193,16 +190,15 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 /// A live, migrated Harvest database, isolated to this one test.
 ///
-/// The boot gate inspects the **whole** database — it has no `?workflow_type=`
-/// filter, because a boot gate that only looked at some types would not be a
-/// gate. So every test here needs a database of its own: on a shared
-/// `HARVEST_TEST_DATABASE_URL` server, one test's seeded orphan would otherwise
-/// decide another's verdict, and `standalone_start_boots_under_fail_when_clean`
-/// could not be written at all. The container path already gives that isolation
-/// (one container per test); the shared-server path gets it by provisioning a
-/// fresh, uniquely-named, migrated database per call — the same
-/// `provision_ephemeral_db` pattern `autumn-harvest/tests/integration/canary_tests.rs`
-/// uses, for the same reason.
+/// The boot gate inspects the **whole** database and has no `?workflow_type=`
+/// filter. A gate that looked at only some types would not be a gate. So each
+/// test needs a database of its own. On a shared
+/// `HARVEST_TEST_DATABASE_URL` server, one test's orphan would decide another's
+/// verdict. `standalone_start_boots_under_fail_when_clean` would then be
+/// impossible. The container path gives one container per test. The
+/// shared-server path provisions a fresh, uniquely-named, migrated database per
+/// call. `autumn-harvest/tests/integration/canary_tests.rs` uses the same
+/// `provision_ephemeral_db` pattern for the same reason.
 async fn setup_db_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (provision_ephemeral_db(&base_url).await, None);
@@ -354,11 +350,10 @@ fn single_shard_router() -> ShardRouter {
 /// `fail` + a seeded orphan → `HarvestRunner::start` refuses to boot, naming the
 /// orphaned type.
 ///
-/// `worker_enabled` is deliberately TRUE: the gate must fire before the runner
-/// spawns the worker poll loop, so the assertions below (the orphan's task row
-/// is still claimable and its history carries no `WorkflowFailed`) are the
-/// deterministic analogue of "no worker claimed or terminally failed the
-/// orphaned run" — exactly the #700 P1 guarantee, now on the standalone path.
+/// `worker_enabled` is deliberately TRUE. The gate must fire before the runner
+/// spawns the worker poll loop. The orphan's task row stays claimable, and its
+/// history has no `WorkflowFailed`. So no worker claimed or failed the orphaned
+/// run. That is the #700 guarantee, now on the standalone path.
 #[tokio::test]
 async fn standalone_start_refuses_boot_on_orphan_under_fail() {
     use autumn_harvest::schema::{harvest_events, harvest_task_queue, harvest_workflow_executions};
@@ -380,15 +375,14 @@ async fn standalone_start_refuses_boot_on_orphan_under_fail() {
         .workflows(vec![workflow_info_named("runner_gate_registered")])
         .build();
 
-    // Deterministic ordering pin, alongside the row assertions below. Those are
-    // a race detector: if the gate ran AFTER the worker spawn, `start` would
-    // still return `Err` and whether the spawned poll loop got to the row first
-    // would be timing. This is not timing — `PreparedHarvestRuntime::build`
-    // resolves the storage pool through `ShardedDbPool::single`, which WRITES
-    // `GLOBAL_SHARDED_POOL`. So if the gate ran after `build`, the global would
-    // afterwards carry THIS test's distinctively-tagged pool. Snapshot rather
-    // than assert `None`: a sibling test in this binary installs a global of its
-    // own, and libtest gives no ordering guarantee.
+    // Deterministic ordering pin. The row assertions below only detect a race.
+    // If the gate ran AFTER the worker spawn, `start` still returns `Err`. Then
+    // the poll loop reaching the row first is a matter of timing. This check
+    // does not depend on timing. `PreparedHarvestRuntime::build` resolves the
+    // pool through `ShardedDbPool::single`, which WRITES `GLOBAL_SHARDED_POOL`.
+    // If the gate ran after `build`, the global would carry THIS test's tagged
+    // pool. Take a snapshot, not an assertion of `None`. A sibling test in this
+    // binary installs its own global, and libtest has no ordering guarantee.
     let pool = build_test_pool_sized(&database_url, 61);
     let global_before = installed_global_shard0_tag();
 
@@ -553,10 +547,10 @@ async fn standalone_start_boots_under_fail_when_clean() {
 // AC3 — the standalone path is the multi-shard path: every shard is inspected
 // ---------------------------------------------------------------------------
 
-/// The standalone runner supports genuinely multi-shard deployments (#522),
-/// which the plugin rejects. An orphan on a NON-ZERO shard must still refuse
-/// boot: a shard-0-only gate (the plugin's, which is sound only because the
-/// plugin is single-shard) would miss it and report a `complete`, clean fleet.
+/// The standalone runner supports multi-shard deployments (#522); the plugin
+/// does not. An orphan on a NON-ZERO shard must still refuse boot. The plugin's
+/// shard-0 gate is sound only because the plugin is single-shard. Here it would
+/// miss the orphan and report a `complete`, clean fleet.
 #[tokio::test]
 async fn standalone_gate_detects_an_orphan_on_a_non_zero_shard() {
     let (shard0_url, _container) = setup_db_env_or_container().await;
@@ -614,10 +608,10 @@ async fn standalone_gate_detects_an_orphan_on_a_non_zero_shard() {
 // AC4 — a caller that already ran the gate is not gated twice
 // ---------------------------------------------------------------------------
 
-/// The plugin boot path runs the gate itself, EARLIER than the runner could —
-/// before it publishes any admission global — and marks its resources so
-/// `HarvestRunner::start` does not repeat the scan (and its warnings). With the
-/// marker set, an orphan that would otherwise abort under `fail` does not.
+/// The plugin boot path runs the gate EARLIER, before it publishes any
+/// admission global. It marks its resources, so `HarvestRunner::start` does not
+/// repeat the scan and its warnings. With the marker set, an orphan does not
+/// abort under `fail`.
 #[tokio::test]
 async fn standalone_start_skips_the_gate_when_the_caller_already_ran_it() {
     let (database_url, _container) = setup_db_env_or_container().await;
@@ -652,18 +646,15 @@ async fn standalone_start_skips_the_gate_when_the_caller_already_ran_it() {
 /// `fail` + a REAL orphan + a shard this process cannot inspect must **warn**,
 /// never abort.
 ///
-/// This is the branch whose failure mode is a production boot loop, and the
-/// whole `Option<DbPool>` shape of the gate's shard enumeration exists to feed
-/// it: a shard the router names but this process has no pool for is reported
-/// `unavailable`, which degrades the report to `partial`, which
-/// `startup_orphan_decision` turns into a warning. Covered until now only by the
-/// pure decision table and by a unit test asserting the map *shape* — nothing
-/// asserted that a real orphan plus an uninspectable shard actually boots.
+/// A failure of this branch is a production boot loop. The `Option<DbPool>`
+/// shape of the gate's shard enumeration exists to feed it. A shard that the
+/// router names, with no pool in this process, is `unavailable`. That degrades
+/// the report to `partial`, and `startup_orphan_decision` turns it into a
+/// warning. Before this test, only the decision table and a map-*shape* unit
+/// test covered it.
 ///
-/// Calls the gate directly rather than `HarvestRunner::start`, because `start`
-/// would then reject this router/pool pair for an unrelated reason
-/// (`missing_router_shards`); the gate is the unit whose crash-loop rule is
-/// under test.
+/// Calls the gate directly. `HarvestRunner::start` would reject this
+/// router/pool pair for an unrelated reason (`missing_router_shards`).
 #[tokio::test]
 async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable() {
     let (database_url, _container) = setup_db_env_or_container().await;
@@ -692,10 +683,10 @@ async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable()
         HarvestRunnerResources::new(build_test_pool(&database_url)).with_shard_router(router);
 
     // Capture what an operator would read in the boot log. This is the MIXED
-    // case — `fail`, an orphan found on a reachable shard, and another shard
-    // uninspectable — and it is the one that most needs explaining (Codex round
-    // 1, P2): the operator configured `fail`, and it was downgraded to a warning
-    // because detection did not run everywhere.
+    // case: `fail`, an orphan found on a reachable shard, and another shard
+    // uninspectable. It is the case that most needs explaining. The operator
+    // configured `fail`, and it was downgraded to a warning because detection
+    // did not run everywhere.
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
@@ -739,13 +730,12 @@ async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable()
 
 /// A registered unified DAG with in-flight runs must NOT read as an orphan.
 ///
-/// The DAG half of the registered-set union is load-bearing: executions of a
-/// unified DAG are stored with `workflow_name = <dag name>`, but the handler
-/// registry's workflow map does not carry DAG names. A registered set built from
-/// workflows alone would call every running DAG an orphan and refuse boot under
-/// `fail` — an outage for a correctly configured deployment. Pinned at the
-/// name-set level by a `runner.rs` unit test; this asserts it end to end,
-/// against a real database, through the gate an operator's `fail` action runs.
+/// The DAG half of the registered-set union is load-bearing. A unified DAG's
+/// executions store `workflow_name = <dag name>`. The handler registry's
+/// workflow map does not carry DAG names. A set built from workflows alone
+/// would call every running DAG an orphan and refuse boot under `fail`. That is
+/// an outage for a correct deployment. A `runner.rs` unit test pins the name
+/// set. This test asserts it end to end, against a real database.
 #[tokio::test]
 async fn standalone_gate_does_not_orphan_a_registered_unified_dag() {
     let (database_url, _container) = setup_db_env_or_container().await;

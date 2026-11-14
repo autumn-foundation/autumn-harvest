@@ -513,14 +513,14 @@ async fn test_await_cross_shard_via_outbox() {
     let pool = build_test_pool(&database_url);
     truncate_all(&pool).await;
 
-    // Both shards point to the same physical DB (logical sharding mock), mirroring
-    // the cross-shard cancel test — but each shard gets a GENUINELY DISTINCT pool
-    // instance (not a `pool.clone()`), so the outbox's `same_pool` check
-    // (`std::ptr::eq` of the two shards' pools) yields distinct pointers and the
-    // real cross-pool `target_conn` acquisition branch is exercised, even though
-    // both logical shards resolve to one physical database (issue #757 review,
-    // P2-d). `ShardedDbPool::from_map` installs itself into `GLOBAL_SHARDED_POOL`,
-    // which is what the outbox reads (the worker itself carries no sharded pool).
+    // Both shards point to the same physical DB (logical sharding mock), as in
+    // the cross-shard cancel test. But each shard gets a GENUINELY DISTINCT pool
+    // instance, not a `pool.clone()`. So the outbox's `same_pool` check
+    // (`std::ptr::eq` of the two pools) sees distinct pointers. The real
+    // cross-pool `target_conn` branch then runs, though both logical shards
+    // share one physical database (issue #757). `ShardedDbPool::from_map`
+    // installs itself into `GLOBAL_SHARDED_POOL`, which the outbox reads. The
+    // worker itself carries no sharded pool.
     let pool_shard1 = build_test_pool(&database_url);
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), pool.clone());
@@ -530,9 +530,9 @@ async fn test_await_cross_shard_via_outbox() {
     let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
     let target = ExecutionId::new_for_shard(ShardId::new(1));
 
-    // Prove the cross-pool branch is genuinely reachable: the two shards' pools
-    // must be distinct pointers, so the outbox's `std::ptr::eq(t_pool, c_pool)`
-    // is `false` → `same_pool = false` → the separate-`target_conn` path runs.
+    // Prove the cross-pool branch is reachable. With distinct pointers,
+    // `std::ptr::eq(t_pool, c_pool)` is `false`, so `same_pool = false` and the
+    // separate-`target_conn` path runs.
     let t_pool = sharded.exact_pool_for_execution(target).unwrap();
     let c_pool = sharded.exact_pool_for_execution(awaiter).unwrap();
     assert!(
@@ -813,16 +813,16 @@ async fn test_await_is_observe_only_target_unchanged() {
     let _ = handle.await;
 }
 
-// ── (h) Inline/outbox terminal de-duplication idempotency (issue #757 review, P1) ─
+// ── (h) Inline/outbox terminal de-duplication idempotency (issue #757) ─
 
-/// The awaiter-row lock is the serialization point between the inline re-park
-/// path and the outbox sweep: whichever appends the terminal first, the other
-/// observes it (inline via `existing_external_await_terminal` under the lock,
-/// outbox via its NOT EXISTS filter + a re-check under the same lock) and skips
-/// the duplicate. This exercises the AC "no duplicate event, no workflow
-/// failure" when a terminal already exists for the await id: pre-append an
-/// `ExternalAwaitResolved`, then run the outbox and assert it neither appends a
-/// second terminal nor fails the awaiter.
+/// The awaiter-row lock serializes the inline re-park path and the outbox
+/// sweep. Whichever appends the terminal first, the other observes it and
+/// skips the duplicate. Inline checks `existing_external_await_terminal` under
+/// the lock. The outbox uses its NOT EXISTS filter and a re-check under the
+/// same lock. This exercises the AC "no duplicate event, no workflow failure"
+/// for an await id that already has a terminal. The test pre-appends an
+/// `ExternalAwaitResolved`, then runs the outbox. The outbox must neither
+/// append a second terminal nor fail the awaiter.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
@@ -956,12 +956,12 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
     assert_ne!(a.state, "FAILED", "the awaiter must not be failed");
 }
 
-// ── (i) Cancel a RUNNING target → awaiter surfaces target_cancelled (P2-a end-to-end) ─
+// ── (i) Cancel a RUNNING target → awaiter surfaces target_cancelled (end-to-end) ─
 
-/// End-to-end validation of P2-a (issue #757 review): a running target that is
-/// CANCELLED resolves the awaiter's await as a typed `WorkflowFailed` whose
-/// `workflow_error_type()` is exactly `target_cancelled` — the reader (not a
-/// hand-written fixture) stamps the branchable `error_type`.
+/// End-to-end check for issue #757. A running target that is CANCELLED
+/// resolves the await as a typed `WorkflowFailed`. Its `workflow_error_type()`
+/// is exactly `target_cancelled`. The reader, not a hand-written fixture,
+/// stamps the branchable `error_type`.
 #[tokio::test]
 async fn test_await_cancelled_target_surfaces_target_cancelled() {
     let _guard = TEST_MUTEX.lock().await;

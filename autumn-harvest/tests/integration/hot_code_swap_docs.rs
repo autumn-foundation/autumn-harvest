@@ -1,19 +1,20 @@
 //! Guards that keep the issue-#967 R&D report honest against the code it audits.
 //!
-//! `docs/rnd/hot-code-swap.md` is a go/no-go decision document. Its load-bearing
-//! claims are not opinions — they are assertions about *this* codebase: that
-//! workflow handlers are bare `fn` pointers, that `ctx.build_id()` reports the
-//! worker's build rather than the execution's, that `harvest_events` has exactly
-//! two sanctioned in-place writers, that the shipped build-routing APIs the
-//! design leans on actually exist, and that the spike is invisible to a default
-//! build. Every one of those is true the day it is written and quietly false one
-//! merge later.
+//! `docs/rnd/hot-code-swap.md` is a go/no-go decision document. Its
+//! load-bearing claims are assertions about *this* codebase, not opinions:
+//!
+//! * workflow handlers are bare `fn` pointers;
+//! * `ctx.build_id()` reports the worker's build, not the execution's;
+//! * `harvest_events` has exactly two sanctioned in-place writers;
+//! * the shipped build-routing APIs the design leans on exist;
+//! * the spike is invisible to a default build.
+//!
+//! Each one is true the day it is written and can be false one merge later.
 //!
 //! These guards make the claims falsifiable. They re-derive each fact from the
 //! live tree at test runtime and assert the report agrees. Unlike the spike
-//! itself, this suite is **not** feature-gated: a default `cargo test` run must
-//! catch a report that has drifted from the code, whether or not wasmtime is
-//! compiled.
+//! itself, this suite is **not** feature-gated. A default `cargo test` run must
+//! catch a report that has drifted from the code, with or without wasmtime.
 //!
 //! Deliberately *not* covered: the report's prose judgements — the cost tiers,
 //! the go/no-go reasoning, the comparison against the do-nothing baseline. Those
@@ -32,10 +33,10 @@ fn repo_root() -> PathBuf {
 
 /// Read a file with line endings normalised to `\n`.
 ///
-/// Every guard here does substring matching over the document; under a CRLF
-/// checkout the raw text carries `\r` that `str::lines()` strips, so a literal
-/// containing a newline would never match. Normalising once on read removes the
-/// whole class. Mirrors `sqlite_feasibility_docs::read_normalized`.
+/// Every guard here does substring matching over the document. Under a CRLF
+/// checkout the raw text carries `\r`, so a literal that contains a newline
+/// never matches. Normalising once on read removes the whole class. Mirrors
+/// `sqlite_feasibility_docs::read_normalized`.
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
@@ -137,9 +138,9 @@ fn the_handler_fn_pointer_constraint_is_still_true() {
 #[test]
 fn the_build_id_routing_hazard_is_still_real() {
     // The report warns that `ctx.build_id()` is the WORKER's configured build,
-    // not the execution's `assigned_build_id`, and that routing modules on it
-    // would drag in-flight work onto new code. That warning is only worth
-    // printing while the semantics still hold.
+    // not the execution's `assigned_build_id`. Routing modules on it would drag
+    // in-flight work onto new code. That warning matters only while the
+    // semantics hold.
     let context = read_src("src/context.rs");
     assert!(
         context.contains("The worker build ID of the worker executing this workflow."),
@@ -190,8 +191,8 @@ fn the_shipped_routing_apis_the_design_leans_on_exist() {
 #[test]
 fn the_append_only_exception_count_matches_claude_md() {
     // The report asserts it adds no third writer of `harvest_events.event_data`.
-    // CLAUDE.md is the authority on how many there are; if a fourth ever lands,
-    // this fails and the claim gets re-examined instead of aging into a lie.
+    // CLAUDE.md is the authority on how many there are. If another lands, this
+    // fails, and the claim gets re-examined instead of aging into a lie.
     let claude_md = read_normalized(&repo_root().join("CLAUDE.md"));
     assert!(
         claude_md
@@ -199,10 +200,9 @@ fn the_append_only_exception_count_matches_claude_md() {
         "CLAUDE.md's append-only exception count changed — re-check §7 of the report"
     );
     let report = read_report();
-    // Asserting merely that the report mentions `harvest_events` was vacuous:
-    // the word appears in §2's C7 unconditionally, so the guard would pass a
-    // report rewritten to claim this change ADDS a writer. Pin the substantive
-    // claim instead.
+    // A check that the report mentions `harvest_events` is vacuous. The word
+    // appears in §2's C7 unconditionally, so it passes a report that claims
+    // this change ADDS a writer. Pin the substantive claim instead.
     assert!(
         report.contains("no third in-place writer of `harvest_events.event_data`"),
         "§7 must state, in those words, that this change adds no third in-place \
@@ -236,9 +236,9 @@ fn the_feature_exists_and_is_not_in_the_default_set() {
 
 #[test]
 fn the_feature_adds_no_new_dependency_to_the_workspace() {
-    // AC7 says the default build is byte-for-byte unaffected; the stronger
-    // property the spike actually holds is that it adds no dependency at all,
-    // because it reuses the wasmtime embedding issue #965 already vetted.
+    // AC7 says the default build is byte-for-byte unaffected. The spike holds
+    // a stronger property: it adds no dependency at all. It reuses the
+    // wasmtime embedding that issue #965 already vetted.
     let manifest = manifest();
     let feature_line = manifest
         .lines()
@@ -298,18 +298,18 @@ const CITED_TESTS: &[&str] = &[
     "the_hosts_encoder_never_reorders_keys_the_way_a_json_value_would",
     "an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run",
     "only_activity_outcomes_are_handed_to_the_guest",
-    // Codex review round 1.
+    // Decision-cache isolation and the decision trampoline.
     "the_decision_cache_never_serves_one_builds_answer_to_another",
     "the_trampoline_never_yields_between_decisions",
-    // Codex review round 2.
+    // Timeout scoping and cache eviction order.
     "activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not",
     "the_decision_cache_evicts_oldest_first",
-    // Codex review round 3.
+    // The cache byte bound.
     "the_decision_cache_is_bounded_in_bytes_not_just_entries",
-    // Codex review round 4.
+    // Cache-hit budget charging and signing rotation.
     "a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation",
     "signing_can_be_introduced_and_rotated_on_an_existing_build",
-    // Codex review round 5.
+    // Single budget check and module signing integrity.
     "the_run_budget_is_charged_and_checked_once_for_both_cache_paths",
     "an_unsigned_republish_does_not_erase_an_existing_signature",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
@@ -329,9 +329,9 @@ const CITED_TESTS: &[&str] = &[
 
 #[test]
 fn every_test_the_report_cites_exists() {
-    // A report that cites a test which has been renamed or deleted is worse
-    // than one that cites nothing, so both directions are checked: the test
-    // exists, AND the report actually cites it.
+    // A report that cites a renamed or deleted test is worse than one that
+    // cites nothing. So both directions are checked: the test exists, AND the
+    // report cites it.
     //
     // Two homes, because some claims are about pure functions and belong in the
     // module's own unit tests rather than the DB-capable integration suite.
@@ -464,11 +464,11 @@ fn pack_calls(wat: &str) -> Vec<(u32, usize)> {
 #[test]
 fn every_guest_returns_exactly_as_many_bytes_as_its_data_segment_holds() {
     // The guests hard-code the byte length of each pre-baked JSON response
-    // alongside its data-segment offset. Get one wrong and the host reads a
-    // truncated or over-long slice of linear memory and reports an
-    // unparseable-response error that says nothing about the real cause — the
-    // kind of bug that costs an afternoon. Deriving both sides from the file and
-    // comparing them makes it a compile-time-ish failure instead.
+    // alongside its data-segment offset. If one is wrong, the host reads a
+    // truncated or over-long slice of linear memory. It then reports an
+    // unparseable-response error that says nothing about the real cause. This
+    // test derives both sides from the file and compares them, so the failure
+    // names the guest.
     let dir = repo_root().join("autumn-harvest/examples/workflow-modules");
     for guest in ["pipeline_v1.wat", "pipeline_v2.wat"] {
         let wat = read_normalized(&dir.join(guest));
@@ -502,9 +502,9 @@ fn every_guest_returns_exactly_as_many_bytes_as_its_data_segment_holds() {
 
 #[test]
 fn every_guest_response_is_valid_json_for_the_decide_abi() {
-    // The pre-baked responses are hand-typed JSON. A missing quote would only
-    // surface as a runtime "response the host cannot parse" from deep inside a
-    // workflow; parsing them here names the offending guest instead.
+    // The pre-baked responses are hand-typed JSON. A missing quote would show
+    // only as a runtime "response the host cannot parse" deep inside a
+    // workflow. Parsing them here names the offending guest instead.
     let dir = repo_root().join("autumn-harvest/examples/workflow-modules");
     for guest in ["pipeline_v1.wat", "pipeline_v2.wat"] {
         let wat = read_normalized(&dir.join(guest));
@@ -530,14 +530,14 @@ fn every_guest_response_is_valid_json_for_the_decide_abi() {
     }
 }
 
-// ── Codex review round 1: keep the report's numbers and its C9 claim honest ────
+// ── keep the report's numbers and its C9 claim honest ─────────────────────────
 
 /// Every `(constant, value)` the report quotes as a number in prose.
 ///
-/// The report is the deliverable a reader reaches a go/no-go from, so a figure
-/// in it that no longer matches the code is worse than no figure at all. Two had
-/// already drifted (`MAX_DECIDE_STEPS` quoted as 512 against 64;
-/// `DECIDE_MAX_WALL_CLOCK` as 500 ms against 5 s) before this guard existed.
+/// A reader reaches a go/no-go from the report. So a figure in it that no
+/// longer matches the code is worse than no figure at all. Two had already
+/// drifted before this guard existed: `MAX_DECIDE_STEPS` was quoted as 512
+/// against 64, and `DECIDE_MAX_WALL_CLOCK` as 500 ms against 5 s.
 const REPORT_CONSTANTS: &[(&str, &str)] = &[
     ("MAX_DECIDE_STEPS", "64"),
     ("DECIDE_MAX_WALL_CLOCK", "5 s"),

@@ -12,9 +12,8 @@
 //!   never appears in the result.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (each test scrubs the executions table first);
-//! otherwise a fresh testcontainers Postgres is booted with the full migration
-//! bundle.
+//! against it directly. Each test scrubs the executions table first. Otherwise
+//! the test boots a fresh testcontainers Postgres with the full migration bundle.
 
 use std::collections::BTreeMap;
 

@@ -21,12 +21,12 @@
 //!
 //! ## The solution: `ctx.timer_business_days(id, n, calendar)`
 //!
-//! One call. The anchor is captured **once** on first live execution and the
-//! resolved deadline is frozen into history as a `SideEffectRecorded` event —
-//! an *existing* variant, so **no new `WorkflowEvent`, no migration**. On every
-//! replay the frozen deadline is used verbatim and the calendar is **not**
-//! re-read, so an operator editing the calendar after the timer is armed can
-//! never move its deadline.
+//! One call. The anchor is captured **once** on first live execution. The
+//! resolved deadline is frozen into history as a `SideEffectRecorded` event.
+//! That variant exists, so there is **no new `WorkflowEvent` and no
+//! migration**. Every replay uses the frozen deadline verbatim and does **not**
+//! re-read the calendar. So a calendar edit after the timer is armed never
+//! moves its deadline.
 //!
 //! ```rust,ignore
 //! use autumn_harvest::prelude::*;
@@ -145,9 +145,9 @@ fn main() {
     println!("  - no new WorkflowEvent variant, no migration");
 }
 
-// Gated on the `testing` feature as well as `test`: the example must keep
-// building under `--no-default-features`, while `autumn_harvest::testing` only
-// exists for external consumers when the `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`. `autumn_harvest::testing` exists
+// for an external consumer only when the `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -171,8 +171,8 @@ mod tests {
     }
 
     /// The headline AC: 2 business days anchored Thursday lands on the
-    /// following **Monday**, skipping Sat + Sun — and the run completes with no
-    /// real sleeping.
+    /// following **Monday**, skipping Sat + Sun. The run completes with no real
+    /// sleeping.
     #[tokio::test]
     async fn two_business_days_from_thursday_skips_the_weekend() {
         let outcome = WorkflowTestEnv::new()
@@ -201,9 +201,9 @@ mod tests {
         );
     }
 
-    /// Anchoring the Thursday *before* the 2026-07-03 holiday makes the holiday
-    /// bite as well as the weekend: Thu 07-02 + 2 business days skips Fri 07-03
-    /// (holiday) and Sat/Sun, landing Tue 07-07.
+    /// An anchor on the Thursday *before* the 2026-07-03 holiday tests the
+    /// holiday as well as the weekend. Thu 07-02 + 2 business days skips Fri
+    /// 07-03 (holiday) and Sat/Sun, landing Tue 07-07.
     #[tokio::test]
     async fn holidays_are_skipped_as_well_as_weekends() {
         let anchor = Utc.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).single().unwrap();
@@ -231,9 +231,9 @@ mod tests {
     ///
     /// Falsifiable by construction. From Thu 2026-07-09: the first wait (1
     /// business day) lands Fri 07-10; the second (2 business days) then steps
-    /// over the weekend to **Tue 07-14**. Had the second wait re-anchored at the
-    /// original Thursday it would land Mon 07-13 — a different date — so this
-    /// assertion fails if chaining regresses.
+    /// over the weekend to **Tue 07-14**. A second wait that re-anchored at the
+    /// original Thursday would land Mon 07-13. So this assertion fails if
+    /// chaining regresses.
     #[tokio::test]
     async fn sequential_business_day_waits_chain() {
         let outcome = WorkflowTestEnv::new()

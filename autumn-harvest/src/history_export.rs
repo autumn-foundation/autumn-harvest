@@ -11,13 +11,14 @@ use std::fmt::Write;
 use std::str::FromStr;
 
 /// Serde adapter for `Option<chrono::Duration>` as `Option<i64>` milliseconds
-/// (issue #772). `chrono::Duration` (`TimeDelta`) has no serde impl, so the
-/// deadline-aware replay metadata (`execution_timeout`) that both
-/// [`HistoryExportDocument`] and `testing::HistorySnapshot` carry is serialised
-/// as an integer millisecond count — lossless for the `INTERVAL`-backed
-/// `execution_timeout` column and matching the millisecond granularity of the
-/// deadline probe. Both structs use this module so the exported JSON round-trips
-/// into a `HistorySnapshot` verbatim.
+/// (issue #772).
+///
+/// `chrono::Duration` (`TimeDelta`) has no serde impl. So `execution_timeout`
+/// in [`HistoryExportDocument`] and `testing::HistorySnapshot` is serialised as
+/// integer milliseconds. That is lossless for the `INTERVAL`-backed column, and
+/// it matches the millisecond granularity of the deadline probe. Both structs
+/// use this module, so the exported JSON round-trips into a `HistorySnapshot`
+/// verbatim.
 pub(crate) mod opt_duration_millis {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -130,32 +131,33 @@ pub struct HistoryExportDocument {
     /// Registered workflow handler name.
     pub workflow_name: String,
     /// The business-level workflow identifier (issue #698), sourced from the
-    /// `harvest_workflow_executions.workflow_id` column. Like `parent_execution_id`
-    /// / `execution_timeout`, it lives in no `WorkflowEvent`, so it must ride the
-    /// top-level export document for an exported history (retention archive /
-    /// offline `replay_from_json`) to replay `ctx.info().workflow_id` without
-    /// false-reporting non-determinism when a workflow branches on it or embeds it
-    /// in an activity input. Serialised at the same top-level name as
-    /// [`testing::HistorySnapshot::workflow_id`], so an exported history round-trips
-    /// into that snapshot verbatim. `None` for a run without an explicit id or a
-    /// legacy export produced before this field. Non-payload operational metadata
-    /// — never redacted. The workflow **type** name rides
+    /// `harvest_workflow_executions.workflow_id` column.
+    ///
+    /// Like `parent_execution_id` and `execution_timeout`, it lives in no
+    /// `WorkflowEvent`. So it rides the top-level export document. Otherwise a
+    /// replay (retention archive or offline `replay_from_json`) misses
+    /// `ctx.info().workflow_id`. A workflow that branches on it, or embeds it
+    /// in an activity input, then false-reports non-determinism. The name
+    /// matches [`testing::HistorySnapshot::workflow_id`], so an export
+    /// round-trips into that snapshot verbatim. `None` for a run without an
+    /// explicit id, or a legacy export. Non-payload operational metadata, never
+    /// redacted. The workflow **type** name rides
     /// [`workflow_name`](Self::workflow_name).
     ///
     /// [`testing::HistorySnapshot::workflow_id`]: crate::testing::HistorySnapshot::workflow_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     /// The execution's task queue (issue #798), sourced from the
-    /// `harvest_workflow_executions.queue_name` column. The live worker supplies
-    /// `ctx.queue_name()` from the claimed task row, so — like `workflow_id` /
-    /// `parent_execution_id` / `execution_timeout` — it lives in no
-    /// `WorkflowEvent` and must ride the top-level export document, or a replayed
-    /// run reports `queue_name == ""` and a workflow that branches on it (or
-    /// embeds it in an activity input) false-reports non-determinism. Serialised
-    /// at the same top-level name as [`testing::HistorySnapshot::queue_name`], so
-    /// an exported history round-trips into that snapshot verbatim. `None` for a
-    /// legacy export produced before this field. Non-payload operational metadata
-    /// — never redacted.
+    /// `harvest_workflow_executions.queue_name` column.
+    ///
+    /// The live worker supplies `ctx.queue_name()` from the claimed task row.
+    /// Like `workflow_id`, it lives in no `WorkflowEvent`, so it rides the
+    /// top-level export document. Otherwise a replayed run reports
+    /// `queue_name == ""`. A workflow that branches on it, or embeds it in an
+    /// activity input, then false-reports non-determinism. The name matches
+    /// [`testing::HistorySnapshot::queue_name`], so an export round-trips into
+    /// that snapshot verbatim. `None` for a legacy export. Non-payload
+    /// operational metadata, never redacted.
     ///
     /// [`testing::HistorySnapshot::queue_name`]: crate::testing::HistorySnapshot::queue_name
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,12 +186,13 @@ pub struct HistoryExportDocument {
     /// restore the same ambient headers the workflow saw during live execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_headers: Option<HashMap<String, String>>,
-    /// The execution's `execution_timeout` budget (issue #772), serialised as
-    /// integer milliseconds at the top level so it round-trips into a
-    /// `testing::HistorySnapshot` and the JSON / `harvest-replay` replay path
-    /// threads the deadline-aware continue-as-new budget. `None` for a workflow
-    /// with no execution timeout, or a legacy export produced before this field.
-    /// **Non-payload operational metadata** — never redacted.
+    /// The execution's `execution_timeout` budget (issue #772), as integer
+    /// milliseconds.
+    ///
+    /// It round-trips into a `testing::HistorySnapshot`. The JSON and
+    /// `harvest-replay` replay path then threads the deadline-aware
+    /// continue-as-new budget. `None` for a workflow with no execution timeout,
+    /// or a legacy export. **Non-payload operational metadata**, never redacted.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -197,24 +200,23 @@ pub struct HistoryExportDocument {
     )]
     pub execution_timeout: Option<chrono::Duration>,
     /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
-    /// (issue #772). Serialised at the top level so the JSON replay path can
-    /// compute the deadline against the value the timeout scanner enforces
-    /// rather than the nominal `start + execution_timeout`. `None` when no
-    /// absolute deadline was recorded, or a legacy export. Non-payload
-    /// operational metadata — never redacted.
+    /// (issue #772). The JSON replay path computes the deadline from it, as the
+    /// timeout scanner does, not from the nominal `start + execution_timeout`.
+    /// `None` when no absolute deadline was recorded, or a legacy export.
+    /// Non-payload operational metadata — never redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at: Option<DateTime<Utc>>,
     /// The spawning parent's execution id (issue #698), sourced from the
-    /// `harvest_workflow_executions.parent_id` column. `parent_id` lives in no
-    /// `WorkflowEvent`, so — exactly like `execution_timeout`/`deadline_at` — it
-    /// must ride the top-level export document for a parent-aware child exported
-    /// here (retention archive / offline `replay_from_json`) to replay without
-    /// false-reporting non-determinism when its control flow branches on
-    /// `ctx.info().parent_execution_id`. Serialised at the same top-level name
-    /// as [`testing::HistorySnapshot::parent_execution_id`], so an exported
-    /// history round-trips into that snapshot verbatim. `None` for a top-level
-    /// run or a legacy export produced before this field. Non-payload
-    /// operational metadata — never redacted.
+    /// `harvest_workflow_executions.parent_id` column.
+    ///
+    /// Like `execution_timeout` and `deadline_at`, `parent_id` lives in no
+    /// `WorkflowEvent`, so it rides the top-level export document. A
+    /// parent-aware child can branch on `ctx.info().parent_execution_id`.
+    /// Without this field, its replay (retention archive or offline
+    /// `replay_from_json`) false-reports non-determinism. The name matches
+    /// [`testing::HistorySnapshot::parent_execution_id`], so an export
+    /// round-trips into that snapshot verbatim. `None` for a top-level run or a
+    /// legacy export. Non-payload operational metadata, never redacted.
     ///
     /// [`testing::HistorySnapshot::parent_execution_id`]: crate::testing::HistorySnapshot::parent_execution_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,12 +277,11 @@ pub struct HistoryExportRequest {
     /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
     /// (issue #772). `None` when no absolute deadline was recorded.
     pub deadline_at: Option<DateTime<Utc>>,
-    /// The spawning parent's execution id (issue #698), sourced from the
-    /// execution row's `parent_id` column and embedded in the export so the
-    /// JSON / `harvest-replay` replay path threads the child's spawner into the
-    /// replayed `WorkflowContext`. `None` for a top-level run. Mirrors
-    /// `execution_timeout`/`deadline_at`: the value lives in no `WorkflowEvent`,
-    /// so it must be carried explicitly on the request.
+    /// The spawning parent's execution id (issue #698), from the execution
+    /// row's `parent_id` column. The JSON and `harvest-replay` replay path
+    /// threads it into the replayed `WorkflowContext`. `None` for a top-level
+    /// run. Mirrors `execution_timeout`/`deadline_at`: the value lives in no
+    /// `WorkflowEvent`, so it must be carried explicitly on the request.
     pub parent_execution_id: Option<ExecutionId>,
     /// How the run started (issue #2082), from the execution row. `None` when the
     /// caller has no row, as for a legacy export.
@@ -347,22 +348,21 @@ pub fn export_history(
 ///
 /// Under [`HistoryPayloadPolicy::Full`] with `Some(decoder)`, every exported
 /// event is tolerantly decoded ([`PayloadCodecs::decode_value_lossy`])
-/// **before** the document is assembled and measured, so `max_bytes`
-/// enforcement and `size_limit.actual_bytes` reflect the decoded bytes the
-/// caller actually receives — never a stale pre-decode measurement (PR #936
-/// review): a decoded export that fits is not rejected because its encoded
-/// envelopes were over the limit, and a decoded export that exceeds the limit
-/// is rejected instead of shipping oversized while reporting a smaller size.
+/// **before** the document is assembled and measured (PR #936). So
+/// `max_bytes` and `size_limit.actual_bytes` reflect the decoded bytes that
+/// the caller receives. A decoded export that fits is not rejected for
+/// oversized encoded envelopes. A decoded export over the limit is rejected,
+/// and never ships while it reports a smaller size.
 ///
-/// The decoder is ignored under [`HistoryPayloadPolicy::Redacted`] — redacted
+/// The decoder is ignored under [`HistoryPayloadPolicy::Redacted`]. Redacted
 /// exports replace payload fields wholesale (envelope included) and must
 /// never materialize plaintext. `None` is byte-identical to
 /// [`export_history`].
 ///
-/// `outcome` accumulates decode/marker counts (never content) across calls —
-/// including calls that return [`HistoryExportError`], since decoding has
-/// already happened by then — so callers can audit every decode, even one
-/// whose export was subsequently rejected for size.
+/// `outcome` accumulates decode and marker counts (never content) across
+/// calls. That includes calls that return [`HistoryExportError`], since the
+/// decode has already happened. So callers can audit every decode, even for
+/// an export later rejected for size.
 ///
 /// # Errors
 ///
@@ -387,10 +387,8 @@ pub fn export_history_decoded(
         schema: HISTORY_EXPORT_SCHEMA.to_string(),
         version: HISTORY_EXPORT_VERSION,
         workflow_name: request.workflow_name,
-        // Issue #698: business `workflow_id` — non-payload operational metadata,
-        // carried verbatim under BOTH policies (never redacted) so an exported
-        // history round-trips its `workflow_id` into the JSON replay path, exactly
-        // like the deadline/parent metadata below.
+        // Issue #698: non-payload metadata, carried verbatim under BOTH
+        // policies, like the deadline and parent metadata below.
         workflow_id: request.workflow_id,
         // Issue #798: the execution's task queue — non-payload operational
         // metadata, carried verbatim under BOTH policies (never redacted).
@@ -418,16 +416,12 @@ pub fn export_history_decoded(
         } else {
             request.context_headers
         },
-        // Deadline-aware replay metadata (issue #772) — non-payload operational
-        // fields, carried verbatim under BOTH policies (never redacted) so the
-        // exported history round-trips the deadline budget into the JSON /
-        // `harvest-replay` replay path.
+        // Deadline-aware replay metadata (issue #772): non-payload fields,
+        // carried verbatim under BOTH policies (never redacted).
         execution_timeout: request.execution_timeout,
         deadline_at: request.deadline_at,
-        // Spawning-parent id (issue #698) — non-payload operational metadata,
-        // carried verbatim under BOTH policies (never redacted) so a parent-aware
-        // child's exported history round-trips its `parent_execution_id` into the
-        // JSON replay path, exactly like the deadline metadata above.
+        // Spawning-parent id (issue #698): non-payload metadata, carried
+        // verbatim under BOTH policies (never redacted).
         parent_execution_id: request.parent_execution_id,
         // Start provenance (issue #2082) — non-payload metadata, never redacted.
         start_provenance: request.start_provenance,
@@ -491,10 +485,10 @@ fn redact_value(value: &mut Value) -> Result<(), HistoryExportError> {
 
 fn is_payload_field(key: &str) -> bool {
     // `value` is the arbitrary `ctx.side_effect(...)` result on a
-    // `SideEffectRecorded` event (issue #384). Before #384 custom side effects
-    // were stored under `MarkerRecorded.details` and redacted via "details"; the
-    // new field must be redacted too so secrets/PII captured by the closure are
-    // not leaked in a redacted export.
+    // `SideEffectRecorded` event (issue #384). Before #384, custom side effects
+    // lived under `MarkerRecorded.details` and redacted via "details". Redact
+    // the new field too, so a redacted export leaks no secrets or PII from the
+    // closure.
     // `last_completion_result` is the prior run's output frozen into WorkflowStarted
     // for scheduled carryover (issue #488); redact it like any other payload copy.
     matches!(
@@ -1375,11 +1369,10 @@ mod tests {
         assert!(!document.size_limit.truncated);
     }
 
-    /// Issue #772 (Codex P2): a full history export must carry the deadline-aware
-    /// replay metadata (`execution_timeout`/`deadline_at`) at the TOP LEVEL, in
-    /// the same wire shape a `testing::HistorySnapshot` expects, so an exported
-    /// history round-trips into a snapshot and the JSON / `harvest-replay`
-    /// replay path threads the deadline budget.
+    /// Issue #772: a full history export carries `execution_timeout` and
+    /// `deadline_at` at the TOP LEVEL, in the wire shape of
+    /// `testing::HistorySnapshot`. The JSON and `harvest-replay` replay path
+    /// then threads the deadline budget.
     #[test]
     fn full_export_carries_deadline_metadata_round_tripping_into_a_snapshot() {
         use crate::types::ExecutionId;
@@ -1422,9 +1415,7 @@ mod tests {
             "execution_timeout must serialise as top-level integer millis: {json}"
         );
 
-        // The exported JSON must deserialise into a HistorySnapshot carrying the
-        // deadline metadata verbatim — this is the exact round-trip the JSON /
-        // `harvest-replay` replay path relies on.
+        // The JSON and `harvest-replay` replay path relies on this round-trip.
         let snapshot: crate::testing::HistorySnapshot =
             serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
         assert_eq!(snapshot.execution_timeout, Some(timeout));
@@ -1433,14 +1424,14 @@ mod tests {
         assert_eq!(snapshot.execution_id, exec_id);
     }
 
-    /// Issue #798 (Codex round-12 P1): a history export must carry the execution's
-    /// `queue_name` at the TOP LEVEL — sourced from the row's `queue_name` column,
-    /// present in no `WorkflowEvent` — in the same wire shape a
-    /// `testing::HistorySnapshot` expects.
+    /// Issue #798: a history export must carry the execution's
+    /// `queue_name` at the TOP LEVEL, in the same wire shape a
+    /// `testing::HistorySnapshot` expects. The value comes from the row's
+    /// `queue_name` column and is present in no `WorkflowEvent`.
     ///
-    /// Without it the replay-drift gate (and every other `replay_from_json`
-    /// caller) replays under `queue_name == ""`, so an **unchanged** workflow that
-    /// branches on `ctx.queue_name()` — or embeds it in an activity input —
+    /// Without it the replay-drift gate, and every other `replay_from_json`
+    /// caller, replays under `queue_name == ""`. An **unchanged** workflow that
+    /// branches on `ctx.queue_name()`, or embeds it in an activity input, then
     /// false-reports drift. Carried verbatim under BOTH payload policies: it is
     /// operational metadata, never a payload.
     #[test]
@@ -1491,9 +1482,9 @@ mod tests {
         }
     }
 
-    /// A legacy export (produced before issue #798 added the field) omits
-    /// `queue_name` entirely and must still deserialise — to `None`, which falls
-    /// back to the replayer's global / the empty-string default.
+    /// A legacy export from before issue #798 omits `queue_name`. It still
+    /// deserialises, to `None`. The replayer then uses its global or the
+    /// empty-string default.
     #[test]
     fn a_legacy_export_without_queue_name_still_deserialises() {
         use crate::types::ExecutionId;
@@ -1533,13 +1524,13 @@ mod tests {
         assert_eq!(snapshot.queue_name, None);
     }
 
-    /// Issue #698 (Codex P2): a full history export must carry the spawning
-    /// `parent_execution_id` at the TOP LEVEL — sourced from the row's
-    /// `parent_id` column, present in no `WorkflowEvent` — in the same wire
-    /// shape a `testing::HistorySnapshot` expects, so a parent-aware child
-    /// exported through the DB `export_history` -> `replay_from_json` path
-    /// (retention archive / offline replay) round-trips its parent instead of
-    /// deserialising `None` and false-reporting non-determinism.
+    /// Issue #698: a full history export carries the spawning
+    /// `parent_execution_id` at the TOP LEVEL, in the wire shape of
+    /// `testing::HistorySnapshot`. It comes from the row's `parent_id` column,
+    /// and no `WorkflowEvent` holds it. A parent-aware child goes through
+    /// `export_history` and then `replay_from_json` (retention archive or
+    /// offline replay). It round-trips its parent. Otherwise it deserialises
+    /// `None` and false-reports non-determinism.
     #[test]
     fn full_export_carries_parent_execution_id_round_tripping_into_a_snapshot() {
         use crate::types::ExecutionId;
@@ -1579,9 +1570,7 @@ mod tests {
             "parent_execution_id must serialise at the top level: {json}"
         );
 
-        // The exported JSON must deserialise into a HistorySnapshot carrying the
-        // parent verbatim — the exact round-trip the JSON / `harvest-replay`
-        // replay path relies on.
+        // The JSON and `harvest-replay` replay path relies on this round-trip.
         let snapshot: crate::testing::HistorySnapshot =
             serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
         assert_eq!(snapshot.parent_execution_id, Some(parent));
@@ -1589,10 +1578,9 @@ mod tests {
         assert_eq!(snapshot.execution_id, exec_id);
     }
 
-    /// Issue #698 back-compat: an OLD export document JSON that predates the
-    /// top-level `parent_execution_id` field deserialises into a
-    /// `HistorySnapshot` with `parent_execution_id == None` (serde default),
-    /// so legacy archives replay unchanged.
+    /// Issue #698 back-compat: an OLD export without the top-level
+    /// `parent_execution_id` deserialises with `parent_execution_id == None`.
+    /// So legacy archives replay unchanged.
     #[test]
     fn legacy_export_without_parent_field_deserialises_to_none() {
         use crate::types::ExecutionId;
@@ -1896,15 +1884,14 @@ mod tests {
         let _ = exporter.handle_update_event(&event);
     }
 
-    // ── Codec-envelope-bearing histories (issue #608, PR #936 review) ─────────
+    // ── Codec-envelope-bearing histories (issue #608, PR #936) ───────────────
     //
     // The export handlers load history *raw* (`store::load_history_undecoded`)
     // so a non-identity codec envelope reaches `export_history` verbatim as an
     // opaque `Value` inside the event's payload field. These tests pin the two
-    // downstream policy legs: Full passes the envelope through byte-identical
-    // (the read-path decoder — when active — decodes it afterwards), and
-    // Redacted replaces the payload field wholesale, envelope included,
-    // without ever needing a codec.
+    // downstream policy legs. Full passes the envelope through byte-identical.
+    // The read-path decoder, when active, decodes it afterwards. Redacted
+    // replaces the payload field wholesale, envelope included, with no codec.
 
     fn codec_envelope_fixture() -> serde_json::Value {
         serde_json::json!({
@@ -1980,14 +1967,13 @@ mod tests {
         assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
     }
 
-    // --- issue #608, PR #936 review: `export_history_decoded` runs the
-    // read-path decoder *before* the document is measured, so `max_bytes`
-    // enforcement and `size_limit.actual_bytes` always describe the decoded
-    // bytes the caller actually receives.
+    // --- issue #608, PR #936: `export_history_decoded` decodes *before* it
+    // measures the document. So `max_bytes` and `size_limit.actual_bytes`
+    // describe the decoded bytes that the caller receives.
 
     /// Test codec whose decode ignores the stored ciphertext and returns a
-    /// fixed plaintext, so tests can independently size the encoded envelope
-    /// (via the base64 `data` length) and the decoded result.
+    /// fixed plaintext. Tests then size the encoded envelope (the base64 `data`
+    /// length) and the decoded result independently.
     struct FixedPlaintextCodec {
         plaintext: String,
     }

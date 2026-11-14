@@ -41,7 +41,7 @@ pub struct HarvestOutboxConfig {
 /// Tunables for the batch-operations executor (issue #102).
 ///
 /// `concurrency` caps the number of in-flight per-target operations so a
-/// 10k-target batch can't monopolise the connection pool. `tick_interval_ms`
+/// 10k-target batch cannot monopolise the connection pool. `tick_interval_ms`
 /// is how often the background loop wakes up to scan for new open jobs;
 /// the same loop drains in-progress jobs synchronously within a tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,8 +217,8 @@ pub struct HarvestRedisConfig {
 /// startup (issue #700 AC4).
 ///
 /// An *orphaned* type has ≥1 non-terminal execution whose `#[workflow]` handler
-/// is no longer registered in this build — those runs would wedge in permanent
-/// replay failure. This action defaults to `Warn` (non-breaking): mixed fleets
+/// this build no longer registers. Those runs would wedge in permanent replay
+/// failure. This action defaults to `Warn` (non-breaking): mixed fleets
 /// mid-rollout must not crash-loop just because an old handler was removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

@@ -1,14 +1,13 @@
 //! Post-restore resumability verification — DB integration tests (issue #943).
 //!
 //! These tests are the **correctness oracle** for `backup_verify::verify_restore`.
-//! Each one seeds a freshly-migrated database with a deliberately-injected
-//! incoherence class, runs the verifier, and asserts the report *detects that
-//! exact class* — the issue's success metric ("detects 100% of a seeded set of
-//! >= 5 incoherence classes").
+//! Each one seeds a migrated database with one incoherence class and runs the
+//! verifier. The report must *detect that exact class*. That is the issue's
+//! success metric: "detects 100% of a seeded set of >= 5 incoherence classes".
 //!
-//! DB source of truth: `test_init_sql()` (the paved-path bundle) applied
-//! to a fresh per-test database (when `HARVEST_TEST_DATABASE_URL` points at an
-//! admin server) or a throwaway testcontainer (CI default).
+//! DB source of truth: `test_init_sql()` (the paved-path bundle). It is applied
+//! to a fresh per-test database when `HARVEST_TEST_DATABASE_URL` points at an
+//! admin server, or else to a throwaway testcontainer (CI default).
 #![cfg(feature = "db")]
 #![allow(
     clippy::doc_markdown,
@@ -93,7 +92,7 @@ async fn exec_sql(conn: &mut AsyncPgConnection, sql: &str) {
     conn.batch_execute(sql).await.expect("seed sql");
 }
 
-/// Insert a RUNNING workflow execution with the given id on `shard_id`.
+/// Insert a workflow execution with the given id and `state` on `shard_id`.
 async fn seed_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -185,13 +184,13 @@ async fn detects_dead_worker_running_task_as_reclaimable_not_a_failure() {
 /// Class 2: a task-queue row whose owning execution row does not exist — a torn
 /// restore. Incoherent: workers must NOT be started.
 ///
-/// The live schema carries an FK from `harvest_task_queue.workflow_exec_id`, so
-/// this state is only reachable when the restore path bypassed constraint
-/// enforcement — which `pg_restore --data-only --disable-triggers` and
-/// `COPY`-based restores routinely do. The test reproduces exactly that: drop
-/// the constraint, load the row, and leave the constraint off (a restore that
-/// forgot to re-validate). That is *why* the probe is worth running even though
-/// a healthy schema forbids the state.
+/// The live schema carries an FK from `harvest_task_queue.workflow_exec_id`.
+/// So this state needs a restore path that bypassed constraint enforcement.
+/// `pg_restore --data-only --disable-triggers` and `COPY`-based restores
+/// routinely do that. The test reproduces it: drop the constraint, load the
+/// row, and leave the constraint off (a restore that forgot to re-validate).
+/// That is *why* the probe is worth running even though a healthy schema
+/// forbids the state.
 #[tokio::test]
 async fn detects_dangling_task_execution_as_incoherent() {
     let (url, _c) = setup().await;
@@ -356,9 +355,8 @@ async fn verify_never_mutates_the_database() {
     )
     .await;
 
-    // Seed every table a probe reads, so "untouched" is a claim about the
-    // tables verify actually queries -- not a claim about three of them while
-    // six went unexercised.
+    // Seed every table a probe reads. Then "untouched" covers every table
+    // verify queries, not three of them while six go unexercised.
     let sched = uuid::Uuid::new_v4();
     exec_sql(
         &mut conn,
@@ -416,9 +414,9 @@ async fn verify_never_mutates_the_database() {
         #[diesel(sql_type = diesel::sql_types::Text)]
         delivery_states: String,
     }
-    // `state` is the field every scanner would MUTATE, so a snapshot that
-    // counts rows but never captures state cannot catch the regression this
-    // test exists for: a probe that reclaims instead of reporting.
+    // `state` is the field every scanner would MUTATE. A snapshot that counts
+    // rows but never captures state misses the regression this test exists
+    // for: a probe that reclaims instead of reporting.
     let snap_sql = "SELECT \
         (SELECT COUNT(*) FROM harvest_workflow_executions) AS execs, \
         (SELECT COUNT(*) FROM harvest_task_queue) AS tasks, \
@@ -512,8 +510,8 @@ async fn the_read_only_session_pin_makes_postgres_reject_writes() {
 }
 
 /// AC3, the skew signal itself. The other cross-shard tests catch a *specific*
-/// broken reference; this one catches the condition that produces them
-/// wholesale — two shards restored to materially different points in time.
+/// broken reference. This one catches the condition that produces them
+/// wholesale: two shards restored to materially different points in time.
 ///
 /// It is deliberately Advisory, not Incoherent: unequal newest-event
 /// timestamps are a symptom, and a fleet can be legitimately skewed simply
@@ -633,9 +631,9 @@ async fn detects_cross_shard_child_terminal_rolled_back() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// The success metric names "cross-shard missing child" explicitly, and it is a
-/// DIFFERENT invariant from a rolled-back terminal: the parent is still awaiting
-/// a child whose execution row is simply absent from the shard that owns it.
+/// The success metric names "cross-shard missing child" explicitly. It is a
+/// DIFFERENT invariant from a rolled-back terminal. The parent still awaits a
+/// child whose execution row is absent from the shard that owns it.
 #[tokio::test]
 async fn detects_cross_shard_child_execution_missing() {
     let (url_a, _ca) = setup().await;
@@ -791,9 +789,9 @@ async fn an_unencodable_default_shard_makes_the_library_entry_point_undetermined
 }
 
 /// A torn claim pair (`fire_claim_token` set, `fire_claimed_until` NULL) is
-/// PERMANENTLY wedged, not merely expired: the scheduler's claim predicate is
-/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row
-/// satisfies neither half of. Reporting it as reclaimable would tell an
+/// PERMANENTLY wedged, not merely expired. The scheduler's claim predicate is
+/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`. Such a row
+/// satisfies neither half. Reporting it as reclaimable would tell an
 /// operator to start workers on a schedule that will never fire again.
 #[tokio::test]
 async fn a_torn_schedule_claim_is_incoherent_not_reclaimable() {
@@ -889,8 +887,8 @@ async fn an_unreachable_shard_is_undetermined_not_clean() {
 }
 
 /// The most dangerous possible false-clean: a "restore" that produced an
-/// **unmigrated** (empty) database. Every probe errors on a missing table, so a
-/// naive report finds nothing wrong — and would tell an operator to start
+/// **unmigrated** (empty) database. Every probe errors on a missing table. A
+/// naive report then finds nothing wrong. It would tell an operator to start
 /// workers against a database with no harvest schema at all.
 ///
 /// Must report `Unavailable` (exit 2), never a pass.
@@ -942,13 +940,13 @@ async fn an_unmigrated_restore_is_undetermined_never_a_pass() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 1 regressions
+// Cross-shard effect and replay-verdict regressions
 // ---------------------------------------------------------------------------
 
-/// Codex round 1, P1. A caller that recorded `ExternalCancelDelivered` asserts
-/// the target is terminal. If the target's shard was restored to a point where
-/// it is still RUNNING, resuming silently loses an effect the caller believes
-/// already happened — the external-request analogue of a rolled-back child
+/// A caller that recorded `ExternalCancelDelivered` asserts the target is
+/// terminal. The target's shard can be restored to a point where it is still
+/// RUNNING. Resuming then silently loses an effect the caller believes already
+/// happened. This is the external-request analogue of a rolled-back child
 /// terminal. Before the fix a *resolved* request was dropped from adjudication
 /// entirely and the drill exited 0.
 #[tokio::test]
@@ -1039,8 +1037,8 @@ async fn a_delivered_external_cancel_whose_target_is_terminal_is_clean() {
     );
 }
 
-/// A *failed* external terminal applied no effect, so there is nothing to
-/// adjudicate on the target shard and no finding may be raised — the fix must
+/// A *failed* external terminal applied no effect. There is nothing to
+/// adjudicate on the target shard, so no finding may be raised. The fix must
 /// not turn every resolved request into a check.
 #[tokio::test]
 async fn a_failed_external_request_asserts_no_effect_on_the_target() {
@@ -1139,17 +1137,17 @@ async fn detects_delivered_external_signal_rolled_back_on_the_target_shard() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// Codex round 3, P1. The reference scan filtered owning executions to
-/// non-terminal states -- a rule that belongs to the CHILD checks (a terminal
-/// parent's awaited child may legitimately have been collected by retention)
-/// but was wrongly applied to external effects too.
+/// The reference scan once filtered owning executions to non-terminal states.
+/// That rule belongs to the CHILD checks, because a terminal parent's awaited
+/// child may legitimately have been collected by retention. It was wrongly
+/// applied to external effects too.
 ///
 /// A caller that recorded `ExternalSignalDelivered` asserted durable state on
-/// the TARGET shard. That assertion does not expire when the caller completes;
-/// if anything a terminal caller is worse, because there is no live caller left
-/// to re-drive the delivery. The target below resumes waiting forever for a
-/// signal the (now COMPLETED) caller believes it delivered, and verification
-/// used to exit 0 on it.
+/// the TARGET shard. That assertion does not expire when the caller completes.
+/// If anything, a terminal caller is worse, because no live caller is left to
+/// re-drive the delivery. The target below resumes waiting forever for a
+/// signal the (now COMPLETED) caller believes it delivered. Verification used
+/// to exit 0 on it.
 #[tokio::test]
 async fn a_delivered_effect_from_a_terminal_caller_is_still_adjudicated() {
     let (url_a, _ca) = setup().await;
@@ -1209,10 +1207,10 @@ async fn a_delivered_effect_from_a_terminal_caller_is_still_adjudicated() {
 
 /// The other half of the split: widening the scan to terminal callers must NOT
 /// drag their *unresolved* requests along. A caller terminated mid-flight can
-/// leave an `ExternalSignalRequested` with no terminal, and its target may since
-/// have been collected by retention -- reporting that as `external_target_missing`
-/// would be a false Incoherent (exit 1, "do not start workers") on a healthy
-/// restore. Only DELIVERED effects are adjudicated from terminal callers.
+/// leave an `ExternalSignalRequested` with no terminal. Retention may since have
+/// collected its target. Reporting that as `external_target_missing` would be a
+/// false Incoherent (exit 1, "do not start workers") on a healthy restore. Only
+/// DELIVERED effects are adjudicated from terminal callers.
 #[tokio::test]
 async fn an_unresolved_request_from_a_terminal_caller_is_not_reported_missing() {
     let (url_a, _ca) = setup().await;
@@ -1461,10 +1459,10 @@ async fn an_absent_external_effect_target_without_a_summary_is_undetermined() {
     assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
 }
 
-/// Codex round 1, P2. An undecodable child/external `event_data` row may be the
-/// very reference that would have exposed a missing target, so dropping it can
-/// turn an incoherent restore into a resumable verdict. Fail closed: the whole
-/// cross-shard check becomes Undetermined.
+/// An undecodable child/external `event_data` row may be the very reference
+/// that would have exposed a missing target. Dropping it can turn an incoherent
+/// restore into a resumable verdict. Fail closed: the whole cross-shard check
+/// becomes Undetermined.
 #[tokio::test]
 async fn an_undecodable_reference_event_is_undetermined_not_silently_dropped() {
     let (url, _c) = setup().await;
@@ -1501,10 +1499,10 @@ async fn an_undecodable_reference_event_is_undetermined_not_silently_dropped() {
     assert_eq!(report.status, VerifyStatus::Unavailable);
 }
 
-/// Codex round 1, P1 — the *mapping*, driven end to end.
+/// The *mapping* of a replay failure, driven end to end.
 ///
 /// A registered handler that returns `Err` against a NON-terminal recorded
-/// history is not a clean replay: the history carries no terminal failure, so
+/// history is not a clean replay. The history carries no terminal failure. So
 /// the deployed code is erroring where the live run had not, and resuming
 /// fails the run immediately. Before the fix the status was collapsed to a
 /// divergent/clean bool, so this counted as `clean` and the drill exited 0.
@@ -1526,8 +1524,8 @@ async fn a_replayed_workflow_failure_is_not_counted_clean() {
     let exec = ExecutionId::new_for_shard(ShardId::new(0));
     seed_execution(&mut conn, exec, "redeployed_flow", "rf-1", "RUNNING", 0).await;
     // `timestamp` is REQUIRED by the real `WorkflowStarted` variant. The other
-    // tests in this file omit it because they register no handler and so never
-    // decode; these two actually replay, so the event must be genuine or the
+    // tests in this file omit it because they register no handler and never
+    // decode. These two actually replay. The event must be genuine, or the
     // assertions below pass vacuously on an `unreadable` history.
     append_event(
         &mut conn,
@@ -1599,14 +1597,14 @@ async fn a_replayed_workflow_that_succeeds_is_still_clean() {
     );
 }
 
-// ─────────────── Codex round 2: signal effect identity + chain ───────────────
+// ────────────────────── Signal effect identity + chain ───────────────────────
 
-/// Codex round 2, P1. Continue-as-new REASSIGNS unconsumed `harvest_signals`
-/// rows to the successor (`worker.rs`), and an unconsumed signal produces no
-/// `SignalReceived` event — so after the transition the ORIGINAL target row
-/// carries no row and no event. Checking the target alone reports a perfectly
-/// healthy restore as rolled back and exits 1, telling an operator not to start
-/// workers. Follow the successor chain.
+/// Continue-as-new REASSIGNS unconsumed `harvest_signals` rows to the successor
+/// (`worker.rs`). An unconsumed signal produces no `SignalReceived` event. So
+/// after the transition the ORIGINAL target row carries no row and no event.
+/// Checking the target alone reports a perfectly healthy restore as rolled back
+/// and exits 1, telling an operator not to start workers. Follow the successor
+/// chain.
 #[tokio::test]
 async fn a_signal_forwarded_by_continue_as_new_is_found_on_the_successor() {
     let (url_a, _ca) = setup().await;
@@ -1679,9 +1677,10 @@ async fn a_signal_forwarded_by_continue_as_new_is_found_on_the_successor() {
     );
 }
 
-/// The retry path is BROADER than continue-as-new: `forward_signals_to_retry_attempt`
-/// (issue #843) moves the WHOLE mailbox and re-arms `consumed`, so the original
-/// target is left with zero rows even for signals it had already consumed.
+/// The retry path is BROADER than continue-as-new.
+/// `forward_signals_to_retry_attempt` (issue #843) moves the WHOLE mailbox and
+/// re-arms `consumed`. The original target is left with zero rows, even for
+/// signals it had already consumed.
 #[tokio::test]
 async fn a_signal_forwarded_to_a_retry_attempt_is_found_on_the_successor() {
     let (url_a, _ca) = setup().await;
@@ -1748,7 +1747,7 @@ async fn a_signal_forwarded_to_a_retry_attempt_is_found_on_the_successor() {
     assert_ne!(report.status, VerifyStatus::Incoherent);
 }
 
-/// Codex round 2, P1. A repeated channel name made the name-level EXISTS match
+/// A repeated channel name once made the name-level EXISTS match
 /// an OLDER delivery, so a rollback that dropped only the newer one read clean.
 /// With an `idempotency_key` the delivery has a real identity, so the check is
 /// exact: a target carrying only the earlier key is definitively rolled back.
@@ -1811,8 +1810,8 @@ async fn a_keyed_signal_is_matched_exactly_not_by_channel_name() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// The control for the keyed case: the exact key is present, so the check is
-/// definitive and the report is clean — no advisory, no finding.
+/// The control for the keyed case. The exact key is present, so the check is
+/// definitive and the report is clean: no advisory, no finding.
 #[tokio::test]
 async fn a_keyed_signal_whose_exact_key_is_present_is_definitively_clean() {
     let (url_a, _ca) = setup().await;
@@ -1874,8 +1873,8 @@ async fn a_keyed_signal_whose_exact_key_is_present_is_definitively_clean() {
 }
 
 /// An UNKEYED delivery whose channel name is present cannot be proven to be
-/// THIS delivery — the engine persists no per-delivery identity for it. That is
-/// a permanent precision limit of the data model, so it is surfaced as an
+/// THIS delivery. The engine persists no per-delivery identity for it. That is
+/// a permanent precision limit of the data model. So it is surfaced as an
 /// advisory: honest, but never escalating a healthy restore to exit 1.
 #[tokio::test]
 async fn an_unkeyed_signal_with_name_evidence_is_advisory_not_clean_and_not_incoherent() {
@@ -1996,8 +1995,8 @@ async fn a_terminal_outcome_await_failure_is_adjudicated_not_discarded() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// The control for the test above: `target_unknown` is the ONE
-/// `ExternalAwaitFailed` reason code that is a genuine TRANSPORT failure -- the
+/// The control for the test above. `target_unknown` is the ONE
+/// `ExternalAwaitFailed` reason code that is a genuine TRANSPORT failure. The
 /// grace window elapsed with no target row (`timeout.rs:3161`). It asserts no
 /// target-shard state, so it must stay in the "applied no effect" bucket. Without
 /// this control, "adjudicate every ExternalAwaitFailed" would pass the test above.
@@ -2053,7 +2052,7 @@ async fn a_target_unknown_await_failure_asserts_no_effect_on_the_target() {
 /// `read_external_await_outcome` FOLLOWS a `CONTINUED_AS_NEW` target through its
 /// successor chain and resolves only when the chain HEAD is terminal
 /// (`execution.rs:7350-7375`). So the original target row reading
-/// `CONTINUED_AS_NEW` is NOT by itself proof the await resolved: if the
+/// `CONTINUED_AS_NEW` is NOT by itself proof the await resolved. If the
 /// successor is still running, the target shard was restored to before the
 /// resolution the caller recorded. `is_terminal_state("CONTINUED_AS_NEW")` is
 /// true, so a bare terminal check reads this as coherent.
@@ -2167,11 +2166,11 @@ async fn a_resolved_await_whose_successor_is_terminal_is_clean() {
     );
 }
 
-/// The cross-shard reference scan must PAGINATE, not truncate. A hard
-/// `LIMIT probe_limit` makes any fleet with more reference events than the
-/// probe limit report `ProbeFailed` -> `Undetermined` -> exit 2, which is a
-/// false "cannot verify" on a perfectly healthy restore. Seed more complete
-/// owner groups than a deliberately tiny probe limit and require a clean pass.
+/// The cross-shard reference scan must PAGINATE, not truncate. With a hard
+/// `LIMIT probe_limit`, a fleet with more reference events than the probe limit
+/// reports `ProbeFailed` -> `Undetermined` -> exit 2. That is a false "cannot
+/// verify" on a perfectly healthy restore. Seed more complete owner groups
+/// than a deliberately tiny probe limit and require a clean pass.
 #[tokio::test]
 async fn a_reference_scan_larger_than_the_probe_limit_is_paginated_not_truncated() {
     let (url_a, _ca) = setup().await;
@@ -2251,9 +2250,9 @@ async fn a_reference_scan_larger_than_the_probe_limit_is_paginated_not_truncated
     );
 }
 
-/// Pagination must not silently narrow the check: a rollback in the LAST owner
-/// group -- one a single-page `LIMIT` would never have reached -- must still be
-/// detected. Without this, "page once and stop" would pass the test above.
+/// Pagination must not silently narrow the check. A rollback in the LAST owner
+/// group must still be detected, though a single-page `LIMIT` never reaches it.
+/// Without this, "page once and stop" would pass the test above.
 #[tokio::test]
 async fn pagination_still_detects_a_rollback_beyond_the_first_page() {
     let (url_a, _ca) = setup().await;
@@ -2690,9 +2689,9 @@ async fn a_delivered_completion_trigger_fire_stays_silent() {
 }
 
 /// The adjudication batches every fire targeting one shard into a single
-/// existence check and a single retention check (issue #1401, Codex
-/// follow-up). It does this rather than one query pair per fire. Two
-/// DISTINCT fires targeting the same shard must not cross-contaminate.
+/// existence check and a single retention check (issue #1401). It does this
+/// rather than one query pair per fire. Two DISTINCT fires targeting the same
+/// shard must not cross-contaminate.
 /// One delivered (target exists, stays silent) and one lost (target
 /// absent, decisive timestamp) are in the same batch. Each must get its
 /// own correct verdict.
@@ -2837,7 +2836,7 @@ async fn an_absent_completion_trigger_target_with_a_summary_stays_silent() {
 /// A same-shard fire is committed atomically with the target start
 /// (`evaluate_triggers_for_execution`'s inline path), so its target row is
 /// guaranteed to have been created there. It is still adjudicated like any
-/// other fire (Codex follow-up x14). A later shard rebalance can move the
+/// other fire (issue #1401). A later shard rebalance can move the
 /// target away, so the atomic-commit fact alone does not prove the target
 /// SURVIVED to this restore. A genuinely-present, non-migrated target
 /// reports nothing.
@@ -2879,11 +2878,11 @@ async fn a_same_shard_completion_trigger_fire_with_a_live_target_is_clean() {
     );
 }
 
-/// The exact gap Codex follow-up x14 found. A same-shard fire's target was
-/// created atomically, then later rebalanced away by a shard-migration.
-/// That leaves a `MIGRATED` forwarding seal under the same business key on
-/// the SAME shard the fire recorded. The seal must not be read as proof
-/// the target survived this restore.
+/// The rebalance gap behind the test above (issue #1401). A same-shard
+/// fire's target was created atomically, then later rebalanced away by a
+/// shard-migration. That leaves a `MIGRATED` forwarding seal under the same
+/// business key on the SAME shard the fire recorded. The seal must not be
+/// read as proof the target survived this restore.
 #[tokio::test]
 async fn a_same_shard_fire_whose_target_migrated_away_is_unproven() {
     let (url_a, _ca) = setup().await;
@@ -2938,7 +2937,7 @@ async fn a_same_shard_fire_whose_target_migrated_away_is_unproven() {
 /// shard is NOT a historical fact -- a historical drain could have sent it
 /// cross-shard for real. It must surface as `CompletionTriggerFireUnproven`,
 /// never be silently dropped as if it were a recorded same-shard commit
-/// (issue #1401, Codex follow-up).
+/// (issue #1401).
 #[tokio::test]
 async fn a_reconstructed_pre_migration_same_shard_pick_is_unproven() {
     let (url_a, _ca) = setup().await;
@@ -2969,7 +2968,7 @@ async fn a_reconstructed_pre_migration_same_shard_pick_is_unproven() {
 /// A fire naming a trigger definition that no longer exists cannot resolve
 /// its target at all. Neither the fires row nor a joined trigger row
 /// carries a `target_workflow_name`. This is reported, not silently
-/// skipped. The report text stays bounded (issue #1401, Codex follow-up):
+/// skipped. The report text stays bounded (issue #1401):
 /// the exact count is always right, only the joined sample list is capped
 /// at `MAX_FINDING_SAMPLES`.
 #[tokio::test]

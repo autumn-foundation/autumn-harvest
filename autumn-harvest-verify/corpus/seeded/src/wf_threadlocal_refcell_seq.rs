@@ -4,13 +4,13 @@
 //! `TL_SEQ.with(|c| { *c.borrow_mut() += 1; *c.borrow() })` over
 //! `thread_local! { static TL_SEQ: RefCell<u64> }`. In MIR this is
 //! `LocalKey::<RefCell<u64>>::with::<{closure@…}, u64>` plus the
-//! `promoted[0]` indirection that thread-local access lowers to — so the
-//! analyzer must follow a `LocalKey::with` closure argument *and* recognize the
-//! promoted-const path back to the thread-local's name.
+//! `promoted[0]` indirection that thread-local access lowers to. So the
+//! analyzer must follow a `LocalKey::with` closure argument. It must also
+//! recognize the promoted-const path back to the thread-local's name.
 //!
-//! **Launder.** Sibling of S03 with the mutation on the *helper's* side rather
-//! than the caller's, so it exercises the plain `LocalKey::with` shape with no
-//! caller closure involved. No HVG or DET rule mentions `thread_local`,
+//! **Launder.** Sibling of S03 with the mutation on the *helper's* side. So it
+//! exercises the plain `LocalKey::with` shape with no caller closure involved.
+//! No HVG or DET rule mentions `thread_local`,
 //! `LocalKey`, `RefCell` or `borrow_mut`; the crate boundary is on top of that.
 //!
 //! **Expected trace hops.** `wf_threadlocal_refcell_seq` ⇒

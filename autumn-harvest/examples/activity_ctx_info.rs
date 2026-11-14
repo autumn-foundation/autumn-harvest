@@ -2,18 +2,18 @@
 //!
 //! Two things an activity author could not do before:
 //!
-//! **(a) One-hop correlation.** An activity can log the *owning* run's
-//! `execution_id` — the exact `{exec_id}` segment of
-//! `GET /api/harvest/workflows/{exec_id}` — so an on-call engineer paging from
-//! a log line opens the run with **zero** directory lookups. Alongside it,
+//! **(a) One-hop correlation.** An activity can log the `execution_id` of the
+//! *owning* run. It is the exact `{exec_id}` segment of
+//! `GET /api/harvest/workflows/{exec_id}`. So an on-call engineer opens the run
+//! from a log line with **zero** directory lookups. Alongside it,
 //! `task_id` is the `harvest_task_queue` row id the operator `retry-now` /
 //! `fail-now` routes address, so the pair is directly actionable.
 //!
 //! **(b) Deadline-aware checkpointing.** A long activity can ask how much of
-//! its attempt budget is left and bail out *cleanly* — flushing a checkpoint
-//! via `ctx.heartbeat(...)` — instead of being killed mid-item by the
-//! start-to-close scanner and losing everything it had done. The retry resumes
-//! from the checkpoint, so **no completed work is ever re-executed**.
+//! its attempt budget is left. It can then stop *cleanly* and flush a
+//! checkpoint via `ctx.heartbeat(...)`. Otherwise the start-to-close scanner
+//! kills it mid-item and its work is lost. The retry resumes from the
+//! checkpoint, so **no completed work is ever re-executed**.
 //!
 //! Run it:
 //!
@@ -138,10 +138,6 @@ async fn import_rows(ctx: &ActivityContext, req: ImportRequest) -> Result<u32, S
     Ok(next)
 }
 
-// ---------------------------------------------------------------------------
-// Workflow.
-// ---------------------------------------------------------------------------
-
 #[workflow]
 async fn order_flow(ctx: &WorkflowContext, total_rows: u32) -> Result<String, String> {
     let receipt: String = ctx
@@ -163,19 +159,15 @@ async fn main() {
     println!("See the module docs for the two patterns it demonstrates.");
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
     use autumn_harvest::{ActivityIdentity, ExecutionId};
     use std::sync::{Arc, Mutex};
 
-    /// (a) The correlation pattern: every identifier an operator needs is on
-    /// `ctx.info()`, and `execution_id` renders as the bare management-API path
-    /// segment (it round-trips back through `FromStr`).
+    /// (a) Every identifier an operator needs is on `ctx.info()`.
+    /// `execution_id` renders as the bare management-API path segment and
+    /// round-trips through `FromStr`.
     #[tokio::test]
     async fn info_carries_the_operator_correlation_pair() {
         let exec_id = ExecutionId::new();
@@ -234,8 +226,8 @@ mod tests {
         assert!(None::<Duration> < Some(RESERVE));
     }
 
-    /// (b) The whole checkpoint cycle, without a worker or a database:
-    /// attempt 1 does work and flushes checkpoints; attempt 2 RESUMES from the
+    /// (b) The whole checkpoint cycle, without a worker or a database.
+    /// Attempt 1 does work and flushes checkpoints. Attempt 2 RESUMES from the
     /// last one and re-executes nothing.
     #[tokio::test]
     async fn import_resumes_from_the_checkpoint_and_re_executes_nothing() {

@@ -5,11 +5,11 @@
 //! top of the #148 workflow-reset internals; it adds no new event variant and no
 //! migration.
 //!
-//! Semantics under test (operator-selected "level-granular" mode): retrying a
-//! failed node resets to the clean boundary before the earliest scheduling of
-//! the failed node and its declared downstream. When the failed node shares a
-//! parallel level with siblings scheduled before it, that boundary is rejected
-//! by the #148 validator and the endpoint returns `409` with a remediation hint.
+//! Semantics under test (operator-selected "level-granular" mode): a failed-node retry
+//! resets to the clean boundary before the earliest scheduling of that node
+//! and its declared downstream. A failed node can share a parallel
+//! level with siblings scheduled before it. Then the #148 validator rejects
+//! that boundary, and the endpoint returns `409` with a remediation hint.
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
@@ -658,15 +658,15 @@ async fn retry_running_run_is_conflict() {
 /// A source run whose payloads were erased (issue #495) must be refused.
 ///
 /// Erasure tombstones every payload field, so the issue #780 compensated-run
-/// guard can go blind: `ActivityScheduled.input` is `{"_harvest_erased": true}`
-/// rather than the compensation envelope (signal 2), and a run that unwound at a
-/// drained signal frontier (issue #801) recorded no marker for signal 1 to
-/// anchor on. On that intersection an already-rolled-back run would look
-/// retryable — the double-spend `CompensatedRun` exists to prevent.
+/// guard can go blind. `ActivityScheduled.input` is `{"_harvest_erased": true}`,
+/// not the compensation envelope (signal 2). A run that unwound at a drained
+/// signal frontier (issue #801) recorded no marker for signal 1. On that
+/// intersection, an already-rolled-back run would look retryable. That is the
+/// double-spend `CompensatedRun` exists to prevent.
 ///
-/// The refusal is correct independently of compensation, too: the #148 fork
-/// carries over upstream events whose `output` is now a tombstone, so a
-/// re-executing downstream node with an `input_from` binding would be handed
+/// The refusal is correct without compensation, too. The #148 fork carries
+/// over upstream events whose `output` is now a tombstone. A re-executing
+/// downstream node with an `input_from` binding would get
 /// `{"_harvest_erased": true}` as its input.
 #[tokio::test]
 async fn retry_erased_run_is_conflict() {
@@ -760,11 +760,11 @@ async fn retry_with_unresolved_upstream_side_effect_is_conflict() {
     let mut conn = establish(&url).await;
 
     // Under level-granular semantics the cut lands before the failed node's
-    // whole level, so the only way to land inside an unresolved side effect is
-    // an UPSTREAM one. Here step_a was scheduled but never settled (the run was
-    // cancelled while it was in flight) yet step_b was recorded as failed.
-    // Retrying step_b cuts before step_b's level, where step_a is still pending,
-    // so the #148 validator rejects the boundary -> 409 with a remediation hint.
+    // whole level. So only an UPSTREAM side effect can be unresolved at the cut.
+    // Here step_a was scheduled but never settled, because the run was
+    // cancelled in flight. Yet step_b was recorded as failed. A retry of
+    // step_b cuts before its level, where step_a is still pending. The #148
+    // validator rejects that boundary -> 409 with a remediation hint.
     // 0 WfStarted,1 schedA,2 schedB,3 failB,4 WorkflowCancelled
     let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
     let events = vec![

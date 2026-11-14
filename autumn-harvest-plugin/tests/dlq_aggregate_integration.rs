@@ -1,8 +1,8 @@
 //! Integration tests for the DLQ root-cause aggregation endpoint (issue #385).
 //!
-//! Seeds dead-letter rows spanning multiple workflow names and failure
-//! signatures, then asserts each `group_by` combination returns the expected
-//! counts and that the per-group counts reconcile to `filtered_total`.
+//! Seeds dead-letter rows over several workflow names and failure signatures.
+//! Each `group_by` combination must return the expected counts, and the
+//! per-group counts must reconcile to `filtered_total`.
 
 use std::collections::BTreeMap;
 
@@ -253,9 +253,9 @@ async fn insert_dlq_rows(
 /// Seed the standard 50-row fixture on `database_url` (single shard).
 ///
 /// Distribution (`workflow_name` × `failure_signature`):
-///   onboarding × sig1 = 20, onboarding × sig2 = 5  (onboarding total 25)
-///   billing    × sig1 = 10, billing    × sig2 = 8  (billing total 18)
-///   reporting  × sig1 = 4,  reporting  × sig2 = 3  (reporting total 7)
+///   onboarding × sig1 = 20, onboarding × sig2 = 5  (onboarding total 25).
+///   billing    × sig1 = 10, billing    × sig2 = 8  (billing total 18).
+///   reporting  × sig1 = 4,  reporting  × sig2 = 3  (reporting total 7).
 /// Totals: 50 rows, sig1 = 34, sig2 = 16.
 async fn seed_fixture(database_url: &str, shard: i32) {
     let onboarding = insert_execution(database_url, shard, "onboarding").await;
@@ -554,8 +554,8 @@ fn callback_exhausted_error() -> String {
     .to_string()
 }
 
-/// Seed a 10-row cause fixture with three distinct engine-authored quarantine
-/// reasons plus a plain retry-exhaustion cohort:
+/// Seed a 10-row cause fixture: three engine-authored quarantine reasons and
+/// a plain retry-exhaustion cohort.
 ///   `poison_pill` = 4, `workflow_task_timeout` = 2,
 ///   `callback_delivery_exhausted` = 1, `retry_exhaustion` (plain) = 3.
 async fn seed_cause_fixture(database_url: &str, shard: i32) {

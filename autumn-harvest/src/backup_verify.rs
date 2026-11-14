@@ -1,11 +1,11 @@
 //! Post-restore resumability verification for backup/PITR drills (issue #943).
 //!
-//! "It's just Postgres" is harvest's durability pitch — your DBA's existing
+//! "It is just Postgres" is harvest's durability pitch — your DBA's existing
 //! backup and point-in-time-recovery tooling applies unchanged. That pitch is
-//! only *true* if the restore story is written down and mechanically checkable,
-//! because a database restored to time `T` comes back carrying in-flight
-//! artifacts that look alarming to an operator seeing them for the first time
-//! during an actual disaster:
+//! only *true* if the restore story is written down and mechanically
+//! checkable. A database restored to time `T` comes back with in-flight
+//! artifacts. They look alarming to an operator who first sees them during an
+//! actual disaster:
 //!
 //! * `RUNNING` task rows referencing `worker_id`s that no longer exist,
 //! * schedule fire claims (issue #350), worker-session leases (issue #606) and
@@ -20,17 +20,17 @@
 //! Every item in the first list is **expected and self-healing**: the reclaim
 //! machinery that already ships handles it. Only the last is a real problem.
 //! This module encodes that distinction as a three-tier severity model
-//! ([`FindingSeverity`]) so a restore drill produces an actionable verdict
-//! rather than a wall of scary-looking rows, and so `harvest backup verify`
-//! can exit non-zero on exactly the findings that mean "do not start workers".
+//! ([`FindingSeverity`]). A restore drill then produces an actionable verdict,
+//! not a wall of scary-looking rows. And `harvest backup verify` can exit
+//! non-zero on exactly the findings that mean "do not start workers".
 //!
 //! # Scope and safety
 //!
 //! **Read-only.** Nothing in this module writes. The db-gated probes issue
-//! `SELECT`s only, and [`verify_restore`] additionally pins every connection it
-//! opens into a read-only Postgres session (see [`READ_ONLY_SESSION_SQL`]) so a
-//! future bug *cannot* mutate the database it is inspecting — the guarantee is
-//! mechanical, not a code-review promise.
+//! `SELECT`s only. [`verify_restore`] also pins every connection it opens into
+//! a read-only Postgres session (see [`READ_ONLY_SESSION_SQL`]). So a future
+//! bug *cannot* mutate the database it inspects. The guarantee is mechanical,
+//! not a code-review promise.
 //!
 //! **Zero engine impact.** No new `WorkflowEvent` variant, no migration, no
 //! change to any runtime path. Every reclaim class below is reported by
@@ -52,8 +52,8 @@ use uuid::Uuid;
 
 /// Maximum number of sample identifiers retained per [`Finding`].
 ///
-/// A restore of a large fleet can produce thousands of rows in a single class;
-/// the report is a triage artifact, not an export, so each finding keeps a
+/// A restore of a large fleet can produce thousands of rows in a single class.
+/// The report is a triage artifact, not an export. So each finding keeps a
 /// bounded, deterministic prefix and reports the true `count` alongside it.
 pub const MAX_FINDING_SAMPLES: usize = 10;
 
@@ -71,8 +71,8 @@ pub const DEFAULT_PROBE_LIMIT: i64 = 1_000;
 
 /// Upper bound on pages the cross-shard reference scan will read per shard.
 ///
-/// A runaway guard, not a tuning knob: at the default `probe_limit` it admits
-/// a million reference events, and exceeding it raises a truncation note
+/// A runaway guard, not a tuning knob. At the default `probe_limit` it admits
+/// a million reference events. Exceeding it raises a truncation note
 /// (`Undetermined`) rather than reporting a clean prefix.
 pub const MAX_REFERENCE_SCAN_PAGES: usize = 1_000;
 
@@ -146,9 +146,9 @@ impl FindingSeverity {
 
 /// A bounded catalogue of post-restore conditions this module detects.
 ///
-/// Each class maps to exactly one [`FindingSeverity`] via [`Self::severity`],
-/// and names the shipped mechanism that heals it (for `Reclaimable`) or the
-/// invariant it breaks (for `Incoherent`) in [`Self::explanation`].
+/// Each class maps to exactly one [`FindingSeverity`] via [`Self::severity`].
+/// [`Self::explanation`] names the shipped mechanism that heals it (for
+/// `Reclaimable`) or the invariant it breaks (for `Incoherent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -169,9 +169,9 @@ pub enum FindingClass {
     ExpiredMutexLease,
     /// A completion delivery frozen `INFLIGHT`.
     ///
-    /// Any `INFLIGHT` row in a restored snapshot is frozen by definition — the
-    /// worker that claimed it is gone with the process, so the lease is
-    /// irrelevant to whether it is stuck.
+    /// Any `INFLIGHT` row in a restored snapshot is frozen by definition. The
+    /// worker that claimed it is gone with the process. So the lease does not
+    /// tell whether it is stuck.
     InflightCompletionDelivery,
     /// An external signal/cancel/await request with no recorded terminal and a
     /// target that is still resolvable — the outbox will retry it.
@@ -198,19 +198,19 @@ pub enum FindingClass {
     /// restore.
     ChildTerminalRolledBack,
     /// A caller recorded an external signal/cancel/await as *successfully*
-    /// delivered, but the target's own shard shows no trace of the effect —
-    /// the external-request analogue of `ChildTerminalRolledBack`, and the
-    /// signature of a target shard restored to a point before the effect
-    /// landed. Resuming would silently lose an effect the caller believes
-    /// already happened.
+    /// delivered, but the target's own shard shows no trace of the effect.
+    /// This is the external-request analogue of `ChildTerminalRolledBack`. It
+    /// is the signature of a target shard restored to a point before the
+    /// effect landed. Resuming would silently lose an effect the caller
+    /// believes already happened.
     ExternalEffectRolledBack,
     /// A sampled history no longer replays cleanly against the deployed
     /// workflow code.
     ReplayDivergence,
     /// A sampled non-terminal history replayed to a workflow *failure* under
-    /// the deployed code. The recorded history contains no terminal failure,
-    /// so this is the newly deployed handler erroring where the live run had
-    /// not — resuming it fails the run immediately.
+    /// the deployed code. The recorded history contains no terminal failure.
+    /// So the newly deployed handler errors where the live run did not.
+    /// Resuming it fails the run immediately.
     ReplayWorkflowFailed,
     /// The source shard confirms a cross-shard completion-trigger relay
     /// delivered (issue #1401). The target execution is absent, and the
@@ -228,15 +228,16 @@ pub enum FindingClass {
     DuplicateEventId,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
-    /// A caller recorded an external *signal* as delivered and the target's
-    /// shard does carry a signal of that name, but the delivery carried no
-    /// `idempotency_key`, so the exact delivery cannot be proven to have
-    /// survived. The engine persists no per-delivery identity for an unkeyed
-    /// signal (`SignalReceived` carries only name + payload, and
-    /// `harvest_signals` carries a key only when the caller supplied one), so
-    /// this is a permanent precision limit of the data model, not a probe
-    /// failure — hence Advisory rather than Undetermined. A signal whose name
-    /// has *no* trace at all is still reported as `ExternalEffectRolledBack`.
+    /// A caller recorded an external *signal* as delivered, and the target's
+    /// shard carries a signal of that name. But the delivery carried no
+    /// `idempotency_key`, so nothing proves that this exact delivery survived.
+    ///
+    /// The engine persists no per-delivery identity for an unkeyed signal.
+    /// `SignalReceived` carries only name and payload. `harvest_signals`
+    /// carries a key only when the caller supplied one. So this is a permanent
+    /// precision limit of the data model, not a probe failure. Hence Advisory
+    /// rather than Undetermined. A signal whose name has *no* trace at all is
+    /// still reported as `ExternalEffectRolledBack`.
     ExternalEffectUnverifiable,
     /// Shards were restored to materially different points in time.
     RestorePointSkew,
@@ -256,9 +257,9 @@ pub enum FindingClass {
     /// A probe could not execute at all — most commonly a missing table,
     /// i.e. the "restore" produced an unmigrated or empty database.
     ///
-    /// This is deliberately NOT advisory: a probe that never ran found nothing
-    /// *because it did not look*, and reporting that as a pass is the single
-    /// most dangerous false-clean a restore drill can emit.
+    /// This is deliberately NOT advisory. A probe that never ran found nothing
+    /// *because it did not look*. Reporting that as a pass is the single most
+    /// dangerous false-clean a restore drill can emit.
     ProbeFailed,
     /// A recorded child terminal or delivered external effect targets an
     /// execution absent from its own shard, and no `harvest_execution_summaries`
@@ -312,9 +313,8 @@ impl FindingClass {
 
     /// The fixed severity of this class.
     ///
-    /// Severity is a property of the *class*, never of the individual row, so
-    /// a report can never disagree with itself about how bad a given condition
-    /// is.
+    /// Severity is a property of the *class*, never of the individual row. So
+    /// a report never disagrees with itself about how bad a condition is.
     #[must_use]
     pub const fn severity(self) -> FindingSeverity {
         match self {
@@ -524,9 +524,9 @@ pub struct Finding {
     /// True when `samples` does not enumerate the whole population.
     ///
     /// `count` is **always exact** — it comes from `COUNT(*) OVER ()`, computed
-    /// before `LIMIT`. Only the sample identifiers are bounded, so `truncated`
-    /// means "there are more rows than the ones listed here", never "the count
-    /// itself is a lower bound".
+    /// before `LIMIT`. Only the sample identifiers are bounded. So `truncated`
+    /// means "more rows exist than the ones listed here". It never means "the
+    /// count itself is a lower bound".
     pub truncated: bool,
 }
 
@@ -593,10 +593,9 @@ impl Finding {
 
 /// Outcome tally for the sampled-history replay check.
 ///
-/// The `skipped_no_handler` field exists so the report can never claim to have
-/// verified replay-safety when it in fact registered no workflow handlers —
-/// the failure mode that would make a "clean" verdict a lie. See
-/// [`ReplaySummary::verified`].
+/// The `skipped_no_handler` field stops the report from claiming verified
+/// replay-safety when it registered no workflow handlers. That failure mode
+/// makes a "clean" verdict a lie. See [`ReplaySummary::verified`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ReplaySummary {
     /// Histories selected for replay.
@@ -687,9 +686,9 @@ impl std::fmt::Display for VerifyStatus {
 
 /// Resolves the overall status from the observed findings.
 ///
-/// `Unavailable` wins over everything: a partially-inspected fleet cannot be
-/// declared resumable, and reporting an unreachable shard as `Clean` would be
-/// exactly the false assurance a restore drill exists to prevent.
+/// `Unavailable` wins over everything. A partially-inspected fleet cannot be
+/// declared resumable. Reporting an unreachable shard as `Clean` is exactly
+/// the false assurance a restore drill exists to prevent.
 #[must_use]
 pub fn classify_status<'a>(
     findings: impl IntoIterator<Item = &'a Finding>,
@@ -788,7 +787,7 @@ pub struct RestoreVerifyReport {
     /// Surfaced at the top level so a JSON consumer can gate on it without
     /// re-deriving [`ReplaySummary::verified`]. `false` means the `status`
     /// verdict says nothing about whether the deployed workflow code still
-    /// replays these histories: the shipped `harvest` CLI links no application
+    /// replays these histories. The shipped `harvest` CLI links no application
     /// handlers, so it always reports `false` (see the runbook's "Replay
     /// honesty" section).
     pub replay_verified: bool,
@@ -854,14 +853,13 @@ impl RestoreVerifyReport {
 
     /// Process exit code.
     ///
-    /// `0` = resumable (clean, or only reclaimable/advisory findings);
-    /// `1` = a broken invariant — do not start workers;
-    /// `2` = the drill could not determine an answer (a shard was unreachable).
+    /// - `0`: resumable (clean, or only reclaimable/advisory findings).
+    /// - `1`: a broken invariant. Do not start workers.
+    /// - `2`: the drill could not determine an answer (a shard was unreachable).
     ///
-    /// `2` is deliberately distinct from `1`: "we found a problem" and "we
-    /// could not tell" demand different operator responses, and collapsing
-    /// them would let a connection failure masquerade as a clean bill of
-    /// health on retry.
+    /// `2` is deliberately distinct from `1`. "We found a problem" and "we
+    /// could not tell" demand different operator responses. Collapsing them
+    /// lets a connection failure masquerade as a clean bill of health on retry.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self.status {
@@ -915,7 +913,7 @@ struct ResolvedFire {
 
 /// A [`ResolvedFire`] resolved to a concrete target shard, pending
 /// adjudication. `target_shard == source_shard` for a RECORDED same-shard
-/// fire (Codex follow-up x14/x15). The trigger fire and the target start
+/// fire (issue #1401). The trigger fire and the target start
 /// commit atomically in that case. A restore containing the fire
 /// necessarily contains the target's initial creation too. That fact
 /// changes what adjudication means, not whether it happens.
@@ -961,7 +959,7 @@ struct PendingTriggerFire {
 /// documents. It is a residual limitation for pre-migration data only.
 ///
 /// A RECORDED same-shard fire (`fire.target_shard == Some(source_shard)`)
-/// is still adjudicated, not dropped outright (Codex follow-up x14). The
+/// is still adjudicated, not dropped outright (issue #1401). The
 /// atomic-commit fact only proves the target was CREATED there. A shard
 /// rebalance after the fire can move the live row elsewhere. It leaves a
 /// `MIGRATED` seal under the same business key on `source_shard` -- the
@@ -971,7 +969,7 @@ struct PendingTriggerFire {
 /// `source_shard`, gets it that same protection for free.
 ///
 /// A RE-DERIVED pick that happens to equal `source_shard` is different
-/// (issue #1401, Codex follow-up). The same historical-drain blind spot
+/// (issue #1401). The same historical-drain blind spot
 /// can point the fallback at the wrong CROSS-shard target. It can just as
 /// easily land the pick on `source_shard` by coincidence. That would
 /// silently drop a fire that was actually lost. Unlike the RECORDED case,
@@ -986,8 +984,8 @@ struct RoutedTriggerFires {
     /// source shard -- a same-shard conclusion this function cannot
     /// trust. Sample identifiers, for a [`FindingClass::CompletionTriggerFireUnproven`].
     /// Bounded at [`MAX_FINDING_SAMPLES`] as it accumulates; `uncertain_count`
-    /// stays exact regardless (issue #1401, Codex follow-up x3), mirroring
-    /// `TriggerFireBuckets`'s bounded sample lists.
+    /// stays exact regardless (issue #1401). This mirrors the bounded sample
+    /// lists of `TriggerFireBuckets`.
     uncertain: Vec<String>,
     uncertain_count: u64,
 }
@@ -1028,7 +1026,7 @@ fn route_trigger_fires(
         }
         // A RECORDED same-shard fire (`target_shard == source_shard`,
         // `!reconstructed`) falls through to here instead of being dropped
-        // (Codex follow-up x14). It still needs the MIGRATED-seal check
+        // (issue #1401). It still needs the MIGRATED-seal check
         // below, in case the target has since rebalanced away.
         pending.push(PendingTriggerFire {
             source_shard,
@@ -1057,8 +1055,8 @@ fn route_trigger_fires(
 /// trustworthy.
 ///
 /// `fired_at` and `target_latest_event_at` come from TWO DIFFERENT
-/// Postgres hosts' clocks in a multi-shard deployment (issue #1401, Codex
-/// follow-up). A raw `<` comparison would treat any clock skew between
+/// Postgres hosts' clocks in a multi-shard deployment (issue #1401).
+/// A raw `<` comparison would treat any clock skew between
 /// them as proof of loss. `max_skew_secs` is the same operator-configured
 /// tolerance [`FindingClass::RestorePointSkew`] already uses to flag
 /// excessive cross-shard skew. A gap smaller than that tolerance is never
@@ -1074,7 +1072,7 @@ fn route_trigger_fires(
 /// This is the same evidentiary gap [`FindingClass::RetentionUnproven`]
 /// names for a recorded child terminal or delivered effect.
 ///
-/// Residual limitation (issue #1401, Codex follow-up x2). A target that
+/// Residual limitation (issue #1401). A target that
 /// ran, completed, and was retention-collected with no other traffic on
 /// its shard afterward can itself have been the shard's newest event. Its
 /// deletion then pulls the visible newest-event timestamp back to before
@@ -1102,14 +1100,14 @@ fn absence_is_decisive_loss(
     target_latest_event_at: Option<DateTime<Utc>>,
     max_skew_secs: i64,
 ) -> bool {
-    // `VerifyOptions::max_skew_secs` is a public, unvalidated field (Codex
-    // follow-up x20). A negative value would flip this comparison's
+    // `VerifyOptions::max_skew_secs` is a public, unvalidated field (issue
+    // #1401). A negative value would flip this comparison's
     // direction. A target shard AHEAD of `fired_at` would then read as
     // decisive loss instead of proof of life. Floor it at zero: a
     // negative tolerance means "no tolerance", not "invert the check".
     let max_skew_secs = max_skew_secs.max(0);
     // A very large positive value can still overflow `Duration::seconds`'s
-    // representable range and panic (Codex follow-up). That would abort
+    // representable range and panic (issue #1401). That would abort
     // the whole verify run instead of returning an undetermined report.
     // Fall back to the largest representable tolerance instead. An
     // out-of-range request means "tolerate anything." That is the safe
@@ -1125,11 +1123,10 @@ fn absence_is_decisive_loss(
 
 /// True when `candidate` and `live` address the same Postgres database.
 ///
-/// Compares host/`hostaddr`, port and database name only — user, password and
-/// query parameters are deliberately ignored, because pointing a "read-only
-/// replica user" at the production database is exactly the mistake this guard
-/// exists to catch. Ports are normalised so `:5432` and an omitted port
-/// compare equal.
+/// Compares host/`hostaddr`, port and database name only. It deliberately
+/// ignores user, password and query parameters. A "read-only replica user"
+/// pointed at the production database is exactly the mistake this guard
+/// catches. Ports are normalised so `:5432` and an omitted port compare equal.
 ///
 /// Host and port matching use **overlap**, not set equality, so a multi-host
 /// failover DSN that merely lists production among its candidates still trips
@@ -1154,11 +1151,11 @@ pub fn dsn_targets_same_database(candidate: &str, live: &str) -> bool {
 
 /// True when two sorted, deduped sets share at least one element.
 ///
-/// Overlap rather than equality: a multi-host failover DSN that lists
-/// production among its candidates reaches production, so one shared endpoint
-/// is enough to trip the guard. Erring toward *more* matches is the safe
-/// direction -- a false match costs the operator an explicit acknowledgement,
-/// a false miss costs them their production database.
+/// Overlap rather than equality. A multi-host failover DSN that lists
+/// production among its candidates reaches production. So one shared endpoint
+/// trips the guard. Erring toward *more* matches is the safe direction. A
+/// false match costs the operator an explicit acknowledgement. A false miss
+/// costs them their production database.
 #[cfg(feature = "db")]
 fn overlaps<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     a.iter().any(|x| b.contains(x))
@@ -1174,7 +1171,6 @@ struct DsnIdentity {
     hostaddrs: Vec<String>,
     /// Ports, normalised so an omitted port compares as 5432.
     ports: Vec<u16>,
-    /// Database name.
     database: String,
 }
 
@@ -1182,30 +1178,31 @@ struct DsnIdentity {
 /// cannot be parsed.
 ///
 /// Parsed with **`tokio_postgres::Config`** — the exact parser
-/// `diesel_async` hands the DSN to when it opens the connection. Using any
-/// other parser (`url::Url`, say) is a guard bypass waiting to happen: the two
-/// disagree on percent-decoding (`/%68arvest` is database `harvest`), on
-/// libpq query parameters (`?dbname=`, `?host=`, `?port=`, `?hostaddr=` all
-/// override the URL form), and on comma-separated multi-host failover. Every
-/// one of those parses cleanly under `url` while resolving somewhere else
-/// entirely at connect time — so a guard built on `url` waves through a DSN
-/// that lands on production. Sharing the connector's parser makes that class
-/// of disagreement impossible by construction.
+/// `diesel_async` hands the DSN to when it opens the connection. Any other
+/// parser (`url::Url`, say) is a guard bypass waiting to happen. The two
+/// disagree on percent-decoding (`/%68arvest` is database `harvest`). They
+/// disagree on libpq query parameters: `?dbname=`, `?host=`, `?port=` and
+/// `?hostaddr=` all override the URL form. They also disagree on
+/// comma-separated multi-host failover. Each of those parses cleanly under
+/// `url` but resolves somewhere else at connect time. So a guard built on
+/// `url` waves through a DSN that lands on production. Sharing the
+/// connector's parser makes that class of disagreement impossible by
+/// construction.
 ///
-/// `hostaddr` is kept **separate** from `hosts` rather than folded into one
-/// set: tokio-postgres prefers it for the TCP connection, so two DSNs sharing
-/// an address are the same database however differently they spell the
-/// hostname. Folding them together would make identity require matching
-/// hostname *text* as well, and `host=scratch-alias&hostaddr=<prod-ip>` would
-/// slip past a live `host=prod-alias&hostaddr=<prod-ip>`.
+/// `hostaddr` stays **separate** from `hosts`, not folded into one set.
+/// tokio-postgres prefers it for the TCP connection. So two DSNs sharing an
+/// address are the same database however they spell the hostname. Folding
+/// them together makes identity require matching hostname *text* as well.
+/// Then `host=scratch-alias&hostaddr=<prod-ip>` slips past a live
+/// `host=prod-alias&hostaddr=<prod-ip>`.
 ///
 /// A NUMERIC `host` is folded into the address set: it IS an address, so it
 /// compares against the other side's `hostaddr` with no DNS involved.
 ///
 /// Known limit: when one side pins only `hostaddr` and the other only a
-/// `host` NAME, no comparison is possible without resolving DNS -- which this
-/// guard deliberately does not do (a name can resolve differently between the
-/// check and the connect). Spell both DSNs the same way, or pass the
+/// `host` NAME, no comparison is possible without resolving DNS. This guard
+/// deliberately does not resolve DNS: a name can resolve differently between
+/// the check and the connect. Spell both DSNs the same way, or pass the
 /// acknowledgement.
 #[cfg(feature = "db")]
 fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
@@ -1219,12 +1216,12 @@ fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
         .map(ToString::to_string)
         .collect();
     // A NUMERIC `host` is already an address -- comparing it needs no DNS, so
-    // it belongs in the address set, not the hostname set. Leaving it in
-    // `hosts` meant `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5`
-    // -- the same TCP destination -- overlapped in neither set and the guard
-    // waved a production target through. Parsing also normalises IPv6
-    // spellings (`[0:0:...:1]` and `::1`) on both sides, since `get_hostaddrs`
-    // yields `IpAddr` and we render it the same way.
+    // it belongs in the address set, not the hostname set. Kept in `hosts`,
+    // the same TCP destination spelled `host=10.0.0.5` and
+    // `host=prod-alias&hostaddr=10.0.0.5` overlapped in neither set. The guard
+    // then waved a production target through. Parsing also normalises IPv6
+    // spellings (`[0:0:...:1]` and `::1`) on both sides. `get_hostaddrs`
+    // yields `IpAddr`, and this code renders it the same way.
     let mut hosts: Vec<String> = Vec::new();
     for h in config.get_hosts() {
         match h {
@@ -1259,14 +1256,14 @@ fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
 
     // An omitted `dbname` is NOT an empty database name. tokio-postgres simply
     // leaves `database` out of the startup packet, and the server then applies
-    // the libpq default: the CONNECTION USER. Comparing `""` against the other
-    // side's real name made two DSNs that reach the same database look
-    // different, so the guard waved a production target through.
+    // the libpq default: the CONNECTION USER. A `""` compared against the other
+    // side's real name made two DSNs to the same database look different. The
+    // guard then waved a production target through.
     //
-    // With neither `dbname` nor `user` the default is the OS username of
-    // whoever connects -- not knowable here, and different on the operator's
-    // machine than in the deployed config -- so we fail closed by refusing to
-    // produce an identity at all (`None` makes the guard return `true`).
+    // With neither `dbname` nor `user`, the default is the OS username of
+    // whoever connects. It is not knowable here, and it differs between the
+    // operator's machine and the deployed config. So fail closed and produce
+    // no identity at all (`None` makes the guard return `true`).
     let database = config
         .get_dbname()
         .or_else(|| config.get_user())?
@@ -1285,11 +1282,10 @@ fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
 /// A DSN that cannot be parsed is redacted **wholesale** rather than echoed, so
 /// a malformed-but-secret-bearing string can never reach a report or a log
 /// line. The same applies to any DSN carrying a `password` connection
-/// parameter: `tokio_postgres::Config` accepts `?password=` in the query string
-/// and in the libpq `key=value` form, and neither survives a naive URL
-/// userinfo rewrite — so rather than emit a string we cannot prove is clean,
-/// we withhold it. The report needs the DSN only to name which shard is being
-/// discussed, and the shard id already does that.
+/// parameter. `tokio_postgres::Config` accepts `?password=` in the query string
+/// and in the libpq `key=value` form. Neither survives a naive URL userinfo
+/// rewrite. So a string that cannot be proven clean is withheld. The report
+/// needs the DSN only to name the shard, and the shard id already does that.
 #[must_use]
 pub fn redact_dsn(dsn: &str) -> String {
     let trimmed = dsn.trim();
@@ -1431,7 +1427,7 @@ impl VerifyOptions {
     /// Set the per-probe row cap.
     ///
     /// For the cross-shard reference scan this is a *page* size, not a hard
-    /// ceiling -- the scan pages through complete owner groups until the shard
+    /// ceiling. The scan pages through complete owner groups until the shard
     /// is exhausted (see `scan_reference_events`). Raising it trades memory for
     /// fewer round trips.
     #[must_use]
@@ -1469,9 +1465,9 @@ mod probes {
     use crate::testing::WorkflowReplayer;
     use crate::types::{ExecutionId, ExternalTarget, ShardId};
 
-    /// One row of a bounded probe: a sample identifier plus the exact total
-    /// (computed by a window function *before* `LIMIT`, so the count is never
-    /// truncated even when only `probe_limit` identifiers are returned).
+    /// One row of a bounded probe: a sample identifier plus the exact total.
+    /// A window function computes the total *before* `LIMIT`. So the count is
+    /// never truncated, even when only `probe_limit` identifiers are returned.
     #[derive(diesel::QueryableByName)]
     struct ProbeRow {
         #[diesel(sql_type = Text)]
@@ -1530,24 +1526,18 @@ mod probes {
         new_exec_id: Option<String>,
     }
 
-    /// Wrap a caller-supplied selection predicate in a bounded, counted probe.
-    ///
-    /// The inner query is *only ever* one of the engine's own read-only
-    /// selection predicates (or a hand-written `SELECT` in this module); it is
-    /// never caller input, so the string interpolation carries no injection
-    /// surface.
     /// The session-reclaim candidate set the scanner will *act* on.
     ///
     /// `sessions::broken_session_candidates_query()` is only the broad SQL
-    /// scan; `sessions::resolve_broken_reason` then applies one Rust-side
-    /// suppression the SQL cannot express — a session whose ONLY qualifying
+    /// scan. `sessions::resolve_broken_reason` then applies one Rust-side
+    /// suppression the SQL cannot express. A session whose ONLY qualifying
     /// reason is an elapsed lease, but which still has a `RUNNING` member
-    /// task, is deliberately NOT broken (the lease is refreshed on member
-    /// completion, so a long-running member is independent proof of progress).
+    /// task, is deliberately NOT broken. Member completion refreshes the lease,
+    /// so a long-running member is independent proof of progress.
     ///
     /// Reusing the scan alone would over-report. Mirror the suppression here
-    /// so the report matches what the fleet actually reclaims; the host and
-    /// owning-workflow reasons take priority in the scanner and so are
+    /// so the report matches what the fleet actually reclaims. The host and
+    /// owning-workflow reasons take priority in the scanner, so they are
     /// deliberately NOT suppressed.
     fn session_candidates_matching_the_scanner() -> String {
         format!(
@@ -1567,6 +1557,12 @@ mod probes {
         )
     }
 
+    /// Wrap a caller-supplied selection predicate in a bounded, counted probe.
+    ///
+    /// The inner query is *only ever* one of the engine's own read-only
+    /// selection predicates, or a hand-written `SELECT` in this module. It is
+    /// never caller input, so the string interpolation carries no injection
+    /// surface.
     fn bounded(inner: &str, ident_expr: &str, limit: i64) -> String {
         format!(
             "SELECT {ident_expr} AS ident, COUNT(*) OVER () AS total \
@@ -1576,9 +1572,9 @@ mod probes {
 
     /// Establish a connection and pin the whole session **read only**.
     ///
-    /// Postgres then rejects any write with SQLSTATE 25006, so AC4's
-    /// "never mutates" is enforced mechanically by the server rather than by
-    /// code review of every probe.
+    /// Postgres then rejects any write with SQLSTATE 25006. So the server
+    /// enforces AC4's "never mutates" mechanically, not by code review of every
+    /// probe.
     ///
     /// [`crate::pg_tls`] picks the transport from the `sslmode`, so a
     /// managed Postgres that refuses plaintext is reachable.
@@ -1644,8 +1640,8 @@ mod probes {
         ExternalTarget,
         /// The caller recorded a *successful* external terminal, so the target
         /// shard must show the corresponding durable effect. A target restored
-        /// to a point before the effect landed is a silent lost-effect break,
-        /// which is exactly what the caller's own history says cannot happen.
+        /// to a point before the effect landed is a silent lost-effect break.
+        /// The caller's own history says exactly that cannot happen.
         ExternalEffectDelivered(ExternalEffect),
     }
 
@@ -1655,12 +1651,11 @@ mod probes {
         /// The named signal must be queued or already recorded on the target.
         ///
         /// `idempotency_key` is the ONLY per-delivery identity the engine
-        /// persists on the target side (issue #521): `SignalReceived` carries
-        /// just name + payload, and `harvest_signals.idempotency_key` is set
-        /// only when the caller supplied one. With a key the check is exact;
-        /// without one it can only ask whether *any* signal of that name
-        /// survives, which is why an unkeyed hit is reported as
-        /// `ExternalEffectUnverifiable` rather than clean.
+        /// persists on the target side (issue #521). `SignalReceived` carries
+        /// just name and payload. `harvest_signals.idempotency_key` is set only
+        /// when the caller supplied one. With a key the check is exact. Without
+        /// one it can only ask whether *any* signal of that name survives. So
+        /// an unkeyed hit is reported as `ExternalEffectUnverifiable`, not clean.
         Signal {
             name: String,
             idempotency_key: Option<String>,
@@ -1673,11 +1668,11 @@ mod probes {
 
     /// Whether the target shard still shows a recorded-as-delivered effect.
     ///
-    /// Tri-state rather than a bool: for an UNKEYED signal the engine persists
-    /// no per-delivery identity, so "a signal of this name is present" is not
+    /// Tri-state rather than a bool. For an UNKEYED signal the engine persists
+    /// no per-delivery identity. So "a signal of this name is present" is not
     /// proof that *this* delivery survived. Collapsing that to `true` reopens
-    /// the false-clean the whole class exists to prevent; collapsing it to
-    /// `false` would report a false rollback on every repeated channel name.
+    /// the false-clean the whole class exists to prevent. Collapsing it to
+    /// `false` reports a false rollback on every repeated channel name.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum EffectVerdict {
         /// The effect is durably present on the target's shard.
@@ -1723,29 +1718,29 @@ mod probes {
 
         let mut findings = Vec::new();
         let mut soft_errors: Vec<String> = Vec::new();
-        // A non-positive limit would emit `LIMIT 0`: every probe returns no
-        // sample rows, every condition reads as absent, and the run exits 0
+        // A non-positive limit would emit `LIMIT 0`. Every probe then returns
+        // no sample rows, every condition reads as absent, and the run exits 0
         // having looked at nothing. Floor it at 1 so a mis-set knob degrades
         // to "one sample per finding", never to a fabricated all-clear.
         // (Exact counts come from `COUNT(*) OVER ()`, so they are unaffected.)
         let limit = options.probe_limit.max(1);
         // Clamp to the same bound the poison-pill reclaimer applies at its own
-        // entry point before binding. Without this an out-of-range
-        // `--worker-stale-secs` would have the report evaluate a threshold that
-        // scanner would never actually use, so the report would disagree with
-        // what the running fleet reclaims. (`sessions::enforce_broken_sessions`
-        // binds unclamped; we clamp both uniformly, which only diverges for
-        // absurd inputs -- above a year, or negative -- and diverges toward a
-        // value Postgres interval arithmetic can actually represent.)
+        // entry point before binding. Else an out-of-range
+        // `--worker-stale-secs` makes the report evaluate a threshold that
+        // scanner never uses. The report then disagrees with what the running
+        // fleet reclaims. `sessions::enforce_broken_sessions` binds unclamped.
+        // This code clamps both uniformly. That diverges only for absurd
+        // inputs (above a year, or negative). It diverges toward a value that
+        // Postgres interval arithmetic can represent.
         let stale = options
             .worker_stale_secs
             .clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
 
         // ── Reclaimable: what the existing scanners will heal ───────────────
         //
-        // Each of these reuses the engine's own selection predicate verbatim,
-        // so a change to the scanner's definition of "timed out" can never
-        // drift from what this drill reports.
+        // Each of these reuses the engine's own selection predicate verbatim.
+        // So the scanner's definition of "timed out" never drifts from what
+        // this drill reports.
         let reclaimable: Vec<(FindingClass, String, Option<i64>)> = vec![
             (
                 FindingClass::DeadWorkerRunningTask,
@@ -1774,14 +1769,14 @@ mod probes {
             (
                 FindingClass::WorkflowDeadlineExpired,
                 // The one predicate reused here that the engine does NOT
-                // execute: `workflow_execution_timeout_query` renders `NOW()`
-                // illustratively and the real scanner
+                // execute. `workflow_execution_timeout_query` renders `NOW()`
+                // illustratively. The real scanner
                 // (`enforce_workflow_execution_timeouts`) uses the equivalent
                 // Diesel DSL with a Rust-captured `now`. The two are
-                // semantically identical and `timeout.rs` pins the const's
-                // shape, but a DSL-only change would not break this reuse --
-                // so unlike every sibling probe, this one is faithful by
-                // review rather than by construction.
+                // semantically identical, and `timeout.rs` pins the const's
+                // shape. But a DSL-only change does not break this reuse. So
+                // unlike every sibling probe, this one is faithful by review,
+                // not by construction.
                 bounded(
                     crate::timeout::workflow_execution_timeout_query(),
                     "sub.id::text",
@@ -1857,25 +1852,26 @@ mod probes {
         )];
         // Issue #958: on the opt-in PARTITIONED layout an orphan event row is
         // the designed steady state, not a torn restore. That layout drops the
-        // `harvest_events` foreign key — its `ON DELETE CASCADE` is the delete
-        // storm the partitioning exists to remove — so collecting an execution
-        // deliberately leaves its events behind for the partition sweeper to
-        // reclaim at whole-partition granularity.
+        // `harvest_events` foreign key. Its `ON DELETE CASCADE` is the delete
+        // storm the partitioning exists to remove. So collecting an execution
+        // deliberately leaves its events behind. The partition sweeper reclaims
+        // them at whole-partition granularity.
         //
-        // Running the probe there would report EVERY healthy partitioned shard
-        // as `Incoherent` ("a broken invariant; do not start workers", exit 1)
-        // — permanently, and including the cross-region failover runbook's
+        // Running the probe there reports EVERY healthy partitioned shard as
+        // `Incoherent` ("a broken invariant; do not start workers", exit 1).
+        // That is permanent and includes the cross-region failover runbook's
         // pre-flight. The invariant is real and worth checking; it just is not
         // an invariant of that layout.
+        //
         // A FAILED probe is not "unpartitioned". `detect_layout` errors when the
-        // catalog cannot be read or when `harvest_event_cohort` is missing or
-        // has an unexpected body — and a partitioned shard whose cohort
-        // function is damaged is precisely the kind of thing a restore drill
-        // should surface. Defaulting to `false` there would run the
-        // dangling-event invariant against a partitioned shard, report its
-        // designed orphans as `Incoherent` ("do not start workers", exit 1),
-        // block the restore, and discard the real catalog error that explains
-        // why. Record it as a soft error and skip the layout-dependent probe.
+        // catalog cannot be read, or when `harvest_event_cohort` is missing or
+        // has an unexpected body. A restore drill must surface a partitioned
+        // shard whose cohort function is damaged. Defaulting to `false` there
+        // runs the dangling-event invariant against a partitioned shard. It
+        // reports the designed orphans as `Incoherent` ("do not start workers",
+        // exit 1) and blocks the restore. It also discards the real catalog
+        // error that explains why. So record a soft error and skip the
+        // layout-dependent probe.
         let layout = match crate::partition::detect_layout(&mut conn).await {
             Ok(layout) => Some(layout),
             Err(e) => {
@@ -1932,11 +1928,12 @@ mod probes {
         }
 
         // ── Non-terminal population + newest event timestamp ────────────────
-        // Both reads feed operator-visible report fields, and a swallowed
-        // error here is the worst possible failure mode: a count that reads
-        // `0` looks like a drained fleet, and a `None` timestamp silently
-        // disables the cross-shard skew check. Record the error instead so
-        // the shard is Undetermined rather than falsely clean.
+        //
+        // Both reads feed operator-visible report fields. A swallowed error
+        // here is the worst possible failure mode. A count that reads `0` looks
+        // like a drained fleet. A `None` timestamp silently disables the
+        // cross-shard skew check. So record the error, and the shard is
+        // Undetermined rather than falsely clean.
         let non_terminal: Option<i64> = match diesel::sql_query(
             "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
              WHERE state IN ('RUNNING', 'PAUSED', 'SUSPENDED')",
@@ -2093,44 +2090,6 @@ mod probes {
     /// [`MAX_REFERENCE_SCAN_PAGES`]. A runaway guard, not a tuning knob.
     const MAX_TRIGGER_FIRE_SCAN_PAGES: usize = 1_000;
 
-    /// Scan this shard for completion-trigger fires it recorded as delivered
-    /// (issue #1401).
-    ///
-    /// `outcome IS NULL` alone is NOT proof of delivery. It is set the
-    /// moment the trigger fires, in the same transaction that inserts the
-    /// cross-shard outbox row. This is before any relay attempt. A fire
-    /// still waiting on the outbox scanner, or parked behind a
-    /// `QuotaExceeded` backoff, has `outcome IS NULL` too. Adjudicating it
-    /// as delivered would report an ordinary backlog as a lost relay.
-    ///
-    /// The actual "confirmed delivered" signal is `outcome IS NULL` AND no
-    /// `harvest_completion_trigger_outbox` row remains for this
-    /// `(source_exec_id, trigger_id)`. `relay_gate_checked_start` deletes
-    /// that row only after the target-shard start committed, or an
-    /// any-state existence check found the target already there. A
-    /// same-shard fire never had an outbox row at all -- it is filtered out
-    /// later by [`super::route_trigger_fires`], not here. A row with a
-    /// RESOLVED outcome (`condition_unmet`/`admission_blocked`) started
-    /// nothing on any shard, so it is excluded outright.
-    ///
-    /// **Residual gap for fires rejected before this fix shipped** (Codex
-    /// follow-up). `enforce_completion_triggers_outbox_with_codecs` now sets
-    /// `outcome = 'payload_too_large'` in the same transaction as the
-    /// outbox delete. A fire it permanently rejects is excluded above like
-    /// any other RESOLVED outcome. A fire an OLDER build rejected the same
-    /// way has `outcome IS NULL` and no outbox row instead, since that
-    /// write did not exist yet. This is the identical shape this scan
-    /// reads as a candidate for adjudication. Nothing durable records
-    /// which case applies. So this scan cannot tell a pre-fix rejection
-    /// from a genuinely lost relay after the fact. This is the same
-    /// category of unfixable-after-the-fact gap as the pre-migration
-    /// `target_shard`/`target_workflow_name` reconstruction documented on
-    /// [`route_trigger_fires`]. It is scoped to fires rejected before this
-    /// deploy, not to fires written before the migration.
-    ///
-    /// Each row stands alone. Unlike the event scan, no group spans more
-    /// than one row, so plain keyset pagination on the primary key
-    /// `(source_exec_id, trigger_id)` cannot split anything.
     /// One page of [`scan_completion_trigger_fires`], keyset-paginated on
     /// the fires table's own primary key `(source_exec_id, trigger_id)`.
     async fn fetch_trigger_fire_page(
@@ -2173,6 +2132,44 @@ mod probes {
         .map_err(|e| format!("completion-trigger fire scan failed: {e}"))
     }
 
+    /// Scan this shard for completion-trigger fires it recorded as delivered
+    /// (issue #1401).
+    ///
+    /// `outcome IS NULL` alone is NOT proof of delivery. It is set the
+    /// moment the trigger fires, in the same transaction that inserts the
+    /// cross-shard outbox row. This is before any relay attempt. A fire
+    /// still waiting on the outbox scanner, or parked behind a
+    /// `QuotaExceeded` backoff, has `outcome IS NULL` too. Adjudicating it
+    /// as delivered would report an ordinary backlog as a lost relay.
+    ///
+    /// The actual "confirmed delivered" signal is `outcome IS NULL` AND no
+    /// `harvest_completion_trigger_outbox` row remains for this
+    /// `(source_exec_id, trigger_id)`. `relay_gate_checked_start` deletes
+    /// that row only after the target-shard start committed, or an
+    /// any-state existence check found the target already there. A
+    /// same-shard fire never had an outbox row at all -- it is filtered out
+    /// later by [`super::route_trigger_fires`], not here. A row with a
+    /// RESOLVED outcome (`condition_unmet`/`admission_blocked`) started
+    /// nothing on any shard, so it is excluded outright.
+    ///
+    /// **Residual gap for fires rejected before this fix shipped** (issue
+    /// #1401). `enforce_completion_triggers_outbox_with_codecs` now sets
+    /// `outcome = 'payload_too_large'` in the same transaction as the
+    /// outbox delete. A fire it permanently rejects is excluded above like
+    /// any other RESOLVED outcome. A fire an OLDER build rejected the same
+    /// way has `outcome IS NULL` and no outbox row instead, since that
+    /// write did not exist yet. This is the identical shape this scan
+    /// reads as a candidate for adjudication. Nothing durable records
+    /// which case applies. So this scan cannot tell a pre-fix rejection
+    /// from a genuinely lost relay after the fact. This is the same
+    /// category of unfixable-after-the-fact gap as the pre-migration
+    /// `target_shard`/`target_workflow_name` reconstruction documented on
+    /// [`route_trigger_fires`]. It is scoped to fires rejected before this
+    /// deploy, not to fires written before the migration.
+    ///
+    /// Each row stands alone. Unlike the event scan, no group spans more
+    /// than one row, so plain keyset pagination on the primary key
+    /// `(source_exec_id, trigger_id)` cannot split anything.
     async fn scan_completion_trigger_fires(
         conn: &mut AsyncPgConnection,
         limit: i64,
@@ -2193,21 +2190,21 @@ mod probes {
             }
         }
 
-        // The budget ran out with the last page full (issue #1401, Codex
-        // follow-up x6). A qualifying-row count that is an exact multiple
+        // The budget ran out with the last page full (issue #1401). A
+        // qualifying-row count that is an exact multiple
         // of `page` looks the same as genuine truncation. `len < page`
         // never fires when every page, including the true last one, comes
         // back full.
         //
         // A same-sized confirming PAGE just moves that boundary one page
-        // later (issue #1401, Codex follow-up x12). Any fixed-size fetch
+        // later (issue #1401). Any fixed-size fetch
         // has a count where a full result is genuinely the end. An
         // EXISTENCE probe does not: fetch at most one row past the cursor.
         // Empty proves nothing remains, for any qualifying-row count. One
         // row proves the opposite, just as certainly.
         //
         // That one confirmation row is deliberately NOT added to `rows`
-        // (Codex follow-up x21). Appending it, then unconditionally
+        // (issue #1401). Appending it, then unconditionally
         // reporting truncation, made the truncation message lie exactly
         // when the qualifying count was one row over budget. That row was
         // in fact adjudicated, yet "the remainder was NOT adjudicated"
@@ -2294,9 +2291,10 @@ mod probes {
         })
     }
 
-    /// What one shard's reference scan produced: the cross-shard references to
-    /// adjudicate, an optional truncation note, and an optional advisory for
-    /// business-key-addressed requests that carry no execution id.
+    /// What one shard's reference scan produced. It holds the cross-shard
+    /// references to adjudicate and an optional truncation note. It also holds
+    /// an optional advisory for business-key-addressed requests with no
+    /// execution id.
     struct CollectedRefs {
         refs: Vec<PendingRef>,
         truncation: Option<String>,
@@ -2351,46 +2349,46 @@ mod probes {
         // classes answer different questions.
         //
         // CHILD events: only a NON-TERMINAL owner matters. A terminal parent's
-        // recorded child terminal is history, not a live dependency, and
-        // retention may legitimately have collected the child -- scanning
-        // those would report `child_execution_missing` (Incoherent, exit 1)
-        // on a healthy restore.
+        // recorded child terminal is history, not a live dependency. Retention
+        // may legitimately have collected the child. Scanning those reports
+        // `child_execution_missing` (Incoherent, exit 1) on a healthy restore.
         //
         // EXTERNAL events: EVERY owner matters, terminal included. A caller
         // that recorded `ExternalSignalDelivered` asserted durable state on the
         // TARGET shard, and that assertion does not expire when the caller
-        // completes. If anything a terminal caller is worse: there is no live
-        // caller left to re-drive the delivery, so a target restored to before
-        // it waits forever. Filtering them out made that a silent exit 0.
+        // completes. If anything a terminal caller is worse. No live caller is
+        // left to re-drive the delivery, so a target restored to before it
+        // waits forever. Filtering them out made that a silent exit 0.
         //
         // Terminal owners' *unresolved* requests are dropped in `build_refs`
         // (see `terminal_owners`) -- only DELIVERED effects are adjudicated
         // from them.
+        //
         // The scan PAGES through complete owner groups rather than taking a
-        // single `LIMIT probe_limit` slice. A hard limit made any fleet with
-        // more reference events than the probe limit report `ProbeFailed` ->
-        // `Undetermined` -> exit 2: a false "cannot verify" on a healthy
-        // restore, with no operator override.
+        // single `LIMIT probe_limit` slice. With a hard limit, any fleet with
+        // more reference events than the probe limit reported `ProbeFailed`
+        // -> `Undetermined` -> exit 2. That is a false "cannot verify" on a
+        // healthy restore, with no operator override.
         //
         // Two invariants hold every page:
         //
         // (1) The cut lands on an execution BOUNDARY. The scan is ordered
-        //     `(workflow_exec_id, event_id)`, so a raw `LIMIT` slices through
-        //     the middle of the last execution -- keeping its
-        //     `ChildWorkflowStarted` but dropping the matching
-        //     `ChildWorkflowCompleted`. `build_refs` would then classify that
-        //     child as still-awaited rather than terminal-recorded, and
-        //     `resolve_refs` would report `ChildExecutionMissing` --
-        //     Incoherent, exit 1, "do not start workers" -- on a healthy
-        //     restore whose child had simply been collected by retention.
+        //     `(workflow_exec_id, event_id)`. So a raw `LIMIT` slices through
+        //     the middle of the last execution. It keeps its
+        //     `ChildWorkflowStarted` but drops the matching
+        //     `ChildWorkflowCompleted`. `build_refs` then classifies that
+        //     child as still-awaited rather than terminal-recorded.
+        //     `resolve_refs` then reports `ChildExecutionMissing` (Incoherent,
+        //     exit 1, "do not start workers"). Yet the restore is healthy:
+        //     retention had simply collected the child.
         //     Dropping the partial tail and RE-FETCHING that owner from the
         //     start of the next page makes that false positive impossible
         //     without losing the group.
         //
-        // (2) Anything genuinely NOT reached is still Undetermined. Reporting a
-        //     clean verdict over an arbitrary prefix of a real fleet is exactly
-        //     the false-clean this module exists to refuse, so both bounded
-        //     exits below raise a truncation note.
+        // (2) Anything genuinely NOT reached is still Undetermined. A clean
+        //     verdict over an arbitrary prefix of a real fleet is exactly the
+        //     false-clean this module exists to refuse. So both bounded exits
+        //     below raise a truncation note.
         let page = limit.max(1);
         let mut rows: Vec<EventRow> = Vec::new();
         let mut cursor: Option<Uuid> = None;
@@ -2456,8 +2454,8 @@ mod probes {
                 // could be taken and the cursor cannot advance. That does not
                 // yet prove the group is oversized: a group whose size is
                 // exactly `page` fills the page while still being whole.
-                // Re-read it alone with one extra row to tell the two apart --
-                // otherwise every such group would raise a false stall
+                // Re-read it alone with one extra row to tell the two apart.
+                // Else every such group raises a false stall
                 // (`probe_failed` -> Undetermined) on a healthy shard.
                 let Some(owner) = boundary else { break };
                 let Some(group) = read_owner_group(conn, owner, page).await? else {
@@ -2500,11 +2498,11 @@ mod probes {
 
     /// Read ONE owner's reference events whole, or report that it does not fit.
     ///
-    /// Used only when a page was filled entirely by a single owner: reading
-    /// `page + 1` rows distinguishes a group of exactly `page` events (whole --
-    /// returned) from a genuinely oversized one (`None`, which the caller turns
-    /// into a truncation note). Without it, a group whose size happens to equal
-    /// the page would raise a false stall on a healthy shard.
+    /// Used only when a single owner filled a whole page. Reading `page + 1`
+    /// rows tells a group of exactly `page` events (whole, so returned) from a
+    /// genuinely oversized one. The oversized case returns `None`, which the
+    /// caller turns into a truncation note. Without it, a group whose size
+    /// equals the page raises a false stall on a healthy shard.
     async fn read_owner_group(
         conn: &mut AsyncPgConnection,
         owner: Uuid,
@@ -2577,9 +2575,9 @@ mod probes {
     /// Fold a `*Requested` event -- the record of an effect this shard's caller
     /// asked for against a target that may live on another shard.
     ///
-    /// A `WorkflowId`-addressed target (issue #751) is resolved at delivery time
-    /// against whichever run is current, so it is not adjudicable from a
-    /// restored snapshot: it is collected for an advisory note instead.
+    /// A `WorkflowId`-addressed target (issue #751) resolves at delivery time
+    /// against whichever run is current. So a restored snapshot cannot
+    /// adjudicate it. It is collected for an advisory note instead.
     fn fold_reference_request(
         scan: &mut RefScan,
         owner: Uuid,
@@ -2681,7 +2679,7 @@ mod probes {
             // is RESOLVED (`execution.rs::read_external_await_outcome` ->
             // `ExternalAwaitOutcome::Terminal` -> `worker.rs`/`timeout.rs`). Those
             // reason codes assert that the target reached a chain-head terminal,
-            // exactly like `ExternalAwaitResolved`, so a target restored to
+            // exactly like `ExternalAwaitResolved`. So a target restored to
             // before that terminal is a genuine rollback. Only the TRANSPORT
             // codes assert nothing about the target's state.
             WorkflowEvent::ExternalAwaitFailed {
@@ -2704,17 +2702,20 @@ mod probes {
     /// never observed a target terminal), rather than a resolved non-`COMPLETED`
     /// terminal outcome?
     ///
-    /// The engine emits exactly two transport codes: `target_unknown` (the grace
-    /// window elapsed with no target row -- `timeout.rs`) and `self_await`
-    /// (rejected inline, and never persisted, but matched here so a future
-    /// persisted form cannot be mis-adjudicated). Everything else --
-    /// `target_failed` / `target_cancelled` / `target_timed_out` /
-    /// `target_terminated` -- carries an assertion about the target shard.
+    /// The engine emits exactly two transport codes:
     ///
-    /// The match is deliberately an ALLOWLIST of transport codes rather than of
-    /// outcome codes: an unrecognised future reason code then falls into the
-    /// adjudicated bucket, where the worst case is a reported finding an
-    /// operator can dismiss -- never a silently skipped check.
+    /// - `target_unknown`: the grace window elapsed with no target row
+    ///   (`timeout.rs`).
+    /// - `self_await`: rejected inline and never persisted. It is matched here
+    ///   so a future persisted form cannot be mis-adjudicated.
+    ///
+    /// Everything else (`target_failed` / `target_cancelled` /
+    /// `target_timed_out` / `target_terminated`) asserts the target shard state.
+    ///
+    /// The match is deliberately an ALLOWLIST of transport codes, not of
+    /// outcome codes. An unrecognised future reason code then falls into the
+    /// adjudicated bucket. There the worst case is a reported finding an
+    /// operator can dismiss, never a silently skipped check.
     pub(super) fn is_await_transport_failure(reason_code: &str) -> bool {
         matches!(reason_code, "target_unknown" | "self_await")
     }
@@ -2726,8 +2727,8 @@ mod probes {
     fn fold_reference_events(rows: Vec<EventRow>) -> RefScan {
         let mut scan = RefScan::default();
         // `ExternalTarget::WorkflowId` requests resolve by business key at
-        // delivery time, not by a fixed execution id, so there is no row this
-        // check could look up -- they are deliberately not tracked here.
+        // delivery time, not by a fixed execution id. This check has no row to
+        // look up, so they are deliberately not tracked here.
         let mut workflow_id_targets: Vec<String> = Vec::new();
 
         for row in rows {
@@ -2736,11 +2737,11 @@ mod probes {
                 Err(e) => {
                     // FAIL CLOSED. A malformed, legacy or newer-version payload
                     // on a child/external row may be the very reference that
-                    // would have exposed a missing target, so dropping it can
-                    // turn an incoherent restore into a resumable verdict. The
-                    // replay sample is not a backstop here: the shipped CLI
-                    // links no handlers (so it replays nothing) and an embedded
-                    // replayer samples only a bounded subset.
+                    // exposes a missing target. Dropping it can turn an
+                    // incoherent restore into a resumable verdict. The replay
+                    // sample is not a backstop here. The shipped CLI links no
+                    // handlers, so it replays nothing. An embedded replayer
+                    // samples only a bounded subset.
                     if scan.undecodable_samples.len() < MAX_FINDING_SAMPLES {
                         scan.undecodable_samples
                             .push(format!("{}: {e}", row.workflow_exec_id));
@@ -2755,11 +2756,11 @@ mod probes {
             }
             fold_reference_event(&mut scan, owner, event, &mut workflow_id_targets);
         }
-        // A business-key-addressed request (#751) resolves at delivery time, so
-        // there is no fixed execution id to look up and we cannot adjudicate it.
+        // A business-key-addressed request (#751) resolves at delivery time. It
+        // has no fixed execution id to look up, so it cannot be adjudicated.
         // Every other unadjudicable case in this module gets an advisory
-        // (`UninspectedShardReference`, `ReplaySkippedNoHandler`); silently
-        // discarding these would be the one blind spot with no signal at all.
+        // (`UninspectedShardReference`, `ReplaySkippedNoHandler`). Silently
+        // discarding these makes the one blind spot with no signal at all.
         if !workflow_id_targets.is_empty() {
             let n = workflow_id_targets.len() as u64;
             scan.workflow_id_targets = Some(Finding::new(
@@ -2773,8 +2774,8 @@ mod probes {
     }
 
     /// Turn a shard-local [`RefScan`] into the cross-shard references that still
-    /// need adjudication (a started child with no recorded terminal, a recorded
-    /// child terminal, or an unresolved external request).
+    /// need adjudication. Each is a started child with no recorded terminal, a
+    /// recorded child terminal, or an unresolved external request.
     fn build_refs(scan: RefScan, shard_id: i32, default_shard: i32) -> Vec<PendingRef> {
         let RefScan {
             awaited,
@@ -2815,19 +2816,19 @@ mod probes {
                 if bad.contains(corr) {
                     continue;
                 }
-                // A *delivered* terminal is not "done with" -- it is an
-                // assertion about the target shard's durable state, and a
-                // target restored to an earlier point can silently contradict
-                // it. Adjudicate it rather than dropping it.
+                // A *delivered* terminal is not "done with". It asserts the
+                // target shard's durable state. A target restored to an earlier
+                // point can silently contradict it. Adjudicate it rather than
+                // dropping it.
                 let kind = if ok.contains(corr) {
                     RefKind::ExternalEffectDelivered(effect.clone())
                 } else if terminal_owners.contains(owner) {
                     // The owner is already terminal, so an UNRESOLVED request
-                    // is not a live dependency -- nothing is still waiting on
-                    // it, and the target may since have been collected by
-                    // retention. Reporting it as `external_target_missing`
-                    // would be a false Incoherent on a healthy restore. Its
-                    // DELIVERED siblings above are still adjudicated.
+                    // is not a live dependency. Nothing still waits on it, and
+                    // retention may since have collected the target. Reporting
+                    // it as `external_target_missing` is a false Incoherent on
+                    // a healthy restore. Its DELIVERED siblings above are still
+                    // adjudicated.
                     continue;
                 } else {
                     RefKind::ExternalTarget
@@ -2975,12 +2976,12 @@ mod probes {
             // suspends before consuming its whole recorded history, which strict
             // mode would report as a false `EarlyCompletion` divergence.
             //
-            // The FULL status is preserved. Collapsing it to a divergent/clean
-            // bool would count `WorkflowFailed` as clean, but these samples are
-            // *non-terminal* runs: their recorded history contains no terminal
-            // failure, so a replay failure means the deployed handler now errors
-            // where the live run had not. The engine's own replay canary
-            // (`run_canary`) counts that as `replay_failed`; so do we.
+            // The FULL status is preserved. A divergent/clean bool counts
+            // `WorkflowFailed` as clean. But these samples are *non-terminal*
+            // runs, and their recorded history contains no terminal failure. So
+            // a replay failure means the deployed handler now errors where the
+            // live run did not. The engine's own replay canary (`run_canary`)
+            // counts that as `replay_failed`, and so does this check.
             match replayer.replay_canary_from_db(conn, exec_id).await {
                 Ok(report) => match report.status {
                     crate::testing::ReplayStatus::ReplaySucceeded => summary.clean += 1,
@@ -3000,8 +3001,8 @@ mod probes {
                 Err(e) => {
                     summary.unreadable += 1;
                     if unreadable_samples.len() < MAX_FINDING_SAMPLES {
-                        // Carry the reason: "unreadable" alone leaves an
-                        // operator with nothing to act on, and the cause
+                        // Carry the reason. "unreadable" alone leaves an
+                        // operator with nothing to act on. The cause
                         // (undecodable payload vs missing row vs codec) decides
                         // whether the restore or the deployed build is at fault.
                         unreadable_samples.push(format!("{exec_id}: {e}"));
@@ -3023,11 +3024,6 @@ mod probes {
         Ok((summary, findings))
     }
 
-    /// Resolve every cross-shard reference against the shard that owns it.
-    ///
-    /// A reference pointing at a shard whose DSN was not supplied cannot be
-    /// adjudicated either way, so it is reported as an advisory rather than
-    /// silently passing.
     /// The per-reference adjudication buckets for one owning shard.
     #[derive(Default)]
     struct RefBuckets {
@@ -3102,7 +3098,7 @@ mod probes {
     }
 
     /// One `(workflow_name, workflow_id)` business key, matched against a
-    /// batch of candidates via `UNNEST` (issue #1401, Codex follow-up).
+    /// batch of candidates via `UNNEST` (issue #1401).
     #[derive(diesel::QueryableByName)]
     struct WorkflowKeyRow {
         #[diesel(sql_type = Text)]
@@ -3112,7 +3108,7 @@ mod probes {
     }
 
     /// Cap on fires [`adjudicate_trigger_fires`] adjudicates per round trip
-    /// (issue #1401, Codex follow-up x2). With summaries disabled or
+    /// (issue #1401). With summaries disabled or
     /// unbounded, `harvest_completion_trigger_fires` has no cleanup.
     /// The preceding scan admits up to
     /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
@@ -3124,8 +3120,8 @@ mod probes {
     const WORKFLOW_KEY_LOOKUP_CHUNK: usize = 1_000;
 
     /// One matched `harvest_workflow_executions` business key, along with
-    /// whether EVERY row under it is a `MIGRATED` forwarding seal (Codex
-    /// follow-up x13).
+    /// whether EVERY row under it is a `MIGRATED` forwarding seal (issue
+    /// #1401).
     #[derive(diesel::QueryableByName)]
     struct WorkflowExecutionMatchRow {
         #[diesel(sql_type = Text)]
@@ -3135,8 +3131,8 @@ mod probes {
         #[diesel(sql_type = diesel::sql_types::Bool)]
         all_migrated: bool,
         /// The seal's forwarding shard, when `all_migrated`. A completion-
-        /// trigger target's business key is a one-time id (Codex follow-up
-        /// x16). In practice at most one row exists per key. `MAX` is a
+        /// trigger target's business key is a one-time id (issue #1401). In
+        /// practice at most one row exists per key. `MAX` is a
         /// deterministic pick if that assumption is ever violated. `NULL`
         /// when `all_migrated` is false -- the caller never needs it then.
         #[diesel(sql_type = Nullable<Integer>)]
@@ -3156,7 +3152,7 @@ mod probes {
     /// runnable target survived THIS restore, since the actual row is not
     /// on this shard's snapshot at all. UNLESS the reconciler already
     /// observed the live copy reach a terminal state. That state is
-    /// `migrated_run_terminal_at IS NOT NULL` (Codex follow-up x17), and
+    /// `migrated_run_terminal_at IS NOT NULL` (issue #1401), and
     /// is durable proof of delivery in its own right. Such a row then
     /// counts as a genuine match here, not a seal still needing to be
     /// chased. `all_migrated` is true only when every matched row under a
@@ -3265,8 +3261,8 @@ mod probes {
     /// than one whole-shard batch) bounds request and result-set size the
     /// same way it does there. Each chunk's state map is adjudicated and
     /// discarded before the next chunk's lookup starts. This matches how
-    /// `adjudicate_trigger_fires` discards its own per-chunk keys (Codex
-    /// follow-up). Otherwise the chunk bound would cap round-trip size only.
+    /// `adjudicate_trigger_fires` discards its own per-chunk keys. Otherwise
+    /// the chunk bound would cap round-trip size only.
     /// It would not bound the aggregate map this function holds for the
     /// whole reference set.
     ///
@@ -3394,9 +3390,9 @@ mod probes {
     /// delivered?
     ///
     /// * `Cancel` — delivered either by cancelling the target or as a
-    ///   documented no-op against an ALREADY-terminal one (issue #492), so any
-    ///   terminal state on the restored shard is consistent with the delivery
-    ///   and a non-terminal one means it was rolled back.
+    ///   documented no-op against an ALREADY-terminal one (issue #492). So any
+    ///   terminal state on the restored shard is consistent with the delivery.
+    ///   A non-terminal one means it was rolled back.
     /// * `Await` — resolved only once the target's `CONTINUED_AS_NEW` CHAIN HEAD
     ///   is terminal, so a bare terminal check is not enough (see
     ///   [`await_verdict`]).
@@ -3427,10 +3423,10 @@ mod probes {
                 // workflow-level retry (`signal::forward_signals_to_retry_attempt`,
                 // issue #843 -- the WHOLE mailbox, re-arming `consumed`)
                 // REASSIGN `harvest_signals.workflow_exec_id` to the successor.
-                // An unconsumed signal produces no `SignalReceived` event, so
+                // An unconsumed signal produces no `SignalReceived` event. So
                 // after either transition the original target carries no row
-                // AND no event -- checking it alone would report a healthy
-                // restore as rolled back and exit 1.
+                // AND no event. Checking it alone reports a healthy restore as
+                // rolled back and exits 1.
                 //
                 // `UNION` (not `UNION ALL`) makes the recursion terminate even
                 // if a chain link were ever cyclic.
@@ -3465,12 +3461,12 @@ mod probes {
                     });
                 }
 
-                // Unkeyed: the engine persists no per-delivery identity, so the
+                // Unkeyed: the engine persists no per-delivery identity. So the
                 // most that can be asked is whether ANY signal of this name
-                // survives on the chain. Absence is still definitive (nothing
-                // of this name survived); presence is not proof that THIS
-                // delivery did -- a repeated channel name would match an older
-                // one -- so it is reported as unverifiable, never clean.
+                // survives on the chain. Absence is still definitive: nothing
+                // of this name survived. Presence is not proof that THIS
+                // delivery did, since a repeated channel name matches an older
+                // one. So it is reported as unverifiable, never clean.
                 let row: ExistsRow = diesel::sql_query(format!(
                     "{CHAIN}SELECT EXISTS ( \
                          SELECT 1 FROM harvest_signals s \
@@ -3504,9 +3500,9 @@ mod probes {
     /// asserted?
     ///
     /// `read_external_await_outcome` FOLLOWS a `CONTINUED_AS_NEW` target through
-    /// its successor chain and resolves only once the chain HEAD is terminal, so
-    /// the ORIGINAL row reading `CONTINUED_AS_NEW` is not by itself proof the
-    /// await resolved -- the successor may be back to `RUNNING`. Because
+    /// its successor chain. It resolves only once the chain HEAD is terminal.
+    /// So the ORIGINAL row reading `CONTINUED_AS_NEW` is not by itself proof
+    /// the await resolved: the successor may be back to `RUNNING`. Because
     /// `is_terminal_state("CONTINUED_AS_NEW")` is true, a bare terminal check
     /// reads exactly that rollback as coherent.
     async fn await_verdict(
@@ -3529,8 +3525,8 @@ mod probes {
             // Follow the link the engine reader itself follows: the
             // predecessor's own `WorkflowContinuedAsNew` event. The successor's
             // `continued_from_exec_id` back-link is the newer (issue #701)
-            // encoding of the same edge and is absent on pre-#701 rows, so the
-            // event is the safer source.
+            // encoding of the same edge. Pre-#701 rows lack it, so the event is
+            // the safer source.
             let successor: Option<SuccessorRow> = diesel::sql_query(
                 "SELECT e.event_data->'data'->>'new_exec_id' AS new_exec_id \
                  FROM harvest_events e \
@@ -3547,9 +3543,9 @@ mod probes {
                 .and_then(|row| row.new_exec_id)
                 .and_then(|raw| Uuid::parse_str(&raw).ok())
             else {
-                // A `CONTINUED_AS_NEW` row naming no readable successor is what
-                // the engine reader reports as still-in-flight, so the caller
-                // could not have resolved against this shard's current state.
+                // The engine reader reports a `CONTINUED_AS_NEW` row with no
+                // readable successor as still in flight. So the caller could
+                // not have resolved against this shard's current state.
                 return Ok(EffectVerdict::Lost);
             };
 
@@ -3562,10 +3558,10 @@ mod probes {
 
             let Some(row) = row else {
                 // The successor row is gone. The predecessor's seal and the
-                // successor's insert are one transaction, so an absent successor
-                // is retention collecting a TERMINAL run -- not a restore point
-                // that predates it. Treated as ordinary retention, exactly like
-                // an absent target row upstream.
+                // successor's insert are one transaction. So an absent
+                // successor is retention collecting a TERMINAL run, not a
+                // restore point that predates it. Treated as ordinary
+                // retention, exactly like an absent target row upstream.
                 return Ok(EffectVerdict::Survived);
             };
 
@@ -3573,12 +3569,17 @@ mod probes {
             current_state = row.state;
         }
 
-        // A chain longer than the engine's own reader follows. Neither verdict
-        // is supportable from what we can see, so prefer the one that cannot
-        // fail a healthy restore.
+        // A chain longer than the engine's own reader follows. The visible
+        // data supports neither verdict, so prefer the one that cannot fail a
+        // healthy restore.
         Ok(EffectVerdict::Survived)
     }
 
+    /// Resolve every cross-shard reference against the shard that owns it.
+    ///
+    /// A reference to a shard whose DSN was not supplied cannot be adjudicated
+    /// either way. So it is reported as an advisory rather than silently
+    /// passing.
     pub(super) async fn resolve_refs(refs: &[PendingRef], targets: &[ShardTarget]) -> Vec<Finding> {
         use std::collections::BTreeSet;
 
@@ -3608,11 +3609,11 @@ mod probes {
                 continue;
             }
             // This is a SECOND, independent connection: `verify_shard` opened
-            // and dropped its own long before we got here. So a failure now is
-            // NOT "already reported by verify_shard" -- that shard is recorded
-            // `reachable: true` and carries no unreachable finding, meaning a
-            // silent `continue` here would drop every cross-shard check for it
-            // and still report exit 0. That is precisely the false-clean the
+            // and dropped its own long before this point. So a failure now is
+            // NOT "already reported by verify_shard". That shard is recorded
+            // `reachable: true` and carries no unreachable finding. A silent
+            // `continue` here drops every cross-shard check for it and still
+            // reports exit 0. That is precisely the false-clean the
             // Undetermined tier exists to prevent.
             let mut conn = match connect_read_only(&target.dsn).await {
                 Ok(conn) => conn,
@@ -3654,9 +3655,9 @@ mod probes {
                     unverifiable_effect,
                 ),
                 (FindingClass::RetentionUnproven, retention_unproven),
-                // A reference we could not adjudicate is Undetermined, never a
-                // pass: the row may be missing, or the query may simply have
-                // failed, and we must not guess which.
+                // An unadjudicated reference is Undetermined, never a pass. The
+                // row may be missing, or the query may simply have failed. This
+                // check must not guess which.
                 (FindingClass::ProbeFailed, lookup_errors),
             ] {
                 if !samples.is_empty() {
@@ -3675,9 +3676,9 @@ mod probes {
     /// Verdict buckets for one target shard's pending completion-trigger fires.
     ///
     /// Each sample list is bounded at [`MAX_FINDING_SAMPLES`] as it
-    /// accumulates; the paired count stays exact regardless (issue #1401,
-    /// Codex follow-up), mirroring `fold_reference_events`'s
-    /// `undecodable_samples`/`undecodable_count` split.
+    /// accumulates; the paired count stays exact regardless (issue #1401).
+    /// This mirrors the `undecodable_samples`/`undecodable_count` split of
+    /// `fold_reference_events`.
     #[derive(Default)]
     struct TriggerFireBuckets {
         lost: Vec<String>,
@@ -3717,8 +3718,8 @@ mod probes {
     /// mirroring `adjudicate_refs`.
     ///
     /// Chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] fires per round trip, not
-    /// per-fire and not as one whole-shard batch (issue #1401, Codex
-    /// follow-up x2). With summaries disabled or unbounded,
+    /// per-fire and not as one whole-shard batch (issue #1401). With
+    /// summaries disabled or unbounded,
     /// `harvest_completion_trigger_fires` has no cleanup.
     /// A busy fleet's confirmed-delivered fire count can reach
     /// into the hundreds of thousands. One query per fire, plus a second
@@ -3749,7 +3750,7 @@ mod probes {
         out
     }
 
-    /// Adjudicate RECORDED same-shard fires (Codex follow-up x15).
+    /// Adjudicate RECORDED same-shard fires (issue #1401).
     /// `source_shard == target_shard`, so the trigger fire and the
     /// target's initial creation share one transaction. A restore
     /// containing the fire necessarily contains that creation too. There
@@ -3759,7 +3760,7 @@ mod probes {
     /// completed run, or a target the engine legitimately never created
     /// (an inline rejection such as `PayloadTooLarge`). Either way it is
     /// silent here. A `MIGRATED`-seal-only match tries to confirm on its
-    /// forwarding shard first (Codex follow-up x16). Only an unconfirmed
+    /// forwarding shard first. Only an unconfirmed
     /// seal is reported, as `completion_trigger_fire_unproven`: the live
     /// run may have rebalanced to a shard this restore does not cover.
     async fn adjudicate_same_shard_fires(
@@ -3844,8 +3845,8 @@ mod probes {
     }
 
     /// Try to confirm each `MIGRATED`-seal-only key by following its
-    /// forwarding chain, one round trip per distinct shard per hop (Codex
-    /// follow-up x16/x18). `shard_rebalance.rs` explicitly supports A -> B
+    /// forwarding chain, one round trip per distinct shard per hop (issue
+    /// #1401). `shard_rebalance.rs` explicitly supports A -> B
     /// -> C chains. A destination that is ITSELF an unreconciled seal
     /// keeps chasing its own `migrated_to_shard` rather than being
     /// accepted on sight. Bounded at `targets.len()` hops. A legitimate
@@ -3853,8 +3854,8 @@ mod probes {
     /// exist means a cycle, and this stops rather than looping forever.
     ///
     /// A destination row genuinely absent still proves delivery via
-    /// `harvest_execution_summaries` (Codex follow-up x19), mirroring the
-    /// ordinary absent-target path elsewhere in this module. A shard
+    /// `harvest_execution_summaries`. This mirrors the ordinary
+    /// absent-target path elsewhere in this module. A shard
     /// outside the supplied `--shard` list, or unreachable, is left
     /// unconfirmed at that hop. The caller keeps reporting the fire
     /// `unproven`, same as before this function existed.
@@ -3928,8 +3929,8 @@ mod probes {
 
     /// One bounded chunk of [`adjudicate_trigger_fires`]'s work, for
     /// CROSS-shard fires only (`resolve_trigger_fires` routes same-shard
-    /// fires to [`adjudicate_same_shard_fires`] instead, Codex follow-up
-    /// x15). `chunk` is never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so
+    /// fires to [`adjudicate_same_shard_fires`] instead, issue #1401).
+    /// `chunk` is never larger than [`WORKFLOW_KEY_LOOKUP_CHUNK`], so
     /// every vector built here is bounded the same way.
     ///
     /// [`match_live_targets`] checks the whole chunk in one query against
@@ -3938,9 +3939,9 @@ mod probes {
     /// before starting the target, read-only against a restored snapshot.
     /// A key matched by `MIGRATED` seals only is neither delivered nor
     /// absent. It tries to confirm on the seal's forwarding shard first
-    /// (Codex follow-up x16). An unconfirmed one goes straight to
-    /// `unproven`, skipping the retention/timestamp checks below (Codex
-    /// follow-up x13). Everything genuinely absent is checked in one more
+    /// (issue #1401). An unconfirmed one goes straight to
+    /// `unproven`, skipping the retention/timestamp checks below.
+    /// Everything genuinely absent is checked in one more
     /// query against `harvest_execution_summaries`. That retention/timestamp
     /// fallback is calibrated for a CROSS-shard relay's delivery window --
     /// it does not apply to a same-shard fire, which never has one.
@@ -4079,8 +4080,8 @@ mod probes {
         let mut findings = Vec::new();
         let known: BTreeSet<i32> = targets.iter().map(|t| t.shard_id).collect();
 
-        // Bounded like `TriggerFireBuckets`'s sample lists (issue #1401,
-        // Codex follow-up x4): an exact count, with the joined sample text
+        // Bounded like `TriggerFireBuckets`'s sample lists (issue #1401):
+        // an exact count, with the joined sample text
         // capped at `MAX_FINDING_SAMPLES`. `pending` can hold up to the
         // scan's one-million-fire ceiling per source shard.
         let mut uninspected = Vec::new();
@@ -4119,7 +4120,7 @@ mod probes {
             if owned.is_empty() {
                 continue;
             }
-            // Same-shard fires (Codex follow-up x15) get a narrower check.
+            // Same-shard fires (issue #1401) get a narrower check.
             // Ordinary absence is never a relay loss for them, so they
             // must not reach the cross-shard retention/timestamp fallback
             // below. See `adjudicate_same_shard_fires`.
@@ -4257,7 +4258,7 @@ mod probes {
 
         let skew = compute_skew(shards.iter().map(|s| s.latest_event_at));
         // Floored at zero, same as `absence_is_decisive_loss`'s own copy
-        // of this tolerance (Codex follow-up x20). A negative
+        // of this tolerance (issue #1401). A negative
         // `max_skew_secs` must not flag every nonzero skew.
         let max_skew_secs = options.max_skew_secs.max(0);
         if let Some(secs) = skew
@@ -4280,10 +4281,10 @@ mod probes {
 /// Verify that a restored (scratch) fleet is resumable.
 ///
 /// Connects to every supplied shard **read-only** (`SET SESSION CHARACTERISTICS
-/// AS TRANSACTION READ ONLY`, so Postgres itself rejects any write with
-/// SQLSTATE 25006), probes each shard for the conditions in [`FindingClass`],
-/// replays a bounded sample of non-terminal histories through `replayer`, and
-/// cross-checks references that span shards.
+/// AS TRANSACTION READ ONLY`). Postgres itself then rejects any write with
+/// SQLSTATE 25006. It probes each shard for the conditions in
+/// [`FindingClass`]. It replays a bounded sample of non-terminal histories
+/// through `replayer`, and cross-checks references that span shards.
 ///
 /// Never mutates any database (AC4) and never starts a worker, a scanner, or a
 /// scheduler tick — the reclaimable classes are *reported*, never applied.
@@ -4304,14 +4305,14 @@ mod tests {
         Finding::new(class, Some(0), 1, vec!["x".into()])
     }
 
-    /// Codex round 4, P1. `ExternalAwaitFailed` is the channel for BOTH a
+    /// `ExternalAwaitFailed` is the channel for BOTH a
     /// transport failure and a resolved non-`COMPLETED` terminal outcome
     /// (`execution::read_external_await_outcome`). Only the transport codes may
     /// be skipped; the outcome codes assert target-shard state.
     ///
-    /// The `unknown_future_code` case pins the allowlist direction: an
-    /// unrecognised code must be ADJUDICATED, so the worst case is a finding an
-    /// operator can dismiss rather than a silently skipped check.
+    /// The `unknown_future_code` case pins the allowlist direction. An
+    /// unrecognised code must be ADJUDICATED. The worst case is then a finding
+    /// an operator can dismiss, not a silently skipped check.
     #[test]
     #[cfg(all(feature = "db", feature = "testing"))]
     fn await_transport_failures_are_an_allowlist_not_a_denylist() {
@@ -4397,8 +4398,8 @@ mod tests {
             .pick_for_new_workflow("child_flow", &target_workflow_id)
             .as_i32();
         // A RECORDED same-shard fire is a historical fact, not a guess.
-        // The target can still have rebalanced away since (Codex follow-up
-        // x14), so it must reach `pending` for adjudication rather than
+        // The target can still have rebalanced away since (issue #1401),
+        // so it must reach `pending` for adjudication rather than
         // being dropped outright.
         fire.target_shard = Some(same_shard);
 
@@ -4571,7 +4572,7 @@ mod tests {
     #[cfg(all(feature = "db", feature = "testing"))]
     fn absence_is_decisive_loss_floors_a_negative_skew_tolerance_at_zero() {
         // `VerifyOptions::max_skew_secs` is a public, unvalidated field
-        // (Codex follow-up x20). A negative value must not flip the
+        // (issue #1401). A negative value must not flip the
         // comparison and report a target shard AHEAD of `fired_at` as
         // decisive loss.
         let fired_at = Utc::now();
@@ -4596,7 +4597,7 @@ mod tests {
     #[cfg(all(feature = "db", feature = "testing"))]
     fn absence_is_decisive_loss_clamps_a_skew_tolerance_too_large_for_a_chrono_duration() {
         // `VerifyOptions::max_skew_secs` is a public, unvalidated field
-        // (Codex follow-up). `chrono::Duration::seconds` panics when its
+        // (issue #1401). `chrono::Duration::seconds` panics when its
         // argument overflows the representable range. This must return a
         // finding instead of aborting the whole verify run.
         let fired_at = Utc::now();
@@ -4612,10 +4613,10 @@ mod tests {
         );
     }
 
-    /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`
-    /// reach the SAME database; folding hostaddr into the hostname set made
-    /// identity require matching hostname *text*, so the guard waved the run
-    /// through against production.
+    /// `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X` reach the SAME
+    /// database. Folding hostaddr into the hostname set made identity require
+    /// matching hostname *text*, so the guard waved the run through against
+    /// production.
     #[test]
     #[cfg(feature = "db")]
     fn dsn_guard_matches_on_a_shared_hostaddr_despite_different_hostnames() {
@@ -4634,11 +4635,11 @@ mod tests {
         ));
     }
 
-    /// Codex round 7, P2. A NUMERIC `host` is an address, not a name: it needs
-    /// no DNS to compare against the other side's `hostaddr`. Keeping it in the
-    /// hostname set meant `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5`
-    /// -- the same TCP destination -- overlapped in neither set, so the guard
-    /// waved a production target through.
+    /// A NUMERIC `host` is an address, not a name: it needs no DNS to compare
+    /// against the `hostaddr` of the other side. Keeping it in the hostname set
+    /// meant that `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5` (the
+    /// same TCP destination) overlapped in neither set. The guard then waved a
+    /// production target through.
     ///
     /// This is NOT the documented name-vs-address limit: that one genuinely
     /// requires resolving a name, which the guard deliberately will not do.
@@ -4689,10 +4690,10 @@ mod tests {
         ));
     }
 
-    /// A replayed history that ends in a workflow ERROR is not clean: these
+    /// A replayed history that ends in a workflow ERROR is not clean. These
     /// samples are non-terminal runs, so the recorded history contains no
-    /// terminal failure and the deployed handler is erroring where the live run
-    /// had not. The engine's own canary counts this as `replay_failed`.
+    /// terminal failure. The deployed handler errors where the live run did
+    /// not. The engine's own canary counts this as `replay_failed`.
     #[test]
     fn replay_workflow_failure_is_incoherent_never_clean() {
         assert_eq!(
@@ -4732,9 +4733,9 @@ mod tests {
     #[test]
     fn severity_truth_table_is_pinned_for_every_class() {
         // EXHAUSTIVE by construction: the expected table is matched against
-        // `FindingClass::ALL`, so demoting any single class (the mutation that
-        // previously survived every test in this module) fails here, and
-        // adding a class without deciding its severity fails here too.
+        // `FindingClass::ALL`. So demoting any single class fails here. That
+        // mutation previously survived every test in this module. Adding a
+        // class without deciding its severity fails here too.
         //
         // Severity is the whole product: it decides the exit code, and
         // therefore whether an operator starts workers on a broken fleet.
@@ -4811,7 +4812,7 @@ mod tests {
     #[test]
     fn every_reclaimable_class_names_the_mechanism_that_heals_it() {
         // A "reclaimable" verdict is an assurance to the operator; the report
-        // must always say WHAT will heal it, never just "don't worry".
+        // must always say WHAT will heal it, never just "do not worry".
         for class in FindingClass::ALL {
             if class.severity() == FindingSeverity::Reclaimable {
                 let text = class.explanation();
@@ -4844,10 +4845,10 @@ mod tests {
     #[test]
     fn an_unrunnable_probe_is_undetermined_never_a_pass() {
         // The regression this guards: a "restore" that produced an unmigrated
-        // (empty) database makes every probe error on a missing table. Folding
-        // that into an advisory made the report read `resumable_with_reclaim`
-        // and exit 0 -- telling an operator to start workers against a database
-        // with no harvest schema at all.
+        // (empty) database makes every probe error on a missing table. Folded
+        // into an advisory, it made the report read `resumable_with_reclaim`
+        // and exit 0. That told an operator to start workers against a
+        // database with no harvest schema at all.
         assert_eq!(
             FindingClass::ProbeFailed.severity(),
             FindingSeverity::Undetermined
@@ -4870,9 +4871,9 @@ mod tests {
 
     #[test]
     fn advisory_classes_never_escalate_the_verdict() {
-        // The mirror of the above: a genuinely-advisory class (a single
-        // unreadable history among many replayed) must NOT be undetermined, or
-        // every partially-readable restore would fail the drill.
+        // The mirror of the above. A genuinely-advisory class (a single
+        // unreadable history among many replayed) must NOT be undetermined.
+        // Else every partially-readable restore fails the drill.
         for class in [
             FindingClass::HistoryUnreadable,
             FindingClass::ReplaySkippedNoHandler,
@@ -5196,13 +5197,13 @@ mod tests {
         ));
     }
 
-    /// Codex round 3, P2. libpq (and therefore the server, since
-    /// tokio-postgres simply omits `database` from the startup packet when
-    /// `dbname` is unset) defaults the database name to the CONNECTION USER.
-    /// Storing `""` for an omitted `dbname` made `postgres://harvest@prod-host`
-    /// compare unequal to `postgres://ops@prod-host/harvest` even though both
-    /// land on database `harvest` -- so the guard waved a production target
-    /// through without the acknowledgement.
+    /// libpq defaults the database name to the CONNECTION USER. So does the
+    /// server, because tokio-postgres omits `database` from the startup packet
+    /// when `dbname` is unset. Storing `""` for an omitted `dbname` made
+    /// `postgres://harvest@prod-host` compare unequal to
+    /// `postgres://ops@prod-host/harvest`, though both land on database
+    /// `harvest`. The guard then waved a production target through without
+    /// the acknowledgement.
     // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
     // the guard itself only exists in a `db` build.
     #[test]
@@ -5232,10 +5233,10 @@ mod tests {
         ));
     }
 
-    /// With neither `dbname` nor `user` present the database name is the OS
-    /// username of whoever connects -- not knowable here, and different on the
-    /// operator's machine than in the deployed config. A guard that cannot
-    /// determine the identity must refuse, not guess.
+    /// With neither `dbname` nor `user` present, the database name is the OS
+    /// username of whoever connects. It is not knowable here, and it differs
+    /// between the operator's machine and the deployed config. A guard that
+    /// cannot determine the identity must refuse, not guess.
     // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
     // the guard itself only exists in a `db` build.
     #[test]
@@ -5264,7 +5265,7 @@ mod tests {
     fn redact_dsn_withholds_any_password_bearing_query_key() {
         // `sslpassword` is a libpq option like `password`, and matching the
         // exact word let it through whole. The keyword-form scanner already
-        // used a `contains` rule; the URL form must not be laxer, or the same
+        // used a `contains` rule. The URL form must not be laxer. Else the same
         // secret is redacted or not depending on how the DSN was spelled.
         for dsn in [
             "postgres://db.prod/harvest?password=hunter2",

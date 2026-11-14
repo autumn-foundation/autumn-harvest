@@ -40,8 +40,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-// ── Workflow handler ──────────────────────────────────────────────────────────
-
 /// Records `ctx.scheduled_time()` as an RFC3339 string (or null) in its output.
 fn scheduled_time_recorder<'a>(
     ctx: &'a WorkflowContext,
@@ -54,8 +52,6 @@ fn scheduled_time_recorder<'a>(
         Ok(json!({ "scheduled_time": slot }))
     })
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     // Pin Postgres 16 like every other suite. The image default is 11.
@@ -193,8 +189,6 @@ async fn wait_for_state(url: &str, wf_name: &str, state: &str, min_count: usize)
     .expect("timed out waiting for execution state")
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 /// A fired scheduled run's `WorkflowStarted.scheduled_time` equals its nominal slot
 /// and is NOT `now()` (the execution-start wall-clock).
 #[tokio::test]
@@ -232,7 +226,6 @@ async fn scheduled_run_has_correct_scheduled_time() {
     let ids = wait_for_state(&url, wf_name, "COMPLETED", 1).await;
     let exec_id = ids[0];
 
-    // Load event history and find the WorkflowStarted event.
     let mut check = AsyncPgConnection::establish(&url).await.unwrap();
     let history = store::load_history(&mut check, ExecutionId::from_uuid(exec_id))
         .await
@@ -251,7 +244,7 @@ async fn scheduled_run_has_correct_scheduled_time() {
     );
 
     let slot = scheduled_time.unwrap();
-    // The slot should be close to `before_arm - slot_secs_ago` (within a few seconds margin).
+    // The slot is within a few seconds of `before_arm - slot_secs_ago`.
     let expected_approx = before_arm - chrono::Duration::seconds(slot_secs_ago);
     let diff = (slot - expected_approx).num_seconds().abs();
     assert!(
@@ -259,8 +252,8 @@ async fn scheduled_run_has_correct_scheduled_time() {
         "scheduled_time should be close to the armed slot (diff={diff}s). slot={slot}, expected≈{expected_approx}"
     );
 
-    // The slot must NOT be approximately now() (the execution start wall-clock).
-    // It should differ by at least slot_secs_ago - 30s from now.
+    // The slot is not near `now()`, the execution start wall clock. It differs
+    // from now by at least `slot_secs_ago - 30` seconds.
     let diff_from_now = (Utc::now() - slot).num_seconds();
     assert!(
         diff_from_now > (slot_secs_ago - 30),
@@ -348,7 +341,6 @@ async fn manual_start_has_no_scheduled_time() {
     .await
     .expect("start workflow");
 
-    // Drain with a worker.
     let worker = make_worker("w-manual", registry.clone());
     let pool_clone = pool.clone();
     let worker_clone = worker.clone();
@@ -407,7 +399,6 @@ async fn n_slots_produce_n_distinct_scheduled_times() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Drain all N with a worker.
     let worker = make_worker("w-n-slots", registry.clone());
     let pool_clone = pool.clone();
     let worker_clone = worker.clone();

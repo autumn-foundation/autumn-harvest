@@ -15,11 +15,11 @@
 //!
 //! `queue::claim_task_batched` is not wired into the default claim path.
 //! See the module doc above `queue::claim_task_batched_candidates_query`.
-//! These tests exist to establish the one thing
-//! `docs/assays/0005-claim-batched-seek-and-refine.md`'s single-session
-//! apparatus could not: the batching mechanism holds its exactly-once,
-//! never-over-the-cap guarantee under REAL concurrent claimers. It does so
-//! not just in a single serial walk.
+//! The single-session apparatus of
+//! `docs/assays/0005-claim-batched-seek-and-refine.md` could not prove one
+//! thing. These tests prove it: the batching mechanism keeps its
+//! exactly-once, never-over-the-cap guarantee under REAL concurrent
+//! claimers, not only in a serial walk.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres, to
 //! run against it directly. Otherwise a fresh testcontainers Postgres
@@ -216,9 +216,8 @@ async fn batched_claim_picks_the_same_row_the_single_row_path_would() {
             .await
             .expect("a row was claimable");
 
-    // Both must have claimed the row seeded with priority 9. That is the
-    // only fact this test needs to hold, across two structurally
-    // identical, but row-id-distinct, backlogs.
+    // Both paths claim the row of priority 9. The row ids of the two
+    // backlogs differ, so the priority is the fact to compare.
     assert_eq!(single_claimed.priority, 9);
     let batched_priority: i32 = {
         use diesel_async::RunQueryDsl;
@@ -249,8 +248,8 @@ async fn batched_claim_returns_none_on_an_empty_backlog() {
 // ── Adversarial saturated-key fixtures (ledger #4 / #5 style) ──────────────
 
 /// A saturated concurrency key ranked ahead of the one claimable row must
-/// not block the claim. That is the whole point of moving the gate to a
-/// per-candidate recheck, instead of a single-row candidate-side filter.
+/// not block the claim. That is why the gate is a per-candidate recheck,
+/// not a single-row candidate-side filter.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_finds_the_claimable_row_behind_a_saturated_key() {
     let (_url, mut conn, _container) = setup_db().await;
@@ -313,9 +312,8 @@ async fn batched_claim_finds_the_claimable_row_behind_a_saturated_key() {
 }
 
 /// Enough poisoned rows to span more than one batch, WITH ties in the
-/// poisoned rows' sort key. This exercises the keyset cursor's `id`
-/// tiebreak across a batch boundary -- the exact bug ledger #5's own
-/// post-review caught and fixed.
+/// poisoned rows' sort key. This exercises the `id` tiebreak of the keyset
+/// cursor across a batch boundary. Ledger #5 found and fixed that bug.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_walks_multiple_batches_across_tied_sort_keys() {
     let (_url, mut conn, _container) = setup_db().await;
@@ -444,9 +442,9 @@ async fn batched_claim_gives_up_after_max_batches_without_claiming_poisoned_rows
 
 /// `N` concurrent claimers racing a backlog of rows sharing one
 /// `concurrency_cap`-capped key must never push RUNNING rows for that key
-/// past the cap. The count of successful claims must also exactly equal
-/// the cap -- not more, and, since every row is otherwise identical,
-/// not fewer either.
+/// past the cap. The count of successful claims must fall in `1..=CAP`.
+/// A claimer that loses the non-blocking lock race claims nothing, so a
+/// round can land below the cap. The RUNNING count must equal the claim count.
 ///
 /// This is the exact property `pg_try_advisory_xact_lock` plus the fresh
 /// per-candidate `COUNT` exists to guarantee, now checked under REAL
@@ -495,14 +493,11 @@ async fn concurrent_batched_claimers_never_exceed_the_concurrency_cap() {
         }
     }
 
-    // `pg_try_advisory_xact_lock` is non-blocking by design (matches
-    // `claim_task_on_shard`'s own documented behavior). A claimer that
-    // loses the lock race gets 0 rows, and simply retries next poll cycle.
-    // That happens even if the cap was not actually saturated at that
-    // instant. So a racing round can land BELOW the cap -- that is
-    // safe-side and expected. What must never happen is landing ABOVE it.
-    // At least one claimer winning is the soundness floor for this test
-    // (10 claimers racing 10 identical rows with real Tokio concurrency).
+    // `pg_try_advisory_xact_lock` does not block, as in `claim_task_on_shard`.
+    // A claimer that loses the lock race gets 0 rows and retries on the next
+    // poll, even when the cap is not saturated. So a round can land BELOW the
+    // cap, which is safe. It must never land ABOVE it. One winner is the
+    // soundness floor (10 claimers race 10 identical rows).
     assert!(
         claimed >= 1 && claimed <= CAP as usize,
         "claimed count must be in (0, CAP] -- non-blocking lock contention \
@@ -547,12 +542,10 @@ async fn batched_claim_respects_the_rate_limit_bucket() {
     let queue = unique_queue("batched-rate-limit");
     let bucket_key = format!("bucket-{}", Uuid::new_v4().simple());
 
-    // burst=1, refill_rate=0 -- capacity for exactly one token, never
-    // auto-refilling. `ensure_rate_limit_bucket` starts `tokens` at
-    // `burst` (full). Drain it explicitly, to get the "empty bucket"
-    // starting state this test wants. A burst of 0 would instead cap
-    // `effective_available_tokens_expr`'s LEAST(burst, ...) at 0 forever,
-    // making the later top-up unable to ever clear the gate.
+    // burst=1, refill_rate=0: room for one token, and no refill.
+    // `ensure_rate_limit_bucket` starts `tokens` at `burst`, so drain it for
+    // the empty start. A burst of 0 would cap the LEAST(burst, ...) of
+    // `effective_available_tokens_expr` at 0, and no top-up could clear it.
     queue::ensure_rate_limit_bucket(&mut conn, &bucket_key, 0.0, 1.0)
         .await
         .expect("ensure bucket");
@@ -608,19 +601,15 @@ async fn batched_claim_respects_the_rate_limit_bucket() {
     );
 }
 
-/// Regression test for a review finding on this PR (Codex, P2).
+/// A deadline that passes mid-transaction blocks the claim.
 ///
-/// A candidate whose `schedule_to_close_at` deadline passes in REAL
-/// wall-clock time, while a batch search is still walking earlier
-/// candidates, must not be claimed. That holds even though the frozen
-/// transaction `NOW()` the batch scan itself uses would have let it
-/// through.
+/// A candidate whose `schedule_to_close_at` passes in REAL wall-clock time,
+/// while a batch search still walks earlier candidates, must not be claimed.
+/// The frozen transaction `NOW()` of the batch scan would have let it through.
 ///
-/// Drives `claim_batched_candidate_attempt_query()` directly inside a
-/// hand-managed transaction, with a `pg_sleep` standing in for "a long
-/// batch search." That keeps this test deterministic. It does not depend
-/// on actually walking hundreds of poisoned candidates to consume real
-/// time.
+/// The test drives `claim_batched_candidate_attempt_query()` in a
+/// hand-managed transaction. A `pg_sleep` stands in for "a long batch
+/// search", so the test is deterministic. It walks no poisoned candidates.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() {
     use diesel_async::RunQueryDsl;
@@ -648,10 +637,9 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() 
     let claimed: Option<Uuid> = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> Result<Option<Uuid>, diesel::result::Error> {
-                // Real wall-clock time advances 600ms here. This
-                // transaction's own frozen NOW() does not. `deadline` is
-                // still "not yet past NOW()" from this transaction's own
-                // point of view for the rest of it.
+                // Real wall-clock time advances 600ms here. The frozen NOW()
+                // of this transaction does not, so `deadline` stays ahead of
+                // NOW() for the rest of it.
                 diesel::sql_query("SELECT pg_sleep(0.6)")
                     .execute(conn)
                     .await?;
@@ -697,12 +685,12 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() 
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
-/// Regression test for a review finding on this PR. A data-modifying CTE
-/// runs whether or not a later CTE reads its result. A candidate whose
-/// deadline passed mid-transaction must not debit a rate-limit token.
-/// `claimed` was always going to reject it anyway. This is the same
-/// shape as the concurrency-rejected-candidate leak below, on the
-/// deadline recheck instead of the concurrency recheck.
+/// A candidate whose deadline passed mid-transaction debits no rate-limit
+/// token.
+///
+/// A data-modifying CTE runs whether or not a later CTE reads its result.
+/// `claimed` rejects the candidate anyway. The concurrency-rejected leak
+/// test below has the same shape, on the concurrency recheck.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_deadline() {
     use diesel_async::RunQueryDsl;
@@ -797,12 +785,12 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_
     );
 }
 
-/// Regression test for a review finding on this PR, against the
-/// thirteenth bug's own fix. Same shape as the deadline-leak test
-/// above: a data-modifying CTE runs whether or not `claimed` uses its
-/// result. A candidate whose build compatibility was never declared
-/// must not debit a rate-limit token either. `claimed` was always
-/// going to reject it on the build-routing gate.
+/// A candidate with no declared build compatibility debits no rate-limit
+/// token.
+///
+/// As in the deadline-leak test above, a data-modifying CTE runs whether or
+/// not `claimed` uses its result. `claimed` rejects the candidate on the
+/// build-routing gate.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_candidate() {
     use diesel_async::RunQueryDsl;
@@ -894,11 +882,10 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_
     );
 }
 
-/// Regression test for a review finding on this PR. Same
-/// never-debits-on-rejection shape as the build-routing and deadline
-/// leak tests above, for the capability-labels gate. A candidate whose
-/// worker does not satisfy `required_capabilities` must not debit a
-/// rate-limit token either.
+/// A candidate whose worker does not satisfy `required_capabilities` debits
+/// no rate-limit token.
+///
+/// The build-routing and deadline leak tests above have the same shape.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_never_debits_rate_limit_for_a_capability_mismatched_candidate() {
     use diesel_async::RunQueryDsl;
@@ -1002,17 +989,16 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_capability_mismatch
     );
 }
 
-/// Regression test for a review finding on this PR. The batch scan's
-/// own capability-label gate only filters at scan time, the same class
-/// of gap the build-routing bug closed. A worker's labels can change
-/// between the scan and this candidate's own attempt, a separate,
-/// later statement. `claimed`'s `WHERE` must re-check labels fresh from
-/// `harvest_workers`, not trust the scan's own stale snapshot.
+/// `claimed` re-checks capability labels at the attempt.
 ///
-/// Drives `claim_batched_candidate_attempt_query()` directly, same
-/// style as the build-routing test above. A worker whose labels do
-/// not satisfy the requirement is rejected. Updating the worker's
-/// labels to satisfy it flips the same query's own re-check to pass.
+/// The capability-label gate of the batch scan filters only at scan time,
+/// the class of gap that the build-routing fix closed. Labels can change
+/// before the attempt, a later statement. So the `WHERE` of `claimed` reads
+/// `harvest_workers` again and does not trust the stale scan.
+///
+/// The test drives `claim_batched_candidate_attempt_query()` directly, as
+/// the build-routing test does. A worker without the labels is rejected.
+/// Labels that satisfy the requirement then make the same re-check pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_scan() {
     use diesel_async::RunQueryDsl;
@@ -1091,8 +1077,7 @@ async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_sca
     assert_eq!(claimed, None);
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 
-    // Updating the worker's labels flips the same query's own re-check
-    // to pass, confirming it reads current state, not a stale snapshot.
+    // New labels make the same re-check pass, so it reads current state.
     diesel::sql_query("UPDATE harvest_workers SET labels = $2 WHERE worker_id = $1")
         .bind::<diesel::sql_types::Text, _>(&worker_id)
         .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({"region": "us-east"}))
@@ -1104,16 +1089,13 @@ async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_sca
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
-/// Regression test for a review finding on this PR. Walking a batch must
-/// NOT debit a rate-limit token for a candidate the concurrency gate
-/// always rejects.
+/// A batch walk does NOT debit a rate-limit token for a candidate that the
+/// concurrency gate always rejects.
 ///
-/// Every poisoned row here shares BOTH a saturated `concurrency_key` AND a
-/// `rate_limit_key`, funded with many tokens. That is the exact
-/// adversarial combination the fix in
-/// `queue::claim_batched_candidate_concurrency_probe_query` exists to
-/// close. Before that fix, walking past these poisoned rows would debit
-/// one token per row tried.
+/// Each poisoned row shares BOTH a saturated `concurrency_key` AND a
+/// `rate_limit_key` with many tokens.
+/// `queue::claim_batched_candidate_concurrency_probe_query` closes that
+/// combination. Before that fix, the walk debited one token per row tried.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_never_debits_rate_limit_for_a_concurrency_rejected_candidate() {
     let (_url, mut conn, _container) = setup_db().await;
@@ -1189,13 +1171,12 @@ async fn batched_claim_never_debits_rate_limit_for_a_concurrency_rejected_candid
     );
 }
 
-/// Regression test for a review finding on this PR. A batch walk can spend
-/// real wall-clock time inside one transaction. `NOW()` stays frozen at
-/// transaction start for that whole walk. So `started_at = NOW()` would
-/// backdate the claim by the walk's duration, silently shortening the
-/// task's `start_to_close`/`heartbeat_timeout` budget (both measured from
-/// `started_at`). `started_at` must instead read the query's own
-/// materialized `clock_timestamp()`, taken at the actual claim.
+/// `started_at` reads the materialized `clock_timestamp()` of the claim.
+///
+/// A batch walk can spend real time inside one transaction, and `NOW()`
+/// stays frozen at its start. `started_at = NOW()` would backdate the claim
+/// by the walk. That shortens the `start_to_close` and `heartbeat_timeout`
+/// budgets, which both run from `started_at`.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now() {
     use diesel_async::RunQueryDsl;
@@ -1273,19 +1254,18 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
-/// Regression test for a review finding on this PR. `now_ts` has no
-/// `FROM` clause of its own, so Postgres could resolve it before
-/// `rate_limit_debit` even attempts its own row lock. A concurrent
-/// transaction holding that lock would then let `now_ts` capture a
-/// stale, pre-wait value that `rate_limit_debit`, `claimed`, and
-/// `started_at` all reuse. A deadline that expires DURING the wait
-/// would incorrectly still read as live.
+/// `now_ts` reads the clock after the wait for the bucket row lock.
 ///
-/// Reproduces the race with two real connections. One holds the bucket
-/// row's lock well past the deadline. The other attempts the claim,
-/// genuinely blocked on that exact lock. This is not a `pg_sleep`
-/// stand-in. The bug is specifically about WHEN a blocking wait
-/// resolves relative to the shared clock read.
+/// `now_ts` has no `FROM` clause, so Postgres could resolve it before
+/// `rate_limit_debit` takes its row lock. With a concurrent lock holder,
+/// `now_ts` would capture a stale, pre-wait value. `rate_limit_debit`,
+/// `claimed` and `started_at` all reuse it. A deadline that expires DURING
+/// the wait would then still read as live.
+///
+/// Two real connections reproduce the race. One holds the bucket row lock
+/// past the deadline. The other attempts the claim and blocks on that lock.
+/// A `pg_sleep` cannot stand in: the bug is WHEN the wait resolves against
+/// the clock read.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_the_bucket_lock() {
     use diesel_async::RunQueryDsl;
@@ -1334,8 +1314,8 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
         .expect("locker transaction");
     });
 
-    // Wait for the locker to actually hold the row lock -- a fixed sleep
-    // cannot guarantee that on a loaded CI host (review finding).
+    // Wait until the locker holds the row lock. A fixed sleep cannot
+    // guarantee that on a loaded CI host.
     locked_rx.await.expect("locker signaled");
 
     #[derive(diesel::QueryableByName)]
@@ -1409,17 +1389,15 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
     );
 }
 
-/// Regression test for a review finding on this PR, against the ninth
-/// bug's own `now_ts` fix. `rate_limit_debit` never touches the bucket
-/// row for a circuit-breaker-bypassed activity. `now_ts`'s forced lock
-/// must skip it too. A bypassed claim is meant to run at full speed,
-/// past rate limiting entirely. Without this, it serializes behind an
-/// unrelated transaction holding that bucket row for an unrelated
-/// activity.
+/// A circuit-breaker-bypassed claim does not wait on the bucket row lock.
 ///
-/// Proven with a real lock held by a separate connection, not a
-/// `pg_sleep` stand-in. A bypassed claim must complete quickly despite
-/// contention it has no reason to wait on.
+/// This covers the `now_ts` fix above. `rate_limit_debit` never touches the
+/// bucket row of a bypassed activity, so the forced lock of `now_ts` skips
+/// it too. A bypassed claim runs at full speed, past rate limiting.
+/// Otherwise it waits behind an unrelated transaction that holds the row.
+///
+/// A separate connection holds a real lock, not a `pg_sleep` stand-in. The
+/// bypassed claim must still complete quickly.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activity() {
     use diesel_async::RunQueryDsl;
@@ -1464,8 +1442,8 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
         .expect("locker transaction");
     });
 
-    // Wait for the locker to actually hold the row lock -- a fixed sleep
-    // cannot guarantee that on a loaded CI host (review finding).
+    // Wait until the locker holds the row lock. A fixed sleep cannot
+    // guarantee that on a loaded CI host.
     locked_rx.await.expect("locker signaled");
 
     #[derive(diesel::QueryableByName)]
@@ -1524,22 +1502,17 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
-/// Regression test for a review finding on this PR. A candidate's
-/// deadline can pass DURING the batch walk. Not while waiting on that
-/// candidate's own bucket lock (the ninth-bug scenario above), but
-/// while an EARLIER candidate's bucket lock is being waited on. By the
-/// time the walk reaches this later candidate, its deadline has already
-/// passed. It can never claim, regardless of what its own bucket
-/// protects. Waiting on that bucket lock anyway wastes an entire second
-/// lock wait for nothing.
+/// An expired candidate never waits on its own bucket lock.
 ///
-/// `try_claim_batched_candidate` must reject an already-expired
-/// candidate before ever issuing the attempt query. It must not add its
-/// own bucket wait on top of the earlier candidate's. Proven with two
-/// real, separately-held locks, not a `pg_sleep` stand-in. One
-/// candidate absorbs a real wait. A second candidate's own deadline
-/// expires during that wait, and its own (still-locked) bucket must
-/// never be waited on at all.
+/// A deadline can pass DURING the batch walk, while the walk waits on the
+/// bucket lock of an EARLIER candidate. The `now_ts` test above waits on the
+/// lock of the candidate itself instead. The later candidate then can never
+/// claim, so a second lock wait for it is wasted.
+///
+/// `try_claim_batched_candidate` must reject an expired candidate before it
+/// sends the attempt query. Two real, separately held locks prove it, not a
+/// `pg_sleep` stand-in. Candidate A absorbs a real wait. The deadline of
+/// candidate B expires during it, and its locked bucket is never waited on.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::similar_names)]
 async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_deadline() {
@@ -1548,11 +1521,9 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
     let (url, mut conn, _container) = setup_db().await;
     let bucket_a = format!("bucket-a-{}", Uuid::new_v4().simple());
     let bucket_b = format!("bucket-b-{}", Uuid::new_v4().simple());
-    // Funded with exactly one token. The batch scan's own soft
-    // rate-limit pre-filter (`{rate_limit_available} >= 1.0`) requires
-    // this, or candidate A is excluded from the batch before it ever
-    // reaches a per-candidate attempt. That would never touch
-    // bucket_a's lock at all, defeating this test's setup.
+    // Exactly one token. The soft rate-limit pre-filter of the batch scan
+    // (`{rate_limit_available} >= 1.0`) needs it. Otherwise the scan drops
+    // candidate A, and the walk never touches the lock of bucket_a.
     queue::ensure_rate_limit_bucket(&mut conn, &bucket_a, 0.0, 1.0)
         .await
         .expect("ensure bucket a");
@@ -1597,10 +1568,9 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
         let mut tx = locker_conn.build_transaction().read_committed();
         tx.run(
             async |conn: &mut AsyncPgConnection| -> Result<(), diesel::result::Error> {
-                // Locks the row and spends the one token a concurrent
-                // claimer would have spent. Once A's own attempt gets
-                // past this lock, it correctly finds no funds left and
-                // moves on to B.
+                // Lock the row and spend the one token that a concurrent
+                // claimer would spend. After this lock, the attempt of A
+                // finds no funds and moves on to B.
                 diesel::sql_query(
                     "UPDATE harvest_rate_limit_buckets SET tokens = 0 WHERE key = $1",
                 )
@@ -1643,8 +1613,8 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
         .expect("locker b transaction");
     });
 
-    // Wait for both lockers to actually hold their row locks -- a fixed
-    // sleep cannot guarantee that on a loaded CI host (review finding).
+    // Wait until both lockers hold their row locks. A fixed sleep cannot
+    // guarantee that on a loaded CI host.
     locked_a_rx.await.expect("locker a signaled");
     locked_b_rx.await.expect("locker b signaled");
 
@@ -1672,16 +1642,15 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
     assert_eq!(task_state(&mut conn, task_b).await, "PENDING");
 }
 
-/// Regression test for a review finding on this PR, the same class as
-/// the circuit-breaker and deadline skips above. `claimed` is certain to
-/// reject a build-incompatible candidate -- the thirteenth-bug fix above
-/// guarantees that. Without this gate, the forced lock still waits on
-/// an unrelated bucket row first. That wastes the whole wait on a claim
-/// that could never succeed.
+/// A build-incompatible claim does not wait on the bucket row lock.
 ///
-/// Proven with a real lock held by a separate connection, not a
-/// `pg_sleep` stand-in, the same technique the circuit-breaker skip test
-/// above uses.
+/// This is the class of the circuit-breaker and deadline skips above.
+/// `claimed` always rejects a build-incompatible candidate, by the
+/// build-routing recheck. Without this gate, the forced lock still waits on
+/// an unrelated bucket row first, and the whole wait is wasted.
+///
+/// A separate connection holds a real lock, not a `pg_sleep` stand-in, as
+/// in the circuit-breaker skip test.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_skips_the_bucket_lock_for_a_build_incompatible_candidate() {
     use diesel_async::RunQueryDsl;
@@ -1793,17 +1762,15 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_build_incompatible_ca
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
-/// Regression test for a review finding on this PR (P1). A long batch
-/// walk can leave this transaction's own frozen `NOW()` well behind
-/// real time by the time `rate_limit_debit` finally runs. Writing
-/// `last_refilled_at = NOW()` then persists a timestamp from the past,
-/// not from the actual moment of the debit. A later claimant reading
-/// that stale timestamp re-accrues tokens for an interval already
-/// accounted for, exceeding the configured rate limit.
+/// `rate_limit_debit` stamps `last_refilled_at` at the debit, not at `NOW()`.
 ///
-/// Same deterministic `pg_sleep` technique as the sibling `started_at`
-/// test above. `last_refilled_at` must land after the in-transaction
-/// sleep, not near the pre-sleep timestamp a frozen `NOW()` would give.
+/// After a long batch walk, the frozen `NOW()` of the transaction is well
+/// behind real time. `last_refilled_at = NOW()` would store a past time. A
+/// later claimant would re-accrue tokens for an interval already counted,
+/// and exceed the rate limit.
+///
+/// The test uses the `pg_sleep` technique of the `started_at` test.
+/// `last_refilled_at` must land after the sleep, not near the pre-sleep time.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen_now() {
     use diesel_async::RunQueryDsl;
@@ -1897,17 +1864,16 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
     );
 }
 
-/// Regression test for a review finding on this PR. The batch scan's
-/// own build-routing gate only filters at scan time. This candidate's
-/// own attempt is a separate, later statement. An operator revoking
-/// build compatibility in between must still be caught. Otherwise a
-/// worker could claim a task requiring a build it is no longer allowed
-/// to run, breaking the replay-determinism guarantee build routing
-/// protects.
+/// `claimed` re-checks build compatibility at the attempt.
 ///
-/// Drives `claim_batched_candidate_attempt_query()` directly (like the
-/// deadline and concurrency authoritative-recheck tests above), proving
-/// the `WHERE` clause's own re-check, not just the batch scan's.
+/// The build-routing gate of the batch scan filters only at scan time. The
+/// attempt is a separate, later statement, so it must catch a revoke in
+/// between. Otherwise a worker could claim a task for a build that it may no
+/// longer run. That breaks the replay determinism that build routing guards.
+///
+/// The test drives `claim_batched_candidate_attempt_query()` directly, as
+/// the deadline and concurrency recheck tests do. So it proves the re-check
+/// in the `WHERE` clause, not only the one in the batch scan.
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_attempt_rechecks_build_routing_not_just_the_batch_scan() {
     use diesel_async::RunQueryDsl;
@@ -1981,8 +1947,8 @@ async fn batched_claim_attempt_rechecks_build_routing_not_just_the_batch_scan() 
     assert_eq!(claimed, None);
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 
-    // Declaring compatibility flips the same query's own re-check to
-    // pass, proving this is a live gate, not a stale one.
+    // Declared compatibility makes the same re-check pass, so the gate
+    // is live.
     build_routing::declare_compat(&mut conn, &worker_build, &required_build)
         .await
         .expect("declare compat");
@@ -2146,14 +2112,12 @@ async fn reseed_end_to_end_fixture(url: &str) {
 /// the hot-contention fixture `docs/performance-claim-batched-seek-and-refine.md`
 /// cites.
 ///
-/// `cargo xtask perf claim-batched-seek-and-refine`
-/// also takes SQL-only `EXPLAIN` captures. Unlike those, this drives the
-/// REAL compiled functions over real connections. So it is the only
-/// source for that page's headline milliseconds-per-claim numbers. Each
-/// path measures against its own freshly reseeded copy of the identical
-/// fixture -- see [`reseed_end_to_end_fixture`] for why that reseed is
-/// not optional. Single-row still runs first, so the batched path's own
-/// numbers never benefit from a warmer page cache.
+/// `cargo xtask perf claim-batched-seek-and-refine` takes SQL-only
+/// `EXPLAIN` captures. This test drives the REAL compiled functions over
+/// real connections instead. So it is the only source of the headline
+/// milliseconds per claim on that page. Each path claims against its own
+/// reseeded copy of the fixture ([`reseed_end_to_end_fixture`] says why).
+/// Single-row runs first, so the batched path never gains a warmer cache.
 ///
 /// `CLAIM_BATCHED_CAPTURE_N` overrides the claim count per path (default
 /// 400).
@@ -2182,13 +2146,10 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
     ];
     let mut conn = connect(&bench.url).await;
 
-    // Each path gets its OWN fresh 10,000-row/2,000-`RUNNING` fixture. A
-    // shared fixture would let the single-row loop's 400 claims (PENDING
-    // -> RUNNING) leave the batched loop measuring a smaller, differently
-    // shaped backlog. That was a real methodological bug a review caught
-    // on this PR (Codex, P2). The two loops would no longer measure the
-    // same starting conditions. That silently invalidates the ratio this
-    // capture exists to produce.
+    // Each path gets its OWN fresh 10,000-row/2,000-`RUNNING` fixture. With
+    // a shared fixture, the 400 claims of the single-row loop (PENDING ->
+    // RUNNING) shrink and reshape the backlog of the batched loop. The two
+    // loops then start from different conditions, and the ratio is invalid.
     reseed_end_to_end_fixture(&bench.url).await;
     let mut single_ms = Vec::with_capacity(n);
     for _ in 0..n {
@@ -2229,9 +2190,8 @@ async fn zz_capture_claim_batched_end_to_end_latency() {
     let single_stats = super::claim_bench_support::LatencyStats::from_samples(&single_ms);
     let batch_stats = super::claim_bench_support::LatencyStats::from_samples(&batch_ms);
 
-    // The true minimum, not the first sample. An earlier draft of this
-    // capture mislabeled `.first()` as "min" -- only correct by
-    // coincidence, since samples are not collected in sorted order.
+    // The true minimum. The samples are not sorted, so `.first()` is not
+    // the minimum.
     let single_min = single_ms.iter().copied().fold(f64::INFINITY, f64::min);
     let batch_min = batch_ms.iter().copied().fold(f64::INFINITY, f64::min);
 

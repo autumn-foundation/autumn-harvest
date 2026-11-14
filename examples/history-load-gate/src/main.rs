@@ -74,7 +74,6 @@ impl Config {
     }
 }
 
-/// Reads an optional value from the environment.
 fn env_opt<T: std::str::FromStr>(name: &str) -> Result<Option<T>, BoxError>
 where
     T::Err: std::error::Error + Send + Sync + 'static,

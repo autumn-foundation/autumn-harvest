@@ -268,7 +268,7 @@ impl Smoke {
             self.scenario(name, name, &[])?;
         }
 
-        // The same scenarios with a payload codec on both sides.
+        // Rerun the scenarios with a payload codec on both N and N-1.
         let codec = codec_scenarios(&previous);
         self.codec = true;
         for name in SCENARIOS {

@@ -1,26 +1,24 @@
 //! Issue #746 — declarative DAG signal/timer gate nodes.
 //!
-//! **Phase 1 = RED.** These tests reference the not-yet-implemented gate API
-//! (`DagBuilder::signal_gate`, `DagBuilder::signal_gate_with_timeout`,
-//! `DagTask::signal`, `DagSignalGate`, `GateTimeoutAction`,
-//! `HarvestBuilderError::DagSignalGateRequiresUnifiedExecution`). Per this
-//! repo's TDD convention a compile error against not-yet-existing API is an
-//! acceptable RED — the GREEN implementation lands these symbols.
+//! These tests pin the gate API: `DagBuilder::signal_gate`,
+//! `DagBuilder::signal_gate_with_timeout`, the `DagTask::signal` field,
+//! `DagSignalGate`, `GateTimeoutAction` and
+//! `HarvestBuilderError::DagSignalGateRequiresUnifiedExecution`.
 //!
 //! Acceptance-criteria coverage:
-//! * AC1/AC2/Gap B — signal payload lands in `__outputs`, addressable by
-//!   downstream nodes (`.map` fan-out, conditions); optional timeout with a
-//!   per-gate `on_timeout` choice (fail the run vs continue with a null gate
-//!   output).
+//! * AC1/AC2/Gap B — the signal payload lands in `__outputs`, where downstream
+//!   nodes address it (`.map` fan-out, conditions). An optional timeout has a
+//!   per-gate `on_timeout` choice: fail the run, or continue with a null gate
+//!   output.
 //! * AC5 — deterministic replay via `WorkflowReplayer` over the generated DAG
 //!   handler (signal-first and timer-first histories).
 //! * AC6 — a classic (non-unified) DAG with a gate is rejected at build time.
-//! * Level isolation — a gate occupies its own singleton execution level so its
+//! * Level isolation — a gate occupies its own singleton execution level, so its
 //!   `WaitForSignal` suspension is never batched with a level's activity
-//!   `ScheduleActivity` dispatches. (Originally the worker's homogeneous-batch
-//!   requirement; since issue #950 the mixed batch is persistable, but the
-//!   singleton-level split is retained so in-flight DAG histories keep replaying
-//!   against the command order they recorded.)
+//!   `ScheduleActivity` dispatches. The worker once required homogeneous
+//!   batches. Since issue #950 the mixed batch is persistable. The split stays,
+//!   so in-flight DAG histories keep replaying against their recorded command
+//!   order.
 
 #![allow(clippy::unused_async, clippy::missing_const_for_fn)]
 
@@ -87,9 +85,9 @@ fn signal_gate_with_timeout_stores_timeout_and_action() {
 }
 
 /// **Level isolation (highest-risk design point).** A gate that shares a
-/// topological level with an independent activity must be split into its own
-/// singleton execution level so its `WaitForSignal` suspension is never batched
-/// with the sibling activity's `ScheduleActivity`.
+/// topological level with an independent activity moves to its own singleton
+/// execution level. Its `WaitForSignal` suspension is then never batched with
+/// the sibling activity's `ScheduleActivity`.
 ///
 /// Topology: `a → {activity b, gate g}` (b and g both depend only on a, so Kahn
 /// places them in the same level 1) `→ c`. After isolation no level may contain
@@ -149,9 +147,9 @@ fn signal_gate_is_usable_as_upstream_and_map_source() {
     assert!(tasks[mapped.index()].upstreams.contains(&gate.index()));
 }
 
-/// AC6 — a classic (non-unified) DAG (`workflow_handler: None`) containing a
-/// signal gate is rejected at `try_build` time with an error naming the DAG and
-/// the signal (a gate requires the unified workflow-handler path).
+/// AC6 — `try_build` rejects a classic (non-unified) DAG
+/// (`workflow_handler: None`) that contains a signal gate. The error names the
+/// DAG and the signal. A gate requires the unified workflow-handler path.
 #[test]
 fn classic_dag_with_gate_is_rejected_at_build_time() {
     use autumn_harvest::DagInfo;
@@ -194,9 +192,9 @@ fn classic_dag_with_gate_is_rejected_at_build_time() {
     );
 }
 
-/// Codex round-2 (#746): a gate stores its signal name in `activity_name`, so
-/// the local-activity validator (`validate_dags_do_not_use_local_activities`)
-/// must skip gate tasks — a gate never dispatches that activity. Registering a
+/// Issue #746: a gate stores its signal name in `activity_name`. So the
+/// local-activity validator (`validate_dags_do_not_use_local_activities`)
+/// must skip gate tasks, because a gate never dispatches that activity. Registering a
 /// LOCAL activity named `approval` alongside a unified DAG `signal_gate("approval")`
 /// must therefore still build; before the fix it false-rejected with
 /// `HarvestBuilderError::LocalActivityInDag`.
@@ -330,13 +328,13 @@ mod unified {
 
     /// `extract → signal_gate(timeout, Continue) → load[.condition(payload)]`.
     ///
-    /// The downstream `load` is gated on the *signal payload* — it dispatches
-    /// only when the gate's stored output is `{"approved": true}`. This makes the
-    /// gate's payload binding **observable in history**: a bug that stored
-    /// `Value::Null` for a signal-win (instead of the real payload) flips the
-    /// condition to `false`, so `load` records a `dag_skip` marker instead of an
-    /// `ActivityScheduled` — a replay divergence. Used by the AC5 "both-events,
-    /// signal wins" money fixture below.
+    /// The downstream `load` is gated on the *signal payload*. It dispatches
+    /// only when the gate's stored output is `{"approved": true}`. This makes
+    /// the gate's payload binding **observable in history**. Suppose a bug
+    /// stores `Value::Null` for a signal-win, not the real payload. The
+    /// condition flips to `false`, and `load` records a `dag_skip` marker, not
+    /// an `ActivityScheduled`. That is a replay divergence. The AC5
+    /// "both-events, signal wins" money fixture below uses this DAG.
     #[dag(default_queue = "gate-q")]
     fn gate_signal_payload_dag(dag: &mut DagBuilder) {
         let extract = dag.activity(extract_users);
@@ -549,16 +547,16 @@ mod unified {
 
     // ── AC5: both-events replay fixtures (issue #746 review, mutation-proven) ──
     //
-    // The `WorkflowTestEnv`-generated money tests above deliberately do NOT
-    // arm the timer when a signal will win (see the harness): the signal-branch
-    // test has a *no-timeout* gate (no timer in history) and the timeout tests
-    // queue *no signal*. So a BOUNDED gate that RECEIVES its signal — the
-    // production-realistic "approval-with-SLA that gets approved" shape, where
-    // both a `TimerStarted` (the armed deadline) AND a `SignalReceived` sit in
-    // history — had ZERO replay coverage. A bug storing `Value::Null` instead of
-    // the signal payload on a bounded-gate signal-win passed every generated
-    // test. These hand-built fixtures feed the exact both-events history and
-    // replay the DAG's own generated handler against it.
+    // The `WorkflowTestEnv`-generated money tests above do NOT arm the timer
+    // when a signal will win (see the harness). The signal-branch test has a
+    // *no-timeout* gate, so no timer is in history. The timeout tests queue *no
+    // signal*. So a BOUNDED gate that RECEIVES its signal had ZERO replay
+    // coverage. That is the realistic "approval-with-SLA that gets approved"
+    // shape. Both a `TimerStarted` (the armed deadline) AND a `SignalReceived`
+    // sit in its history. A bug storing `Value::Null` for the signal payload on
+    // a bounded-gate signal-win passed every generated test. These hand-built
+    // fixtures feed the exact both-events history and replay the DAG's own
+    // generated handler against it.
 
     /// The conf-wrapped input the unified DAG walker synthesizes for a plain
     /// (non-mapped) activity node: `{"conf": <dag input>, "dag_task": <name>}`.
@@ -590,10 +588,10 @@ mod unified {
     /// `{"approved": true}` is bound into the gate's output slot, satisfying the
     /// downstream `load`'s `.condition(...)` and scheduling `load`.
     ///
-    /// This is the fixture that a `Value::Null`-for-signal-win bug MUST fail: a
-    /// null gate output flips the condition to `false`, so the walker would
-    /// record a `dag_skip` marker where history has `ActivityScheduled(load)` —
-    /// a replay divergence. (Verified falsifiable by temporarily applying that
+    /// A `Value::Null`-for-signal-win bug MUST fail this fixture. A null gate
+    /// output flips the condition to `false`. The walker then records a
+    /// `dag_skip` marker where history has `ActivityScheduled(load)`. That is a
+    /// replay divergence. (Verified falsifiable by temporarily applying that
     /// mutation during review.)
     #[tokio::test]
     async fn gate_bounded_signal_win_both_events_replays_and_binds_payload() {
@@ -636,8 +634,8 @@ mod unified {
     /// **AC5 — bounded gate, both timer events present, timer wins (Continue).**
     ///
     /// History has `TimerStarted` then `TimerFired` and NO signal, so the
-    /// deadline wins; `on_timeout = Continue` proceeds past the gate (null gate
-    /// output) and the unconditional downstream `load` still runs.
+    /// deadline wins. `on_timeout = Continue` proceeds past the gate with a null
+    /// gate output, and the unconditional downstream `load` still runs.
     #[tokio::test]
     async fn gate_bounded_timer_win_continue_replays_downstream() {
         let id_e = ActivityExecId::new();
@@ -723,18 +721,18 @@ mod unified {
     }
 
     /// **AC1 direct payload binding.** `gate_signal_payload_dag`'s downstream
-    /// `load` is `.condition`-gated on the gate's stored output, so whether it
-    /// dispatches is a direct, live-run function of the *signal payload* — not a
-    /// null sentinel. A matching payload dispatches `load`; a non-matching one
-    /// skips it. (This is the live-run twin of the both-events replay money
-    /// fixture above.)
+    /// `load` is `.condition`-gated on the gate's stored output. So its dispatch
+    /// is a direct, live-run function of the *signal payload*, not a null
+    /// sentinel. A matching payload dispatches `load`; a non-matching one skips
+    /// it. (This is the live-run twin of the both-events replay money fixture
+    /// above.)
     ///
     /// **AC3 note.** The gate lowers onto `wait_for_signal`, which consumes a
-    /// `SignalReceived` event regardless of how it was delivered — the standalone
-    /// signal route, `signal_with_start` (#244), or in-workflow
-    /// `signal_external_workflow` all append the same `SignalReceived`. Delivery
-    /// is therefore route-agnostic at the gate, so a payload delivered via
-    /// signal-with-start binds identically to the queued signal here; the
+    /// `SignalReceived` event however it was delivered. The standalone signal
+    /// route, `signal_with_start` (#244), and in-workflow
+    /// `signal_external_workflow` all append the same `SignalReceived`. So
+    /// delivery is route-agnostic at the gate. A payload delivered via
+    /// signal-with-start binds identically to the queued signal here. The
     /// both-events replay fixtures replay exactly such a `SignalReceived`.
     #[tokio::test]
     async fn gate_signal_payload_binds_into_downstream_condition() {
@@ -755,10 +753,9 @@ mod unified {
              dispatch the conditioned downstream"
         );
 
-        // Non-matching payload → condition false → load skipped. (A null gate
-        // output would also skip it, which is exactly why the matching case
-        // above — where load DOES run — proves the real payload, not a sentinel,
-        // is bound.)
+        // Non-matching payload → condition false → load skipped. A null gate
+        // output would also skip it. So the matching case above, where load DOES
+        // run, proves that the real payload is bound, not a sentinel.
         let rejected = WorkflowTestEnv::new()
             .mock_activity("extract_users", |_| Ok(json!("extracted")))
             .mock_activity("load_users", |_| Ok(json!("loaded")))
@@ -776,10 +773,10 @@ mod unified {
     }
 
     /// **Level isolation, end-to-end.** The builder-level
-    /// `signal_gate_is_isolated_into_its_own_singleton_level` proves the split;
-    /// this proves it *matters*: a DAG whose Kahn topology co-locates an activity
-    /// and a gate in one level runs cleanly (the gate's `WaitForSignal` is never
-    /// batched with the sibling's `ScheduleActivity`, which the worker rejects).
+    /// `signal_gate_is_isolated_into_its_own_singleton_level` proves the split.
+    /// This test proves it *matters*. A DAG whose Kahn topology puts an activity
+    /// and a gate in one level runs cleanly. The gate's `WaitForSignal` is never
+    /// batched with the sibling's `ScheduleActivity`, which the worker rejects.
     #[tokio::test]
     async fn mixed_level_gate_and_activity_run_cleanly_end_to_end() {
         let outcome = WorkflowTestEnv::new()

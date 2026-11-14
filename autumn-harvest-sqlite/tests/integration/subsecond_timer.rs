@@ -1,16 +1,15 @@
-//! FIX 2 (Codex #1069 P2, runtime.rs:686): durable timer deadlines are stored at
-//! MILLISECOND precision, so a timer never fires before its true sub-second
-//! deadline.
+//! Durable timer deadlines are stored at MILLISECOND precision (issue #1069), so a
+//! timer never fires before its true sub-second deadline.
 //!
-//! Before the fix the drivers passed `now.timestamp()` (whole seconds) into the
-//! arm calculation, flooring the arm instant before adding `duration_secs`. A
-//! timer armed at `…000.900` with duration `1s` stored `fire_at = …001` (whole
-//! second), so a poll at `…001.001` fired it after only ~100 ms — ~900 ms EARLY —
-//! violating "a timer never resolves before its deadline". Milliseconds
-//! throughout (`now.timestamp_millis()` at the seam + `duration_secs * 1000` in
-//! the arm calc) preserves the sub-second deadline; every internal epoch value
-//! (`fire_at`, `received_at`, `run_at`) is a relative epoch-millisecond, so the
-//! comparison stays self-consistent with no DDL change.
+//! The drivers once passed `now.timestamp()` (whole seconds) into the arm
+//! calculation. That floored the arm instant before it added `duration_secs`. A
+//! timer armed at `…000.900` with duration `1s` stored `fire_at = …001`. A poll at
+//! `…001.001` then fired it after only ~100 ms, ~900 ms EARLY. That violated "a
+//! timer never resolves before its deadline". Milliseconds throughout keep the
+//! sub-second deadline: `now.timestamp_millis()` at the seam and
+//! `duration_secs * 1000` in the arm calculation. Every internal epoch value
+//! (`fire_at`, `received_at`, `run_at`) is in epoch milliseconds. So the comparison
+//! stays self-consistent with no DDL change.
 
 #![allow(clippy::used_underscore_binding)]
 
@@ -71,8 +70,8 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
 
     // Drive 2 at t0 + 100 ms (= 3_000_001.000 s). This is BEFORE the true deadline
     // (3_000_001.900 s), so the timer must NOT fire — the run stays WaitingTimer.
-    // Pre-fix (whole-second flooring) the deadline was 3_000_001 s and this poll —
-    // at 3_000_001 s — fired it ~900 ms early, completing the run.
+    // With whole-second flooring, the deadline was 3_000_001 s. This poll at
+    // 3_000_001 s fired it ~900 ms early and completed the run.
     let state = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::milliseconds(100))
         .await
@@ -95,9 +94,8 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     );
 }
 
-// The precision change is uniform, so a whole-second arm (the common case, used
-// by every other timer test) still fires exactly at its whole-second deadline —
-// no regression for integer durations.
+// The precision change is uniform. So a whole-second arm, the common case in every
+// other timer test, still fires exactly at its whole-second deadline.
 #[tokio::test]
 async fn whole_second_timer_still_fires_at_its_deadline() {
     let (_dir, path) = temp_db();
@@ -115,7 +113,6 @@ async fn whole_second_timer_still_fires_at_its_deadline() {
         "a whole-second arm stores a whole-second-millis deadline"
     );
 
-    // Just before the deadline: not fired.
     let state = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::milliseconds(999))
         .await
@@ -125,7 +122,6 @@ async fn whole_second_timer_still_fires_at_its_deadline() {
         "must not fire 1 ms before the deadline, got {state:?}"
     );
 
-    // At the deadline: fires.
     let state = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
         .await

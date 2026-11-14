@@ -54,9 +54,8 @@ fn shard_db_name(cluster: &db::ShardCluster) -> String {
 /// test that drops a lease and immediately re-triggers the sweep can
 /// therefore race the server's own cleanup. It could see a
 /// stale-but-still-listed backend, and wrongly skip a database that is
-/// genuinely abandoned. Bounded, so a server that never clears the backend
-/// fails loudly
-/// instead of hanging the suite.
+/// genuinely abandoned. The wait is bounded, so a server that never clears
+/// the backend fails loudly instead of hanging the suite.
 async fn wait_for_connections_to_clear(admin: &mut AsyncPgConnection, datname: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while super::claim_bench_support::db::database_has_connections(admin, datname).await {

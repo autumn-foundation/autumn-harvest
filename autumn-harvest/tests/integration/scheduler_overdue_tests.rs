@@ -1,16 +1,16 @@
 #![cfg(feature = "db")]
 //! Overdue-schedule detection tests — issue #696.
 //!
-//! Server-side detection that an *active* schedule is overdue to fire relative
-//! to its own cadence (the scheduler loop stalled, `next_run_at` wedged in the
-//! past, an HA claim that never released, or all scheduler replicas down).
+//! Server-side detection that an *active* schedule is overdue against its own
+//! cadence. Causes include a stalled scheduler loop, a `next_run_at` wedged in
+//! the past, an HA claim that never released, or all scheduler replicas down.
 //!
-//! These tests drive the per-shard sampler function
-//! (`scheduler::sample_overdue_schedules`) against a real Postgres container
-//! and assert the `harvest.schedule.overdue` gauge is emitted correctly. AC3
-//! (intentionally-not-firing states) and the at-capacity false-positive guard
-//! are exercised in the DB path here; the pure predicate (`schedule_overdue`)
-//! is unit-tested without a database in `scheduler.rs`.
+//! These tests drive the per-shard sampler
+//! (`scheduler::sample_overdue_schedules`) against a real Postgres container.
+//! They assert that it emits the `harvest.schedule.overdue` gauge correctly.
+//! The DB path here covers AC3 (intentionally-not-firing states) and the
+//! at-capacity false-positive guard. `scheduler.rs` unit-tests the pure
+//! predicate (`schedule_overdue`) without a database.
 
 use std::sync::Mutex;
 
@@ -66,10 +66,10 @@ impl MetricsRecorder for RecordingMetrics {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 //
-// Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-// these against a shared local cluster (Docker-free); otherwise a fresh
-// testcontainers Postgres 16 is started per test. On a shared DB each test
-// `scrub()`s first for isolation.
+// Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run these against
+// a shared local cluster without Docker. Otherwise each test starts a fresh
+// testcontainers Postgres 16. On a shared DB, each test calls `scrub()` first
+// for isolation.
 
 async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -152,8 +152,8 @@ async fn insert_running_execution(conn: &mut AsyncPgConnection, wf_name: &str) {
     conn.batch_execute(&sql).await.expect("insert execution");
 }
 
-/// Insert a workflow schedule with explicit bound/overlap fields (Codex P2
-/// tests): `overlap_policy`, `catchup`, `max_runs`, `runs_started`, `end_at`.
+/// Insert a workflow schedule with explicit bound and overlap fields:
+/// `overlap_policy`, `catchup`, `max_runs`, `runs_started`, `end_at`.
 #[allow(clippy::too_many_arguments)]
 async fn insert_schedule_bounded(
     conn: &mut AsyncPgConnection,
@@ -183,7 +183,7 @@ async fn insert_schedule_bounded(
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick hasn't stamped it
+            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick has not stamped it
             dsl::max_runs.eq(max_runs),
             dsl::runs_started.eq(runs_started),
             dsl::end_at.eq(end_at),
@@ -195,7 +195,7 @@ async fn insert_schedule_bounded(
 }
 
 /// Insert a daily-cron workflow schedule attached to a calendar + skip policy
-/// (Codex round 3 calendar-deferral test). `calendar_name = None` disables the
+/// for the calendar-deferral tests. `calendar_name = None` disables the
 /// calendar (the control case). Uses a daily midnight cron so a slot on an
 /// excluded (weekend) day is rebased to the next business day.
 async fn insert_calendar_schedule(
@@ -338,8 +338,8 @@ async fn at_capacity_schedule_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
     let now = Utc::now();
     // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
-    // catchup is the tick's DEFERRING config (Codex P2-B), so at-capacity holds
-    // next_run_at in the past and the predicate suppresses.
+    // catchup is the tick's DEFERRING config. So at-capacity holds next_run_at
+    // in the past, and the predicate suppresses.
     insert_schedule_bounded(
         &mut conn,
         "busy_wf",
@@ -399,11 +399,13 @@ async fn overdue_schedule_samples_reports_lag() {
     );
 }
 
-/// AC6 "backfill" term: a HEALTHY schedule (fresh `next_run_at`) with an
-/// in-progress backfill (#337 creates independent RUNNING executions carrying
-/// the schedule's `workflow_name`, and never touches the live `next_run_at`)
-/// reports `overdue: false`. Backfill runs can only inflate the running basis
-/// (pushing toward suppression), never cause a false positive.
+/// AC6 "backfill" term: a HEALTHY schedule with an in-progress backfill
+/// reports `overdue: false`.
+///
+/// The schedule has a fresh `next_run_at`. A backfill (#337) creates
+/// independent RUNNING executions that carry the schedule's `workflow_name`.
+/// It never touches the live `next_run_at`. Backfill runs can only inflate the
+/// running basis (pushing toward suppression), never cause a false positive.
 #[tokio::test]
 async fn backfill_in_progress_does_not_flag_overdue() {
     let (mut conn, _c) = setup_db().await;
@@ -436,17 +438,19 @@ async fn backfill_in_progress_does_not_flag_overdue() {
     );
 }
 
-/// BLOCKER 1: the at-capacity basis includes the #607 pending-throttle count,
-/// exactly as the scheduler tick does. A schedule with 0 RUNNING executions but
-/// a pending throttled fire that pushes it to `max_active_runs` (the tick then
-/// deliberately holds `next_run_at` in the past under Skip+catchup) must NOT be
-/// reported overdue — otherwise a throttled schedule pages spuriously.
+/// The at-capacity basis includes the #607 pending-throttle count, exactly as
+/// the scheduler tick does.
+///
+/// The schedule has 0 RUNNING executions and one pending throttled fire that
+/// brings it to `max_active_runs`. Under Skip+catchup the tick deliberately
+/// holds `next_run_at` in the past. The sampler must NOT report it overdue.
+/// Otherwise a throttled schedule pages spuriously.
 #[tokio::test]
 async fn throttle_pending_at_capacity_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
     let now = Utc::now();
     // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
-    // catchup so the tick defers (Codex P2-B) and at-capacity suppresses.
+    // catchup so the tick defers and at-capacity suppresses.
     insert_schedule_bounded(
         &mut conn,
         "throttled_wf",
@@ -475,10 +479,11 @@ async fn throttle_pending_at_capacity_is_not_overdue() {
     );
 }
 
-/// Codex P2-A: a schedule the tick WOULD exhaust (`runs_started >= max_runs`)
-/// but whose tick died before stamping `exhausted_at` (so `exhausted_at IS
-/// NULL`) must NOT be reported overdue — bounded-out is derived from the raw
-/// budget fields, not just `exhausted_at`.
+/// A schedule the tick WOULD exhaust (`runs_started >= max_runs`) is not
+/// overdue, even when `exhausted_at IS NULL`.
+///
+/// Here the tick died before it stamped `exhausted_at`. The sampler derives
+/// bounded-out from the raw budget fields, not just `exhausted_at`.
 #[tokio::test]
 async fn bounded_out_by_max_runs_with_null_exhausted_at_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
@@ -508,10 +513,12 @@ async fn bounded_out_by_max_runs_with_null_exhausted_at_is_not_overdue() {
     );
 }
 
-/// Codex P2-B: a NON-deferring overlap policy (`CancelOther`) at capacity with a
-/// stale `next_run_at` is a GENUINE stall — the tick would ADVANCE `next_run_at`,
-/// so a persistent past value means the scheduler is wedged. Must be reported
-/// overdue (the blanket at-capacity suppression must NOT mask it).
+/// A NON-deferring overlap policy (`CancelOther`) at capacity with a stale
+/// `next_run_at` is a GENUINE stall.
+///
+/// The tick would ADVANCE `next_run_at`, so a persistent past value means the
+/// scheduler is wedged. The sampler must report it overdue. The blanket
+/// at-capacity suppression must NOT mask it.
 #[tokio::test]
 async fn non_deferring_policy_at_capacity_is_overdue() {
     let (mut conn, _c) = setup_db().await;
@@ -544,9 +551,9 @@ async fn non_deferring_policy_at_capacity_is_overdue() {
     );
 }
 
-/// Codex round 3: a calendar `run_next_business_day` schedule whose slot fell on
-/// an excluded (weekend) day is deliberately deferred by the tick to the next
-/// business day; while that adjusted fire is still in the FUTURE the tick keeps
+/// A calendar `run_next_business_day` schedule whose slot fell on an excluded
+/// (weekend) day is deliberately deferred by the tick to the next business day.
+/// While that adjusted fire is still in the FUTURE, the tick keeps
 /// `next_run_at` pinned to the (past) original slot. The sampler must NOT flag it
 /// overdue — reusing the tick's own calendar rebasing. A control run WITHOUT the
 /// calendar (same past slot) IS overdue, proving the calendar resolution is what
@@ -590,7 +597,7 @@ async fn calendar_deferred_weekend_schedule_is_not_overdue_via_sampler() {
     );
 }
 
-/// Codex round 3: detection is preserved for a calendar schedule genuinely wedged
+/// Detection is preserved for a calendar schedule genuinely wedged
 /// PAST its calendar-adjusted fire. Here `now` is a Tuesday well after the rebased
 /// Monday fire, so the effective fire is itself in the past by > grace → overdue.
 #[tokio::test]
@@ -623,9 +630,9 @@ async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
 }
 
 /// Run ONE overdue sampling pass for a single shard connection and emit into
-/// `metrics`, mirroring the worker sampler loop's per-pass reconciliation
-/// (Codex round 5): run [`overdue_schedule_pass`], emit each verdict, then zero
-/// any label from `previous_emitted` that disappeared from this COMPLETE pass via
+/// `metrics`. This mirrors the worker sampler loop's per-pass reconciliation.
+/// Run [`overdue_schedule_pass`] and emit each verdict. Then zero any label from
+/// `previous_emitted` that disappeared from this COMPLETE pass, via
 /// [`autumn_harvest::worker::labels_to_clear`]. Returns `(current keys,
 /// pass_complete)`. Single-shard, so a pass is complete iff the read succeeded.
 async fn run_and_emit_overdue_pass(
@@ -656,9 +663,9 @@ async fn run_and_emit_overdue_pass(
     (current, complete)
 }
 
-/// Codex round 5 F2: a schedule that was overdue and is then deleted has its
-/// gauge series zeroed on the next COMPLETE pass, so `harvest.schedule.overdue`
-/// cannot stick at `1` for a schedule that no longer exists. Drives the real
+/// A schedule that was overdue and is then deleted has its gauge series zeroed
+/// on the next COMPLETE pass. So `harvest.schedule.overdue` cannot stick at `1`
+/// for a schedule that no longer exists. Drives the real
 /// `overdue_schedule_pass` + `worker::labels_to_clear` reconciliation the sampler
 /// loop performs, against a real DB, across a delete. (F1's eager-first-pass is a
 /// structural loop change — sample-before-sleep — with no non-brittle unit seam;

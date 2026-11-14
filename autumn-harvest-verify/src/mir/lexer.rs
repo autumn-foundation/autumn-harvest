@@ -1,10 +1,10 @@
 //! Balanced-delimiter scanning over textual MIR.
 //!
-//! `rustc --emit=mir` prints item paths, types, places and operands that are
-//! full of `:`, `,`, `(` and `<` *inside* nested delimiters
-//! (`<impl at f.rs:9:1: 9:9>::emit`, `{closure@f.rs:16:21: 16:24}`,
-//! `Result::<u64, E>::map_err::<String, {closure@f.rs:104:32: 104:35}>`), so
-//! nothing here may split on a bare byte. Every helper is tolerant: unbalanced
+//! `rustc --emit=mir` prints item paths, types, places and operands with `:`,
+//! `,`, `(` and `<` *inside* nested delimiters (`<impl at f.rs:9:1: 9:9>::emit`,
+//! `{closure@f.rs:16:21: 16:24}`,
+//! `Result::<u64, E>::map_err::<String, {closure@f.rs:104:32: 104:35}>`).
+//! So nothing here may split on a bare byte. Every helper is tolerant: unbalanced
 //! or truncated input yields `None` or a best-effort answer, never a panic.
 
 /// Calls `f(index, byte, depth)` for every byte outside a string or char
@@ -12,9 +12,9 @@
 ///
 /// `depth` is the nesting depth *outside* the delimiter at `index`, so an
 /// opening bracket and its matching closer are both reported at the same
-/// depth. `->` and `=>` are recognised as arrows, so their `>` does not close
-/// a generic argument list; double-quoted strings are skipped wholesale
-/// because MIR assert messages contain `{}` and quotes. A char literal is
+/// depth. `->` and `=>` are arrows, so their `>` does not close a generic
+/// argument list. Double-quoted strings are skipped wholesale, because MIR
+/// assert messages contain `{}` and quotes. A char literal is
 /// skipped the same way, because `const ']'` and `const ','` are operands.
 pub fn walk(s: &str, mut f: impl FnMut(usize, u8, u32) -> bool) {
     let bytes = s.as_bytes();
@@ -196,8 +196,9 @@ pub fn is_wrapped(s: &str) -> bool {
         && match_at(s, 0) == s.len().checked_sub(1)
 }
 
-/// Byte index of the first depth-0 `:` that is not part of a `::` path
-/// separator — the `PATH: TYPE` split point of a decl, a parameter or a
+/// Byte index of the first depth-0 `:` that is not part of a `::` path separator.
+///
+/// It is the `PATH: TYPE` split point of a decl, a parameter or a
 /// `static`/`const` header.
 pub fn find_type_colon(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();

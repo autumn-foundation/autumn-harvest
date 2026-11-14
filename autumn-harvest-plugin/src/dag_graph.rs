@@ -1,9 +1,9 @@
 //! DAG run graph view (issue #690).
 //!
-//! This module contains the **pure** projection that reconstructs a unified
-//! DAG run's node topology — annotated with per-node status, timing, attempts,
-//! and (on failure) the truncated error — purely from the registered
-//! [`DagDefinition`] and the run's recorded [`WorkflowEvent`] history.
+//! This module holds the **pure** projection of a unified DAG run's node
+//! topology. Each node carries its status, timing, attempts and, on failure,
+//! the truncated error. The only inputs are the registered [`DagDefinition`]
+//! and the run's recorded [`WorkflowEvent`] history.
 //!
 //! It is **read-only**: it introduces no new [`WorkflowEvent`] variant, no
 //! migration, and never writes to `harvest_dag_runs`. The handler
@@ -20,83 +20,82 @@
 //!
 //! ### v1 limitation: duplicate activity names
 //!
-//! This view assumes activity names are **unique** within a DAG. Because node
-//! identity is keyed purely by activity name (there is no per-task id in the
-//! recorded history), a DAG that reuses the same activity name across more than
-//! one task yields **ambiguous, duplicated** node entries: two [`DagRunNode`]s
-//! with the identical name, each carrying the same name-keyed status, timing,
-//! and error, and a combined `attempts` count. This is not supported.
+//! This view assumes activity names are **unique** within a DAG. Node
+//! identity is keyed purely by activity name, because the recorded history has
+//! no per-task id. A DAG that reuses one activity name across tasks yields
+//! **ambiguous, duplicated** node entries. Two [`DagRunNode`]s then share the
+//! name and the same name-keyed status, timing and error. They also share a
+//! combined `attempts` count. This is not supported.
 //!
-//! It is the same assumption the #366 retry resolver enforces — but that
-//! resolver *rejects* a duplicate-name DAG outright
+//! The #366 retry resolver makes the same assumption. But that resolver
+//! *rejects* a duplicate-name DAG outright
 //! ([`DagRetryResolveError::AmbiguousNodes`](crate::dag_retry::DagRetryResolveError)
-//! → `400`). This read view deliberately does **not** reject: it is a
-//! best-effort, always-render-the-graph read path, and refusing to render a
-//! validly-running DAG would be worse operator UX than showing the (documented)
+//! → `400`). This read view deliberately does **not** reject. It is a
+//! best-effort read path that always renders the graph. A refusal to render a
+//! validly-running DAG would be worse operator UX than the (documented)
 //! ambiguous duplicates. `DagBuilder::build()` itself does not reject duplicate
 //! activity names, so such a DAG can be registered and run.
 //!
 //! ### v1 limitation: mapped (fan-out) tasks
 //!
-//! A mapped task (`DagBuilder::map_activity`) is a single `DagTask`, but at
+//! A mapped task (`DagBuilder::map_activity`) is a single `DagTask`. At
 //! runtime the unified DAG handler dispatches one activity instance per
-//! input-array element, **all sharing the task's activity name** with distinct
-//! `activity_id`s (no `fan_out:` marker is recorded — the handler hand-rolls the
-//! fan-out via `execute_activity_raw_with_opts`). Because node identity is keyed
-//! purely by activity name and both this view and [`crate::dag_retry::node_outcome`]
-//! select the **latest-scheduled** `ActivityScheduled` for the name, the whole
-//! mapped node collapses to that single instance's outcome. If an earlier mapped
-//! element fails or times out while a later element succeeds, the node is
-//! reported with the later element's status/attempts/error rather than an
-//! aggregate — a `FAILED` run can show the mapped node as `succeeded` or
-//! `cancelled`.
+//! input-array element. **All instances share the task's activity name**, with
+//! distinct `activity_id`s. No `fan_out:` marker is recorded, because the
+//! handler hand-rolls the fan-out via `execute_activity_raw_with_opts`. Node
+//! identity is keyed purely by activity name. Both this view and
+//! [`crate::dag_retry::node_outcome`] select the **latest-scheduled**
+//! `ActivityScheduled` for the name. So the whole mapped node collapses to that
+//! single instance's outcome. An earlier element can fail or time out while a
+//! later one succeeds. The node then shows the later element's
+//! status/attempts/error, not an aggregate. So a `FAILED` run can show the
+//! mapped node as `succeeded` or `cancelled`.
 //!
 //! This is **intentionally identical** to the #366 retry resolver, which
 //! collapses mapped tasks the same way ([`node_outcome`](crate::dag_retry::node_outcome)
 //! has no `map_upstream` awareness). Keeping the two consistent is the point
-//! (AC5): aggregating here would make the graph disagree with the retry
-//! endpoint — an operator could see a mapped node reported `failed` yet have the
-//! retry endpoint reject it as succeeded. A map-aware aggregate outcome is
-//! deferred to a #366 change that updates `node_outcome` and this view together.
+//! (AC5). An aggregate here would make the graph disagree with the retry
+//! endpoint. An operator could see a mapped node as `failed` while the retry
+//! endpoint rejects it as succeeded. A map-aware aggregate outcome is deferred
+//! to a #366 change that updates `node_outcome` and this view together.
 //!
-//! **Empty mapped fan-out** (issue #690 review, Codex). A mapped task over an
-//! *empty* upstream array is a special case of the same limitation: the unified
-//! DAG handler returns `TaskStatus::Succeeded` **without dispatching any
+//! **Empty mapped fan-out** (issue #690). A mapped task over an *empty*
+//! upstream array is a special case of the same limitation. The unified DAG
+//! handler returns `TaskStatus::Succeeded` **without dispatching any
 //! instance** (`autumn-harvest-macros/src/dag.rs`, the `__n_instances == 0`
-//! guard), so the node appends **no** `ActivityScheduled`/activity events at all.
-//! With zero events for the node, [`node_outcome`](crate::dag_retry::node_outcome)
-//! returns [`NodeOutcome::NotAttempted`] and this view reports it as
-//! [`DagNodeStatus::Pending`] on a completed run — not `succeeded`. From history
-//! alone a zero-event, no-marker node is indistinguishable from a not-yet-reached
-//! node (and from a `SkipByTriggerRule` skip, which also records no marker — see
-//! the AC7 scope note below). This is **AC5-consistent** (`node_outcome` returns
-//! `NotAttempted` for the same history, so the graph and the #366 retry path
-//! agree); a precise `succeeded` classification is deferred to the same
-//! coordinated #366 change as the instance-collapse case above.
+//! guard). So the node appends **no** `ActivityScheduled`/activity events at
+//! all. With zero events for the node, [`node_outcome`](crate::dag_retry::node_outcome)
+//! returns [`NodeOutcome::NotAttempted`]. This view then reports
+//! [`DagNodeStatus::Pending`] on a completed run, not `succeeded`. From history
+//! alone, a zero-event, no-marker node looks like a not-yet-reached node. It
+//! also looks like a `SkipByTriggerRule` skip, which records no marker either
+//! (see the AC7 scope note below). This is **AC5-consistent**: `node_outcome`
+//! returns `NotAttempted` for the same history, so the graph and the #366
+//! retry path agree. A precise `succeeded` classification is deferred to the
+//! same coordinated #366 change as the instance-collapse case above.
 //!
 //! ## Status classification (AC5 anchor)
 //!
 //! Base classification comes from [`crate::dag_retry::node_outcome`], the exact
-//! function the #366 retry path uses, so a node the retry path treats as
+//! function the #366 retry path uses. So a node that the retry path treats as
 //! `Failed` reports [`DagNodeStatus::Failed`] here. Two derived statuses layer
 //! on top of the base outcome:
 //!
 //! * A [`NodeOutcome::Cancelled`] node (scheduled, no terminal event) is
-//!   reported as [`DagNodeStatus::Running`] while the run is still
-//!   `RUNNING`/`SUSPENDED`, and [`DagNodeStatus::Cancelled`] once the run has
-//!   reached a terminal state.
+//!   [`DagNodeStatus::Running`] while the run is still `RUNNING`/`SUSPENDED`.
+//!   It is [`DagNodeStatus::Cancelled`] once the run is terminal.
 //! * A [`NodeOutcome::NotAttempted`] node is reported as
-//!   [`DagNodeStatus::Skipped`] when a `dag_skip:{task_index}` marker was
-//!   recorded for it (a #482 data-dependent condition branch that was not
-//!   taken), and [`DagNodeStatus::Pending`] otherwise (never reached).
+//!   [`DagNodeStatus::Skipped`] when it has a recorded `dag_skip:{task_index}`
+//!   marker. That marks a #482 data-dependent condition branch not taken.
+//!   Otherwise it is [`DagNodeStatus::Pending`] (never reached).
 //!
 //! ### AC7 scope note
 //!
 //! Only [`DagDispatchDecision::SkipByCondition`](autumn_harvest::dag::DagDispatchDecision)
 //! (issue #482, data-dependent) records a `dag_skip:` marker. A
-//! `SkipByTriggerRule` skip records **no** marker and is therefore
-//! indistinguishable from `pending` via history alone — which is acceptable per
-//! the issue's AC7 wording, which targets #482 data-dependent branches.
+//! `SkipByTriggerRule` skip records **no** marker. So history alone cannot
+//! tell it from `pending`. The issue's AC7 wording accepts that, because it
+//! targets #482 data-dependent branches.
 
 use std::collections::BTreeSet;
 
@@ -124,9 +123,10 @@ pub enum DagNodeStatus {
     Failed,
     /// The node's activity timed out.
     TimedOut,
-    /// The node's activity was scheduled but never recorded a terminal event,
-    /// and the run has itself reached a terminal state (it was cancelled /
-    /// force-failed while the activity was in flight).
+    /// The node's activity was scheduled but never recorded a terminal event.
+    ///
+    /// The run itself is terminal: it was cancelled or force-failed while the
+    /// activity was in flight.
     Cancelled,
     /// The node's activity is scheduled-but-not-terminal on a run that is still
     /// `RUNNING`/`SUSPENDED`.
@@ -174,10 +174,11 @@ pub struct DagRunNode {
     /// When the node's latest attempt reached a terminal event, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// Number of execution attempts of the node's latest attempt-chain — the
-    /// count of `ActivityStarted` events for its authoritative `activity_id`
-    /// (one per worker claim, so activity-level retries are counted). `0` for a
-    /// never-scheduled node.
+    /// Number of execution attempts of the node's latest attempt-chain.
+    ///
+    /// It counts the `ActivityStarted` events for its authoritative
+    /// `activity_id`. There is one per worker claim, so activity-level retries
+    /// count. `0` for a never-scheduled node.
     pub attempts: u32,
     /// Low-cardinality error-type name for a failed node.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,7 +229,7 @@ fn first_line_truncated(error: &str) -> Option<String> {
 ///
 /// Classified by **terminality**, not an explicit RUNNING allow-list: any
 /// non-terminal state is live. This deliberately includes `PAUSED` (a real
-/// non-terminal state, issue #383) — a scheduled-but-not-terminal node on a
+/// non-terminal state, issue #383). A scheduled-but-not-terminal node on a
 /// paused run is still in flight and reports `running`, not `cancelled`. It
 /// also future-proofs against any new non-terminal state. `SUSPENDED` is not a
 /// persisted execution state (the state CHECK constraint forbids it), so it is
@@ -242,19 +243,17 @@ fn is_live_state(exec_state: &str) -> bool {
 /// attempts, and error all describe the same authoritative attempt.
 ///
 /// That mirroring includes [`node_outcome`]'s issue #780 compensator exclusion
-/// (`dag_retry::is_compensation_dispatch`): a compensator dispatch is not a
-/// forward node's dispatch, and a later definition may introduce a forward node
-/// named after an older definition's compensator. Skipping it here keeps
-/// `status` (from `node_outcome`) and the timing/attempts/error this selects
-/// describing the same attempt — without it a name-reused node would report
-/// `pending` alongside the old compensation's timestamps.
+/// (`dag_retry::is_compensation_dispatch`). A compensator dispatch is not a
+/// forward node's dispatch. A later definition may add a forward node named
+/// after an older definition's compensator. The skip keeps `status` (from
+/// `node_outcome`) and the selected timing/attempts/error on the same attempt.
+/// Without it, a name-reused node would report `pending` with the old
+/// compensation's timestamps.
 ///
 /// `dispatched` is [`crate::dag_retry::dispatched_activity_names`] over the
-/// same `events` — the caller's job to compute, since it depends only on
-/// `events` and is identical across every node in one `build_run_graph` call
-/// ([`build_run_graph`] computes it once and threads it down here rather than
-/// this function rebuilding it — an O(events) scan plus a fresh `BTreeSet`
-/// allocation — on every single node).
+/// same `events`. It depends only on `events`, so it is identical for every
+/// node in one call. [`build_run_graph`] computes it once and threads it down.
+/// A rebuild here would cost an O(events) scan and a fresh `BTreeSet` per node.
 fn latest_scheduled(
     events: &[WorkflowEvent],
     node: &str,
@@ -280,16 +279,16 @@ fn latest_scheduled(
 /// and return the index of the **latest** attempt's start.
 ///
 /// An activity-level retry (a `RetryPolicy` firing within a single dispatch)
-/// **reuses the same task row and the same `activity_id`**: the engine keeps the
-/// original `ActivityScheduled` and appends a fresh `ActivityStarted` on every
-/// claim (`queue::requeue_for_retry` re-pends the row and appends no event; a
-/// retryable failure appends no `ActivityFailed` at all — only the final,
-/// retry-exhausting failure does). Counting `ActivityScheduled` would therefore
-/// report `attempts: 1` for a node the engine attempted N times, and anchor the
-/// timing to the original schedule instead of the latest attempt. The
-/// authoritative signal for "how many times a worker ran this" is the number of
-/// `ActivityStarted` events for the node's latest `activity_id` (the same
-/// `activity_id` [`node_outcome`] treats as authoritative).
+/// **reuses the same task row and the same `activity_id`**. The engine keeps
+/// the original `ActivityScheduled` and appends a fresh `ActivityStarted` on
+/// every claim. `queue::requeue_for_retry` re-pends the row and appends no
+/// event. A retryable failure appends no `ActivityFailed` at all; only the
+/// final, retry-exhausting failure does. A count of `ActivityScheduled` would
+/// report `attempts: 1` for a node attempted N times. It would also anchor the
+/// timing to the original schedule, not the latest attempt. The authoritative
+/// count of worker runs is the number of `ActivityStarted` events for the
+/// node's latest `activity_id`. [`node_outcome`] treats the same
+/// `activity_id` as authoritative.
 ///
 /// Returns `(started_count, latest_started_index)` scoped to `activity_id`.
 fn started_attempts(events: &[WorkflowEvent], activity_id: ActivityExecId) -> (u32, Option<usize>) {
@@ -336,9 +335,9 @@ fn terminal_index(events: &[WorkflowEvent], activity_id: ActivityExecId) -> Opti
 
 /// Extract the `(error_type, error)` pair from the terminal `ActivityFailed`
 /// for `activity_id`, first line truncated. The outer `Option` is `Some` when a
-/// terminal `ActivityFailed` exists for this attempt; the inner fields are each
-/// `None` when empty (an empty error string or empty error type serializes as an
-/// omitted field rather than `Some("")`).
+/// terminal `ActivityFailed` exists for this attempt. Each inner field is
+/// `None` when empty. So an empty error string or error type serializes as an
+/// omitted field, not `Some("")`.
 fn failure_detail(
     events: &[WorkflowEvent],
     activity_id: ActivityExecId,
@@ -366,32 +365,32 @@ fn failure_detail(
 /// still identifies the current node).
 ///
 /// A `dag_skip:{idx}` marker (#482) is keyed by the node's *position* in the
-/// DAG, but the marker's `details` also record the bound `task` (activity name)
-/// and `upstreams` (edges) at record time. If the DAG was reordered or a task
-/// renamed after this run recorded its markers, the marker at `task_index` would
-/// belong to a *different* node than the one now at that index — treating the
-/// bare marker name as authoritative would mislabel the wrong current node as
-/// `skipped`. Guard against that by requiring the recorded `details.task` to
-/// still match the current node's activity name, and the recorded
-/// `details.upstreams` fingerprint to still match its edges (old-format markers
-/// without an `upstreams` field pass through for backward compatibility). This
-/// mirrors the Vantage UI's condition-skip validation (`ui.rs`); a marker whose
-/// fingerprint no longer matches is ignored, so the node falls through to
-/// `pending` rather than being falsely reported as `skipped`.
+/// DAG. The marker's `details` also record the bound `task` (activity name)
+/// and `upstreams` (edges) at record time. The DAG can be reordered, or a task
+/// renamed, after this run recorded its markers. The marker at `task_index`
+/// then belongs to a *different* node than the one now at that index. A bare
+/// marker name as authority would mislabel the wrong current node as
+/// `skipped`. So the recorded `details.task` must still match the current
+/// node's activity name. The recorded `details.upstreams` fingerprint must
+/// still match its edges. Old-format markers without an `upstreams` field pass
+/// through for backward compatibility. This mirrors the Vantage UI's
+/// condition-skip validation (`ui.rs`). A marker whose fingerprint no longer
+/// matches is ignored. So the node falls through to `pending`, not a false
+/// `skipped`.
 ///
-/// **Codec/offload deployments (issue #690 review, Codex CLAIM D).** `details`
-/// is a payload field (`PAYLOAD_FIELD_KEYS`), so on a deployment with a
-/// non-identity [`PayloadCodec`](autumn_harvest::payload_codec::PayloadCodec) —
-/// or, in principle, large-payload offload — it is stored as an opaque envelope
-/// (`_harvest_codec_envelope` / `_harvest_offload_envelope`). This read path
-/// deliberately does **not** codec-decode (matching the Vantage UI's `dag_skip`
-/// detection and [`crate::store::load_history_with_timestamps`]), so the
-/// recorded fingerprint is not visible. When `details.task` is unreadable the
-/// fingerprint validation cannot run, so we fall back to matching by the marker
-/// **name/index** alone — which is never a payload field and is always in the
-/// clear — and report the node `skipped`. Reorder-safety is not available in
-/// that opaque case (accepted: this equals the pre-#690 behavior, and skip
-/// detection itself stays correct in every deployment).
+/// **Codec/offload deployments (issue #690).** `details` is a payload field
+/// (`PAYLOAD_FIELD_KEYS`). A deployment with a non-identity
+/// [`PayloadCodec`](autumn_harvest::payload_codec::PayloadCodec) stores it as
+/// an opaque envelope (`_harvest_codec_envelope`). In principle, large-payload
+/// offload does too (`_harvest_offload_envelope`). This read path deliberately
+/// does **not** codec-decode. That matches the Vantage UI's `dag_skip`
+/// detection and [`crate::store::load_history_with_timestamps`]. So the
+/// recorded fingerprint is not visible. With `details.task` unreadable, the
+/// fingerprint validation cannot run. The check then matches by the marker
+/// **name/index** alone and reports the node `skipped`. That name is never a
+/// payload field and is always in the clear. Reorder-safety is not available
+/// in that opaque case. That is accepted: it equals the pre-#690 behavior, and
+/// skip detection itself stays correct in every deployment.
 fn has_skip_marker(
     events: &[WorkflowEvent],
     task_index: usize,
@@ -406,10 +405,10 @@ fn has_skip_marker(
         if *name != marker_name {
             return false;
         }
-        // When the recorded fingerprint is unreadable — an opaque codec/offload
-        // envelope, or an erasure tombstone — validation cannot run, so honor
-        // the skip by the (always-clear) marker name/index alone. See the doc
-        // comment (issue #690 review, Codex CLAIM D).
+        // An opaque codec/offload envelope or an erasure tombstone makes the
+        // fingerprint unreadable. Validation cannot run, so honor the skip by
+        // the (always-clear) marker name/index alone. See the doc comment
+        // (issue #690).
         let Some(recorded_task) = details.get("task").and_then(|v| v.as_str()) else {
             return true;
         };
@@ -444,22 +443,18 @@ pub fn build_run_graph(
     timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
     exec_state: &str,
 ) -> Vec<DagRunNode> {
-    // A view of just the events, for the classification/scan helpers.
     let events: Vec<WorkflowEvent> = timestamped_events
         .iter()
         .map(|(_, event)| event.clone())
         .collect();
     let tasks = def.tasks();
     // `latest_scheduled`'s issue #780 compensator exclusion needs the set of
-    // dispatched activity names — computed once here (it depends only on
-    // `events`, identical for every node below) and threaded down through
-    // `classify`, instead of `latest_scheduled` rebuilding it (an O(events)
-    // scan plus a fresh `BTreeSet` allocation) on every node in the loop.
-    // Only activity (non-gate) nodes ever read `dispatched` (gate nodes take
-    // the early-return branch below and never reach `classify`), so a
-    // gate-only DAG -- which paid nothing for this before the hoist --
-    // skips the O(events) scan entirely rather than paying it unconditionally
-    // for a value nothing will use (issue #690 review, Codex).
+    // dispatched activity names. It depends only on `events`, so it is
+    // computed once here and threaded down through `classify`. A rebuild per
+    // node would cost an O(events) scan and a fresh `BTreeSet`. Only activity
+    // (non-gate) nodes read `dispatched`. Gate nodes take the early-return
+    // branch below and never reach `classify`. So a gate-only DAG skips the
+    // O(events) scan entirely, as it did before the hoist (issue #690).
     let dispatched = if tasks.iter().any(|t| t.signal.is_none()) {
         crate::dag_retry::dispatched_activity_names(&events)
     } else {
@@ -473,11 +468,11 @@ pub fn build_run_graph(
             let node_name = task.activity_name.clone();
 
             // ── Signal/timer gate node (issue #746) ─────────────────────────
-            // A gate has no activity dispatch (and thus no activity events), so
-            // it is classified from `SignalReceived` / gate-timer history plus
-            // the same reachability signals (`has_skip_marker`, trigger-rule
-            // reachability over upstream outcomes) the activity path uses,
-            // rather than through `node_outcome`.
+            // A gate has no activity dispatch, so it has no activity events.
+            // It is not classified through `node_outcome`. It is classified
+            // from `SignalReceived` / gate-timer history. It also uses the
+            // reachability signals of the activity path: `has_skip_marker` and
+            // trigger-rule reachability over upstream outcomes.
             if task.signal.is_some() {
                 let depends_on: Vec<String> = task
                     .upstreams
@@ -500,9 +495,9 @@ pub fn build_run_graph(
             let base = node_outcome(&events, &node_name, &dispatched);
 
             // `classify` is the single source of truth for status, timing,
-            // attempts, and error: all four describe the node's authoritative
-            // (latest-scheduled) attempt-chain, so they never disagree about
-            // which attempt they are reporting.
+            // attempts and error. All four describe the node's authoritative
+            // (latest-scheduled) attempt-chain. So they never disagree about
+            // which attempt they report.
             let (status, started_at, finished_at, error_type, error, attempts) = classify(
                 base,
                 task_index,
@@ -537,45 +532,44 @@ pub fn build_run_graph(
 
 /// Classify a signal/timer gate node (issue #746) from recorded history.
 ///
-/// Reachability is checked BEFORE resolution (issue #746 review, Codex): the
-/// unified walker only awaits a gate's signal *after* `dispatch_decision`
-/// passes, so a matching `SignalReceived` / gate race-timer fire merely present
-/// in history does not prove the gate ran (it may be a signal buffered to the
-/// execution while an upstream was still in flight or later failed). The order
-/// is therefore:
+/// Reachability is checked BEFORE resolution (issue #746). The unified walker
+/// only awaits a gate's signal *after* `dispatch_decision` passes. So a
+/// matching `SignalReceived` / gate race-timer fire present in history does
+/// not prove that the gate ran. It may be a signal buffered to the execution
+/// while an upstream was still in flight or later failed. The order is
+/// therefore:
 ///
 /// 1. A `dag_skip:{task_index}` marker (a #482 data-dependent `.condition(...)`
 ///    on the gate that was not taken) → [`DagNodeStatus::Skipped`].
-/// 2. Reachability (via [`task_reach`], mirroring the walker's own
-///    `dispatch_decision` trigger-rule check over the gate's upstream outcomes):
-///    an upstream still running / never reached, or a trigger rule that skips
-///    the gate → [`DagNodeStatus::Pending`] (the walker never awaited the gate),
-///    regardless of any stray matching signal in history.
-/// 3. Reached → classify by **recorded history order**, mirroring the
-///    `match_signal_or_timer` (#476) replay contract, via [`gate_resolution`]:
+/// 2. Reachability, via [`task_reach`]. It mirrors the walker's own
+///    `dispatch_decision` trigger-rule check over the gate's upstream outcomes.
+///    An upstream still running or never reached, or a trigger rule that skips
+///    the gate, gives [`DagNodeStatus::Pending`]. The walker never awaited the
+///    gate, whatever stray matching signal history holds.
+/// 3. Reached → classify by **recorded history order** via [`gate_resolution`].
+///    This mirrors the `match_signal_or_timer` (#476) replay contract:
 ///    * a matching `SignalReceived` recorded before any matching gate race-timer
 ///      `TimerFired` → [`DagNodeStatus::Succeeded`];
 ///    * a matching gate race-timer `TimerFired` recorded first (a bounded
 ///      `wait_for_signal_timeout` deadline fired before the signal arrived) →
-///      [`DagNodeStatus::TimedOut`]. Order matters, not mere existence: a
-///      deadline that fires first and then has a late matching signal recorded
-///      in the same wake batch replays to a timeout, so the graph view must
-///      agree. `timed_out` collapses the `on_timeout` choice: a `Continue`
-///      timeout (gate succeeds with a null output) and a `FailRun` timeout (the
-///      run fails) both report `timed_out` here — the gate's own outcome *was* a
-///      timeout; whether the run continued or failed is visible on the
-///      downstream / run state, not a separate gate status.
+///      [`DagNodeStatus::TimedOut`]. Order matters, not mere existence. A
+///      deadline can fire first, with a late matching signal in the same wake
+///      batch. That replays to a timeout, so the graph view must agree.
+///      `timed_out` collapses the `on_timeout` choice. A `Continue` timeout
+///      (gate succeeds with a null output) reports `timed_out` here. So does a
+///      `FailRun` timeout (the run fails). The gate's own outcome *was* a
+///      timeout. The downstream or run state shows whether the run continued
+///      or failed; no separate gate status does.
 ///    * neither resolved yet → [`DagNodeStatus::Waiting`] while the run is live,
 ///      else [`DagNodeStatus::Pending`].
 ///
 /// ### v1 limitation: two gates on the same signal name
 ///
-/// Gate resolution is keyed purely by signal name (there is no per-gate id in
-/// the recorded `SignalReceived` / race-timer history), so a DAG with two gates
-/// awaiting the **same** signal name reports both with the same resolution
-/// status once that signal arrives (or its timer fires). This is the same class
-/// of ambiguity as the duplicate-activity-names limitation documented on this
-/// module.
+/// Gate resolution is keyed purely by signal name. The recorded
+/// `SignalReceived` / race-timer history has no per-gate id. So two gates that
+/// await the **same** signal name both report the same resolution status once
+/// that signal arrives (or its timer fires). This is the same class of
+/// ambiguity as the duplicate-activity-names limitation on this module.
 fn gate_status(
     events: &[WorkflowEvent],
     task_index: usize,
@@ -595,14 +589,14 @@ fn gate_status(
     if has_skip_marker(events, task_index, &task.activity_name, &task.upstreams) {
         return DagNodeStatus::Skipped;
     }
-    // Reachability FIRST (issue #746 review, Codex). The unified walker only
-    // calls `wait_for_signal(_timeout)` AFTER `dispatch_decision` passes, so a
-    // matching `SignalReceived` (or gate race-timer fire) merely *present* in
-    // history — e.g. a signal buffered to the execution while an upstream is
-    // still in flight or later failed — does NOT prove the gate ran. Classify a
-    // gate by its recorded resolution ONLY once its upstreams' outcomes show the
-    // walker would have reached it; an unreached (or trigger-rule-skipped) gate
-    // is `pending`, never `succeeded`/`timed_out` from a stray event.
+    // Reachability FIRST (issue #746). The unified walker only calls
+    // `wait_for_signal(_timeout)` AFTER `dispatch_decision` passes. So a
+    // matching `SignalReceived` (or gate race-timer fire) *present* in history
+    // does NOT prove that the gate ran. An example is a signal buffered while
+    // an upstream is still in flight or later failed. Classify a gate by its
+    // recorded resolution ONLY once its upstreams show that the walker reached
+    // it. An unreached (or trigger-rule-skipped) gate is `pending`. A stray
+    // event never makes it `succeeded`/`timed_out`.
     match task_reach(events, task, tasks, tasks.len(), dispatched) {
         TaskReach::NotReached | TaskReach::SkippedByTrigger => return DagNodeStatus::Pending,
         TaskReach::Reached => {}
@@ -626,11 +620,11 @@ fn gate_status(
 
 /// The first gate-resolution event in recorded history order (issue #746).
 ///
-/// Mirrors the `match_signal_or_timer` (#476) replay contract: the winner of a
-/// bounded signal/timer gate is whichever of the matching `SignalReceived` or
-/// the gate race-timer `TimerFired` appears **first in recorded history**, not
-/// merely whichever exists. So a deadline that fires first and then has a late
-/// matching signal recorded in the same wake batch resolves to a timeout.
+/// Mirrors the `match_signal_or_timer` (#476) replay contract. The winner of a
+/// bounded signal/timer gate is the matching `SignalReceived` or gate
+/// race-timer `TimerFired` that appears **first in recorded history**. Mere
+/// existence does not decide it. So a deadline that fires first resolves to a
+/// timeout, even with a late matching signal in the same wake batch.
 enum GateResolution {
     /// A matching `SignalReceived` precedes any matching gate race-timer fire.
     SignalWon,
@@ -643,10 +637,10 @@ enum GateResolution {
 /// Resolve a gate by scanning history in order for the first matching
 /// `SignalReceived` or gate race-timer `TimerFired` (issue #746).
 ///
-/// The gate race-timer id (issue #476, `__signal_timeout:{seq}:{name}`) is
-/// parsed exactly via [`timer_id_matches_gate`] rather than matched with
-/// `ends_with(":{name}")`, which would false-positive: a gate on signal
-/// `approval` must not match a *different* race timer `__signal_timeout:2:x:approval`.
+/// [`timer_id_matches_gate`] parses the gate race-timer id (issue #476,
+/// `__signal_timeout:{seq}:{name}`) exactly. `ends_with(":{name}")` would
+/// false-positive. A gate on signal `approval` must not match a *different*
+/// race timer `__signal_timeout:2:x:approval`.
 fn gate_resolution(events: &[WorkflowEvent], signal_name: &str) -> GateResolution {
     for event in events {
         match event {
@@ -718,17 +712,18 @@ fn task_reach(
     }
 }
 
-/// Resolve an upstream node's terminal [`TaskStatus`] from history, or `None`
-/// when it has not resolved (still in flight, or never reached) — which the
-/// caller treats as "this task has not been reached yet".
+/// Resolve an upstream node's terminal [`TaskStatus`] from history.
+///
+/// It is `None` when the upstream has not resolved (still in flight, or never
+/// reached). The caller treats that as "this task has not been reached yet".
 ///
 /// Mirrors the walker's own skip bookkeeping so downstream reachability is
-/// faithful (issue #746 review, Codex):
+/// faithful (issue #746):
 ///   * a `.condition(...)`-skipped upstream (activity **or** gate) records a
 ///     #482 `dag_skip` marker → [`TaskStatus::Skipped`] (a "done" outcome);
-///   * a **trigger-rule**-skipped upstream records NO marker and no events — the
-///     walker just sets its status to `Skipped` — so it is inferred by
-///     recursively evaluating that upstream's own [`task_reach`]
+///   * a **trigger-rule**-skipped upstream records NO marker and no events.
+///     The walker just sets its status to `Skipped`. So this infers it from
+///     that upstream's own [`task_reach`], evaluated recursively
 ///     ([`TaskReach::SkippedByTrigger`] → `Skipped`).
 fn resolved_upstream_status(
     events: &[WorkflowEvent],
@@ -750,13 +745,13 @@ fn resolved_upstream_status(
         if has_skip_marker(events, idx, &up.activity_name, &up.upstreams) {
             return Some(TaskStatus::Skipped);
         }
-        // Reachability BEFORE resolution (Codex round-3 P2, mirroring
-        // `gate_status`): the unified walker only calls `wait_for_signal(_timeout)`
-        // AFTER `dispatch_decision` passes, so a matching `SignalReceived` / gate
+        // Reachability BEFORE resolution (issue #746, mirroring `gate_status`):
+        // the unified walker only calls `wait_for_signal(_timeout)` AFTER
+        // `dispatch_decision` passes. So a matching `SignalReceived` / gate
         // race-timer `TimerFired` merely *present* in history does NOT prove the
         // walker awaited this gate. A gate whose own trigger rule skipped it (an
-        // upstream failed) is resolved to `Skipped` even though a buffered signal
-        // for it may exist; an unreached gate (an upstream still in flight) is not
+        // upstream failed) resolves to `Skipped`, even if a buffered signal for
+        // it exists. An unreached gate (an upstream still in flight) is not
         // "done" → None. Only a gate the walker actually reached is classified from
         // its recorded signal/timer resolution.
         return match task_reach(events, up, tasks, depth, dispatched) {
@@ -854,17 +849,17 @@ fn classify(
 
     if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name, dispatched) {
         let (started_count, latest_started_idx) = started_attempts(events, activity_id);
-        // A scheduled node has made at least one attempt: the engine appends an
+        // A scheduled node has made at least one attempt. The engine appends an
         // `ActivityStarted` per claim, so `started_count` is the true attempt
-        // count for a claimed node. Floor to 1 so a scheduled-but-not-yet-claimed
-        // PENDING node (or an abbreviated history that omits `ActivityStarted`)
-        // still reports its single pending attempt rather than 0.
+        // count for a claimed node. The floor of 1 covers a scheduled but
+        // unclaimed PENDING node, or a history without `ActivityStarted`. It
+        // still reports its single pending attempt, not 0.
         attempts = started_count.max(1);
         // `started_at` is the LATEST attempt's actual start (its `ActivityStarted`
-        // timestamp), not the original schedule — so a node that backed off and
-        // retried is not made to look like it ran for the whole backoff window.
-        // Fall back to the schedule timestamp when no `ActivityStarted` exists
-        // (not yet claimed), so a running node still shows when it was scheduled.
+        // timestamp), not the original schedule. So a node that backed off and
+        // retried does not look like it ran for the whole backoff window. With
+        // no `ActivityStarted` (not yet claimed), fall back to the schedule
+        // timestamp. A running node then still shows when it was scheduled.
         started_at = latest_started_idx
             .or(Some(sched_idx))
             .and_then(|i| timestamped_events.get(i).map(|(ts, _)| *ts));
@@ -947,8 +942,10 @@ mod tests {
     }
 
     /// A compensator dispatch exactly as issue #780's `unwind_dag_compensations`
-    /// records it: the compensator's own activity name, plus the three-key
-    /// envelope naming the **forward node** being rolled back.
+    /// records it.
+    ///
+    /// It carries the compensator's own activity name and the three-key
+    /// envelope that names the **forward node** being rolled back.
     fn compensator_sched(
         compensator_name: &str,
         compensates_node: &str,
@@ -1030,12 +1027,13 @@ mod tests {
         }
     }
 
-    /// A `dag_skip` marker whose `details` has been replaced by a codec envelope,
-    /// exactly as `PayloadCodecs::transform_event_data` does on write when a
-    /// non-identity `PayloadCodec` is configured (`details` is a payload field).
-    /// The recorded task/upstream fingerprint is opaque here — the read path does
-    /// not codec-decode — so classification must fall back to the (always
-    /// in-the-clear) marker name/index (issue #690 review, Codex CLAIM D).
+    /// A `dag_skip` marker whose `details` is a codec envelope.
+    ///
+    /// `PayloadCodecs::transform_event_data` writes exactly this with a
+    /// non-identity `PayloadCodec`, because `details` is a payload field. The
+    /// read path does not codec-decode, so the task/upstream fingerprint is
+    /// opaque here. Classification must fall back to the (always
+    /// in-the-clear) marker name/index (issue #690).
     fn skip_marker_codec_envelope(task_index: usize) -> WorkflowEvent {
         WorkflowEvent::MarkerRecorded {
             name: format!("dag_skip:{task_index}"),
@@ -1100,16 +1098,16 @@ mod tests {
 
     #[test]
     fn attempts_counts_activity_started_not_scheduled() {
-        // Realistic engine output for an activity-level retry (issue #690
-        // review, Codex CLAIM A). The node is scheduled ONCE (one
-        // ActivityScheduled / activity_id); the engine appends a fresh
-        // ActivityStarted on each claim. `queue::requeue_for_retry` re-pends the
-        // same task row and appends no event, and a *retryable* failure appends
-        // NO ActivityFailed (only a retry-exhausting terminal failure does) — so
-        // a node the engine ran twice has ONE ActivityScheduled and TWO
-        // ActivityStarted. Counting ActivityScheduled (the pre-fix behavior)
-        // would report attempts: 1 and anchor started_at to the original
-        // schedule; this test would fail against that code.
+        // Realistic engine output for an activity-level retry (issue #690).
+        // The node is scheduled ONCE (one ActivityScheduled / activity_id). The
+        // engine appends a fresh ActivityStarted on each claim.
+        // `queue::requeue_for_retry` re-pends the same task row and appends no
+        // event. A *retryable* failure appends NO ActivityFailed; only a
+        // retry-exhausting terminal failure does. So a node run twice has ONE
+        // ActivityScheduled and TWO ActivityStarted. A count of
+        // ActivityScheduled (the pre-fix behavior) would report attempts: 1. It
+        // would also anchor started_at to the original schedule. This test
+        // fails against that code.
         let def = linear_dag();
         let (ia, ib, ic) = (
             ActivityExecId::new(),
@@ -1174,9 +1172,9 @@ mod tests {
     fn attempts_are_scoped_to_the_authoritative_latest_activity_id() {
         // DAG-level re-dispatch (a #366 retry-from-node reset re-runs the node
         // with a fresh activity_id). node_outcome treats the LATEST activity_id
-        // as authoritative; attempts/timing/error follow suit, so `attempts`
-        // reports the latest dispatch's execution count (here: 2 for ic2), not a
-        // cumulative total across the superseded first dispatch (ic1).
+        // as authoritative, and attempts/timing/error follow suit. So `attempts`
+        // reports the latest dispatch's execution count (here: 2 for ic2). It
+        // is not a cumulative total across the superseded first dispatch (ic1).
         let def = linear_dag();
         let (ia, ic1, ic2) = (
             ActivityExecId::new(),
@@ -1210,8 +1208,8 @@ mod tests {
     #[test]
     fn scheduled_but_unclaimed_node_reports_one_attempt() {
         // A node scheduled but not yet claimed (no ActivityStarted) still made
-        // one (pending) attempt; started_at falls back to the schedule time so a
-        // running node shows when it was scheduled.
+        // one (pending) attempt. started_at falls back to the schedule time, so
+        // a running node shows when it was scheduled.
         let def = linear_dag();
         let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
         let events = vec![
@@ -1343,12 +1341,12 @@ mod tests {
 
     #[test]
     fn skip_marker_with_mismatched_task_is_ignored() {
-        // Issue #690 review (Codex CLAIM B): a dag_skip:{idx} marker whose
-        // recorded details.task no longer identifies the current node at that
-        // index — because the DAG was reordered or a task renamed after this run
-        // recorded the marker — must NOT mislabel the current node as skipped.
-        // It falls through to pending. (The pre-fix has_skip_marker matched on
-        // the bare marker name alone and would report Skipped here.)
+        // Issue #690: a dag_skip:{idx} marker can have a recorded details.task
+        // that no longer identifies the current node at that index. The DAG was
+        // reordered, or a task renamed, after this run recorded the marker. It
+        // must NOT mislabel the current node as skipped. It falls through to
+        // pending. (The pre-fix has_skip_marker matched on the bare marker name
+        // alone and would report Skipped here.)
         let def = conditional_dag(); // a(0) -> b(1)[cond] -> c(2)
         let ia = ActivityExecId::new();
         let events = vec![
@@ -1366,8 +1364,8 @@ mod tests {
     #[test]
     fn skip_marker_with_matching_task_and_upstreams_is_skipped() {
         // A full-format marker (task + upstream fingerprint) that still matches
-        // the current node marks it skipped — the positive control for the
-        // validation added in the CLAIM B fix.
+        // the current node marks it skipped. This is the positive control for
+        // the reorder-safety validation.
         let def = conditional_dag(); // b(1) upstream is [0]
         let ia = ActivityExecId::new();
         let events = vec![
@@ -1382,9 +1380,9 @@ mod tests {
 
     #[test]
     fn skip_marker_with_mismatched_upstreams_is_ignored() {
-        // A full-format marker whose recorded upstream fingerprint no longer
-        // matches the current node's edges (topology changed at the same index)
-        // is ignored, mirroring the Vantage UI's validation.
+        // A full-format marker is ignored when its recorded upstream fingerprint
+        // no longer matches the current node's edges. The topology changed at
+        // the same index. This mirrors the Vantage UI's validation.
         let def = conditional_dag(); // b(1) upstream is [0]
         let ia = ActivityExecId::new();
         let events = vec![
@@ -1400,14 +1398,14 @@ mod tests {
 
     #[test]
     fn skip_marker_with_opaque_codec_envelope_details_is_still_skipped() {
-        // Issue #690 review (Codex CLAIM D): on a deployment with a non-identity
-        // PayloadCodec, a `dag_skip:{idx}` marker's `details` is stored as an
-        // opaque codec envelope (`details` is a payload field), so the recorded
-        // task/upstream fingerprint is not readable at this read path. The node
-        // must still be reported `skipped` (falling back to the in-the-clear
-        // marker name/index) rather than `pending` — the marker name is never a
-        // payload field. Before the fix, the unreadable `details.task` made
-        // has_skip_marker return false and the node was wrongly reported pending.
+        // Issue #690: a deployment with a non-identity PayloadCodec stores a
+        // `dag_skip:{idx}` marker's `details` as an opaque codec envelope,
+        // because `details` is a payload field. So this read path cannot read
+        // the task/upstream fingerprint. The node must still report `skipped`,
+        // not `pending`. It falls back to the in-the-clear marker name/index,
+        // which is never a payload field. Before the fix, the unreadable
+        // `details.task` made has_skip_marker return false. The node then
+        // wrongly reported pending.
         let def = conditional_dag(); // a(0) -> b(1)[cond] -> c(2)
         let ia = ActivityExecId::new();
         let events = vec![
@@ -1553,10 +1551,10 @@ mod tests {
         // The node-name==activity-name contract assumes activity names are unique
         // within a DAG. `DagBuilder::build()` does NOT reject duplicates (only the
         // #366 retry resolver does, by rejecting the whole DAG). This read view
-        // neither guards nor rejects — it always shows the graph — so two tasks
-        // sharing an activity name yield two ambiguous, duplicated node entries
-        // with the same name-keyed status. This test pins that documented v1
-        // behavior so a future change is intentional.
+        // neither guards nor rejects; it always shows the graph. So two tasks
+        // that share an activity name yield two ambiguous, duplicated node
+        // entries with the same name-keyed status. This test pins that
+        // documented v1 behavior, so a future change is intentional.
         let mut builder = DagBuilder::new();
         let n1 = builder.activity(a);
         // Same activity function `a` again → same activity_name "a".
@@ -1571,7 +1569,6 @@ mod tests {
         ];
         let nodes = build_run_graph(&def, &events, "RUNNING");
 
-        // Two node entries, both named "a".
         let dupes: Vec<&DagRunNode> = nodes.iter().filter(|n| n.node_name == "a").collect();
         assert_eq!(dupes.len(), 2, "both duplicated nodes are present");
         // Both carry the same name-keyed status (ambiguous by construction).
@@ -1581,9 +1578,9 @@ mod tests {
 
     /// Issue #780 introduced the compensator dispatch — a *new class* of
     /// `ActivityScheduled` this name-keyed view had never seen. Within one
-    /// definition version `CompensatorNameCollidesWithNode` keeps it
-    /// distinguishable from a forward node, but that is a per-version
-    /// guarantee: a later definition may introduce a **forward** node named
+    /// definition version, `CompensatorNameCollidesWithNode` keeps it apart
+    /// from a forward node. But that is a per-version guarantee. A later
+    /// definition may introduce a **forward** node named
     /// after an older definition's compensator. Reading the old compensation
     /// dispatch would report that never-executed node as succeeded, with the
     /// compensation's timestamps.
@@ -1634,20 +1631,20 @@ mod tests {
 
     #[test]
     fn mapped_task_collapses_to_latest_scheduled_instance() {
-        // A mapped (fan-out) task is a single DagTask, but the unified DAG
-        // handler dispatches one activity instance per input-array element, all
-        // sharing the task's activity name with distinct activity_ids and NO
-        // `fan_out:` marker. Because node identity is keyed purely by activity
-        // name and `latest_scheduled` (this view) and `node_outcome` (the #366
-        // retry resolver) both select the LATEST-scheduled instance for the
-        // name, the whole mapped node collapses to that single instance's
-        // outcome (issue #690 review, Codex CLAIM C).
+        // A mapped (fan-out) task is a single DagTask. The unified DAG handler
+        // dispatches one activity instance per input-array element. All share
+        // the task's activity name, with distinct activity_ids and NO
+        // `fan_out:` marker. Node identity is keyed purely by activity name.
+        // `latest_scheduled` (this view) and `node_outcome` (the #366 retry
+        // resolver) both select the LATEST-scheduled instance for the name. So
+        // the whole mapped node collapses to that single instance's outcome
+        // (issue #690).
         //
-        // This test PINS that documented v1 collapse — it is NOT asserting the
-        // "ideal" map-aware aggregate. On a FAILED run where an EARLIER mapped
-        // element failed but the LATER element succeeded, the node is reported
-        // `succeeded` (the latest-scheduled element B), not `failed`. Diverging
-        // from this would break AC5 consistency with the #366 retry endpoint.
+        // This test PINS that documented v1 collapse. It does NOT assert the
+        // "ideal" map-aware aggregate. Here an EARLIER mapped element failed
+        // and the LATER element succeeded, on a FAILED run. The node reports
+        // `succeeded` (the latest-scheduled element B), not `failed`. A change
+        // would break AC5 consistency with the #366 retry endpoint.
         //
         // The mapped node is a single task; the collapse is purely name-keyed,
         // so a plain single-node DAG faithfully models it.
@@ -1684,22 +1681,23 @@ mod tests {
 
     #[test]
     fn empty_mapped_fan_out_reports_pending_on_completed_run() {
-        // A mapped task over an EMPTY upstream array dispatches zero instances:
-        // the unified DAG handler returns TaskStatus::Succeeded without recording
-        // any ActivityScheduled/activity events for the node (dag.rs
+        // A mapped task over an EMPTY upstream array dispatches zero instances.
+        // The unified DAG handler returns TaskStatus::Succeeded and records no
+        // ActivityScheduled/activity events for the node (dag.rs
         // `__n_instances == 0` guard). With zero events, node_outcome returns
-        // NotAttempted and this view reports the node `pending` on a COMPLETED
-        // run — because from history alone an empty-mapped node is
-        // indistinguishable from a not-yet-reached node (and from a
-        // SkipByTriggerRule skip, which also records no marker).
+        // NotAttempted. This view then reports the node `pending` on a
+        // COMPLETED run. From history alone, an empty-mapped node looks like a
+        // not-yet-reached node. It also looks like a SkipByTriggerRule skip,
+        // which records no marker either.
         //
-        // This test PINS that documented v1 behavior — NOT the ideal `succeeded`
+        // This test PINS that documented v1 behavior, NOT the ideal `succeeded`
         // classification. It matches node_outcome's NotAttempted for the same
-        // history (AC5), and a precise fix is deferred to a coordinated #366
-        // change (same rationale as the instance-collapse case). Modelled as a
-        // two-node DAG where the mapped node `a` fans out over nothing while the
-        // downstream node `b` runs and succeeds — the mapped node still reports
-        // `pending`, not `succeeded`, even on a COMPLETED run.
+        // history (AC5). A precise fix is deferred to a coordinated #366
+        // change, for the same reason as the instance-collapse case. The test
+        // uses the four-node `linear_dag`. Its node `a` stands in for a mapped
+        // node that fans out over nothing, so the history holds no events for
+        // `a`. The downstream node `b` runs and succeeds. The mapped node still
+        // reports `pending`, not `succeeded`, even on a COMPLETED run.
         let def = linear_dag(); // a -> b -> c -> d
         let ib = ActivityExecId::new();
         // `a` (the empty mapped fan-out) appends NO events; `b` runs & succeeds.
@@ -1804,11 +1802,10 @@ mod tests {
 
     #[test]
     fn gate_only_dag_classifies_without_an_activity_node() {
-        // issue #690 review, Codex: `build_run_graph` hoists
-        // `dispatched_activity_names` once per call for the (overwhelmingly
-        // common) case of a DAG with at least one activity node, but must
-        // not pay that scan at all for a DAG with none -- the gate-only
-        // shape exercised here.
+        // Issue #690: `build_run_graph` hoists `dispatched_activity_names`
+        // once per call when a DAG has at least one activity node, which is the
+        // common case. A DAG with none must not pay that scan at all. This test
+        // exercises that gate-only shape.
         let def = gate_only_dag();
         let events = vec![(ts(0), started())];
         let nodes = build_run_graph(&def, &events, "RUNNING");
@@ -1901,9 +1898,9 @@ mod tests {
 
     #[test]
     fn gate_reached_and_unsignalled_still_reports_waiting() {
-        // With the upstream succeeded, the gate IS reached; an un-signalled
-        // bounded gate on a live run still reports `waiting` (regression guard
-        // that the reachability gating did not break the genuine waiting case).
+        // With the upstream succeeded, the gate IS reached. An un-signalled
+        // bounded gate on a live run still reports `waiting`. This guards that
+        // the reachability gating did not break the genuine waiting case.
         let def = bounded_gate_dag();
         let ia = ActivityExecId::new();
         let events = vec![
@@ -2011,7 +2008,7 @@ mod tests {
         );
     }
 
-    // ── Issue #746 Codex P2: classify a resolved gate by history ORDER, not
+    // ── Issue #746: classify a resolved gate by history ORDER, not
     // mere existence, to agree with the `match_signal_or_timer` (#476) replay
     // contract. When both a matching signal and the gate's race-timer fire are
     // recorded, whichever appears first in history wins.
@@ -2044,9 +2041,9 @@ mod tests {
 
     #[test]
     fn gate_succeeded_when_signal_precedes_timer_fire() {
-        // Symmetric case: the signal arrives before the gate's race-timer fires,
-        // so the signal wins and the gate reports `succeeded` even though the
-        // timer's stray fire is also recorded.
+        // Symmetric case: the signal arrives before the gate's race-timer fires.
+        // So the signal wins, and the gate reports `succeeded`. The timer's
+        // stray fire is recorded too.
         let def = bounded_gate_dag();
         let ia = ActivityExecId::new();
         let events = vec![
@@ -2070,11 +2067,11 @@ mod tests {
 
     #[test]
     fn gate_timer_before_late_signal_cascades_failrun_to_downstream_pending() {
-        // The same helper feeds upstream gate reachability (Codex P2). A
+        // The same helper feeds upstream gate reachability (issue #746). A
         // FailRun-bounded gate whose timer fires before a late signal resolves
-        // to FAILED (timer won), so a downstream AllSuccess gate is unreachable
-        // and must report `pending` — not `waiting` as an existence-only check
-        // (which would see the signal and treat the upstream as succeeded) would.
+        // to FAILED (timer won). So a downstream AllSuccess gate is unreachable
+        // and must report `pending`. An existence-only check would see the
+        // signal and treat the upstream as succeeded. It would report `waiting`.
         let mut builder = DagBuilder::new();
         let extract = builder.activity(a);
         let gate1 = builder
@@ -2111,7 +2108,7 @@ mod tests {
         );
     }
 
-    // ── Issue #746 Codex round-2 P2: reachability BEFORE resolution, and
+    // ── Issue #746: reachability BEFORE resolution, and
     // trigger-rule / condition skips of upstreams count as resolved for a
     // downstream gate's reachability. ────────────────────────────────────────
 
@@ -2181,9 +2178,9 @@ mod tests {
 
     #[test]
     fn downstream_alldone_gate_reached_when_upstream_activity_trigger_skipped() {
-        // Upstream activity `b` is skipped by its `AllSuccess` trigger rule
-        // (because `a` failed): the walker records NO events and NO marker for it,
-        // just sets its status to Skipped. A downstream `AllDone` gate is then
+        // Upstream activity `b` is skipped by its `AllSuccess` trigger rule,
+        // because `a` failed. The walker records NO events and NO marker for it.
+        // It just sets its status to Skipped. A downstream `AllDone` gate is then
         // reached. The reachability inference must DERIVE the trigger-rule skip
         // from `b`'s own upstream outcomes (mirroring `dispatch_decision`), so the
         // gate reports `waiting`, not `pending`.
@@ -2215,14 +2212,14 @@ mod tests {
     #[test]
     fn downstream_onesuccess_gate_unreachable_when_upstream_gate_trigger_skipped_with_stray_signal()
     {
-        // Codex round-3 P2 (dag_graph.rs:713): `resolved_upstream_status` must
-        // check an upstream GATE's reachability BEFORE resolving it from a
-        // signal/timer, exactly as `gate_status` already does for a gate's own
-        // status. Here upstream gate1("approval") is skipped by its default
-        // AllSuccess trigger rule because activity `a` FAILED — the unified walker
-        // never awaited it — yet a matching `SignalReceived("approval")` is
-        // buffered in history (signals are durable and land even for a skipped
-        // gate). An existence-only classifier resolves gate1 to `Succeeded`, so a
+        // Issue #746: `resolved_upstream_status` must check an upstream GATE's
+        // reachability BEFORE resolving it from a signal/timer. `gate_status`
+        // already does exactly that for a gate's own status. Here upstream
+        // gate1("approval") is skipped by its default AllSuccess trigger rule,
+        // because activity `a` FAILED. The unified walker never awaited it. Yet
+        // a matching `SignalReceived("approval")` is buffered in history.
+        // Signals are durable and land even for a skipped gate. An
+        // existence-only classifier resolves gate1 to `Succeeded`, so a
         // downstream `OneSuccess` gate2 is wrongly reported reachable → `waiting`.
         // With reachability-first, gate1 resolves to `Skipped`, gate2's
         // OneSuccess([Skipped]) fails → gate2 is trigger-skipped → `pending`.

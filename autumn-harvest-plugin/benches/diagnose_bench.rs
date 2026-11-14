@@ -2,45 +2,39 @@
 //! Postgres (issue #1194).
 //!
 //! Issue #809 published a structural argument for `p95 < 500 ms` but never
-//! measured it, and the argument has a hole: the handler's cost is **not**
-//! constant in the shape of the execution being diagnosed. Three drivers are
-//! unbounded (see `build_diagnosis_report` in `src/api.rs` for the code this
-//! bench exercises):
+//! measured it. The argument has a hole. The handler's cost is **not**
+//! constant in the shape of the diagnosed execution. Three drivers are
+//! unbounded. `build_diagnosis_report` in `src/api.rs` is the code under test.
 //!
-//! 1. **Fan-out width x fleet size.** `eligible_worker_ids` is called once
-//!    per pending-activity row, each call doing an in-memory linear scan of
-//!    the whole fetched worker fleet -- O(N x M) CPU work for N pending
-//!    activities and M live workers, even though the two DB queries that
-//!    feed it are each a single flat round trip.
-//! 2. **The replay path.** When the DB-observable categories alone would
-//!    report `sleeping_timer` or `no_pending_work`, the handler drives a full
-//!    history replay (`build_awaitables_report`) bounded by
-//!    `WorkerConfig::query_timeout` (default 5 s -- 10x the 500 ms budget).
+//! 1. **Fan-out width x fleet size.** `eligible_worker_ids` runs once per
+//!    pending-activity row. Each call scans the whole fetched worker fleet in
+//!    memory. That is O(N x M) CPU work for N pending activities and M live
+//!    workers. The two DB queries that feed it are each one flat round trip.
+//! 2. **The replay path.** If the DB-observable categories alone would report
+//!    `sleeping_timer` or `no_pending_work`, the handler drives a full
+//!    history replay (`build_awaitables_report`). `WorkerConfig::query_timeout`
+//!    bounds it (default 5 s -- 10x the 500 ms budget).
 //! 3. **Pending-row count**, which is deliberately unbounded (no `LIMIT`):
 //!    a worst-of fold must see every row to find the one wedged slot.
 //!
 //! This bench sweeps N (fan-out), M (fleet), and history length on the
-//! replay path, plus a single-pending-activity baseline as the control, and
-//! prints markdown-ready tables -- the source data
-//! `docs/performance-diagnose-latency.md` is built from. Section headings in
-//! the published doc are prose, not a verbatim paste of this bench's
-//! `println!` output; only the tables themselves are meant to transcribe
-//! directly.
+//! replay path. A single-pending-activity baseline is the control. It prints
+//! markdown-ready tables, the source data of
+//! `docs/performance-diagnose-latency.md`. The section headings in that doc
+//! are prose, not a paste of this bench's `println!` output. Only the tables
+//! transcribe directly.
 //!
 //! # Why this crate, not `autumn-harvest/benches/`
 //!
 //! `build_diagnosis_report`, `eligible_worker_ids` and
 //! `build_awaitables_report` are all private to `autumn-harvest-plugin`, and
-//! `autumn-harvest` has no dev-dependency on this crate. A bench under
-//! `autumn-harvest/benches/` could therefore only ever measure a
-//! reimplementation of the query shapes, not the literal handler -- exactly
-//! the kind of drift risk the `harvest_events` append-only invariant
-//! elsewhere in this repo is so careful to avoid for a different reason.
-//! Issue #1194 explicitly allows "a plugin-side equivalent", so this bench
-//! drives the real, exported `harvest_api_router` over
-//! `tower::ServiceExt::oneshot` -- the same technique
-//! `tests/query_integration.rs` and its siblings already use -- rather than
-//! calling any internal function directly.
+//! `autumn-harvest` has no dev-dependency on this crate. So a bench under
+//! `autumn-harvest/benches/` could only measure a reimplementation of the
+//! query shapes, not the literal handler. That is a drift risk. Issue #1194
+//! explicitly allows "a plugin-side equivalent". So this bench drives the
+//! real, exported `harvest_api_router` over `tower::ServiceExt::oneshot`. It
+//! calls no internal function directly. `tests/query_integration.rs` and its
+//! siblings use the same technique.
 //!
 //! # Why not criterion
 //!
@@ -50,9 +44,9 @@
 //! read-only by construction (see `build_diagnosis_report`'s own doc
 //! comment), so that constraint does not apply here -- criterion would be
 //! numerically valid. This bench still uses a hand-rolled `harness = false`
-//! loop, purely so its output matches the p50/p99/max table format
-//! `docs/performance.md` already established for `claim_bench`, rather than
-//! introducing a second report shape.
+//! loop. The only reason is to match the p50/p99/max table format that
+//! `docs/performance.md` uses for `claim_bench`, not to add a second report
+//! shape.
 //!
 //! # Running
 //!
@@ -104,18 +98,18 @@ type HarvestApiApp = axum::Router;
 
 // ── The one registered workflow ─────────────────────────────────────────────
 //
-// Every seeded execution uses this workflow. For the fan-out/fleet scenarios
-// the handler is never actually replayed (the DB-observable categories decide
-// the verdict before the replay drive would run), so one shared, simple
-// function covers every scenario:
+// Every seeded execution uses this workflow. The fan-out/fleet scenarios
+// never replay the handler. The DB-observable categories decide the verdict
+// before the replay drive would run. So one shared, simple function covers
+// every scenario:
 //
 //   for i in 0..history_activities { execute_activity_raw("noop", i) }
 //   wait_for_signal("never_arrives")  // never recorded -> parks
 //
-// Seeding a matching history that stops right after the last completed
-// activity pair (no `SignalReceived`, no seal) reproduces exactly the
-// "awaited-but-unsent signal" case `build_awaitables_report` exists to find,
-// with `history_activities` as the knob on replay length.
+// The seeded history stops right after the last completed activity pair (no
+// `SignalReceived`, no seal). That reproduces the "awaited-but-unsent signal"
+// case that `build_awaitables_report` finds. `history_activities` sets the
+// replay length.
 fn diagnose_bench_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -244,10 +238,11 @@ async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
     })
 }
 
-/// Best-effort cleanup for the `HARVEST_TEST_DATABASE_URL` path. Never fails
-/// the run: an orphaned throwaway database is an operator inconvenience, not
-/// a correctness problem, and this bench (unlike `claim_bench`'s CI-gated
-/// budget test) is not expected to run unattended many times per day.
+/// Best-effort cleanup for the `HARVEST_TEST_DATABASE_URL` path.
+///
+/// It never fails the run. An orphaned throwaway database is an operator
+/// inconvenience, not a correctness problem. Unlike `claim_bench`'s CI-gated
+/// budget test, this bench does not run unattended many times per day.
 async fn drop_bench_db(admin_url: &str, db_url: &str) {
     let Ok(parsed) = Url::parse(db_url) else {
         return;
@@ -382,7 +377,7 @@ async fn seed_pending_activities(conn: &mut AsyncPgConnection, exec_id: Executio
 /// Bulk-insert `m` live workers covering the `default` queue, set-based like
 /// `claim_bench_support.rs::seed_workers`. `queues` deliberately includes
 /// `"default"` (unlike `claim_bench`'s workers, whose `claim_task` predicate
-/// doesn't need it) because `eligible_worker_ids`' queue-coverage check does.
+/// does not need it) because `eligible_worker_ids`' queue-coverage check does.
 async fn seed_workers(conn: &mut AsyncPgConnection, m: u32) {
     diesel::sql_query(
         "INSERT INTO harvest_workers \
@@ -403,10 +398,9 @@ async fn seed_workers(conn: &mut AsyncPgConnection, m: u32) {
 struct LatencyStats {
     n: usize,
     p50_ms: f64,
-    // Issue #809 published a `p95 < 500 ms` claim, so p95 is reported
-    // directly rather than leaving the reader to infer it from p99
-    // (p95 <= p99 always holds, but naming the actual statistic the issue
-    // measures is clearer than relying on that monotonicity).
+    // Issue #809 published a `p95 < 500 ms` claim, so this reports p95
+    // directly. p95 <= p99 always holds. But the issue names p95, so the
+    // reader need not infer it from p99.
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
@@ -414,9 +408,9 @@ struct LatencyStats {
 
 /// Nearest-rank percentile: `ceil(pct * n)`, clamped to `[1, n]` -- matching
 /// `claim_bench_support.rs::percentile_ms`. The clamp happens in float space
-/// *before* the cast, so the value cast to `usize` is always an exact
-/// integer in `[1.0, n]`, which is what makes the truncation/sign-loss/
-/// precision-loss lints below provably not apply.
+/// *before* the cast. So the value cast to `usize` is always an exact integer
+/// in `[1.0, n]`. That is why the truncation/sign-loss/precision-loss lints
+/// below provably do not apply.
 fn percentile_ms(sorted_ms: &[f64], pct: f64) -> f64 {
     if sorted_ms.is_empty() {
         return 0.0;
@@ -445,13 +439,12 @@ fn stats_from(mut samples_ms: Vec<f64>) -> LatencyStats {
 }
 
 // `MIN_MEANINGFUL_SAMPLES` mirrors `claim_bench_support.rs`'s floor of the
-// same name: below 100 samples, nearest-rank p99 is `ceil(0.99n) == n` for
-// any n < 100 -- i.e. p99 is silently just `max` relabeled, not an
-// independent tail statistic. `MEASURED`/`REPLAY_MEASURED` are kept
-// comfortably above that floor so every published p99 in
-// `docs/performance-diagnose-latency.md` is a real (if still coarse: the
-// second-worst observation, per the same floor's own doc comment)
-// percentile rather than a relabeled max.
+// same name. For any n < 100, nearest-rank p99 is `ceil(0.99n) == n`. So p99
+// is silently `max` relabeled, not an independent tail statistic.
+// `MEASURED`/`REPLAY_MEASURED` stay comfortably above that floor. So every
+// published p99 in `docs/performance-diagnose-latency.md` is a real
+// percentile, not a relabeled max. It is still coarse: the second-worst
+// observation, per the same floor's own doc comment.
 const MIN_MEANINGFUL_SAMPLES: usize = 100;
 const WARMUP: usize = 15;
 const MEASURED: usize = 120;
@@ -479,12 +472,13 @@ async fn run_scenario(
     stats_from(samples_ms)
 }
 
-/// Marks a row whose `n` fell below [`MIN_MEANINGFUL_SAMPLES`] with `‡`
-/// (`claim_bench.rs`'s convention) so a thin sample can never be silently
-/// transcribed into `docs/performance-diagnose-latency.md` and quoted as a
-/// steady-state number. Not expected to fire given [`MEASURED`]/
-/// [`REPLAY_MEASURED`] are both comfortably above the floor -- a defensive
-/// backstop, not the primary fix.
+/// Marks a row whose `n` fell below [`MIN_MEANINGFUL_SAMPLES`] with `‡`.
+///
+/// This is `claim_bench.rs`'s convention. A thin sample then never goes
+/// silently into `docs/performance-diagnose-latency.md` as a steady-state
+/// number. [`MEASURED`] and [`REPLAY_MEASURED`] are both comfortably above
+/// the floor, so it should not fire. It is a defensive backstop, not the
+/// primary fix.
 fn print_row(label: &str, stats: LatencyStats) {
     let flag = if stats.n < MIN_MEANINGFUL_SAMPLES {
         " ‡"
@@ -558,12 +552,11 @@ async fn fleet_section(app: &HarvestApiApp, pool: &DbPool) {
     }
 }
 
-/// The fan-out and fleet sweeps above vary N and M **independently**, each
-/// holding the other at a small fixed value -- neither alone exercises the
-/// O(N x M) shape the issue actually names ("a wide fan-out ... on a large
-/// fleet"). This scenario combines both sweeps' largest points so the
-/// combined-worst-case number is measured, not extrapolated from the two
-/// independent sweeps.
+/// The fan-out and fleet sweeps above vary N and M **independently**. Each
+/// holds the other at a small fixed value. Neither alone exercises the
+/// O(N x M) shape that the issue names ("a wide fan-out ... on a large
+/// fleet"). This scenario combines the largest points of both sweeps. So the
+/// combined worst case is measured, not extrapolated.
 async fn combined_worst_case_section(app: &HarvestApiApp, pool: &DbPool) {
     let n = *FANOUT_SWEEP.last().expect("non-empty");
     let m = *FLEET_SWEEP.last().expect("non-empty");

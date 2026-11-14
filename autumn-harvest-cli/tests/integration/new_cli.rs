@@ -1,8 +1,8 @@
 //! Integration tests for the `harvest new` project scaffold (issue #692).
 //!
-//! Black-box tests over the crate's public scaffold surface: they derive names,
-//! render the embedded `minimal` template, and drive `run_new` end to end into
-//! `tempfile::tempdir()` sandboxes (mirroring `det_check_cli.rs`).
+//! Black-box tests over the public scaffold surface. They derive names and
+//! render the embedded `minimal` template. They drive `run_new` end to end into
+//! `tempfile::tempdir()` sandboxes, as `det_check_cli.rs` does.
 
 use std::sync::Mutex;
 
@@ -376,9 +376,9 @@ fn existing_file_at_target_is_rejected() {
     let target = dir.path().join("afile");
     std::fs::write(&target, "i am a file").expect("seed file");
 
-    // A plain file at the target is not a directory we can scaffold into; the
-    // command must reject it with a clear "is not a directory" message (not an
-    // opaque create_dir_all OS error), even with --force.
+    // A plain file at the target is not a directory to scaffold into. The
+    // command must reject it with a clear "is not a directory" message, even
+    // with --force. An opaque create_dir_all OS error is not enough.
     let err = run_new("app", Some(&target), false, ScaffoldTemplate::Minimal)
         .expect_err("a plain file at target must be rejected");
     assert!(
@@ -436,7 +436,7 @@ fn default_path_none_resolves_to_name_under_cwd() {
     let name = "scaffold_cwd_demo";
     let result = run_new(name, None, false, ScaffoldTemplate::Minimal);
 
-    // Restore cwd before asserting so a panic can't leave the process adrift.
+    // Restore cwd before asserting so a panic cannot leave the process adrift.
     std::env::set_current_dir(&original).expect("restore cwd");
 
     result.expect("scaffold ok");

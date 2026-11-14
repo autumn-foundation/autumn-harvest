@@ -1,8 +1,8 @@
 //! Call-target resolution over the checked-in MIR fixtures (D7).
 //!
-//! The resolution *query* API proposed during the RED phase is implemented and
-//! its tests are enabled below; the signatures they were written against are
-//! reproduced verbatim in the doc block above them.
+//! The resolution *query* API proposed during the RED phase is implemented, and
+//! its tests are enabled below. The doc block above them reproduces the
+//! signatures they were written against verbatim.
 
 use std::path::{Path, PathBuf};
 
@@ -347,7 +347,7 @@ fn the_real_example_workflow_body_is_reachable_by_path() {
     );
 }
 
-// ── Review round 2: shadowed statics and shadowed impl methods ──────────────
+// ── Shadowed statics and shadowed impl methods ─────────────────────────────
 
 #[test]
 fn statics_are_indexed_by_their_full_printed_path() {
@@ -439,9 +439,9 @@ fn a_bare_static_last_segment_resolves_to_every_candidate() {
 // ── closure spans two bodies share ──────────────────────────────────────────
 
 /// A closure written in a `macro_rules!` body carries the macro *definition*'s
-/// span, so every expansion prints the same `{closure@..}`. Indexing them with
-/// "first one wins" resolves the second expansion's call site into the first
-/// expansion's body — which is how a wall-clock read comes back `proven`.
+/// span, so every expansion prints the same `{closure@..}`. A "first one wins"
+/// index resolves the second expansion's call site into the first expansion's
+/// body. That is how a wall-clock read comes back `proven`.
 #[test]
 fn a_closure_span_two_bodies_share_resolves_to_the_enclosing_ones() {
     let program = Program::build(
@@ -493,10 +493,10 @@ fn an_undisambiguated_closure_span_unions_its_candidates() {
 
 // ── drop glue two types share ───────────────────────────────────────────────
 
-/// `clean::Guard` and `ambient::Guard` answer to the same last segment, so the
-/// glue lookup must narrow on the dropped type's module — and never come back
-/// empty, which reads as "this type has no user `Drop` impl" and drops the
-/// whole glue body on the floor.
+/// `clean::Guard` and `ambient::Guard` answer to the same last segment. So the
+/// glue lookup must narrow on the dropped type's module, and never come back
+/// empty. An empty answer reads as "this type has no user `Drop` impl", and
+/// the whole glue body is lost.
 #[test]
 fn shadowed_drop_glue_resolves_by_the_dropped_types_module() {
     let program =

@@ -1,19 +1,19 @@
 //! Generates runnable Rust integration tests from production event histories.
 //!
-//! This tool takes a recorded workflow execution history (e.g., from a failing
-//! production run) and generates a self-contained `#[tokio::test]` that uses
-//! `WorkflowSimulator` to exactly reproduce the execution locally, mocking out
-//! all activities to match their recorded production outcomes.
+//! This tool takes a recorded workflow execution history, e.g. from a failing
+//! production run. It generates a self-contained `#[tokio::test]` that uses
+//! `WorkflowSimulator` to reproduce the execution exactly, locally. The test
+//! mocks every activity to match its recorded production outcome.
 //!
-//! Expects a **production-shaped** history: every `ActivityCompleted`/
-//! `ActivityFailed` event's `activity_id` has a matching earlier
-//! `ActivityScheduled` (true of every history read from `harvest_events`,
-//! since a real execution appends exactly one terminal event per scheduled
-//! activity). A history produced by `WorkflowSimulator`'s own retry loop
-//! (`simulator.rs`) is not safe input here: its non-terminal retry-attempt
-//! `ActivityFailed` events intentionally use a synthetic id with no matching
-//! `ActivityScheduled`, and the id-keyed lookups below silently drop any
-//! event whose id they don't recognize.
+//! Expects a **production-shaped** history. The `activity_id` of every
+//! `ActivityCompleted`/`ActivityFailed` event has a matching earlier
+//! `ActivityScheduled`. That holds for every history read from
+//! `harvest_events`, since a real execution appends exactly one terminal event
+//! per scheduled activity. A history produced by `WorkflowSimulator`'s own
+//! retry loop (`simulator.rs`) is not safe input here. Its non-terminal
+//! retry-attempt `ActivityFailed` events intentionally use a synthetic id with
+//! no matching `ActivityScheduled`. The id-keyed lookups below silently drop
+//! any event whose id they do not recognize.
 
 use crate::event::WorkflowEvent;
 use crate::types::ActivityExecId;
@@ -90,7 +90,6 @@ impl TestHarnessGenerator {
                     activity_id, error, ..
                 } => {
                     if let Some(name) = activity_names.get(activity_id) {
-                        // For simplicity, we just capture the failure outcome for the mock.
                         mocks.push((name.clone(), Err(error.clone())));
                     }
                 }
@@ -114,7 +113,7 @@ impl TestHarnessGenerator {
             self.handler_name
         )?;
 
-        // De-duplicate mocks by name (take the first occurrence for simplicity).
+        // One mock per name: the first occurrence wins.
         let mut mocked_names = std::collections::HashSet::new();
 
         for (name, outcome) in mocks {

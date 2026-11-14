@@ -3,13 +3,12 @@
 //!
 //! Every module here contains exactly one `#[workflow]` function, named
 //! identically to its module, that **must** come back `proven-deterministic`.
-//! Several of them are deliberately uncomfortable: they route genuinely
-//! non-deterministic values into `ctx.side_effect`, `ctx.metrics()` and
-//! `ctx.logger()`, or branch on `ctx.version(..)`, or use a `HashMap` in ways
-//! that are perfectly safe. Each one is a false positive the analyzer is not
-//! allowed to have, because each corresponds to something real workflows do
-//! constantly — and a determinism gate that fires on `?`, on the logger, or on
-//! the fix its own sibling lint recommends will simply be turned off.
+//! Several are deliberately uncomfortable. They route non-deterministic values
+//! into `ctx.side_effect`, `ctx.metrics()` and `ctx.logger()`. Others branch
+//! on `ctx.version(..)` or use a `HashMap` in safe ways. Each is a false
+//! positive the analyzer must not have, because real workflows do each one
+//! constantly. A determinism gate that fires on `?`, on the logger, or on the
+//! fix its own sibling lint recommends will simply be turned off.
 //!
 //! Naming convention (shared with the seeded and boundary crates): the workflow
 //! function has the same name as its module, so the fully-qualified path is

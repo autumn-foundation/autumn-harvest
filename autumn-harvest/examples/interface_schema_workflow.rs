@@ -1,10 +1,10 @@
 //! Published interaction schema + `/interface` discovery (issue #610).
 //!
-//! Extends the #373 workflow input/output/error schema story to the
-//! *interaction* surface — a workflow's signals, queries, and updates — so an
-//! operator or non-Rust caller can discover the exact JSON shape of every way
-//! to talk to a running workflow, and so malformed payloads are rejected at the
-//! HTTP boundary before durable enqueue.
+//! Extends the #373 workflow input/output/error schemas to the *interaction*
+//! surface: a workflow's signals, queries, and updates. An operator or non-Rust
+//! caller can discover the exact JSON shape of every way to talk to a running
+//! workflow. The HTTP boundary rejects malformed payloads before durable
+//! enqueue.
 //!
 //! Demonstrates:
 //! 1. Declaring a `#[signal]`, `#[query]`, and `#[update]` with a
@@ -13,8 +13,8 @@
 //! 2. Building the `WorkflowInterfaceRecord` that
 //!    `GET /workflows/registered/{name}/interface` returns.
 //! 3. `validate_arg` rejecting a malformed signal payload with a structured
-//!    RFC-6901 `field_path` error — the exact check the signal, signal-with-start,
-//!    and update HTTP routes run before a payload is enqueued.
+//!    RFC-6901 `field_path` error. The signal, signal-with-start, and update
+//!    HTTP routes run this exact check before a payload is enqueued.
 //!
 //! Run with:
 //!   cargo run --example interface_schema_workflow --features schema
@@ -73,9 +73,9 @@ pub async fn order_workflow(_ctx: &WorkflowContext, _input: ()) -> Result<(), St
 
 /// Signal: cancel the in-flight order.
 ///
-/// The `#[signal]` macro derives `cancel_order_info()` from this signature; the
-/// function body itself is never invoked (signals have no handler fn — they are
-/// dispatched via `register_signal_handler`), so it is intentionally unused here.
+/// The `#[signal]` macro derives `cancel_order_info()` from this signature. The
+/// body never runs, because `register_signal_handler` dispatches signals. So it
+/// is intentionally unused here.
 #[allow(dead_code)]
 #[signal(
     workflow = "order_workflow",
@@ -123,8 +123,6 @@ fn order_interface() -> WorkflowInterfaceRecord {
         )],
     }
 }
-
-// ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
     println!("=== Harvest workflow interaction schema demo (issue #610) ===\n");

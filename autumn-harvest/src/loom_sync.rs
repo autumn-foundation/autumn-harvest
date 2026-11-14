@@ -5,11 +5,11 @@
 //! [`MutexGuard`](std::sync::MutexGuard): production code is completely
 //! unaffected.
 //!
-//! Under `RUSTFLAGS="--cfg loom"` (only ever set by the dedicated
-//! `tests/loom_models.rs` model-checking target, never by `cargo test`) these
-//! resolve to [`loom`](https://docs.rs/loom)'s instrumented equivalents so that
+//! Under `RUSTFLAGS="--cfg loom"`, these resolve to
+//! [`loom`](https://docs.rs/loom)'s instrumented equivalents. Then
 //! [`loom::model`] can exhaustively explore the thread interleavings of the
-//! modules that opt in.
+//! modules that opt in. Only the dedicated `tests/loom_models.rs`
+//! model-checking target sets that flag, never `cargo test`.
 //!
 //! ## Scope is deliberately contained
 //!
@@ -26,15 +26,15 @@
 //!
 //! ## Poison handling stays identical
 //!
-//! loom's `Mutex::lock()` returns the very same `std::sync::LockResult` type as
-//! std and never poisons (it always yields `Ok`), so the existing
-//! poison-tolerant `.unwrap_or_else(std::sync::PoisonError::into_inner)` call
-//! sites compile and behave identically under both configurations — no
-//! `cfg`-gating of the lock call itself is required.
+//! loom's `Mutex::lock()` returns the same `std::sync::LockResult` type as std.
+//! It never poisons; it always yields `Ok`. So the existing poison-tolerant
+//! `.unwrap_or_else(std::sync::PoisonError::into_inner)` call sites compile and
+//! behave identically under both configurations. The lock call itself needs no
+//! `cfg`-gating.
 
-// `pub use` (not `pub(crate) use`): the `loom_sync` module is itself private
-// (`mod loom_sync;`), so these re-exports are only reachable crate-internally
-// anyway, and clippy's `redundant_pub_crate` prefers `pub` in that position.
+// `pub use`, not `pub(crate) use`. The `loom_sync` module is itself private
+// (`mod loom_sync;`), so these re-exports are crate-internal anyway. Clippy's
+// `redundant_pub_crate` prefers `pub` in that position.
 #[cfg(loom)]
 pub use loom::sync::{Arc, Mutex, MutexGuard};
 #[cfg(not(loom))]

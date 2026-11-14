@@ -12,10 +12,10 @@
 //! Under `harvest.mode = "split"` / `"external"` it is not. Harvest storage is
 //! a separate database that Autumn has no handle on, and `plugin_migrations`
 //! can only ever target the primary one. Outside the `dev` profile the plugin
-//! only *warns* about pending migrations there, so an operator has to migrate
-//! that database themselves before rolling replicas — which until now meant a
-//! checked-out source tree and the `diesel` CLI. This module is that procedure
-//! as library code, driven by `harvest migrate` in the CLI.
+//! only *warns* about pending migrations there. An operator has to migrate that
+//! database before rolling replicas. Until now that meant a checked-out source
+//! tree and the `diesel` CLI. This module is that procedure as library code,
+//! driven by `harvest migrate` in the CLI.
 //!
 //! # Compatibility with Diesel's bookkeeping
 //!
@@ -27,18 +27,19 @@
 //!   KEY, run_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`;
 //! * a migration's **version** is the part of its directory name before the
 //!   first `_` (`20260409000000_harvest_initial` → `20260409000000`);
-//! * migrations are applied in ascending version order, each inside one
+//! * migrations are applied in ascending version order. Each runs inside one
 //!   transaction together with its ledger row, so a failure leaves neither the
 //!   schema change nor the record of it;
-//! * a migration whose `metadata.toml` says `run_in_transaction = false` — what
-//!   a `CREATE INDEX CONCURRENTLY` migration needs, since Postgres rejects that
-//!   statement inside a transaction block — is applied without one, as Diesel
-//!   applies it (see [`apply_without_transaction`]).
+//! * a migration whose `metadata.toml` says `run_in_transaction = false` is
+//!   applied without one, as Diesel applies it (see
+//!   [`apply_without_transaction`]). A `CREATE INDEX CONCURRENTLY` migration
+//!   needs that, since Postgres rejects that statement inside a transaction
+//!   block.
 //!
 //! A version already present in the ledger is skipped, whoever wrote it. Rows
-//! this binary does not recognise are *reported*, never removed: they normally
-//! mean the database was migrated by a newer build than the one running here
-//! (see [`MigrationPlan::unrecognized`]).
+//! this binary does not recognise are *reported*, never removed. They normally
+//! mean that a newer build than this one migrated the database (see
+//! [`MigrationPlan::unrecognized`]).
 //!
 //! # What it does not do
 //!
@@ -50,11 +51,11 @@
 //!   version across sets is a hard error ([`validate_versions`]) rather than a
 //!   silently skipped migration.
 //! * **No transport policy.** [`connect`] is `AsyncPgConnection::establish`,
-//!   which is `NoTls`. A caller that must reach a TLS-requiring database — the
-//!   `harvest migrate` CLI does, since a managed Harvest database usually is
-//!   one — builds its own connection and calls [`plan_on_connection`] /
-//!   [`apply_to_connection`] instead. Keeping the connector out of here is what
-//!   keeps a rustls stack out of the engine core.
+//!   which is `NoTls`. A caller that must reach a TLS-requiring database builds
+//!   its own connection. It then calls [`plan_on_connection`] /
+//!   [`apply_to_connection`] instead. The `harvest migrate` CLI does this,
+//!   because a managed Harvest database usually requires TLS. Keeping the
+//!   connector out of here keeps a rustls stack out of the engine core.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -93,9 +94,7 @@ const MAX_VERSION_LEN: usize = 50;
 /// Diesel's per-migration metadata file, sitting beside `up.sql`.
 const METADATA_FILE: &str = "metadata.toml";
 
-/// One migration ready to apply: the directory name, the version Diesel keys
-/// the ledger by, the `up.sql` body, and whether Diesel would wrap it in a
-/// transaction.
+/// One migration ready to apply.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct MigrationScript {
     /// Migration directory name, e.g. `20260409000000_harvest_initial`.
@@ -176,19 +175,24 @@ impl MigrationScript {
 ///
 /// # Why the real TOML parser
 ///
-/// This began as a hand-rolled reader of the one key Diesel defines, on the
-/// theory that a strict subset of TOML was cheaper than a dependency. Review
-/// found five separate ways that subset was wrong — an unknown key carrying an
-/// invalid value, a duplicate key, a line that is not `key = value`, an
-/// unbalanced quoted key, and non-ASCII whitespace — each of them a file
-/// `diesel migration run` refuses and this accepted, applying and recording a
-/// migration on metadata nobody agreed about.
+/// This began as a hand-rolled reader of the one key Diesel defines. The theory
+/// was that a strict subset of TOML was cheaper than a dependency. Review found
+/// five ways that subset was wrong:
+///
+/// * an unknown key that carries an invalid value;
+/// * a duplicate key;
+/// * a line that is not `key = value`;
+/// * an unbalanced quoted key;
+/// * non-ASCII whitespace.
+///
+/// Each is a file that `diesel migration run` refuses, but the subset accepted.
+/// It then applied and recorded a migration on metadata nobody agreed about.
 ///
 /// Parsing with the crate Diesel parses with removes the class rather than the
-/// instances: what this reads and what Diesel reads are identical by
+/// instances. What this reads and what Diesel reads are identical by
 /// construction, rejections included. Unknown keys are *ignored* (serde's
-/// default, and Diesel's behaviour) — but only once the file parses as TOML,
-/// which is exactly the distinction the hand parser could not make.
+/// default, and Diesel's behaviour). That holds only once the file parses as
+/// TOML, and the hand parser could not make that distinction.
 ///
 /// # Errors
 ///
@@ -208,8 +212,8 @@ pub fn parse_run_in_transaction(name: &str, metadata: &str) -> HarvestResult<boo
 /// Diesel's `metadata.toml` shape: one optional key, defaulting to `true`.
 ///
 /// `#[serde(default)]` and no `deny_unknown_fields`, mirroring Diesel's own
-/// struct — a key this does not know is ignored rather than refused, so a
-/// future Diesel option does not make such a migration unapplyable here.
+/// struct. A key this does not know is ignored rather than refused. So a future
+/// Diesel option does not make such a migration unapplyable here.
 #[derive(Debug, serde::Deserialize)]
 #[serde(default)]
 struct Metadata {
@@ -218,8 +222,6 @@ struct Metadata {
 
 impl Default for Metadata {
     fn default() -> Self {
-        // Diesel's default, and the one that matters: a migration that says
-        // nothing about it runs inside a transaction.
         Self {
             run_in_transaction: true,
         }
@@ -228,26 +230,23 @@ impl Default for Metadata {
 
 /// Harvest's own migration set, embedded in the binary at build time.
 ///
-/// This is the same `migrations/` directory `autumn_harvest::MIGRATIONS`
-/// embeds for Diesel — regenerated by `build.rs` on every build, so it cannot
+/// This is the same `migrations/` directory that `autumn_harvest::MIGRATIONS`
+/// embeds for Diesel. `build.rs` regenerates it on every build, so it cannot
 /// drift from what Autumn and the plugin apply.
 ///
 /// # Panics
 ///
-/// If a migration directory in this crate is named such that it carries no
-/// usable version — an authoring error in this repository, caught by the
-/// `embedded_set_is_well_formed_and_matches_the_build_manifest` unit test
-/// rather than left to fail against a production database.
+/// If a migration directory in this crate carries no usable version, or has a
+/// `metadata.toml` this cannot read. That is an authoring error in this
+/// repository. The `embedded_set_is_well_formed_and_matches_the_build_manifest`
+/// unit test catches it, rather than letting it fail against a production
+/// database.
 #[must_use]
 #[expect(clippy::expect_used, reason = "a unit test checks the embedded set")]
 pub fn embedded() -> Vec<MigrationScript> {
     let mut scripts: Vec<MigrationScript> = EMBEDDED_MIGRATION_SCRIPTS
         .iter()
         .map(|(name, sql, metadata)| {
-            // A name that cannot produce a version, or a `metadata.toml` this
-            // cannot read, is a build-time authoring error in this repository --
-            // caught by `embedded_set_is_well_formed_and_matches_the_build_manifest`
-            // rather than left to fail against a production database.
             MigrationScript::with_metadata(*name, *sql, metadata)
                 .expect("embedded migration is not well formed")
         })
@@ -270,10 +269,13 @@ pub fn embedded() -> Vec<MigrationScript> {
 ///
 /// # Errors
 ///
-/// [`HarvestError::Config`] when the directory cannot be read, when a
-/// migration directory has no readable `up.sql` (a silently short set is the
-/// failure mode this exists to prevent), when a name carries no usable
-/// version, or when a `metadata.toml` cannot be read unambiguously.
+/// [`HarvestError::Config`] when:
+///
+/// * the directory cannot be read;
+/// * a migration directory has no readable `up.sql` (a silently short set is
+///   the failure mode this exists to prevent);
+/// * a name carries no usable version;
+/// * a `metadata.toml` cannot be read unambiguously.
 pub fn from_directory(dir: &Path) -> HarvestResult<Vec<MigrationScript>> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         HarvestError::Config(format!(
@@ -308,9 +310,9 @@ pub fn from_directory(dir: &Path) -> HarvestResult<Vec<MigrationScript>> {
             ))
         })?;
         // Diesel's optional per-migration metadata. Absent is the common case
-        // and means its default (run in a transaction); present and unreadable
-        // is an error rather than a silent default, because the one thing it
-        // says decides whether the body may contain `CONCURRENTLY`.
+        // and means the default (run in a transaction). Present but unreadable
+        // is an error rather than a silent default. Its one key decides whether
+        // the body may contain `CONCURRENTLY`.
         let metadata_path = dir.join(&name).join(METADATA_FILE);
         let metadata = match std::fs::read_to_string(&metadata_path) {
             Ok(metadata) => metadata,
@@ -330,11 +332,11 @@ pub fn from_directory(dir: &Path) -> HarvestResult<Vec<MigrationScript>> {
 
 /// Reject two migrations that would key the same ledger row.
 ///
-/// Diesel's ledger is keyed by version *alone*, so two sets that independently
-/// picked the same version would leave one of them applied and the other
-/// recorded-but-never-run — invisibly, forever. Autumn resolves that by
-/// assigning the loser a substitute version, which it can only do because it
-/// sees every registered set at once. Here the honest answer is to refuse.
+/// Diesel's ledger is keyed by version *alone*. Two sets that independently
+/// picked the same version would leave one applied and the other recorded but
+/// never run, invisibly and forever. Autumn resolves that by assigning the
+/// loser a substitute version. It can do so only because it sees every
+/// registered set at once. Here the honest answer is to refuse.
 ///
 /// # Errors
 ///
@@ -364,11 +366,11 @@ pub struct MigrationPlan {
     pub pending: Vec<MigrationScript>,
     /// Ledger versions no supplied set accounts for, in version order.
     ///
-    /// Ordinarily this means the database was migrated by a **newer** build
-    /// than the one reporting — the deploy that owns those versions has already
-    /// shipped. It is not an error (Diesel ignores such rows too), but it is
-    /// worth an operator's attention: it can equally mean this binary is
-    /// pointed at the wrong database.
+    /// Ordinarily this means a **newer** build than the one reporting migrated
+    /// the database: the deploy that owns those versions has already shipped.
+    /// It is not an error, and Diesel ignores such rows too. It still deserves an
+    /// operator's attention, because it can equally mean this binary points at
+    /// the wrong database.
     pub unrecognized: Vec<String>,
     /// Whether the ledger table exists yet. `false` on a database that has
     /// never been migrated; [`plan`] does not create it.
@@ -385,19 +387,19 @@ impl MigrationPlan {
 
 /// A run that failed part-way, carrying **what it did before it failed**.
 ///
-/// A run applies migrations one at a time and each commits on its own, so a
-/// failure at the fourth of six leaves three applied. Dropping that on the
-/// error path would leave an operator — or the deploy tooling reading the JSON
-/// report — unable to say which of the six the database now has, which is the
-/// question they need answered before deciding what to do next.
+/// A run applies migrations one at a time and each commits on its own. So a
+/// failure at the fourth of six leaves three applied. If the error path dropped
+/// that, an operator could not say which of the six the database now has.
+/// Deploy tooling that reads the JSON report could not say either. An operator
+/// needs that answer before deciding what to do next.
 ///
 /// [`Display`](std::fmt::Display) delegates to the error, so a caller that only
 /// prints it sees exactly the failure message.
 ///
 /// The `apply*` signatures return this **boxed**. It is the `Err` half of a
-/// `Result` whose `Ok` half is one `MigrationReport`, and an `Err` that dwarfs
-/// the `Ok` is paid on the success path too — `clippy::result_large_err`, which
-/// CI denies. Field access is unaffected: `partial.report` and `partial.error`
+/// `Result` whose `Ok` half is one `MigrationReport`. An `Err` that dwarfs the
+/// `Ok` is paid on the success path too (`clippy::result_large_err`, which CI
+/// denies). Field access is unaffected: `partial.report` and `partial.error`
 /// read through the box.
 #[derive(Debug)]
 pub struct PartialMigration {
@@ -451,10 +453,10 @@ impl From<HarvestError> for PartialMigration {
 
 /// The migration a run stopped on.
 ///
-/// Named separately from the error message so a report — JSON included — says
+/// Named separately from the error message, so a report (JSON included) says
 /// *structurally* what the database may now contain. That matters most for a
-/// `run_in_transaction = false` migration: nothing rolls it back, so an early
-/// statement can stand while a later one fails, and the run has applied
+/// `run_in_transaction = false` migration. Nothing rolls it back, so an early
+/// statement can stand while a later one fails. The run has then applied
 /// something it cannot list.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct FailedMigration {
@@ -497,17 +499,16 @@ pub struct MigrationReport {
     /// order applied, each with the reason it ran that way.
     ///
     /// Per migration rather than per run, because the two reasons take
-    /// different remedies and a single run can contain both: a role that
-    /// cannot lock the ledger applies *every* migration unserialized, and a
-    /// `run_in_transaction = false` migration in the same run is unserialized
-    /// for a reason no grant fixes. Attributing the whole list to one cause
-    /// would send an operator to change something that was never the cause for
-    /// half of it.
+    /// different remedies and one run can contain both. A role that cannot lock
+    /// the ledger applies *every* migration unserialized. A
+    /// `run_in_transaction = false` migration in the same run is unserialized for
+    /// a reason no grant fixes. Attributing the whole list to one cause would send an operator to
+    /// change something that was never the cause for half of it.
     ///
     /// Either way a concurrent migrator can run the same body, so this is
-    /// reported rather than only logged — a caller may be a CLI with no
-    /// tracing subscriber installed, and a degradation nobody sees is not one
-    /// anyone can act on. See [`apply_to_connection`].
+    /// reported rather than only logged. A caller may be a CLI with no tracing
+    /// subscriber installed. Nobody can act on a degradation that nobody sees.
+    /// See [`apply_to_connection`].
     pub applied_unserialized: Vec<UnserializedMigration>,
 }
 
@@ -547,9 +548,10 @@ pub async fn connect(database_url: &str) -> HarvestResult<AsyncPgConnection> {
         .map_err(database_error)
 }
 
-/// Report what [`apply`] would do, without writing anything at all — the
-/// ledger table is not created, so this is safe against a database an operator
-/// is only inspecting.
+/// Report what [`apply`] would do, without writing anything at all.
+///
+/// The ledger table is not created, so this is safe against a database an
+/// operator is only inspecting.
 ///
 /// # Errors
 ///
@@ -584,13 +586,17 @@ pub async fn plan_on_connection(
 ///
 /// # Errors
 ///
-/// A [`PartialMigration`], carrying the failure *and* everything applied before
-/// it: [`HarvestError::Config`] when the supplied set has a duplicate version,
-/// [`HarvestError::Database`] when the connection fails or a migration does —
-/// naming the migration. That migration and its ledger row are rolled back
-/// together; migrations applied earlier in the run stay applied, which is
-/// exactly Diesel's behaviour and the reason migrations are ordered, so
-/// [`PartialMigration::report`] is what says which ones those were.
+/// A [`PartialMigration`] that carries the failure *and* everything applied
+/// before it:
+///
+/// * [`HarvestError::Config`] when the supplied set has a duplicate version;
+/// * [`HarvestError::Database`] when the connection fails or a migration does,
+///   naming the migration.
+///
+/// That migration and its ledger row roll back together. Migrations applied
+/// earlier in the run stay applied. That is exactly Diesel's behaviour and the
+/// reason migrations are ordered. [`PartialMigration::report`] says which ones
+/// those were.
 pub async fn apply(
     database_url: &str,
     scripts: &[MigrationScript],
@@ -606,29 +612,29 @@ pub async fn apply(
 ///
 /// Each migration's transaction takes a `SHARE UPDATE EXCLUSIVE` lock on the
 /// ledger table before running anything. A second migrator racing on the same
-/// database therefore blocks there rather than half-way through the schema
-/// change, and on acquiring the lock re-reads the ledger: finding the version
-/// already committed, it skips the migration as already applied
-/// ([`MigrationReport::applied_concurrently`]) instead of replaying DDL that
-/// has already happened. The lock does not conflict with plain readers, so
-/// `status` is unaffected, nor with `ROW EXCLUSIVE`, so it never blocks another
-/// migrator's own ledger insert — see `apply_in_transaction` for why that
-/// second property is what keeps this deadlock-free.
+/// database therefore blocks there, not half-way through the schema change. On
+/// acquiring the lock it re-reads the ledger. If the version is already
+/// committed, it skips the migration as already applied
+/// ([`MigrationReport::applied_concurrently`]). It does not replay DDL that has
+/// already happened. The lock does not conflict with plain readers, so `status`
+/// is unaffected. It also does not conflict with `ROW EXCLUSIVE`, so it never
+/// blocks another migrator's own ledger insert. See `apply_in_transaction` for
+/// why that second property keeps this deadlock-free.
 ///
 /// That serialization is best-effort by design, because it costs a privilege
-/// Diesel's own bookkeeping never needs: Postgres requires `UPDATE`, `DELETE`
-/// or `TRUNCATE` on a table to lock it in any mode above `ROW EXCLUSIVE`,
-/// while reading the ledger and inserting into it need only `SELECT` and
-/// `INSERT`. A least-privilege role granted exactly those two on a ledger it
-/// does not own would be denied the lock before any body ran. Rather than
-/// refuse a migration set `diesel migration run` would apply for that role,
-/// the run probes the privilege once (`ledger_lock_is_permitted`), warns, and
-/// proceeds unlocked — Diesel's behaviour exactly. Run migrators one at a time
+/// that Diesel's own bookkeeping never needs. Postgres requires `UPDATE`,
+/// `DELETE` or `TRUNCATE` on a table to lock it in any mode above
+/// `ROW EXCLUSIVE`. Reading the ledger and inserting into it need only `SELECT`
+/// and `INSERT`. A least-privilege role granted exactly those two on a ledger
+/// it does not own would be denied the lock before any body ran.
+/// `diesel migration run` would apply the migration set for that role, so this
+/// run does not refuse it. It probes the privilege once (`ledger_lock_is_permitted`), warns,
+/// and proceeds unlocked, exactly as Diesel does. Run migrators one at a time
 /// against such a database.
 ///
-/// The ledger row itself is **not** the contention point, because it is written
-/// after the body — Diesel's order, which a body that consults the ledger can
-/// depend on. See `apply_in_transaction`.
+/// The ledger row itself is **not** the contention point, because the run
+/// writes it after the body. That is Diesel's order, and a body that consults
+/// the ledger can depend on it. See `apply_in_transaction`.
 ///
 /// A `run_in_transaction = false` migration has no transaction to contend on,
 /// so that protection does not apply to it: see `apply_without_transaction`
@@ -646,8 +652,8 @@ pub async fn apply_to_connection(
     create_ledger(conn).await?;
 
     // Decided once for the run: every migration's transaction takes the same
-    // lock, and the answer cannot change mid-run without someone revoking a
-    // grant underneath a deploy.
+    // lock. The answer changes mid-run only if someone revokes a grant
+    // underneath a deploy.
     let lock_ledger = ledger_lock_is_permitted(conn).await?;
     if !lock_ledger {
         tracing::warn!(
@@ -688,10 +694,10 @@ pub async fn apply_to_connection(
             }
             Ok(Applied::Concurrently) => report.applied_concurrently.push(script.name.clone()),
             Ok(Applied::ConcurrentlyAfterBody) => {
-                // Recorded by the other migrator, so it belongs in
-                // `applied_concurrently` — but this run really did execute the
-                // body without the lock, which is the whole point of the
-                // unserialized list.
+                // The other migrator recorded it, so it belongs in
+                // `applied_concurrently`. But this run did execute the body
+                // without the lock, and the unserialized list exists to show
+                // that.
                 report.applied_concurrently.push(script.name.clone());
                 // Only the non-transactional path returns this variant, so the
                 // reason is that path's own.
@@ -701,9 +707,9 @@ pub async fn apply_to_connection(
                 });
             }
             Err(error) => {
-                // Say which it was: a rolled-back migration left nothing
-                // behind, a non-transactional one may have applied part of
-                // its body and needs the operator's eyes before a re-run.
+                // A rolled-back migration left nothing behind. A
+                // non-transactional one may have applied part of its body, and
+                // needs the operator's eyes before a re-run.
                 let aftermath = if script.run_in_transaction {
                     "rolled back"
                 } else {
@@ -716,7 +722,7 @@ pub async fn apply_to_connection(
                 ));
                 // The migrations that DID apply are committed, and are the
                 // caller's to report -- they never travel in the message alone.
-                // The failing migration is named structurally too: when it is
+                // The failing migration is named structurally too. When it is
                 // non-transactional, "nothing applied" and "part of it applied
                 // and nobody can say which" look identical without this.
                 report.failed = Some(FailedMigration {
@@ -736,13 +742,13 @@ pub async fn apply_to_connection(
 
 /// Create the ledger table, tolerating a concurrent creator.
 ///
-/// `CREATE TABLE IF NOT EXISTS` is **not** race-free in Postgres: two sessions
-/// creating the same table at once can leave the loser with a catalog unique
-/// violation (`pg_type_typname_nsp_index`) rather than the "already exists,
-/// skipping" notice. Against a brand-new database that is exactly the moment
-/// two migrators are most likely to collide — and failing there would drop the
-/// loser out before it ever reaches the per-version row contention that makes
-/// the rest of this function safe.
+/// `CREATE TABLE IF NOT EXISTS` is **not** race-free in Postgres. Two sessions
+/// that create the same table at once can leave the loser with a catalog unique
+/// violation (`pg_type_typname_nsp_index`). The loser then does not get the
+/// "already exists, skipping" notice. Two migrators are most likely to collide
+/// against a brand-new database. A failure there would drop the loser out
+/// before it reaches the per-version row contention that makes the rest of this
+/// function safe.
 ///
 /// So a failure is not taken at face value: if the ledger exists afterwards,
 /// someone else created it and there is nothing left to do.
@@ -772,8 +778,8 @@ enum Applied {
     /// Only reachable without a transaction: there the body runs first and the
     /// ledger insert can lose afterwards, with nothing to roll the body back.
     /// Kept distinct from [`Concurrently`](Self::Concurrently) because the two
-    /// differ in the fact an operator needs — whether unlocked DDL ran against
-    /// this database — and collapsing them would let the report claim no
+    /// differ in the fact an operator needs: whether unlocked DDL ran against
+    /// this database. Collapsing them would let the report claim no
     /// unserialized body ran when one did.
     ConcurrentlyAfterBody,
 }
@@ -781,11 +787,11 @@ enum Applied {
 /// Transaction-body failure, split so "already applied" is never inferred from
 /// a database error.
 ///
-/// `AlreadyRecorded` is raised only by an explicit ledger lookup under the
-/// table lock, never by matching `UniqueViolation` on the transaction's result:
-/// a migration whose body legitimately hits a unique constraint would otherwise
-/// be classified as "someone else already applied this" and silently skipped
-/// while reporting success.
+/// `AlreadyRecorded` comes only from an explicit ledger lookup under the table
+/// lock. It never comes from matching `UniqueViolation` on the transaction's
+/// result. Otherwise a migration whose body legitimately hits a unique
+/// constraint would be classified as "someone else already applied this". It
+/// would then be silently skipped while the run reports success.
 enum ApplyError {
     /// The ledger already carries this version — a concurrent migrator
     /// committed it before this transaction took the lock.
@@ -815,21 +821,21 @@ async fn apply_one(
 
 /// Apply a migration whose `metadata.toml` says `run_in_transaction = false`.
 ///
-/// Postgres rejects `CREATE INDEX CONCURRENTLY` — the reason that key exists —
-/// inside a transaction block, so there is no transaction to put the ledger row
-/// in either. Two consequences, both Diesel's as well:
+/// Postgres rejects `CREATE INDEX CONCURRENTLY` inside a transaction block, and
+/// that is the reason the key exists. So there is no transaction to put the
+/// ledger row in either. Two consequences follow, both Diesel's as well:
 ///
 /// * **The body runs first, the ledger row second.** Recording a version before
 ///   a statement that may fail would leave the ledger claiming a migration that
-///   never ran, and no later run can repair that. The reverse order can only
-///   lose the *record* of a migration that did run, which a re-run fixes.
+///   never ran. No later run can repair that. The reverse order can only lose
+///   the *record* of a migration that did run, which a re-run fixes.
 /// * **A partial failure stays partial.** With no transaction, statements that
 ///   already succeeded are not rolled back. The version is not recorded, so the
-///   next run replays the whole body from the start — safe only if that body is
-///   idempotent (`IF NOT EXISTS`). Nothing here can verify that, and a Diesel
-///   migration set is under no obligation to be, so a failure leaves an
-///   operator to inspect what stands before re-running: exactly the position
-///   `diesel migration run` leaves them in.
+///   next run replays the whole body from the start. That is safe only if the
+///   body is idempotent (`IF NOT EXISTS`). Nothing here can verify that, and a
+///   Diesel migration set need not be idempotent. So after a failure an
+///   operator must inspect what stands before re-running.
+///   `diesel migration run` leaves them in exactly that position.
 async fn apply_without_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
@@ -846,18 +852,19 @@ async fn apply_without_transaction(
     match recorded {
         Ok(_) => Ok(Applied::Yes),
         // A unique violation here *usually* means a concurrent migrator
-        // recorded this version while the body was running. Both ran the DDL —
-        // unavoidable without a transaction to contend on, and why such a
-        // migration must be idempotent.
+        // recorded this version while the body was running. Both ran the DDL.
+        // That is unavoidable without a transaction to contend on, and is why
+        // such a migration must be idempotent.
         //
         // Only the row itself proves that, though. This module is explicitly
-        // pointed at ledgers it did not create, and one may carry an extra
-        // constraint or an insert trigger that raises `unique_violation`
+        // pointed at ledgers it did not create. Such a ledger may carry an
+        // extra constraint or an insert trigger that raises `unique_violation`
         // without recording anything. Taking the error at face value would
-        // report a migration as applied, exit 0, and leave a schema change no
-        // ledger row covers — so the next run replays the body, which for a
-        // non-transactional migration is precisely the case that cannot be
-        // rolled back. Confirm the version is there before saying so.
+        // report a migration as applied and exit 0. It would leave a schema
+        // change that no ledger row covers. The next run would then replay the
+        // body. For a non-transactional migration, that is precisely the case
+        // that cannot be rolled back. Confirm the version is there before
+        // saying so.
         Err(error @ DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
             if version_is_recorded(conn, &script.version).await? {
                 // Not plain `Concurrently`: this run's body ran to completion,
@@ -873,9 +880,9 @@ async fn apply_without_transaction(
 
 /// Why `script` would run without the ledger lock, or `None` if it holds it.
 ///
-/// A migration with no transaction is unserialized whatever the privilege, so
-/// that reason is reported in preference to the privilege one: it is the reason
-/// a grant would not fix.
+/// A migration with no transaction is unserialized whatever the privilege. So
+/// that reason takes precedence over the privilege one: it is the reason a
+/// grant would not fix.
 const fn unserialized_reason(
     lock_ledger: bool,
     script: &MigrationScript,
@@ -891,24 +898,24 @@ const fn unserialized_reason(
 
 /// Whether this role may take [`LEDGER_LOCK_MODE`] on the ledger.
 ///
-/// Postgres grants `LOCK TABLE` by mode: `ACCESS SHARE` needs `SELECT`,
-/// `ROW EXCLUSIVE` needs one of `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, and
-/// every stronger mode — [`LEDGER_LOCK_MODE`] among them — needs `UPDATE`,
-/// `DELETE` or `TRUNCATE`.
+/// Postgres grants `LOCK TABLE` by mode. `ACCESS SHARE` needs `SELECT`.
+/// `ROW EXCLUSIVE` needs one of `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`. Every
+/// stronger mode, [`LEDGER_LOCK_MODE`] among them, needs `UPDATE`, `DELETE` or
+/// `TRUNCATE`.
 ///
-/// Diesel's bookkeeping only ever reads the ledger and inserts into it, so a
+/// Diesel's bookkeeping only ever reads the ledger and inserts into it. So a
 /// least-privilege deployment can grant its migration role exactly `SELECT` and
-/// `INSERT` on a ledger that role does not own. Taking the lock unconditionally
-/// would deny such a role before any body ran, on a migration set
-/// `diesel migration run` applies for it perfectly well — breaking the
-/// compatibility this module exists to keep, and doing so at the one moment an
-/// operator is mid-deploy.
+/// `INSERT` on a ledger that role does not own. An unconditional lock would
+/// deny such a role before any body ran. Yet `diesel migration run` applies
+/// that same migration set for the role perfectly well. The refusal would break
+/// the compatibility this module exists to keep, at the one moment an operator
+/// is mid-deploy.
 ///
 /// So the lock is conditional on this probe, which is itself a plain `SELECT`.
-/// Where the privilege is absent the run falls back to exactly Diesel's
-/// behaviour — no ledger lock, no serialization between concurrent migrators —
-/// which is what that role has today and is strictly better than refusing to
-/// run at all.
+/// Where the privilege is absent, the run falls back to exactly Diesel's
+/// behaviour: no ledger lock, and no serialization between concurrent
+/// migrators. That is what the role has today, and it is strictly better than
+/// refusing to run at all.
 async fn ledger_lock_is_permitted(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
     // `has_table_privilege` with a comma-separated list is true if *any* of the
     // listed privileges is held.
@@ -936,11 +943,10 @@ struct LockPermitted {
 
 /// Whether `version` is present in the ledger.
 ///
-/// Both apply paths decide "already applied" with this rather than inferring it
-/// from a unique violation. A violation is ambiguous evidence: the migration's
-/// own SQL can raise one, and on a ledger this module did not create some other
-/// constraint can raise one while recording nothing. A row either is there or
-/// is not.
+/// Both apply paths decide "already applied" with this, not from a unique
+/// violation. A violation is ambiguous evidence. The migration's own SQL can
+/// raise one. On a ledger this module did not create, some other constraint can
+/// raise one while recording nothing. A row either is there or is not.
 async fn version_is_recorded(
     conn: &mut AsyncPgConnection,
     version: &str,
@@ -958,51 +964,53 @@ async fn version_is_recorded(
 /// ledger row second**.
 ///
 /// That order is not cosmetic. A migration body may legitimately consult
-/// `__diesel_schema_migrations` — conditioning DDL on its own version being
-/// absent, say. Recording the version first makes it visible to the body
-/// through the transaction's own writes, so such a migration skips its DDL and
-/// still commits the version: an incomplete schema, permanently marked applied,
-/// from a file `diesel migration run` would have applied correctly. Whatever
-/// serializes concurrent migrators must therefore not be the ledger row itself.
+/// `__diesel_schema_migrations`, for example to condition DDL on its own
+/// version being absent. If the version were recorded first, the body would see
+/// it through the transaction's own writes. Such a migration would skip its DDL
+/// and still commit the version. The result is an incomplete schema,
+/// permanently marked applied, from a file that `diesel migration run` would
+/// have applied correctly. So whatever serializes concurrent migrators must not
+/// be the ledger row itself.
 ///
 /// A `SHARE UPDATE EXCLUSIVE` lock on the ledger table does the serializing
-/// instead. It conflicts with itself, so a second migrator waits here — before
-/// any DDL — rather than half-way through the schema change. It is held to the
-/// end of the transaction and needs no advisory key, keeping this path out of
-/// the keyspace shared with the claim path, `mutex`, `admission_gate` and the
+/// instead. It conflicts with itself, so a second migrator waits here, before
+/// any DDL, not half-way through the schema change. It is held to the end of
+/// the transaction and needs no advisory key. That keeps this path out of the
+/// keyspace shared with the claim path, `mutex`, `admission_gate` and the
 /// scheduler.
 ///
 /// The mode is chosen for what it does *not* conflict with. `ACCESS SHARE`
-/// means `status` and any other plain reader is unaffected. `ROW EXCLUSIVE` —
-/// what an `INSERT` takes — means this lock never blocks a *different*
-/// migrator's ledger insert, and that is what keeps the arrangement
-/// deadlock-free rather than merely convenient.
+/// means `status` and any other plain reader is unaffected. `ROW EXCLUSIVE` is
+/// what an `INSERT` takes, so this lock never blocks a *different* migrator's
+/// ledger insert. That is what keeps the arrangement deadlock-free rather than
+/// merely convenient.
 ///
-/// Diesel's own order is body-then-insert with no ledger lock, so a
+/// Diesel's own order is body-then-insert with no ledger lock. So a
 /// `diesel migration run` (or Autumn's startup path) racing here takes its
-/// locks in the opposite order to this function: the schema object first, the
-/// ledger second. A self-conflicting mode that also blocked `ROW EXCLUSIVE` —
-/// `SHARE ROW EXCLUSIVE`, the obvious first choice — would close that cycle.
-/// This transaction would hold the ledger while waiting on a table the other
-/// migrator has locked for DDL, and that migrator would then wait on the ledger
-/// to record the body it just finished. Postgres would break the deadlock by
-/// aborting one of them, and this command could report a migration as failed
-/// while the competing migrator was in the middle of applying it correctly.
-/// `SHARE UPDATE EXCLUSIVE` lets that insert through, so the other migrator
-/// always finishes and releases its DDL lock, and this transaction proceeds.
+/// locks in the opposite order to this function. It takes the schema object first and the
+/// ledger second. A self-conflicting mode that also blocked `ROW EXCLUSIVE`
+/// would close that cycle. `SHARE ROW EXCLUSIVE`, the obvious first choice, is
+/// such a mode. This transaction would hold the ledger while it waits on a
+/// table the other migrator has locked for DDL. That migrator would then wait
+/// on the ledger to record the body it just finished. Postgres would break the
+/// deadlock by aborting one of them. This command could then report a migration
+/// as failed while the competing migrator was in the middle of applying it
+/// correctly. `SHARE UPDATE EXCLUSIVE` lets that insert through, so the other
+/// migrator always finishes and releases its DDL lock, and this transaction
+/// proceeds.
 ///
 /// What that costs is honest: a migrator that does not take this lock is not
-/// serialized by it, so racing a Diesel migrator can still mean both run the
-/// same body and one fails on its own DDL. Diesel offers no protection against
-/// that either — the guarantee here is over concurrent `harvest migrate` runs,
-/// and it is not worth turning a survivable race against a foreign migrator
-/// into a deadlock to widen it.
+/// serialized by it. Racing a Diesel migrator can still mean both run the same
+/// body and one fails on its own DDL. Diesel offers no protection against that
+/// either. The guarantee here covers concurrent `harvest migrate` runs.
+/// Widening it is not worth turning a survivable race against a foreign
+/// migrator into a deadlock.
 ///
-/// Holding the lock, the ledger is re-checked before the body runs: the
+/// Holding the lock, the run re-checks the ledger before the body runs: the
 /// migrator that waited must not replay DDL the winner already committed. That
-/// check is a plain `SELECT`, so "already applied" is decided deterministically
-/// rather than inferred from a unique violation — which the body's own SQL
-/// could equally have raised.
+/// check is a plain `SELECT`. So "already applied" is decided
+/// deterministically, not inferred from a unique violation that the body's own
+/// SQL could equally raise.
 async fn apply_in_transaction(
     conn: &mut AsyncPgConnection,
     script: &MigrationScript,
@@ -1271,9 +1279,9 @@ mod tests {
             );
         }
 
-        // Harvest's own migrations are all transactional today, and the
-        // embedded loader would have panicked above on a `metadata.toml` it
-        // could not read -- so this also proves every metadata slot parses.
+        // Harvest's own migrations are all transactional today. The embedded
+        // loader would have panicked above on a `metadata.toml` it could not
+        // read. So this also proves every metadata slot parses.
         for script in &scripts {
             assert!(
                 script.run_in_transaction,
@@ -1301,9 +1309,9 @@ mod tests {
 
     #[test]
     fn embedded_scripts_carry_the_same_sql_as_the_concatenated_bundle() {
-        // Both artifacts come from build.rs; this pins them to each other so a
-        // future edit cannot leave the applier and the test-fixture bundle
-        // disagreeing about what a migration contains.
+        // Both artifacts come from build.rs. This pins them to each other, so
+        // no future edit can make the applier and the test-fixture bundle
+        // disagree on a migration's contents.
         let bundle = crate::full_migrations_sql();
         for (name, sql, _metadata) in EMBEDDED_MIGRATION_SCRIPTS {
             assert!(

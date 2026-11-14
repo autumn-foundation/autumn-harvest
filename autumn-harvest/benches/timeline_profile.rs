@@ -1,35 +1,34 @@
 //! Non-criterion instruction/allocation-count profiling harness for
-//! `autumn_harvest::timeline::derive_timeline` — the pure, read-only
-//! projection behind `GET /workflows/{id}/timeline` (issue #739). Wall-clock
-//! timing is not admissible evidence on this (shared-vCPU) machine, so this
-//! binary is not measured with `cargo bench` / criterion timing. It is
-//! driven directly under `valgrind --tool=callgrind` (instruction counts)
-//! and `valgrind --tool=dhat` (allocation counts/bytes) instead -- a direct
-//! single-process measurement, but **not** bit-for-bit reproducible
-//! run-to-run: this harness generates fresh random activity/child UUIDs on
-//! every run, and both this file's own `AccKey`-keyed lookup map (mirroring
-//! `derive_timeline`'s internal one) and `derive_timeline` itself use
-//! `std::collections::HashMap`'s randomly-seeded `RandomState`, so hash
-//! values and probe patterns vary between runs. Measured spread: two
-//! callgrind runs each of the pre-fix and post-fix binaries (see #1372's
-//! commits) varied by ~0.1-0.2% run-to-run, over two orders of magnitude
-//! below the delta this harness was built to detect. dhat's allocation
-//! counts/bytes are unaffected (allocation *count* doesn't depend on hash
-//! values) and were confirmed byte-identical across repeated runs.
+//! `autumn_harvest::timeline::derive_timeline`.
+//!
+//! It is the pure, read-only projection behind `GET /workflows/{id}/timeline`
+//! (issue #739). Wall-clock timing is not admissible evidence on this
+//! shared-vCPU machine, so this binary does not use `cargo bench` / criterion
+//! timing. It runs under `valgrind --tool=callgrind` (instruction counts) and
+//! `valgrind --tool=dhat` (allocation counts/bytes). That is a direct
+//! single-process measurement, but **not** bit-for-bit reproducible run-to-run.
+//! This harness generates fresh random activity/child UUIDs on each run. This
+//! file's `AccKey`-keyed lookup map mirrors the internal map of
+//! `derive_timeline`. Both use the randomly-seeded `RandomState` of
+//! `std::collections::HashMap`, so hash values and probe patterns vary between
+//! runs. Measured spread: two callgrind runs each of the pre-fix and post-fix
+//! binaries (see the #1372 commits) varied by ~0.1-0.2% run-to-run. That is
+//! over two orders of magnitude below the delta this harness detects. dhat
+//! allocation counts/bytes do not depend on hash values. Repeated runs
+//! confirmed them byte-identical.
 //!
 //! # Workload
 //!
-//! `autumn-harvest-plugin`'s timeline handler loads an execution's full event
-//! history (`crate::store::load_timestamped_history`, uncapped) and calls
+//! The `autumn-harvest-plugin` timeline handler loads an execution's full event
+//! history (`crate::store::load_timestamped_history`, uncapped). It calls
 //! `derive_timeline` exactly once per request. This harness reproduces the
-//! shape the module's own docs single out: a long-running, wide-fan-out
-//! workflow near completion — regular activities (some retried once before
-//! succeeding), local activities, external handoffs, durable timers, and
-//! child workflows, most closed out with a handful still open — the shape an
-//! operator's "where did this run spend its time?" request targets. The
-//! fixed history is derived `TIMELINE_PROFILE_REPS` times, mirroring how many
-//! times an operator might reload the same execution's timeline, or how a
-//! polling dashboard re-requests it.
+//! shape the module docs single out: a long-running, wide-fan-out workflow
+//! near completion. It has regular activities (some retried once before
+//! success), local activities, external handoffs, durable timers, and child
+//! workflows. Most are closed and a handful are still open. An operator's
+//! "where did this run spend its time?" request targets this shape. The
+//! harness derives the fixed history `TIMELINE_PROFILE_REPS` times. That
+//! mirrors an operator who reloads the timeline, or a polling dashboard.
 //!
 //! # Running
 //!
@@ -43,12 +42,12 @@
 //! ```
 //!
 //! `TIMELINE_PROFILE_N` (default `400`) sets the number of regular activities
-//! scheduled per simulated execution (the other categories scale off it).
+//! per simulated execution. The other categories scale off it.
 //! `TIMELINE_PROFILE_REPS` (default `1_500`, minimum `100`) sets how many
-//! times the (fixed) history is derived into a timeline. The floor keeps the
-//! one-time sanity-check derivation below `main` (also captured by
-//! Callgrind's default `--collect-atstart=yes`) under ~1% of the total
-//! collected instruction count.
+//! times the fixed history is derived into a timeline. Callgrind's default
+//! `--collect-atstart=yes` also captures the one-time sanity-check derivation
+//! in `main`. The floor keeps that derivation under ~1% of the collected
+//! instruction count.
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
@@ -61,7 +60,7 @@ fn now() -> DateTime<Utc> {
 }
 
 /// A representative per-activity input/output record — small enough to be
-/// typical, large enough that a `Value` clone isn't free.
+/// typical, large enough that a `Value` clone is not free.
 fn payload(i: usize) -> Value {
     json!({
         "order_id": format!("order-{i:08}"),
@@ -82,20 +81,19 @@ const fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow
     TimelineEventRow { timestamp, event }
 }
 
-/// Builds the fixed, realistic history this harness derives repeatedly: `n`
-/// regular activities (9 of every 10 closed; 1 of every 5 closed ones retries
-/// once before succeeding), plus proportionally scaled local activities,
-/// external handoffs, timers, and children in the same 9:1 closed:open
-/// ratio — a long-running fan-out workflow near completion with a genuine
-/// handful of things still open, exactly the shape an operator's timeline
-/// request targets.
+/// Builds the fixed history that this harness derives repeatedly.
 ///
-/// Returns the rows alongside the timestamp of the last generated event:
-/// callers must derive the profiling clock (`now`) from it rather than a
-/// fixed offset from `start`, or a large enough `TIMELINE_PROFILE_N` makes
-/// the fixed history outlast a hardcoded horizon and produces "future"
-/// events relative to the clock the timeline is derived against (Codex
-/// review on #1372).
+/// It holds `n` regular activities. 9 of every 10 are closed, and 1 of every 5
+/// closed ones retries once before success. Scaled local activities, external
+/// handoffs, timers, and children follow the same 9:1 closed:open ratio. That
+/// is a fan-out workflow near completion with a few things still open, the
+/// shape an operator's timeline request targets.
+///
+/// Returns the rows and the timestamp of the last generated event. Callers
+/// must derive the profiling clock (`now`) from it, not from a fixed offset
+/// from `start` (#1372). Otherwise a large `TIMELINE_PROFILE_N` makes the
+/// history outlast a hardcoded horizon. Its events are then in the "future"
+/// of the clock that the timeline is derived against.
 #[allow(clippy::too_many_lines, reason = "one straight-line event list")]
 fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, DateTime<Utc>) {
     let mut rows: Vec<TimelineEventRow> = Vec::new();
@@ -108,12 +106,12 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, Dat
 
     // Regular activities: 9 of every 10 close out (1 of every 5 of those
     // retries once first); the rest stay open (scheduled, never started).
-    // The retry selector counts CLOSED activities, not `i` -- picking on `i
-    // % 5` directly would make every retry candidate (i % 5 == 4) land on an
-    // index that's ALSO open (i % 10 == 9, since 9 % 5 == 4 and the period-10
-    // open cycle never shifts that residue), so retries would fire on 1 in 10
-    // regular activities instead of the documented 1 in 5 of the CLOSED ones
-    // (Codex review on #1372).
+    // The retry selector counts CLOSED activities, not `i` (#1372). Picking on
+    // `i % 5` directly would make every retry candidate (i % 5 == 4) land on an
+    // index that is ALSO open. That index is i % 10 == 9, since 9 % 5 == 4 and
+    // the period-10 open cycle never shifts that residue. Retries would then
+    // fire on 1 in 10 regular activities. The documented rate is 1 in 5 of
+    // the CLOSED ones.
     let mut closed_count: usize = 0;
     for i in 0..n {
         let activity_id = ActivityExecId::new();
@@ -282,16 +280,16 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn validate_workload_params(n: usize, reps: usize) {
     // Callgrind's `--collect-atstart` defaults to `yes` (see the Running
-    // section above), so the one-time, unmeasured-in-INTENT sanity
+    // section above). So the one-time, unmeasured-in-INTENT sanity
     // `derive_timeline` call in `main` below IS captured in the collected
-    // instruction count -- there is no in-process way to exclude it without
-    // a client-request crate this repo hasn't taken a dependency on. At
+    // instruction count. No in-process way excludes it without a
+    // client-request crate, and this repo has no dependency on one. At
     // reps=1 that one call is roughly HALF of the counted work, silently
-    // diluting the measured delta (Codex review on #1372). Requiring at
-    // least 100 reps keeps the sanity call's fixed one-call cost under ~1%
-    // of the total -- an order of magnitude below both the impact floor
-    // (>=5% Ir) and this harness's own measured run-to-run noise
-    // (~0.1-0.2%, see the header) -- so it can never be mistaken for signal.
+    // diluting the measured delta (#1372). At least 100 reps keep the fixed
+    // cost of the sanity call under ~1% of the total. That is an order of
+    // magnitude below the impact floor (>=5% Ir). It is also below this
+    // harness's measured run-to-run noise (~0.1-0.2%, see the header). So it
+    // can never be mistaken for signal.
     assert!(
         reps >= 100,
         "TIMELINE_PROFILE_REPS must be at least 100 (so the one-time, \
@@ -300,10 +298,9 @@ fn validate_workload_params(n: usize, reps: usize) {
          got {reps}"
     );
     // The smallest category is children at n/20. Below n=200, child_n < 10,
-    // so its 9:1 ratio (i % 10 == 9) can never land on an open item -- the
-    // fixture would silently measure a workload with an all-closed category
-    // rather than the documented 9:1 closed:open mix in every category (Codex
-    // review on #1372).
+    // so its 9:1 ratio (i % 10 == 9) can never land on an open item (#1372).
+    // The fixture would then silently measure an all-closed category, not the
+    // documented 9:1 closed:open mix in every category.
     assert!(
         n >= 200,
         "TIMELINE_PROFILE_N must be at least 200 (so even n/20 reaches the \
@@ -323,10 +320,9 @@ fn main() {
     // gets -- see build_workload's doc comment.
     let now_ts = last_event_ts + chrono::Duration::hours(1);
 
-    // Sanity-check the fixture once, unmeasured: the timeline must actually
-    // contain both open and closed steps in every category, or this harness
-    // would silently profile a degenerate (all-closed, or missing-category)
-    // history.
+    // Sanity-check the fixture once, unmeasured. The timeline must contain
+    // both open and closed steps in every category. Otherwise this harness
+    // silently profiles a degenerate (all-closed, or missing-category) history.
     let sanity = derive_timeline(
         &rows,
         start,
@@ -367,13 +363,12 @@ fn main() {
         );
     }
 
-    // BTreeMap, not HashMap: this tally is read inside the measured loop
-    // below, and HashMap's default RandomState hasher is seeded per-process
-    // -- its instructions would leak into the profiled instruction count and
-    // add MORE run-to-run variance on top of what derive_timeline's own
-    // internal hashing already contributes (see this file's header).
-    // BTreeMap is Ord-keyed (no hashing at all), so it costs nothing extra
-    // and doesn't make that existing variance any worse.
+    // BTreeMap, not HashMap: the measured loop below reads this tally.
+    // HashMap's default RandomState hasher is seeded per process. Its
+    // instructions would leak into the profiled count. They would add MORE
+    // run-to-run variance on top of the internal hashing of derive_timeline
+    // (see this file's header). BTreeMap is Ord-keyed with no hashing, so it
+    // does not make that variance worse.
     let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     let mut total_steps: u64 = 0;

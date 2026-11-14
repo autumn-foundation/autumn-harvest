@@ -1,12 +1,12 @@
 //! Database pool configuration with separate pools and shared ceiling.
 //!
-//! Design Decision DD-2: Two `deadpool` instances — one for the web server,
-//! one for Harvest workers — share a `max_total_connections` ceiling so the
+//! Design Decision DD-2: two `deadpool` instances, one for the web server and
+//! one for Harvest workers, share a `max_total_connections` ceiling. So the
 //! combined pool sizes never exceed Postgres `max_connections`.
 //!
-//! If the sum of requested sizes exceeds the ceiling, both are scaled down
-//! proportionally, with any remainder awarded to the web pool (HTTP latency
-//! is more user-visible than worker throughput).
+//! If the requested sizes sum past the ceiling, both scale down
+//! proportionally. Any remainder goes to the web pool, because HTTP latency
+//! is more user-visible than worker throughput.
 //!
 //! ## Sharded deployments
 //!
@@ -94,7 +94,6 @@ pub fn compute_pool_sizes(
     requested_worker: usize,
     ceiling: usize,
 ) -> (usize, usize) {
-    // Guarantee at least 1 each — clamp inputs.
     let requested_web = requested_web.max(1);
     let requested_worker = requested_worker.max(1);
     let ceiling = ceiling.max(2); // need room for at least 1 + 1
@@ -104,13 +103,11 @@ pub fn compute_pool_sizes(
         return (requested_web, requested_worker);
     }
 
-    // Scale proportionally using integer arithmetic to avoid cast warnings.
-    // worker gets floor(ceiling * requested_worker / combined), minimum 1.
+    // Integer arithmetic avoids cast warnings.
     let mut scaled_worker = (ceiling * requested_worker / combined).max(1);
-    // web gets the rest, minimum 1.
     let mut scaled_web = ceiling.saturating_sub(scaled_worker).max(1);
 
-    // If rounding pushed us over ceiling, trim worker (prioritise web).
+    // If rounding exceeds the ceiling, trim worker, because web has priority.
     if scaled_web + scaled_worker > ceiling {
         scaled_worker = ceiling.saturating_sub(scaled_web).max(1);
         scaled_web = ceiling.saturating_sub(scaled_worker);
@@ -661,7 +658,6 @@ mod tests {
         assert!(web + worker <= 50);
         assert!(web >= 1);
         assert!(worker >= 1);
-        // web should get at least as much proportion as worker
         assert!(web >= worker, "web ({web}) should be >= worker ({worker})");
     }
 

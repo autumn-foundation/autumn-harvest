@@ -6,9 +6,9 @@
 //! controls is therefore **control-clean**, and the two arms may legitimately
 //! emit different sequences.
 //!
-//! This is the single most likely false positive in real code: a naive
-//! "switchInt on anything that came from a call ⇒ Control taint" rule flags
-//! every versioned workflow in the repository. Verdict:
+//! This is the most likely false positive in real code. A naive rule,
+//! "switchInt on anything that came from a call ⇒ Control taint", flags every
+//! versioned workflow in the repository. Verdict:
 //! `proven-deterministic`.
 
 use autumn_harvest::prelude::*;

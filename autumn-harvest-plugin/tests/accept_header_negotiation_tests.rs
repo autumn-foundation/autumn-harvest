@@ -1,19 +1,17 @@
 //! Regression test for issue #1579.
 //!
-//! `autumn-web` renders a styled HTML error page for a request whose
-//! `Accept` header resolves to a browser preference. A bare wildcard
-//! `Accept: */*` resolves that way. A genuinely missing header does
-//! not: autumn-web treats an absent header as unspecified, and
-//! unspecified is not a browser preference. `curl` sends `Accept:
-//! */*` by default. A validation error, an unknown `--state` filter
-//! for example, then came back as an HTML page. It did not come back
-//! as the documented `application/problem+json` body.
+//! `autumn-web` renders an HTML error page when the `Accept` header resolves
+//! to a browser preference. A bare `Accept: */*` resolves that way. An
+//! absent header does not: autumn-web treats it as unspecified, and
+//! unspecified is not a browser preference. `curl` sends `Accept: */*` by
+//! default. So a validation error, such as an unknown `--state` filter, came
+//! back as an HTML page, not as the documented `application/problem+json`
+//! body.
 //!
-//! These tests pin the real behavior for both request shapes. They
-//! also confirm an explicit `Accept: application/json` header avoids
-//! the HTML page regardless of a client's own default. That header
-//! is what the fixed `harvest` CLI now sends on every request. No
-//! database is needed; the route below never touches storage.
+//! These tests pin both request shapes. They also confirm that an explicit
+//! `Accept: application/json` header avoids the HTML page, whatever the
+//! default of the client. The fixed `harvest` CLI sends that header on every
+//! request. The route below touches no storage, so no database is needed.
 
 use autumn_web::error::AutumnError;
 use autumn_web::prelude::*;

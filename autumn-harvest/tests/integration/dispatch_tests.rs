@@ -1809,7 +1809,7 @@ async fn a_reference_for_a_full_pool_does_not_spin_the_reader() {
 }
 
 /// A stale reference must not spend a claimable sibling's share of the same
-/// batch (Codex review, issue #1429).
+/// batch (issue #1429).
 ///
 /// `dispatch_leases` used to increment `claimed_workflow` before calling
 /// `consume_reference`, for every workflow-kind lease regardless of outcome.

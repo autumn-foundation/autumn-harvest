@@ -3,20 +3,20 @@
 //! ## Design
 //!
 //! This module implements **sanctioned in-place mutation exception #2** of
-//! `harvest_events.event_data` rows. There are exactly two such writers: this
-//! one and codec key re-encryption (`crate::codec_rotation`, issue #948,
-//! exception #3); both are enumerated with their scope guarantees in the
-//! "Engine Invariants" section of `CLAUDE.md`. (The heartbeat checkpoint this
-//! comment used to name alongside them mutates `harvest_task_queue`, not the
-//! event log — see that section.) Payload-bearing fields inside each event's
-//! `data` object are
-//! replaced with a tombstone marker while the append-only event log structure —
-//! variant `type`, event IDs, timestamps, sequence — is left completely intact.
+//! `harvest_events.event_data` rows. There are exactly two such writers. One is
+//! this module. The other is codec key re-encryption (`crate::codec_rotation`,
+//! issue #948, exception #3). The "Engine Invariants" section of `CLAUDE.md`
+//! lists both with their scope guarantees. This comment once also named the
+//! heartbeat checkpoint. That checkpoint mutates `harvest_task_queue`, not the
+//! event log; see that section. Payload-bearing fields inside each event's
+//! `data` object are replaced with a tombstone marker. The append-only event
+//! log structure stays completely intact: variant `type`, event IDs,
+//! timestamps, sequence.
 //!
-//! Erasure always **wins** a race with the re-encryption sweep: that sweep
-//! writes with a compare-and-swap on the row's previous bytes, so a tombstone
-//! committed between its read and its write makes its update match zero rows
-//! rather than resurrecting the ciphertext this module just destroyed.
+//! Erasure always **wins** a race with the re-encryption sweep. That sweep
+//! writes with a compare-and-swap on the row's previous bytes. A tombstone
+//! committed between its read and its write makes its update match zero rows.
+//! So the sweep cannot resurrect the ciphertext this module just destroyed.
 //!
 //! Erasure is **terminal-only**: the gate rejects any execution that is not
 //! in a finished state (`COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`,
@@ -40,16 +40,16 @@
 //!   `search_attrs`, and `context_headers` columns.
 //! - All `harvest_signals.payload` rows associated with the execution.
 //! - All `harvest_completion_deliveries.payload` rows associated with the
-//!   execution (issue #605) — the frozen `CompletionEnvelope` JSON is
-//!   tombstoned in place; delivery scheduling (`state`/`attempt`/
-//!   `next_attempt_at`) is untouched, so a still-pending, in-flight, or
-//!   later-redriven delivery posts the tombstone marker instead of the
-//!   erased result/error.
+//!   execution (issue #605). The frozen `CompletionEnvelope` JSON is
+//!   tombstoned in place. Delivery scheduling (`state`/`attempt`/
+//!   `next_attempt_at`) is untouched. So a still-pending, in-flight, or
+//!   later-redriven delivery posts the tombstone marker, not the erased
+//!   result/error.
 //! - All `harvest_dead_letters.input` rows for the execution whose
-//!   `task_type = "CALLBACK"` (issue #605) — a completion delivery that
+//!   `task_type = "CALLBACK"` (issue #605). A completion delivery that
 //!   exhausted its retries writes a second, independent copy of the frozen
-//!   envelope here; scoped to `CALLBACK` rows only, not a general expansion
-//!   of erasure to every dead-lettered activity/task for the execution.
+//!   envelope here. The scope is `CALLBACK` rows only. Erasure does not
+//!   expand to every dead-lettered activity/task for the execution.
 //! - The `harvest_entity_state.snapshot` row that the execution wrote last
 //!   (issue #2259). It copies the payload of an entity snapshot event.
 //!
@@ -89,9 +89,9 @@ pub fn erasure_tombstone() -> Value {
 /// `{"_harvest_erased": true}` — the FIELD-AGNOSTIC predicate (issue #495).
 ///
 /// [`erase_workflow_payloads`] writes this same canonical value into the
-/// execution row's `input`, `memo`, and `search_attrs` columns (and into every
-/// payload-bearing event field), so any consumer that must not PROPAGATE an
-/// erased value can test it with this regardless of which column it came from.
+/// execution row's `input`, `memo`, and `search_attrs` columns. It also writes
+/// it into every payload-bearing event field. So a consumer that must not
+/// PROPAGATE an erased value can test it with this, whatever its column.
 /// [`execution_input_is_erased`] is the `input`-specific spelling used by the
 /// O(1) erased-row check; prefer this one for any other column.
 ///
@@ -143,11 +143,12 @@ pub fn tombstone_payload_fields(event_value: &mut Value) -> usize {
 /// The canonical set of recognised terminal execution states.
 ///
 /// This is the single source of truth for terminal-state classification across
-/// the engine: [`is_terminal_state`] is `TERMINAL_STATES.contains(&state)`, and
-/// consumers that need the literal list for a SQL filter (e.g.
-/// `execution::resolve_execution_id_by_workflow_id`, issue #805) reference this
-/// constant directly rather than re-declaring the states, so the two can never
-/// drift. Raw SQL templates render a list from it with `render_states`.
+/// the engine. [`is_terminal_state`] is `TERMINAL_STATES.contains(&state)`. A
+/// consumer that needs the literal list for a SQL filter references this
+/// constant and does not re-declare the states. An example is
+/// `execution::resolve_execution_id_by_workflow_id` (issue #805). So the two
+/// can never drift. Raw SQL templates render a list from it with
+/// `render_states`.
 pub const TERMINAL_STATES: &[&str] = &[
     "COMPLETED",
     "FAILED",
@@ -155,18 +156,18 @@ pub const TERMINAL_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
-    // Issue #964: the sealed source of a shard migration. Terminal-shaped in
-    // exactly the sense this list means -- nothing more will ever happen to it
-    // on THIS shard -- which is what lets an erasure reach the copy the
-    // migration left behind. Without it the source's plaintext payloads would
-    // be permanently unreachable: an erasure routed by ExecutionId follows the
-    // forwarding pointer to the target, tombstones that, and reports success
-    // while the source keeps every byte.
+    // Issue #964: the sealed source of a shard migration. It is terminal-shaped
+    // in exactly the sense this list means: nothing more happens to it on THIS
+    // shard. That lets an erasure reach the copy the migration left behind.
+    // Without it, the source's plaintext payloads are permanently unreachable.
+    // An erasure routed by ExecutionId follows the forwarding pointer to the
+    // target and tombstones that. It reports success while the source keeps
+    // every byte.
     //
-    // Terminal for CLASSIFICATION is not the same as purgeable: the retention
-    // janitor's candidate queries enumerate their own state list and do not
-    // include `MIGRATED`, because hard-deleting a sealed row would destroy the
-    // forwarding pointer every pre-migration id resolves through.
+    // Terminal for CLASSIFICATION is not the same as purgeable. The candidate
+    // queries of the retention janitor enumerate their own state list without
+    // `MIGRATED`. A hard delete of a sealed row would destroy the forwarding
+    // pointer that every pre-migration id resolves through.
     "MIGRATED",
 ];
 
@@ -229,22 +230,22 @@ pub(crate) fn render_states(template: &str, states: &[&str]) -> String {
 /// Returns `true` if a workflow execution row's payload has been PII-erased
 /// (issue #495), from an O(1) check of its already-loaded `input` column.
 ///
-/// A PII-erased terminal history still replays *structurally* (event types,
-/// order, and IDs are untouched), so a post-mortem query (issue #612) would
-/// drive it to completion and then compute against `{"_harvest_erased": true}`
-/// payloads — a subtly wrong answer. Callers serving queries on terminal
-/// executions use this to reject such histories explicitly rather than return
-/// misleading state.
+/// A PII-erased terminal history still replays *structurally*: event types,
+/// order, and IDs are untouched. So a post-mortem query (issue #612) would
+/// drive it to completion and compute against `{"_harvest_erased": true}`
+/// payloads. That answer is subtly wrong. Callers that serve queries on
+/// terminal executions use this to reject such histories explicitly. They do
+/// not return misleading state.
 ///
-/// This is authoritative and O(1): [`erase_workflow_payloads`] **always**
-/// tombstones the execution row's own `input` column (it is the very first
-/// column set in the row-scrub `UPDATE`), so testing `input` alone is
-/// sufficient and far cheaper than re-serialising and tree-walking the entire
-/// event history on every terminal query (the 10k-events-under-200ms budget).
+/// This is authoritative and O(1). [`erase_workflow_payloads`] **always**
+/// tombstones the execution row's own `input` column. It is the first column
+/// set in the row-scrub `UPDATE`. So a test of `input` alone is sufficient. It
+/// is far cheaper than a re-serialise and tree-walk of the entire event
+/// history on every terminal query (the 10k-events-under-200ms budget).
 ///
-/// `_harvest_erased` is a **reserved payload key**: a workflow whose real input
-/// is literally `{"_harvest_erased": true}` would be indistinguishable from an
-/// erased row here, so authors must not use that key as a top-level input shape.
+/// `_harvest_erased` is a **reserved payload key**. A workflow whose real input
+/// is literally `{"_harvest_erased": true}` looks like an erased row here. So
+/// authors must not use that key as a top-level input shape.
 #[must_use]
 pub fn execution_input_is_erased(input: &Value) -> bool {
     is_tombstone(input)
@@ -300,11 +301,11 @@ pub struct EraseOutcome {
     /// Number of `harvest_signals` rows whose `payload` was tombstoned.
     pub signals_scrubbed: usize,
     /// Number of durable workflow log rows (issue #790) DELETED for this
-    /// execution. Unlike every other surface here these are removed outright
-    /// rather than tombstoned: a log line is a single free-form author string
-    /// with no field structure to preserve, so a tombstone would carry no
-    /// information a plain absence does not. Logs are observational and are
-    /// never replayed, so deleting them cannot affect determinism.
+    /// execution. Unlike every other surface here, these are removed outright,
+    /// not tombstoned. A log line is a single free-form author string with no
+    /// field structure to preserve. So a tombstone carries no information that
+    /// a plain absence does not. Logs are observational and never replayed, so
+    /// their deletion cannot affect determinism.
     #[serde(default)]
     pub logs_deleted: usize,
     /// Number of durable stream chunks (issue #1974) deleted for this
@@ -324,16 +325,16 @@ pub struct EraseOutcome {
     pub entity_states_scrubbed: usize,
     /// Number of `harvest_completion_deliveries` rows (issue #605) whose
     /// frozen `payload` envelope was tombstoned. The delivery row itself
-    /// (state, retry schedule) is left untouched — a still-pending,
-    /// in-flight, or redriven delivery now posts the tombstone marker
-    /// instead of the workflow's erased result/error.
+    /// (state, retry schedule) is left untouched. A still-pending, in-flight,
+    /// or redriven delivery now posts the tombstone marker, not the workflow's
+    /// erased result/error.
     pub completion_deliveries_scrubbed: usize,
     /// Number of `harvest_dead_letters` rows (`task_type = "CALLBACK"`,
-    /// issue #605) whose `input` — a second, independent copy of the frozen
-    /// `CompletionEnvelope` written when a callback delivery exhausts its
-    /// retries — was tombstoned. Without this, erasing
-    /// `harvest_completion_deliveries.payload` alone leaves the same PII
-    /// sitting in the DLQ until retention or redrive.
+    /// issue #605) whose `input` was tombstoned. That `input` is a second,
+    /// independent copy of the frozen `CompletionEnvelope`. It is written when
+    /// a callback delivery exhausts its retries. Without this, an erase of
+    /// `harvest_completion_deliveries.payload` alone leaves the same PII in
+    /// the DLQ until retention or redrive.
     pub dead_letters_scrubbed: usize,
     /// Outcomes for terminal child executions that were recursively erased.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -348,12 +349,12 @@ pub struct EraseOutcome {
     /// Erase outcomes for the **sealed source copies** a shard rebalance
     /// (issue #964) left behind on shards that previously hosted this run.
     ///
-    /// A rebalance copies an execution to a new shard and seals — but does not
-    /// delete — the original, which keeps its full event payloads until the
-    /// source shard's own retention collects it. An erase that visited only the
-    /// live residence would therefore report success while leaving a complete,
-    /// readable copy of the subject's data on another database. Each entry here
-    /// is the proof that one such copy was scrubbed too.
+    /// A rebalance copies an execution to a new shard and seals the original.
+    /// It does not delete the original. The original keeps its full event
+    /// payloads until the source shard's own retention collects it. An erase of
+    /// only the live residence would report success. Yet a complete, readable
+    /// copy of the subject's data would stay on another database. Each entry
+    /// here is the proof that one such copy was scrubbed too.
     ///
     /// Empty — and omitted from the JSON entirely — for every execution that has
     /// never been rebalanced, which is every execution on a single-shard
@@ -361,16 +362,17 @@ pub struct EraseOutcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_residences: Vec<ErasedResidence>,
     /// Shards on this execution's residence chain that have been **retired**
-    /// (issue #964) — decommissioned, their pools removed from every node, and
-    /// their ids forwarded to a successor — and so were not visited.
+    /// (issue #964), and so were not visited.
     ///
-    /// This is reported rather than silently skipped because it is the one case
-    /// where the erasure is complete only if the decommission was done properly:
-    /// `docs/runbooks/shard-decommission.md` requires the retired shard's
-    /// database to be destroyed (or its payloads erased) before its pool is
-    /// dropped, and declaring the forward is the operator's assertion that it
-    /// was. A merely *unreachable* residence is a different thing entirely and
-    /// fails the whole call instead of appearing here.
+    /// A retired shard is decommissioned. Its pools are removed from every
+    /// node, and its ids forward to a successor. This is reported, not
+    /// silently skipped. It is the one case where the erasure is complete only
+    /// if the decommission was done properly.
+    /// `docs/runbooks/shard-decommission.md` requires that the retired shard's
+    /// database is destroyed, or its payloads erased, before its pool is
+    /// dropped. A declared forward is the operator's assertion that it was. A
+    /// merely *unreachable* residence is a different thing entirely. It fails
+    /// the whole call and does not appear here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_residences: Vec<i32>,
 }
@@ -509,12 +511,12 @@ mod db {
 
     /// Top-level erase entry with gate-REJECT semantics (issue #495): a
     /// non-terminal execution → `Config` (409), a legal-held execution →
-    /// `Config` (409). Falls back to a summary-only erase when the execution
-    /// row is already retention-deleted (issue #752, AC6): a terminal execution
-    /// may have been demoted into a `harvest_execution_summaries` row and its
-    /// full row collected, so erasing PII must scrub the summary too and
-    /// SUCCEED when only the summary (or a lingering child-summary subtree)
-    /// remains. A truly-unknown id still returns `NotFound` (404).
+    /// `Config` (409). It falls back to a summary-only erase when retention has
+    /// already deleted the execution row (issue #752, AC6). A terminal
+    /// execution may be demoted into a `harvest_execution_summaries` row, with
+    /// its full row collected. So a PII erase must scrub the summary too. It
+    /// must SUCCEED when only the summary (or a lingering child-summary
+    /// subtree) remains. A truly-unknown id still returns `NotFound` (404).
     async fn erase_top_level(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -562,28 +564,29 @@ mod db {
     }
 
     /// Erase an execution's payloads at **every shard that still holds a copy
-    /// of them** — the live residence and every sealed source a shard rebalance
-    /// (issue #964) left behind.
+    /// of them**.
     ///
-    /// This is the entry point an erasure request must use on a sharded
-    /// deployment. [`erase_workflow_payloads`] takes a connection, so it scrubs
-    /// exactly one database; after a rebalance an execution's bytes exist in two
-    /// (the live copy on the target, the sealed copy on the source, which stays
-    /// readable until the source shard's own retention collects it). Scrubbing
-    /// only the shard the id currently routes to would report a clean erasure
-    /// while a complete copy of the subject's data sat on another database —
-    /// exactly the outcome the erasure exists to prevent.
+    /// Those are the live residence and every sealed source that a shard
+    /// rebalance (issue #964) left behind. This is the entry point an erasure
+    /// request must use on a sharded deployment. [`erase_workflow_payloads`]
+    /// takes a connection, so it scrubs exactly one database. After a
+    /// rebalance, an execution's bytes exist in two. The live copy is on the
+    /// target. The sealed copy is on the source, and it stays readable until
+    /// the source shard's own retention collects it. A scrub of only the shard
+    /// the id currently routes to would report a clean erasure. Yet a complete
+    /// copy of the subject's data would sit on another database. The erasure
+    /// exists to prevent exactly that outcome.
     ///
     /// **The live residence is erased first, and its result is the answer.**
-    /// It is the only copy whose state can answer the gate questions: a
-    /// non-terminal run must be refused (409) and a legal hold must be honoured
-    /// *before* anything is destroyed anywhere. A sealed source always reads as
-    /// terminal, so gating on it would let a live run be erased through its own
-    /// stale shadow.
+    /// It is the only copy whose state can answer the gate questions. A
+    /// non-terminal run must be refused (409), and a legal hold must be
+    /// honoured, *before* anything is destroyed anywhere. A sealed source
+    /// always reads as terminal. A gate on it would let a live run be erased
+    /// through its own stale shadow.
     ///
     /// Prior residences are then scrubbed in order and reported individually in
-    /// [`EraseOutcome::prior_residences`]. A source copy that has already been
-    /// collected yields `NotFound` there, which is success — nothing to scrub is
+    /// [`EraseOutcome::prior_residences`]. A source copy that is already
+    /// collected yields `NotFound` there, which is success. Nothing to scrub is
     /// not a gap. Every other failure propagates: an unscrubbed source copy is a
     /// compliance failure, not a partial one, so the caller must see it. The
     /// whole operation is idempotent, so a retry after such a failure is safe.
@@ -593,10 +596,10 @@ mod db {
     ///
     /// # Errors
     ///
-    /// Everything [`erase_workflow_payloads`] returns, plus
+    /// Everything [`erase_workflow_payloads`] returns. It also returns
     /// [`HarvestError::ShardUnavailable`] when a shard on the residence chain
-    /// has no pool on this node — the erase cannot be shown to be complete, so
-    /// it is not reported as complete.
+    /// has no pool on this node. Then the erase cannot be shown to be complete,
+    /// so it is not reported as complete.
     pub async fn erase_workflow_payloads_all_residences(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
@@ -610,11 +613,11 @@ mod db {
             ));
         };
 
-        // The live residence resolves tolerantly: a single-pool deployment
-        // registers one pool under one shard id, and the run's row is in it
+        // The live residence resolves tolerantly. A single-pool deployment
+        // registers one pool under one shard id. The run's row is in it,
         // whatever its id's shard bits say. Prior residences below keep the
-        // exact form -- a sealed source is one specific database, and falling
-        // back to the default there would scrub the wrong copy.
+        // exact form. A sealed source is one specific database, and a fallback
+        // to the default there would scrub the wrong copy.
         let mut conn = crate::shard_rebalance::conn_for_live_shard(pool, *live).await?;
         let mut outcome =
             erase_workflow_payloads_with_pool(&mut conn, exec_id, reason, Some(pool)).await?;
@@ -622,14 +625,14 @@ mod db {
 
         for shard in priors {
             // A RETIRED shard is not an unreachable one. `with_shard_forwards`
-            // refuses to declare a forward for a shard that is still readable,
-            // so the declaration is the operator's assertion that the shard is
-            // decommissioned and its database gone — which the decommission
-            // runbook requires before the pool is dropped. Failing closed on it
+            // refuses a forward for a shard that is still readable. So the
+            // declaration is the operator's assertion that the shard is
+            // decommissioned and its database gone. The decommission runbook
+            // requires that before the pool is dropped. A fail-closed answer
             // would make every run that ever lived on a retired shard
-            // permanently un-erasable, which is a worse answer than none. It is
-            // reported rather than skipped silently, so the response never
-            // implies a copy was scrubbed that this node could not see.
+            // permanently un-erasable, which is worse than no answer. It is
+            // reported, not skipped silently. So the response never implies a
+            // scrub of a copy that this node could not see.
             if crate::shard::ShardedDbPool::shard_is_retired(*shard) {
                 outcome.retired_residences.push(shard.as_i32());
                 continue;
@@ -640,9 +643,9 @@ mod db {
                     shard_id: shard.as_i32(),
                     outcome: prior,
                 }),
-                // The sealed copy can legitimately be gone already: retention on
-                // the source shard collects it on its own schedule, and a
-                // collected copy holds nothing left to erase.
+                // The sealed copy can legitimately be gone already. Retention on
+                // the source shard collects it on its own schedule. A collected
+                // copy holds nothing left to erase.
                 Err(HarvestError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -707,8 +710,8 @@ mod db {
     /// Tombstones the summary's `result`/`search_attrs` and recurses into its
     /// children via the same two-source lookup (a summarized child may itself
     /// have summarized grandchildren, linked by `parent_id`). Returns `None`
-    /// only when nothing at all is found for `exec_id` (no summary, no children,
-    /// no skips, no failures) so a truly-unknown top-level id still 404s.
+    /// only when nothing at all is found for `exec_id`: no summary, children,
+    /// skips, or failures. So a truly-unknown top-level id still 404s.
     fn erase_summary_only_node<'a>(
         conn: &'a mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -719,27 +722,26 @@ mod db {
         Box::pin(async move {
             let summary_scrubbed = erase_execution_summary(conn, exec_id).await?;
 
-            // Issue #958: on the opt-in partitioned layout the execution row's
-            // deletion no longer cascades into `harvest_events`, so a
-            // retention-collected (or summarized, #752) execution's full
-            // PII-bearing `event_data` can still be sitting there as orphan
-            // rows until the partition sweeper reclaims the whole cohort —
-            // which a legal hold or long-running sibling can defer
-            // indefinitely.
+            // Issue #958: on the opt-in partitioned layout, the execution row's
+            // deletion no longer cascades into `harvest_events`. So the full
+            // PII-bearing `event_data` of a retention-collected (or summarized,
+            // #752) execution can stay there as orphan rows. They stay until the
+            // partition sweeper reclaims the whole cohort. A legal hold or a
+            // long-running sibling can defer that indefinitely.
             //
             // Without this, a data-subject erasure request for such an
             // execution returned 200 with `events_scrubbed: 0` and "summary
-            // scrubbed" while the plaintext survived in the event log, breaking
+            // scrubbed". The plaintext survived in the event log. That broke
             // the #495 tombstoning contract exactly where #752 promised it
-            // still held. `scrub_events` already works on orphans — it filters
-            // on `workflow_exec_id` alone — so it only had to be called.
+            // still held. `scrub_events` already works on orphans, because it
+            // filters on `workflow_exec_id` alone. So it only had to be called.
             let (events_scrubbed, fields_tombstoned) = scrub_events(conn, exec_id).await?;
-            // The live execution row is gone, but retention deliberately leaves
-            // non-DELIVERED completion deliveries and CALLBACK DLQ rows behind
-            // (both keyed on `workflow_exec_id`) — each holds a frozen copy of
-            // the workflow's own result/error PII. Scrub them here too (issue
-            // #752 Codex P1), else a summarized run returns 200 while retryable
-            // / redrivable PII survives.
+            // The live execution row is gone. But retention deliberately leaves
+            // non-DELIVERED completion deliveries and CALLBACK DLQ rows behind,
+            // both keyed on `workflow_exec_id`. Each holds a frozen copy of the
+            // workflow's own result/error PII. Scrub them here too (issue
+            // #752). Else a summarized run returns 200 while retryable /
+            // redrivable PII survives.
             let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
                 scrub_callback_pii(conn, exec_id).await?;
             let (children, skipped_children, failures) =
@@ -804,19 +806,19 @@ mod db {
             if count > 0 {
                 // Keyed on `workflow_exec_id` as well as the row id.
                 //
-                // This does NOT prune partitions — the partition key is
-                // `cohort`, the row's append instant, so an execution's history
-                // genuinely spans partitions and no predicate on
-                // `workflow_exec_id` can narrow the set. What it does buy is a
-                // usable index: on the partitioned layout a bare `id` predicate
-                // has no index to use at all (the primary key is
-                // `(id, cohort)`), so every partition would be sequentially
-                // scanned per row; `(workflow_exec_id, id)` matches
+                // This does NOT prune partitions. The partition key is
+                // `cohort`, the row's append instant. So an execution's history
+                // genuinely spans partitions, and no predicate on
+                // `workflow_exec_id` can narrow the set. It does buy a usable
+                // index. On the partitioned layout, a bare `id` predicate has no
+                // index at all, because the primary key is `(id, cohort)`. Then
+                // every partition would be sequentially scanned per row.
+                // `(workflow_exec_id, id)` matches
                 // `idx_harvest_events_history_page` in each of them.
                 //
-                // The predicate is strictly narrower than `find(row_id)` — the
+                // The predicate is strictly narrower than `find(row_id)`. The
                 // rows were just selected FOR this execution, and `id` is
-                // globally unique from a single sequence — so the unpartitioned
+                // globally unique from a single sequence. So the unpartitioned
                 // layout behaves identically.
                 diesel::update(
                     harvest_events::table
@@ -838,11 +840,11 @@ mod db {
     /// Collect child execution ids from BOTH the live-execution table and the
     /// summary table (issue #752), deduped and in a stable order.
     ///
-    /// A terminal child is independently retention-eligible, so by the time a
-    /// parent is erased a child may exist as a live row, as a summary-only row,
-    /// or (transiently) neither. Unioning both sources is what lets the erase
-    /// cascade reach a child that was already demoted into a summary and had its
-    /// own execution row collected.
+    /// A terminal child is independently retention-eligible. So when a parent
+    /// is erased, a child may exist as a live row, as a summary-only row, or
+    /// (transiently) neither. The union of both sources lets the erase cascade
+    /// reach a child that is already demoted into a summary, with its own
+    /// execution row collected.
     async fn collect_child_ids(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -978,10 +980,10 @@ mod db {
         Option<SkippedChild>,
         Option<EraseFailure>,
     ) {
-        // Re-read state + hold under a FOR UPDATE row lock (issue #747 MINOR
-        // 2a): the parent's erase tx only locks the parent, so a hold placed
-        // directly on this child after the unlocked list read above must
-        // still be caught. Locking here serializes against `set_legal_hold`.
+        // Re-read state + hold under a FOR UPDATE row lock (issue #747). The
+        // parent's erase tx only locks the parent. A hold placed directly on
+        // this child after the unlocked list read above must still be caught.
+        // The lock here serializes against `set_legal_hold`.
         match load_erase_gate_row(conn, child_exec_id).await {
             Ok((child_state, set_at, until, reason)) => {
                 if !is_terminal_state(&child_state) {
@@ -995,9 +997,9 @@ mod db {
                         None,
                     );
                 }
-                // A held child is a deliberate SKIP, not a failure (issue #747
-                // MINOR 2b): its events are left intact while the parent and
-                // other children erase normally.
+                // A held child is a deliberate SKIP, not a failure (issue #747).
+                // Its events stay intact while the parent and other children
+                // erase normally.
                 if crate::retention::legal_hold_active(set_at, until, now) {
                     let hold_reason = reason.as_deref().unwrap_or("no reason recorded");
                     return (
@@ -1288,10 +1290,10 @@ mod db {
     /// acquiring a `FOR UPDATE` row lock.
     ///
     /// The lock is taken for BOTH the top-level execution and each cascaded
-    /// child (issue #747 MINOR 2a): the outer transaction only locks the parent
-    /// row, so a hold placed directly on a child between an unlocked read and
-    /// its scrub could otherwise be missed. Locking the row here serializes the
-    /// gate against `set_legal_hold`. A re-entrant lock on a row already locked
+    /// child (issue #747). The outer transaction only locks the parent row. A
+    /// hold placed directly on a child between an unlocked read and its scrub
+    /// could otherwise be missed. The row lock here serializes the gate
+    /// against `set_legal_hold`. A re-entrant lock on a row already locked
     /// by the same transaction is a no-op in Postgres.
     async fn load_erase_gate_row(
         conn: &mut AsyncPgConnection,
@@ -1316,25 +1318,25 @@ mod db {
     /// Scrub the frozen completion-callback PII for one execution, keyed only
     /// on `workflow_exec_id`, and return `(deliveries_scrubbed, dead_letters_scrubbed)`.
     ///
-    /// Shared by the execution-exists path (`scrub_execution_node`) and the
-    /// summary-only path (`erase_summary_only_node`) so a summarized execution
+    /// The execution-exists path (`scrub_execution_node`) and the summary-only
+    /// path (`erase_summary_only_node`) share it. So a summarized execution
     /// whose live row is already gone still has its lingering callback PII
-    /// erased (issue #752 Codex P1). Two independent copies of the workflow's
-    /// own `result`/`error` can survive after retention:
+    /// erased (issue #752). Two independent copies of the workflow's own
+    /// `result`/`error` can survive after retention:
     ///
-    /// * `harvest_completion_deliveries.payload` — the frozen
-    ///   `CompletionEnvelope` (issue #605 / PR #921 review). Retention leaves
-    ///   non-`DELIVERED` deliveries in place, and a still-`PENDING`/`INFLIGHT`/
-    ///   `FAILED` delivery could still be `POST`ed to the external receiver (or
-    ///   redriven by an operator) after the erase. Only `payload` is tombstoned;
-    ///   `state`/`attempt`/`next_attempt_at`/`last_status` are untouched so
-    ///   delivery scheduling is unaffected — a pending delivery simply posts the
-    ///   tombstone marker instead of the real data.
-    /// * `harvest_dead_letters.input` where `task_type = 'CALLBACK'` — a second,
-    ///   independent copy the callback-delivery scanner writes on retry
-    ///   exhaustion (issue #921 review). Scoped to `CALLBACK` only: this is
-    ///   specifically issue #605's callback copy, not a general expansion of
-    ///   erasure to every dead-lettered activity/task (out of scope here).
+    /// * `harvest_completion_deliveries.payload`, the frozen
+    ///   `CompletionEnvelope` (issue #605 / PR #921). Retention leaves
+    ///   non-`DELIVERED` deliveries in place. A still-`PENDING`/`INFLIGHT`/
+    ///   `FAILED` delivery could still be `POST`ed to the external receiver, or
+    ///   redriven by an operator, after the erase. Only `payload` is
+    ///   tombstoned. `state`/`attempt`/`next_attempt_at`/`last_status` are
+    ///   untouched, so delivery scheduling is unaffected. A pending delivery
+    ///   simply posts the tombstone marker, not the real data.
+    /// * `harvest_dead_letters.input` where `task_type = 'CALLBACK'`. This is a
+    ///   second, independent copy that the callback-delivery scanner writes on
+    ///   retry exhaustion (issue #921). The scope is `CALLBACK` only: issue
+    ///   #605's callback copy. Erasure does not expand to every dead-lettered
+    ///   activity/task (out of scope here).
     async fn scrub_callback_pii(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -1416,10 +1418,10 @@ mod db {
             crate::entity_state::erase_for_execution(conn, exec_id).await?;
 
         // Completion-callback PII (deliveries + CALLBACK DLQ), keyed only on
-        // `workflow_exec_id` so it applies whether or not a live execution row
-        // exists (issue #752 Codex P1 — the summary-only path must scrub these
-        // too, since retention deliberately leaves non-DELIVERED deliveries and
-        // CALLBACK DLQ rows behind).
+        // `workflow_exec_id`. So it applies whether or not a live execution row
+        // exists (issue #752). The summary-only path must scrub these too.
+        // Retention deliberately leaves non-DELIVERED deliveries and CALLBACK
+        // DLQ rows behind.
         let (completion_deliveries_scrubbed, dead_letters_scrubbed) =
             scrub_callback_pii(conn, exec_id).await?;
 

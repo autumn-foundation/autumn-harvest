@@ -2,23 +2,23 @@
 //!
 //! **Why does this exist?**
 //! `harvest_events` must stay small for fast, cheap deterministic replay, so the
-//! payload-size cap (issue #252) *rejects* anything over the limit. That blocks a
-//! legitimate class of workloads — document processing, media pipelines, RAG
-//! ingestion, report generation — where a single step genuinely needs to hand a
-//! multi-megabyte blob to the next step.
+//! payload-size cap (issue #252) *rejects* anything over the limit. That blocks
+//! workloads such as document processing, media pipelines, RAG ingestion and
+//! report generation. There, a single step must hand a multi-megabyte blob to
+//! the next step.
 //!
-//! The claim-check pattern turns that "reject" into a graceful "offload": when a
-//! payload-bearing field is larger than a configurable threshold, harvest writes
-//! the bytes to an **embedder-supplied** [`PayloadStore`] and keeps only a small,
-//! self-describing **reference envelope** (store id, content key, byte length,
-//! content checksum) inline in the event. On read/replay the bytes are fetched
-//! back and the original value is reconstructed byte-for-byte.
+//! The claim-check pattern turns that "reject" into a graceful "offload". When a
+//! payload-bearing field exceeds a configurable threshold, harvest writes the
+//! bytes to an **embedder-supplied** [`PayloadStore`]. The event keeps only a
+//! small, self-describing **reference envelope** inline: store id, content key,
+//! byte length and content checksum. On read/replay the bytes are fetched back
+//! and the original value is reconstructed byte-for-byte.
 //!
-//! Harvest core ships **no** concrete S3/GCS client — the embedder owns the
-//! backend, preserving the Postgres-only engine boundary. The reference envelope
-//! rides inside the existing payload JSON exactly as the encryption codec's
-//! output does, so **no new `WorkflowEvent` variant** is introduced and the
-//! append-only / adjacently-tagged-JSON contracts are untouched.
+//! Harvest core ships **no** concrete S3/GCS client. The embedder owns the
+//! backend, which preserves the Postgres-only engine boundary. The reference
+//! envelope rides inside the existing payload JSON, exactly as the encryption
+//! codec's output does. So **no new `WorkflowEvent` variant** is introduced, and
+//! the append-only / adjacently-tagged-JSON contracts are untouched.
 //!
 //! ## Composition with [`PayloadCodec`](crate::payload_codec::PayloadCodec)
 //!
@@ -50,10 +50,10 @@ use crate::telemetry::MetricsRecorder;
 /// Payload-bearing field keys carried inside an event's `data` object.
 ///
 /// Mirrors the set transformed by
-/// [`PayloadCodecs`](crate::payload_codec::PayloadCodecs) so offload applies
-/// uniformly to every payload boundary: workflow input/output, activity
-/// input/output, signal payload, query/update args & results, child-workflow
-/// input/output, side-effect values, and scheduled carryover.
+/// [`PayloadCodecs`](crate::payload_codec::PayloadCodecs), so offload applies
+/// uniformly to every payload boundary. These are workflow input/output,
+/// activity input/output, signal payload, query/update args & results,
+/// child-workflow input/output, side-effect values, and scheduled carryover.
 pub(crate) const PAYLOAD_FIELD_KEYS: [&str; 6] = [
     "input",
     "output",
@@ -65,10 +65,10 @@ pub(crate) const PAYLOAD_FIELD_KEYS: [&str; 6] = [
 
 /// Discriminator key marking an offload reference envelope.
 ///
-/// Public so a consumer that must *detect* an envelope without fetching it —
-/// e.g. the replay-drift gate's fixture guard (issue #798), which refuses a
-/// bundle it cannot inflate — can cheaply reject on the raw JSON without
-/// hardcoding the key and drifting from this definition.
+/// Public so a consumer can *detect* an envelope on the raw JSON without a
+/// fetch, and without a hardcoded key that drifts from this definition. One
+/// such consumer is the replay-drift gate's fixture guard (issue #798). It
+/// refuses a bundle it cannot inflate.
 pub const OFFLOAD_ENVELOPE_KEY: &str = "_harvest_offload_envelope";
 
 /// Future returned by [`PayloadStore`] methods.
@@ -273,9 +273,10 @@ struct OffloadEnvelope {
 /// Drives offload-on-write and inflate-on-read against a configured
 /// [`PayloadStore`].
 ///
-/// Constructed by the builder when a store is registered and carried on the
-/// worker's `HandlerRegistry` (and threaded to retention) so every payload-write
-/// and history-read path can compose offload with the codec pipeline.
+/// The builder constructs it when a store is registered. The worker's
+/// `HandlerRegistry` carries it, and retention receives it too. So every
+/// payload-write and history-read path can compose offload with the codec
+/// pipeline.
 #[derive(Clone)]
 pub struct PayloadOffloader {
     store: Arc<dyn PayloadStore>,
@@ -490,13 +491,13 @@ pub fn refs_in_event_value(value: &Value) -> Vec<OffloadedRef> {
 /// [`OFFLOAD_ENVELOPE_KEY`] — i.e. the field holds a claim-check *reference*,
 /// not inline content.
 ///
-/// Discriminator-only, and deliberately looser than [`extract_offload_ref`]:
-/// that one is the strict PARSER and returns `None` for a malformed envelope,
-/// which is the wrong question for a caller asking "may I rewrite this field?".
-/// The re-encryption sweep (issue #948) asks exactly that — a field bearing the
-/// offload discriminator must be passed through untouched whether or not its
-/// reference parses, because offload composes *after* codec encode so there is
-/// no ciphertext here to rotate and rewriting it would orphan the blob.
+/// Discriminator-only, and deliberately looser than [`extract_offload_ref`].
+/// That one is the strict PARSER and returns `None` for a malformed envelope.
+/// That answers the wrong question for a caller that asks "may I rewrite this
+/// field?". The re-encryption sweep (issue #948) asks exactly that. A field
+/// with the offload discriminator must pass through untouched, whether or not
+/// its reference parses. Offload composes *after* codec encode, so there is no
+/// ciphertext here to rotate. A rewrite would orphan the blob.
 ///
 /// The codec sibling is [`crate::payload_codec::is_codec_envelope`].
 #[must_use]
@@ -842,18 +843,16 @@ mod tests {
         let refs = off.offload_event_value(&mut event).await.unwrap();
         let extracted = extract_offload_ref(&event["data"]["output"]).unwrap();
         assert_eq!(extracted, refs[0]);
-        // No get performed.
         assert_eq!(store.gets.load(Ordering::SeqCst), 0);
-        // refs_in_event_value finds the same.
         assert_eq!(refs_in_event_value(&event), refs);
     }
 
     #[tokio::test]
     async fn composes_after_codec_envelope() {
         // Simulate codec-encoded output (the codec's 3-key envelope), then
-        // offload it: the offload envelope must wrap the codec envelope, and
-        // inflate must restore the codec envelope verbatim (so a later
-        // codec.decode can run).
+        // offload it. The offload envelope must wrap the codec envelope.
+        // Inflate must restore the codec envelope verbatim, so a later
+        // codec.decode can run.
         let store = MemStore::new();
         let off = offloader(store.clone(), 16);
         let codec_value = serde_json::json!({
@@ -874,7 +873,7 @@ mod tests {
         let off = offloader(store.clone(), 16);
         let mut event = event_with_output(serde_json::json!("q".repeat(1_000)));
         off.offload_event_value(&mut event).await.unwrap();
-        // Rewrite the envelope's store_id to a store we don't have.
+        // Rewrite the envelope's store_id to a store that is not configured.
         event["data"]["output"]["store_id"] = serde_json::json!("other");
         let err = off.inflate_event_value(&mut event).await.unwrap_err();
         assert!(err.to_string().contains("unknown store"));

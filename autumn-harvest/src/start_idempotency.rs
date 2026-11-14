@@ -3,45 +3,45 @@
 //! # Overview
 //!
 //! `POST /workflows/{name}/start` accepts an optional `idempotency_key`. Two
-//! starts carrying the *same* key (within a retention window, default 24h)
-//! converge on exactly **one** execution: the first creates it, the second is a
-//! no-op returning the *same* `execution_id` with success — no `409`, no second
-//! `WorkflowStarted` event, no second enqueued task.
+//! starts with the *same* key converge on exactly **one** execution. The key
+//! holds for a retention window, 24h by default. The first start creates the
+//! execution. The second is a no-op that returns the *same* `execution_id` with
+//! success: no `409`, no second `WorkflowStarted` event, no second enqueued task.
 //!
 //! # Delivery identity vs business identity
 //!
-//! `idempotency_key` is a **delivery-identity** dedupe (this exact request),
-//! scoped to `(workflow_name, idempotency_key)` and **independent of
-//! `workflow_id`** — so it converges even when `workflow_id` is auto-generated
-//! per request. It is layered *in front of* the **business-identity**
-//! reuse-policy matrix keyed on `workflow_id`: the idempotency check
-//! short-circuits the reuse-policy matrix entirely. When a start is *not*
-//! deduplicated (fresh key), the normal reuse-policy semantics apply unchanged.
+//! `idempotency_key` is a **delivery-identity** dedupe (this exact request).
+//! Its scope is `(workflow_name, idempotency_key)`, **independent of
+//! `workflow_id`**. So it converges even when each request auto-generates its
+//! `workflow_id`. It sits *in front of* the **business-identity** reuse-policy
+//! matrix keyed on `workflow_id`: the idempotency check short-circuits that
+//! matrix entirely. When a start is *not* deduplicated (fresh key), the normal
+//! reuse-policy semantics apply unchanged.
 //!
 //! Because the dedupe is `workflow_id`-independent, a keyed start must **route
 //! by the key**, not by `workflow_id`. The HTTP handler picks the shard via
-//! [`crate::shard::ShardRouter::pick_for_idempotency_key`] (rendezvous over
-//! `(workflow_name, idempotency_key)`), so two same-key retries — whose
-//! `workflow_id` may be auto-generated per request — deterministically
-//! co-locate on one shard and hit the same claim row. The claim row, its
-//! execution, and the per-shard expiry sweep all share that key-derived shard.
+//! [`crate::shard::ShardRouter::pick_for_idempotency_key`], a rendezvous over
+//! `(workflow_name, idempotency_key)`. So two same-key retries deterministically
+//! co-locate on one shard and hit the same claim row, even with auto-generated
+//! `workflow_id` values. The claim row, its execution, and the per-shard expiry
+//! sweep all share that key-derived shard.
 //!
 //! # Concurrency
 //!
 //! Safety comes from the `(workflow_name, idempotency_key)` primary key and a
-//! single `INSERT ... ON CONFLICT DO UPDATE` upsert: N simultaneous same-key
-//! starts race to insert one row; the winner reserves, every loser observes the
-//! winner's row and returns its `execution_id`. Wrapping the reserve + start in
-//! one transaction makes a start that fails *after* reserving roll the claim
-//! back so a retry can start fresh.
+//! single `INSERT ... ON CONFLICT DO UPDATE` upsert. N simultaneous same-key
+//! starts race to insert one row. The winner reserves. Every loser observes the
+//! winner's row and returns its `execution_id`. The reserve and the start share
+//! one transaction. So a start that fails *after* reserving rolls the claim back,
+//! and a retry can start fresh.
 //!
 //! # Retention & reuse
 //!
 //! The upsert's `ON CONFLICT ... DO UPDATE ... WHERE created_at <= now() -
-//! window` clause lets a key be reused once the window elapses: a stale row is
+//! window` clause makes a key reusable once the window elapses. A stale row is
 //! overwritten in place and the start proceeds as fresh. A background sweep
 //! ([`purge_expired_start_idempotency`], folded into
-//! `timeout::enforce_timeouts_once`) deletes expired rows so the table can't
+//! `timeout::enforce_timeouts_once`) deletes expired rows so the table cannot
 //! grow unbounded for keys that are never reused. Even with no sweep,
 //! correctness holds — an expired row is overwritten on the next same-key start.
 //!
@@ -50,7 +50,7 @@
 //! Shard-local. The claim row and its execution live on the same shard (no
 //! cross-shard coordination), consistent with per-key concurrency (#247) and the
 //! start throttle (#607). There is deliberately **no** foreign key to
-//! `harvest_workflow_executions`: a claim pointing at a retention-deleted
+//! `harvest_workflow_executions`. A claim that points at a retention-deleted
 //! execution is handled by the defensive reclaim path in
 //! [`reserve_start_idempotency`] plus the expiry sweep.
 //!
@@ -79,11 +79,11 @@ pub const START_IDEMPOTENCY_PURGE_BATCH: i64 = 1000;
 /// (`autumn-harvest-plugin::api::validate_start_idempotency_key`) and
 /// [`crate::handle::TransactionalStartOptions::with_idempotency_key`] (issue
 /// #763's review). The key is half of the composite PRIMARY KEY
-/// `(workflow_name, idempotency_key)` on `harvest_start_idempotency`; an
-/// oversized key would exceed Postgres's ~2704-byte btree index tuple limit
-/// and error at INSERT, leaking a raw database error on client-controlled
-/// input. Capped conservatively so `workflow_name` + key stays well under
-/// that limit.
+/// `(workflow_name, idempotency_key)` on `harvest_start_idempotency`. An
+/// oversized key would exceed the Postgres btree index tuple limit (~2704
+/// bytes) and fail at INSERT. That leaks a raw database error on
+/// client-controlled input. The conservative cap keeps `workflow_name` + key
+/// well under that limit.
 pub const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
 /// Key prefix **reserved for engine-derived keys**, refused on every
@@ -101,27 +101,28 @@ pub const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 /// The prefix alone does not separate them. Derived keys are *predictable*:
 /// Kafka coordinates are `{topic}:{partition}:{offset}`, so anyone who knows a
 /// topic name can enumerate them. A caller who lands the derived key first
-/// claims that row, and the broker's own delivery then reads as an idempotent
-/// replay and is acknowledged **without ever dispatching its payload** — silent
-/// loss, precisely the failure the derived key exists to prevent.
+/// claims that row. The broker's own delivery then reads as an idempotent
+/// replay. It is acknowledged **without ever dispatching its payload**. That
+/// silent loss is precisely the failure the derived key exists to prevent.
 ///
 /// Refusing the prefix at the caller boundary is what actually makes the two
 /// namespaces disjoint, so an engine-derived key can never be squatted.
 ///
 /// # Scope
 ///
-/// Applied to every caller-facing key that reaches one of those two scopes:
-/// the plain start route (header and body), the in-process transactional-start
-/// client, signal-with-start, and the standalone signal route. Deliberately
-/// **not** applied to `update-with-start` or batch operations: their keys live
-/// in different uniqueness scopes that no connector key can reach, so refusing
-/// there would reject a caller's key for no protective gain. A connector target
-/// that ever dispatches into one of those scopes must extend this guard.
+/// Applied to every caller-facing key that reaches one of those two scopes.
+/// These are the plain start route (header and body), the in-process
+/// transactional-start client, signal-with-start, and the standalone signal
+/// route. Deliberately **not** applied to `update-with-start` or batch
+/// operations. Their keys live in different uniqueness scopes that no connector
+/// key can reach. Refusing there would reject a caller's key for no protective
+/// gain. A connector target that ever dispatches into one of those scopes must
+/// extend this guard.
 ///
 /// # Case sensitivity
 ///
 /// The comparison is case-**sensitive**, matching the Postgres text comparison
-/// that backs both uniqueness scopes: `CONN:` is a genuinely different key that
+/// that backs both uniqueness scopes. `CONN:` is a genuinely different key that
 /// cannot alias a derived one, so rejecting it would be over-broad.
 pub const RESERVED_KEY_PREFIX: &str = "conn:";
 
@@ -135,17 +136,16 @@ pub fn is_reserved_key(key: &str) -> bool {
 /// Shared trim + empty-rejection + length-cap validation for a request-scoped
 /// `idempotency_key`.
 ///
-/// Every start path should agree on what a "valid" key looks like, rather
-/// than each independently (re)implementing -- or, as issue #763's review
-/// found for the transactional-start client, omitting -- the same rule. An
-/// unvalidated key would let an accidental empty/whitespace value become a
-/// real `(workflow_name, "")` claim that silently dedupes every *other*
+/// Every start path shares this one rule instead of reimplementing it. Issue
+/// #763's review found that the transactional-start client omitted it. An
+/// unvalidated empty or whitespace key would become a real
+/// `(workflow_name, "")` claim. That claim silently dedupes every *other*
 /// unrelated start for that workflow against each other.
 ///
-/// `Ok(None)` = no key supplied; `Ok(Some(trimmed))` = a valid, trimmed key;
-/// `Err(_)` = the key is present but empty/whitespace-only, exceeds
-/// [`MAX_START_IDEMPOTENCY_KEY_LEN`] bytes after trimming, or is in the
-/// engine-reserved [`RESERVED_KEY_PREFIX`] namespace.
+/// `Ok(None)` means no key was supplied. `Ok(Some(trimmed))` is a valid,
+/// trimmed key. `Err(_)` means the key is present but empty or
+/// whitespace-only, exceeds [`MAX_START_IDEMPOTENCY_KEY_LEN`] bytes after
+/// trimming, or is in the engine-reserved [`RESERVED_KEY_PREFIX`] namespace.
 ///
 /// # Errors
 ///
@@ -176,8 +176,8 @@ pub fn validate_start_idempotency_key(
     }
 }
 
-/// The one rejection message every caller-facing path uses for a reserved key,
-/// so the plugin's HTTP routes and this validator can never describe the same
+/// The one rejection message for a reserved key on every caller-facing path.
+/// The plugin's HTTP routes and this validator then never describe the same
 /// refusal differently.
 #[must_use]
 pub const fn reserved_key_message() -> &'static str {
@@ -190,26 +190,27 @@ pub const fn reserved_key_message() -> &'static str {
 /// `const`).
 const DEFAULT_WINDOW_SECS_F64: f64 = 24.0 * 60.0 * 60.0;
 
-/// Process-global expiry-sweep retention window in **seconds**, stored as the
-/// bit pattern of an `f64` ([`f64::to_bits`]) so it carries the **same
-/// sub-second precision as the reserve path's `Duration::as_secs_f64()`**
-/// (issue #808, Codex P2).
+/// Process-global expiry-sweep retention window in **seconds**.
+///
+/// It holds the bit pattern of an `f64` ([`f64::to_bits`]). So it carries the
+/// **same sub-second precision as the reserve path's `Duration::as_secs_f64()`**
+/// (issue #808).
 ///
 /// The reserve `WHERE created_at <= now() - make_interval(secs => $window)`
-/// guard treats a key as live for exactly `window` seconds. If the sweep used a
-/// *truncated* whole-second window (`Duration::as_secs()`), a 1500 ms config
-/// would let the sweep DELETE a claim after 1.0 s while the reserve still
-/// considers it live until 1.5 s — a same-key retry at 1.2 s would then find no
-/// claim and start a **second** execution inside the configured window. Storing
-/// the window as `f64` seconds guarantees the sweep window *equals* the reserve
-/// window, so the sweep never deletes a claim the reserve still considers live.
+/// guard treats a key as live for exactly `window` seconds. Suppose the sweep
+/// used a *truncated* whole-second window (`Duration::as_secs()`) with a
+/// 1500 ms config. The sweep would DELETE a claim after 1.0 s, while the
+/// reserve still considers it live until 1.5 s. A same-key retry at 1.2 s would
+/// then find no claim and start a **second** execution inside the configured
+/// window. The `f64` seconds window guarantees that the sweep window *equals*
+/// the reserve window. So the sweep never deletes a claim the reserve still
+/// considers live.
 ///
-/// Set once at `Plugin::build` time from the same `HarvestBuilder` config the
-/// HTTP reserve path reads, via [`set_purge_window_secs`] — mirroring the
-/// `GLOBAL_CALLBACK_CONFIG` pattern (issue #605) so the sweep does not require a
-/// new parameter threaded through `enforce_timeouts_once` /
-/// `spawn_timeout_checker` and their many call sites. Defaults to
-/// [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
+/// [`set_purge_window_secs`] sets it once at `Plugin::build` time. It reads the
+/// same `HarvestBuilder` config as the HTTP reserve path. This mirrors the
+/// `GLOBAL_CALLBACK_CONFIG` pattern (issue #605). The sweep then needs no new
+/// parameter threaded through `enforce_timeouts_once`, `spawn_timeout_checker`
+/// and their many call sites. Defaults to [`DEFAULT_START_IDEMPOTENCY_WINDOW`].
 static PURGE_WINDOW_SECS_BITS: AtomicU64 = AtomicU64::new(DEFAULT_WINDOW_SECS_F64.to_bits());
 
 /// Set the process-global expiry-sweep retention window (issue #808).
@@ -237,20 +238,21 @@ pub fn purge_window_secs() -> f64 {
 
 /// The `INSERT ... ON CONFLICT DO UPDATE` reserve/claim statement.
 ///
-/// Extracted as a `const fn` so a no-DB shape test can assert the exact SQL
-/// string (mirroring the `*_stmt!` shape-test precedent for the backfill
-/// reservation, issue #688) — editing the guard, the `SET` list, or the
-/// `RETURNING` clause breaks that test rather than silently drifting.
+/// It is a `const fn` so a no-DB shape test can assert the exact SQL string.
+/// This mirrors the `*_stmt!` shape-test precedent for the backfill
+/// reservation (issue #688). An edit to the guard, the `SET` list, or the
+/// `RETURNING` clause then breaks that test instead of drifting silently.
 ///
 /// Binds:
 /// - `$1` `workflow_name`, `$2` `idempotency_key`, `$3` new `workflow_exec_id`,
 ///   `$4` `shard_id`, `$5` retention window in seconds.
 ///
-/// On a conflicting row *older than* the window it overwrites the claim in place
-/// (key reuse) and `RETURNING`s the new id; on a conflicting row *within* the
-/// window the `WHERE` guard is false, no row is updated, and the caller resolves
-/// the existing claim via [`reserve_start_idempotency`]'s duplicate branch. The
-/// window is bound as a **parameter** (not string-interpolated).
+/// On a conflicting row *older than* the window, it overwrites the claim in
+/// place (key reuse) and `RETURNING`s the new id. On a conflicting row *within*
+/// the window, the `WHERE` guard is false and no row is updated. The caller
+/// then resolves the existing claim via [`reserve_start_idempotency`]'s
+/// duplicate branch. The window is bound as a **parameter** (not
+/// string-interpolated).
 #[must_use]
 pub const fn reserve_start_idempotency_stmt() -> &'static str {
     "INSERT INTO harvest_start_idempotency AS s \
@@ -290,8 +292,8 @@ pub const fn window_to_secs_f64(window: Duration) -> f64 {
 }
 
 /// Serializes tests that mutate and read back the process-global
-/// [`PURGE_WINDOW_SECS_BITS`] static so they don't race each other in the shared
-/// lib-test binary (issue #808, Codex P2). Any test that calls
+/// [`PURGE_WINDOW_SECS_BITS`] static. They then do not race each other in the
+/// shared lib-test binary (issue #808). Any test that calls
 /// `set_purge_window_secs` and then asserts on `purge_window_secs()` — here or in
 /// `builder.rs` — must hold this lock for the set→read span.
 #[cfg(test)]
@@ -303,8 +305,8 @@ mod pure_tests {
 
     /// A caller must not be able to squat an engine-derived key.
     ///
-    /// The connector derives predictable keys from broker coordinates and
-    /// relies on them being unclaimable from outside; if a caller lands one
+    /// The connector derives predictable keys from broker coordinates. It
+    /// relies on them being unclaimable from outside. If a caller lands one
     /// first, the broker's delivery reads as a replay and is acked without
     /// dispatching.
     #[test]
@@ -344,8 +346,6 @@ mod pure_tests {
     #[test]
     fn reserve_stmt_is_a_conflict_guarded_upsert_returning_exec_id() {
         let sql = reserve_start_idempotency_stmt();
-        // Upsert onto the composite PK, guarded on the retention window as a
-        // bound parameter, returning the (possibly-reclaimed) exec id.
         assert!(sql.contains("INSERT INTO harvest_start_idempotency"));
         assert!(sql.contains("ON CONFLICT (workflow_name, idempotency_key) DO UPDATE"));
         assert!(sql.contains("WHERE s.created_at <= now() - make_interval(secs => $5)"));
@@ -372,11 +372,12 @@ mod pure_tests {
         let _guard = PURGE_WINDOW_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Sub-second precision (issue #808, Codex P2): the sweep window must be
-        // >= the reserve window (`Duration::as_secs_f64()`) so the sweep never
+        // Sub-second precision (issue #808): the sweep window must be >= the
+        // reserve window (`Duration::as_secs_f64()`). Then the sweep never
         // deletes a claim the reserve still considers live. A truncating u64
-        // store would make the sweep window 1.0s for a 1500ms config while the
-        // reserve treats the key as live until 1.5s — a sub-second dedup gap.
+        // store would make the sweep window 1.0s for a 1500ms config. The
+        // reserve treats the key as live until 1.5s, so a sub-second dedup gap
+        // opens.
         let window = Duration::from_millis(1500);
         set_purge_window_secs(window);
         let sweep_window = purge_window_secs();
@@ -387,22 +388,18 @@ mod pure_tests {
         );
         assert!((sweep_window - 1.5).abs() < 1e-9);
 
-        // Whole-second window round-trips exactly.
         set_purge_window_secs(Duration::from_secs(7200));
         assert!((purge_window_secs() - 7200.0).abs() < 1e-9);
 
-        // Non-positive falls back to the default window.
         set_purge_window_secs(Duration::ZERO);
         assert!(
             (purge_window_secs() - DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs_f64()).abs() < 1e-9
         );
 
-        // Restore default so ordering-independent test runs don't leak state.
+        // Restore default so ordering-independent test runs do not leak state.
         set_purge_window_secs(DEFAULT_START_IDEMPOTENCY_WINDOW);
     }
 }
-
-// ── DB-backed reserve / purge ────────────────────────────────────────────────
 
 #[cfg(feature = "db")]
 mod db_impl {
@@ -520,16 +517,16 @@ mod db_impl {
 
     /// Reserve a start idempotency claim for `(workflow_name, key)`.
     ///
-    /// Returns [`StartIdempotencyReservation::Reserved`] when this request should
-    /// perform the start with `new_exec_id`, or
+    /// Returns [`StartIdempotencyReservation::Reserved`] when this request must
+    /// perform the start with `new_exec_id`. Returns
     /// [`StartIdempotencyReservation::Duplicate`] when an earlier start already
-    /// claimed the key and its execution still exists (return that run as a
-    /// no-op).
+    /// claimed the key and its execution still exists. The caller returns that
+    /// run as a no-op.
     ///
     /// Concurrency-safe via the composite-PK upsert. Robust to both Postgres
-    /// interpretations of a `WHERE`-false `DO UPDATE` (`RETURNING` may yield the
-    /// pre-existing row or nothing) and to a dangling claim whose execution was
-    /// deleted by retention.
+    /// interpretations of a `WHERE`-false `DO UPDATE`: `RETURNING` may yield the
+    /// pre-existing row or nothing. Also robust to a dangling claim whose
+    /// execution was deleted by retention.
     ///
     /// # Errors
     /// Propagates database failures.
@@ -553,15 +550,15 @@ mod db_impl {
             }
             ReserveClassification::Dangling => {
                 // Defensive reclaim path: the claim row exists but points at an
-                // execution that no longer exists (a dangling pointer — only
+                // execution that no longer exists. That dangling pointer is only
                 // reachable if the idempotency window exceeds execution retention
-                // and the sweep hasn't run yet). Delete the stale claim, but ONLY
-                // if it still points at a non-existent execution: the `NOT EXISTS`
-                // guard makes this safe against a concurrent same-key request that
-                // repointed the claim to a real new run between our classifying
-                // JOIN above and this delete — that request's valid claim is
-                // preserved, so we never delete a live claim and never produce a
-                // duplicate execution. Binds `workflow_name`/`key` as parameters.
+                // and the sweep has not run yet. Delete the stale claim ONLY if it
+                // still points at a non-existent execution. The `NOT EXISTS` guard
+                // makes this safe against a concurrent same-key request. That
+                // request may repoint the claim to a real new run between the
+                // classifying JOIN above and this delete. Its valid claim is
+                // preserved, so this never deletes a live claim and never produces
+                // a duplicate execution. Binds `workflow_name`/`key` as parameters.
                 diesel::sql_query(
                     "DELETE FROM harvest_start_idempotency \
                      WHERE workflow_name = $1 AND idempotency_key = $2 \
@@ -576,11 +573,10 @@ mod db_impl {
                 .await
                 .map_err(database_error)?;
 
-                // Re-classify ONCE after the guarded delete. Because the delete is
-                // guarded, it may have removed 0 rows (a concurrent request already
-                // repointed the claim to a valid run), so we must NOT assume
-                // Reserved — re-run the classify and honour whatever now owns the
-                // key.
+                // Re-classify ONCE after the guarded delete. The guarded delete may
+                // have removed 0 rows, because a concurrent request already
+                // repointed the claim to a valid run. So do NOT assume Reserved.
+                // Re-run the classify and honour whatever now owns the key.
                 match try_reserve_once(conn, workflow_name, key, new_exec_id, shard_id, window_secs)
                     .await?
                 {
@@ -608,17 +604,18 @@ mod db_impl {
 
     /// Read-only probe for a live (within-window) start idempotency claim.
     ///
-    /// Returns the claimed execution's id when a claim row for `(workflow_name,
-    /// key)` exists, was created within `window_secs`, **and** still points at a
-    /// live execution (the JOIN mirrors [`reserve_start_idempotency`]'s
-    /// `Duplicate` classification — a within-window claim whose execution was
-    /// retention-deleted is *not* a dedup hit, it reclaims to a fresh start).
+    /// Returns the claimed execution's id when three things hold. A claim row
+    /// for `(workflow_name, key)` exists, it was created within `window_secs`,
+    /// **and** it still points at a live execution. The JOIN mirrors the
+    /// `Duplicate` classification of [`reserve_start_idempotency`]. A
+    /// within-window claim whose execution was retention-deleted is *not* a
+    /// dedup hit. It reclaims to a fresh start.
     ///
-    /// Used by the admission-gate idempotent-retry bypass (issue #808): a keyed
-    /// replay of an already-successful start resolves to a `200` no-op, so it is
-    /// **not** fresh admission and a raised gate must not reject it. Side-effect
-    /// free (no upsert, no reclaim) — a genuinely fresh keyed start finds no
-    /// claim and still passes through the gate normally.
+    /// The admission-gate idempotent-retry bypass uses it (issue #808). A keyed
+    /// replay of an already-successful start resolves to a `200` no-op. So it is
+    /// **not** fresh admission, and a raised gate must not reject it.
+    /// Side-effect free (no upsert, no reclaim). A genuinely fresh keyed start
+    /// finds no claim and still passes through the gate normally.
     ///
     /// # Errors
     /// Propagates database failures.
@@ -653,14 +650,14 @@ mod db_impl {
     /// Repoint an existing claim at the execution the start actually resolved to.
     ///
     /// The reserve upsert writes the claim pointing at the *reserved*
-    /// `new_exec_id`, but when the fresh-key start's `workflow_id` collides with
-    /// a prior run and the reuse policy **returns that existing run** (e.g.
-    /// `AllowDuplicate`), `start_or_load_workflow_execution_collect` returns the
-    /// existing execution's id rather than `new_exec_id` — so `new_exec_id` is
-    /// never inserted and the claim would dangle. Repointing it at the real run
-    /// (`resolved_exec_id`) means the next same-key request's join resolves to a
-    /// live execution and deduplicates cleanly, instead of hitting the defensive
-    /// reclaim path and re-running the whole start every time.
+    /// `new_exec_id`. A fresh-key start's `workflow_id` can collide with a prior
+    /// run, and the reuse policy can **return that existing run** (e.g.
+    /// `AllowDuplicate`). Then `start_or_load_workflow_execution_collect`
+    /// returns the existing execution's id, not `new_exec_id`. So `new_exec_id`
+    /// is never inserted and the claim would dangle. Repointing it at the real
+    /// run (`resolved_exec_id`) lets the next same-key request's join resolve to
+    /// a live execution and deduplicate cleanly. Otherwise each such request hits
+    /// the defensive reclaim path and re-runs the whole start.
     ///
     /// Runs inside the caller's reserve+start transaction.
     ///
@@ -688,8 +685,8 @@ mod db_impl {
 
     /// Delete idempotency claims older than the retention window on one shard.
     ///
-    /// Bounded to `batch_limit` rows per call via a `ctid` subselect so a large
-    /// backlog is drained across several sweep ticks rather than in one long
+    /// A `ctid` subselect bounds each call to `batch_limit` rows. A large
+    /// backlog then drains across several sweep ticks, not in one long
     /// statement. Returns the number of rows deleted.
     ///
     /// # Errors
@@ -779,8 +776,8 @@ mod db_impl {
             .await
         }
 
-        // Sub-second precise (issue #808, Codex P2): use the same `f64`-seconds
-        // window the reserve path binds, so the sweep never deletes a claim the
+        // Sub-second precise (issue #808): use the same `f64`-seconds window
+        // that the reserve path binds. The sweep then never deletes a claim the
         // reserve still considers live.
         let window_secs = super::purge_window_secs();
         let mut total = 0usize;

@@ -219,8 +219,6 @@ async fn append_activity_events(
     events.len()
 }
 
-// ─── RED phase tests ──────────────────────────────────────────────────────────
-
 /// (d) Unknown execution id → 404.
 #[tokio::test]
 async fn history_unknown_id_returns_404() {
@@ -334,14 +332,12 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
 
     assert!(page_count > 1, "must have needed more than one page");
     assert!(!collected_ids.is_empty(), "must have collected events");
-    // All IDs must be in ascending order across pages.
     let mut sorted = collected_ids.clone();
     sorted.sort_unstable();
     assert_eq!(
         collected_ids, sorted,
         "event row ids must be in ascending order across pages"
     );
-    // 15 total events (1 WorkflowStarted + 14 timer events).
     assert_eq!(collected_ids.len(), 15, "must have collected all 15 events");
     // The same walk check runs on SQLite (issue #2489).
     wire_contract::history_pages_cover(&pages, limit, 15);
@@ -360,7 +356,6 @@ async fn history_event_type_filter_returns_only_matching() {
     // 5 TimerStarted + 5 TimerFired = 10, plus 1 WorkflowStarted = 11 total.
     append_mixed_events(&mut conn, exec_id, 5).await;
 
-    // Filter to only TimerStarted.
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{exec_id}/history?event_type=TimerStarted&limit=100"),
@@ -382,7 +377,6 @@ async fn history_event_type_filter_returns_only_matching() {
         );
     }
 
-    // total_events reflects ALL events (unfiltered).
     let total = body["total_events"]
         .as_i64()
         .expect("total_events must be i64");
@@ -433,11 +427,9 @@ async fn history_append_during_paging_stability() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let exec_id = seed_execution(&mut conn, "append-paging-wf").await;
-    // Seed 5 events (1 WorkflowStarted already). Append 4 more.
+    // The run already has its `WorkflowStarted` event. Four more make 5.
     append_activity_events(&mut conn, exec_id, 4).await;
-    // Total = 5 events.
 
-    // Page 1: limit=3 → get 3 rows, capture cursor.
     let (status, page1) = get_json(&app, &format!("/workflows/{exec_id}/history?limit=3")).await;
     assert_eq!(status, StatusCode::OK, "page1: {page1}");
     let page1_events = page1["events"].as_array().unwrap();
@@ -453,7 +445,6 @@ async fn history_append_during_paging_stability() {
     // Append 3 more events while "between pages".
     append_activity_events(&mut conn, exec_id, 3).await;
 
-    // Page 2: use cursor — must not see page1's rows; must see remaining old rows + new rows.
     let (status, page2) = get_json(
         &app,
         &format!("/workflows/{exec_id}/history?limit=100&after={cursor}"),
@@ -462,7 +453,6 @@ async fn history_append_during_paging_stability() {
     assert_eq!(status, StatusCode::OK, "page2: {page2}");
     let page2_events = page2["events"].as_array().unwrap();
 
-    // No page-1 ID should appear in page 2.
     for ev in page2_events {
         let id = ev["id"].as_i64().unwrap();
         assert!(
@@ -471,7 +461,6 @@ async fn history_append_during_paging_stability() {
         );
     }
 
-    // We started with 5 rows, appended 3 more = 8 total. Page1 took 3, so page2 must have 5.
     assert_eq!(
         page2_events.len(),
         5,
@@ -517,7 +506,7 @@ async fn get_workflow_history_is_truncated_when_over_100_events() {
     );
 }
 
-/// Response shape: each event in the history page must have `id`, `event_id`, timestamp, type, data.
+/// Each event of a history page has `id`, `event_id`, `timestamp`, `type` and `data`.
 #[tokio::test]
 async fn history_response_shape_has_required_fields() {
     let (url, _container) = setup_database().await;
@@ -530,7 +519,6 @@ async fn history_response_shape_has_required_fields() {
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/history?limit=10")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    // Top-level response fields.
     assert!(
         body["events"].is_array(),
         "response must have 'events' array"
@@ -543,13 +531,11 @@ async fn history_response_shape_has_required_fields() {
         body["last_event_id"].is_number(),
         "response must have 'last_event_id' number"
     );
-    // next_cursor may be null (last page) or a string.
     assert!(
         body["next_cursor"].is_null() || body["next_cursor"].is_string(),
         "next_cursor must be null or string"
     );
 
-    // Per-event fields.
     let events = body["events"].as_array().unwrap();
     assert!(!events.is_empty(), "must have at least WorkflowStarted");
     let first = &events[0];
@@ -588,7 +574,6 @@ async fn history_unknown_event_type_yields_empty_page() {
         events.is_empty(),
         "unknown event_type must yield empty page"
     );
-    // total_events still reflects the real total.
     let total = body["total_events"].as_i64().unwrap();
     assert_eq!(
         total, 1,

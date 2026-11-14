@@ -31,7 +31,6 @@ use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, answer, calls, recorded_tool, runtime};
 use serde_json::{Value, json};
 
-/// The name of the notice activity.
 const NOTICE_ACTIVITY: &str = "agent_approval_notice";
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {

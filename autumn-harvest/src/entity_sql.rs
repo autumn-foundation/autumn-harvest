@@ -768,8 +768,8 @@ mod tests {
         }
     }
 
-    /// Codex review on issue #2260: a state past the value cap is still
-    /// valid, so a query reads it. A new value past the cap is refused.
+    /// Issue #2260: a state past the value cap is still valid, so a query
+    /// reads it. A new value past the cap is refused.
     #[test]
     fn a_state_past_the_value_cap_stays_queryable() {
         let cap = usize::try_from(MAX_VALUE_BYTES).expect("positive");

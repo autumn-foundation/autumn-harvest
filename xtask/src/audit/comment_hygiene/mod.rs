@@ -39,13 +39,23 @@
 //!   argued against the variant that the code beside it already used.
 //! - CH004, a blank comment edge: a comment block that opens or closes on
 //!   an empty `//` line. That is an editing artifact.
+//! - CH005, review archaeology: the name of the round of review, or of the
+//!   priority tag, that produced a change. That is process trivia that a
+//!   future reader cannot look up. The issue number is the durable handle,
+//!   so cite that instead.
+//! - CH006, a contraction: ASD-STE100 forbids contractions such as "is not"
+//!   written short. They hurt readers whose first language is not English,
+//!   and machine translation, for no gain in brevity.
+//!
+//! CH005 and CH006 started in Tier B. They moved here once the corpus
+//! reached zero.
 //!
 //! ## Tier B: ratcheted against the merge base
 //!
-//! These are real style defects with a legacy population far too large to
-//! fix in one change. CH007 alone has about 17.9k sentences. The rule for
-//! these is simple: a change may not add one to a file that it touches.
-//! Existing findings stay until someone chooses to fix them.
+//! This is a real style defect. The rule is simple. A change may not add
+//! one to a file that it touches. The corpus held about 17k such sentences
+//! when the rule landed. A cleanup cleared all of them, so the corpus is at
+//! zero.
 //!
 //! The comparison reads the merge base out of git. CI passes `--base <ref>`.
 //! The audit scans each changed file again as it was there. There is no
@@ -69,13 +79,6 @@
 //! moment when the tool cannot tell what changed is the worst option
 //! available. Tier A has no scope. It gates everywhere, always.
 //!
-//! - CH005, review archaeology: the name of the round of review, or of the
-//!   priority tag, that produced a change. That is process trivia that a
-//!   future reader cannot look up. The issue number is the durable handle,
-//!   so cite that instead.
-//! - CH006, a contraction: ASD-STE100 forbids contractions such as "is not"
-//!   written short. They hurt readers whose first language is not English,
-//!   and machine translation, for no gain in brevity.
 //! - CH007, a long sentence: over 25 words, the ASD-STE100 limit for
 //!   descriptive text. It applies per sentence. So a long rationale block
 //!   with a good structure passes cleanly once it is written as several
@@ -154,13 +157,9 @@
 //!   in recall from a relaxed anchor has given a false positive each time
 //!   it was tried here. Add a new alternative with a narrow anchor instead.
 //!
-//! - CH005 and CH006 match inside inline code spans (`` `like this` ``). So
-//!   a literal that holds a round of review or an apostrophe-s is flagged. No
-//!   current case does. To strip code spans first would also hide real prose
-//!   violations that only sit next to one. CH002 is the exception, and it
-//!   blanks them, because it is absolute. A comment that documents the
-//!   marker syntax ("Parse the `TODO:` prefix") must not fail the build, and
-//!   that risk is greater than the one above.
+//! - CH002, CH005 and CH006 skip inline code spans (`` `like this` ``).
+//!   They are absolute. A comment that documents a literal ("Parse the
+//!   `TODO:` prefix", "Match the `can't` token") must not fail the build.
 //!
 //! - CH004 judges only runs of leading `//`. A trailing comment has no block
 //!   to have edges. A blank first line inside `/* */` is a conventional
@@ -219,10 +218,10 @@ use rules::{Finding, findings_for_source};
 const SKIP_DIRS: [&str; 4] = [".git", "target", "node_modules", ".cargo"];
 
 /// The absolute rules.
-pub const TIER_A: [&str; 4] = ["CH001", "CH002", "CH003", "CH004"];
+pub const TIER_A: [&str; 6] = ["CH001", "CH002", "CH003", "CH004", "CH005", "CH006"];
 
 /// The ratcheted rules.
-pub const TIER_B: [&str; 3] = ["CH005", "CH006", "CH007"];
+pub const TIER_B: [&str; 1] = ["CH007"];
 
 /// The title of each rule.
 pub const RULE_TITLES: [(&str, &str); 7] = [

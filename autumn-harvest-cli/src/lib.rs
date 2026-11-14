@@ -49,14 +49,15 @@ const BULK_DLQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300
 /// Characters percent-encoded when a caller-supplied value becomes one URL path
 /// segment.
 ///
-/// `/` and `\` are both here because the URL parser reqwest uses treats **both**
-/// as path separators for special (http/https) URLs, so either one would split a
-/// single value into extra segments and silently retarget the request at a
-/// different route — and `\` additionally re-enables `..` traversal inside what
-/// should be one opaque segment (`payments\..\admin` resolved to
-/// `/admin/queues/admin/pause`). `%` is here so a caller-supplied `%2e` cannot
-/// become a dot-segment; the LITERAL `.`/`..` forms cannot be encoded away at
-/// all and are rejected instead — see `is_url_dot_segment`.
+/// The URL parser that reqwest uses treats **both** `/` and `\` as path
+/// separators for special (http/https) URLs. Either one would split a single
+/// value into extra segments and silently retarget the request at a different
+/// route. `\` also re-enables `..` traversal inside one opaque segment
+/// (`payments\..\admin` resolved to `/admin/queues/admin/pause`).
+///
+/// `%` is here so a caller-supplied `%2e` cannot become a dot-segment. The
+/// LITERAL `.`/`..` forms cannot be encoded away, so they are rejected instead.
+/// See `is_url_dot_segment`.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -134,9 +135,9 @@ pub enum OutputFormat {
 
 /// Cross-region disaster-recovery operator commands (issue #954).
 ///
-/// All three talk to shard databases directly, never to the management API:
-/// during a regional failover the management API may be exactly what is down,
-/// and the whole point of the fence is to be reachable when the region is not.
+/// All three talk to shard databases directly, never to the management API.
+/// During a regional failover the management API may be what is down. The
+/// fence must be reachable when the region is not.
 #[derive(Subcommand, Debug)]
 pub enum DrCommand {
     /// Report each shard's write-authority epoch and measured RPO.
@@ -152,11 +153,11 @@ pub enum DrCommand {
 
         /// Slot-name prefix identifying this shard's DR replication.
         ///
-        /// Must match the workers' `replication_slot_prefix`. Without a prefix
-        /// every walsender for the database would count as a DR standby —
-        /// including an unrelated logical-decoding consumer such as a CDC
-        /// pipeline — so a shard whose real cross-region subscriber had
-        /// disconnected would report itself protected.
+        /// Must match the workers' `replication_slot_prefix`. Without a prefix,
+        /// every walsender for the database counts as a DR standby. That
+        /// includes an unrelated logical-decoding consumer, such as a CDC
+        /// pipeline. A shard whose real cross-region subscriber disconnected
+        /// would then report itself protected.
         #[arg(long, value_name = "PREFIX", default_value = "harvest_dr")]
         slot_prefix: String,
 
@@ -205,13 +206,12 @@ pub enum DrCommand {
 
         /// Fence a shard that has no fencing row yet, creating one.
         ///
-        /// Off by default, and that default is a safety guard rather than
-        /// tidiness. A shard with no row has never been pinned by a worker, so
-        /// there is nothing to fence — and the overwhelmingly likely cause of
-        /// an absent row is a **wrong shard id**: `--shard <dsn>` with no
-        /// `<id>=` prefix takes its *positional index* as the shard id, so one
-        /// mis-ordered DSN silently creates a phantom row, bumps it, prints
-        /// success, and fences nobody while the operator believes the region is
+        /// Off by default, as a safety guard. A shard with no row has never
+        /// been pinned by a worker, so there is nothing to fence. The likely
+        /// cause of an absent row is a **wrong shard id**. `--shard <dsn>` with
+        /// no `<id>=` prefix takes its *positional index* as the shard id. One
+        /// mis-ordered DSN then creates a phantom row, bumps it and prints
+        /// success. It fences nobody while the operator believes the region is
         /// fenced. Refusing is the loud outcome.
         #[arg(long)]
         provision: bool,
@@ -219,10 +219,10 @@ pub enum DrCommand {
         /// Fence a database that still looks like a live primary.
         ///
         /// By default this refuses a target that is not in recovery **and**
-        /// still has connected standbys — i.e. a healthy primary rather than
-        /// the standby you just promoted. That combination is the signature of
-        /// a mis-typed DSN, and the cost of getting it wrong is a self-inflicted
-        /// fleet-wide outage on a region that was fine.
+        /// still has connected standbys. That is a healthy primary, not the
+        /// standby you just promoted. That combination is the signature of a
+        /// mis-typed DSN. The cost of an error is a self-inflicted fleet-wide
+        /// outage on a region that was fine.
         #[arg(long)]
         force: bool,
 
@@ -234,15 +234,16 @@ pub enum DrCommand {
     /// Finish promoting a standby: advance every sequence to match the data.
     ///
     /// **Required after promoting a LOGICAL standby.** Logical replication
-    /// copies rows but not sequence values, so a promoted logical standby holds
-    /// every replicated `harvest_events` row while `harvest_events_id_seq`
-    /// still sits where it started — and the new primary's first append dies on
+    /// copies rows but not sequence values. A promoted logical standby holds
+    /// every replicated `harvest_events` row, but `harvest_events_id_seq` still
+    /// sits where it started. The first append of the new primary then fails on
     /// a duplicate key.
     ///
-    /// A separate verb from `fence` on purpose: folding it in would let an
-    /// operator fence a shard and never advance its sequences, and discover it
-    /// only when the first workflow tried to make progress. Harmless and
-    /// idempotent on a physical replica, which replicates sequences already.
+    /// This verb is separate from `fence` on purpose. Folded into `fence`, it
+    /// would let an operator fence a shard and never advance its sequences.
+    /// The operator would discover it only when the first workflow tried to
+    /// make progress. Harmless and idempotent on a physical replica, which
+    /// replicates sequences already.
     Promote {
         /// A promoted shard database DSN. Repeat once per shard.
         #[arg(long = "shard", value_name = "DSN", required = true)]
@@ -271,16 +272,16 @@ pub enum DrFormat {
 /// `harvest partition` — inspect and manage the opt-in partitioned
 /// `harvest_events` layout (issue #958).
 ///
-/// Every subcommand is shard-local by construction: a shard is a database, so
-/// each `--shard` DSN is acted on independently and one shard's outcome never
-/// depends on another's.
+/// Every subcommand is shard-local by construction. A shard is a database, so
+/// each `--shard` DSN is acted on independently. The outcome of one shard
+/// never depends on another.
 #[derive(Debug, Subcommand)]
 pub enum PartitionCommand {
     /// Report each shard's layout, partitions, and what the sweeper would do.
     ///
-    /// Read-only and safe at any time. This is the first thing to run when
-    /// asking "why has space not come back?": the `blocked` column names each
-    /// cohort the sweeper considered and the reason it was left alone.
+    /// Read-only and safe at any time. Run it first to ask "why has space not
+    /// come back?". The `blocked` column names each cohort the sweeper
+    /// considered and the reason it was left alone.
     Status {
         /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
         /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
@@ -327,10 +328,10 @@ pub enum PartitionCommand {
     /// **Convert this shard to the partitioned layout.**
     ///
     /// One transaction under a bounded `lock_timeout`, so a failure leaves the
-    /// deployment exactly as it was. Instant on an empty table; on a populated
-    /// one the existing table is attached WHOLE as the pre-cutover partition,
-    /// so no row is copied or rewritten — but the index builds and constraint
-    /// validation happen inside the lock window.
+    /// deployment exactly as it was. Instant on an empty table. On a populated
+    /// one, the existing table is attached WHOLE as the pre-cutover partition,
+    /// so no row is copied or rewritten. The index builds and constraint
+    /// validation still happen inside the lock window.
     ///
     /// On a large live table use `plan` instead.
     Enable {
@@ -389,8 +390,8 @@ pub enum PartitionCommand {
     ///
     /// Drains the `DEFAULT` partition, extends the lookahead window, then
     /// sweeps droppable cohorts. The retention janitor does exactly this every
-    /// tick; this exists for incident response and for a deployment that runs
-    /// with history retention disabled (where no janitor is running to do it).
+    /// tick. This command is for incident response, and for a deployment with
+    /// history retention disabled, where no janitor runs.
     ///
     /// This command never exports a partition. On a shard whose engine exports
     /// aged partitions (issue #2009), it drops nothing and reports
@@ -426,7 +427,7 @@ pub enum PartitionCommand {
     /// **Revert this shard to the ordinary unpartitioned table.**
     ///
     /// The escape hatch. Copies every surviving row back into a plain table and
-    /// restores the foreign key, so it REWRITES THE WHOLE TABLE — schedule a
+    /// restores the foreign key, so it REWRITES THE WHOLE TABLE. Schedule a
     /// window for it on anything large.
     Disable {
         /// A shard database DSN. Repeat once per shard.
@@ -461,8 +462,8 @@ pub enum BackupCommand {
         /// A scratch-database DSN to inspect. Repeat once per shard. Accepts a
         /// bare DSN or an explicit `<shard_id>=<dsn>` pair. An unprefixed DSN
         /// takes its POSITIONAL index as its shard id (first `--shard` is
-        /// shard `0`, second is shard `1`, ...) — so prefix explicitly
-        /// whenever your shard ids are not `0..n`.
+        /// shard `0`, second is shard `1`, ...). Prefix explicitly whenever
+        /// your shard ids are not `0..n`.
         ///
         /// Supply EVERY shard: a cross-shard reference into a shard that was
         /// not supplied is reported as an advisory, never silently passed.
@@ -977,8 +978,8 @@ pub enum CliError {
     ///
     /// The escape hatch is auditable by construction: absorbing a break writes
     /// a justification into the artifact. This fires when the artifact moved
-    /// over a break with no such record — the shape a hand-edited baseline
-    /// takes, which the ordinary check cannot see because the artifact and the
+    /// over a break with no such record. That is the shape of a hand-edited
+    /// baseline. The ordinary check cannot see it, because the artifact and the
     /// generated contract already agree. Exit code is `1`.
     #[error(
         "schema check: {missing} breaking schema change(s) since the previous revision of the \
@@ -995,11 +996,11 @@ pub enum CliError {
 
     /// The acknowledgement log lost a record it previously carried.
     ///
-    /// The log is append-only, and the coverage check above leans on that: it
+    /// The log is append-only, and the coverage check above relies on that. It
     /// subtracts the records the previous revision already had, so a stale one
-    /// cannot cover a fresh break. Retargeting an existing record — editing the
-    /// break it names rather than appending — defeats that subtraction, and is
-    /// invisible to both the ordinary diff and the coverage check. A vanished
+    /// cannot cover a fresh break. Retargeting an existing record defeats that
+    /// subtraction: it edits the break the record names instead of appending.
+    /// Neither the ordinary diff nor the coverage check can see it. A vanished
     /// record is its one observable signature. Exit code is `1`.
     #[error(
         "schema check: {dropped} acknowledgement record(s) present in the previous revision of \
@@ -1046,12 +1047,12 @@ pub enum CliError {
     /// least one was capped by `max_steps`, and found no difference in it
     /// (issue #949).
     ///
-    /// This is deliberately *not* exit `0`. "No difference in the part we
-    /// looked at" is not "these agree", and a CI gate that treats it as a pass
-    /// is silently trusting an unexamined suffix. Exit code is `2`, joining
-    /// the other "could not determine" gates (`WorkflowReachabilityGate`,
-    /// `QueueCoverageGate`, `RestoreUndetermined`) so a script can tell it
-    /// apart from `1` = "differences found".
+    /// This is deliberately *not* exit `0`. "No difference in the examined
+    /// part" is not "these agree". A CI gate that treats it as a pass trusts an
+    /// unexamined suffix. Exit code is `2`, as for the other "could not
+    /// determine" gates (`WorkflowReachabilityGate`, `QueueCoverageGate`,
+    /// `RestoreUndetermined`). A script can then tell it apart from `1` =
+    /// "differences found".
     #[error("debug diff: inconclusive — {reason} (compared {examined} steps)")]
     DebugDiffInconclusive {
         /// How many steps were actually compared.
@@ -1074,9 +1075,9 @@ pub enum CliError {
 
     /// A `migrate` operation failed against one database (issue #1240).
     ///
-    /// The DSN is redacted before it reaches this message: a migration command
-    /// is run from deploy pipelines whose logs are far more widely readable
-    /// than the credential in `harvest.database.url`. Exit code is `1`.
+    /// The DSN is redacted before it reaches this message. Deploy pipelines run
+    /// a migration command, and their logs are more widely readable than the
+    /// credential in `harvest.database.url`. Exit code is `1`.
     #[error("migrate: {database}: {reason}")]
     Migrate {
         /// Redacted DSN of the database the operation was pointed at.
@@ -1090,10 +1091,10 @@ pub enum CliError {
     /// The report itself is already printed; this only signals the exit code.
     /// Exit code is `1` — "determined: not migrated", as distinct from the
     /// exit-`2` gates that mean "could not determine".
-    // The remedy names the flags on purpose: this gate reports on exactly the
-    // sets it was handed, so a bare `harvest migrate run` after a `--check`
-    // that carried `--include-dir` would apply the embedded set only, exit 0,
-    // and leave the very migration that failed the gate unapplied.
+    // The remedy names the flags on purpose. This gate reports on exactly the
+    // sets it was handed. A `--check` can carry `--include-dir`. A bare
+    // `harvest migrate run` after it applies the embedded set only and exits 0.
+    // The migration that failed the gate then stays unapplied.
     #[error(
         "migrate status: {pending} pending migration(s) across {databases} database(s) — \
          run `harvest migrate run` with the SAME --database-url and --include-dir \
@@ -1113,21 +1114,19 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::PreflightGate { status } if status == "warn" => 2,
-            // Issue #520 / #774: both the workflow-reachability gate and the
-            // queue-coverage gate use exit code 2 specifically so CI can
-            // distinguish "an orphaned/partial/uncovered deploy hazard" from
-            // a generic transport/usage failure (exit 1).
+            // Issues #520 and #774 give the workflow-reachability and
+            // queue-coverage gates exit code 2. CI can then tell "an orphaned/
+            // partial/uncovered deploy hazard" from a transport/usage failure
+            // (exit 1).
             //
-            // Issue #943 joins them for the same reason: "could not determine"
-            // (a shard was unreachable) must be distinguishable from
-            // "determined broken" (exit 1), so an operator drill script can
-            // retry a transient shard outage rather than declare the restore
-            // unusable.
+            // Issue #943 joins them for the same reason. "Could not determine"
+            // (a shard was unreachable) differs from "determined broken" (exit
+            // 1). An operator drill script can then retry a transient shard
+            // outage instead of declaring the restore unusable.
             //
-            // Issue #949's `debug diff` joins them on the same reasoning: a
-            // capped comparison examined only a prefix, so "inconclusive" must
-            // be distinguishable from `1` = "differences found" and from
-            // `0` = "compared in full and agree".
+            // Issue #949's `debug diff` joins them too. A capped comparison
+            // examined only a prefix. So "inconclusive" differs from `1` =
+            // "differences found" and from `0` = "compared in full and agree".
             Self::WorkflowReachabilityGate { .. }
             | Self::QueueCoverageGate { .. }
             | Self::RestoreUndetermined { .. }
@@ -1474,8 +1473,8 @@ enum Commands {
     /// Inspect and manage the opt-in partitioned `harvest_events` layout
     /// (issue #958).
     ///
-    /// Talks to shard databases directly, never to the management API: the
-    /// layout is a property of each shard's own schema, and `enable`/`disable`
+    /// Talks to shard databases directly, never to the management API. The
+    /// layout is a property of the schema of each shard. `enable`/`disable`
     /// are DDL that no HTTP surface should be able to trigger.
     Partition {
         #[command(subcommand)]
@@ -1545,15 +1544,15 @@ enum Commands {
     /// (issue #1240).
     ///
     /// For `harvest.mode = "split"` / `"external"` deployments, where Harvest
-    /// storage is a database Autumn has no handle on: `autumn migrate` reaches
-    /// the application database only, and outside the `dev` profile the plugin
-    /// warns about pending Harvest migrations rather than applying them.
+    /// storage is a database Autumn has no handle on. `autumn migrate` reaches
+    /// the application database only. Outside the `dev` profile, the plugin
+    /// warns about pending Harvest migrations instead of applying them.
     ///
-    /// Talks to Postgres directly — no management API, no running app — and
-    /// uses the same `__diesel_schema_migrations` ledger Autumn and Diesel use,
-    /// so a migration is applied exactly once no matter which of them applies
-    /// it. Under `embedded` mode use `autumn migrate` instead; the two Harvest
-    /// sets are Autumn's there.
+    /// Talks to Postgres directly, with no management API and no running app.
+    /// It uses the same `__diesel_schema_migrations` ledger as Autumn and
+    /// Diesel. So a migration is applied exactly once, whichever of them
+    /// applies it. Under `embedded` mode use `autumn migrate` instead. The two
+    /// Harvest sets are Autumn's there.
     ///
     /// Harvest's own migrations are embedded in this binary. Sets that are not
     /// (the plugin's connector dead-letter table, an application's own) are
@@ -1574,12 +1573,14 @@ enum Commands {
 
     /// Scaffold a new, runnable autumn-harvest project (issue #692).
     ///
-    /// Emits a complete crate — a `Cargo.toml` with crates.io deps and the `db`
-    /// feature, a `#[workflow]`/`#[activity]` pair with `HarvestPlugin` wiring, a
-    /// `compose.yaml` Postgres, an `autumn.toml`, and a README whose three-command
-    /// path reaches one terminal execution. Pure local file generation: no
-    /// database, no network. Everything is named after `<name>` — no manual
-    /// find-and-replace of example identifiers.
+    /// Emits a complete crate. It holds a `Cargo.toml` with crates.io deps and
+    /// the `db` feature, and a `#[workflow]`/`#[activity]` pair with
+    /// `HarvestPlugin` wiring. It also holds a `compose.yaml` Postgres, an
+    /// `autumn.toml`, and a README whose three-command path reaches one
+    /// terminal execution.
+    ///
+    /// Pure local file generation: no database, no network. Everything is
+    /// named after `<name>`, so no manual find-and-replace is necessary.
     New {
         /// Project name. Becomes the crate name, the workflow/activity function
         /// stems, and the activity queue. Must be a valid Cargo package name
@@ -1602,8 +1603,8 @@ enum Commands {
 /// `harvest migrate` subcommands (issue #1240).
 ///
 /// Both talk to Postgres directly and never to the management API. `status` is
-/// strictly read-only — it does not even create the migration ledger — so it is
-/// safe to point at a database you are only inspecting.
+/// strictly read-only and does not even create the migration ledger. It is
+/// safe to point at a database you only inspect.
 #[derive(Debug, Subcommand)]
 enum MigrateCommand {
     /// Report applied and pending migrations without changing anything.
@@ -1640,14 +1641,16 @@ enum MigrateCommand {
     },
     /// Apply every pending migration, in version order.
     ///
-    /// Each migration runs inside one transaction together with its ledger row,
-    /// so a failure leaves neither the schema change nor the record of it —
-    /// with one exception, which the report names when it happens: a migration
-    /// whose `metadata.toml` sets `run_in_transaction = false` (what `CREATE
-    /// INDEX CONCURRENTLY` requires) has no transaction to roll back, so any
-    /// statement of it that already succeeded still stands. A failing target
-    /// stops the run: remaining targets are left untouched rather than
-    /// half-migrated behind a database that already failed.
+    /// Each migration runs inside one transaction together with its ledger row.
+    /// A failure leaves neither the schema change nor the record of it.
+    ///
+    /// One exception exists, and the report names it when it happens. A
+    /// migration whose `metadata.toml` sets `run_in_transaction = false` has no
+    /// transaction to roll back. (`CREATE INDEX CONCURRENTLY` requires that
+    /// setting.) Each statement of it that already succeeded still stands.
+    ///
+    /// A failing target stops the run. The remaining targets are left
+    /// untouched, not half-migrated behind a database that already failed.
     Run {
         /// Harvest database to migrate: the value of `harvest.database.url`.
         ///
@@ -1679,10 +1682,10 @@ enum MigrateCommand {
 
 /// Workflow payload-schema contract subcommands (issue #794).
 ///
-/// Both are pure local file comparison — no database, no network. `--current`
-/// is the schema set your app publishes *right now*; generate it with a
-/// three-line binary in your own crate (the only place the registry is in
-/// scope), or pipe `GET /workflows/registered` straight in.
+/// Both are pure local file comparison: no database, no network. `--current`
+/// is the schema set your app publishes *right now*. Generate it with a
+/// three-line binary in your own crate, the only place the registry is in
+/// scope. Or pipe `GET /workflows/registered` straight in.
 #[derive(Debug, Subcommand)]
 enum SchemaCommand {
     /// Compare the current published schemas against the checked-in baseline
@@ -1704,14 +1707,14 @@ enum SchemaCommand {
         format: SchemaCheckFormat,
         /// Fail on ANY unabsorbed delta, not only a breaking one.
         ///
-        /// Without this the artifact is allowed to lag: a compatible change
-        /// passes and nobody regenerates it, so the baseline records what was
-        /// deployed *some time ago* while the gate reads it as what was deployed
-        /// *last*. That gap round-trips — add an enum variant (compatible, so
-        /// nothing is absorbed), deploy and record payloads carrying it, then
-        /// remove it again, and the generated contract equals the stale baseline
-        /// while replay of the intermediate release's data fails. Use it in CI;
-        /// the fix is always `harvest schema update`.
+        /// Without this the artifact is allowed to lag. A compatible change
+        /// passes and nobody regenerates it. The baseline then records what was
+        /// deployed *some time ago*, but the gate reads it as what was deployed
+        /// *last*. That gap round-trips. Add an enum variant (compatible, so
+        /// nothing is absorbed), deploy, and record payloads that carry it. Then
+        /// remove it again. The generated contract equals the stale baseline,
+        /// but replay of the data of the intermediate release fails. Use it in
+        /// CI. The fix is always `harvest schema update`.
         #[arg(long, default_value_t = false, conflicts_with = "acknowledged_in")]
         require_current: bool,
         /// Verify the ESCAPE HATCH instead of the artifact's freshness.
@@ -1719,12 +1722,13 @@ enum SchemaCommand {
         /// Pass the artifact as it stands now, with `--baseline` pointing at the
         /// PREVIOUS revision of it (e.g. `git show <base>:<path>`). Every
         /// breaking delta must then be covered by an acknowledgement that is new
-        /// in this artifact — which catches a baseline hand-edited to absorb a
-        /// break silently, something the ordinary check cannot see because the
-        /// artifact and the generated contract already agree. Also enforces that
-        /// the acknowledgement log is append-only: a record the previous
-        /// revision carried and this one does not is reported, since retargeting
-        /// an existing record would otherwise read as fresh coverage.
+        /// in this artifact. This catches a baseline hand-edited to absorb a
+        /// break silently. The ordinary check cannot see that, because the
+        /// artifact and the generated contract already agree.
+        ///
+        /// Also enforces that the acknowledgement log is append-only. A record
+        /// that the previous revision carried and this one does not is reported.
+        /// Otherwise a retargeted record would read as fresh coverage.
         #[arg(long, value_name = "PATH")]
         acknowledged_in: Option<PathBuf>,
     },
@@ -1732,7 +1736,7 @@ enum SchemaCommand {
     /// Regenerate the checked-in baseline from the current schemas.
     ///
     /// A breaking delta is **refused** unless `--acknowledge` records why it is
-    /// safe; the justification is written into the artifact, so the
+    /// safe. The justification is written into the artifact. So the
     /// acknowledgement is visible in the checked-in diff and never silent.
     Update {
         /// Baseline artifact to rewrite in place.
@@ -1795,10 +1799,10 @@ enum RampCommand {
 enum WorkflowTypesCommand {
     /// Report per-workflow-type handler reachability.
     ///
-    /// Exits `2` when any workflow type is `orphaned` (a non-terminal execution
-    /// still depends on a handler this deployment no longer registers) or when
-    /// the report is incomplete (a shard was unreachable), so it can gate a
-    /// deploy in CI.
+    /// Exits `2` when any workflow type is `orphaned`, so it can gate a deploy
+    /// in CI. Orphaned means a non-terminal execution still depends on a
+    /// handler this deployment no longer registers. It also exits `2` when the
+    /// report is incomplete (a shard was unreachable).
     Reachability {
         /// Narrow the report to a single workflow type.
         #[arg(long = "type")]
@@ -1858,12 +1862,11 @@ enum HistoryCommand {
     /// Export a stratified sample of IN-FLIGHT histories as a replay bundle.
     ///
     /// Takes at most `--per-workflow` non-terminal executions per registered
-    /// workflow type across every shard and writes one JSON fixture per
-    /// execution into `--output-dir`, alongside a
-    /// `harvest-sample-manifest.json` reporting how many were sampled versus
-    /// how many are actually in flight. Feed the directory to
-    /// `WorkflowReplayer::replay_bundle` in CI to block promotion of a build
-    /// that would diverge on in-flight work (issue #798).
+    /// workflow type across every shard. Writes one JSON fixture per execution
+    /// into `--output-dir`. A `harvest-sample-manifest.json` reports how many
+    /// were sampled versus how many are actually in flight. Feed the directory
+    /// to `WorkflowReplayer::replay_bundle` in CI. It blocks promotion of a
+    /// build that would diverge on in-flight work (issue #798).
     ExportSample {
         /// Directory to write the replay bundle into. Created if absent.
         #[arg(long, value_name = "DIR")]
@@ -2027,15 +2030,15 @@ enum TokenCommand {
         tenant: Option<String>,
     },
     /// Seed the FIRST token offline (issue #942). Prints a fresh secret ONCE
-    /// and the exact `INSERT INTO harvest_api_tokens ...` SQL for you to run
-    /// against your database — no API call and no DB connection is made.
+    /// and the exact `INSERT INTO harvest_api_tokens ...` SQL to run against
+    /// your database. It makes no API call and no DB connection.
     ///
     /// Standalone (tokens-only) deployments use this to mint their first
     /// `admin` token. With tokens as the only auth, no admin caller exists
-    /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once (you
-    /// already have DB access — the trust anchor), then mint every further
-    /// token through the API. The printed SQL contains ONLY the hash; the
-    /// secret is shown separately for you to store.
+    /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once. Your
+    /// DB access is the trust anchor. Then mint every further token through the
+    /// API. The printed SQL contains ONLY the hash. The secret is shown
+    /// separately for you to store.
     Bootstrap {
         /// Human-readable label for the seed token.
         #[arg(long, default_value = "bootstrap")]
@@ -2063,10 +2066,10 @@ enum TokenCommand {
 enum ShardCommand {
     /// Migrate quiescent workflow executions from one shard to another (issue #964).
     ///
-    /// Connects to the shard databases DIRECTLY rather than through the
-    /// management API: a rebalance is a two-database operation, and the node
-    /// serving the API has no reason to hold a pool for both. Supply each shard
-    /// with `--shard <ID>=<DSN>`.
+    /// Connects to the shard databases DIRECTLY, not through the management
+    /// API. A rebalance is a two-database operation. The node that serves the
+    /// API has no reason to hold a pool for both. Supply each shard with
+    /// `--shard <ID>=<DSN>`.
     ///
     /// Always dry-run first. `--dry-run` walks the same code path up to the
     /// first write and reports exactly the population a real run would move.
@@ -2114,8 +2117,8 @@ enum ShardCommand {
     /// Drive any migration left unfinished by a crash forward one step (issue #964).
     ///
     /// Idempotent and safe to re-run. A migration killed after its cutover is
-    /// completed; one killed before it is either finished or cleanly abandoned,
-    /// depending on whether the source woke up in the meantime.
+    /// completed. One killed before the cutover is either finished or cleanly
+    /// abandoned. That depends on whether the source woke up in the meantime.
     RebalanceResume {
         /// Shard databases, as `<ID>=<DSN>`. Supply every shard any unfinished
         /// migration touches.
@@ -2214,7 +2217,7 @@ enum WorkflowCommand {
         #[arg(long = "search-attr", value_name = "KEY=VALUE")]
         search_attr: Vec<String>,
         /// Filter by a typed comparison/set predicate over a search attribute,
-        /// `key:op:value` where op is one of eq, ne, gt, gte, lt, lte, in,
+        /// as `key:op:value`. The op is one of eq, ne, gt, gte, lt, lte, in,
         /// exists (e.g. `amount:gt:10000`, `phase:in:blocked,awaiting_approval`,
         /// `phase:exists`). Repeat to AND multiple predicates together. Forwarded
         /// verbatim to the `search_attr_filter` API param (issue #506).
@@ -2232,13 +2235,14 @@ enum WorkflowCommand {
         /// stalled-workflow results. Only meaningful with --no-progress-minutes.
         #[arg(long)]
         include_sleeping: bool,
-        /// Operator early-warning discovery for workflow history bloat (issue
-        /// #704): return only live (non-terminal) executions whose current
-        /// recorded event count is at least this many, sorted by history size
-        /// descending. Distinct from the server's general-purpose
-        /// `min_history_events` filter (issue #493, not currently CLI-exposed),
-        /// which composes with `--state`/pagination and does not restrict to
-        /// live executions or force this sort order.
+        /// Operator early warning for workflow history bloat (issue #704).
+        /// Returns only live (non-terminal) executions whose recorded event
+        /// count is at least this many, sorted by history size descending.
+        ///
+        /// Distinct from the general-purpose `min_history_events` filter of the
+        /// server (issue #493, not CLI-exposed). That filter composes with
+        /// `--state`/pagination. It does not restrict to live executions or
+        /// force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
         /// Filter by workflow-start provenance (issue #740). Values: api,
@@ -2337,10 +2341,12 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
-    /// Diagnose why one execution is stuck: a one-word health verdict plus the
-    /// discriminated root cause (no live worker on the queue, circuit open,
-    /// retry backoff, rate-limited, concurrency-deferred, queue paused,
-    /// awaiting a signal, sleeping on a timer, ...), in a single call.
+    /// Diagnose why one execution is stuck, in a single call.
+    ///
+    /// Prints a one-word health verdict plus the discriminated root cause.
+    /// Causes include no live worker on the queue, circuit open, retry backoff,
+    /// rate-limited, concurrency-deferred, queue paused, awaiting a signal, and
+    /// sleeping on a timer.
     ///
     /// For a determinism verdict on a code change instead, see
     /// `workflow replay-diagnosis`.
@@ -2352,8 +2358,10 @@ enum WorkflowCommand {
         json: bool,
     },
     /// Render the recursive descendant lineage tree for an execution across all
-    /// shards — the spawn topology of a saga or fan-out, annotated with each
-    /// descendant's state.
+    /// shards.
+    ///
+    /// The tree is the spawn topology of a saga or fan-out, annotated with the
+    /// state of each descendant.
     Tree {
         /// Root workflow execution ID (may be any node in the tree; the
         /// response is the subtree below it).
@@ -2501,9 +2509,9 @@ enum WorkflowCommand {
     /// Set, update, or clear an execution's operator-mutable triage tags:
     /// owner, severity, and a free-text note (issue #759).
     ///
-    /// A plain metadata update on the execution row -- appends no workflow
-    /// event, is never read by the workflow function, and has zero
-    /// replay-determinism impact; distinct from author-controlled
+    /// A plain metadata update on the execution row. It appends no workflow
+    /// event, the workflow function never reads it, and it has zero
+    /// replay-determinism impact. Distinct from author-controlled
     /// `search_attrs`. `owner`/`severity` set this way are immediately
     /// reflected in `harvest workflow list --owner ... --severity ...`.
     /// Works on any lifecycle state (RUNNING, PAUSED, FAILED, COMPLETED,
@@ -2591,16 +2599,17 @@ enum WorkflowCommand {
     },
     /// Re-run a terminal workflow execution as a brand-new run.
     ///
-    /// The complement to `reset`: reset forks an execution mid-history so the
-    /// surviving prefix is replayed, whereas a re-run replays nothing — it
-    /// starts the whole workflow over from the source run's recorded start
-    /// parameters (input, queue, memo, search attributes, timeouts, SLA,
-    /// owner/severity, context headers, retry policy, completion callbacks).
+    /// The complement to `reset`. Reset forks an execution mid-history so the
+    /// surviving prefix is replayed. A re-run replays nothing. It starts the
+    /// whole workflow over from the recorded start parameters of the source
+    /// run. These are the input, queue, memo, search attributes, timeouts, SLA,
+    /// owner/severity, context headers, retry policy and completion callbacks.
+    ///
     /// The source must be terminal (`COMPLETED`, `FAILED`, `CANCELLED`,
-    /// `TIMED_OUT`, `TERMINATED`); a `RUNNING`/`PAUSED` or already-sealed
-    /// `CONTINUED_AS_NEW` source is rejected. Admin-only, and NOT idempotent —
-    /// re-running the default way seals the source to `CONTINUED_AS_NEW` to
-    /// free its business key, so a second identical call returns `409`.
+    /// `TIMED_OUT`, `TERMINATED`). A `RUNNING`/`PAUSED` or already-sealed
+    /// `CONTINUED_AS_NEW` source is rejected. Admin-only, and NOT idempotent.
+    /// The default re-run seals the source to `CONTINUED_AS_NEW` to free its
+    /// business key, so a second identical call returns `409`.
     Rerun {
         /// Workflow execution ID of the terminal source run.
         execution_id: String,
@@ -3134,9 +3143,9 @@ enum ConcurrencyCommand {
 /// Task-queue pause/resume (issue #619): hold dispatch on a whole queue while a
 /// downstream dependency is down, then thaw it.
 ///
-/// A pause never fails, retries, or dead-letters work — held tasks stay
-/// `PENDING` and become claimable again the instant the queue is resumed, with
-/// the time they spent held credited back so the thaw does not retroactively
+/// A pause never fails, retries, or dead-letters work. Held tasks stay
+/// `PENDING` and become claimable again the instant the queue is resumed. The
+/// time they spent held is credited back. So the thaw does not retroactively
 /// schedule-to-start-time-out the backlog.
 #[derive(Debug, Subcommand)]
 enum QueueCommand {
@@ -3168,7 +3177,7 @@ enum QueueCommand {
     /// them (issue #774).
     ///
     /// Exits `2` when any queue is uncovered, or when the report is
-    /// incomplete (a shard was unreachable), so it can gate a deploy or
+    /// incomplete (a shard was unreachable). So it can gate a deploy or
     /// migration in CI.
     Coverage {
         /// Narrow the report to a single queue name.
@@ -3222,15 +3231,15 @@ enum FairnessCommand {
 /// queue pause above.
 ///
 /// Hold dispatch for ONE activity type while a scoped downstream dependency is
-/// down, leaving every other activity type on the same queue flowing. Held
-/// tasks stay `PENDING` — never failed, retried, or dead-lettered — and an
+/// down. Every other activity type on the same queue keeps flowing. Held
+/// tasks stay `PENDING`, never failed, retried, or dead-lettered. An
 /// already-running attempt finishes naturally. On resume the time each task
-/// spent held is credited back to its `scheduled_at`, so the thaw does not
+/// spent held is credited back to its `scheduled_at`. So the thaw does not
 /// retroactively schedule-to-start-time-out the backlog.
 ///
-/// Reach for `harvest queue pause` instead when the WHOLE queue must stop; for
-/// many affected activity types on one queue, one queue hold is easier to
-/// remember to release than N activity holds.
+/// Use `harvest queue pause` instead when the WHOLE queue must stop. For many
+/// affected activity types on one queue, one queue hold is easier to remember
+/// to release than N activity holds.
 #[derive(Debug, Subcommand)]
 enum ActivityCommand {
     /// Hold dispatch for one activity type, fleet-wide.
@@ -3238,8 +3247,8 @@ enum ActivityCommand {
         /// Activity type name, matched exactly (no trimming).
         activity_name: String,
         /// Why the activity is being held. Recorded on the pause row, surfaced
-        /// by `harvest activity list`, and carried into the audit trail — which
-        /// is the reason's only permanent home, since resume deletes the row.
+        /// by `harvest activity list`, and carried into the audit trail. Resume
+        /// deletes the row, so the audit trail is the only permanent home.
         #[arg(long)]
         reason: Option<String>,
         /// Operator identity to record as `paused_by`. A LABEL for attribution,
@@ -3256,10 +3265,10 @@ enum ActivityCommand {
     /// List registered activity types with their pause state and held backlog.
     ///
     /// Driven by the registered catalogue, not the pause table, so a healthy
-    /// activity is listed with `paused: false` — this is the surface used to
-    /// answer "is `charge_card` held?" during an incident. A paused-but-
-    /// unregistered activity is listed too, flagged `registered: false`, so a
-    /// mistyped hold can never become invisible here.
+    /// activity is listed with `paused: false`. This surface answers "is
+    /// `charge_card` held?" during an incident. A paused-but-unregistered
+    /// activity is listed too, flagged `registered: false`. So a mistyped hold
+    /// can never become invisible here.
     #[command(alias = "list-paused", alias = "status")]
     List {
         /// Print the raw JSON body instead of the human-readable table.
@@ -3319,9 +3328,9 @@ enum RateLimitCommand {
     /// declared per-activity rate limit (issue #945).
     ///
     /// Takes effect on the existing token-consumption path immediately,
-    /// with no worker restart; self-expires and reverts to the declared
-    /// baseline at the TTL with no further operator action. Each call
-    /// fully replaces the whole override.
+    /// with no worker restart. At the TTL it self-expires and reverts to the
+    /// declared baseline, with no further operator action. Each call fully
+    /// replaces the whole override.
     Override {
         /// Name of a registered activity that declares a static
         /// (non-dynamic) rate limit.
@@ -3360,9 +3369,9 @@ enum ThrottleCommand {
     /// declared workflow-start throttle (issue #945, extends issue #607).
     ///
     /// Takes effect on the existing token-consumption path immediately,
-    /// with no worker restart; self-expires and reverts to the declared
-    /// baseline at the TTL with no further operator action. Each call
-    /// fully replaces the whole override.
+    /// with no worker restart. At the TTL it self-expires and reverts to the
+    /// declared baseline, with no further operator action. Each call fully
+    /// replaces the whole override.
     Override {
         /// Name of a registered workflow that declares a static
         /// (non-dynamic) start throttle.
@@ -3867,11 +3876,11 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
-            // Locally-executed commands: each returns from `run` before the
+            // Locally-executed commands return from `run` before the
             // API-request mapper is reached, so none of them can arrive here.
-            // Grouped rather than listed one arm apiece -- a three-line arm per
-            // command is what pushed this function past `too_many_lines`, and
-            // it would do so again on the next local command.
+            // They share one arm. A three-line arm per command pushed this
+            // function past `too_many_lines`, and the next local command would
+            // do so again.
             cmd @ (Commands::Backup { .. }
             | Commands::Dr { .. }
             | Commands::Partition { .. }
@@ -3957,10 +3966,10 @@ pub mod tui;
 ///
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
-// A dispatcher: a sequence of `if let ... return` guards for locally-handled
-// commands (det-check, schema, new, tui, debug, events, worker-drain-wait,
-// backup verify, token bootstrap) followed
-// by the shared execute/render path. Splitting it would only scatter the guards.
+// A dispatcher: `if let ... return` guards for locally-handled commands, then
+// the shared execute/render path. The local commands are det-check, schema,
+// new, tui, debug, events, worker-drain-wait, backup verify and token
+// bootstrap. Splitting it would only scatter the guards.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     // `backup verify` talks to scratch databases directly (read-only), not to
@@ -3999,9 +4008,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return run_dr(command).await;
     }
 
-    // `shard rebalance` moves rows between two shard databases, so like `dr` and
-    // `partition` it connects to them directly rather than through the
-    // management API -- which would need a pool for both shards on one node.
+    // `shard rebalance` moves rows between two shard databases. Like `dr` and
+    // `partition`, it connects to them directly. The management API would
+    // need a pool for both shards on one node.
     if let Commands::Shard { command } = &cli.command
         && matches!(
             command,
@@ -4013,9 +4022,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return run_shard_rebalance(command, cli.actor.as_deref()).await;
     }
 
-    // `partition` is shard-local DDL and inspection: it connects to each shard
-    // database directly, so it is handled in-process before the API execute
-    // path, exactly like `dr`.
+    // `partition` is shard-local DDL and inspection. It connects to each shard
+    // database directly, so, like `dr`, it runs in-process before the API
+    // execute path.
     if let Commands::Partition { command } = &cli.command {
         return run_partition(command).await;
     }
@@ -4096,9 +4105,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         };
     }
 
-    // `migrate` talks to the Harvest database directly (issue #1240): no HTTP,
-    // and deliberately no running app — it is the step that happens *before*
-    // replicas roll (mirrors `backup verify`).
+    // `migrate` talks to the Harvest database directly (issue #1240). It uses
+    // no HTTP and deliberately no running app. It is the step *before*
+    // replicas roll, as `backup verify` is.
     if let Commands::Migrate { command } = &cli.command {
         return match command {
             MigrateCommand::Status {
@@ -4239,9 +4248,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                     context: err.to_string(),
                 });
             }
-            // Issue #774: same fail-closed convention as the reachability gate
-            // above -- a transport error on a queue-coverage deploy gate must
-            // also read as "deploy hazard" (exit 2), not a generic error (exit 1).
+            // Issue #774: the fail-closed convention of the reachability gate
+            // above. A transport error on a queue-coverage deploy gate must
+            // read as "deploy hazard" (exit 2), not a generic error (exit 1).
             if queue_coverage_should_gate(&cli) {
                 return Err(CliError::QueueCoverageGate {
                     context: err.to_string(),
@@ -4256,17 +4265,16 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if let Some(notice) = fanout_partial_notice(&response) {
         eprintln!("{notice}");
     }
-    // `render_response` is deliberately called inside each arm rather than once
-    // up front: for a bundle export it produces a full pretty-printed copy of
-    // every sampled payload, which the default (non-JSON) arm then discards in
-    // favour of `summary`. `write_history_sample_bundle` is already serializing
-    // every fixture, so holding a second whole-response copy alongside it is
-    // what pushes a large export toward an OOM on a CI runner.
+    // `render_response` is called inside each arm, not once up front. For a
+    // bundle export it produces a pretty-printed copy of every sampled payload.
+    // The default (non-JSON) arm discards it in favour of `summary`.
+    // `write_history_sample_bundle` already serializes every fixture. A second
+    // whole-response copy pushes a large export toward an OOM on a CI runner.
     if let Some(dir) = history_sample_output_dir(&cli) {
-        // Issue #798: the sample export writes a replay BUNDLE (one fixture per
-        // sampled execution plus the coverage manifest), not a single blob, so
-        // the directory can be fed straight to `WorkflowReplayer::replay_bundle`.
-        // `-o json` still prints the raw response for scripting.
+        // Issue #798: the sample export writes a replay BUNDLE, not a single
+        // blob. It holds one fixture per sampled execution plus the coverage
+        // manifest. The directory feeds `WorkflowReplayer::replay_bundle`
+        // directly. `-o json` still prints the raw response for scripting.
         let summary = write_history_sample_bundle(&response, dir)?;
         if cli.output == OutputFormat::Json {
             println!("{}", render_response(&cli, &response)?);
@@ -4326,9 +4334,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             .to_string();
         return Err(CliError::QueuePartialMutation { detail });
     }
-    // Same 207-is-2xx hazard as the queue mutation above, and the response
-    // carries the identical `ok`/`status` contract, so the same body-level gate
-    // applies: a hold that missed a shard must never look like success.
+    // Same 207-is-2xx hazard as the queue mutation above. The response carries
+    // the same `ok`/`status` contract, so the same body-level gate applies. A
+    // hold that missed a shard must never look like success.
     if activity_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
         let detail = response
             .get("partial_failures")
@@ -4391,9 +4399,8 @@ pub struct BundleFile {
 ///
 /// # Errors
 /// Returns [`CliError::InvalidInput`] when the response is not a sample-export
-/// body (missing `exports` array or `manifest` object) — better than writing a
-/// silently-empty bundle that a CI gate would then pass or fail for the wrong
-/// reason.
+/// body (missing `exports` array or `manifest` object). A silently-empty
+/// bundle would let a CI gate pass or fail for the wrong reason.
 pub fn history_sample_bundle_files(response: &Value) -> Result<Vec<BundleFile>, CliError> {
     let exports = response
         .get("exports")
@@ -4521,10 +4528,10 @@ pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
             "NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.\n",
         );
     }
-    // Distinct from the NOTE above, and the distinction is what an operator acts
-    // on: that one reports the *intended* truncation of sampling `per_workflow`
-    // out of a larger population, this one an *unplanned* resource limit. Raising
-    // `--per-workflow` would make this strictly worse.
+    // Distinct from the NOTE above, and an operator acts on the distinction.
+    // That one reports the *intended* truncation of sampling `per_workflow`
+    // out of a larger population. This one reports an *unplanned* resource
+    // limit. Raising `--per-workflow` would make this strictly worse.
     if manifest
         .and_then(|manifest| manifest.get("truncated_by_size"))
         .and_then(Value::as_bool)
@@ -4557,11 +4564,11 @@ pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
         );
     }
 
-    // A redacted bundle is refused by the replay gate (it rewrites the very
-    // activity inputs replay compares against, so every fixture would report a
-    // false divergence). The CLI default is `redacted`, so an operator who omits
-    // the flag writes an unusable bundle. Say so here, at write time, rather than
-    // letting them discover it as an exit-2 wall of BLOCKED lines later.
+    // The replay gate refuses a redacted bundle. Redaction rewrites the
+    // activity inputs that replay compares against, so every fixture would
+    // report a false divergence. The CLI default is `redacted`, so an operator
+    // who omits the flag writes an unusable bundle. Say so at write time, not
+    // later as an exit-2 wall of BLOCKED lines.
     if bundle_is_redacted(response) {
         out.push_str(
             "\nWARNING: this bundle was exported with --payload-policy redacted, which the \
@@ -4579,9 +4586,8 @@ pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
 /// route echoes back from the request. That is authoritative and present even
 /// when `exports` is empty, so it beats sniffing the individual fixtures.
 ///
-/// Absent or unrecognized reads as *not* redacted: a legacy response, or a
-/// future policy value, must never produce a spurious warning about a bundle the
-/// gate would happily replay.
+/// Absent or unrecognized reads as *not* redacted. A legacy response or a
+/// future policy value must never warn about a bundle the gate would replay.
 fn bundle_is_redacted(response: &Value) -> bool {
     response.get("payload_policy").and_then(Value::as_str) == Some("redacted")
 }
@@ -4611,26 +4617,26 @@ fn write_history_sample_bundle(response: &Value, dir: &Path) -> Result<String, C
 
 /// Remove a previous bundle's fixtures from `dir` so a re-export replaces it.
 ///
-/// A fixture's file name embeds its execution id, so re-exporting does not
-/// overwrite the previous run's fixtures — it accumulates on top of them. The
-/// manifest has a fixed name and *is* overwritten, so the two end up describing
-/// different things: the manifest counts this run's sample while the directory
-/// holds every run's, and `replay_bundle` walks every `*.json` it finds. The
-/// gate would then verify executions that finished hours ago and report coverage
-/// numbers that never described them.
+/// A fixture's file name embeds its execution id. So a re-export does not
+/// overwrite the fixtures of the previous run; it accumulates on top of them.
+/// The manifest has a fixed name and *is* overwritten. The manifest then
+/// counts the sample of this run, but the directory holds the fixtures of every
+/// run. `replay_bundle` walks every `*.json` it finds. The gate would verify
+/// executions that finished hours ago, with coverage numbers that never
+/// described them.
 ///
 /// Scoped narrowly, because this deletes files in a path the caller chose:
-/// * A top-level manifest **that is a regular file** must be present — that is
-///   the marker identifying a directory this CLI wrote. A directory holding
-///   `*.json` with no such manifest is somebody else's and is **refused**, not
-///   cleaned; `--output-dir .` must never eat a user's files because they
+/// * A top-level manifest **that is a regular file** must be present. It is
+///   the marker of a directory this CLI wrote. A directory holding `*.json`
+///   with no such manifest is somebody else's and is **refused**, not
+///   cleaned. `--output-dir .` must never eat the files of a user who
 ///   mistyped a path.
-/// * Every `*.json` entry the gate would replay is removed — at **any depth**,
-///   and whether it is a regular file or a **symlink** (the link is removed,
-///   never the file it points at). The predicate deliberately mirrors
-///   `testing::collect_json_files`: if the two walks disagree about what counts
-///   as a fixture, a leftover entry is replayed against the fresh manifest and
-///   reported as drift the candidate never caused.
+/// * Every `*.json` entry the gate would replay is removed, at **any depth**,
+///   as a regular file or a **symlink**. For a link, the link is removed,
+///   never the file it points at. The predicate mirrors
+///   `testing::collect_json_files`. If the two walks disagree about what is a
+///   fixture, a leftover entry is replayed against the fresh manifest. It is
+///   then reported as drift the candidate never caused.
 /// * Directories and every non-`.json` file are left alone.
 ///
 /// # Errors
@@ -4642,12 +4648,11 @@ fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
     let mut has_manifest = false;
 
     // Walk exactly what the gate replays. `testing::collect_json_files`
-    // DESCENDS SUBDIRECTORIES, so a top-level-only clean would leave a nested
-    // fixture in place while the gate still replayed it — the new manifest
-    // would describe only the fresh top-level fixtures, and the stale nested
-    // one would surface as unrelated drift. That is precisely the false verdict
-    // this function exists to prevent, so the two walks must agree on depth as
-    // well as on the extension predicate.
+    // DESCENDS SUBDIRECTORIES. A top-level-only clean would leave a nested
+    // fixture in place, and the gate would still replay it. The new manifest
+    // describes only the fresh top-level fixtures, so the stale nested one
+    // surfaces as unrelated drift. This function exists to prevent that false
+    // verdict. So the two walks must agree on depth and on the extension.
     let mut dirs_to_visit = vec![dir.to_path_buf()];
     while let Some(current) = dirs_to_visit.pop() {
         let at_top_level = current == dir;
@@ -4672,34 +4677,31 @@ fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
             }
             // Deliberately NOT `is_file()`. `testing::collect_json_files`
             // decides what the GATE replays with the predicate "not a directory
-            // and ends in `.json`" — which a SYMLINK satisfies. Requiring a
-            // regular file here would leave a linked fixture behind for the
-            // replay walk to pick up, and the disagreement is a false verdict:
-            // the fresh manifest describes this run's sample while the
-            // directory still holds a previous run's, and the stale fixture
-            // surfaces as unrelated drift on an unchanged candidate.
+            // and ends in `.json`". A SYMLINK satisfies it. A regular-file check
+            // here would leave a linked fixture for the replay walk. The fresh
+            // manifest describes the sample of this run, but the directory
+            // still holds one of a previous run. The stale fixture surfaces as
+            // unrelated drift on an unchanged candidate.
             //
-            // Containment depends on it too. `fs::write` FOLLOWS a symlink, so
-            // a leftover link whose name collides with a fixture about to be
-            // written sends that write outside the directory the operator
-            // named. Clearing the link first is what keeps the replace inside
-            // `--output-dir`; `fs::remove_file` removes the LINK, never the file
-            // it points at.
+            // Containment depends on it too. `fs::write` FOLLOWS a symlink. A
+            // leftover link can have the name of a fixture about to be written.
+            // That write then goes outside the directory the operator named.
+            // Clearing the link first keeps the replace inside `--output-dir`.
+            // `fs::remove_file` removes the LINK, never the file it points at.
             let is_manifest = entry.file_name().to_string_lossy() == manifest_name;
             if is_manifest && kind.is_file() {
-                // Only a TOP-LEVEL manifest marks this directory as our bundle;
-                // a nested one is just a file we happen to skip (the replay walk
+                // Only a TOP-LEVEL manifest marks this directory as a CLI
+                // bundle. A nested one is a skipped file. The replay walk
                 // excludes the reserved name at any depth, so it is never
-                // replayed and never needs deleting).
+                // replayed and never needs deleting.
                 //
-                // The MARKER is held to a stricter rule than the fixtures it
-                // guards — a regular file, not merely a `.json` entry — because
-                // it is what AUTHORIZES deleting this directory's contents. A
-                // *linked* manifest is not evidence we wrote the directory, so
-                // it falls through to the `.json` branch below and blocks the
-                // replace instead of licensing it. That also keeps the manifest
-                // write itself contained, since it is a name we are about to
-                // `fs::write`.
+                // The MARKER must be a regular file, not merely a `.json`
+                // entry. That rule is stricter than for the fixtures, because
+                // the marker AUTHORIZES deleting the contents of this
+                // directory. A *linked* manifest is no evidence that this CLI
+                // wrote the directory. It falls through to the `.json` branch
+                // below and blocks the replace. That also keeps the manifest
+                // write contained, since this name is about to get `fs::write`.
                 if at_top_level {
                     has_manifest = true;
                 }
@@ -4737,12 +4739,11 @@ fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
 
 /// Builds one determinism report across every requested source path.
 ///
-/// A single shared first-party helper index (issue #778) is used, so a
-/// cross-file transitive violation is caught even when the two files are passed
-/// as separate arguments (the changed-files CI pattern). Directories are walked
-/// recursively; files are scanned directly; symlinks are not followed;
-/// overlapping arguments are de-duplicated; a non-UTF-8 file mid-walk is
-/// skipped. Pure — no printing.
+/// One shared first-party helper index (issue #778) catches a cross-file
+/// transitive violation, even when the two files are separate arguments (the
+/// changed-files CI pattern). Directories are walked recursively. Files are
+/// scanned directly. Symlinks are not followed. Overlapping arguments are
+/// de-duplicated. A non-UTF-8 file mid-walk is skipped. Pure: no printing.
 ///
 /// # Errors
 /// Returns [`CliError::InvalidInput`] if a top-level path is missing or a source
@@ -4970,8 +4971,8 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
     let mut out = Vec::with_capacity(raw.len());
     for (idx, spec) in raw.iter().enumerate() {
         let spec = spec.trim();
-        // Only split on a `<digits>=` prefix: a DSN can legitimately contain
-        // `=` in its query string (`?sslmode=require`), so an unconditional
+        // Only split on a `<digits>=` prefix. A DSN can contain `=` in its
+        // query string (`?sslmode=require`). An unconditional
         // `split_once('=')` would mangle a bare DSN.
         let (shard_id, dsn) = match spec.split_once('=') {
             Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
@@ -4983,13 +4984,13 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
             _ => (i32::try_from(idx).unwrap_or(0), spec),
         };
         // An `ExecutionId` carries its shard as `shard & 0xFFFF`, and `0xFFFF`
-        // is the reserved `ShardId::UNENCODED` sentinel -- so a value outside
+        // is the reserved `ShardId::UNENCODED` sentinel. So a value outside
         // `0..=0xFFFE` does not survive the round trip. `65536` truncates to
-        // `0`, which would make every target id read out of THIS database
-        // decode as shard 0, miss the supplied map, and be written off as
-        // "on an uninspected shard": an advisory, exit 0, and the shard the
-        // operator supplied never actually checked. Validate with the same
-        // rule the shard router uses so the two cannot drift.
+        // `0`. Every target id read out of THIS database would then decode as
+        // shard 0 and miss the supplied map. It would be written off as "on an
+        // uninspected shard": an advisory, exit 0, and the supplied shard never
+        // checked. Validate with the rule of the shard router so the two cannot
+        // drift.
         if !autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(shard_id)) {
             return Err(CliError::InvalidInput(format!(
                 "--shard: shard id `{shard_id}` cannot be encoded into an execution id \
@@ -5078,9 +5079,9 @@ fn strip_shard_prefix(dsn: &str) -> &str {
 /// The stderr notice to print when the live-DSN guard could not actually
 /// protect anything.
 ///
-/// The guard is silent by design in two cases, and silence is the dangerous
-/// part: an operator who believes a safety net is engaged will point the
-/// command at whatever DSN is to hand. Say so out loud instead.
+/// The guard is silent by design in two cases, and silence is the danger. An
+/// operator who believes a safety net is engaged points the command at any
+/// DSN to hand. Say so out loud instead.
 ///
 /// * No `--live-dsn` was supplied at all — nothing was compared.
 /// * `--i-know-this-is-scratch` was passed — the comparison was skipped.
@@ -5290,11 +5291,11 @@ pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
         }),
         VerifyStatus::Unavailable => Some(CliError::RestoreUndetermined {
             unreachable_shards: report.shards.iter().filter(|s| !s.reachable).count(),
-            // Sum each finding's `count`, not the number of findings: one
+            // Sum each finding's `count`, not the number of findings. One
             // `ProbeFailed` finding aggregates every probe that could not run
-            // on that shard, so counting findings would under-report by an
-            // order of magnitude and make the message read far less alarming
-            // than the truth.
+            // on that shard. Counting findings would under-report by an order
+            // of magnitude and make the message far less alarming than the
+            // truth.
             failed_probes: report
                 .all_findings()
                 .filter(|f| f.severity == FindingSeverity::Undetermined)
@@ -5323,9 +5324,9 @@ pub async fn run_backup_verify(
     default_shard: i32,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
-    // Say out loud when the guard could not protect anything -- an operator
-    // who believes a safety net is engaged is the one who points this at
-    // production. On stderr so `-o json` stdout stays parseable.
+    // Say out loud when the guard could not protect anything. An operator who
+    // believes a safety net is engaged points this at production. On stderr
+    // so `-o json` stdout stays parseable.
     if let Some(w) = scratch_guard_warning(live_dsn, ack) {
         eprintln!("{w}");
     }
@@ -5359,11 +5360,10 @@ pub async fn run_backup_verify(
 /// Assemble the migration set to apply: Harvest's own, embedded in this binary,
 /// plus every `--include-dir` set in the order given.
 ///
-/// The combined set is validated for duplicate versions here rather than per
-/// directory, because that is exactly where a collision arises — two
-/// independently authored sets that picked the same version. Diesel's ledger is
-/// keyed by version alone, so one of them would otherwise be recorded and never
-/// run.
+/// The combined set is validated for duplicate versions here, not per
+/// directory. A collision arises here: two independently authored sets pick
+/// the same version. The Diesel ledger is keyed by version alone. Without
+/// this check, one of them would be recorded and never run.
 ///
 /// # Errors
 ///
@@ -5384,30 +5384,29 @@ fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliErr
 
 /// Establish the connection `harvest migrate` works over.
 ///
-/// Deliberately not [`autumn_harvest::migrate::connect`]: that is
-/// `AsyncPgConnection::establish`, which is `NoTls` and so cannot reach a
-/// database whose `sslmode` demands TLS — the common shape of a managed
-/// Harvest database, and exactly the production case this command exists for
-/// (issue #1240). This builds the same rustls-backed connector autumn-web's
-/// own migration path uses, so the two agree about which databases are
-/// reachable.
+/// Deliberately not [`autumn_harvest::migrate::connect`]. That is
+/// `AsyncPgConnection::establish`, which is `NoTls`. It cannot reach a
+/// database whose `sslmode` demands TLS. That is the common shape of a managed
+/// Harvest database, and the production case of this command (issue #1240).
+/// This builds the rustls-backed connector of the autumn-web migration path,
+/// so the two agree about which databases are reachable.
 ///
-/// **TLS is always verified** — certificate chain *and* hostname, against the
+/// **TLS is always verified**: certificate chain *and* hostname, against the
 /// platform's trust store. That is stricter than libpq, whose `require` and
-/// `prefer` encrypt without authenticating: a certificate this cannot verify is
+/// `prefer` encrypt without authenticating. A certificate this cannot verify is
 /// refused here, where libpq would connect.
 ///
 /// What that means per mode, precisely:
 ///
 /// * `disable` — plaintext, no trust store consulted.
-/// * `prefer` (the default) — TLS is attempted; tokio-postgres falls back to
+/// * `prefer` (the default) — TLS is attempted. tokio-postgres falls back to
 ///   plaintext only when the **server declines** TLS, not when the handshake
 ///   fails. So an untrusted or hostname-mismatched certificate is an error
-///   here rather than a silent downgrade to an unauthenticated connection.
-///   Deliberate: this command carries a database password and applies schema
-///   changes, and "the certificate was wrong so we sent the credential in
-///   clear" is not a fallback worth having. Use `sslmode=disable` to say
-///   plaintext out loud, or put the CA in the trust store.
+///   here, not a silent downgrade to an unauthenticated connection. This is
+///   deliberate. This command carries a database password and applies schema
+///   changes. Sending the credential in clear after a bad certificate is not a
+///   useful fallback. Use `sslmode=disable` to say plaintext out loud, or put
+///   the CA in the trust store.
 /// * `require` / `verify-ca` / `verify-full` — TLS, verified. An empty trust
 ///   store is a named error rather than a downgrade.
 ///
@@ -5425,9 +5424,9 @@ async fn connect_for_migration(
         .map_err(|error: tokio_postgres::Error| migrate_error(database_url, redacted, &error))?;
 
     // `sslmode=disable` never touches the TLS configuration, so it must not be
-    // gated on one: a minimal container with no CA bundle is a perfectly good
-    // place to migrate a plaintext database, and failing there would contradict
-    // what this command promises.
+    // gated on one. A minimal container with no CA bundle is a good place to
+    // migrate a plaintext database. Failing there would contradict what this
+    // command promises.
     if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
         return autumn_harvest::migrate::connect(database_url)
             .await
@@ -5442,12 +5441,11 @@ async fn connect_for_migration(
         let _ = roots.add(cert);
     }
     if roots.is_empty() {
-        // With no anchors, every TLS handshake would fail verification. What
-        // that should mean depends on whether the operator asked for TLS:
-        // under `require` it is a hard error, and under `prefer` -- which is
-        // libpq's "TLS if it works, plaintext otherwise" -- plaintext is the
-        // documented degradation. Never the reverse: a `require` DSN is never
-        // quietly downgraded.
+        // With no anchors, every TLS handshake would fail verification. The
+        // outcome depends on whether the operator asked for TLS. Under
+        // `require` it is a hard error. `prefer` is libpq's "TLS if it works,
+        // plaintext otherwise", so plaintext is the documented degradation.
+        // A `require` DSN is never quietly downgraded.
         if config.get_ssl_mode() == tokio_postgres::config::SslMode::Prefer {
             eprintln!(
                 "warning: {redacted}: no usable certificates in the platform trust \
@@ -5498,16 +5496,16 @@ async fn connect_for_migration(
 /// Rewrite `sslmode=verify-ca` / `verify-full` to `require`.
 ///
 /// tokio-postgres 0.7 accepts only `disable`, `prefer` and `require`, and
-/// **fails to parse** the DSN otherwise — so a `verify-full` DSN that libpq and
-/// the `diesel` CLI accept would be rejected before a connection is attempted.
+/// **fails to parse** the DSN otherwise. A `verify-full` DSN that libpq and
+/// the `diesel` CLI accept would be rejected before a connection attempt.
 ///
-/// Substituting `require` is not a downgrade: verification is the rustls
-/// connector's job here, and it always checks the chain and the hostname. The
+/// Substituting `require` is not a downgrade. The rustls connector does the
+/// verification here, and it always checks the chain and the hostname. The
 /// two verify modes therefore describe what [`connect_for_migration`] already
 /// does unconditionally.
 ///
-/// Handles both DSN spellings — a URL (`postgres://…?sslmode=verify-full`) and
-/// libpq keyword form (`host=… sslmode=verify-full`) — and leaves anything else
+/// Handles both DSN spellings: a URL (`postgres://…?sslmode=verify-full`) and
+/// libpq keyword form (`host=… sslmode=verify-full`). Leaves anything else
 /// byte-identical.
 #[must_use]
 pub fn normalize_sslmode(dsn: &str) -> String {
@@ -5543,17 +5541,17 @@ pub fn normalize_sslmode(dsn: &str) -> String {
 /// Rewrite the top-level `sslmode` option of a libpq **keyword/value** DSN
 /// (`host=… sslmode=verify-full`), leaving every other byte alone.
 ///
-/// Scans the DSN the way libpq reads it — options separated by whitespace,
-/// optional whitespace around `=`, values optionally single-quoted with `\`
-/// escapes — rather than splitting on whitespace. A whitespace split cannot see
-/// quoting, so `password='abc sslmode=verify-full def'` would have had the text
-/// *inside the password* rewritten, corrupting the credential and failing
-/// authentication. It also could not see `sslmode = verify-full`, which libpq
-/// accepts and this now rewrites.
+/// Scans the DSN the way libpq reads it, not by a whitespace split. Options
+/// are separated by whitespace, with optional whitespace around `=`. Values
+/// are optionally single-quoted with `\` escapes. A whitespace split cannot
+/// see quoting. In `password='abc sslmode=verify-full def'` it would rewrite
+/// the text *inside the password*, so authentication would fail. It also
+/// could not see `sslmode = verify-full`, which libpq accepts and this now
+/// rewrites.
 ///
 /// A DSN this cannot scan (an unterminated quote, a missing `=`) is returned
-/// **unchanged**, so tokio-postgres reports its own parse error rather than
-/// this mangling the input first.
+/// **unchanged**. tokio-postgres then reports its own parse error, and this
+/// does not mangle the input first.
 fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
     scan_keyword_dsn(dsn, |key, value| {
         (key == "sslmode" && verify_modes.contains(&value)).then(|| "require".to_string())
@@ -5564,10 +5562,9 @@ fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
 /// Redact the secrets in a libpq **keyword/value** DSN, leaving the rest legible.
 ///
 /// [`redact_dsn`] parses URLs, and answers `<unparseable dsn>` for the keyword
-/// form. That is safe but useless as a *label*: repeat `--database-url` with
-/// three keyword-form shards and every line of the report reads the same, which
-/// is exactly the "which databases did we already migrate?" question a partial
-/// report exists to answer.
+/// form. That is safe but useless as a *label*. With three keyword-form shards
+/// in `--database-url`, every line of the report reads the same. A partial
+/// report exists to answer "which databases are already migrated?".
 ///
 /// Returns `None` when the DSN cannot be scanned, so a caller can fall back
 /// rather than print something it has not actually inspected.
@@ -5600,11 +5597,11 @@ fn skip_whitespace(dsn: &str, i: &mut usize) {
 /// Scan a libpq keyword/value DSN, replacing the values `replace` returns
 /// `Some` for and copying every other byte verbatim.
 ///
-/// Reads the DSN the way libpq does — options separated by whitespace, optional
-/// whitespace around `=`, values optionally single-quoted, backslash escaping
-/// the next character in either form. A whitespace split cannot see quoting, so
-/// `password='abc sslmode=verify-full def'` would otherwise have the text
-/// *inside the password* rewritten.
+/// Reads the DSN the way libpq does. Options are separated by whitespace,
+/// with optional whitespace around `=`. Values are optionally single-quoted.
+/// A backslash escapes the next character in either form. A whitespace split
+/// cannot see quoting. It would rewrite the text *inside the password* of
+/// `password='abc sslmode=verify-full def'`.
 ///
 /// "Whitespace" is Unicode `White_Space` (`char::is_whitespace`), matching
 /// `tokio_postgres::config`'s own `skip_ws`. It is not ASCII only.
@@ -5613,10 +5610,10 @@ fn skip_whitespace(dsn: &str, i: &mut usize) {
 /// separator. This scan must too. Otherwise it reads two options as one
 /// and a `password` key past the separator goes unseen (issue #1321).
 ///
-/// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
-/// `=`, a value that never arrives — leaving the caller to pass the original
-/// through so tokio-postgres reports its own parse error rather than this
-/// mangling the input first.
+/// Returns `None` for a DSN this cannot scan: an unterminated quote, a missing
+/// `=`, a value that never arrives. The caller then passes the original
+/// through. tokio-postgres reports its own parse error, and this does not
+/// mangle the input first.
 fn scan_keyword_dsn(
     dsn: &str,
     mut replace: impl FnMut(&str, &str) -> Option<String>,
@@ -5645,13 +5642,13 @@ fn scan_keyword_dsn(
         }
         let key = &dsn[key_start..i];
         // The key must be a keyword libpq actually recognizes, not merely
-        // keyword-SHAPED. Checking only the character set is not enough: a
-        // mistyped URL that keeps a credential but loses the `://`
-        // (`postgres=//alice:hunter2@db/harvest`) scans as the "keyword"
-        // `postgres`, needs no redaction because there is no `password=`, and
-        // comes back whole -- password included -- as if it had been examined.
-        // Rejecting here yields the caller's `<unparseable dsn>` label, which
-        // is what an input tokio-postgres will also reject should produce.
+        // keyword-SHAPED. A character-set check is not enough. Take a mistyped
+        // URL that keeps a credential but loses the `://`
+        // (`postgres=//alice:hunter2@db/harvest`). It scans as the "keyword"
+        // `postgres` and has no `password=` to redact. It comes back whole,
+        // password included, as if it had been examined. Rejecting here yields
+        // the `<unparseable dsn>` label of the caller. That is the right label
+        // for an input that tokio-postgres also rejects.
         if !is_connection_keyword(key) {
             return None;
         }
@@ -5682,10 +5679,10 @@ fn scan_keyword_dsn(
                 }
                 match bytes[i] {
                     b'\\' if i + 1 < bytes.len() => {
-                        // Advance past the WHOLE escaped character: `\é` is
-                        // three bytes, and `i += 2` would leave `i` inside it,
-                        // so the next `dsn[i..]` slice panics on a non-char
-                        // boundary instead of connecting.
+                        // Advance past the WHOLE escaped character. `\é` is
+                        // three bytes, and `i += 2` would leave `i` inside it.
+                        // The next `dsn[i..]` slice would then panic on a
+                        // non-char boundary.
                         let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
                         value.push(escaped);
                         i += 1 + escaped.len_utf8();
@@ -5726,9 +5723,10 @@ fn scan_keyword_dsn(
     Some(out)
 }
 
-/// The label a migration target is reported under: its DSN with the credential
-/// removed, and — when it cannot be redacted at all — an ordinal, so repeated
-/// targets stay tellable apart.
+/// The label of a migration target: its DSN with the credential removed.
+///
+/// A DSN that cannot be redacted at all gets an ordinal, so repeated targets
+/// stay distinct.
 ///
 /// `ordinal` is the target's 1-based position on the command line.
 #[must_use]
@@ -5740,11 +5738,10 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
     const WITHHELD: &str = "<redacted dsn>";
 
     // Decide the FORM first, then redact with the reader for that form. The
-    // other order leaks: `redact_dsn` parses with a general URL parser, and
-    // `alice:hunter2@db.internal/harvest` is a syntactically fine URL whose
-    // scheme is `alice` and whose password is nowhere the parser looks — so it
-    // came back unredacted and went into the log. libpq's own rule is the
-    // scheme prefix, so use exactly that.
+    // other order leaks. `redact_dsn` parses with a general URL parser.
+    // `alice:hunter2@db.internal/harvest` is a valid URL with scheme `alice`.
+    // Its password is nowhere the parser looks, so it went into the log
+    // unredacted. libpq's own rule is the scheme prefix, so use exactly that.
     let trimmed = dsn.trim_start();
     let is_url_form = ["postgres://", "postgresql://"].iter().any(|scheme| {
         trimmed
@@ -5754,10 +5751,10 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
 
     if is_url_form {
         let redacted = redact_dsn(dsn);
-        // A URL is a URL, malformed or not: if the URL reader cannot read it,
-        // the keyword scanner has no business trying. Whenever the reader
-        // withholds the WHOLE DSN -- unparseable, or a password in the query
-        // string it cannot rewrite -- the label carries no identity, so every
+        // A URL is a URL, malformed or not. If the URL reader cannot read it,
+        // the keyword scanner must not try. The reader can withhold the WHOLE
+        // DSN: it is unparseable, or has a password in the query string that
+        // it cannot rewrite. The label then carries no identity, so every
         // target would report the same. Keep the reason and add the ordinal.
         return if redacted == UNPARSEABLE || redacted == WITHHELD {
             format!("{redacted} #{ordinal}")
@@ -5772,11 +5769,12 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
 /// Whether `key` is a libpq connection keyword.
 ///
 /// Deliberately a superset of what tokio-postgres itself accepts. Erring wide
-/// only risks handing back a redacted label for a DSN the driver will reject
-/// anyway; erring narrow would downgrade a legitimate DSN's label to
-/// `<unparseable dsn>` and cost an operator the identity of the failing shard.
-/// What it must not admit is a token that is keyword-shaped but not a keyword,
-/// which is how a mistyped URL smuggles a password past redaction.
+/// only risks a redacted label for a DSN that the driver rejects anyway.
+/// Erring narrow would downgrade a legitimate DSN's label to
+/// `<unparseable dsn>`. The operator would then lose the identity of the
+/// failing shard. The list must not admit a token that is keyword-shaped but
+/// not a keyword. A mistyped URL uses such a token to smuggle a password past
+/// redaction.
 ///
 /// `autumn-harvest-plugin`'s dev runtime solves the same problem for DSN
 /// redaction. See `is_connection_keyword` in
@@ -5838,9 +5836,9 @@ fn is_connection_keyword(key: &str) -> bool {
 
 /// Render a migration failure without leaking the DSN.
 ///
-/// A migration command runs from deploy pipelines whose logs are read far more
-/// widely than the credential in `harvest.database.url`, and a driver is free
-/// to quote the connection string it was handed. Substituting the redacted form
+/// A migration command runs from deploy pipelines. Their logs are read more
+/// widely than the credential in `harvest.database.url`. A driver is free to
+/// quote the connection string it was handed. Substituting the redacted form
 /// costs nothing and removes the whole class.
 fn migrate_error(database_url: &str, redacted: &str, error: &impl std::fmt::Display) -> CliError {
     CliError::Migrate {
@@ -5870,9 +5868,9 @@ pub fn format_migrate_plan_text(heading: &str, targets: &[(String, MigrationPlan
         for script in &plan.pending {
             let _ = writeln!(out, "      {}", script.name);
         }
-        // Reported, never removed: the usual cause is a newer build having
-        // already migrated this database, but it also catches a DSN pointed at
-        // the wrong one.
+        // Reported, never removed. The usual cause is a newer build that
+        // already migrated this database. It also catches a DSN pointed at the
+        // wrong one.
         if !plan.unrecognized.is_empty() {
             let _ = writeln!(
                 out,
@@ -5918,10 +5916,9 @@ pub struct MigrateRunTarget {
     /// The run never reached a migration on this target: connecting, creating
     /// the ledger, or reading it failed.
     ///
-    /// Distinguished because an empty report is otherwise indistinguishable
-    /// from "finished, nothing to do" — a JSON consumer would read `applied:
-    /// []`, `failed: null` on a database the run could not even inspect and
-    /// call it done.
+    /// Otherwise an empty report looks like "finished, nothing to do". A JSON
+    /// consumer would read `applied: []`, `failed: null` on a database the run
+    /// could not even inspect, and call it done.
     pub setup_failed: bool,
 }
 
@@ -6074,9 +6071,9 @@ pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError
                 // empty report reads as "finished with nothing to do".
                 "setup_failed": target.setup_failed,
                 // `null` on a target that finished. On one that did not, the
-                // migration it stopped on and whether that rolled back -- the
-                // difference between "nothing changed" and "something changed
-                // and the run cannot say what".
+                // migration it stopped on and whether that rolled back. That
+                // separates "nothing changed" from "something changed and the
+                // run cannot say what".
                 "failed": target.report.failed.as_ref().map(|failed| json!({
                     "name": failed.name,
                     "rolled_back": failed.rolled_back,
@@ -6146,10 +6143,12 @@ fn report_and_fail(
 ///
 /// # Errors
 ///
-/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
-/// migration version; [`CliError::Migrate`] when a database cannot be reached;
-/// [`CliError::MigrationsPending`] when `--check` is set and any target still
-/// has a pending migration. The report is printed before the gate fires.
+/// - [`CliError::InvalidInput`] on an unreadable `--include-dir` or a
+///   duplicate migration version.
+/// - [`CliError::Migrate`] when a database cannot be reached.
+/// - [`CliError::MigrationsPending`] when `--check` is set and any target
+///   still has a pending migration. The report is printed before the gate
+///   fires.
 pub async fn run_migrate_status(
     database_url: &[String],
     include_dir: &[PathBuf],
@@ -6175,8 +6174,8 @@ pub async fn run_migrate_status(
 
 /// Run `harvest migrate run` end to end.
 ///
-/// Databases are migrated in the order given and a failure stops the run: the
-/// remaining targets are left untouched rather than migrated behind a database
+/// Databases are migrated in the order given, and a failure stops the run.
+/// The remaining targets are left untouched, not migrated behind a database
 /// that already failed. Whatever completed first is still reported, so an
 /// operator can see exactly how far the deploy step got.
 ///
@@ -6210,11 +6209,11 @@ pub async fn run_migrate_run(
     let mut targets = Vec::with_capacity(database_url.len());
     for (ordinal, url) in database_url.iter().enumerate() {
         let redacted = migrate_target_label(url, ordinal + 1);
-        // Every failure past the first target -- connecting to it as much as
-        // migrating it -- goes through `report_and_fail`: on a multi-shard run
-        // the operator needs to know which databases are already migrated
-        // before deciding what to do next, and an unreachable third shard says
-        // nothing about the two behind it.
+        // Every failure past the first target goes through `report_and_fail`,
+        // for the connection and the migration alike. On a multi-shard run, the
+        // operator must know which databases are already migrated before the
+        // next step. An unreachable third shard says nothing about the two
+        // behind it.
         let mut conn = match connect_for_migration(url, &redacted).await {
             Ok(conn) => conn,
             Err(failure) => {
@@ -6238,10 +6237,10 @@ pub async fn run_migrate_run(
             Err(partial) => {
                 let failure = migrate_error(url, &redacted, &partial.error);
                 // The failing target always joins the report, even with nothing
-                // applied: a `run_in_transaction = false` migration that failed
-                // part-way leaves changes it cannot list, and "no report at
-                // all" and "nothing happened" must not look the same to the
-                // tooling reading this.
+                // applied. A `run_in_transaction = false` migration that failed
+                // part-way leaves changes it cannot list. To the tooling that
+                // reads this, "no report at all" and "nothing happened" must
+                // differ.
                 //
                 // `failed: None` means no migration failed, so the run never
                 // got that far -- the ledger could not be created or read.
@@ -6268,8 +6267,8 @@ pub async fn run_migrate_run(
 
 /// One shard's DR state, as `harvest dr status` reports it.
 ///
-/// Serialized by hand rather than by `serde::Serialize`: this crate depends on
-/// `serde_json` but not on `serde` itself, and one small projection is a better
+/// Serialized by hand, not by `serde::Serialize`. This crate depends on
+/// `serde_json` but not on `serde` itself. One small projection is a better
 /// trade than a new dependency.
 #[derive(Debug)]
 struct DrShardStatus {
@@ -6280,9 +6279,9 @@ struct DrShardStatus {
     unreachable_reason: Option<String>,
     /// `None` when this shard has never been provisioned, which means fencing
     /// is not yet in force there. Distinct from `generation_error`: "there is
-    /// no fence here" and "we could not tell" are different answers, and the
+    /// no fence here" and "the CLI could not tell" are different answers. The
     /// runbook's verification step ("every shard's generation must have
-    /// increased") reads the second as the first if they are collapsed.
+    /// increased") would read the second as the first if they merged.
     generation: Option<String>,
     /// Why the generation could not be read, when it could not be.
     generation_error: Option<String>,
@@ -6300,12 +6299,12 @@ struct DrShardStatus {
     lag_bytes: Option<i64>,
     /// `None` when the replication views could not be read at all.
     ///
-    /// Distinct from `Some(0)`, and the distinction is the point: `0` is the
-    /// definitive "this shard has no standby, its RPO is unbounded", while
-    /// `None` is "the role cannot read `pg_stat_replication` — most likely a
-    /// missing `GRANT pg_monitor`". Collapsing the second into the first
-    /// printed a categorical no-standby warning for a permissions gap, to an
-    /// operator deciding whether to fail over.
+    /// Distinct from `Some(0)`, and the distinction is the point. `0` is the
+    /// definitive "this shard has no standby, its RPO is unbounded". `None` is
+    /// "the role cannot read `pg_stat_replication`", most likely a missing
+    /// `GRANT pg_monitor`. Treating the second as the first printed a
+    /// categorical no-standby warning for a permissions gap. The operator who
+    /// read it was deciding whether to fail over.
     connected_standbys: Option<usize>,
     inactive_slots: Option<usize>,
     /// Why the replication views were unreadable, when they were.
@@ -6689,9 +6688,9 @@ async fn shard_pool_write_authority(
 
 /// What `harvest partition disable` did on one shard.
 ///
-/// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
-/// successful no-op, not an absent result, and the two must not be spelled the
-/// same way in the JSON an operator's script reads.
+/// A named enum, not `Option<Option<_>>`. "Already unpartitioned" is a
+/// successful no-op, not an absent result. The JSON that an operator's script
+/// reads must spell the two differently.
 #[derive(Debug)]
 enum DisableOutcome {
     /// Reverted, discarding the rows the flat layout's constraints forbid.
@@ -6711,11 +6710,11 @@ impl DisableOutcome {
 
 /// One shard's row in a `harvest partition` report.
 ///
-/// A plain struct with a hand-written JSON projection rather than a
-/// `serde::Serialize` derive: this crate depends on `serde_json` but
-/// deliberately not on `serde` itself (see `DrShardStatus`), and one small
-/// projection is a better trade than a new dependency. The engine types it
-/// embeds do derive `Serialize`, so `serde_json::to_value` handles them.
+/// A plain struct with a hand-written JSON projection, not a
+/// `serde::Serialize` derive. This crate depends on `serde_json` but
+/// deliberately not on `serde` itself (see `DrShardStatus`). One small
+/// projection is a better trade than a new dependency. The embedded engine
+/// types do derive `Serialize`, so `serde_json::to_value` handles them.
 #[derive(Debug)]
 struct PartitionShardReport {
     shard_id: i32,
@@ -6940,11 +6939,11 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                         Ok(parts) => row.partitions = Some(parts),
                         Err(e) => row.error = Some(e.to_string()),
                     }
-                    // The `blocked` reasons are produced by the sweep's gate,
-                    // so a status command that only listed partitions could
-                    // never answer the question this command exists for. This
-                    // is a read-only evaluation of the same gate: no lock, no
-                    // DDL, no straggler delete.
+                    // The sweep's gate produces the `blocked` reasons. A status
+                    // command that only listed partitions could not answer the
+                    // question this command exists for. This is a read-only
+                    // evaluation of the same gate: no lock, no DDL, no
+                    // straggler delete.
                     match autumn_harvest::partition::evaluate(
                         &mut conn,
                         autumn_harvest::chrono::Utc::now(),
@@ -7043,10 +7042,10 @@ async fn run_partition_enable(
                     continue;
                 }
             };
-        // Per-shard independence is deliberate: a shard is a database, and a
-        // half-converted cluster is a supported state (each shard's layout is
-        // detected at runtime), so one shard's lock timeout must not abort the
-        // conversion of the rest.
+        // Per-shard independence is deliberate. A shard is a database. A
+        // half-converted cluster is a supported state, because each shard's
+        // layout is detected at runtime. So the lock timeout of one shard must
+        // not abort the conversion of the rest.
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let enabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -7108,14 +7107,14 @@ async fn run_partition_maintain(
         .and_then(|done| done);
         match maintained {
             Ok(outcome) => {
-                // A pass that ran but did not COMPLETE — a `drain_default` that
-                // lost its bounded lock attempt, say — comes back as `Ok` with
-                // `last_error` set, because maintenance is best-effort and must
+                // A pass that ran but did not COMPLETE comes back as `Ok` with
+                // `last_error` set. An example is a `drain_default` that lost
+                // its bounded lock attempt. Maintenance is best-effort and must
                 // never fail a retention tick. The CLI is not a retention tick.
                 // Without this, `harvest partition maintain` would print an
-                // ordinary zero-drain report and exit 0 while the DEFAULT
-                // partition stayed undrained, and scheduled operator automation
-                // would never notice.
+                // ordinary zero-drain report and exit 0. The DEFAULT partition
+                // would stay undrained, and operator automation would never
+                // notice.
                 row.error.clone_from(&outcome.last_error);
                 row.maintenance = Some(outcome);
             }
@@ -7156,9 +7155,9 @@ async fn run_partition_disable(
             Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
                 // `None` = already unpartitioned. That is a successful no-op,
-                // not a failure: `enable` on an already-partitioned shard exits
-                // 0, and a deployment script must be able to run `disable`
-                // twice without the second run failing.
+                // not a failure. `enable` on an already-partitioned shard exits
+                // 0. A deployment script must be able to run `disable` twice
+                // without the second run failing.
                 row.disable = Some(report.map_or(
                     DisableOutcome::AlreadyUnpartitioned,
                     DisableOutcome::Reverted,
@@ -7173,9 +7172,9 @@ async fn run_partition_disable(
 
 /// Render a report, and fail the process if any shard errored.
 ///
-/// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
-/// that converted `a` and failed on `b` has left a half-converted cluster, and a
-/// zero exit would let a deployment script move on as though it had not.
+/// The nonzero exit is the point. Take `harvest partition enable --shard a
+/// --shard b` that converted `a` and failed on `b`. It left a half-converted
+/// cluster. A zero exit would let a deployment script move on regardless.
 // One text/JSON report, field by field. Splitting it would scatter one
 // operator-facing rendering across helpers that only print once each.
 #[allow(clippy::too_many_lines)]
@@ -7185,11 +7184,10 @@ fn emit_partition_report(
     verb: &str,
 ) -> Result<(), CliError> {
     // `status` is read-only reporting and must not fail the process for an
-    // unreachable shard — that is the established `harvest dr status`
-    // behaviour, and a monitoring script should get the report for the shards
-    // it could reach. Only the MUTATING verbs exit nonzero, where a partial
-    // result means a half-converted cluster a deployment script must not move
-    // on from.
+    // unreachable shard. That matches `harvest dr status`. A monitoring script
+    // should get the report for the shards it could reach. Only the MUTATING
+    // verbs exit nonzero. For them, a partial result means a half-converted
+    // cluster that a deployment script must not move on from.
     let fail_on_error = verb != "status";
     match format {
         DrFormat::Json => {
@@ -7316,9 +7314,9 @@ fn emit_partition_report(
 ///
 /// Returns [`CliError::InvalidInput`] for an unparseable or unreachable shard
 /// target, and propagates database errors from the fence and promote paths.
-/// `status` never fails on an unreachable shard: it reports the shard as
-/// unreachable and carries on, because during an incident a partial answer
-/// about the shards you *can* reach is the answer you need.
+/// `status` never fails on an unreachable shard. It reports the shard as
+/// unreachable and carries on. During an incident, a partial answer about the
+/// shards you *can* reach is the answer you need.
 pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
     match command {
         DrCommand::Status {
@@ -7396,9 +7394,9 @@ async fn run_dr_status(
             lag_bytes: status
                 .as_ref()
                 .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
-            // `Unavailable` is carried through as `None` rather than counted as
-            // zero standbys: "we cannot see" and "there is nothing there" are
-            // opposite answers to a failover decision.
+            // `Unavailable` is carried through as `None`, not counted as zero
+            // standbys. "Cannot see" and "nothing there" are opposite answers
+            // to a failover decision.
             connected_standbys: status.as_ref().and_then(|st| {
                 matches!(
                     st,
@@ -7413,10 +7411,10 @@ async fn run_dr_status(
                 )
                 .then(|| st.inactive_slots())
             }),
-            // `ReplicationStatus` is `#[non_exhaustive]`, so this matches the
-            // two variants it cares about and treats anything else as
-            // observable — a future variant must opt in to being reported as an
-            // outage rather than inherit it.
+            // `ReplicationStatus` is `#[non_exhaustive]`. This matches the two
+            // relevant variants and treats anything else as observable. A
+            // future variant must opt in to being reported as an outage, not
+            // inherit it.
             replication_error: match status.as_ref() {
                 Some(autumn_harvest::replication::ReplicationStatus::Unavailable { reason }) => {
                     Some(reason.clone())
@@ -7488,10 +7486,10 @@ fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
         let bytes = r
             .lag_bytes
             .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-        // `unreadable`, never `0`: `0` is the definitive "there is no standby
-        // here", and printing it for a role that simply cannot read
-        // `pg_stat_replication` tells an operator mid-failover that DR is down
-        // when the truth is that it is unobservable.
+        // `unreadable`, never `0`. `0` is the definitive "there is no standby
+        // here". Printed for a role that cannot read `pg_stat_replication`, it
+        // tells an operator mid-failover that DR is down. In fact DR is only
+        // unobservable.
         let standbys = r
             .connected_standbys
             .map_or_else(|| "unreadable".to_string(), |n| n.to_string());
@@ -7531,11 +7529,11 @@ fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
 
 /// Phase 1 of `harvest dr fence`: validate every shard, mutate nothing.
 ///
-/// A fence that dies partway leaves a HALF-FENCED cluster — the state the
-/// runbook names as the worst possible one, because live cross-shard traffic
-/// then turns bounded skew into unbounded skew — and during a regional failover
-/// an unreachable shard is the *expected* condition, not the exceptional one.
-/// So every failure that can be found without writing is found here, before
+/// A fence that dies partway leaves a HALF-FENCED cluster. The runbook names
+/// that state as the worst possible one. Live cross-shard traffic then turns
+/// bounded skew into unbounded skew. During a regional failover, an
+/// unreachable shard is the *expected* condition, not the exceptional one. So
+/// every failure that can be found without writing is found here, before
 /// anything is written.
 async fn dr_fence_preflight(
     targets: &[autumn_harvest::backup_verify::ShardTarget],
@@ -7578,13 +7576,12 @@ async fn dr_fence_preflight(
             .map_err(|e| dr_error(target.shard_id, &e))?
             .is_none()
         {
-            // Preflight the row's existence here rather than letting
-            // `bump_generation` return NotFound in phase 2. A missing row is a
-            // fully discoverable input error — almost always a wrong shard id,
-            // since an unprefixed `--shard <dsn>` takes its POSITIONAL index —
-            // and discovering it after earlier shards were already bumped
-            // produces precisely the half-fenced cluster this two-phase
-            // structure exists to prevent.
+            // Preflight the row's existence here, before `bump_generation`
+            // could return NotFound in phase 2. A missing row is a fully
+            // discoverable input error. It is almost always a wrong shard id,
+            // since an unprefixed `--shard <dsn>` takes its POSITIONAL index.
+            // Found after earlier shards were bumped, it produces the
+            // half-fenced cluster that this two-phase structure prevents.
             return Err(CliError::InvalidInput(format!(
                 "shard {} has no harvest_shard_generation row at {}, so there is nothing to \
                  fence: no worker has ever pinned it. This is usually a wrong shard id — an \
@@ -7645,10 +7642,10 @@ async fn run_dr_fence(
         }
     }
 
-    // Report what DID happen before returning any error. An operator who is
-    // told only "shard 3 failed" cannot know that shards 0-2 are already
-    // fenced, and that is exactly the fact they need in order to decide what to
-    // do next. On the JSON path this goes to stderr so stdout stays parseable.
+    // Report what DID happen before returning any error. An operator told only
+    // "shard 3 failed" cannot know that shards 0-2 are already fenced. That is
+    // the fact the next decision needs. On the JSON path this goes to stderr
+    // so stdout stays parseable.
     let rendered = match format {
         DrFormat::Json => serde_json::to_string_pretty(&results)
             .map_err(|e| CliError::InvalidInput(e.to_string()))?,
@@ -7839,9 +7836,9 @@ pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
         );
     }
 
-    // `breaking_count` rather than a count of the stored deltas: the tally
-    // keeps counting past the storage cap, so a truncated report still states
-    // the true number.
+    // `breaking_count`, not a count of the stored deltas. The tally keeps
+    // counting past the storage cap, so a truncated report still states the
+    // true number.
     let breaking = diff.breaking_count;
     let total = diff.breaking_count + diff.compatible_count;
     if breaking == 0 {
@@ -7884,10 +7881,10 @@ pub fn schema_diff_json(diff: &SchemaContractDiff) -> Result<String, CliError> {
 /// diff is already on stdout), or an [`CliError::InvalidInput`] read/parse
 /// error naming the offending path.
 ///
-/// A **truncated** diff also fails: once the delta cap is hit the report no
-/// longer enumerates every difference, so passing it would be a claim the tool
-/// cannot support. Failing closed keeps "exit `0`" meaning "nothing breaking",
-/// never "nothing breaking *that fit*".
+/// A **truncated** diff also fails. Past the delta cap, the report no longer
+/// enumerates every difference, so a pass would be an unsupported claim.
+/// Failing closed keeps "exit `0`" meaning "nothing breaking", never "nothing
+/// breaking *that fit*".
 pub fn run_schema_check(
     baseline: &Path,
     current: &Path,
@@ -7915,21 +7912,22 @@ pub fn run_schema_check(
     }
 
     // Escape-hatch mode: a breaking delta is allowed, but only when THIS
-    // revision of the artifact records why. Without it the tool's refusal to
-    // absorb a break can be sidestepped by hand-editing the artifact, which
-    // leaves the ordinary check clean and the change unrecorded.
+    // revision of the artifact records why. Without it, a hand-edit of the
+    // artifact sidesteps the refusal to absorb a break. The ordinary check
+    // stays clean and the change goes unrecorded.
     if let Some(ack_path) = acknowledged_in {
         let head = read_schema_contract(ack_path)?;
-        // An INDEPENDENT check, not a precondition of the coverage one: a
+        // An INDEPENDENT check, not a precondition of the coverage one. A
         // retargeted record covers the delta, so coverage passes and only this
-        // notices the rewrite. Reported first because it is the root cause when
-        // both fire, and because the remedy differs — restore the record and
-        // append, rather than record this break — hence its own error type.
-        // The head artifact is loaded here, so `diff_schema_contracts` — which
-        // only ever saw `base` and `current` — never inspected its reasons. The
+        // notices the rewrite. Reported first, because it is the root cause
+        // when both fire. The remedy also differs: restore the record and
+        // append, instead of recording this break. Hence its own error type.
+        //
+        // The head artifact is loaded here. `diff_schema_contracts` only saw
+        // `base` and `current`, so it never inspected its reasons. The
         // coverage check below already refuses to let a blank record cover
-        // anything; reporting it here names the root cause instead of leaving
-        // the operator with "nothing acknowledges this" beside a record that
+        // anything. Reporting it here names the root cause. Otherwise the
+        // operator sees "nothing acknowledges this" beside a record that
         // plainly exists.
         let blank: Vec<&AcknowledgedBreakingChange> = head
             .acknowledged_breaking_changes
@@ -7962,34 +7960,34 @@ pub fn run_schema_check(
         return Ok(());
     }
 
-    // `breaking_count` is the authoritative tally kept by the differ, not a
-    // count of the *stored* deltas: it stays correct even where storage is
-    // capped, so a breaking change can never be dropped on the floor.
+    // `breaking_count` is the authoritative tally of the differ, not a count of
+    // the *stored* deltas. It stays correct where storage is capped, so a
+    // breaking change is never dropped.
     if diff.has_breaking() {
         return Err(CliError::SchemaContractBreaking {
             breaking: diff.breaking_count,
         });
     }
 
-    // Regenerated METADATA is not compared by the differ, which only ever looks
-    // at `workflows` — so a hand-edit to it survives every check above. That
-    // matters because `compatibility` is the machine-readable claim about WHICH
-    // rules this gate implements: an artifact advertising `pattern` as analysed
-    // would promise a guarantee no code provides, and `description` is the same
-    // claim in prose. `schema update` regenerates both, so requiring them to
-    // match the freshly generated contract costs nothing legitimate.
+    // The differ only looks at `workflows`, so it does not compare regenerated
+    // METADATA. A hand-edit to it survives every check above. That matters.
+    // `compatibility` is the machine-readable claim about WHICH rules this gate
+    // implements. An artifact that advertises `pattern` as analysed would
+    // promise a guarantee no code provides. `description` is the same claim in
+    // prose. `schema update` regenerates both. So a match with the freshly
+    // generated contract costs nothing legitimate.
     //
     // Two siblings are deliberately NOT compared here. `version` records which
-    // BUILD produced the artifact rather than what the gate checks, so tying
-    // currency to it would force a regeneration on every crate version bump for
-    // no safety gain. `contract_version` needs no check at all. `parse` refuses
+    // BUILD produced the artifact, not what the gate checks. A check on it
+    // would force a regeneration on every crate version bump for no safety
+    // gain. `contract_version` needs no check at all. `parse` refuses
     // a value this build does not implement. It also refuses a legacy `1` that
     // carries activity or side-effect content (issue #1994). `parse` rebuilds
     // `workflows`, `activities`, `side_effects` and `coverage` from the entries.
     //
-    // Reported before the delta staleness below because it is the stronger
-    // claim: a stale schema means the artifact is behind, while a doctored
-    // ruleset means it is lying.
+    // Reported before the delta staleness below, because it is the stronger
+    // claim. A stale schema means the artifact is behind. A doctored ruleset
+    // means it is lying.
     if require_current {
         let stale: Vec<&str> = [
             ("description", base.description != cur.description),
@@ -8010,7 +8008,7 @@ pub fn run_schema_check(
     }
 
     // Checked AFTER the breaking verdict so a break is always reported as a
-    // break: staleness is the milder finding, and reporting it first would bury
+    // break. Staleness is the milder finding. Reported first, it would bury
     // the severe one behind "run schema update".
     if require_current && !diff.deltas.is_empty() {
         return Err(CliError::InvalidInput(format!(
@@ -8068,16 +8066,16 @@ fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
 /// Refuses a `--current` that publishes nothing against a non-empty baseline.
 ///
 /// An empty contract is almost always a broken *producer*, not a deliberate
-/// mass deletion: a `dump-schema-contract` binary that forgot `.workflows(…)`,
-/// a `curl` that captured an error body, or a truncated redirect. Diffed
-/// literally it is technically correct — every workflow "removed", every schema
-/// "unpublished" — but it buries the real cause under N breaking deltas and
-/// invites the author to reach for `--acknowledge`, which would overwrite the
-/// baseline with nothing and disarm the gate permanently.
+/// mass deletion. Examples are a `dump-schema-contract` binary that forgot
+/// `.workflows(…)`, a `curl` that captured an error body, or a truncated
+/// redirect. A literal diff is technically correct: every workflow "removed",
+/// every schema "unpublished". But it buries the real cause under N breaking
+/// deltas. It invites the author to use `--acknowledge`. That would overwrite
+/// the baseline with nothing and disarm the gate permanently.
 ///
-/// Deleting every workflow at once is legitimate but vanishingly rare, so this
-/// trades that case (regenerate the baseline directly) for a clear diagnosis of
-/// the common one.
+/// Deleting every workflow at once is legitimate but very rare. For that case,
+/// regenerate the baseline directly. In exchange, the common case gets a clear
+/// diagnosis.
 fn guard_empty_current(
     base: &WorkflowSchemaContract,
     cur: &WorkflowSchemaContract,
@@ -8135,12 +8133,12 @@ fn guard_empty_current(
 
 /// Writes the regenerated baseline without ever leaving a truncated file behind.
 ///
-/// `fs::write` truncates the target *before* writing, so an interrupted run (a
-/// full disk, a killed CI step, a `^C`) can destroy a checked-in baseline and
-/// leave a half-written one in the working tree — and the next `schema check`
-/// would then diff against garbage. Writing a sibling temp file and `rename`ing
-/// it over the target makes the replacement atomic on POSIX: the baseline is
-/// either the old bytes or the new bytes, never a prefix of the new ones.
+/// `fs::write` truncates the target *before* writing. An interrupted run (a
+/// full disk, a killed CI step, a `^C`) can destroy a checked-in baseline. It
+/// leaves a half-written one in the working tree, and the next `schema check`
+/// diffs against garbage. A sibling temp file, `rename`d over the target,
+/// makes the replacement atomic on POSIX. The baseline is either the old bytes
+/// or the new bytes, never a prefix of the new ones.
 ///
 /// The temp file is a sibling (not `/tmp`) so the rename stays within one
 /// filesystem, and is removed on any failure path.
@@ -8171,8 +8169,8 @@ fn write_baseline_atomically(baseline: &Path, contents: &str) -> Result<(), CliE
 
 /// Runs `harvest schema update`: rewrites `baseline` from `current`.
 ///
-/// A breaking delta is refused unless `acknowledge` records why it is safe; the
-/// justification is written into the artifact so it is visible in the
+/// A breaking delta is refused unless `acknowledge` records why it is safe. The
+/// justification is written into the artifact, so it is visible in the
 /// checked-in diff and never silent.
 ///
 /// # Errors
@@ -8191,10 +8189,10 @@ pub fn run_schema_update(
     guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
-    // The core recomputes the diff internally rather than accepting ours: it is
-    // a pure function of the same two inputs, so it cannot disagree, and the
-    // API cannot be fed a diff computed from *different* contracts — which
-    // would write acknowledgement records for deltas that were never inspected.
+    // The core recomputes the diff internally and accepts none from here. It
+    // is a pure function of the same two inputs, so it cannot disagree. The
+    // API cannot be fed a diff computed from *different* contracts. That would
+    // write acknowledgement records for deltas that were never inspected.
     let updated = acknowledge
         .map_or_else(
             || base.compatible_update(&cur),
@@ -8295,11 +8293,12 @@ const MINIMAL_TEMPLATE: &[(&str, &str)] = &[
 /// Derives a clean, warning-free `snake_case` Rust identifier from a project name.
 ///
 /// Lowercases, maps `-` → `_`, collapses runs of `_`, and trims leading/trailing
-/// `_`, so any spec-valid `<name>` (`^[A-Za-z][A-Za-z0-9_-]*$`) yields a valid
-/// `snake_case` ident with no `non_snake_case` warnings and no double underscore:
-/// `my-app` → `my_app`, `MyApp` → `myapp`, `trail-` → `trail`, `my--app` →
-/// `my_app`. A spec-valid name always starts with an ASCII letter, so the result
-/// is non-empty and never begins with a digit or `_`.
+/// `_`. Any spec-valid `<name>` (`^[A-Za-z][A-Za-z0-9_-]*$`) then yields a
+/// valid `snake_case` ident with no `non_snake_case` warnings and no double
+/// underscore. Examples: `my-app` → `my_app`, `MyApp` → `myapp`, `trail-` →
+/// `trail`, `my--app` → `my_app`. A spec-valid name always starts with an
+/// ASCII letter, so the result is non-empty and never begins with a digit or
+/// `_`.
 #[must_use]
 pub fn derive_crate_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -8350,10 +8349,10 @@ pub fn validate_project_name(name: &str) -> Result<(), CliError> {
             "invalid project name '{name}': only ASCII letters, digits, '-' and '_' are allowed"
         )));
     }
-    // Keyword/reserved collision is checked against the raw `-` → `_` form (not
-    // the case-folded render ident) so name *acceptance* matches cargo-new: a
-    // name is rejected only when it is itself a keyword/reserved word, never
-    // merely because it case-folds to one (e.g. `MyApp` stays accepted).
+    // Keyword/reserved collision is checked against the raw `-` → `_` form,
+    // not the case-folded render ident. So name *acceptance* matches
+    // cargo-new. A name is rejected only when it is itself a keyword/reserved
+    // word, never because it case-folds to one (e.g. `MyApp` stays accepted).
     let raw_ident = name.replace('-', "_");
     if RUST_KEYWORDS.contains(&raw_ident.as_str()) || RUST_KEYWORDS.contains(&name) {
         return Err(CliError::InvalidInput(format!(
@@ -8422,8 +8421,8 @@ fn dir_is_non_empty(dir: &Path) -> bool {
 
 /// Scaffolds a new project named `name` into `path` (default `./<name>`).
 ///
-/// Validates the name and renders the template entirely before writing any
-/// file, so an invalid name or a non-empty target (without `force`) leaves the
+/// Validates the name and renders the template entirely before it writes any
+/// file. An invalid name or a non-empty target (without `force`) leaves the
 /// filesystem untouched. Never removes files it did not write.
 ///
 /// # Errors
@@ -8441,9 +8440,9 @@ pub fn run_new(
     let target = path.unwrap_or(&default_path);
 
     // A plain file (or other non-directory) at the target can never be
-    // scaffolded into; reject it up front with a clear message rather than
-    // letting `create_dir_all` surface an opaque OS error. `--force` cannot
-    // help — it only overwrites the scaffold's own files inside a directory.
+    // scaffolded into. Reject it up front with a clear message, before
+    // `create_dir_all` surfaces an opaque OS error. `--force` cannot help. It
+    // only overwrites the scaffold's own files inside a directory.
     if target.exists() && !target.is_dir() {
         return Err(CliError::InvalidInput(format!(
             "target '{}' exists and is not a directory",
@@ -8922,19 +8921,20 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         cli.output
     };
     // Issue #756: `render_response` returns ONLY the body. When a list read
-    // degraded (a shard was unreachable) the caller emits the partial-
-    // availability notice separately on STDERR via `fanout_partial_notice`, so
-    // STDOUT stays a clean/parseable body on both paths — `workflow list -o
-    // json | jq` is not corrupted by a prepended warning line. (The special
-    // table formatters above, usage/dlq_aggregate, render their own
-    // unavailable-shard block inline.)
+    // degraded (a shard was unreachable), the caller emits the partial-
+    // availability notice on STDERR via `fanout_partial_notice`. STDOUT stays
+    // a clean, parseable body on both paths. No prepended warning line
+    // corrupts `workflow list -o json | jq`. (The special table formatters
+    // above, usage/dlq_aggregate, render their own unavailable-shard block
+    // inline.)
     format_output(value, output)
 }
 
 /// Build a human-readable "shard(s) unavailable" notice line from a degraded
-/// cross-shard fan-out envelope (issue #756), or `None` when the body is not a
-/// degraded envelope (a bare array on the happy path, or an object with an
-/// empty/absent `unavailable_shards`).
+/// cross-shard fan-out envelope (issue #756).
+///
+/// Returns `None` when the body is not a degraded envelope: a bare array on the
+/// happy path, or an object with an empty/absent `unavailable_shards`.
 fn fanout_partial_notice(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
     let unavailable = obj.get("unavailable_shards")?.as_array()?;
@@ -8985,10 +8985,11 @@ const fn diagnose_wants_raw_json(cli: &Cli) -> bool {
 /// Render `GET /workflows/{id}/diagnose` as a human-readable verdict
 /// (issue #809).
 ///
-/// Leads with the two things an operator reads first — the one-word `health`
-/// and the one-sentence `summary` — then the discriminated `blocked_on`
-/// members, so the actionable field (the uncovered queue, the open circuit's
-/// cooldown, the awaited signal's name) is on screen without a `jq` pipeline.
+/// Leads with the two things an operator reads first: the one-word `health`
+/// and the one-sentence `summary`. Then come the discriminated `blocked_on`
+/// members. So the actionable field is on screen without a `jq` pipeline. It
+/// is the uncovered queue, the open circuit's cooldown, or the awaited
+/// signal's name.
 fn format_diagnose_verdict(value: &Value) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -9789,15 +9790,14 @@ fn format_preflight_table(value: &Value) -> String {
 
 /// Render the per-check detail block the summary table cannot show.
 ///
-/// The table's `SUMMARY` column carries only a check's one-line verdict, so the
-/// payload an operator actually needs in order to act — the specific unresolved
-/// references in `details.failures`, and the check's `remediation` — is
-/// invisible in table mode. Surfacing them beneath the table makes a failing
-/// `harvest preflight` (and its non-zero exit in CI) actionable without
-/// re-running the command through `--output json | jq`.
+/// The table's `SUMMARY` column carries only a check's one-line verdict. Table
+/// mode hides what an operator needs to act: the unresolved references in
+/// `details.failures`, and the check's `remediation`. Shown beneath the table,
+/// they make a failing `harvest preflight` (and its non-zero exit in CI)
+/// actionable without `--output json | jq`.
 ///
 /// Only non-`pass` checks contribute, and only when they carry at least one
-/// failure or a remediation, so a healthy fleet's output is unchanged.
+/// failure or a remediation. So the output of a healthy fleet is unchanged.
 fn format_preflight_findings(checks: &[Value]) -> String {
     let mut blocks = Vec::new();
     for check in checks {
@@ -9830,8 +9830,8 @@ fn format_preflight_findings(checks: &[Value]) -> String {
 }
 
 /// A `details.failures` entry is a plain string for some checks (catalog
-/// consistency, worker coverage) and a structured object for others (schedule
-/// resolvability); render both without dropping information.
+/// consistency, worker coverage). It is a structured object for others
+/// (schedule resolvability). Render both without dropping information.
 fn preflight_failure_text(failure: &Value) -> String {
     failure
         .as_str()
@@ -10075,10 +10075,10 @@ const fn workflow_reachability_wants_raw_json(cli: &Cli) -> bool {
 ///   be mistaken for "safe to remove".
 /// - Any `orphaned` verdict: a handler was already removed but runs are still live.
 /// - When a `--type` filter is active: also block on `in_use`. Without a filter
-///   the command is a fleet-wide monitor; `in_use` is the normal state for any
-///   type with running workflows and should not block. With a filter the operator
-///   is asking "can I delete this specific handler?"; `in_use` means "no" — live
-///   runs would become orphaned the moment the handler is removed.
+///   the command is a fleet-wide monitor. There `in_use` is the normal state for
+///   any type with running workflows and should not block. With a filter the
+///   operator asks "can I delete this specific handler?". `in_use` means "no":
+///   live runs would become orphaned the moment the handler is removed.
 ///
 /// Exit `0` otherwise.
 fn workflow_reachability_exit_code(value: &Value) -> i32 {
@@ -10174,11 +10174,11 @@ fn format_workflow_reachability_table(value: &Value) -> String {
 
 /// `harvest activity list` renders the table by default; `--json` opts out.
 ///
-/// Mirrors the `--json`-flag idiom the other list reads use (dlq aggregate,
-/// workflow-types reachability, queue coverage) rather than the queue-pause
-/// sibling, which ships no renderer at all: `queue list-paused` returns only
-/// held queues, whereas this read returns the whole registered catalogue and is
-/// long enough that raw JSON is unreadable mid-incident.
+/// Mirrors the `--json`-flag idiom of the other list reads (dlq aggregate,
+/// workflow-types reachability, queue coverage). The queue-pause sibling ships
+/// no renderer at all, but `queue list-paused` returns only held queues. This
+/// read returns the whole registered catalogue. That is long enough that raw
+/// JSON is unreadable mid-incident.
 fn activity_list_wants_table(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -10199,28 +10199,28 @@ const fn activity_list_wants_raw_json(cli: &Cli) -> bool {
 
 /// Render `GET /activities` (issue #807) as an operator-readable table.
 ///
-/// `status` is a header line rather than a column because it qualifies every
-/// row at once: on a partial read `PAUSED: no` means only "not held on the
-/// shards that answered", so an operator reading a negative during an incident
-/// has to see the degradation before trusting it. The per-shard detail is not
-/// repeated here — `run_cli` already emits it on STDERR via
+/// `status` is a header line, not a column, because it qualifies every row at
+/// once. On a partial read `PAUSED: no` means only "not held on the shards
+/// that answered". An operator who reads a negative during an incident must
+/// see the degradation before trusting it. The per-shard detail is not
+/// repeated here. `run_cli` already emits it on STDERR via
 /// `fanout_partial_notice`, keeping STDOUT a single clean table.
 ///
-/// `LOCAL` earns a column despite being niche: a local activity runs inline on
+/// `LOCAL` earns a column despite being niche. A local activity runs inline on
 /// the workflow worker and never takes a task-queue row, so a hold on one holds
 /// nothing. A `PAUSED: yes` / `LOCAL: yes` row is a no-op hold, and that is
-/// invisible without the column. `REGISTERED` is the mistyped-hold signal — a
+/// invisible without the column. `REGISTERED` is the mistyped-hold signal. A
 /// held name this process has no catalogue entry for is still listed, flagged
 /// `no`.
 ///
-/// `SCOPE` earns one for the same reason (issue #807 review): it is the second
+/// `SCOPE` earns one for the same reason (issue #807 review). It is the second
 /// way `PAUSED: yes` can be a lie. A fleet-wide pause that only reached some
-/// shards writes rows byte-identical to a complete hold and *no* row on the
-/// shards it missed, so `partial_fleet` is the only signal that part of the
-/// fleet is still dispatching. Leaving it to `--json` would put the one field
-/// that contradicts the headline answer behind a flag nobody reaches for
+/// shards writes rows byte-identical to a complete hold. It writes *no* row on
+/// the shards it missed. So `partial_fleet` is the only signal that part of
+/// the fleet is still dispatching. Under `--json` only, the one field that
+/// contradicts the headline answer would hide behind a flag nobody uses
 /// mid-incident. The remaining fields (`scope_shard_id`, `provenance_uniform`,
-/// the per-shard `shards` array) stay `--json` territory: they matter when
+/// the per-shard `shards` array) stay `--json` territory. They matter when
 /// reconciling a disagreeing hold, not when answering "is this held?".
 fn format_activity_list_table(value: &Value) -> String {
     let status = value
@@ -10436,16 +10436,15 @@ fn format_queue_coverage_table(value: &Value) -> String {
         .unwrap_or(0);
 
     // Computed up front so an unavailable shard is warned about on EVERY
-    // return path below, even the friendly "fully covered" shortcuts — a
-    // partial/unavailable report's "nothing uncovered" claim is unverified
-    // for the shards it never reached, and must never read as clean.
+    // return path below, even the friendly "fully covered" shortcuts. A
+    // partial/unavailable report claims "nothing uncovered" without checking
+    // the shards it never reached. That must never read as clean.
     let footer = queue_coverage_unavailable_footer(value);
 
     // A paused, pollerless queue with real pending work is deliberately
-    // excluded from `items`/`uncovered` (see the endpoint's docs), but must
-    // still surface here — unpausing it without adding a worker would
-    // immediately make it uncovered, and `--json` is the only other way to
-    // see this list.
+    // excluded from `items`/`uncovered` (see the endpoint's docs). It must
+    // still surface here. Unpausing it without a worker would make it
+    // uncovered at once. `--json` is the only other way to see this list.
     let paused_note = queue_coverage_paused_note(value) + &queue_coverage_unpolled_note(value);
 
     let Some(items) = value.get("items").and_then(Value::as_array) else {
@@ -10799,9 +10798,9 @@ fn format_workflow_summaries_table(value: &Value) -> String {
 
 /// Render the recursive lineage tree as an indented outline.
 ///
-/// Indentation *is* the topology here — a flat table would lose the parent →
-/// child relationship that is the whole point of the endpoint — so each node is
-/// printed one level deeper than its parent with its state and identity inline.
+/// Indentation *is* the topology here. A flat table would lose the parent →
+/// child relationship, which is the whole point of the endpoint. So each node
+/// is printed one level deeper than its parent, with state and identity inline.
 fn format_lineage_tree(value: &Value) -> String {
     let Some(root) = value.get("root") else {
         return "No lineage tree found.".to_string();
@@ -10891,9 +10890,9 @@ fn format_lineage_summary(value: &Value) -> String {
 
 /// Shared truncation / partial-shard footer.
 ///
-/// A truncated or partial tree must never look complete on the terminal, so
-/// both conditions are called out explicitly rather than left to the operator
-/// to notice a missing subtree.
+/// A truncated or partial tree must never look complete on the terminal. So
+/// both conditions are called out explicitly. The operator need not notice a
+/// missing subtree.
 fn format_lineage_footer(value: &Value) -> String {
     let mut out = String::new();
 
@@ -10946,15 +10945,14 @@ fn format_lineage_footer(value: &Value) -> String {
         out.push('\n');
     }
 
-    // The third incompleteness signal (issue #752). Unlike the other two it
-    // can fire on a tree that is otherwise entirely clean — `truncated:
-    // false`, `status: complete`, `failed: 0` — because a terminal descendant
-    // was collected by retention rather than dropped by a bound or an
-    // unreachable shard. Printing it is what keeps the documented
-    // `harvest workflow tree [--summary]` triage flow from showing an
+    // The third incompleteness signal (issue #752). Unlike the other two, it
+    // can fire on a tree that is otherwise clean (`truncated: false`,
+    // `status: complete`, `failed: 0`). Here retention collected a terminal
+    // descendant; no bound or unreachable shard dropped it. Without this, the
+    // documented `harvest workflow tree [--summary]` triage flow shows an
     // apparently-healthy family that is missing a failed child.
     //
-    // It is deliberately NOT phrased as a truncation: re-rooting here would
+    // It is deliberately NOT phrased as a truncation. Re-rooting here would
     // not surface the omitted rows, because they are no longer in
     // `harvest_workflow_executions` at all.
     if let Some(parents) = value
@@ -11237,9 +11235,9 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
             |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
         ),
         // Intercepted in `run_cli` and executed against the shard databases
-        // directly (issue #964); they never reach the management API. Kept in
-        // the match rather than a `_` arm so a future shard subcommand is a
-        // compile error here until it declares which path it takes.
+        // directly (issue #964). They never reach the management API. Listed
+        // here, not in a `_` arm, so a future shard subcommand is a compile
+        // error until it declares which path it takes.
         ShardCommand::Rebalance { .. }
         | ShardCommand::RebalanceResume { .. }
         | ShardCommand::ReconcileMigratedSeals { .. } => {
@@ -11535,11 +11533,11 @@ fn canary_request(
 
 /// Build `GET /workflows/{id}/logs` (issue #790).
 ///
-/// `--level` is repeatable AND comma-separable; each value is sent as its own
-/// `level=` param (the server accepts both forms). Values are passed through
-/// verbatim so an invalid level is rejected by the server with a clear 400
-/// rather than being silently dropped here — a typo must never look like
-/// "this run logged nothing".
+/// `--level` is repeatable AND comma-separable. Each value is sent as its own
+/// `level=` param (the server accepts both forms). Values pass through
+/// verbatim, so the server rejects an invalid level with a clear 400. Nothing
+/// is silently dropped here. A typo must never look like "this run logged
+/// nothing".
 fn workflow_logs_request(
     execution_id: &str,
     levels: &[String],
@@ -11989,8 +11987,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             )?
             .unwrap_or_else(|| json!({}));
             // The exactly-once delivery key rides the ?idempotency_key= query
-            // param (issue #521's out-of-band surface) — the request body must
-            // stay the raw signal payload, so the key is never smuggled into it.
+            // param (the out-of-band surface of issue #521). The request body
+            // must stay the raw signal payload, so the key never goes into it.
             let suffix = idempotency_key
                 .as_deref()
                 .map(|key| format!("?idempotency_key={}", query_encode(key)))
@@ -12194,10 +12192,10 @@ fn history_request(command: &HistoryCommand) -> ApiRequest {
             if !joined.is_empty() {
                 params.push(("states", joined));
             }
-            // Always sent: the effective per-type cap and payload policy are the
-            // two knobs that decide what the gate actually verified, so they are
-            // explicit on the wire rather than left to a server-side default the
-            // operator cannot see in the request log.
+            // Always sent. The effective per-type cap and payload policy decide
+            // what the gate actually verified. So they are explicit on the
+            // wire, not left to a server-side default that the operator cannot
+            // see in the request log.
             params.push(("per_workflow", per_workflow.to_string()));
             params.push(("order", order.as_wire().to_string()));
             if let Some(value) = shard_id {
@@ -12797,15 +12795,14 @@ const fn queue_mutation_should_gate(cli: &Cli) -> bool {
 
 /// Exit code for a queue pause/resume response.
 ///
-/// A `207` partial fleet-wide hold is NOT in effect on the shards it missed --
-/// those keep dispatching into exactly the outage the operator is riding out --
-/// so it must never look like success to a script or a runbook step. `execute`
-/// only rejects non-2xx statuses, and `207` IS 2xx, hence this body-level gate
-/// (the same shape as `preflight_exit_code` and friends).
+/// A `207` partial fleet-wide hold is NOT in effect on the shards it missed.
+/// Those keep dispatching into the outage the operator is riding out. So it
+/// must never look like success to a script or a runbook step. `execute` only
+/// rejects non-2xx statuses, and `207` IS 2xx. Hence this body-level gate,
+/// the same shape as `preflight_exit_code` and friends.
 ///
-/// Fails closed: a body carrying neither signal is not a queue-mutation response
-/// we can vouch for, so it is reported as a failure rather than as a hold that
-/// may not hold.
+/// Fails closed. A body with neither signal is not a verifiable queue-mutation
+/// response. It is reported as a failure, not as a hold that may not hold.
 fn queue_mutation_exit_code(value: &Value) -> i32 {
     let ok = value.get("ok").and_then(Value::as_bool);
     let complete = value.get("status").and_then(Value::as_str) == Some("complete");
@@ -12814,19 +12811,19 @@ fn queue_mutation_exit_code(value: &Value) -> i32 {
 
 /// True when `raw` names a WHATWG URL dot-segment.
 ///
-/// The URL parser reqwest uses strips single-dot (`.`, `%2e`) and double-dot
-/// (`..`, `.%2e`, `%2e.`, `%2e%2e`) segments, all ASCII-case-insensitively,
-/// when the request URL is parsed -- which happens *after* `ApiRequest.path` is
-/// assembled, so `path_segment` cannot encode its way out of the LITERAL forms:
+/// The URL parser that reqwest uses strips single-dot (`.`, `%2e`) and
+/// double-dot (`..`, `.%2e`, `%2e.`, `%2e%2e`) segments, ASCII-case-insensitively.
+/// It does so when it parses the request URL, *after* `ApiRequest.path` is
+/// assembled. So `path_segment` cannot encode its way out of the LITERAL forms.
 /// `.` on `/admin/queues/{q}/pause` silently resolves to `/admin/queues/pause`
 /// and `..` to `/admin/pause`, retargeting the request at a different route.
 /// They are therefore rejected up front.
 ///
-/// The percent-encoded forms are, today, already neutralized a layer down --
+/// Today the percent-encoded forms are already neutralized a layer down.
 /// `PATH_SEGMENT_ENCODE_SET` encodes `%`, so a queue literally named `%2e`
-/// reaches the URL as `%252e` and survives intact. They are matched here anyway
-/// so this guard stays correct on its own terms rather than silently depending
-/// on that encode set keeping `%`.
+/// reaches the URL as `%252e` and survives intact. They are matched here
+/// anyway. This guard then stays correct on its own terms, and does not
+/// depend on that encode set keeping `%`.
 fn is_url_dot_segment(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     matches!(
@@ -12961,14 +12958,15 @@ const fn activity_mutation_should_gate(cli: &Cli) -> bool {
 
 /// Map `harvest activity …` onto the four management routes (issue #807).
 ///
-/// The activity name is checked for URL dot-segments for exactly the reason
-/// `checked_queue_segment` documents: the WHATWG URL parser strips `.` and `..`
-/// segments AFTER `ApiRequest.path` is assembled, so an activity literally named
-/// `.` would silently retarget `/activities/./pause` at `/activities/pause`.
+/// The activity name is checked for URL dot-segments, for the reason
+/// `checked_queue_segment` documents. The WHATWG URL parser strips `.` and
+/// `..` segments AFTER `ApiRequest.path` is assembled. An activity literally
+/// named `.` would silently retarget `/activities/./pause` at
+/// `/activities/pause`.
 ///
-/// `--reason`/`--actor` are omitted from the body entirely when unset, so the
-/// server applies its own defaults rather than receiving an empty string — and
-/// a bare `harvest activity pause charge_card` is a valid, complete containment
+/// `--reason`/`--actor` are omitted from the body entirely when unset. The
+/// server then applies its own defaults, not an empty string. A bare
+/// `harvest activity pause charge_card` is a valid, complete containment
 /// action. Containment must not wait on paperwork.
 fn activity_request(command: &ActivityCommand) -> Result<ApiRequest, CliError> {
     match command {
@@ -13163,9 +13161,10 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
             dry_run,
             json: _,
         } => {
-            // A non-dry-run Signal submit requires signal_name (enforced here
-            // rather than via clap's `required_if_eq`, so a `Signal --dry-run`
-            // preview — blast radius only, not signal validity — may omit it).
+            // A non-dry-run Signal submit requires signal_name. This check is
+            // here, not in clap's `required_if_eq`. A `Signal --dry-run`
+            // preview shows blast radius only, not signal validity, so it may
+            // omit it.
             if action == "Signal" && signal_name.is_none() && !*dry_run {
                 return Err(CliError::InvalidInput(
                     "--signal-name is required for action Signal (unless --dry-run)".to_string(),
@@ -13668,10 +13667,10 @@ fn sql_quote(s: &str) -> String {
 /// Build the offline bootstrap seed: a fresh secret, its stored hash, and the
 /// exact INSERT SQL. Opens **no** database connection.
 ///
-/// The secret and hash are produced by the SHARED core helpers
-/// ([`autumn_harvest::api_token::mint_secret`] / [`hash_secret`]) — the same
-/// functions the server mint route uses — so a seeded token authenticates
-/// byte-for-byte identically to a route-minted one (no drift).
+/// The SHARED core helpers produce the secret and hash
+/// ([`autumn_harvest::api_token::mint_secret`] / [`hash_secret`]). The server
+/// mint route uses the same functions. So a seeded token authenticates
+/// byte-for-byte like a route-minted one (no drift).
 ///
 /// # Errors
 ///
@@ -14049,20 +14048,19 @@ fn build_workflow_list_path(
     if include_sleeping {
         params.push(("include_sleeping", "true".to_string()));
     }
-    // Issue #704: operator early-warning discovery for workflow history bloat.
-    // A query param DISTINCT from the server's general-purpose
-    // `min_history_events` filter (issue #493, not exposed via this CLI
-    // command) — see `WorkflowFilters::history_bloat_min_events` in the
-    // plugin for why the two must never share a name. The server owns
-    // validation (non-numeric/negative → 400) and the restricted-to-non-
-    // terminal + sorted-by-size-descending behavior — the CLI is a thin
-    // passthrough.
+    // Issue #704: operator early warning for workflow history bloat. A query
+    // param DISTINCT from the general-purpose `min_history_events` filter of
+    // the server (issue #493, not exposed via this CLI command). See
+    // `WorkflowFilters::history_bloat_min_events` in the plugin for why the two
+    // must never share a name. The server owns validation (non-numeric/negative
+    // → 400), the non-terminal restriction and the size-descending sort. The
+    // CLI is a thin passthrough.
     if let Some(value) = history_bloat_min_events {
         params.push(("history_bloat_min_events", value.to_string()));
     }
-    // Issue #740: bounded provenance filter. The server owns validation (a value
-    // outside the known `StartSource` set / "unknown" returns a 400), so the CLI
-    // is a thin passthrough — matching how `--state` forwards verbatim.
+    // Issue #740: bounded provenance filter. The server owns validation. A
+    // value outside the known `StartSource` set / "unknown" returns a 400. So
+    // the CLI is a thin passthrough, as `--state` forwards verbatim.
     if let Some(source) = start_source {
         params.push(("start_source", source.to_string()));
     }
@@ -14195,11 +14193,11 @@ fn query_encode(input: &str) -> String {
 
 /// Clap value-parser for `--idempotency-key` (issue #753).
 ///
-/// Mirrors the server's `Idempotency-Key` header semantics: a present but
-/// empty (or whitespace-only) key is rejected up front rather than silently
-/// degraded — the management API treats an empty `?idempotency_key=` query
-/// param as omitted, which would turn an intended exactly-once delivery into
-/// at-least-once without the caller noticing.
+/// Mirrors the server's `Idempotency-Key` header semantics. A present but
+/// empty (or whitespace-only) key is rejected up front, not silently
+/// degraded. The management API treats an empty `?idempotency_key=` query
+/// param as omitted. An intended exactly-once delivery would silently become
+/// at-least-once.
 fn parse_idempotency_key(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         return Err(
@@ -14536,8 +14534,9 @@ mod reuse_policy_tests {
     #[test]
     fn workflow_list_degraded_body_is_clean_and_notice_is_separate() {
         // Issue #756: on the degraded path the notice goes to STDERR (via
-        // `fanout_partial_notice`, `eprintln!`'d by the caller), NOT prepended
-        // to the STDOUT body — so `workflow list -o json | jq` stays parseable.
+        // `fanout_partial_notice`, printed by the caller with `eprintln!`). It
+        // is NOT prepended to the STDOUT body, so `workflow list -o json | jq`
+        // stays parseable.
         let cli = parse(&["workflow", "list"]);
         let payload = json!({
             "workflows": [{"id": "00000000-0000-0000-0000-000000000001"}],
@@ -15111,8 +15110,8 @@ mod reuse_policy_tests {
     #[test]
     fn queue_coverage_table_surfaces_excluded_paused_queues() {
         // The paused-but-pollerless exclusion (module docs on
-        // `queue_coverage.rs`) must not be invisible outside `--json` --
-        // an operator using the default table view needs to see it too.
+        // `queue_coverage.rs`) must be visible outside `--json`. An operator
+        // who uses the default table view needs to see it too.
         let value = json!({
             "status": "complete",
             "observed_at": "2026-08-07T00:00:00Z",
@@ -15249,10 +15248,10 @@ mod reuse_policy_tests {
 
     #[test]
     fn path_segment_encodes_both_path_separators() {
-        // The URL parser treats `\` as a path separator for http/https, so an
-        // unencoded backslash splits one value into extra segments and the
-        // request silently lands on a different route. Route-wide: every caller
-        // of `path_segment` (queue names, workflow ids, keys, ...) depends on
+        // The URL parser treats `\` as a path separator for http/https. An
+        // unencoded backslash splits one value into extra segments, and the
+        // request silently lands on a different route. Every caller of
+        // `path_segment` (queue names, workflow ids, keys, ...) depends on
         // this, not just queue pause/resume.
         assert_eq!(path_segment(r"payments\eu"), "payments%5Ceu");
         assert_eq!(path_segment(r"a\b\c"), "a%5Cb%5Cc");
@@ -15267,16 +15266,16 @@ mod reuse_policy_tests {
 
     /// Exhaustive guard for the whole path-separator / normalization class.
     ///
-    /// Every printable ASCII byte, embedded in a value that becomes one path
-    /// segment, must survive `path_segment` + URL parsing as **exactly one**
-    /// segment that decodes back to the original. This is the test that would
-    /// have caught the missing `\` (the URL parser treats it as a path
-    /// separator for http/https), and it fails if any separator-class character
-    /// is ever dropped from `PATH_SEGMENT_ENCODE_SET`.
+    /// Each printable ASCII byte goes into a value that becomes one path
+    /// segment. It must survive `path_segment` + URL parsing as **exactly one**
+    /// segment that decodes back to the original. This test would have caught
+    /// the missing `\`, which the URL parser treats as a path separator for
+    /// http/https. It fails if any separator-class character is ever dropped
+    /// from `PATH_SEGMENT_ENCODE_SET`.
     ///
     /// Scope: *embedded* bytes. A whole-segment `.`/`..` cannot be encoded away
-    /// at all and is rejected instead (`is_url_dot_segment`); control
-    /// characters are covered by `CONTROLS`.
+    /// at all and is rejected instead (`is_url_dot_segment`). `CONTROLS` covers
+    /// control characters.
     #[test]
     fn every_printable_ascii_byte_survives_as_exactly_one_path_segment() {
         let mut offenders = Vec::new();
@@ -15305,14 +15304,13 @@ mod reuse_policy_tests {
 
     #[test]
     fn non_ascii_queue_names_survive_as_exactly_one_path_segment() {
-        // The exhaustive sweep above can only walk printable ASCII, because a
-        // lone byte >= 0x80 is not valid UTF-8 and so is not expressible as a
-        // `&str` queue name at all. The reachable non-ASCII case is a real
-        // multi-byte character, and it is worth pinning rather than assuming:
-        // `utf8_percent_encode` percent-encodes every non-ASCII byte regardless
-        // of the `AsciiSet`, so such a name has no separator hazard -- but that
-        // is a property of the encoding crate, and this asserts we actually get
-        // it instead of trusting it.
+        // The exhaustive sweep above can only walk printable ASCII. A lone
+        // byte >= 0x80 is not valid UTF-8, so no `&str` queue name can hold
+        // it. The reachable non-ASCII case is a real multi-byte character, and
+        // this pins it. `utf8_percent_encode` percent-encodes every non-ASCII
+        // byte regardless of the `AsciiSet`, so such a name has no separator
+        // hazard. That is a property of the encoding crate. This asserts it
+        // instead of trusting it.
         for raw in [
             "paiements-europe-é",
             "支払い",
@@ -15367,8 +15365,8 @@ mod reuse_policy_tests {
         // non-complete application is enough to fail the command.
         assert_eq!(queue_mutation_exit_code(&json!({ "ok": false })), 1);
         assert_eq!(queue_mutation_exit_code(&json!({ "status": "partial" })), 1);
-        // A body missing both signals is not a queue-mutation response we can
-        // vouch for -- fail closed rather than reporting a hold that may not hold.
+        // A body missing both signals is not a verifiable queue-mutation
+        // response. Fail closed instead of reporting a hold that may not hold.
         assert_eq!(queue_mutation_exit_code(&json!({})), 1);
     }
 
@@ -15606,14 +15604,14 @@ mod reuse_policy_tests {
         assert!(rendered.contains("compute_checksum"));
     }
 
-    /// Issue #807 review: a partially-applied fleet-wide hold must not render
-    /// as a clean containment action.
+    /// Issue #807: a partially-applied fleet-wide hold must not render as a
+    /// clean containment action.
     ///
-    /// `PAUSED: yes` on its own is exactly the misleading signal: the shards a
-    /// fleet-wide pause reached hold rows byte-identical to a complete hold, and
-    /// the ones it missed hold no row at all, so an operator reading the table
-    /// during an incident would believe `charge_card` is stopped while part of
-    /// the fleet keeps dispatching it. `SCOPE` is the column that says otherwise.
+    /// `PAUSED: yes` on its own is the misleading signal. The shards that a
+    /// fleet-wide pause reached hold rows byte-identical to a complete hold.
+    /// The ones it missed hold no row at all. An operator who reads the table
+    /// during an incident would believe `charge_card` is stopped. Part of the
+    /// fleet keeps dispatching it. `SCOPE` is the column that says otherwise.
     #[test]
     fn activity_list_table_flags_a_partially_applied_fleet_hold() {
         let value = json!({
@@ -17078,11 +17076,10 @@ mod completion_delivery_cli_tests {
 
     #[test]
     fn lineage_tree_render_calls_out_retention_collected_descendants() {
-        // The third incompleteness signal. Unlike the other two it can fire on
-        // a tree that is otherwise clean — `truncated: false`, `status:
-        // complete` — so if the terminal does not print it, the documented
-        // triage flow shows an apparently-healthy family that is missing a
-        // descendant.
+        // The third incompleteness signal. Unlike the other two, it can fire on
+        // a tree that is otherwise clean (`truncated: false`, `status:
+        // complete`). If the terminal does not print it, the documented triage
+        // flow shows an apparently-healthy family that is missing a descendant.
         let mut value = lineage_tree_fixture();
         value["retained_summary_parent_ids"] =
             serde_json::json!(["22222222-2222-2222-2222-222222222222"]);
@@ -17199,9 +17196,9 @@ mod completion_delivery_cli_tests {
 
     #[test]
     fn render_response_renders_the_diagnose_verdict_as_a_table() {
-        // Pins the WIRING, not just the formatter: deleting the dispatch arm in
-        // `render_response` would leave the formatter and predicate tests green
-        // while `harvest workflow diagnose` silently reverted to raw JSON.
+        // Pins the WIRING, not just the formatter. Without the dispatch arm in
+        // `render_response`, the formatter and predicate tests stay green. But
+        // `harvest workflow diagnose` silently reverts to raw JSON.
         let cli = parse(&["workflow", "diagnose", "exec-1"]);
         let value = json!({
             "execution_id": "exec-1",
@@ -17721,9 +17718,9 @@ mod det_check_cli_tests {
 
     // NOTE: these fixtures embed `#[workflow]` source and MUST be single-line
     // string literals (with `\n` escapes), not multi-line `"\`-continuation
-    // strings — a multi-line literal containing `#[workflow]` at a line start is
-    // misread as a real workflow by the line-based det_check scanner (the
-    // documented multi-line-string lexer caveat), producing a self-scan false
+    // strings. The line-based det_check scanner misreads a multi-line literal
+    // with `#[workflow]` at a line start as a real workflow. That is the
+    // documented multi-line-string lexer caveat. It produces a self-scan false
     // positive on this very file. Single-line literals are stripped correctly.
     const WF_TIME: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
 
@@ -18064,11 +18061,11 @@ mod schema_contract_cli_tests {
             .expect("CLI should parse successfully")
     }
 
-    //    // These live inline rather than in `tests/integration/schema_check_cli.rs`
-    // because `Commands` and `SchemaCommand` are private: an external test can
-    // only assert that parsing *succeeded*, which would pass just as happily
-    // with a wrong default baked in. Destructuring is what actually pins the
-    // defaults. Mirrors the det-check tests directly above.
+    // These live inline, not in `tests/integration/schema_check_cli.rs`,
+    // because `Commands` and `SchemaCommand` are private. An external test can
+    // only assert that parsing *succeeded*. That would pass with a wrong
+    // default baked in. Destructuring pins the defaults. Mirrors the det-check
+    // tests directly above.
 
     #[test]
     fn schema_check_parses_paths_and_format() {
@@ -18123,7 +18120,7 @@ mod schema_contract_cli_tests {
         }
 
         // The escape-hatch mode diffs the BASE revision against the generated
-        // contract, where deltas are the whole point — demanding currency there
+        // contract, where deltas are the whole point. A currency demand there
         // would fail every legitimate acknowledged change.
         assert!(
             Cli::try_parse_from([
@@ -18203,7 +18200,7 @@ mod schema_contract_cli_tests {
     #[test]
     fn schema_update_acknowledge_is_optional_at_parse_time() {
         // The refusal is a *runtime* decision made only when a delta is
-        // breaking, not a clap requirement — a purely compatible regeneration
+        // breaking, not a clap requirement. A purely compatible regeneration
         // must not need a justification.
         let cli = parse(&["schema", "update", "--current", "cur.json"]);
         match cli.command {
@@ -18232,9 +18229,9 @@ mod schema_contract_cli_tests {
 mod token_bootstrap_tests {
     use super::*;
 
-    /// The builder produces a valid `hvst_` secret, an INSERT statement whose
-    /// `name`/`scope`/`created_by` match the inputs, embeds ONLY the hash, and
-    /// never leaks the secret into the SQL (issue #942, Codex P1 output-shape check).
+    /// The builder produces a valid `hvst_` secret and an INSERT statement
+    /// whose `name`/`scope`/`created_by` match the inputs. The SQL embeds ONLY
+    /// the hash and never leaks the secret (issue #942).
     #[test]
     fn bootstrap_builder_emits_secret_and_hash_only_sql() {
         let token = build_bootstrap_token("ci-seed", "mutate", None, "op").expect("builds");
@@ -18776,10 +18773,10 @@ mod replay_sample_bundle_tests {
     //! Bundle-writer tests for `harvest history export-sample` (issue #798).
     //!
     //! The split into `history_sample_bundle_files` (which files, named how) and
-    //! `render_history_sample_summary` (the coverage table) keeps both pure, so
-    //! the two things a CI operator depends on — that every sampled fixture is
-    //! written under a name `replay_bundle` will read, and that truncation is
-    //! stated out loud — are testable without touching a filesystem.
+    //! `render_history_sample_summary` (the coverage table) keeps both pure. A
+    //! CI operator depends on two things. Every sampled fixture is written
+    //! under a name that `replay_bundle` reads, and truncation is stated out
+    //! loud. Both are testable without touching a filesystem.
     use super::*;
     use serde_json::json;
 
@@ -18854,8 +18851,8 @@ mod replay_sample_bundle_tests {
     }
 
     /// Two workflow names that sanitize to the same file name must not silently
-    /// overwrite each other — that would make the bundle smaller than the
-    /// manifest claims, so the gate would verify fewer fixtures than reported.
+    /// overwrite each other. The bundle would then be smaller than the manifest
+    /// claims, and the gate would verify fewer fixtures than reported.
     #[test]
     fn colliding_fixture_names_are_disambiguated_never_overwritten() {
         let response = json!({
@@ -18934,11 +18931,11 @@ mod replay_sample_bundle_tests {
 
     /// An export stopped by the response byte budget must say so at write time.
     ///
-    /// Distinct from the `NOTE: the sample is truncated` line, and the
-    /// distinction is what the operator acts on: that reports the *intended*
-    /// truncation of sampling `--per-workflow` out of a larger population, this
-    /// reports an *unplanned* resource limit. Reading the two as the same thing
-    /// leads to raising `--per-workflow`, which makes it strictly worse.
+    /// Distinct from the `NOTE: the sample is truncated` line, and the operator
+    /// acts on the distinction. That line reports the *intended* truncation of
+    /// sampling `--per-workflow` out of a larger population. This one reports
+    /// an *unplanned* resource limit. Confusing the two leads to raising
+    /// `--per-workflow`, which makes it strictly worse.
     #[test]
     fn summary_warns_that_the_export_was_cut_short_by_the_byte_budget() {
         let mut response = sample_response();
@@ -19035,9 +19032,8 @@ mod replay_sample_bundle_tests {
 
     /// The CLI default is `redacted`, and the replay gate REFUSES a redacted
     /// bundle. An operator who omits `--payload-policy full` must find that out
-    /// here — at the moment they write the bundle — not later, as an exit-2 wall
-    /// of BLOCKED lines against a bundle they can no longer re-export (the fleet
-    /// has moved on).
+    /// here, at write time. Later it is an exit-2 wall of BLOCKED lines against
+    /// a bundle that cannot be re-exported (the fleet has moved on).
     #[test]
     fn summary_warns_that_a_redacted_bundle_is_refused_by_the_gate() {
         let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
@@ -19113,11 +19109,11 @@ mod replay_sample_bundle_tests {
 
     /// A stale fixture in a SUBDIRECTORY must not survive a re-export either.
     ///
-    /// `testing::collect_json_files` descends subdirectories, so a top-level-only
-    /// clean leaves a nested fixture that the gate still replays — against a
+    /// `testing::collect_json_files` descends subdirectories. A top-level-only
+    /// clean leaves a nested fixture that the gate still replays, against a
     /// manifest that never counted it. The result is drift reported for an
-    /// execution the operator did not sample, i.e. a false red on a healthy
-    /// build, which is the exact verdict this whole feature exists to avoid.
+    /// execution the operator did not sample. That is a false red on a healthy
+    /// build, the exact verdict this feature exists to avoid.
     #[test]
     fn re_exporting_replaces_a_stale_fixture_nested_in_a_subdirectory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -19191,15 +19187,15 @@ mod replay_sample_bundle_tests {
     // ── JSON symlinks: the cleaner and the replay walk must agree (#798) ──
     //
     // `testing::collect_json_files` decides what the GATE replays with the
-    // predicate "not a directory, extension `.json`" — a symlink satisfies it.
-    // The cleaner therefore has to use the same rule, or the two walks disagree
-    // about what a bundle contains and the disagreement is a false verdict.
+    // predicate "not a directory, extension `.json`". A symlink satisfies it.
+    // The cleaner must use the same rule. Otherwise the two walks disagree
+    // about what a bundle contains, and the disagreement is a false verdict.
 
-    /// A `*.json` symlink is a fixture to the replay walk, so a re-export has to
-    /// clear it like any other. Leaving it behind means the fresh manifest
-    /// describes this run's sample while the directory still holds a previous
-    /// one, and the gate replays the stale fixture and blocks an unchanged
-    /// candidate — the exact false red this replace exists to prevent.
+    /// A `*.json` symlink is a fixture to the replay walk, so a re-export must
+    /// clear it like any other. Otherwise the fresh manifest describes the
+    /// sample of this run, but the directory still holds a previous one. The
+    /// gate replays the stale fixture and blocks an unchanged candidate. This
+    /// replace exists to prevent that false red.
     ///
     /// Removing the LINK must not touch what it points at: the operator pointed
     /// `--output-dir` at the bundle, not at the target's directory.
@@ -19266,10 +19262,10 @@ mod replay_sample_bundle_tests {
         );
     }
 
-    /// The "is this our bundle?" evidence is the count of JSON entries, so a
-    /// symlink has to count toward it too. If it does not, a directory holding
-    /// only a linked JSON reads as empty, the refusal never fires, and this
-    /// command writes into a directory it did not create.
+    /// The "is this a CLI bundle?" evidence is the count of JSON entries, so a
+    /// symlink must count toward it too. Otherwise a directory with only a
+    /// linked JSON reads as empty. The refusal never fires, and this command
+    /// writes into a directory it did not create.
     #[cfg(unix)]
     #[test]
     fn a_directory_whose_only_json_is_a_symlink_is_refused_not_written_into() {
@@ -19289,10 +19285,10 @@ mod replay_sample_bundle_tests {
         assert!(target.exists(), "a foreign file must survive");
     }
 
-    /// The manifest is what AUTHORIZES deleting a directory's contents, so the
-    /// marker is held to a stricter rule than the fixtures it guards: only a
-    /// real file we wrote counts. A linked manifest is not evidence this bundle
-    /// is ours, and the safe answer to "not ours" is to refuse.
+    /// The manifest AUTHORIZES deleting the contents of a directory. So the
+    /// marker has a stricter rule than the fixtures it guards: only a real file
+    /// that this CLI wrote counts. A linked manifest is no evidence of that,
+    /// and the safe answer to "not ours" is to refuse.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_manifest_does_not_authorize_clearing_the_directory() {
@@ -19324,8 +19320,8 @@ mod replay_sample_bundle_tests {
     }
 
     /// A response that predates the field (or uses a policy this CLI does not
-    /// know) must not be accused of being redacted — a spurious warning on a
-    /// perfectly replayable bundle trains operators to ignore the real one.
+    /// know) must not read as redacted. A spurious warning on a replayable
+    /// bundle trains operators to ignore the real one.
     #[test]
     fn an_absent_or_unknown_payload_policy_is_not_reported_as_redacted() {
         let mut response = sample_response();
@@ -19347,12 +19343,12 @@ mod replay_sample_bundle_tests {
 mod preflight_findings_tests {
     //! Rendering tests for the preflight detail block (issue #802 review).
     //!
-    //! The summary table carries only each check's one-line verdict, so the
-    //! specific unresolved references live in `details.failures` and used to be
-    //! invisible in table mode — the exact payload the declared-dependency
-    //! check exists to produce. These pin that they are rendered, that a
-    //! healthy fleet's output is unchanged, and that both `failures` element
-    //! shapes (plain string, structured object) survive.
+    //! The summary table carries only each check's one-line verdict. The
+    //! specific unresolved references live in `details.failures`, and table
+    //! mode used to hide them. The declared-dependency check exists to produce
+    //! that payload. These tests pin that the references are rendered and that
+    //! a healthy fleet's output is unchanged. Both `failures` element shapes
+    //! (plain string, structured object) must survive.
     use super::*;
 
     fn check(name: &str, status: &str, failures: &Value, remediation: Option<&str>) -> Value {
@@ -19785,9 +19781,9 @@ mod migrate_cli_tests {
 
     #[test]
     fn migrate_is_not_routed_through_the_api() {
-        // Guards the local-execution early return in `run_cli`: if a future
-        // edit drops it, this panics instead of the command silently trying to
-        // build an HTTP request.
+        // Guards the local-execution early return in `run_cli`. If a future
+        // edit drops it, this panics. Otherwise the command would silently try
+        // to build an HTTP request.
         let cli = parse(&[
             "migrate",
             "status",
@@ -19916,8 +19912,8 @@ mod migrate_cli_tests {
     #[test]
     fn an_unlocked_run_says_so_in_text_and_json() {
         // The engine logs this through `tracing`, and the `harvest` binary
-        // installs no subscriber -- so if the report did not carry it, an
-        // operator would get no signal that concurrent runs are unsafe here.
+        // installs no subscriber. Without it in the report, an operator would
+        // get no signal that concurrent runs are unsafe here.
         let targets = vec![MigrateRunTarget {
             database: "postgres://harvest/a".to_string(),
             setup_failed: false,
@@ -20042,9 +20038,9 @@ mod migrate_cli_tests {
     fn a_mixed_run_gives_each_migration_its_own_cause() {
         // A role without the privilege applies everything unserialized, and a
         // `run_in_transaction = false` migration in the same run is
-        // unserialized for a reason no grant fixes. Attributing the whole list
-        // to the missing grant would tell an operator that granting it makes
-        // the run safe, which for the second entry is false.
+        // unserialized for a reason no grant fixes. If the report blamed the
+        // missing grant for the whole list, an operator would think the grant
+        // makes the run safe. For the second entry that is false.
         let targets = vec![MigrateRunTarget {
             database: "postgres://harvest/a".to_string(),
             setup_failed: false,
@@ -20214,7 +20210,7 @@ mod migrate_cli_tests {
     fn a_target_the_run_could_not_prepare_is_not_reported_as_finished() {
         // Creating or reading the ledger failed, so no migration ever ran: the
         // report is empty and `failed` is None. Without the flag that is
-        // byte-identical to "finished with nothing to do" -- a JSON consumer
+        // byte-identical to "finished with nothing to do". A JSON consumer
         // would mark a database the run could not even inspect as done.
         let targets = vec![MigrateRunTarget {
             database: "postgres://harvest/a".to_string(),
@@ -20294,9 +20290,9 @@ mod migrate_cli_tests {
         // "could not determine" gates.
         let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
         assert_eq!(error.exit_code(), 1);
-        // The remedy must carry the flags forward: a bare `run` after a
+        // The remedy must carry the flags forward. A bare `run` after a
         // `--check` with `--include-dir` applies fewer sets than the gate
-        // examined, exits 0, and leaves the gating migration unapplied.
+        // examined. It exits 0 and leaves the gating migration unapplied.
         let message = error.to_string();
         assert!(message.contains("--include-dir"), "{message}");
         assert!(message.contains("--database-url"), "{message}");
@@ -20318,10 +20314,10 @@ mod migrate_cli_tests {
     #[test]
     fn a_verify_dsn_is_rewritten_so_tokio_postgres_can_parse_it() {
         // tokio-postgres 0.7 knows only disable/prefer/require and FAILS TO
-        // PARSE anything else, so a `verify-full` DSN that libpq and the
-        // `diesel` CLI accept would be rejected before we ever connect. rustls
-        // verifies the chain and the hostname regardless, so `require` here
-        // describes what the connector already does.
+        // PARSE anything else. A `verify-full` DSN that libpq and the `diesel`
+        // CLI accept would be rejected before any connection. rustls verifies
+        // the chain and the hostname regardless, so `require` here describes
+        // what the connector already does.
         for mode in ["verify-ca", "verify-full"] {
             let rewritten = normalize_sslmode(&format!(
                 "postgres://u:p@db.internal/harvest?sslmode={mode}"
@@ -20365,8 +20361,8 @@ mod migrate_cli_tests {
     #[test]
     fn a_quoted_value_containing_whitespace_is_never_rewritten_inside() {
         // A whitespace split cannot see quoting, so it would rewrite the text
-        // INSIDE the password -- corrupting the credential and failing
-        // authentication against a database that was reachable.
+        // INSIDE the password. Authentication would then fail against a
+        // database that was reachable.
         let dsn = "password='abc sslmode=verify-full def' sslmode=verify-full";
         let rewritten = normalize_sslmode(dsn);
         assert_eq!(
@@ -20448,8 +20444,8 @@ mod migrate_cli_tests {
     #[test]
     fn a_keyword_form_target_is_labelled_by_its_own_dsn() {
         // `redact_dsn` only parses URLs, so every keyword-form shard used to
-        // report as the same `<unparseable dsn>` -- and a partial report that
-        // cannot tell shard A from shard B answers nothing.
+        // report as the same `<unparseable dsn>`. A partial report that cannot
+        // tell shard A from shard B answers nothing.
         let label = migrate_target_label("host=shard-a dbname=harvest password='s e cret'", 1);
         assert!(label.contains("host=shard-a"), "{label}");
         assert!(label.contains("dbname=harvest"), "{label}");
@@ -20475,9 +20471,9 @@ mod migrate_cli_tests {
 
     #[test]
     fn a_malformed_url_never_reaches_the_keyword_scanner() {
-        // `redact_dsn` cannot parse this (`notaport`), and the keyword scanner
+        // `redact_dsn` cannot parse this (`notaport`). The keyword scanner
         // would take the whole prefix for one keyword whose value needs no
-        // redaction -- handing the password straight to the deploy log.
+        // redaction. The password would go straight to the deploy log.
         let label = migrate_target_label(
             "postgres://alice:hunter2@db:notaport/harvest?sslmode=require",
             1,
@@ -20493,9 +20489,9 @@ mod migrate_cli_tests {
     fn a_url_password_option_other_than_password_is_withheld_too() {
         // The URL branch delegates to `redact_dsn`, which matched the exact
         // key `password` while the keyword branch matched any key *containing*
-        // it. So the same secret was redacted or not depending purely on how
-        // the DSN was spelled, and `?sslpassword=` -- a real libpq option --
-        // reached the migration report.
+        // it. So the spelling of the DSN alone decided whether the same secret
+        // was redacted. `?sslpassword=`, a real libpq option, reached the
+        // migration report.
         for dsn in [
             "postgres://db.prod/harvest?sslpassword=hunter2",
             "postgresql://db.prod/harvest?sslmode=require&sslpassword=hunter2",
@@ -20514,10 +20510,10 @@ mod migrate_cli_tests {
     #[test]
     fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
         // A mistyped URL that loses the `://` but keeps the credential scans
-        // as the "keyword" `postgres`: character-set-valid, and with no
-        // `password=` key there is nothing for the scanner to redact, so the
-        // whole DSN came back as if it had been examined. Only requiring a
-        // keyword libpq actually recognizes catches it.
+        // as the "keyword" `postgres`, which is character-set-valid. It has no
+        // `password=` key, so the scanner has nothing to redact. The whole DSN
+        // came back as if it had been examined. Only a check against the
+        // keywords libpq recognizes catches it.
         for dsn in [
             "postgres=//alice:hunter2@db/harvest",
             "postgresql=//alice:hunter2@db/harvest",

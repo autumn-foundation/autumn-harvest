@@ -6,8 +6,8 @@
 //! erase-while-held 409 interaction.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (run this file `--test-threads=1`, since the tests scrub
-//! shared tables); otherwise a fresh testcontainers Postgres is booted with
+//! against it directly. Run this file with `--test-threads=1`, because the
+//! tests scrub shared tables. Otherwise a testcontainers Postgres boots with
 //! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
@@ -215,7 +215,6 @@ async fn set_describe_and_release_round_trip() {
 
     let exec_id = seed_completed(&mut conn, "lh_wf", "lh-http-1").await;
 
-    // Set the hold.
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold"),
@@ -247,7 +246,6 @@ async fn set_describe_and_release_round_trip() {
         "raw hold columns surfaced under execution"
     );
 
-    // Release the hold.
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold/release"),

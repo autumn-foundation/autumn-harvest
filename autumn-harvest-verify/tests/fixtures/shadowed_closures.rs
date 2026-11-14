@@ -6,14 +6,14 @@
 //!         -o shadowed_closures.mir shadowed_closures.rs
 //!
 //! A closure written inside a `macro_rules!` body carries the span of the
-//! *macro definition*, not of the expansion site, so every instantiation of
+//! *macro definition*, not of the expansion site. So every instantiation of
 //! `mk_add!` yields a body whose printed type is
 //! `{closure@shadowed_closures.rs:L:C}` for one and the same `L:C`. The bodies
-//! themselves are different — `$extra` is call-site tokens — and exactly one of
+//! themselves differ, because `$extra` is call-site tokens. Exactly one of
 //! them reads the wall clock.
 //!
 //! Indexing closures by that span with "first one wins" therefore resolves the
-//! ambient closure's call site to the *clean* body and reports
+//! ambient closure's call site to the *clean* body. It then reports
 //! `proven-deterministic` over a wall-clock read: the one verdict this tool
 //! must never print. The span has to be a multimap, disambiguated by the body
 //! path the call site sits in.

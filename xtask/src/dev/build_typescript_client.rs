@@ -42,8 +42,6 @@ const IMPORT_CHECK: &str = "const m = await import(\"autumn-harvest-client\"); \
 const RETRY_DELAY_SECS: u64 = 10;
 
 /// Arguments of `cargo xtask dev build-typescript-client`.
-///
-/// The command takes no argument, so the type is `Copy`.
 #[derive(Debug, Clone, Copy, Args)]
 pub struct Args {}
 

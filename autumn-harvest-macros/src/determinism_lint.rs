@@ -24,11 +24,11 @@ pub struct DeterminismVisitor {
     in_await_condition_closure: bool,
     pub context_param_name: Option<String>,
     /// HVG011 (issue #785): lexical scope stack of local bindings, ident →
-    /// is-hash. Lookup walks innermost-out; a `false` entry MASKS an outer
-    /// tracked binding (shadowing) rather than deleting it, so scope exit
-    /// (block/arm/closure/for-pattern) restores the outer state — the flat
-    /// function-wide set this replaces caused `HardBlocker` false positives on
-    /// pattern-shadowed idents and inner-block bindings (PR #970 review, P1-A).
+    /// is-hash. Lookup walks innermost-out. A `false` entry MASKS an outer
+    /// tracked binding (shadowing) and does not delete it. So scope exit
+    /// (block/arm/closure/for-pattern) restores the outer state. The old flat
+    /// function-wide set caused `HardBlocker` false positives on
+    /// pattern-shadowed idents and inner-block bindings (PR #970).
     /// Last-binding-wins within a scope; unknown shapes default to not-tracked.
     hash_scopes: Vec<HashMap<String, bool>>,
 }
@@ -107,18 +107,18 @@ impl DeterminismVisitor {
 
     /// Like [`Self::add_finding`] but overrides the catalog severity.
     ///
-    /// Used by HVG011's command-aware downgrade: the catalog severity is the
-    /// class's worst case (`HardBlocker` — a command-emitting loop); a
-    /// command-free loop is surfaced as a Warning instead. Kept as a separate
-    /// path so the HVG008 rewrite logic in [`Self::push_finding`] is untouched.
+    /// Used by HVG011's command-aware downgrade. The catalog severity is the
+    /// class's worst case: `HardBlocker`, a command-emitting loop. A
+    /// command-free loop is a Warning instead. A separate path keeps the HVG008
+    /// rewrite logic in [`Self::push_finding`] untouched.
     ///
     /// CONTRACT NOTES: the override string must exactly match `"HardBlocker"`
-    /// or `"Warning"` — workflow.rs's severity dispatch is an exact string
+    /// or `"Warning"`. workflow.rs's severity dispatch is an exact string
     /// match, so any other spelling silently falls through to the warning
-    /// path. And this method must never be used for HVG001/HVG002 findings:
-    /// those two IDs are remapped to HVG008 inside `await_condition` closures
-    /// by [`Self::push_finding`], and an override would pin the pre-remap
-    /// rule's severity onto the remapped HVG008 finding.
+    /// path. Never use this method for HVG001/HVG002 findings.
+    /// [`Self::push_finding`] remaps those two IDs to HVG008 inside
+    /// `await_condition` closures. An override would pin the pre-remap rule's
+    /// severity onto the remapped HVG008 finding.
     fn add_finding_with_severity(&mut self, rule_id: &str, span: Span, severity: &str) {
         self.push_finding(rule_id, span, Some(severity));
     }
@@ -145,12 +145,12 @@ impl DeterminismVisitor {
     /// HVG011: returns the tracked ident when `expr` (a `for` loop's iterated
     /// expression) iterates a locally-bound `HashMap`/`HashSet`.
     ///
-    /// Deliberately narrow (issue #785's explicit syntactic boundary): only a
-    /// bare tracked ident, `&ident` / `&mut ident`, or a SINGLE
-    /// argument-free iteration method call on a tracked ident matches. Longer
-    /// chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`) are never
-    /// flagged — that is how "already-sorted iterators are never flagged"
-    /// holds — and function parameters/fields are never tracked.
+    /// Deliberately narrow, per issue #785's explicit syntactic boundary. Only
+    /// a bare tracked ident, `&ident` / `&mut ident`, or a SINGLE argument-free
+    /// iteration method call on a tracked ident matches. Longer chains
+    /// (`map.keys().sorted()`, `.collect::<Vec<_>>()`) are never flagged. That
+    /// is how "already-sorted iterators are never flagged" holds. Function
+    /// parameters and fields are never tracked.
     fn iterated_hash_local(&self, expr: &syn::Expr) -> Option<String> {
         let path_ident = |e: &syn::Expr| -> Option<String> {
             if let Expr::Path(p) = e {
@@ -205,12 +205,12 @@ fn type_is_hash_collection(ty: &syn::Type) -> bool {
     }
 }
 
-/// `true` when a `.collect` turbofish argument produces a `HashMap`/`HashSet`,
-/// including the fallible/optional forms `Result<HashMap<..>, E>` and
-/// `Option<HashMap<..>>` (PR #970 review, P2-C): the wrapper's FIRST generic
-/// type argument is checked recursively. Pinned contract: the wrapper form is
-/// accepted both behind a `?` (the realistic `.collect::<Result<..>>()?`) and
-/// unwrapped.
+/// `true` when a `.collect` turbofish argument produces a `HashMap`/`HashSet`.
+///
+/// This includes the forms `Result<HashMap<..>, E>` and `Option<HashMap<..>>`
+/// (PR #970). The wrapper's FIRST generic type argument is checked
+/// recursively. Pinned contract: the wrapper form is accepted both behind a
+/// `?` (the realistic `.collect::<Result<..>>()?`) and unwrapped.
 fn collect_target_is_hash(ty: &syn::Type) -> bool {
     if type_is_hash_collection(ty) {
         return true;
@@ -229,11 +229,12 @@ fn collect_target_is_hash(ty: &syn::Type) -> bool {
     false
 }
 
-/// `true` when a `let` initializer expression produces a `HashMap`/`HashSet`:
-/// a constructor call (`HashMap::new()`, `HashSet::from(..)`, `default`,
-/// `with_capacity` variants — any path prefix) or a chain ending in
-/// `.collect::<HashMap<..>>()` / `.collect::<HashSet<..>>()` (also the
-/// `Result`/`Option`-wrapped turbofish forms — see [`collect_target_is_hash`]).
+/// `true` when a `let` initializer expression produces a `HashMap`/`HashSet`.
+///
+/// That is a constructor call (`HashMap::new()`, `HashSet::from(..)`,
+/// `default`, `with_capacity` variants, any path prefix). It is also a chain
+/// ending in `.collect::<HashMap<..>>()` / `.collect::<HashSet<..>>()`,
+/// including the wrapped forms of [`collect_target_is_hash`].
 fn init_is_hash_collection(expr: &syn::Expr) -> bool {
     match expr {
         Expr::Call(call) => {
@@ -453,8 +454,10 @@ fn is_io_path(path_str: &str) -> bool {
 }
 
 /// HVG010 (issue #799) combinator-FUNCTION detection: `true` when `path_str`
-/// names one of the `futures` select combinators, matched conservatively
-/// because HVG010 is a `HardBlocker` and a false positive breaks user builds.
+/// names one of the `futures` select combinators.
+///
+/// The match is conservative. HVG010 is a `HardBlocker`, so a false positive
+/// breaks user builds.
 ///
 /// Matched:
 ///   * the `futures`-anchored qualified forms `futures::future::{select,
@@ -466,9 +469,9 @@ fn is_io_path(path_str: &str) -> bool {
 ///
 /// Deliberately NOT matched: bare `select(...)`. `select` is a common
 /// free-function / query-builder name, so a bare call is too ambiguous to
-/// hard-block. (The bare `select!` MACRO form IS flagged in `visit_macro` —
-/// a macro invocation is unambiguous.) `.select(…)` / `.select_all()` METHOD
-/// calls are never seen here (they are `Expr::MethodCall`, not `Expr::Call`).
+/// hard-block. `visit_macro` DOES flag the bare `select!` MACRO form, because
+/// a macro invocation is unambiguous. `.select(…)` / `.select_all()` METHOD
+/// calls never reach here: they are `Expr::MethodCall`, not `Expr::Call`.
 fn is_select_combinator_path(path_str: &str) -> bool {
     matches!(
         path_str,
@@ -493,9 +496,9 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         // call, or a `.collect::<HashMap<..>>()` turbofish. Last-binding-wins
         // within a scope: re-binding the same ident to a non-hash type masks
         // it. Unknown binding shapes (destructuring, let-else patterns, enum
-        // variants) mask EVERY ident they bind — shadowing, never tracking —
-        // so an outer tracked binding cannot bleed through a pattern re-bind
-        // (PR #970 review, P1-A).
+        // variants) mask EVERY ident they bind. They shadow and never track.
+        // So an outer tracked binding cannot bleed through a pattern re-bind
+        // (PR #970).
         if let Some((name, annotated_hash)) = local_binding_target(&i.pat) {
             let init_hash = i
                 .init
@@ -506,13 +509,12 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             self.mask_pattern_idents(&i.pat);
         }
 
-        // Delegate to nested traversal
         syn::visit::visit_local(self, i);
     }
 
     fn visit_block(&mut self, i: &'ast syn::Block) {
         // HVG011: every block is a lexical scope — bindings made inside it
-        // must not survive block exit (inner-block leak, PR #970 P1-A(b)).
+        // must not survive block exit (inner-block leak, PR #970).
         self.push_hash_scope();
         syn::visit::visit_block(self, i);
         self.pop_hash_scope();
@@ -529,9 +531,9 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
     fn visit_expr_closure(&mut self, i: &'ast syn::ExprClosure) {
         // HVG011: closure parameters shadow outer idents for the closure body.
-        // NOTE: the ctx.side_effect(..) closure-skip in visit_expr_method_call
-        // never reaches this method (it visits the closure's input pats
-        // directly and skips the body), so that escape hatch is unaffected.
+        // The ctx.side_effect(..) closure-skip in visit_expr_method_call never
+        // reaches this method. It visits the closure's input pats directly and
+        // skips the body. So that escape hatch is unaffected.
         self.push_hash_scope();
         for input in &i.inputs {
             self.mask_pattern_idents(input);
@@ -544,8 +546,8 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         // HVG011: NonDeterministicIteration (issue #785; the issue proposed
         // HVG010, permanently taken by SelectMacro/#600, hence HVG011).
         // Command-aware severity: a loop body that schedules commands on the
-        // context param is a HardBlocker (the recorded command order would
-        // follow the randomized hash order and diverge on replay); a
+        // context param is a HardBlocker. The recorded command order would
+        // follow the randomized hash order and diverge on replay. A
         // command-free loop is downgraded to a Warning.
         //
         // The check runs against the OUTER scopes — the iterated expression is
@@ -564,7 +566,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
         // Manual traversal (mirrors syn::visit::visit_expr_for_loop's order)
         // so the loop pattern's bindings shadow outer idents for the body
-        // extent only (PR #970 P1-A(a): `for m in &lists { for x in m … }`).
+        // extent only (PR #970: `for m in &lists { for x in m … }`).
         for attr in &i.attrs {
             self.visit_attribute(attr);
         }
@@ -705,7 +707,6 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             }
         }
 
-        // Delegate to nested traversal
         syn::visit::visit_expr_call(self, i);
     }
 
@@ -810,7 +811,6 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             self.add_finding("HVG009", i.mac.path.segments.last().unwrap().ident.span());
         }
 
-        // Delegate to nested traversal
         syn::visit::visit_expr_macro(self, i);
     }
 
@@ -818,16 +818,15 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         // HVG010: SelectMacro (issue #600) -- tokio::select!/futures::select!/
         // futures::select_biased! racing ctx-managed awaitables is a double
         // footgun (non-deterministic winner on replay, no durable loser
-        // cancellation). Checked at the generic `visit_macro` level (rather
-        // than `visit_expr_macro`) because `select! { .. }` used bare at
-        // statement position -- the idiomatic form, with no trailing `;` --
-        // parses as `syn::StmtMacro`, not `syn::ExprMacro`; `visit_macro` is
-        // called from both. Detected by macro path only, mirroring HVG009 --
-        // the macro body's tokens are not parsed as exprs by syn, so this
-        // cannot distinguish a `select!` over ctx awaitables from one over
-        // plain futures, but a workflow body has no legitimate reason to
-        // `select!` over anything else (ctx.race() and futures::join! cover
-        // every wait-first/wait-all shape blessed for workflow code).
+        // cancellation). The check is in `visit_macro`, not
+        // `visit_expr_macro`. A bare `select! { .. }` at statement position,
+        // the idiomatic form, parses as `syn::StmtMacro`, not `syn::ExprMacro`.
+        // `visit_macro` is called from both. Detection is by macro path only,
+        // mirroring HVG009. syn does not parse the macro body's tokens as
+        // exprs. So this cannot tell a `select!` over ctx awaitables from one
+        // over plain futures. A workflow body has no legitimate reason to
+        // `select!` over plain futures. ctx.race() and futures::join! cover
+        // every wait-first/wait-all shape blessed for workflow code.
         let path_str = path_to_string(&i.path);
         if path_str == "select"
             || path_str == "select_biased"
@@ -838,7 +837,6 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             self.add_finding("HVG010", i.path.segments.last().unwrap().ident.span());
         }
 
-        // Delegate to nested traversal
         syn::visit::visit_macro(self, i);
     }
 
@@ -945,9 +943,8 @@ mod hvg011_tests {
     //! Visitor-level tests for HVG011 (issue #785): HashMap/HashSet
     //! iteration-order determinism.
     //!
-    //! NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
-    //! already permanently assigned to `SelectMacro` (issue #600) and rule IDs
-    //! are never reused, so the iteration-order rule ships as HVG011.
+    //! Issue #785 proposed HVG010, but `SelectMacro` (issue #600) already held
+    //! it. Rule IDs are never reused, so the iteration-order rule is HVG011.
 
     use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
     use syn::visit::Visit as _;
@@ -1217,7 +1214,7 @@ mod hvg011_tests {
         );
     }
 
-    // ── P1-A regression pins (PR #970 review): scope-aware binding tracking ──
+    // ── Regression pins (PR #970): scope-aware binding tracking ──
     // Four confirmed false-positive shapes under the old flat function-wide
     // `hash_locals` set, plus the symmetric legit case. Each FP shape must
     // produce ZERO HVG011 findings.
@@ -1363,7 +1360,7 @@ mod hvg011_tests {
         );
     }
 
-    // ── P2-C: fallible collect (`.collect::<Result<HashMap<..>, E>>()?`) ─────
+    // ── Fallible collect (`.collect::<Result<HashMap<..>, E>>()?`) ───────────
 
     #[test]
     fn collect_result_turbofish_with_try_is_tracked() {
@@ -1390,7 +1387,7 @@ mod hvg011_tests {
     #[test]
     fn collect_option_turbofish_without_try_is_tracked() {
         // The Result/Option unwrapping is accepted with or without the `?` —
-        // pinned contract (see PR #970 review, P2-C).
+        // pinned contract (PR #970).
         let findings = lint(
             r#"
             async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
@@ -1403,10 +1400,10 @@ mod hvg011_tests {
             }
             "#,
         );
-        // NOTE: the second `let m = m.unwrap_or_default();` re-binding is NOT
-        // hash-tracked (unknown shape) so this asserts the tracking happens on
-        // the collect line and is then masked — zero findings is the honest
-        // outcome for this exact shape; assert instead on a direct iteration.
+        // The second `let m = m.unwrap_or_default();` re-binding is NOT
+        // hash-tracked (unknown shape). Tracking happens on the collect line
+        // and is then masked, so zero findings is honest for this shape.
+        // Assert on a direct iteration instead.
         let findings_direct = lint(
             r#"
             async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
@@ -1429,7 +1426,7 @@ mod hvg011_tests {
         );
     }
 
-    // ── P2-F: Gemini bot coverage (default ctor, ctx.race) ──────────────────
+    // ── Default ctor and ctx.race coverage ──────────────────────────────────
 
     #[test]
     fn hashmap_default_binding_is_tracked() {
@@ -1477,7 +1474,7 @@ mod hvg011_tests {
         );
     }
 
-    // ── P3 polish pins: test-matrix holes + negative controls ───────────────
+    // ── Test-matrix holes + negative controls ───────────────────────────────
 
     #[test]
     fn bare_by_move_iteration_is_flagged() {
@@ -1611,19 +1608,18 @@ mod hvg011_tests {
 #[cfg(test)]
 mod hvg010_combinator_tests {
     //! Visitor-level tests for HVG010's combinator-FUNCTION detection (issue
-    //! #799). HVG010 already flags the select MACROS (`tokio::select!`,
-    //! `futures::select!`, `select_biased!`) via `visit_macro`; issue #799
+    //! #799). HVG010 flags the select MACROS (`tokio::select!`,
+    //! `futures::select!`, `select_biased!`) via `visit_macro`. Issue #799
     //! extends the SAME rule to the `futures::future::{select, select_all,
-    //! select_ok, try_select}` combinator FUNCTIONS, which race concurrent
+    //! select_ok, try_select}` combinator FUNCTIONS. They race concurrent
     //! futures with the identical non-deterministic-winner footgun.
     //!
-    //! The select-macro positive case is covered by the
-    //! `hvg010_select_macro.rs` compile-fail fixture; the activity-body
-    //! negative case (AC6) is covered by the `#[activity]` macro never running
-    //! this visitor (see `suppressed_guardrails.rs` and the `det_check`
-    //! `det011_activity_bodies_are_never_flagged` test) — the visitor lints
-    //! whatever `fn` it is handed, so an "activity" negative cannot be
-    //! expressed at this layer.
+    //! The `hvg010_select_macro.rs` compile-fail fixture covers the
+    //! select-macro positive case. The `#[activity]` macro never runs this
+    //! visitor, which covers the activity-body negative case (AC6). See
+    //! `suppressed_guardrails.rs` and the `det_check`
+    //! `det011_activity_bodies_are_never_flagged` test. The visitor lints any
+    //! `fn` it is handed, so this layer cannot express an "activity" negative.
 
     use super::{DeterminismVisitor, LinterFinding, load_catalog_metadata};
     use syn::visit::Visit as _;

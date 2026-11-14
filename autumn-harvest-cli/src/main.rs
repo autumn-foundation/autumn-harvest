@@ -7,14 +7,14 @@ use autumn_harvest_cli::{Cli, run_cli};
 /// Stack for the thread that does all the work.
 ///
 /// Windows gives a process's main thread **1 MiB** by default. A debug build of
-/// a CLI with this many subcommands overflows that inside clap's own
-/// argument-tree construction — before any subcommand is dispatched, so even
-/// `harvest --help` aborts with `STATUS_STACK_OVERFLOW` (`0xC00000FD`). Linux's
-/// 8 MiB default hides it entirely.
+/// this CLI, with its many subcommands, overflows that inside clap's
+/// argument-tree construction. This happens before dispatch, so even
+/// `harvest --help` aborts with `STATUS_STACK_OVERFLOW` (`0xC00000FD`).
+/// Linux's 8 MiB default hides it.
 ///
-/// A thread's stack is sized at spawn and is not subject to the main thread's
-/// limit, so doing the work here makes the binary behave the same everywhere.
-/// This is the same approach rustc itself takes for the same reason.
+/// A thread's stack is sized at spawn, not by the main thread's limit. So
+/// the work runs here, and the binary behaves the same everywhere. rustc
+/// does the same for the same reason.
 ///
 /// Reproduce the Windows condition on Linux with:
 /// `bash -c 'ulimit -s 1024; harvest --help'`
@@ -53,9 +53,8 @@ fn run() -> i32 {
         0
     });
 
-    // `std::process::exit` does not unwind, so flush explicitly rather than
-    // relying on it to drain a block-buffered stdout (which is what a caller
-    // capturing our output gets).
+    // `std::process::exit` does not unwind, so flush explicitly. A caller
+    // that captures the output gets a block-buffered stdout.
     let _ = std::io::stdout().flush();
     code
 }

@@ -26,10 +26,9 @@ pub const BUILTIN_MODEL_TOML: &str = include_str!("../../harvest-verify.model.to
 /// A taint origin.
 ///
 /// The `path` is matched as a `::`-segment suffix of the callee path with
-/// generic arguments stripped, so `SystemTime::now` matches
-/// `std::time::SystemTime::now`, and
-/// `<HashMap<K, V> as IntoIterator>::into_iter` is matched via
-/// `receiver = "HashMap"`, `path = "into_iter"`.
+/// generic arguments stripped. So `SystemTime::now` matches
+/// `std::time::SystemTime::now`. `<HashMap<K, V> as IntoIterator>::into_iter`
+/// is matched via `receiver = "HashMap"`, `path = "into_iter"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceRule {
@@ -40,9 +39,9 @@ pub struct SourceRule {
     /// Optional disambiguator: a `::`-segment **suffix** of the fully-qualified declared
     /// type of the call's destination local, as printed by the `let _N: T;` declarations.
     ///
-    /// MIR prints callee paths *trimmed* (`std::env::var` is printed as bare `var`) but
-    /// `let` declarations *fully qualified*, so a bare-suffix rule such as `var` would
-    /// otherwise match any user function of that name. Requiring
+    /// MIR prints callee paths *trimmed* (`std::env::var` is printed as bare `var`).
+    /// It prints `let` declarations *fully qualified*. A bare-suffix rule such as `var`
+    /// would otherwise match any user function of that name. Requiring
     /// `dest_type = "std::result::Result<std::string::String, std::env::VarError>"`
     /// pins the row to the real `std::env::var` without keying on an unstable path prefix.
     /// `None` = the destination type is not consulted.
@@ -112,10 +111,10 @@ pub struct SanitizerRule {
     pub path: String,
     #[serde(default)]
     pub receiver: Option<String>,
-    /// Same disambiguator as [`SourceRule::dest_type`]. It is what makes
-    /// `collect` expressible as a sanitizer: only
-    /// `collect` *into* a `BTreeMap`/`BTreeSet` kills `Order`, and the
-    /// collection chosen is visible only in the destination local's declared type.
+    /// Same disambiguator as [`SourceRule::dest_type`]. It makes `collect`
+    /// expressible as a sanitizer. Only `collect` *into* a `BTreeMap`/`BTreeSet`
+    /// kills `Order`. The collection chosen is visible only in the destination
+    /// local's declared type.
     #[serde(default)]
     pub dest_type: Option<String>,
     /// Which taint kind the sanitizer clears on its receiver/result.
@@ -125,16 +124,16 @@ pub struct SanitizerRule {
 
 /// A rule keyed on a *type* name rather than a call path.
 ///
-/// Used by [`Model::ambient_type`]: the interior-mutability rows in `[[source]]`
+/// Used by [`Model::ambient_type`]. The interior-mutability rows in `[[source]]`
 /// (`Mutex::lock`, `AtomicU64::load`, `RefCell::borrow`, `LazyLock`'s `Deref::deref`, ...)
-/// are only non-deterministic **sources** when their receiver is *ambient* — a `static`,
-/// a `static mut`, a `thread_local!`, or a value reachable from one. Applied to a
+/// are non-deterministic **sources** only when their receiver is *ambient*. That is a
+/// `static`, a `static mut`, a `thread_local!`, or a value reachable from one. Applied to a
 /// non-ambient local (a `Mutex` created inside the workflow body) the same call merely
 /// propagates the receiver's taint.
 ///
-/// The analyzer therefore reads these two tables together: a `[[source]]` row on such a
-/// receiver means "propagate the receiver's taint through this call, **and** treat a
-/// `static` whose declared type appears in `[[ambient_type]]` as an ambient root".
+/// The analyzer therefore reads these two tables together. A `[[source]]` row on such a
+/// receiver means "propagate the receiver's taint through this call". It also means
+/// "treat a `static` whose declared type appears in `[[ambient_type]]` as an ambient root".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeRule {
@@ -153,14 +152,13 @@ pub struct TrustedCrate {
 /// A body-less callee that is provably std/core/alloc even though rustc printed
 /// its path trimmed to a bare segment.
 ///
-/// The default for a callee with no body in the analyzed set is a named
-/// [`crate::BoundaryKind::ExternalCrateBody`] boundary: an unemitted dependency
-/// really is code the analysis never saw. std is the exception, because it is
-/// modelled by the `[[source]]` / `[[sanitizer]]` / `[[reduction]]` tables
-/// instead — but only when the analyzer can *tell* it is std, which the declared
-/// types at the call site usually settle. These rows cover the rest: free
-/// functions whose whole signature is primitives, so no type at the call site is
-/// rooted at `std::`.
+/// A callee with no body in the analyzed set defaults to a named
+/// [`crate::BoundaryKind::ExternalCrateBody`] boundary. An unemitted dependency
+/// really is code the analysis never saw. std is the exception, because the
+/// `[[source]]` / `[[sanitizer]]` / `[[reduction]]` tables model it instead. That
+/// holds only when the analyzer can *tell* it is std. The declared types at the
+/// call site usually settle that. These rows cover the rest: free functions whose
+/// whole signature is primitives, so no type at the call site is rooted at `std::`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StdFreeFnRule {
@@ -266,13 +264,13 @@ impl Model {
 
     /// Overlay another model on this one (D8).
     ///
-    /// The result is the **union** of the rows: an overlay row whose
+    /// The result is the **union** of the rows. An overlay row whose
     /// `(path, receiver, dest_type)` key is already present *replaces* the
-    /// earlier row in place (keeping its position, so the model stays readable
-    /// as "builtin, then additions"), and any other overlay row is appended.
+    /// earlier row in place. It keeps its position, so the model stays readable
+    /// as "builtin, then additions". Any other overlay row is appended.
     /// `[[trusted]]` and `[[ambient_type]]` rows are keyed on `name`.
-    /// The `version` string is taken from the overlay when it sets a non-empty
-    /// one, so a verdict can always be traced to the rules that produced it.
+    /// The `version` string comes from the overlay when it sets a non-empty one.
+    /// So a verdict can always be traced to the rules that produced it.
     #[must_use]
     pub fn merged_with(self, overlay: Self) -> Self {
         Self {

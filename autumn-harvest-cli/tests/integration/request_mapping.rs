@@ -187,9 +187,9 @@ fn workflow_start_shard_id_maps_to_a_numeric_body_field() {
     assert_eq!(request.body, Some(json!({ "shard_id": 2 })));
 }
 
-/// Lineage tree (issue #621) maps onto `GET /workflows/{id}/tree`, with every
-/// bound carried as a query param so an omitted flag inherits the *server's*
-/// documented default rather than a second copy of it in the CLI.
+/// Lineage tree (issue #621) maps onto `GET /workflows/{id}/tree`. Every bound
+/// is a query param, so an omitted flag inherits the *server's* documented
+/// default, not a second copy of it in the CLI.
 #[test]
 fn workflow_tree_maps_bounds_onto_query_params() {
     // Bare form sends no query string at all, so the server's documented
@@ -346,11 +346,9 @@ fn workflow_list_and_query_use_get_requests() {
 
 /// Durable per-execution author logs (issue #790) — `harvest workflow logs`.
 ///
-/// Its own test rather than more assertions on
-/// `workflow_list_and_query_use_get_requests`: that function is already at the
-/// `clippy::too_many_lines` ceiling, and the logs route has three distinct
-/// query-shaping behaviours worth naming (bare, fully-filtered, repeated
-/// `--level`).
+/// A separate test, because `workflow_list_and_query_use_get_requests` is at
+/// the `clippy::too_many_lines` ceiling. The logs route has three distinct
+/// query-shaping behaviours: bare, fully-filtered, and repeated `--level`.
 #[test]
 fn workflow_logs_maps_to_the_logs_route_with_query_filters() {
     let logs = Cli::try_parse_from([
@@ -711,9 +709,9 @@ fn history_export_batch_maps_filters_to_admin_route() {
     assert_eq!(request.body, None);
 }
 
-/// Issue #798: the sample export maps onto the stratified admin route with the
-/// per-type cap, the caller-specified non-terminal states, and the payload
-/// policy — the three inputs a CI drift gate actually varies.
+/// Issue #798: the sample export maps onto the stratified admin route. It
+/// carries the per-type cap, the caller-specified non-terminal states, and the
+/// payload policy. A CI drift gate varies these three inputs.
 #[test]
 fn history_export_sample_maps_to_the_stratified_admin_route() {
     let cli = Cli::try_parse_from([
@@ -1027,9 +1025,8 @@ fn workflow_signal_and_cancel_use_post_bodies() {
 
 #[test]
 fn workflow_signal_idempotency_key_maps_to_query_param() {
-    // Issue #753: the CLI signal subcommand reaches parity with the HTTP
-    // surface (issue #521) by mapping --idempotency-key onto the
-    // ?idempotency_key= query param of the plain signal route.
+    // Issue #753: parity with the HTTP surface (issue #521). The CLI maps
+    // --idempotency-key onto ?idempotency_key= of the plain signal route.
     let cli = Cli::try_parse_from([
         "harvest",
         "workflow",
@@ -1076,10 +1073,10 @@ fn workflow_signal_idempotency_key_is_query_encoded() {
 
 #[test]
 fn workflow_signal_empty_idempotency_key_is_rejected() {
-    // Mirror the server's header semantics (issue #521): a present but empty
-    // Idempotency-Key is rejected rather than silently degraded to
-    // at-least-once — the server treats an empty ?idempotency_key= as
-    // omitted, so a client that intended exactly-once must never send one.
+    // Mirror the server's header semantics (issue #521). A present but empty
+    // Idempotency-Key is rejected, not silently degraded to at-least-once.
+    // The server treats an empty ?idempotency_key= as omitted. So a client
+    // that intended exactly-once must never send one.
     for empty in ["", "   "] {
         let result = Cli::try_parse_from([
             "harvest",
@@ -1589,7 +1586,6 @@ fn dlq_redrive_with_all_filters_maps_correctly() {
     );
     assert_eq!(body["max"], 250);
     assert_eq!(body["reason"], "downstream fixed");
-    // dry_run omitted → not present
     assert!(body.get("dry_run").is_none());
 }
 
@@ -1789,7 +1785,6 @@ fn workflow_update_admitted_mode_sets_wait_query_param() {
         .expect("update admitted request should build");
 
     assert_eq!(request.method, ApiMethod::Post);
-    // wait=admitted is in path; timeout_secs is included too
     assert!(
         request.path.contains("wait=admitted"),
         "path must include wait=admitted: {}",
@@ -2532,9 +2527,9 @@ fn workflow_rerun_without_flags_sends_empty_object_body() {
     .expect("workflow rerun args should parse");
     let request = cli.api_request().expect("rerun request should build");
 
-    // No `input` key at all: the server treats an absent `input` as "clone the
-    // source's stored input verbatim" and an explicit JSON null as an override,
-    // so the CLI must never inject a null to mean "the operator said nothing".
+    // No `input` key at all. The server reads an absent `input` as "clone the
+    // source's stored input verbatim" and an explicit JSON null as an override.
+    // So the CLI must never inject a null to mean "the operator said nothing".
     assert_eq!(request.body, Some(json!({})));
 }
 
@@ -3116,16 +3111,15 @@ fn queue_pause_percent_encodes_the_queue_name() {
 
 #[test]
 fn queue_pause_rejects_url_dot_segment_queue_names() {
-    // A literal `.` or `..` queue name is NOT percent-encodable out of the
-    // problem: the WHATWG URL parser that reqwest uses collapses dot-segments
-    // *after* `ApiRequest.path` is built, so a `.` name silently rewrites the
-    // request to `/admin/queues/pause` -- a DIFFERENT route. Rejection at
-    // request-construction time is the only correct handling.
+    // Percent-encoding cannot fix a literal `.` or `..` queue name. The WHATWG
+    // URL parser that reqwest uses collapses dot-segments *after*
+    // `ApiRequest.path` is built. So a `.` name silently rewrites the request to
+    // `/admin/queues/pause`, a DIFFERENT route. Rejection at request
+    // construction is the only correct handling.
     //
-    // The `%2e` spellings are additionally rejected as defense in depth: they
-    // are already neutralized today by `PATH_SEGMENT_ENCODE_SET` encoding `%`
-    // (they reach the URL as `%252e`), and the guard should not silently depend
-    // on that staying true.
+    // The `%2e` spellings are also rejected, as defense in depth.
+    // `PATH_SEGMENT_ENCODE_SET` encodes `%`, so they reach the URL as `%252e`
+    // today. The guard should not silently depend on that.
     for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
         let cli = Cli::try_parse_from(["harvest", "queue", "pause", bad, "--reason", "x"])
             .expect("queue pause args should parse");
@@ -3154,13 +3148,12 @@ fn queue_resume_rejects_url_dot_segment_queue_names() {
 
 #[test]
 fn queue_pause_percent_encodes_a_backslash_in_the_queue_name() {
-    // The URL parser treats `\` as a path separator for http/https, so an
-    // unencoded backslash splits the segment and the request silently lands on
-    // a different route -- and it re-enables `..` traversal inside what should
-    // be one opaque segment, past the whole-segment dot-segment guard.
-    // Encoding IS the right fix here (unlike the literal `.`/`..` forms):
-    // `%5C` is not collapsed, so a queue whose name genuinely carries a
-    // backslash stays pausable.
+    // The URL parser treats `\` as a path separator for http/https. An
+    // unencoded backslash splits the segment, and the request silently lands
+    // on a different route. It also re-enables `..` traversal inside one
+    // opaque segment, past the whole-segment dot-segment guard. Here encoding
+    // IS the right fix, unlike for the literal `.`/`..` forms. `%5C` is not
+    // collapsed, so a queue name with a real backslash stays pausable.
     let cli = Cli::try_parse_from([
         "harvest",
         "queue",
@@ -3457,9 +3450,9 @@ fn activity_list_maps_to_the_read_route() {
 #[test]
 fn activity_list_json_flag_is_render_only_and_never_reaches_the_request() {
     // `--json` selects the OUTPUT rendering, so it must not leak into the wire
-    // request as a query param or body field. Pinned because the read route is
-    // shared with the default table path: a leak would send the server an
-    // unknown param that a strict handler could reject.
+    // request as a query param or body field. The default table path shares
+    // the read route. A leak would send an unknown param that a strict
+    // handler could reject.
     let plain = Cli::try_parse_from(["harvest", "activity", "list"])
         .expect("activity list args should parse")
         .api_request()
@@ -3529,11 +3522,11 @@ fn activity_pause_percent_encodes_the_activity_name() {
 
 #[test]
 fn activity_routes_reject_url_dot_segment_names() {
-    // Identical hazard to the queue path: the WHATWG URL parser collapses
-    // dot-segments AFTER `ApiRequest.path` is assembled, so an activity named
-    // `.` would silently rewrite `/activities/./pause` to `/activities/pause`
-    // -- a different route. Every subcommand that interpolates the name must
-    // reject it, including the reads (a `..` on `get` would target `/`).
+    // Identical hazard to the queue path. The WHATWG URL parser collapses
+    // dot-segments AFTER `ApiRequest.path` is assembled. An activity named `.`
+    // would silently rewrite `/activities/./pause` to `/activities/pause`.
+    // Every subcommand that interpolates the name must reject it, reads
+    // included: a `..` on `get` would target `/`.
     for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
         for verb in ["pause", "resume", "get"] {
             let cli = Cli::try_parse_from(["harvest", "activity", verb, bad])

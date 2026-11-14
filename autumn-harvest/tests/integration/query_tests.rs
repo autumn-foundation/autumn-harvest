@@ -142,7 +142,6 @@ fn query_registry_execute_with_args_propagates_handler_error() {
     );
 
     let result = registry.execute_with_args("failing", json!(null));
-    // The handler error should propagate as a specific error variant
     assert!(result.is_err(), "handler error should propagate");
 }
 
@@ -181,7 +180,7 @@ fn register_query_handler_typed_deserializes_request_and_serializes_response() {
 
 #[test]
 fn register_query_handler_with_no_args_type() {
-    // Handler with serde_json::Value as the Req type (generic pass-through)
+    // A `serde_json::Value` request type passes the args through.
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
     ctx.register_query_handler(
         "echo",
@@ -196,7 +195,7 @@ fn register_query_handler_with_no_args_type() {
 
 #[test]
 fn register_query_handler_is_idempotent() {
-    // Registering the same name twice should not panic; first registration wins.
+    // A second registration of the same name does not panic. The first one wins.
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
     ctx.register_query_handler(
         "status",
@@ -210,7 +209,7 @@ fn register_query_handler_is_idempotent() {
     let result = ctx
         .execute_query_with_args("status", json!(null))
         .expect("query should succeed");
-    // First registration wins (idempotent like UpdateRegistry)
+    // The first registration wins, as in `UpdateRegistry`.
     assert_eq!(result, json!("first"), "first registration must win");
 }
 
@@ -218,7 +217,7 @@ fn register_query_handler_is_idempotent() {
 
 #[test]
 fn execute_query_with_args_passes_args_to_no_arg_handler() {
-    // register_query (no-arg) ignores args; execute_query_with_args should still work.
+    // A no-arg `register_query` handler ignores the args.
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
     ctx.register_query("simple", || json!("simple_result"));
 

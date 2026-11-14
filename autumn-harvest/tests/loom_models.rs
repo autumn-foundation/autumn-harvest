@@ -22,18 +22,18 @@
 //!
 //! # Honest scope
 //!
-//! Loom models *in-process* atomics and locks only. The large majority of
-//! harvest's concurrency lives in Postgres — `SELECT ... FOR UPDATE SKIP
-//! LOCKED` claims, the `wake_requested` re-pend race, the HA scheduler
-//! `fire_claim_token` guard — and is entirely out of loom's reach. See
+//! Loom models *in-process* atomics and locks only. Most of the concurrency of
+//! harvest lives in Postgres, entirely out of reach of loom. Examples are
+//! `SELECT ... FOR UPDATE SKIP LOCKED` claims, the `wake_requested` re-pend
+//! race and the HA scheduler `fire_claim_token` guard. See
 //! `docs/testing/loom.md` for the full include/exclude rationale and the
 //! coverage caveat.
 //!
 //! Each model uses exactly two [`loom::thread`] threads doing at most two
 //! operations each, so the state spaces are small and exhaustive exploration
-//! terminates quickly. If a future model needs a larger space, prefer trimming
-//! ops; only reach for [`loom::model::Builder`]'s `preemption_bound` as a last
-//! resort (and document the loss of exhaustiveness in a comment).
+//! terminates quickly. If a future model needs a larger space, trim ops first.
+//! Use the `preemption_bound` of [`loom::model::Builder`] only as a last resort,
+//! and document the loss of exhaustiveness in a comment.
 
 #![cfg(loom)]
 
@@ -53,8 +53,8 @@ use loom::sync::Arc;
 
 /// A breaker policy that trips on the very first retryable failure. A threshold
 /// of one makes the "a stale straggler must not (re-)trip the breaker"
-/// invariants below maximally sharp: if the fence ever leaks a single stale
-/// failure through, the breaker trips and the assertion fires.
+/// invariants maximally sharp. If the fence leaks one stale failure, the
+/// breaker trips and the assertion fires.
 fn trip_on_first_policy(cooldown: Duration) -> CircuitBreakerPolicy {
     CircuitBreakerPolicy::new(1, Duration::from_secs(30), cooldown)
 }
@@ -77,9 +77,9 @@ fn breaker(cooldown: Duration) -> Arc<CircuitBreakerRegistry> {
 ///   token.
 ///
 /// Under **every** interleaving the stale failure must be dropped and the
-/// operator's reset must stand — the breaker ends CLOSED with an empty failure
-/// window and the stale `on_result` returns `None`. Two fences enforce this and
-/// loom proves at least one always applies regardless of order:
+/// operator's reset must stand. The breaker ends CLOSED with an empty failure
+/// window, and the stale `on_result` returns `None`. Two fences enforce this.
+/// Loom proves that at least one always applies, in any order:
 ///
 /// * if the failure lands while still forced-open, the `forced_open` guard drops
 ///   it;
@@ -179,9 +179,9 @@ fn circuit_breaker_admits_at_most_one_half_open_probe() {
         let a_outcome = a.join().unwrap();
         let b_outcome = b.join().unwrap();
 
-        // Exactly one dispatch was admitted; the other short-circuited. This is
-        // the property Codex asked for: the loser must be *rejected*, not merely
-        // "not a probe". A regression admitting both concurrently fails here.
+        // Exactly one dispatch was admitted; the other short-circuited. The loser
+        // must be *rejected*, not merely "not a probe". A regression that admits
+        // both concurrently fails here.
         let a_allowed = a_outcome != Outcome::ShortCircuit;
         let b_allowed = b_outcome != Outcome::ShortCircuit;
         assert!(
@@ -241,12 +241,12 @@ fn session_slot_bound_admits_at_most_one_at_capacity_one() {
 /// Model 4: release genuinely frees reusable capacity under every interleaving.
 ///
 /// Capacity two, so under contention *both* threads acquire (distinct ids) and
-/// each releases only its own id. After both join, the registry must not only
-/// drain back to empty — a fresh acquire of a *third* distinct id must then
-/// succeed, proving the slots were genuinely freed and are reusable rather than
-/// merely counted down. A `release_session_slot` that removed the wrong key or
-/// no-op'd would leave the registry non-empty (or the reacquire blocked) under
-/// some interleaving and fail this model. Exercises the real
+/// each releases only its own id. After both join, the registry must drain back
+/// to empty. A fresh acquire of a *third* distinct id must then succeed. That
+/// proves the slots are freed and reusable, not merely counted down. A
+/// `release_session_slot` that removed the wrong key or did nothing would leave
+/// the registry non-empty (or the reacquire blocked) under some interleaving.
+/// This model would then fail. Exercises the real
 /// `try_acquire_session_slot` / `release_session_slot` pair racing across
 /// threads at a capacity that admits both.
 #[test]

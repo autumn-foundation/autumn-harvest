@@ -56,7 +56,6 @@ struct OfflineModel {
     calls: AtomicUsize,
 }
 
-/// The system text of a request.
 fn system_of(request: &ChatRequest) -> String {
     request
         .messages

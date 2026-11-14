@@ -27,10 +27,11 @@ use serde_json::{Value, json};
 // ---------------------------------------------------------------------------
 
 /// Two sequential activities with a `publish_progress` chunk emitted before,
-/// between, and after them. Because progress leaves **zero** footprint in
-/// `harvest_events`, this workflow must replay identically against a history
-/// containing ONLY the two activity pairs — the same history a workflow that
-/// never published progress would produce.
+/// between, and after them.
+///
+/// Progress leaves **zero** footprint in `harvest_events`. So this workflow
+/// must replay against a history with ONLY the two activity pairs. A workflow
+/// that never published progress produces the same history.
 fn publish_progress_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,

@@ -16,7 +16,6 @@ fn scratch() -> TempDir {
     tempfile::tempdir().expect("a temp dir")
 }
 
-/// The database path inside `dir`.
 fn db(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("runs.db")
 }

@@ -3,56 +3,55 @@
 //!
 //! # The problem
 //!
-//! `harvest_events` is one append-only heap with a `BIGSERIAL` primary key, and
-//! retention reclaims space through the `ON DELETE CASCADE` on
-//! `harvest_workflow_executions`: deleting an expired execution row deletes its
+//! `harvest_events` is one append-only heap with a `BIGSERIAL` primary key.
+//! Retention reclaims space through the `ON DELETE CASCADE` on
+//! `harvest_workflow_executions`. Deleting an expired execution row deletes its
 //! event rows one at a time. At sustained volume that is the classic Postgres
-//! failure mode — millions of dead tuples per pass, bloating the heap and every
-//! index, and driving autovacuum pressure that competes with the non-blocking
-//! task-claim query and the append hot path. Dropping a partition is a metadata
+//! failure mode: millions of dead tuples per pass bloat the heap and every
+//! index. The autovacuum pressure competes with the non-blocking task-claim
+//! query and the append hot path. Dropping a partition is a metadata
 //! operation: O(1), no dead tuples, no vacuum debt.
 //!
 //! # The partition key
 //!
 //! The key is **not** `harvest_events.timestamp`. Postgres requires the
-//! partition key in every `UNIQUE` constraint, so a `timestamp` key would turn
+//! partition key in every `UNIQUE` constraint. A `timestamp` key would turn
 //! `UNIQUE (workflow_exec_id, event_id)` into `UNIQUE (workflow_exec_id,
-//! event_id, timestamp)` — silently destroying the per-execution id uniqueness
-//! that *is* the engine's optimistic-concurrency detector. `timestamp` is also
-//! caller-settable and back-datable by operator tooling, so it is not a safe
-//! routing key.
+//! event_id, timestamp)`. That silently destroys the per-execution id
+//! uniqueness that *is* the engine's optimistic-concurrency detector.
+//! `timestamp` is also caller-settable and back-datable by operator tooling,
+//! so it is not a safe routing key.
 //!
 //! The key is a dedicated `cohort` column: the row's **append instant**,
 //! floored to a fixed width by a plain column `DEFAULT`. Two properties follow.
 //!
 //! 1. `cohort` comes from a `DEFAULT`, never from a statement the engine
-//!    issues, so `UNIQUE (workflow_exec_id, event_id, cohort)` still rejects
+//!    issues. So `UNIQUE (workflow_exec_id, event_id, cohort)` still rejects
 //!    exactly what the old constraint rejected: a second row for the same
 //!    `(execution, event_id)`. The concurrency contract is preserved.
 //! 2. **Past partitions are sealed.** A cohort's range is a window of wall
-//!    clock that has already closed, and the `DEFAULT` can only ever produce a
-//!    cohort at or after "now", so no future `INSERT` can route into a
-//!    partition whose upper bound is in the past. Once the sweeper proves a
-//!    closed partition holds no live execution's rows, nothing can race an
-//!    append into it before the drop. The safety argument is structural, not a
-//!    lock.
+//!    clock that has already closed. The `DEFAULT` only produces a cohort at
+//!    or after "now". So no future `INSERT` can route into a partition whose
+//!    upper bound is in the past. Once the sweeper proves a closed partition
+//!    holds no live execution's rows, nothing can race an append into it
+//!    before the drop. The safety argument is structural, not a lock.
 //!
 //! ## Why a `DEFAULT` and not a trigger
 //!
 //! The first iteration of this module stamped `cohort` from the owning
-//! execution's `created_at` in a `BEFORE INSERT` trigger, so every event of one
-//! execution landed in one partition. **Postgres forbids that.** Tuple routing
-//! happens *before* row triggers fire, so a trigger that changes the partition
-//! key fails with `moving row to another partition during a BEFORE FOR EACH ROW
-//! trigger is not supported` — and, worse, silently succeeds whenever the
-//! pre-trigger and post-trigger destinations happen to coincide (both the
-//! `DEFAULT` partition, say), which looks like it works. The value has to be
-//! present before routing, and for a column the engine's SQL never mentions,
-//! that means a `DEFAULT`.
+//! execution's `created_at` in a `BEFORE INSERT` trigger. Every event of one
+//! execution then landed in one partition. **Postgres forbids that.** Tuple
+//! routing happens *before* row triggers fire. A trigger that changes the
+//! partition key fails with `moving row to another partition during a BEFORE
+//! FOR EACH ROW trigger is not supported`. Worse, it silently succeeds when
+//! the pre-trigger and post-trigger destinations coincide, for example both
+//! the `DEFAULT` partition. That looks like it works. The value must be present
+//! before routing. For a column the engine's SQL never mentions, that means a
+//! `DEFAULT`.
 //!
-//! That trades whole-execution cohesion for sealed partitions. It is precisely
-//! the trade issue #958 anticipates ("an execution's events span time"), and
-//! the drop gate is exact about it.
+//! That trades whole-execution cohesion for sealed partitions. Issue #958
+//! anticipates exactly this trade ("an execution's events span time"). The
+//! drop gate is exact about it.
 //!
 //! # The drop gate
 //!
@@ -61,49 +60,47 @@
 //!
 //! - **Fast path** — `NOT EXISTS (SELECT 1 FROM harvest_workflow_executions
 //!   WHERE created_at < upper)`. An execution cannot have appended a row before
-//!   it existed, so if nothing predates the partition's upper bound, nothing
-//!   that could own a row in it survives. One index probe. This is the steady
+//!   it existed. If nothing predates the partition's upper bound, nothing that
+//!   could own a row in it survives. One index probe. This is the steady
 //!   state, because retention collects oldest-first.
-//! - **Exact path** — only when the fast probe says "maybe": a bounded
-//!   semi-join proving no row in the partition has a live owner, under a
-//!   `statement_timeout` so one huge partition cannot stall the tick.
+//! - **Exact path** — only when the fast probe says "maybe". A bounded
+//!   semi-join proves that no row in the partition has a live owner. It runs
+//!   under a `statement_timeout`, so one huge partition cannot stall the tick.
 //!
 //! Legal holds (#747), per-type overrides (#737) and long-running executions
-//! need **no special-casing at all**: each keeps its execution row alive, which
-//! keeps its rows owned, which blocks the drop. There is no second copy of the
-//! retention policy to drift out of sync with the first.
+//! need **no special-casing at all**. Each keeps its execution row alive. That
+//! keeps its rows owned, which blocks the drop. No second copy of the
+//! retention policy can drift out of sync with the first.
 //!
 //! # What this costs, honestly
 //!
 //! - **No foreign key.** The partitioned layout drops
-//!   `harvest_events_workflow_exec_id_fkey`, because that FK's `ON DELETE
-//!   CASCADE` *is* the delete storm being eliminated. Its insert-time half is
-//!   restored by a validate-only trigger (a primary-key probe either way; the
-//!   trigger takes no `FOR KEY SHARE` lock, so it is cheaper in lock traffic
-//!   than the FK trigger it replaces). What is deliberately *not* restored is
-//!   the delete-time cascade: deleting an execution leaves orphan event rows,
-//!   and the sweeper is their garbage collector. Orphans are invisible to every
-//!   read path in the engine — all of them filter by a `workflow_exec_id` the
-//!   caller already resolved.
+//!   `harvest_events_workflow_exec_id_fkey`. That FK's `ON DELETE CASCADE`
+//!   *is* the delete storm being eliminated. A validate-only trigger restores
+//!   its insert-time half. Both do a primary-key probe. The trigger takes no
+//!   `FOR KEY SHARE` lock, so it costs less lock traffic than the FK trigger
+//!   it replaces. The delete-time cascade is deliberately *not* restored.
+//!   Deleting an execution leaves orphan event rows, and the sweeper is their
+//!   garbage collector. Orphans are invisible to every read path in the
+//!   engine. Each one filters by a `workflow_exec_id` the caller resolved.
 //! - **Reads do not prune.** History reads filter on `workflow_exec_id`, not on
 //!   `cohort`, so each one probes every partition's index. Keep the live
-//!   partition count small (retention horizon ÷ cohort width, plus the
-//!   lookahead window); `docs/partitioned-events.md` publishes the measured
+//!   partition count small: retention horizon ÷ cohort width, plus the
+//!   lookahead window. `docs/partitioned-events.md` publishes the measured
 //!   cost and the sizing rule.
 //! - **A long-running execution pins the cohorts it wrote into.** Its
 //!   siblings' rows in those cohorts are reclaimed late.
 //!   [`SweepOptions::straggler_grace`] opts into a targeted orphan `DELETE` for
-//!   that case; it is **off by default**, so the default configuration never
+//!   that case. It is **off by default**, so the default configuration never
 //!   issues a row-level delete against `harvest_events`.
 //!
 //! # Invisible to Diesel
 //!
 //! `cohort` is absent from [`crate::schema`] on purpose. Diesel always emits
-//! explicit column lists, so a column it does not know about is neither read
-//! nor written by any generated statement — every read and write SQL string is
+//! explicit column lists. So no generated statement reads or writes a column
+//! that Diesel does not know about. Every read and write SQL string is
 //! byte-for-byte identical in both layouts. AC2 ("per-execution semantics are
-//! byte-identical") therefore holds *by construction* rather than by testing
-//! luck.
+//! byte-identical") therefore holds *by construction*, not by testing luck.
 
 #[cfg(feature = "db")]
 use std::future::Future;
@@ -125,33 +122,33 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 
 /// Default cohort width: one UTC day.
 ///
-/// Sized so a typical retention horizon yields a live partition count in the
-/// low tens — small enough that the non-pruning read path stays cheap, large
-/// enough that a retention pass drops whole days rather than thousands of
+/// A typical retention horizon then yields a live partition count in the low
+/// tens. That is small enough to keep the non-pruning read path cheap. It is
+/// large enough that a retention pass drops whole days, not thousands of
 /// slivers.
 pub const DEFAULT_COHORT_WIDTH_SECS: i64 = 86_400;
 
 /// How many cohorts beyond the current one the engine keeps pre-created.
 ///
-/// Every live partition costs on the read path (history reads filter on
-/// `workflow_exec_id`, not `cohort`, so each one probes every partition), so
-/// the window is sized for resilience rather than generosity: at the default
-/// hourly tick and daily cohorts, maintenance would have to be down for three
-/// days before an append could reach an uncovered cohort — and even then the
-/// `DEFAULT` partition catches it rather than failing the append.
+/// Every live partition costs on the read path. History reads filter on
+/// `workflow_exec_id`, not `cohort`, so each one probes every partition. So
+/// the window is sized for resilience, not generosity. At the default hourly
+/// tick and daily cohorts, maintenance must be down for three days before an
+/// append can reach an uncovered cohort. Even then the `DEFAULT` partition
+/// catches it, and the append does not fail.
 pub const DEFAULT_LOOKAHEAD_COHORTS: u32 = 3;
 
 /// Smallest accepted cohort width: one hour, matching the retention janitor's
 /// default tick interval.
 ///
 /// Not an arbitrary floor. Coverage created per tick is
-/// `width × (lookahead + 1)`, so a width far below the tick interval leaves the
-/// write window uncovered for most of every hour and sends every append to the
-/// `DEFAULT` partition — whose drain then holds `ACCESS EXCLUSIVE` while it
-/// moves an hour of events, which is precisely the append stall this whole
-/// change exists to avoid. Narrower widths also multiply the partition count
-/// (every non-pruning read probes every partition) without improving
-/// reclamation granularity in any way an operator can use.
+/// `width × (lookahead + 1)`. A width far below the tick interval leaves the
+/// write window uncovered for most of every hour. Every append then goes to
+/// the `DEFAULT` partition. Its drain holds `ACCESS EXCLUSIVE` while it moves
+/// an hour of events. That is the append stall this change exists to avoid.
+/// Narrower widths also multiply the partition count, and every non-pruning
+/// read probes every partition. They give no reclamation granularity that an
+/// operator can use.
 pub const MIN_COHORT_WIDTH_SECS: i64 = 3_600;
 
 /// Largest accepted cohort width (365 days).
@@ -178,7 +175,7 @@ const LEGACY_RENAME_SUFFIX: &str = "__pre958";
 /// A POSIX regex matching `pg_get_constraintdef`'s rendering of harvest's own
 /// `{LEGACY_PARTITION}_cohort_ck` (`CHECK (cohort < cutover) NOT VALID`).
 ///
-/// Review finding: name, type, table and column alone do not identify
+/// Name, type, table and column alone do not identify
 /// harvest's own generated check. An operator's own `CHECK` on `cohort`
 /// could reuse the exact reserved name with a different expression --
 /// enforcing, say, a floor rather than a ceiling. Matching the rendered
@@ -206,7 +203,7 @@ const LEGACY_COHORT_CK_DEF_RE: &str =
 /// bound, a `timestamptz` SQL expression. The result omits any
 /// `NOT VALID` suffix.
 ///
-/// Review finding: [`LEGACY_COHORT_CK_DEF_RE`] matches a `CHECK` bounded
+/// [`LEGACY_COHORT_CK_DEF_RE`] matches a `CHECK` bounded
 /// by any timestamp, not the specific cutover this conversion actually
 /// planned or attached. A same-named, same-shaped constraint bounded by
 /// an unrelated date would pass that regex. It would then be treated as
@@ -324,7 +321,7 @@ fn we_created_at_idx_owned_check_sql() -> String {
 /// Name of the transient function [`bounded_rename_fn_sql`] defines,
 /// schema-qualified into `pg_temp`.
 ///
-/// Review finding: a bare, fixed name in the application schema is not
+/// A bare, fixed name in the application schema is not
 /// guaranteed free. An operator's own schema could already hold a function
 /// of this exact name and signature. The plain `CREATE FUNCTION` below
 /// would then abort the conversion. For the large-table plan, that abort
@@ -343,9 +340,10 @@ const BOUNDED_RENAME_FN: &str = "pg_temp.harvest_bounded_rename_958";
 // covers every one of them. Inline strings would let a reason be reworded here
 // and go stale there with nothing failing.
 
-/// Something in the cohort is still retained: a run in flight, a legal hold
-/// (#747), a longer per-type override (#737), or a row not yet past its
-/// horizon.
+/// Something in the cohort is still retained.
+///
+/// Examples are a run in flight, a legal hold (#747), a longer per-type
+/// override (#737), or a row not yet past its horizon.
 pub const OWNED_REASON: &str = "a live execution still owns rows";
 
 /// The exact ownership scan exceeded its `statement_timeout`.
@@ -399,8 +397,8 @@ pub const SWEEP_REASONS: &[&str] = &[
 
 /// Floor `ts` to the start of its cohort.
 ///
-/// Uses `div_euclid`, not `/`: Rust integer division truncates toward zero,
-/// which would round a pre-1970 timestamp *up* into the next cohort and route
+/// Uses `div_euclid`, not `/`. Rust integer division truncates toward zero.
+/// That would round a pre-1970 timestamp *up* into the next cohort, and route
 /// an execution's events to the wrong partition. The SQL side
 /// (`harvest_event_cohort`) uses `floor()` for the same reason.
 ///
@@ -551,9 +549,9 @@ pub enum EnableMode {
     /// partition. No row is copied or rewritten.
     AttachLegacy {
         /// Exclusive upper bound of the legacy partition. Every execution that
-        /// existed at conversion time has a cohort strictly below this, so all
-        /// of its events — including ones appended *after* the conversion —
-        /// stay in the legacy partition together.
+        /// existed at conversion time has a cohort strictly below this. So all
+        /// of its events stay in the legacy partition together, including
+        /// ones appended *after* the conversion.
         cutover: DateTime<Utc>,
     },
 }
@@ -588,9 +586,9 @@ pub struct PartitionInfo {
 pub struct SweepOptions {
     /// Maximum partitions to drop in one pass.
     ///
-    /// Each drop takes a brief `ACCESS EXCLUSIVE` lock on the parent, so an
-    /// unbounded pass could hold the append path off for as long as it takes to
-    /// drop a backlog. Bounded passes converge over successive ticks instead.
+    /// Each drop takes a brief `ACCESS EXCLUSIVE` lock on the parent. An
+    /// unbounded pass could hold off the append path until a whole backlog
+    /// drops. Bounded passes converge over successive ticks instead.
     pub max_drops: usize,
     /// Maximum partitions to *evaluate* in one pass, dropped or not.
     ///
@@ -606,9 +604,9 @@ pub struct SweepOptions {
     pub max_attempts: usize,
     /// How long to wait for that lock before giving up on a partition.
     ///
-    /// Failing fast and retrying next tick is what keeps the concurrent-p99
-    /// budget: a sweep must never queue behind a long-running transaction while
-    /// every append queues behind the sweep.
+    /// Failing fast and retrying next tick keeps the concurrent-p99 budget. A
+    /// sweep must never queue behind a long-running transaction while every
+    /// append queues behind the sweep.
     pub lock_timeout: Duration,
     /// Opt-in targeted `DELETE` of orphan rows in a cohort that a straggler
     /// execution has pinned for longer than this.
@@ -625,17 +623,17 @@ pub struct SweepOptions {
     /// enumerate before falling back to the exact scan.
     ///
     /// The narrow probe asks "do any of THESE executions have a row here?",
-    /// one index probe each, which is what keeps a single legal hold or
-    /// long-running execution from forcing a full ownership scan of every
-    /// closed partition on every tick. Above this many survivors the scan is
-    /// cheaper than the probes.
+    /// with one index probe each. So a single legal hold or long-running
+    /// execution does not force a full ownership scan of every closed
+    /// partition on every tick. Above this many survivors the scan is cheaper
+    /// than the probes.
     pub owner_probe_cap: usize,
     /// Budget for the exact ownership scan that runs only when the cheap
     /// `created_at` probe cannot decide.
     ///
     /// Enforced as a `statement_timeout`. Exceeding it reports the partition as
-    /// blocked and retries next tick — the fail-safe direction for a janitor:
-    /// an unfinished proof of "nothing lives here" is not a proof.
+    /// blocked and retries next tick. That is the fail-safe direction for a
+    /// janitor: an unfinished proof of "nothing lives here" is not a proof.
     pub exact_scan_timeout: Duration,
 }
 
@@ -669,10 +667,11 @@ pub struct SweepOutcome {
     /// rest".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// Partitions considered but left in place, each with the reason — a live
-    /// execution still owns rows there, or the lock could not be taken in time.
-    /// Reported rather than silently skipped so an operator can see *why*
-    /// space is not coming back.
+    /// Partitions considered but left in place, each with the reason.
+    ///
+    /// A live execution still owns rows there, or the lock was not taken in
+    /// time. The sweep reports them, so an operator can see *why* space is not
+    /// coming back.
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
@@ -684,7 +683,7 @@ pub struct SweepOutcome {
     /// bound of the last partition this pass actually evaluated (dropped
     /// or blocked).
     ///
-    /// Review finding: a fixed oldest-first scan, restarted from the very
+    /// A fixed oldest-first scan, restarted from the very
     /// beginning every call, cannot converge when the oldest
     /// [`SweepOptions::max_attempts`] partitions are permanently blocked.
     /// Say, by a legal hold, or a long-running execution spanning many
@@ -702,7 +701,7 @@ pub struct SweepOutcome {
     /// next pass then skips straight past every partition at or before
     /// `instant`, instead of re-attempting the same blocked prefix.
     ///
-    /// Review finding: an instant, not a partition name. A name would go
+    /// An instant, not a partition name. A name would go
     /// stale the moment the partition it names is dropped. That is the
     /// common case for the LAST attempted partition in a truncated pass,
     /// which is exactly the boundary this field exists to preserve.
@@ -714,7 +713,7 @@ pub struct SweepOutcome {
     /// The fixed horizon a multi-pass catch-up cycle must reach before
     /// [`Self::next_resume`] is allowed to reset to `None`.
     ///
-    /// Review finding: a backlog can gain an eligible partition at
+    /// A backlog can gain an eligible partition at
     /// least as fast as the per-tick budget attempts one. That alone
     /// never lets `next_resume` reset on its own. Each pass's own fresh
     /// partition query grows a new eligible partition onto the tail.
@@ -803,9 +802,9 @@ pub async fn detect_layout(conn: &mut AsyncPgConnection) -> HarvestResult<EventL
 /// Read the cohort width back out of the deployed `harvest_event_cohort`
 /// function rather than trusting a caller-supplied value.
 ///
-/// The function body is the single source of truth: it is what actually stamps
-/// rows, so a mismatch between it and any config value would tear an
-/// execution's history across partitions. Deriving the width from it makes that
+/// The function body is the single source of truth, because it stamps rows.
+/// A mismatch between it and a config value would tear an execution's
+/// history across partitions. Deriving the width from it makes that
 /// impossible.
 #[cfg(feature = "db")]
 async fn deployed_cohort_width(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
@@ -920,7 +919,7 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
     // scopes the override to this one query, so it never leaks onto a
     // pooled connection reused for something else afterward.
     //
-    // Review finding: that scoping argument holds only when this call opens
+    // That scoping argument holds only when this call opens
     // the outer transaction itself. Diesel implements a nested
     // `.transaction()` as a `SAVEPOINT`, and `RELEASE SAVEPOINT` does not
     // undo a `SET LOCAL` made inside it — only `ROLLBACK TO SAVEPOINT`
@@ -976,17 +975,16 @@ pub async fn list_partitions(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<
 
 /// Sweep order: oldest closed cohort first, with the `DEFAULT` partition last.
 ///
-/// `DEFAULT` sorting last is load-bearing, not cosmetic: it is the one
-/// partition that must never be dropped (an append whose cohort has no
-/// partition lands there instead of failing), so a bounded sweep must never
+/// `DEFAULT` sorting last is load-bearing, not cosmetic. It is the one
+/// partition that must never be dropped. An append whose cohort has no
+/// partition lands there instead of failing. So a bounded sweep must never
 /// spend its budget reaching it.
 ///
-/// Extracted so [`list_partitions`] and its unit test share one comparator —
-/// a test that re-implements the ordering it is meant to guard tests the copy.
-// Used by `list_partitions` and by its unit test. Both are gated — the
-// former on `db`, the latter on `test` — so without this the function is
-// dead code in a `--no-default-features` build, which is how dependent
-// crates (autumn-harvest-sqlite) compile the library.
+/// [`list_partitions`] and its unit test share this one comparator. A test
+/// that re-implements the ordering it guards only tests the copy.
+// `list_partitions` is gated on `db`, and its unit test on `test`. Without
+// this gate the function is dead code in a `--no-default-features` build.
+// Dependent crates (autumn-harvest-sqlite) compile the library that way.
 #[cfg(any(feature = "db", test))]
 fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Ordering {
     a.is_default
@@ -998,9 +996,8 @@ fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Orderin
 /// Format a timestamp as a SQL literal.
 ///
 /// The only value interpolated into partition DDL. RFC 3339 output from
-/// `chrono` cannot contain a quote, so this cannot be an injection vector, but
-/// the value is still emitted through one audited helper rather than ad hoc at
-/// each call site.
+/// `chrono` cannot contain a quote, so this is not an injection vector. The
+/// value still goes through one audited helper, not ad hoc at each call site.
 fn ts_literal(ts: DateTime<Utc>) -> String {
     format!("'{}'", ts.to_rfc3339())
 }
@@ -1043,10 +1040,10 @@ async fn ensure_cohort_with_width(
     let name = partition_name(lower);
     // Probed first, so `was_created` means what it says. `CREATE TABLE IF NOT
     // EXISTS … PARTITION OF` is a successful NO-OP when a relation of that name
-    // already exists, so a bare `Ok` arm would report every already-covered
-    // cohort as newly created on every single maintenance tick — and would
-    // report a colliding unrelated table as coverage while appends kept piling
-    // into the DEFAULT partition.
+    // already exists. A bare `Ok` arm would report every covered cohort as
+    // newly created on every maintenance tick. It would also report a
+    // colliding unrelated table as coverage while appends pile into the
+    // DEFAULT partition.
     if cohort_partition_is_attached(conn, &name, lower, upper).await? {
         return Ok((name, false));
     }
@@ -1058,16 +1055,16 @@ async fn ensure_cohort_with_width(
     );
     // Bounded, and in its own transaction so the bound is scoped to it.
     //
-    // `CREATE TABLE ... PARTITION OF` takes ACCESS EXCLUSIVE on the parent, and
-    // Postgres queues later conflicting requests behind a WAITER rather than
-    // only behind held locks — so behind one long history query still holding
-    // ACCESS SHARE, this statement waits and every append arriving after it
-    // queues behind this statement. Unbounded, that turns a routine maintenance
-    // tick into a shard-wide write outage that ends when the reader does.
+    // `CREATE TABLE ... PARTITION OF` takes ACCESS EXCLUSIVE on the parent.
+    // Postgres queues later conflicting requests behind a WAITER, not only
+    // behind held locks. So behind one long history query that holds ACCESS
+    // SHARE, this statement waits. Every append that arrives after it queues
+    // behind this statement. Unbounded, a routine maintenance tick becomes a
+    // shard-wide write outage that ends when the reader does.
     //
     // A cohort that cannot be carved out in time is reported blocked and
-    // retried next tick, which is what `ensure_partitions` already does with
-    // every other per-cohort failure.
+    // retried next tick. `ensure_partitions` does the same with every other
+    // per-cohort failure.
     let ms = u64::try_from(lock_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
@@ -1091,13 +1088,13 @@ async fn ensure_cohort_with_width(
                 )))
             }
         }
-        // A race is only benign if the partition that now exists is the one we
-        // wanted. `CREATE TABLE IF NOT EXISTS <name> PARTITION OF …` is a
-        // silent no-op when `<name>` exists as an unrelated relation, and the
-        // overlap arm can fire on a genuine bounds mismatch (e.g. after the
-        // cohort width was changed under a live grid) — both would otherwise
-        // report the cohort as covered when it is not, and the next append
-        // would land in the DEFAULT partition with nothing said.
+        // A race is only benign if the partition that now exists is the
+        // wanted one. `CREATE TABLE IF NOT EXISTS <name> PARTITION OF …` is a
+        // silent no-op when `<name>` exists as an unrelated relation. The
+        // overlap arm can fire on a genuine bounds mismatch, for example after
+        // a cohort width change under a live grid. Either case would report
+        // the cohort as covered when it is not. The next append would then
+        // land in the DEFAULT partition with nothing said.
         Err(e) if is_benign_partition_race(&e.to_string()) => {
             if cohort_partition_is_attached(conn, &name, lower, upper).await? {
                 Ok((name, false))
@@ -1109,11 +1106,10 @@ async fn ensure_cohort_with_width(
             }
         }
         // The DEFAULT partition already holds rows for this range, so Postgres
-        // refuses to carve it out. Named explicitly because the raw message
-        // ("updated partition constraint for default partition ... would be
-        // violated by some row") tells an operator nothing about the remedy,
-        // which is a drain — something `maintain` does automatically before it
-        // ever gets here.
+        // refuses to carve it out. The raw message ("updated partition
+        // constraint for default partition ... would be violated by some row")
+        // tells an operator nothing about the remedy. The remedy is a drain,
+        // and `maintain` runs one automatically before it gets here.
         Err(e) if is_default_partition_conflict(&e.to_string()) => {
             Err(HarvestError::Database(format!(
                 "cannot create {name}: the DEFAULT partition holds rows for its range; \
@@ -1127,25 +1123,28 @@ async fn ensure_cohort_with_width(
 
 /// Classifying the Postgres errors this module's fail-safe paths depend on.
 ///
-/// Three behaviours hinge on recognising a specific error — "a concurrent
-/// maintainer won the race", "the exact scan blew its budget, retain", "the
-/// lock was not available, retry next tick" — and getting one wrong turns a
-/// benign path into a hard error that then disappears into a best-effort
-/// warning while reclamation quietly stops.
+/// Three behaviours hinge on recognising a specific error:
+///
+/// - "a concurrent maintainer won the race";
+/// - "the exact scan blew its budget, retain";
+/// - "the lock was not available, retry next tick".
+///
+/// A wrong match turns a benign path into a hard error. That error
+/// disappears into a best-effort warning while reclamation quietly stops.
 ///
 /// Diesel's [`DatabaseErrorKind`](diesel::result::DatabaseErrorKind) is used
 /// wherever it distinguishes the case, because it is locale-independent. It
-/// does not cover `duplicate_table`, `lock_not_available` or `query_canceled`,
-/// so those fall back to matching Postgres's message — the same idiom
-/// `error.rs` already uses for constraint names. That fallback IS
-/// locale-sensitive: on a server with a non-English `lc_messages` these
-/// degrade to "treat as a hard error", which is the safe direction (the pass
-/// fails loudly and retries) but noisier than it should be. `lc_messages` is a
-/// superuser-only GUC, so it cannot be pinned per transaction from here.
+/// does not cover `duplicate_table`, `lock_not_available` or `query_canceled`.
+/// Those fall back to matching Postgres's message, the same idiom `error.rs`
+/// uses for constraint names. That fallback IS locale-sensitive. With a
+/// non-English `lc_messages`, these degrade to "treat as a hard error". That
+/// is the safe direction, because the pass fails loudly and retries, but it
+/// is noisier. `lc_messages` is a superuser-only GUC, so this code cannot pin
+/// it per transaction.
 ///
 /// A concurrent maintainer created the same partition first. Benign either
-/// way: the partition this call wanted now exists, which is the outcome it
-/// wanted — and the caller verifies the bounds before believing it.
+/// way: the partition this call wanted now exists. The caller verifies the
+/// bounds before believing it.
 #[cfg(feature = "db")]
 fn is_benign_partition_race(msg: &str) -> bool {
     msg.contains("already exists")
@@ -1161,10 +1160,9 @@ fn is_benign_partition_race(msg: &str) -> bool {
 /// check violation, which Diesel does classify.
 #[cfg(feature = "db")]
 fn is_default_partition_conflict(msg: &str) -> bool {
-    // Matched on the message rather than on `DatabaseErrorKind`: the DDL now
-    // runs inside a transaction helper that reports failures as
-    // `HarvestError::Database`, so the typed variant is no longer in hand. The
-    // SQLSTATE is carried in the message either way.
+    // Matched on the message, not on `DatabaseErrorKind`. The DDL runs inside
+    // a transaction helper that reports failures as `HarvestError::Database`,
+    // so the typed variant is not in hand. The message carries the SQLSTATE.
     msg.contains("default partition") || msg.contains("23514")
 }
 
@@ -1233,7 +1231,7 @@ pub async fn ensure_partitions(
 /// Same as [`ensure_partitions`], but calls `progress` once per cohort this
 /// loop attempts.
 ///
-/// Review finding: with `lookahead_cohorts` configured high and a long
+/// With `lookahead_cohorts` configured high and a long
 /// reader blocking every attempt, this loop can spend
 /// `lookahead_cohorts × lock_timeout` sequentially. That is long enough on
 /// its own to cross the liveness scanner's staleness threshold.
@@ -1271,16 +1269,15 @@ async fn ensure_partitions_inner(
             // the window from being created.
             //
             // The case that matters: a `drain_default` that lost its bounded
-            // lock attempt leaves current-cohort rows in the DEFAULT partition,
-            // and Postgres then rejects creating THAT cohort because the
-            // updated default constraint would be violated. Aborting the loop
-            // there would stop coverage extension during exactly the
-            // maintenance-gap recovery it is meant to protect — every later
-            // cohort would keep piling into DEFAULT until a drain finally
-            // succeeded, making the gap self-perpetuating.
+            // lock attempt leaves current-cohort rows in the DEFAULT partition.
+            // Postgres then rejects creating THAT cohort, because the updated
+            // default constraint would be violated. Aborting the loop there
+            // would stop coverage extension during the maintenance-gap
+            // recovery it protects. Every later cohort would pile into DEFAULT
+            // until a drain succeeded, so the gap would perpetuate itself.
             //
-            // Later cohorts are almost never represented in DEFAULT, so they
-            // are created normally and the write window is restored; the
+            // Later cohorts are almost never represented in DEFAULT. So they
+            // are created normally, and the write window is restored. The
             // blocked one is retried next tick, after the drain.
             Err(e) => {
                 tracing::warn!(
@@ -1316,44 +1313,44 @@ async fn ensure_partitions_inner(
 /// layout is incompatible with.
 ///
 /// `docs/cross-region-dr.md` tells an operator to run `CREATE PUBLICATION
-/// harvest_dr FOR ALL TABLES` on the primary and to apply Harvest's migrations
-/// on the standby first, "logical replication does not carry DDL". Converting
-/// under that breaks the standby **twice**, and only the first break looks like
-/// a configuration problem.
+/// harvest_dr FOR ALL TABLES` on the primary. It also says to apply Harvest's
+/// migrations on the standby first: "logical replication does not carry DDL".
+/// Converting under that breaks the standby **twice**. Only the first break
+/// looks like a configuration problem.
 ///
-/// **The leaf names.** `publish_via_partition_root` defaults to false, so a
+/// **The leaf names.** `publish_via_partition_root` defaults to false. So a
 /// partitioned table's changes are published under the names of the *leaf*
-/// partitions — `harvest_events_p20260901000000`, `harvest_events_legacy`. The
-/// standby has only the flat `harvest_events` the migrations created, and the
-/// partitions come from DDL that is not replicated, so those relations will
-/// never exist there. The subscription's apply worker stops on the first event
-/// after the conversion.
+/// partitions: `harvest_events_p20260901000000`, `harvest_events_legacy`. The
+/// standby has only the flat `harvest_events` the migrations created. The
+/// partitions come from DDL that is not replicated, so they never exist
+/// there. The subscription's apply worker stops on the first event after the
+/// conversion.
 ///
 /// **The deletes, which `publish_via_partition_root = true` does not fix.**
-/// The partitioned layout drops the `ON DELETE CASCADE` foreign key on purpose
-/// — that cascade *is* the delete storm being eliminated — so deleting an
-/// execution no longer deletes its events. The rows go away when their
-/// partition is dropped, and `DROP TABLE` is DDL: logical replication does not
-/// carry it in any configuration. The subscriber's own cascade cannot cover for
-/// that either, because apply runs with replica trigger behaviour and
-/// referential-integrity triggers do not fire under it. So the standby's
-/// `harvest_events` keeps every event forever, and
+/// The partitioned layout drops the `ON DELETE CASCADE` foreign key on
+/// purpose, because that cascade *is* the delete storm being eliminated. So
+/// deleting an execution no longer deletes its events. The rows go away when
+/// their partition is dropped. `DROP TABLE` is DDL, and logical replication
+/// does not carry it in any configuration. The subscriber's own cascade
+/// cannot cover for that either. Apply runs with replica trigger behaviour,
+/// and referential-integrity triggers do not fire under it. So the standby's
+/// `harvest_events` keeps every event forever.
 /// [`crate::backup_verify::FindingKind::DanglingEventExecution`] is an
-/// *Incoherent* finding — "do not start workers". The standby stops being
+/// *Incoherent* finding: "do not start workers". The standby stops being
 /// failover-capable, which is the one thing it exists for.
 ///
-/// Nothing about either break is loud. The primary keeps accepting writes, and
-/// the second one does not even stop the subscription: it just quietly makes
+/// Nothing about either break is loud. The primary keeps accepting writes.
+/// The second break does not even stop the subscription. It quietly makes
 /// the copy unrestorable.
 ///
 /// So [`enable_partitioning`] refuses while any publication covers the table,
-/// rather than only the ones with `pubviaroot = false` — treating
+/// not only the ones with `pubviaroot = false`. Treating
 /// `publish_via_partition_root` as sufficient is precisely the trap. The
 /// workable configuration is the partitioned layout on **both** sides with
-/// `publish_via_partition_root = true`, where the standby's own maintenance can
-/// reclaim once promoted; [`EnableOptions::allow_incompatible_publications`] is
-/// the operator's statement that they have done that, or that the publication
-/// is not feeding a Harvest standby at all.
+/// `publish_via_partition_root = true`. There the standby's own maintenance
+/// can reclaim once promoted. [`EnableOptions::allow_incompatible_publications`]
+/// is the operator's statement that they did that. It can also state that the
+/// publication does not feed a Harvest standby at all.
 ///
 /// # Errors
 ///
@@ -1361,8 +1358,7 @@ async fn ensure_partitions_inner(
 #[cfg(feature = "db")]
 pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     // `pg_publication_tables` resolves FOR ALL TABLES, FOR TABLES IN SCHEMA and
-    // explicit table lists alike, so there is one query rather than three
-    // catalog shapes to keep in step.
+    // explicit table lists alike. So one query replaces three catalog shapes.
     let rows = diesel::sql_query(
         "SELECT DISTINCT t.pubname AS v
            FROM pg_publication_tables t
@@ -1379,7 +1375,7 @@ pub async fn incompatible_publications(conn: &mut AsyncPgConnection) -> HarvestR
 /// Publications that EXPLICITLY list `harvest_events` as a member, rather
 /// than covering it via `FOR ALL TABLES` or `FOR TABLES IN SCHEMA`.
 ///
-/// Review finding: [`EnableOptions::allow_incompatible_publications`]
+/// [`EnableOptions::allow_incompatible_publications`]
 /// documents its supported configuration as a `FOR ALL TABLES` publication,
 /// with the standby already running the partitioned layout. That
 /// publication resolves membership by name, at apply time, so it
@@ -1417,38 +1413,35 @@ pub async fn explicitly_published_by(conn: &mut AsyncPgConnection) -> HarvestRes
 
 /// Row-level security configured on the events table, if any.
 ///
-/// Returns the policy names, plus whether row security is enabled at all — a
-/// table can have `ENABLE ROW LEVEL SECURITY` with no policy yet, which denies
-/// all rows to non-owners and is very much a configuration a swap must not
-/// silently discard.
+/// Returns the policy names, plus whether row security is enabled at all. A
+/// table can have `ENABLE ROW LEVEL SECURITY` with no policy yet. That denies
+/// all rows to non-owners, and a swap must not silently discard it.
 ///
 /// **Why this blocks the conversion.** Both conversion paths replace
-/// `harvest_events` with a table built by `CREATE TABLE ... (LIKE ...)`, and
+/// `harvest_events` with a table built by `CREATE TABLE ... (LIKE ...)`.
 /// `LIKE` copies neither `relrowsecurity`/`relforcerowsecurity` nor any
-/// `pg_policy` entry — measured, not assumed. `copy_acl_sql` then faithfully
-/// replays the original's owner and grants onto that replacement, so the same
-/// roles reach a parent on which row security is simply off. Rows a policy had
-/// been filtering become readable the moment the conversion commits, and
-/// nothing about it is loud.
+/// `pg_policy` entry. That is measured, not assumed. `copy_acl_sql` then
+/// replays the original's owner and grants onto that replacement. So the same
+/// roles reach a parent on which row security is simply off. Rows a policy
+/// filtered become readable the moment the conversion commits, and nothing
+/// about it is loud.
 ///
-/// That is the same failure the ACL clearing exists to prevent, arriving by a
-/// different route, which is why this refuses rather than warns.
+/// That is the failure the ACL clearing prevents, arriving by a different
+/// route. So this refuses, not warns.
 ///
-/// It refuses rather than recreating the configuration deliberately. A policy
+/// It refuses, and deliberately does not recreate the configuration. A policy
 /// carries a command, a permissive/restrictive mode, a role list and two
-/// separate expressions, and on a partitioned parent the policies that matter
-/// are the ones on the parent AND on every partition. Replaying that wrongly
-/// is itself an exposure, so this reports what it found and leaves the decision
-/// with the operator, exactly as the publication guard does.
+/// separate expressions. On a partitioned parent, the policies that matter
+/// are on the parent AND on every partition. Replaying that wrongly is itself
+/// an exposure. So this reports what it found and leaves the decision with
+/// the operator, exactly as the publication guard does.
 ///
-/// Review finding: on a partitioned shard, `harvest_events` names only the
-/// parent. Postgres lets an operator enable row security or attach a
-/// policy directly on a LEAF partition instead. That configuration used
-/// to pass this check unnoticed, then `disable_partitioning`'s copy-and-
-/// `DROP ... CASCADE` silently dropped the protection along with the
-/// leaf it was attached to. Matching the parent's direct children too
-/// closes that gap, the same way [`dependent_views`] and
-/// [`operator_triggers`] already do.
+/// On a partitioned shard, `harvest_events` names only the parent. Postgres
+/// lets an operator enable row security or attach a policy directly on a LEAF
+/// partition instead. That configuration used to pass this check unnoticed.
+/// Then `disable_partitioning`'s copy-and-`DROP ... CASCADE` silently dropped
+/// the protection along with its leaf. Matching the parent's direct children
+/// too closes that gap, as [`dependent_views`] and [`operator_triggers`] do.
 ///
 /// # Errors
 ///
@@ -1538,7 +1531,7 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// scripted plan, and their respective in-lock rechecks all share it, so
 /// the four copies of that refusal cannot drift apart.
 ///
-/// Review finding: naming these two constraints was not enough on its
+/// Naming these two constraints was not enough on its
 /// own. An operator's own constraint could reuse one of these two
 /// conventional names. Say, a replacement for
 /// `harvest_events_workflow_exec_id_event_id_key` defined as `UNIQUE
@@ -1551,7 +1544,7 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// (`(id)`) or unique key (`(workflow_exec_id, event_id)`) is exempt
 /// now. An impostor of the same name no longer qualifies.
 ///
-/// Review finding: `contype` and the key columns are not the whole
+/// `contype` and the key columns are not the whole
 /// shape. Harvest's own two constraints are plain, immediate ones — the
 /// migration that creates them names neither `DEFERRABLE` nor `INITIALLY
 /// DEFERRED`. A `DEFERRABLE` replacement of the same name, type and
@@ -1561,7 +1554,7 @@ async fn refuse_if_row_security(conn: &mut AsyncPgConnection, verb: &str) -> Har
 /// directly now, closing that gap the same way `contype` closed the
 /// name-only one.
 ///
-/// Review finding: key columns are still not the whole backing-index
+/// Key columns are still not the whole backing-index
 /// shape. An operator can build `harvest_events_pkey PRIMARY KEY (id)
 /// INCLUDE (workflow_exec_id)` -- key columns, type and deferrability
 /// all match harvest's own. The `INCLUDEd` column does not. That index
@@ -1588,7 +1581,7 @@ const HARVEST_OWNED_CONSTRAINT_EXEMPTION_SQL: &str = "NOT EXISTS (\n            
 /// `harvest_events_workflow_exec_id_event_id_key`, both of which add
 /// `cohort` explicitly.
 ///
-/// Review finding: naming harvest's own two constraints explicitly (rather
+/// Naming harvest's own two constraints explicitly (rather
 /// than exempting every constraint-backed index) closed one gap, but left
 /// another. `capture_index_defs` skips every constraint-backed index
 /// unconditionally. It does this regardless of whether the index carries
@@ -1692,7 +1685,7 @@ async fn refuse_if_unique_index_without_cohort(
 /// None of these survive: `capture_index_defs` cannot replay them onto
 /// the flat table [`disable_partitioning`] rebuilds.
 ///
-/// Review finding: [`unique_indexes_missing_cohort`] runs only from
+/// [`unique_indexes_missing_cohort`] runs only from
 /// [`enable_partitioning`]'s preflight, against the still-flat table.
 /// `disable_partitioning` had no equivalent check at all. Take an
 /// operator's own compatible constraint-backed unique index --
@@ -1709,7 +1702,7 @@ async fn refuse_if_unique_index_without_cohort(
 /// layout. The partitioned parent's own primary key and unique
 /// constraint always carry `cohort` too.
 ///
-/// Review finding: also checked on every leaf partition, not only the
+/// Also checked on every leaf partition, not only the
 /// parent. Postgres lets an operator add a `UNIQUE` or primary-key
 /// constraint directly to one leaf, independent of the parent's own.
 /// The same exclusion, at leaf scope, would silently drop it. A leaf's
@@ -1718,7 +1711,7 @@ async fn refuse_if_unique_index_without_cohort(
 /// row through `conparentid` -- a link an independently added leaf
 /// constraint never carries.
 ///
-/// Review finding: the leaf-scope exclusion above required a backing
+/// The leaf-scope exclusion above required a backing
 /// `pg_constraint` row before a leaf index was even a candidate. A
 /// plain `CREATE UNIQUE INDEX` an operator adds directly on one leaf
 /// carries no such row. No `ADD CONSTRAINT` is involved, so it was
@@ -2042,7 +2035,7 @@ async fn refuse_if_constraint_backed_unique_index_on_revert(
 /// dropped outright. The dependency makes that `DROP` fail instead —
 /// safer, but still not loud about the cause.
 ///
-/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// On a partitioned shard, `harvest_events` names only the
 /// parent. A view can depend directly on a LEAF partition instead — Postgres
 /// allows querying one by name like any other table. That view used to pass
 /// this check unnoticed, then `disable_partitioning`'s `DROP ... CASCADE`
@@ -2141,7 +2134,7 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// expression's intended semantics, and an exclusion constraint's operator
 /// class and predicate are not this module's to guess.
 ///
-/// Review finding: an exclusion constraint is index-backed like a unique
+/// An exclusion constraint is index-backed like a unique
 /// or primary-key constraint, but `indisunique` is false for one, so
 /// [`refuse_if_unique_index_without_cohort`] never sees it. It is exactly
 /// as unreplayable as a `CHECK` or foreign key, though: `capture_index_defs`
@@ -2152,7 +2145,7 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// one is backed by an index, so [`refuse_if_unique_index_without_cohort`]
 /// already covers them.
 ///
-/// Review finding: name alone does not identify harvest's own foreign key.
+/// Name alone does not identify harvest's own foreign key.
 /// An operator's own foreign key could reuse the reserved name
 /// `harvest_events_workflow_exec_id_fkey` on different columns, a different
 /// target, or a different `ON DELETE`/`ON UPDATE` action. Name-only
@@ -2171,7 +2164,7 @@ async fn refuse_if_dependent_views(conn: &mut AsyncPgConnection, verb: &str) -> 
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
 pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
-    // Review finding: the cohort-`CHECK` exemption below used to accept
+    // The cohort-`CHECK` exemption below used to accept
     // any same-shaped bound on `{LEGACY_PARTITION}` too, not only on
     // `harvest_events`. The enable-side preflight cannot do this: the
     // real cutover is not chosen yet there. This relation is different.
@@ -2300,20 +2293,20 @@ async fn refuse_if_unreplayable_constraints(
 /// shard, `EXEC_FK_TRIGGER` cannot yet be harvest's, since only a
 /// conversion creates it.
 ///
-/// Review finding: on a partitioned shard, `harvest_events` names only the
+/// On a partitioned shard, `harvest_events` names only the
 /// parent. Postgres lets an operator install a trigger directly on a LEAF
 /// partition instead. That trigger used to pass this check unnoticed, then
 /// `disable_partitioning`'s `DROP ... CASCADE` destroyed it along with the
 /// leaf. Matching the parent's direct children too closes that gap.
 ///
-/// Review finding: the function check alone has a gap in the OTHER
+/// The function check alone has a gap in the OTHER
 /// direction from the name-only check it replaced. An operator's own
 /// trigger, under its own name, could call the same function -- reusing
 /// harvest's validation for a purpose of its own. The exemption now also
 /// requires the reserved trigger's own name, so only harvest's actual
 /// trigger, matching both, is ever exempted.
 ///
-/// Review finding: name and function still are not the whole identity.
+/// Name and function still are not the whole identity.
 /// An operator's trigger could carry both but a different definition.
 /// It could run `BEFORE UPDATE` in place of `BEFORE INSERT FOR EACH
 /// ROW`. It could carry a `WHEN` clause, or arguments harvest's own
@@ -2321,7 +2314,7 @@ async fn refuse_if_unreplayable_constraints(
 /// [`EXEC_FK_TRIGGER_TGTYPE`], no arguments, and no `WHEN` clause --
 /// harvest's trigger's exact, whole shape.
 ///
-/// Review finding: shape alone still omits `tgenabled`. Harvest's own
+/// Shape alone still omits `tgenabled`. Harvest's own
 /// trigger is always the plain enabled state (`O`). An operator's
 /// trigger matching every other check but marked `DISABLED`, `ENABLE
 /// REPLICA`, or `ENABLE ALWAYS` behaves differently after conversion
@@ -2432,17 +2425,17 @@ async fn refuse_if_operator_triggers(
 ///   migration's metadata-only `ADD COLUMN … DEFAULT`.
 ///
 /// The whole conversion runs in ONE transaction under a bounded `lock_timeout`,
-/// so a failure leaves the deployment exactly as it was. For a table large
-/// enough that the in-transaction index builds and constraint validation would
-/// hold that lock too long, use [`migration_plan`] instead: it emits the same
-/// algorithm with the expensive steps moved outside the lock window
+/// so a failure leaves the deployment exactly as it was. A large table can
+/// make the in-transaction index builds and constraint validation hold that
+/// lock too long. Use [`migration_plan`] for it instead. It emits the same
+/// algorithm with the expensive steps outside the lock window
 /// (`CREATE INDEX CONCURRENTLY`, `NOT VALID` + `VALIDATE CONSTRAINT`).
 ///
 /// # Errors
 ///
-/// [`HarvestError::Config`] for invalid options; [`HarvestError::Database`] if
-/// any step fails — including the lock timeout, which is the designed outcome
-/// when a long transaction is holding `harvest_events`.
+/// [`HarvestError::Config`] for invalid options. [`HarvestError::Database`] if
+/// any step fails, including the lock timeout. The timeout is the designed
+/// outcome when a long transaction holds `harvest_events`.
 ///
 /// [`HarvestError::Config`] also when a logical-replication publication would
 /// break — see [`incompatible_publications`].
@@ -2461,7 +2454,7 @@ pub async fn enable_partitioning(
     }
 
     if opts.allow_incompatible_publications {
-        // Review finding: the override above is documented for a FOR ALL
+        // The override above is documented for a FOR ALL
         // TABLES publication. It resolves membership by name, so it
         // covers the new parent this call creates automatically. An
         // EXPLICIT membership does not: it stays pinned to the OID of the
@@ -2513,24 +2506,24 @@ pub async fn enable_partitioning(
     let width = opts.cohort_width_secs;
     let now = Utc::now();
 
-    // `enable_sql` is the single implementation of the conversion (the test
-    // harness feeds the very same string to a container's init SQL), so there
-    // is no second copy of these steps here to drift out of sync with it.
+    // `enable_sql` is the single implementation of the conversion. The test
+    // harness feeds the same string to a container's init SQL. So no second
+    // copy of these steps here can drift out of sync with it.
     //
-    // Sent through `batch_execute`, not `sql_query`: the script is two
-    // statements (the cohort function, then the `DO` block), and Postgres's
-    // extended protocol — which `sql_query` uses — rejects multiple commands in
-    // one prepared statement. `batch_execute` uses the simple query protocol,
-    // where a multi-statement string runs as ONE implicit transaction, so the
-    // atomicity the conversion needs is preserved: a failure anywhere rolls the
-    // whole script back and leaves the deployment exactly as it was.
+    // Sent through `batch_execute`, not `sql_query`. The script is two
+    // statements: the cohort function, then the `DO` block. The extended
+    // protocol that `sql_query` uses rejects multiple commands in one prepared
+    // statement. `batch_execute` uses the simple query protocol. There a
+    // multi-statement string runs as ONE implicit transaction, so the
+    // conversion stays atomic. A failure anywhere rolls the whole script back
+    // and leaves the deployment exactly as it was.
     diesel_async::SimpleAsyncConnection::batch_execute(conn, &enable_sql(opts))
         .await
         .map_err(|e| HarvestError::Database(format!("partition enable script failed: {e}")))?;
 
     // Report which path the script took by reading the catalog it produced,
-    // rather than by predicting it: whether the table had rows is the script's
-    // decision, made under the lock it holds.
+    // not by predicting it. The script decides whether the table had rows,
+    // under the lock it holds.
     let mode = match list_partitions(conn)
         .await?
         .into_iter()
@@ -2567,23 +2560,22 @@ pub async fn enable_partitioning(
 /// `harvest_events` to the partitioned layout.
 ///
 /// This is the **single implementation** of the conversion.
-/// [`enable_partitioning`] executes exactly this script and then reads the
-/// resulting catalog to report which path it took, and the test harness feeds
-/// the same string to a container's `init_sql` so the entire existing DB test
-/// corpus can be re-run against the partitioned layout by setting one
-/// environment variable (issue #958, AC2). There is deliberately no second copy
-/// of these steps in Rust to drift out of sync with this one.
+/// [`enable_partitioning`] executes exactly this script, then reads the
+/// resulting catalog to report which path it took. The test harness feeds the
+/// same string to a container's `init_sql`. One environment variable then
+/// re-runs the entire DB test corpus against the partitioned layout (issue
+/// #958, AC2). There is deliberately no second copy of these steps in Rust.
 ///
-/// It introspects rather than hard-codes: the index set is read from the
-/// catalog and replayed, so a later migration that adds an index to
-/// `harvest_events` is carried onto the partitioned parent with no change here.
+/// It introspects, not hard-codes. The index set is read from the catalog and
+/// replayed. So a later migration that adds an index to `harvest_events` is
+/// carried onto the partitioned parent with no change here.
 ///
 /// Idempotent — a second run against an already-partitioned table returns
 /// immediately.
 ///
-/// For a table large enough that the in-transaction index builds and constraint
-/// validation would hold `ACCESS EXCLUSIVE` too long, use [`migration_plan`]
-/// instead: the same algorithm with the expensive steps moved out of the lock
+/// A large table can make the in-transaction index builds and constraint
+/// validation hold `ACCESS EXCLUSIVE` too long. Use [`migration_plan`] for it
+/// instead: the same algorithm with the expensive steps outside the lock
 /// window.
 // One `format!` of a SQL script. Splitting it to satisfy a line budget would
 // scatter a single readable runbook across helpers that only ever concatenate.
@@ -2595,9 +2587,9 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let lock_ms = opts.lock_timeout.as_millis().max(1);
     let cohort_fn = cohort_function_sql(width);
     let suffix_len = LEGACY_RENAME_SUFFIX.len();
-    // Inlined rather than run as a following statement: on a shard that was
-    // empty the legacy table is dropped before this block ends, so the ACLs
-    // have to be read while it still exists.
+    // Inlined, not run as a following statement. On a shard that was empty,
+    // the legacy table is dropped before this block ends. So the ACLs must be
+    // read while it still exists.
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
     let bounded_rename_fn = bounded_rename_fn_sql();
     let expected_cohort_ck_stmt = expected_cohort_ck_def_sql("cutover");
@@ -2606,7 +2598,7 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let guard = crate::append_only::GUARD_TRIGGER;
     let create_projection = crate::entity_state::create_projection_trigger_sql();
     let projection = crate::entity_state::PROJECTION_TRIGGER;
-    // Review finding: the view, trigger and unique-index rechecks below
+    // The view, trigger and unique-index rechecks below
     // all close the same preflight-to-lock gap for a publication too.
     // See `incompatible_publications` for why a leaf-publishing
     // publication silently stops a logical-replication standby.
@@ -3129,31 +3121,10 @@ $harvest_enable_958$;
     )
 }
 
-/// SQL that replays `source`'s owner and grants onto `target`.
-///
-/// Every conversion path replaces `harvest_events` with a freshly created
-/// table, and `CREATE TABLE ... LIKE` copies columns, defaults, comments and
-/// storage — but **not** ACLs, and not the owner.
-///
-/// That is invisible when migrations and the runtime share one role, and a
-/// total history outage when they do not: the plugin's preflight requires
-/// `SELECT` + `INSERT` on `harvest_events` for the runtime role
-/// (`HARVEST_WRITE_PRIVILEGE_REQUIREMENTS`), and after an uncorrected
-/// conversion those grants sit on the renamed legacy table while the new parent
-/// is unreachable. Reads and appends fail from the instant the conversion
-/// commits until someone re-issues the `GRANT`s by hand.
-///
-/// `ALTER TABLE ... OWNER TO` is always permitted here: reaching this point
-/// required renaming the source table, which requires owning it, which means
-/// being a member of its owning role.
-///
-/// Column-level ACLs (`pg_attribute.attacl`) are not replayed. Nothing in this
-/// engine grants at column granularity, and a table-level `GRANT` is what the
-/// preflight probes.
-///
-/// SQL defining [`BOUNDED_RENAME_FN`], a transient helper both rename loops
-/// (in [`enable_sql`] and [`migration_plan_steps`]) call to compute a
+/// SQL defining [`BOUNDED_RENAME_FN`], a transient helper that computes a
 /// collision-safe temporary name.
+///
+/// Both rename loops call it, in [`enable_sql`] and [`migration_plan_steps`].
 ///
 /// # The bug this closes
 ///
@@ -3171,9 +3142,8 @@ $harvest_enable_958$;
 ///
 /// Truncate the base *before* appending the suffix, so the result always
 /// fits. A truncated base can (rarely) collide with another renamed sibling
-/// that happens to share the same 63-byte prefix. So the result is
-/// verified against the catalog. It is disambiguated with a numeric
-/// counter if needed:
+/// that shares the same 63-byte prefix. So the result is verified against
+/// the catalog, and a numeric counter disambiguates it if needed. The rule is
 /// "generate, then verify the result is actually free", not "generate and
 /// hope".
 ///
@@ -3256,8 +3226,30 @@ $harvest_bounded_rename_958_fn$;"
     )
 }
 
+/// SQL that replays `source`'s owner and grants onto `target`.
+///
+/// Every conversion path replaces `harvest_events` with a freshly created
+/// table. `CREATE TABLE ... LIKE` copies columns, defaults, comments and
+/// storage, but **not** ACLs, and not the owner.
+///
+/// That is invisible when migrations and the runtime share one role. When
+/// they do not, it is a total history outage. The plugin's preflight requires
+/// `SELECT` + `INSERT` on `harvest_events` for the runtime role
+/// (`HARVEST_WRITE_PRIVILEGE_REQUIREMENTS`). After an uncorrected conversion,
+/// those grants sit on the renamed legacy table, and the new parent is
+/// unreachable. Reads and appends fail from the instant the conversion
+/// commits until someone re-issues the `GRANT`s by hand.
+///
+/// `ALTER TABLE ... OWNER TO` is always permitted here. Reaching this point
+/// required renaming the source table, which requires owning it. That means
+/// membership in its owning role.
+///
+/// Column-level ACLs (`pg_attribute.attacl`) are not replayed. Nothing in this
+/// engine grants at column granularity, and a table-level `GRANT` is what the
+/// preflight probes.
+///
 /// [`copy_acl_body`] is the same thing as bare plpgsql statements, for the
-/// conversion paths that already run inside a `DO` block; it needs
+/// conversion paths that already run inside a `DO` block. It needs
 /// [`COPY_ACL_DECLARE`] in that block's `DECLARE` section.
 #[must_use]
 fn copy_acl_sql(source: &str, target: &str) -> String {
@@ -3325,8 +3317,8 @@ fn copy_acl_body(source: &str, target: &str) -> String {
 /// Definitions of every non-constraint index on `harvest_events`, verbatim.
 ///
 /// Replayed against the partitioned parent, each becomes a partitioned index
-/// that Postgres propagates to every partition — so a later migration adding an
-/// index needs no change here.
+/// that Postgres propagates to every partition. So a later migration that
+/// adds an index needs no change here.
 #[cfg(feature = "db")]
 async fn capture_index_defs(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
     let rows = diesel::sql_query(
@@ -3352,9 +3344,9 @@ async fn capture_index_defs(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<S
 #[must_use]
 pub fn cohort_function_sql(width_secs: i64) -> String {
     let width = width_secs.max(1);
-    // A NAMED dollar tag, not `$$`: this definition is embedded in a larger
-    // script alongside a `DO` block, and an anonymous tag there would terminate
-    // at the first nested `$$` instead of its own.
+    // A NAMED dollar tag, not `$$`. This definition sits in a larger script
+    // beside a `DO` block. An anonymous tag there would end at the first
+    // nested `$$`, not at its own.
     format!(
         "CREATE OR REPLACE FUNCTION harvest_event_cohort(ts TIMESTAMPTZ)\n\
          RETURNS TIMESTAMPTZ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $harvest_cohort_fn$\n    \
@@ -3402,7 +3394,7 @@ fn truncate_ident(s: &str, max_bytes: usize) -> &str {
 /// [`bounded_rename_fn_sql`] for why a bare `base || suffix` is unsafe at
 /// Postgres's 63-byte identifier limit.
 ///
-/// Review finding: a constraint candidate free in `pg_constraint` is not
+/// A constraint candidate free in `pg_constraint` is not
 /// necessarily free to rename to. `ALTER TABLE ... RENAME CONSTRAINT`
 /// also renames the constraint's backing index, scoped schema-wide in
 /// `pg_class`, not per-table. An unrelated relation already holding that
@@ -3595,7 +3587,7 @@ async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<b
 /// is defined on some OTHER table, with `confrelid` naming `harvest_events`
 /// as what it references. None of those guards see it.
 ///
-/// Review finding: `disable_partitioning` renames the partitioned parent
+/// `disable_partitioning` renames the partitioned parent
 /// aside, rebuilds a flat `harvest_events` with `CREATE TABLE ... (LIKE
 /// ...)`, then runs `DROP TABLE ... CASCADE` on the renamed original. An
 /// inbound foreign key still points at that original relation by OID, so
@@ -3666,9 +3658,9 @@ async fn refuse_if_inbound_foreign_keys(conn: &mut AsyncPgConnection) -> Harvest
 /// Revert this shard to the ordinary unpartitioned table.
 ///
 /// Copies every surviving row back into a plain table, restores the foreign key
-/// and drops the partitioned parent. This **rewrites the whole table**, so it is
-/// an operator escape hatch (and the reset the test suite uses to run the same
-/// assertions against both layouts) — not something to run on a large live
+/// and drops the partitioned parent. This **rewrites the whole table**. It is
+/// an operator escape hatch, and the reset the test suite uses to run the
+/// same assertions against both layouts. Do not run it on a large live
 /// deployment without a window.
 ///
 /// A no-op on an already-unpartitioned shard.
@@ -3687,8 +3679,8 @@ pub async fn disable_partitioning(
     if !detect_layout(conn).await?.is_partitioned() {
         return Ok(None);
     }
-    // The reverse swap has the identical property: `disable` rebuilds a flat
-    // table with `LIKE` and replays the grants onto it, so a policy added after
+    // The reverse swap has the identical property. `disable` rebuilds a flat
+    // table with `LIKE` and replays the grants onto it. So a policy added after
     // the conversion would be dropped while access is restored.
     refuse_if_row_security(conn, "revert").await?;
     // Same reason as `enable`'s check: a view depending on the partitioned
@@ -3711,7 +3703,7 @@ pub async fn disable_partitioning(
     // It is excluded from `capture_index_defs` unconditionally all the
     // same, and nothing else replays it.
     refuse_if_constraint_backed_unique_index_on_revert(conn).await?;
-    // Review finding: every constraint guard above filters `conrelid` --
+    // Every constraint guard above filters `conrelid` --
     // constraints defined ON harvest_events. An inbound foreign key from
     // another table is the mirror image, invisible to all of them. The
     // `DROP TABLE ... CASCADE` below would silently take it out, along
@@ -3720,7 +3712,7 @@ pub async fn disable_partitioning(
     refuse_if_inbound_foreign_keys(conn).await?;
     let report = Box::pin(
         conn.transaction::<DisableReport, HarvestError, _>(async |conn| {
-            // Review finding: the dependent-view and operator-trigger checks
+            // The dependent-view and operator-trigger checks
             // above ran in a separate round-trip, before this transaction
             // even opened. That is well before anything here takes a lock
             // stronger than ACCESS SHARE. A view or trigger created in that
@@ -3759,7 +3751,7 @@ pub async fn disable_partitioning(
                     triggers.join(", ")
                 )));
             }
-            // Review finding: the view and trigger rechecks above closed
+            // The view and trigger rechecks above closed
             // the gap between the pre-lock preflight and this lock, for
             // those two guards. Not for row security, though. The swap
             // keeps the grants and loses `relrowsecurity` and every
@@ -3782,7 +3774,7 @@ pub async fn disable_partitioning(
                     }
                 )));
             }
-            // Review finding: the view, trigger and row-security rechecks
+            // The view, trigger and row-security rechecks
             // above closed the identical preflight-to-lock gap for a
             // CHECK, foreign-key or exclusion constraint too. Same reason
             // as `refuse_if_unreplayable_constraints` above, under the
@@ -3848,23 +3840,22 @@ pub async fn disable_partitioning(
 
             // The flat layout restores `UNIQUE (workflow_exec_id, event_id)` and
             // the `ON DELETE CASCADE` foreign key. The partitioned layout
-            // deliberately permits rows that violate BOTH, so rebuilding them over
-            // the live data fails — which would make the operator escape hatch
-            // unavailable on exactly the shards that have been running long enough
-            // to need it:
+            // deliberately permits rows that violate BOTH. So rebuilding them
+            // over the live data fails. The operator escape hatch would then be
+            // unavailable on exactly the shards that ran long enough to need it:
             //
             //   * ORPHANS are the design's own garbage. Deleting an execution
-            //     leaves its events behind for the sweeper, and the sweeper only
+            //     leaves its events behind for the sweeper. The sweeper only
             //     collects at whole-partition granularity, so a converted shard
             //     essentially always has some. They violate the FK.
             //   * DUPLICATE (workflow_exec_id, event_id) rows can exist from the
-            //     residual window the insert trigger cannot close (two appends of
-            //     the same event_id in flight at once, landing in different
-            //     cohorts). They violate the unique constraint.
+            //     residual window the insert trigger cannot close. Two appends
+            //     of the same event_id in flight at once can land in different
+            //     cohorts. They violate the unique constraint.
             //
-            // Both are removed here rather than left to blow up the `ALTER TABLE`,
-            // and both counts are reported: silently discarding rows is not
-            // something an operator should have to infer.
+            // Both are removed here, so they cannot blow up the `ALTER TABLE`.
+            // Both counts are reported, so an operator need not infer silently
+            // discarded rows.
             let orphans = diesel::sql_query(
                 "DELETE FROM harvest_events e
               WHERE NOT EXISTS (
@@ -3875,9 +3866,9 @@ pub async fn disable_partitioning(
             .await
             .map_err(database_error)?;
 
-            // Keep the LOWEST `id` of each duplicate group — the first row written
-            // for that `(execution, event_id)`, which is the one every earlier read
-            // would already have ordered first.
+            // Keep the LOWEST `id` of each duplicate group. It is the first row
+            // written for that `(execution, event_id)`. Every earlier read
+            // already ordered it first.
             let duplicates = diesel::sql_query(
                 "DELETE FROM harvest_events e
               WHERE EXISTS (
@@ -3941,23 +3932,22 @@ pub async fn disable_partitioning(
              (LIKE harvest_events_partitioned INCLUDING DEFAULTS INCLUDING COMMENTS)",
             )
             .await?;
-            // `LIKE` copies no ACLs and no owner, so the escape hatch would
-            // lock a separately-granted runtime role out of `harvest_events`
-            // just as surely as the conversion does. See `copy_acl_sql`.
+            // `LIKE` copies no ACLs and no owner. Without this, the escape
+            // hatch locks a separately-granted runtime role out of
+            // `harvest_events`, as the conversion does. See `copy_acl_sql`.
             exec(
                 conn,
                 &copy_acl_sql("harvest_events_partitioned", "harvest_events"),
             )
             .await?;
             // `INCLUDING DEFAULTS` copies the PARTITIONED parent's cohort
-            // default — `harvest_event_cohort(clock_timestamp())` — onto the
-            // flat table, where it has no business being. Left alone, every
-            // append after a revert stamps a live cohort into a column the
-            // unpartitioned layout treats as inert, and a later `enable` then
-            // fails: its legacy `CHECK (cohort < cutover)` is violated by every
-            // row written in the current cohort. That would make reverting a
-            // one-way door, on the one path the documentation offers an
-            // operator for exactly that.
+            // default, `harvest_event_cohort(clock_timestamp())`, onto the flat
+            // table, where it does not belong. Left alone, every append after a
+            // revert stamps a live cohort into a column the unpartitioned
+            // layout treats as inert. A later `enable` then fails: every row
+            // written in the current cohort violates its legacy
+            // `CHECK (cohort < cutover)`. Reverting would become a one-way door,
+            // on the one path the documentation offers an operator for that.
             exec(
                 conn,
                 "ALTER TABLE harvest_events \
@@ -3973,13 +3963,12 @@ pub async fn disable_partitioning(
             // layout is defined to carry.
             //
             // Without this, reverting is a ONE-WAY DOOR. The copied rows keep
-            // the real cohorts they were written with, and a later `enable`
-            // computes `cutover = harvest_event_cohort(now())` and attaches the
-            // legacy table with `CHECK (cohort < cutover)` — which every row
-            // written in the current cohort violates, so the conversion fails
+            // the real cohorts they were written with. A later `enable`
+            // computes `cutover = harvest_event_cohort(now())`. It attaches the
+            // legacy table with `CHECK (cohort < cutover)`. Every row written
+            // in the current cohort violates that, so the conversion fails
             // outright. An operator who rolled back could never roll forward
-            // again, on the one path the documentation offers them for exactly
-            // that.
+            // again, on the one path the documentation offers for that.
             //
             // Free here: `disable` already rewrites the whole table.
             exec(
@@ -4031,7 +4020,7 @@ pub async fn disable_partitioning(
             // symmetrically. The FK restored above makes the partitioned
             // drop gate's index moot on the flat layout anyway.
             //
-            // Review finding: `enable`'s `CREATE INDEX IF NOT EXISTS` leaves
+            // `enable`'s `CREATE INDEX IF NOT EXISTS` leaves
             // an operator's own pre-existing index of this exact name
             // untouched, so it never becomes harvest's to remove. Dropping
             // by name alone would delete that unrelated index. A shape
@@ -4055,7 +4044,7 @@ pub async fn disable_partitioning(
 /// constraints.
 ///
 /// Both counts are normally the first two numbers an operator wants after a
-/// revert, because both are rows that existed a moment ago and no longer do.
+/// revert. Both are rows that existed a moment ago and no longer do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DisableReport {
     /// Event rows whose owning execution no longer existed. The partitioned
@@ -4071,10 +4060,10 @@ pub struct DisableReport {
 /// Report what [`sweep`] would do, without dropping anything.
 ///
 /// Read-only: it runs the same gate over the same candidates and returns the
-/// same `blocked` reasons, but never takes an `ACCESS EXCLUSIVE` lock and never
-/// issues DDL. This is what backs `harvest partition status`'s answer to "why
-/// has space not come back?" — the reasons live in the sweep, so a status
-/// command that did not evaluate them could only ever list partitions.
+/// same `blocked` reasons. It never takes an `ACCESS EXCLUSIVE` lock and never
+/// issues DDL. This backs `harvest partition status`'s answer to "why has
+/// space not come back?". The reasons live in the sweep. A status command
+/// that did not evaluate them could only list partitions.
 ///
 /// `resume_after` — see [`SweepOutcome::next_resume`] — is normally `None`
 /// for a one-shot status check. Pass `None` here too.
@@ -4095,24 +4084,23 @@ pub async fn evaluate(
 /// Drop every fully-reclaimable cohort partition, oldest first.
 ///
 /// A partition is reclaimable when **no row in it belongs to a still-existing
-/// execution** — see [`cohort_occupancy`] for the three tiers that decide that,
-/// cheapest first. Note what this is *not*: cohorts are append instants, so an
-/// execution's events span partitions and the absence of an execution created
-/// in a partition's range proves nothing on its own. (An earlier iteration of
-/// this module did derive the cohort from the owning execution, which would
-/// have made that simpler predicate correct; Postgres forbids it — see the
-/// module documentation.) Optimising toward the simpler predicate would delete
-/// live executions' history.
+/// execution**. [`cohort_occupancy`] has the three tiers that decide that,
+/// cheapest first. Note what this is *not*. Cohorts are append instants, so
+/// an execution's events span partitions. The absence of an execution created
+/// in a partition's range proves nothing on its own. An earlier iteration of
+/// this module derived the cohort from the owning execution. That would make
+/// the simpler predicate correct, but Postgres forbids it (see the module
+/// documentation). Optimising toward the simpler predicate would delete live
+/// executions' history.
 ///
 /// The gate makes legal holds (#747) and per-type overrides (#737) work with no
-/// special-casing: each keeps its execution row alive, which keeps its rows
-/// owned, which blocks the drop. There is no second copy of the retention
-/// policy here to drift out of sync with the janitor's.
+/// special-casing. Each keeps its execution row alive, which keeps its rows
+/// owned, which blocks the drop. No second copy of the retention policy here
+/// can drift out of sync with the janitor's.
 ///
 /// Each drop runs in its own short transaction under `lock_timeout`. A
 /// partition whose lock cannot be taken in time is reported as blocked and
-/// retried next tick, rather than making the append path queue behind the
-/// sweep.
+/// retried next tick. The append path does not queue behind the sweep.
 ///
 /// `resume_after` continues a bounded pass where a previous one left off —
 /// see [`SweepOutcome::next_resume`]. A one-shot caller (a manual `harvest
@@ -4221,7 +4209,7 @@ async fn sweep_inner(
     }
 
     let parts = list_partitions(conn).await?;
-    // Review finding: skipping was keyed on `resume_after` matching a
+    // Skipping was keyed on `resume_after` matching a
     // partition NAME. A truncated pass's own last attempted partition is
     // exactly as likely to have been DROPPED as blocked, though. A
     // dropped partition's name matches nothing next time, silently
@@ -4293,7 +4281,7 @@ async fn sweep_inner(
             // a dropped one. The cheap skips above (DEFAULT, still open,
             // unbounded) reach no such scan and do not spend the budget.
             attempts += 1;
-            // Review finding: a per-shard tick before this whole pass starts
+            // A per-shard tick before this whole pass starts
             // is not bounded progress. Up to `max_attempts` partitions at
             // `exact_scan_timeout` each can still run past the liveness
             // scanner's staleness threshold before the pass returns. Ticking
@@ -4302,7 +4290,7 @@ async fn sweep_inner(
             if let Some(cb) = &mut progress {
                 cb();
             }
-            // Review finding: a fixed oldest-first restart every pass cannot
+            // A fixed oldest-first restart every pass cannot
             // converge past a permanently blocked oldest run — see
             // `SweepOutcome::next_resume`. Recorded before the outcome of
             // THIS partition is known. A pass that ends by hitting budget on
@@ -4315,9 +4303,9 @@ async fn sweep_inner(
             {
                 outcome.blocked.push(format!("{} ({reason})", part.name));
                 // Deliberately NOT after a scan timeout. That reason means the
-                // partition was too big to prove anything about; following it with
-                // an unbounded orphan DELETE over that same partition inverts the
-                // "bounded pass, retry next tick" contract this module is built on.
+                // partition was too big to prove anything about. An unbounded
+                // orphan DELETE over that same partition would invert the
+                // "bounded pass, retry next tick" contract of this module.
                 if apply
                     && gate.allows_straggler_delete()
                     && reason != SCAN_BUDGET_REASON
@@ -4401,7 +4389,7 @@ async fn sweep_inner(
     // fresh query. The next pass should restart from the oldest, rather
     // than resuming forever closer to the end.
     //
-    // Review finding: that alone is not enough when the backlog itself
+    // That alone is not enough when the backlog itself
     // grows at least as fast as the budget can attempt a partition.
     // Every pass's own query then has a fresh, later partition at the
     // tail. So `reached_end` never becomes true on its own, and a
@@ -4510,15 +4498,15 @@ struct EventScope {
 impl EventScope {
     /// The partitioned parent, narrowed to one cohort range.
     ///
-    /// The bounds are inlined as literals rather than bound as parameters so
+    /// The bounds are inlined as literals, not bound as parameters, so
     /// Postgres can prune to the partitions that can match at plan time.
     ///
-    /// A `MINVALUE` lower bound is **omitted rather than substituted**: the
-    /// legacy partition's rows carry the migration's `-infinity` cohort, which
-    /// sorts BELOW every finite timestamptz. Binding any finite value for
-    /// `MINVALUE` would make `cohort >= $lower` exclude 100% of the legacy
-    /// partition's rows — so a scan would find no live owner, declare the
-    /// partition reclaimable, and DROP the entire pre-conversion history of a
+    /// A `MINVALUE` lower bound is **omitted, not substituted**. The legacy
+    /// partition's rows carry the migration's `-infinity` cohort, which sorts
+    /// BELOW every finite timestamptz. Any finite value for `MINVALUE` would
+    /// make `cohort >= $lower` exclude 100% of the legacy partition's rows. A
+    /// scan would then find no live owner and declare the partition
+    /// reclaimable. It would DROP the entire pre-conversion history of a
     /// deployment that had just opted in, running executions and legal holds
     /// included.
     fn cohort(lower: Option<DateTime<Utc>>, upper: DateTime<Utc>) -> Self {
@@ -4553,42 +4541,41 @@ impl EventScope {
 
 /// Is any row in this closed cohort still owned by a live execution?
 ///
-/// Returns `None` when the partition is provably reclaimable, or `Some(reason)`
-/// naming why it was left alone — which is the operator's answer to "why has
-/// space not come back?".
+/// Returns `None` when the partition is provably reclaimable. Otherwise it
+/// returns `Some(reason)`, naming why it was left alone. That is the
+/// operator's answer to "why has space not come back?".
 ///
 /// Three tiers, cheapest first. Each is a *sufficient* condition for the tier
-/// below to be skipped; all three answer the same question.
+/// below to be skipped. All three answer the same question.
 ///
 /// 1. **Nothing predates the partition** — `NOT EXISTS (… WHERE created_at <
-///    upper)`. An execution cannot have appended a row before it existed, so if
-///    nothing predates the partition's upper bound then nothing that could own
-///    a row in it survives. One index probe on `idx_harvest_we_created_at`.
+///    upper)`. An execution cannot have appended a row before it existed. If
+///    nothing predates the partition's upper bound, nothing that could own a
+///    row in it survives. One index probe on `idx_harvest_we_created_at`.
 ///
 /// 2. **Few survivors** — when tier 1 says "maybe", read back the surviving
 ///    old executions, bounded by [`SweepOptions::owner_probe_cap`]. If they fit
-///    under the cap, ask the *narrow* question — do any of THESE executions
-///    have a row in this partition? — which is one index probe per execution on
-///    `idx_harvest_events_exec`, pruned to this partition by the cohort
-///    predicate.
+///    under the cap, ask the *narrow* question: do any of THESE executions
+///    have a row in this partition? That is one index probe per execution on
+///    `idx_harvest_events_exec`. The cohort predicate prunes it to this
+///    partition.
 ///
-///    This tier is what makes the sweeper survive the common case. Tier 1's
-///    predicate is a property of the whole executions table, not of this
-///    partition: **one** long-lived execution — a legal hold (#747), a
-///    per-type override (#737), a 60-day run — makes it say "maybe" for
-///    *every* closed partition, forever. Without tier 2 that means a full
-///    ownership scan of every partition on every tick, and on a large one an
-///    unwinnable scan that times out every time and never reclaims anything.
+///    This tier makes the sweeper survive the common case. Tier 1's predicate
+///    is a property of the whole executions table, not of this partition.
+///    **One** long-lived execution makes it say "maybe" for *every* closed
+///    partition, forever. Examples are a legal hold (#747), a per-type
+///    override (#737), or a 60-day run. Without tier 2, every tick does a
+///    full ownership scan of every partition. On a large one, that scan times
+///    out every time and never reclaims anything.
 ///
-/// 3. **Exact scan** — only when more old executions survive than the cap: a
-///    semi-join proving no row in the range has a live owner, bounded by a
-///    `statement_timeout`. A timeout retains and retries; an unfinished proof
-///    is not a proof.
+/// 3. **Exact scan** — only when more old executions survive than the cap. A
+///    semi-join proves that no row in the range has a live owner, bounded by
+///    a `statement_timeout`. A timeout retains and retries. An unfinished
+///    proof is not a proof.
 ///
-/// Legal holds and per-type overrides need no special-casing in any tier: each
-/// keeps its execution row alive, which keeps its rows owned. There is no
-/// second copy of the retention policy here to drift out of sync with the
-/// janitor's.
+/// Legal holds and per-type overrides need no special-casing in any tier. Each
+/// keeps its execution row alive, which keeps its rows owned. No second copy
+/// of the retention policy here can drift out of sync with the janitor's.
 #[cfg(feature = "db")]
 async fn cohort_occupancy(
     conn: &mut AsyncPgConnection,
@@ -4696,41 +4683,41 @@ async fn cohort_has_rows_for(
 ///
 /// Deliberately near zero, and deliberately not the same bound as acquiring the
 /// initial `SHARE`. An exclusive *waiter* makes every later conflicting request
-/// queue behind it, so each millisecond spent waiting here is a millisecond of
-/// stalled appends across the whole shard — see [`drop_partition`]. A partition
-/// that cannot be dropped in that window is retried next tick, which costs
-/// nothing but time.
+/// queue behind it. So each millisecond of waiting here is a millisecond of
+/// stalled appends across the whole shard (see [`drop_partition`]). A
+/// partition not dropped in that window is retried next tick. That costs
+/// only time.
 #[cfg(feature = "db")]
 const DROP_UPGRADE_TIMEOUT_MS: u64 = 50;
 
 /// Rows one `drain_default` pass may move.
 ///
-/// The drain runs inside the transaction that `DETACH PARTITION` opened, which
-/// holds `ACCESS EXCLUSIVE` on the parent — so every row it copies is a row the
-/// whole shard waits for. `lock_timeout` bounds *acquiring* that lock, never
-/// holding it, so an unbounded drain of a large backlog is an outage on the
-/// automatic retention tick that is supposed to be repairing things.
+/// The drain runs inside the transaction that `DETACH PARTITION` opened. That
+/// transaction holds `ACCESS EXCLUSIVE` on the parent. So the whole shard
+/// waits for every row it copies. `lock_timeout` bounds *acquiring* that lock,
+/// never holding it. An unbounded drain of a large backlog is then an outage,
+/// on the automatic retention tick that should repair things.
 ///
-/// A pass therefore moves whole cohorts up to this budget and re-attaches; the
-/// next tick continues. Whole cohorts, not whole rows, because a cohort's
-/// partition cannot exist while `DEFAULT` still holds rows in its range — the
-/// re-`ATTACH` would fail its constraint check. The budget is a floor, not a
-/// ceiling: one oversized cohort is irreducible and moves in a single pass.
+/// A pass therefore moves whole cohorts up to this budget and re-attaches. The
+/// next tick continues. Whole cohorts, not whole rows: a cohort's partition
+/// cannot exist while `DEFAULT` still holds rows in its range. The re-`ATTACH`
+/// would fail its constraint check. The budget is a floor, not a ceiling. One
+/// oversized cohort is irreducible and moves in a single pass.
 #[cfg(feature = "db")]
 const DRAIN_MAX_ROWS: usize = 50_000;
 
 /// Cohorts one `drain_default` pass may take.
 ///
 /// The row budget does not bound the pass on its own. Each cohort taken needs
-/// its partition created — one `CREATE TABLE ... PARTITION OF` apiece — and
-/// that DDL cannot run before the `DETACH`, because a cohort's partition may
-/// not be created while `DEFAULT` still holds rows in its range. So it runs
-/// under the parent's `ACCESS EXCLUSIVE` by necessity, and a maintenance gap
-/// spanning hundreds of closed cohorts parks few rows in each: the row budget
+/// its partition created, one `CREATE TABLE ... PARTITION OF` apiece. That DDL
+/// cannot run before the `DETACH`. A cohort's partition may not be created
+/// while `DEFAULT` still holds rows in its range. So it runs under the
+/// parent's `ACCESS EXCLUSIVE` by necessity. A maintenance gap that spans
+/// hundreds of closed cohorts parks few rows in each. The row budget then
 /// never binds, and one pass stopped the shard for hundreds of DDL statements.
 ///
-/// Bounding the cohort count bounds that DDL directly. Like the row budget it
-/// is a floor, not a ceiling — a pass always takes at least one cohort, so a
+/// Bounding the cohort count bounds that DDL directly. Like the row budget, it
+/// is a floor, not a ceiling. A pass always takes at least one cohort, so a
 /// backlog always converges.
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -4750,7 +4737,7 @@ const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// How long [`await_with_heartbeat`] keeps granting liveness credit to a
 /// step it has no other way to measure progress on.
 ///
-/// Review finding: an unconditional timer-driven tick has no notion of
+/// An unconditional timer-driven tick has no notion of
 /// progress at all. A step that hangs -- stuck on something the absent
 /// `statement_timeout` cannot catch, for instance -- would then tick
 /// forever. The scanner could never age into `Stale` or `Wedged`. Ten
@@ -4791,86 +4778,86 @@ async fn await_with_heartbeat<F: Future>(
 // A `statement_timeout` inside the drain's window is DELIBERATELY absent, and
 // this is the second thing to know about the pass after the budgets.
 //
-// It looks like the obvious bound and it is a trap. Every statement in the
-// transaction scans `DEFAULT` in proportion to the backlog — `cohort` carries
-// no index, so the move's `DELETE` scans it, and the mandatory re-`ATTACH ...
-// DEFAULT` scans it too, because Postgres must prove no remaining row belongs
-// to an existing partition (measured: ~160ms per 3M rows on PG16, and it is
-// cancellable, so the timeout really does fire).
+// It looks like the obvious bound, and it is a trap. Every statement in the
+// transaction scans `DEFAULT` in proportion to the backlog. `cohort` carries
+// no index, so the move's `DELETE` scans it. The mandatory re-`ATTACH ...
+// DEFAULT` scans it too, because Postgres must prove that no remaining row
+// belongs to an existing partition. Measured: ~160ms per 3M rows on PG16.
+// That scan is cancellable, so the timeout really does fire.
 //
-// So a timeout small relative to the backlog does not bound the work; it
-// discards it. The transaction rolls back, the rows just moved go back, the
-// next tick retries against an identical table and times out at the same
-// point. The backlog never shrinks and its partitions are never reclaimed —
-// a permanent livelock on exactly the deployment the drain exists for, and one
-// that gets worse every tick.
+// So a timeout small relative to the backlog does not bound the work. It
+// discards it. The transaction rolls back, and the rows just moved go back.
+// The next tick retries against an identical table and times out at the same
+// point. The backlog never shrinks, and its partitions are never reclaimed.
+// That is a permanent livelock on the deployment the drain exists for, and it
+// gets worse every tick.
 //
-// The work is bounded by the row and cohort budgets instead, which bound it
-// without ever throwing away a pass that succeeded. What remains unbounded is
-// the per-pass scan of whatever is still parked, and that is irreducible: the
-// re-`ATTACH` cannot be skipped and cannot be made to not scan.
+// The row and cohort budgets bound the work instead. They never throw away a
+// pass that succeeded. The per-pass scan of whatever is still parked stays
+// unbounded, and that is irreducible. The re-`ATTACH` cannot be skipped, and
+// it always scans.
 
 /// Drop one partition under a bounded lock wait, re-proving it is reclaimable
 /// while holding the lock.
 ///
-/// Returns `false` (not an error) when the partition was left in place: the
-/// lock could not be taken in time, a concurrent writer deadlocked with the
-/// attempt, or the re-check found an owner. Leaving it for the next tick is the
-/// correct response to all three; making every concurrent append wait is not.
+/// Returns `false` (not an error) when the partition was left in place. The
+/// lock was not taken in time, a concurrent writer deadlocked with the
+/// attempt, or the re-check found an owner. Leaving it for the next tick is
+/// the correct response to all three. Making every concurrent append wait is
+/// not.
 ///
 /// **The re-check is not belt-and-braces.** `cohort_occupancy` runs in its own
-/// transaction and commits before this one starts, so between the two a row can
+/// transaction and commits before this one starts. Between the two, a row can
 /// legitimately appear in the partition:
 ///
-/// - `drain_default` moves parked rows in with an explicit `cohort`, which is
-///   the one writer that can land a row in an already-closed cohort;
-/// - a transaction that *began* before the cohort boundary and inserts after it
-///   stamps the previous cohort, because the column default is evaluated per
-///   row but a long transaction's clock is not the sweeper's;
-/// - nothing stops a second retention runtime from running maintenance on the
-///   same shard concurrently — candidates are leased per execution, maintenance
-///   is not.
+/// - `drain_default` moves parked rows in with an explicit `cohort`. It is the
+///   one writer that can land a row in an already-closed cohort.
+/// - A transaction that *began* before the cohort boundary and inserts after
+///   it stamps the previous cohort. The column default is evaluated per row,
+///   but a long transaction's clock is not the sweeper's.
+/// - Nothing stops a second retention runtime from running maintenance on the
+///   same shard concurrently. Candidates are leased per execution, but
+///   maintenance is not.
 ///
-/// So the check has to be repeated under a lock that excludes every writer that
-/// could land such a row — and, critically, under **no more than that**. It
-/// takes `SHARE` on the one child partition:
+/// So the check is repeated under a lock that excludes every writer that
+/// could land such a row. Critically, it uses **no more than that**. It takes
+/// `SHARE` on the one child partition:
 ///
-/// - `SHARE` conflicts with `ROW EXCLUSIVE`, so nothing can INSERT, UPDATE or
-///   DELETE in this partition while the proof runs, which is exactly the
+/// - `SHARE` conflicts with `ROW EXCLUSIVE`. So nothing can INSERT, UPDATE or
+///   DELETE in this partition while the proof runs. That is exactly the
 ///   guarantee the re-check needs. Tuple routing locks the destination
-///   partition, so appends to every *other* cohort — which is all of them, this
-///   one being closed — are untouched.
+///   partition. So appends to every *other* cohort are untouched, and that is
+///   all of them, because this one is closed.
 /// - `SHARE` does **not** conflict with `ACCESS SHARE`, so readers are
-///   untouched. That is not a nicety: the insert trigger's cross-partition
+///   untouched. That is not a nicety. The insert trigger's cross-partition
 ///   `(workflow_exec_id, event_id)` uniqueness check reads the partitioned
 ///   parent, which locks every child in `ACCESS SHARE`. An exclusive lock on
 ///   *any* child therefore stalls *every* append on the shard, whichever
 ///   cohort it belongs to.
 ///
-/// `ACCESS EXCLUSIVE` — on the parent or on the child — would be correct and
-/// unusable. The wait for the lock is bounded by `lock_timeout`, but the
-/// re-check that follows it is bounded by
-/// [`SweepOptions::exact_scan_timeout`], 15 seconds by default, and a
-/// `lock_timeout` bounds *acquiring* a lock, never holding one. On a shard
-/// where tier 3 is reached — more surviving old executions than
-/// `owner_probe_cap`, which is the shape this feature exists for — every append
-/// and every read on the table would queue for that whole scan, once per drop
-/// attempt, on every tick.
+/// `ACCESS EXCLUSIVE`, on the parent or on the child, would be correct and
+/// unusable. `lock_timeout` bounds the wait for the lock. But
+/// [`SweepOptions::exact_scan_timeout`] bounds the re-check after it, at 15
+/// seconds by default. A `lock_timeout` bounds *acquiring* a lock, never
+/// holding one. Take a shard that reaches tier 3, with more surviving old
+/// executions than `owner_probe_cap`. That is the shape this feature exists
+/// for. Every append and read on the table would queue for that whole scan,
+/// once per drop attempt, on every tick.
 ///
-/// The re-check reads the child table **directly** ([`EventScope::partition`]),
-/// which keeps the proof inside the relation the lock covers and is also
+/// The re-check reads the child table **directly** ([`EventScope::partition`]).
+/// That keeps the proof inside the relation the lock covers. It is also
 /// strictly less work: no cohort predicate, no pruning, no sibling partitions.
 ///
-/// `ACCESS EXCLUSIVE` is taken only by the `DROP` itself, on the child and (to
-/// update the partition descriptor) on the parent. That is a catalog change:
+/// Only the `DROP` itself takes `ACCESS EXCLUSIVE`, on the child and on the
+/// parent, to update the partition descriptor. That is a catalog change:
 /// metadata-only and immediate.
 ///
 /// Taking the child's lock before the parent's inverts the order a concurrent
-/// insert uses (parent, then destination child), so an append landing in *this*
-/// closed cohort at exactly the wrong moment can deadlock with the drop — as
-/// can the `SHARE`-to-`ACCESS EXCLUSIVE` upgrade at the `DROP`. Postgres
-/// detects both and aborts one side; if it is ours, the partition is reported
-/// blocked and retried next tick, exactly as for a lock timeout.
+/// insert uses (parent, then destination child). So an append that lands in
+/// *this* closed cohort at exactly the wrong moment can deadlock with the
+/// drop. So can the `SHARE`-to-`ACCESS EXCLUSIVE` upgrade at the `DROP`.
+/// Postgres detects both and aborts one side. If it aborts this side, the
+/// partition is reported blocked and retried next tick, as for a lock timeout.
 #[cfg(feature = "db")]
 async fn drop_partition(
     conn: &mut AsyncPgConnection,
@@ -4890,22 +4877,22 @@ async fn drop_partition(
     let result = Box::pin(
         conn.transaction::<DropOutcome, HarvestError, _>(async |conn| {
             exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
-            // Taken explicitly, before the re-check, rather than relying on the
-            // DROP to take it afterwards — the whole point is that the check runs
-            // under a lock that freezes this partition's contents.
+            // Taken explicitly, before the re-check, not left to the DROP
+            // afterwards. The check must run under a lock that freezes this
+            // partition's contents.
             exec(
                 conn,
                 &format!("LOCK TABLE {} IN SHARE MODE", quote_ident(&name)),
             )
             .await?;
 
-            // The SAME three-tier proof, re-run under the lock — not a narrower
-            // one. An earlier revision bailed out whenever more executions survived
-            // than `owner_probe_cap`, which is precisely the condition under which
-            // the gate had used the exact scan: every partition that needed tier 3
-            // to prove itself droppable was then rejected here, forever, so
-            // reclamation stopped entirely on high-volume or legal-hold-heavy
-            // shards — the deployments this feature exists for.
+            // The SAME three-tier proof, re-run under the lock, not a narrower
+            // one. An earlier revision bailed out whenever more executions
+            // survived than `owner_probe_cap`. That is exactly when the gate had
+            // used the exact scan. So every partition that needed tier 3 was
+            // rejected here, forever. Reclamation stopped entirely on
+            // high-volume or legal-hold-heavy shards, the deployments this
+            // feature exists for.
             if cohort_occupancy(conn, &EventScope::partition(&name), upper, &opts)
                 .await?
                 .is_some()
@@ -4941,21 +4928,21 @@ async fn drop_partition(
             // A near-zero bound on the lock UPGRADE, separate from the bound on
             // acquiring the SHARE above, because the two cost different things.
             //
-            // Waiting for `SHARE` is free to bystanders: it conflicts with
-            // `ROW EXCLUSIVE` — writers to this closed cohort, of which there are
-            // none — and not with `ACCESS SHARE`, so a pending `SHARE` request
-            // queues nobody behind it.
+            // Waiting for `SHARE` is free to bystanders. It conflicts with
+            // `ROW EXCLUSIVE`, the writers to this closed cohort, and there are
+            // none. It does not conflict with `ACCESS SHARE`. So a pending
+            // `SHARE` request queues nobody behind it.
             //
             // The `DROP`'s upgrade to `ACCESS EXCLUSIVE` is the opposite. Postgres
             // queues a new request behind an existing *waiter* it conflicts with,
-            // not merely behind held locks, so while this upgrade waits — for one
-            // long history query still holding `ACCESS SHARE` on this child — every
-            // append's cross-partition uniqueness probe, which takes `ACCESS SHARE`
-            // on every child, queues behind it. Whatever cohort it is writing.
-            // Bounding that by `lock_timeout` would stall the whole shard for two
-            // seconds per drop attempt, per tick.
+            // not merely behind held locks. Say this upgrade waits for one long
+            // history query that holds `ACCESS SHARE` on this child. Every
+            // append's cross-partition uniqueness probe takes `ACCESS SHARE` on
+            // every child, so it queues behind the upgrade. Whatever cohort it
+            // is writing. Bounding that by `lock_timeout` would stall the whole
+            // shard for two seconds per drop attempt, per tick.
             //
-            // So the upgrade gets one brief attempt and the partition waits for the
+            // So the upgrade gets one brief attempt. The partition waits for the
             // next tick, where reclamation is bounded and retried by design.
             let upgrade_ms = ms.min(DROP_UPGRADE_TIMEOUT_MS);
             exec(conn, &format!("SET LOCAL lock_timeout = '{upgrade_ms}ms'")).await?;
@@ -5022,8 +5009,8 @@ impl DropOutcome {
 ///
 /// The opt-in fallback issue #958 sanctions for the non-steady-state case.
 /// Deletes only rows whose owning execution no longer exists, in bounded
-/// batches, so a straggler pass can neither touch a live execution's history
-/// nor open an unbounded transaction.
+/// batches. So a straggler pass cannot touch a live execution's history or
+/// open an unbounded transaction.
 ///
 /// Each batch runs under `statement_timeout`, exactly like the exact
 /// ownership scan this fallback runs alongside — see [`cohort_occupancy`].
@@ -5047,15 +5034,14 @@ async fn delete_orphan_rows(
         .unwrap_or(u64::MAX)
         .max(1);
     // Total work per partition per tick is capped, not just per statement. The
-    // inner SELECT restarts from the top of the range each iteration, so on a
-    // partition where orphans are SPARSE — the common shape for one pinned by a
-    // straggler — each pass re-scans the leading owned rows before finding its
-    // batch, which is quadratic in the partition size. Bounded here; the next
-    // tick continues.
+    // inner SELECT restarts from the top of the range each iteration. Orphans
+    // are SPARSE in a partition that a straggler pins. There each pass
+    // re-scans the leading owned rows before it finds its batch, which is
+    // quadratic in the partition size. Bounded here; the next tick continues.
     let max_batches = 16;
     let mut total = 0usize;
     for _ in 0..max_batches {
-        // Review finding: each batch here can run nearly `exact_scan_timeout`
+        // Each batch here can run nearly `exact_scan_timeout`
         // on its own. Sixteen of them can then run past the liveness
         // scanner's staleness threshold even though this call is itself
         // bounded progress. Ticking once per batch closes that gap the same
@@ -5066,22 +5052,22 @@ async fn delete_orphan_rows(
         // Keyed on `(id, cohort)` — the partitioned table's PRIMARY KEY — and
         // NOT on `ctid`.
         //
-        // A `ctid` is unique only WITHIN one physical child table. Matching it
-        // against the partitioned PARENT, whose scan spans every partition,
-        // deletes any row in any other partition that happens to share the same
-        // physical location — including events belonging to live executions.
-        // That is silent, unbounded data loss, and it is invisible in testing
-        // because a small corpus rarely reuses a `ctid` across partitions.
+        // A `ctid` is unique only WITHIN one physical child table. The scan of
+        // the partitioned PARENT spans every partition. Matching a `ctid`
+        // there deletes any row in another partition at the same physical
+        // location, including events of live executions. That is silent,
+        // unbounded data loss. Testing rarely shows it, because a small corpus
+        // rarely reuses a `ctid` across partitions.
         //
-        // `(id, cohort)` is globally unique (one sequence feeds every
-        // partition, and the key carries the partition column), so the outer
-        // DELETE targets exactly the rows the inner SELECT chose — and prunes
-        // to their partition instead of scanning all of them.
+        // `(id, cohort)` is globally unique: one sequence feeds every
+        // partition, and the key carries the partition column. So the outer
+        // DELETE targets exactly the rows the inner SELECT chose. It also
+        // prunes to their partition instead of scanning all of them.
         //
-        // The `MINVALUE` lower bound is omitted rather than substituted, for
-        // the same reason as in `cohort_occupancy`: the legacy partition's rows
-        // carry `-infinity`, which sorts below every finite timestamptz, so a
-        // finite lower bind would silently match none of them.
+        // The `MINVALUE` lower bound is omitted, not substituted, as in
+        // `cohort_occupancy`. The legacy partition's rows carry `-infinity`,
+        // which sorts below every finite timestamptz. A finite lower bind
+        // would silently match none of them.
         let sql = format!(
             "DELETE FROM harvest_events
               WHERE (id, cohort) IN (
@@ -5095,7 +5081,7 @@ async fn delete_orphan_rows(
               )",
             lower.map_or(String::new(), |_| "e.cohort >= $3 AND".to_string())
         );
-        // Review finding: `SET LOCAL` here scopes cleanly only when this
+        // `SET LOCAL` here scopes cleanly only when this
         // call opens the outer transaction itself. Diesel implements a
         // nested `.transaction()` as a `SAVEPOINT`. `RELEASE SAVEPOINT`
         // does not undo a `SET LOCAL` made inside it. Only `ROLLBACK TO
@@ -5158,12 +5144,12 @@ async fn delete_orphan_rows(
 /// must not stall a workflow. But rows sitting there block creation of the very
 /// partitions that would cover them, so maintenance drains it.
 ///
-/// Runs as one transaction: the default partition is detached, the missing
-/// cohorts are created, the rows are re-inserted with the cohort trigger
-/// disabled (they already carry correct cohorts; re-stamping would reject rows
-/// whose execution has since been collected), and the emptied default is
-/// reattached. Normally a no-op — the drain path exists for the rare case, and
-/// says so by returning `0`.
+/// Runs as one transaction. It detaches the default partition and creates the
+/// missing cohorts. It re-inserts the rows with the cohort trigger disabled.
+/// They already carry correct cohorts, and re-stamping would reject rows whose
+/// execution was since collected. Then it reattaches the emptied default.
+/// Normally a no-op that returns `0`. The drain path exists for the rare
+/// case.
 ///
 /// # Errors
 ///
@@ -5203,8 +5189,8 @@ pub async fn drain_default_bounded(
 /// so a failure leaves every row where it was.
 // A census, then one transaction whose steps must be read in order — detach,
 // create, move, re-enable, re-attach. Splitting it to satisfy a line budget
-// would scatter that sequence across helpers that only ever call each other
-// once, and the order is the whole correctness argument.
+// would scatter that sequence across helpers that each call the next once.
+// The order is the whole correctness argument.
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
 async fn drain_default_bounded_inner(
@@ -5232,20 +5218,21 @@ async fn drain_default_bounded_inner(
                 return Ok(None);
             }
 
-            // Review finding: the census below is unbounded by any statement
-            // timeout. It is a full scan of the DEFAULT partition, exactly the
-            // expensive case this whole function exists for. Nothing can tick
-            // between its rows, so a single tick before it starts is not enough
-            // on its own for a large backlog. Race it against a repeating timer,
-            // the same way the oversized-cohort move below does.
+            // The census below has no statement timeout. It is a full scan of
+            // the DEFAULT partition, exactly the expensive case this whole
+            // function exists for. Nothing can tick between its rows, so a
+            // single tick before it starts is not enough for a large backlog.
+            // Race it against a repeating timer, as the oversized-cohort move
+            // below does.
             //
-            // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
-            // partition, and `cohort` carries no index — on the large backlog a
-            // maintenance gap leaves, exactly the case this budget exists for, it is
-            // the most expensive thing the pass does. Run after the `DETACH` it was
-            // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
-            // bounded only what was MOVED while the shard stayed stopped for the whole
-            // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
+            // Census BEFORE the lock. This `GROUP BY` scans every row in the
+            // DEFAULT partition, and `cohort` carries no index. A maintenance
+            // gap leaves a large backlog, the case this budget exists for. There
+            // the census is the most expensive thing the pass does. After the
+            // `DETACH`, it was unbounded work under the parent's ACCESS
+            // EXCLUSIVE. The row budget then bounded only what was MOVED, while
+            // the shard stayed stopped for the whole scan. Here it takes ACCESS
+            // SHARE and costs bystanders nothing.
             let census = {
                 let query = diesel::sql_query(format!(
                     "SELECT cohort AS v, count(*)::bigint AS n
@@ -5266,13 +5253,13 @@ async fn drain_default_bounded_inner(
         return Ok(0);
     };
 
-    // Take whole cohorts, oldest first, up to BOTH budgets — and always at
-    // least one, so a cohort larger than the row budget still makes progress
-    // rather than the drain spinning forever on a backlog it refuses to touch.
+    // Take whole cohorts, oldest first, up to BOTH budgets. Always take at
+    // least one. So a cohort larger than the row budget still makes progress,
+    // and the drain does not spin forever on a backlog it refuses to touch.
     //
-    // Whole cohorts is not a simplification, it is required: a cohort's
-    // partition cannot exist while `DEFAULT` still holds rows in its range, so
-    // a half-moved cohort would make the re-`ATTACH` below fail its constraint
+    // Whole cohorts is not a simplification, it is required. A cohort's
+    // partition cannot exist while `DEFAULT` still holds rows in its range. A
+    // half-moved cohort would make the re-`ATTACH` below fail its constraint
     // check and roll the whole pass back.
     let mut work: Vec<DateTime<Utc>> = Vec::new();
     let mut cutoff = None;
@@ -5311,11 +5298,11 @@ async fn drain_default_bounded_inner(
             }
             // The work list was read before the lock, so a row could have landed in
             // `DEFAULT` between the census and the `DETACH`. Only ONE cohort can
-            // have: an append's cohort is `clock_timestamp()` floored, so a late
-            // arrival carries the currently-open cohort (or the next one, if the
-            // boundary rolled while the `DETACH` waited for its lock). Covering
-            // both makes the pre-lock list valid without re-scanning to revalidate
-            // it — and both are no-ops when a partition already exists.
+            // have. An append's cohort is `clock_timestamp()` floored. So a late
+            // arrival carries the currently-open cohort. It carries the next one
+            // if the boundary rolled while the `DETACH` waited for its lock.
+            // Covering both makes the pre-lock list valid without a re-scan. Both
+            // are no-ops when a partition already exists.
             //
             // Without this the move could meet a row with no partition and fail
             // with `no partition of relation found`, rolling the pass back. Not
@@ -5348,10 +5335,10 @@ async fn drain_default_bounded_inner(
 
             // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT does
             // not re-fire and every row keeps the cohort it was written with. The
-            // integrity trigger is disabled for the move because a parked row whose
-            // execution has since been collected is exactly the orphan the sweeper
-            // is meant to reclaim later — re-validating it here would turn a
-            // maintenance drain into data loss.
+            // move disables the integrity trigger. A parked row whose execution
+            // was since collected is exactly the orphan the sweeper reclaims
+            // later. Re-validating it here would turn a maintenance drain into
+            // data loss.
             //
             // Disabled on EACH PARTITION, not just the parent: `ALTER TABLE …
             // DISABLE TRIGGER` on a partitioned parent only recurses to its
@@ -5387,19 +5374,18 @@ async fn drain_default_bounded_inner(
                 .ok();
             }
 
-            // Review finding: an oversized single cohort can still make this
-            // move itself run long. The row budget bounds the pass overall,
-            // but "always at least one" above means a cohort larger than
-            // `max_rows` is still taken whole.
+            // An oversized single cohort can still make this move run long. The
+            // row budget bounds the pass overall. But "always at least one"
+            // above means a cohort larger than `max_rows` is still taken whole.
             //
             // One statement, so the rows leave `DEFAULT` exactly as they arrive
-            // in their cohort partitions — there is no window in which a row
-            // exists in both, and no `TRUNCATE` that could discard a row this
-            // pass did not move. Nothing can tick between rows of one
-            // statement, so a tick right before it starts is not enough on its
-            // own for an oversized cohort. Race it against a repeating timer
-            // instead. The timer ticks liveness on the clock without ever
-            // touching `conn`. The statement stays exactly one round trip.
+            // in their cohort partitions. No row ever exists in both. No
+            // `TRUNCATE` can discard a row this pass did not move. Nothing can
+            // tick between rows of one statement. So a tick right before it
+            // starts is not enough on its own for an oversized cohort. Race it
+            // against a repeating timer instead. The timer ticks liveness on
+            // the clock without ever touching `conn`. The statement stays
+            // exactly one round trip.
             let moved = {
                 let query = diesel::sql_query(format!(
                     "WITH moved AS (
@@ -5435,7 +5421,7 @@ async fn drain_default_bounded_inner(
             // copied, and anything still here belongs to a cohort this pass did not
             // take. Truncating would destroy it.
             //
-            // Review finding: this re-`ATTACH` makes Postgres prove no
+            // This re-`ATTACH` makes Postgres prove no
             // remaining row belongs to an existing partition. That is a full
             // scan of whatever is left in `DEFAULT`, exactly as unbounded as
             // the move above it. Left as a plain `exec`, nothing ticks
@@ -5462,27 +5448,27 @@ async fn drain_default_bounded_inner(
 
 /// The owner of `harvest_events` when the connected role cannot act as it.
 ///
-/// Every partition operation is DDL on that table — `CREATE TABLE ... PARTITION
+/// Every partition operation is DDL on that table: `CREATE TABLE ... PARTITION
 /// OF` to extend the write window, `DETACH`/`ATTACH` to drain the `DEFAULT`
-/// partition, `DROP TABLE` to reclaim — and Postgres checks **ownership** for
-/// all of it. There is no lesser privilege that grants it.
+/// partition, and `DROP TABLE` to reclaim. Postgres checks **ownership** for
+/// all of it. No lesser privilege grants it.
 ///
-/// That matters because this engine supports, and its preflight probes for, a
-/// split-role deployment: migrations and `harvest partition enable` run as an
-/// owning role while the engine connects as a separately granted one that needs
-/// only `SELECT`/`INSERT` on `harvest_events`. Automatic maintenance runs on
-/// the engine's pool, so on that topology every pass fails — the lookahead
-/// window stops being extended, appends pile into the `DEFAULT` partition, and
-/// nothing is ever reclaimed.
+/// This engine supports a split-role deployment, and its preflight probes for
+/// one. Migrations and `harvest partition enable` run as an owning role. The
+/// engine connects as a separately granted role that needs only
+/// `SELECT`/`INSERT` on `harvest_events`. Automatic maintenance runs on the
+/// engine's pool, so on that topology every pass fails. The lookahead window
+/// stops growing, appends pile into the `DEFAULT` partition, and nothing is
+/// ever reclaimed.
 ///
-/// Postgres checks ownership by role *membership*, not identity, so
-/// `GRANT <owner> TO <engine role>` is the fix and no second connection pool is
-/// needed. Returning the owner's name lets [`maintain`] say that, instead of
-/// relaying a `permission denied for table harvest_events_p_default` that names
-/// neither the role nor the grant.
+/// Postgres checks ownership by role *membership*, not identity. So
+/// `GRANT <owner> TO <engine role>` is the fix, and no second connection pool
+/// is needed. Returning the owner's name lets [`maintain`] say that. Otherwise
+/// it relays a `permission denied for table harvest_events_p_default` that
+/// names neither the role nor the grant.
 ///
-/// `None` when the connected role can act as owner — the single-role default,
-/// where this costs one catalog probe per tick.
+/// `None` when the connected role can act as owner. That is the single-role
+/// default, where this costs one catalog probe per tick.
 ///
 /// # Errors
 ///
@@ -5515,11 +5501,14 @@ async fn maintenance_owner_gap(
 /// retention runtime calls it every tick and at startup. A no-op on an
 /// unpartitioned shard, so it is safe to call unconditionally.
 ///
-/// Ordered deliberately: draining first, because rows parked in `DEFAULT` block
-/// creation of the partitions that would cover them; then creating, so a tick
-/// that drops a backlog still leaves the write window covered; then sweeping,
-/// so a cohort freed earlier in the same tick is reclaimed now rather than
-/// next time.
+/// Ordered deliberately:
+///
+/// 1. Drain, because rows parked in `DEFAULT` block creation of the partitions
+///    that would cover them.
+/// 2. Create, so a tick that drops a backlog still leaves the write window
+///    covered.
+/// 3. Sweep, so a cohort freed earlier in the same tick is reclaimed now, not
+///    next time.
 ///
 /// `resume_after` and `catch_up_target` are threaded straight through to the
 /// sweep step. See [`SweepOutcome::next_resume`] and
@@ -5564,7 +5553,7 @@ pub async fn maintain(
 /// Same as [`maintain`], but calls `progress` once per partition the sweep
 /// step attempts.
 ///
-/// Review finding: a tick recorded once before a shard's whole maintenance
+/// A tick recorded once before a shard's whole maintenance
 /// pass is not bounded progress. A single shard can spend
 /// `max_attempts × exact_scan_timeout` evaluating blocked partitions, long
 /// enough to cross the liveness scanner's own staleness threshold before
@@ -5699,10 +5688,9 @@ async fn maintain_inner(
             ..MaintenanceOutcome::default()
         });
     }
-    // Before any DDL, because the failure is otherwise unreadable: the first
-    // thing to fail is whichever partition operation runs first, and its
-    // `permission denied for table harvest_events_p_default` names neither the
-    // role that needs the grant nor the grant itself.
+    // Before any DDL, because the failure is otherwise unreadable. The first
+    // partition operation to run fails first. Its `permission denied for table
+    // harvest_events_p_default` names neither the role nor the grant.
     if let Some((owner, me)) = maintenance_owner_gap(conn).await? {
         return Err(HarvestError::Config(format!(
             "partition maintenance requires ownership of harvest_events, and the connected \
@@ -5717,16 +5705,16 @@ async fn maintain_inner(
         )));
     }
 
-    // Drain first: rows parked in the DEFAULT partition BLOCK creation of the
-    // very cohort partitions that would cover them, so an ensure before a drain
-    // would fail on exactly the deployment that needs it most.
+    // Drain first. Rows parked in the DEFAULT partition BLOCK creation of the
+    // cohort partitions that would cover them. An ensure before a drain would
+    // fail on exactly the deployment that needs it most.
     //
-    // Best-effort, deliberately: the drain is the heaviest step (it holds
-    // ACCESS EXCLUSIVE while it moves rows) and the most likely to lose a lock
-    // race. Propagating its failure would take `ensure_partitions` down with
-    // it — and extending the write window is the one thing that must never
-    // stop, because an uncovered cohort is what fills the DEFAULT partition in
-    // the first place. A failed drain is recorded and retried next tick.
+    // Best-effort, deliberately. The drain is the heaviest step, because it
+    // holds ACCESS EXCLUSIVE while it moves rows. It is also the most likely
+    // to lose a lock race. Propagating its failure would take
+    // `ensure_partitions` down with it. Extending the write window must never
+    // stop, because an uncovered cohort is what fills the DEFAULT partition.
+    // A failed drain is recorded and retried next tick.
     let (drained, drain_error) = match drain_default_bounded_inner(
         conn,
         DRAIN_MAX_ROWS,
@@ -5790,17 +5778,16 @@ async fn maintain_inner(
 pub struct MaintenanceOutcome {
     /// When this pass finished.
     ///
-    /// `None` only on the zero value. Reported because the retention tick
-    /// publishes its history-retention counters *before* maintenance runs (a
-    /// cohort is only droppable once the candidate loop has collected its
-    /// executions), so "the tick ran" and "maintenance ran" are genuinely
-    /// different instants — and an operator diagnosing "why is space not coming
-    /// back?" needs to know which one they are looking at.
+    /// `None` only on the zero value. The retention tick publishes its
+    /// history-retention counters *before* maintenance runs. A cohort is only
+    /// droppable once the candidate loop has collected its executions. So "the
+    /// tick ran" and "maintenance ran" are different instants. An operator
+    /// who asks "why is space not coming back?" needs to know which one this is.
     pub at: Option<DateTime<Utc>>,
     /// Whether the shard was on the partitioned layout, per this pass's own
     /// probe -- the same probe that gates every step below.
     ///
-    /// Review finding: a caller that probes the layout separately before
+    /// A caller that probes the layout separately before
     /// calling [`maintain`] or [`maintain_with_progress`] can race a
     /// concurrent `enable`/`disable_partitioning`. That race lands
     /// between the caller's own probe and this call's internal one.
@@ -5811,7 +5798,7 @@ pub struct MaintenanceOutcome {
     /// only on the return after the probe below finds the shard
     /// partitioned; `Some(false)` on the unpartitioned early return.
     ///
-    /// Review finding: the owner-gap check, `ensure_partitions`, and
+    /// The owner-gap check, `ensure_partitions`, and
     /// `sweep` below can all still fail AFTER this probe already found
     /// the shard partitioned. A caller that turns the resulting `Err`
     /// into a [`Self::failed`] has no way to recover which layout this
@@ -5841,11 +5828,11 @@ pub struct MaintenanceOutcome {
     pub sweep: SweepOutcome,
     /// Why this pass did not complete, when it did not.
     ///
-    /// Maintenance is best-effort — it must never fail a retention tick, since
+    /// Maintenance is best-effort. It must never fail a retention tick, since
     /// history retention and reclamation are independent. But "best effort"
-    /// must not mean "invisible": without this a permanently-failing shard
-    /// reports exactly what a shard that never opted in reports, and the
-    /// operator has no way to tell them apart.
+    /// must not mean "invisible". Without this, a permanently-failing shard
+    /// reports exactly what a shard that never opted in reports. The operator
+    /// could not tell them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -5885,7 +5872,7 @@ impl MaintenanceOutcome {
 /// operator class. `indkey` is an `int2vector`, whose Postgres-defined
 /// array lower bound is `0`, so `indkey[0]` is the first key column.
 ///
-/// Review finding: also checks `indoption` for each key column. Harvest's
+/// Also checks `indoption` for each key column. Harvest's
 /// own phase-2 indexes sort every key column in plain ascending order. An
 /// operator's own index under one of the reserved names can share every
 /// key column and position with Harvest's own index. One column merely
@@ -5896,7 +5883,7 @@ impl MaintenanceOutcome {
 /// per key column at the same position as `indkey`. `0` means ascending
 /// with nulls last, the only shape Harvest's own indexes ever take.
 ///
-/// Review finding: also checks for `NULLS NOT DISTINCT`. Harvest's own
+/// Also checks for `NULLS NOT DISTINCT`. Harvest's own
 /// phase-2 indexes are ordinary ones — `NULLS DISTINCT`, the default. An
 /// operator's own `UNIQUE NULLS NOT DISTINCT` index under one of these
 /// reserved names, with otherwise matching columns, still passed every
@@ -5906,7 +5893,7 @@ impl MaintenanceOutcome {
 /// `ACCESS EXCLUSIVE` — exactly the unplanned rebuild this assertion
 /// exists to catch in advance.
 ///
-/// Review finding: checked through `pg_get_indexdef`, not
+/// Checked through `pg_get_indexdef`, not
 /// `pg_index.indnullsnotdistinct` directly. That column does not exist
 /// before `PostgreSQL` 15. `docs/partitioned-events.md` still supports 14,
 /// and a literal reference to it fails every phase-4 run there with
@@ -5917,7 +5904,7 @@ impl MaintenanceOutcome {
 /// appear in the reconstructed definition on a version that has no way
 /// to create it.
 ///
-/// Review finding: also checks `indcollation` for each key column. An
+/// Also checks `indcollation` for each key column. An
 /// operator's own index under one of the reserved names can match every
 /// other check here, including column position and sort order. It can
 /// still carry a non-default collation on a text-like column. `ATTACH
@@ -5961,7 +5948,7 @@ fn index_shape_check_sql(index_name: &str, columns: &[&str]) -> String {
 /// unchanged. Tagged with `tag`, so it can appear more than once in the same
 /// generated script.
 ///
-/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// Phase 1's copy of this check runs hours before phase 4's
 /// rename, under `migration_plan`'s online path. An operator could add a
 /// compatible-looking constraint-backed unique index in that window and
 /// pass phase 1 clean. `capture_index_defs` would still drop it silently
@@ -6004,7 +5991,7 @@ fn unique_index_guard_sql(tag: &str) -> String {
 /// A `DO` block refusing when a view depends on `harvest_events`, tagged
 /// with `tag` so it can appear more than once in the same generated script.
 ///
-/// Review finding: phase 1's copy of this check runs hours before phase 4's
+/// Phase 1's copy of this check runs hours before phase 4's
 /// rename, under `migration_plan`'s online path. A view created (or
 /// repointed) at `harvest_events` in that window would pass phase 1 clean.
 /// It would then end up silently stale after phase 4 anyway.
@@ -6038,17 +6025,17 @@ fn dependent_views_guard_sql(tag: &str) -> String {
 /// Tagged with `tag`, so it can appear more than once in the same
 /// generated script.
 ///
-/// Review finding: phase 1's copy of this check has the identical gap
+/// Phase 1's copy of this check has the identical gap
 /// [`dependent_views_guard_sql`] closes. Phase 4 recheck it too, right
 /// alongside the view recheck, under the same lock.
 ///
-/// Review finding: the exemption for harvest's own trigger checked its
+/// The exemption for harvest's own trigger checked its
 /// FUNCTION alone. An operator trigger invoking that same function under
 /// its own name would then also be exempted and stay unnoticed. The
 /// check now also requires the reserved trigger's own name, matching
 /// [`operator_triggers`]'s fix for the identical gap.
 ///
-/// Review finding: name and function still are not the whole identity --
+/// Name and function still are not the whole identity --
 /// see [`operator_triggers`]'s identical follow-up fix. The check now
 /// also requires harvest's exact trigger shape: [`EXEC_FK_TRIGGER_TGTYPE`],
 /// no arguments, no `WHEN` clause, and `tgenabled = 'O'` -- see
@@ -6096,7 +6083,7 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
 /// matched by name, type and shape, the same way harvest's own primary
 /// key and unique constraint are.
 ///
-/// Review finding: `enable_partitioning` makes this check in Rust. The
+/// `enable_partitioning` makes this check in Rust. The
 /// scripted path needs its own because it never calls it, same as the
 /// view and trigger guards above. Phase 4 rechecks it again under the
 /// lock this phase converts under, for the identical hours-long-gap
@@ -6175,7 +6162,7 @@ fn unreplayable_constraints_guard_sql(tag: &str, cutover_lit: &str) -> String {
 /// with `tag`, so it can appear more than once in the same generated
 /// script.
 ///
-/// Review finding: the phase-4 in-lock recheck block rechecked unique
+/// The phase-4 in-lock recheck block rechecked unique
 /// indexes, views and triggers, but not row security. `CREATE TABLE ...
 /// (LIKE ...)` copies neither `relrowsecurity`/`relforcerowsecurity` nor
 /// any `pg_policy` row. That is the same gap [`refuse_if_row_security`]
@@ -6213,7 +6200,7 @@ fn row_security_guard_sql(tag: &str) -> String {
 /// with `tag`, so it can appear more than once in the same generated
 /// script.
 ///
-/// Review finding: the phase-4 in-lock recheck block had no publication
+/// The phase-4 in-lock recheck block had no publication
 /// check at all, unlike phase 1's. See the comment on that step for why
 /// a leaf-publishing publication silently stops a logical-replication
 /// standby. A publication created (or repointed with `ALTER PUBLICATION
@@ -6273,14 +6260,14 @@ fn explicit_publications_guard_sql(tag: &str) -> String {
 
 /// One statement of the large-live-table conversion plan.
 ///
-/// The plan exists in exactly one form — this list — and
-/// [`migration_plan`] renders it. That is what makes it *executable*: an
-/// earlier revision printed the catalog-driven parts as prose ("emit one line
-/// per object from: SELECT format(…)"), so an operator who ran the generated
-/// file verbatim never renamed the legacy constraints, and step 4 aborted on
-/// `ADD CONSTRAINT harvest_events_pkey` because the old schema-scoped index
-/// still held the name. Everything catalog-driven is a `DO` block now, and an
-/// integration test runs these steps against a real populated database.
+/// The plan exists in exactly one form, this list, and [`migration_plan`]
+/// renders it. That makes it *executable*. An earlier revision printed the
+/// catalog-driven parts as prose ("emit one line per object from: SELECT
+/// format(…)"). An operator who ran the generated file verbatim never renamed
+/// the legacy constraints. Step 4 then aborted on `ADD CONSTRAINT
+/// harvest_events_pkey`, because the old schema-scoped index still held the
+/// name. Everything catalog-driven is a `DO` block now. An integration test
+/// runs these steps against a real populated database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {
     /// Numbered phase this statement belongs to (1-5), for the rendered script.
@@ -6295,15 +6282,15 @@ pub struct PlanStep {
 /// The conversion plan for a **large live** `harvest_events`, as executable
 /// statements.
 ///
-/// [`enable_partitioning`] runs the same algorithm in one transaction, which is
-/// right for a fresh or small table and wrong for a ten-million-row one: the
-/// index builds and the constraint validation would hold `ACCESS EXCLUSIVE` for
-/// their whole duration, blocking every append. These steps move both out of
-/// the lock window — `CREATE INDEX CONCURRENTLY` builds without blocking
-/// reads or writes, and `ADD CONSTRAINT … NOT VALID` + `VALIDATE CONSTRAINT`
-/// does the full scan under `SHARE UPDATE EXCLUSIVE`, which concurrent readers
-/// and writers do not conflict with. Because the constraint is then valid,
-/// `ATTACH PARTITION` skips its own verification scan entirely.
+/// [`enable_partitioning`] runs the same algorithm in one transaction. That is
+/// right for a fresh or small table and wrong for a ten-million-row one. The
+/// index builds and the constraint validation would hold `ACCESS EXCLUSIVE`
+/// for their whole duration, blocking every append. These steps move both out
+/// of the lock window. `CREATE INDEX CONCURRENTLY` builds without blocking
+/// reads or writes. `ADD CONSTRAINT … NOT VALID` + `VALIDATE CONSTRAINT` does
+/// the full scan under `SHARE UPDATE EXCLUSIVE`. Concurrent readers and
+/// writers do not conflict with that lock. Because the constraint is then
+/// valid, `ATTACH PARTITION` skips its own verification scan entirely.
 ///
 /// What remains inside the exclusive window is metadata-only: a rename, a
 /// `CREATE TABLE`, and the `ATTACH`.
@@ -6340,17 +6327,17 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         //
         // Re-running the plan after a completed step 4 is not a no-op, it is
         // destructive. Step 3's guard looks for its constraint BY NAME on
-        // `harvest_events`, and the conversion renamed the legacy constraint
-        // onto the legacy partition — so on the new parent the guard finds
-        // nothing and adds `CHECK (cohort < cutover) NOT VALID` to the live
-        // partitioned parent. `NOT VALID` skips the scan of existing rows but
-        // still enforces the check for NEW ones, whose cohort is at or after
-        // the cutover by construction. Every subsequent append fails, on a
-        // shard that was working.
+        // `harvest_events`. The conversion renamed the legacy constraint onto
+        // the legacy partition. So on the new parent the guard finds nothing.
+        // It adds `CHECK (cohort < cutover) NOT VALID` to the live partitioned
+        // parent. `NOT VALID` skips the scan of existing rows but still
+        // enforces the check for NEW ones. Their cohort is at or after the
+        // cutover by construction. Every later append fails, on a shard that
+        // was working.
         //
-        // First, before anything mutates, and repeated inside step 3 because
-        // the runbook explicitly tells an operator to re-run that step alone
-        // after a failed validation.
+        // First, before anything mutates. Repeated inside step 3, because the
+        // runbook tells an operator to re-run that step alone after a failed
+        // validation.
         step(
             1,
             "DO $harvest_relkind_958$\nBEGIN\n    \
@@ -6461,54 +6448,48 @@ pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<Pla
         // ── 2: the partition-key indexes, built without blocking ──────────
         //
         // A cancelled or failed `CREATE INDEX CONCURRENTLY` leaves the index
-        // behind, INVALID — and it is the build most likely to be lost, since
-        // it runs for hours on the table this plan exists for. `IF NOT EXISTS`
+        // behind, INVALID. It is the build most likely to be lost, since it
+        // runs for hours on the table this plan exists for. `IF NOT EXISTS`
         // then reports success on a re-run without looking at
-        // `pg_index.indisvalid`, so the invalid index survives to phase 4,
-        // where `ATTACH PARTITION` cannot reuse it and builds a replacement
+        // `pg_index.indisvalid`. So the invalid index survives to phase 4.
+        // There `ATTACH PARTITION` cannot reuse it, and builds a replacement
         // *while holding the parent-wide exclusive lock*. The window the plan
         // promises is metadata-only becomes a full index build with every
         // append queued behind it.
         //
-        // Dropped, not reindexed: a plain `DROP INDEX` on an invalid index is a
-        // catalog change with no readers to wait for, and the `CONCURRENTLY`
-        // build below then rebuilds it without blocking.
+        // Dropped, not reindexed. A plain `DROP INDEX` on an invalid index is a
+        // catalog change with no readers to wait for. The `CONCURRENTLY` build
+        // below then rebuilds it without blocking.
         //
-        // Review finding: matching by schema and name alone selected any
-        // invalid index anywhere bearing one of these three reserved
-        // names, on any table. An operator's own cancelled concurrent
-        // build could coincidentally share a name. It could sit on an
-        // unrelated table. It could sit on the right table with
-        // different columns. It could even sit on the right table and
+        // Matching by schema and name alone selected any invalid index
+        // anywhere bearing one of these three reserved names, on any table.
+        // An operator's own cancelled concurrent build could share a name. It
+        // could sit on an unrelated table. It could sit on the right table
+        // with different columns. It could even sit on the right table and
         // columns with different semantics -- non-unique, partial,
         // expression-based, a non-default opclass, descending order, or
-        // `NULLS NOT DISTINCT`. The loop below checks all of that per
-        // name, the same full shape rigor
-        // `we_created_at_idx_owned_check_sql` already applies before
-        // `disable_partitioning` drops that index. A mismatch refuses
-        // instead of either silently destroying the unrelated object or
-        // silently leaving it squatting on the name this plan needs to
-        // (re)build under.
+        // `NULLS NOT DISTINCT`. The loop below checks all of that per name.
+        // `we_created_at_idx_owned_check_sql` applies the same shape rigor
+        // before `disable_partitioning` drops that index. A mismatch refuses.
+        // It neither silently destroys the unrelated object nor leaves it
+        // squatting on the name this plan needs to (re)build under.
         //
-        // Review finding: `NULLS NOT DISTINCT` is checked through
-        // `pg_get_indexdef`, not `pg_index.indnullsnotdistinct` directly.
-        // See `index_shape_check_sql`'s identical fix -- that column
-        // does not exist before `PostgreSQL` 15, and
-        // `docs/partitioned-events.md` still supports 14. A literal
-        // reference there would fail this `DO` block to parse on every
+        // `NULLS NOT DISTINCT` is checked through `pg_get_indexdef`, not
+        // `pg_index.indnullsnotdistinct` directly. See `index_shape_check_sql`
+        // for the identical fix. That column does not exist before
+        // `PostgreSQL` 15, and `docs/partitioned-events.md` still supports 14.
+        // A literal reference would fail this `DO` block to parse on every
         // supported-14 deployment, even one with no invalid index at all.
         //
-        // Review finding: the shape checks never looked at the access
-        // method. Every reserved name here is built as a btree. Take an
-        // operator's own failed `CREATE INDEX CONCURRENTLY ... USING
-        // hash` at the same reserved name, over the same columns. It
-        // can still pass every other check. A hash opclass can be the
-        // default one too, and hash carries no sort options, so
-        // `indoption` is all zero regardless. Left unchecked, this loop
-        // would drop that operator's index and replace it with
-        // harvest's own btree. That is exactly the "destroy the
-        // unrelated object" outcome the rest of this shape rigor exists
-        // to refuse instead of doing.
+        // The shape checks also look at the access method. Every reserved
+        // name here is built as a btree. Take an operator's own failed
+        // `CREATE INDEX CONCURRENTLY ... USING hash` at the same reserved
+        // name, over the same columns. It can still pass every other check.
+        // A hash opclass can be the default one too, and hash carries no sort
+        // options, so `indoption` is all zero regardless. Left unchecked, this
+        // loop would drop that operator's index and replace it with harvest's
+        // own btree. That is the "destroy the unrelated object" outcome the
+        // rest of this shape rigor refuses.
         step(2, "BEGIN".to_string()),
         step(2, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
         step(
@@ -6585,9 +6566,9 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
                  ON harvest_events (workflow_exec_id, event_id, cohort)"
             ),
         ),
-        // The sweeper's tier-1 drop gate. On `harvest_workflow_executions`,
-        // the busiest table in the schema, so the concurrent form is not
-        // optional here: a plain build holds SHARE for its duration and every
+        // The sweeper's tier-1 drop gate. It is on `harvest_workflow_executions`,
+        // the busiest table in the schema. So the concurrent form is not
+        // optional here. A plain build holds SHARE for its duration, and every
         // insert, state update and retention delete waits behind it.
         //
         // Unlike `enable_sql`, this step does not stamp
@@ -6610,23 +6591,23 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         //
         // Both statements carry a bounded lock wait, and neither may be run
         // bare. `NOT VALID` skips the table scan but still takes
-        // `ACCESS EXCLUSIVE` to write the catalog row, and `VALIDATE` takes
-        // `SHARE UPDATE EXCLUSIVE`; behind one idle-in-transaction reader
-        // either request queues — and because Postgres queues lock requests in
-        // order, every append arriving after it queues behind the ALTER. That
-        // is the opposite of what this phase is for: it exists so the
+        // `ACCESS EXCLUSIVE` to write the catalog row. `VALIDATE` takes
+        // `SHARE UPDATE EXCLUSIVE`. Behind one idle-in-transaction reader,
+        // either request queues. Postgres queues lock requests in order, so
+        // every append that arrives after it queues behind the ALTER. That is
+        // the opposite of what this phase is for. It exists so the
         // conversion's expensive work happens with the shard *online*. Failing
         // fast leaves the operator a bounded, retryable error instead.
         step(3, "BEGIN".to_string()),
         step(3, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
-        // Guarded rather than bare, because this phase is now TWO transactions
-        // and the half-done state is reachable by design: the constraint lands,
-        // the validation scan then hits its bounded lock wait and rolls back.
-        // The runbook's answer to that is "clear the blocker and re-run step
-        // 3", and an unconditional ADD CONSTRAINT fails with `duplicate_object`
-        // before the validation is ever retried — so bounding the lock wait
-        // would have traded a hang for a dead end, with regenerating the plan
-        // no help either since it bakes in the same constraint name.
+        // Guarded, not bare. This phase is TWO transactions, and the half-done
+        // state is reachable by design. The constraint lands, then the
+        // validation scan hits its bounded lock wait and rolls back. The
+        // runbook's answer is "clear the blocker and re-run step 3". An
+        // unconditional ADD CONSTRAINT fails with `duplicate_object` before
+        // the validation is retried. Bounding the lock wait would then trade a
+        // hang for a dead end. Regenerating the plan does not help, since it
+        // bakes in the same constraint name.
         step(
             3,
             format!(
@@ -6662,7 +6643,7 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         // ── 4: THE WINDOW — one transaction, metadata only ────────────────
         step(4, "BEGIN".to_string()),
         step(4, format!("SET LOCAL lock_timeout = '{lock_ms}ms'")),
-        // Review finding: the recheck below is only as good as the lock it
+        // The recheck below is only as good as the lock it
         // runs under. `BEGIN` and `SET LOCAL` take no lock on
         // `harvest_events` at all. Every statement up to this point is a
         // plain catalog read, ACCESS SHARE at most. Without this explicit
@@ -6678,14 +6659,14 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
             4,
             "LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE".to_string(),
         ),
-        // Review finding: phase 1's unique-index check has the identical
+        // Phase 1's unique-index check has the identical
         // hours-long gap to phase 4's rename. An operator could add a
         // compatible-looking constraint-backed unique index in that gap.
         // It would pass phase 1 clean, and still have it silently dropped
         // by `capture_index_defs` at phase 4. Recheck it too, under the
         // same lock.
         step(4, unique_index_guard_sql("harvest_uniq_cutover_958")),
-        // Review finding: phase 1's dependent-view check ran hours before
+        // Phase 1's dependent-view check ran hours before
         // this window, under this plan's online path. A view created (or
         // repointed) at `harvest_events` in that gap would pass phase 1
         // clean, then silently go stale after the rename below anyway.
@@ -6693,18 +6674,18 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         // actually converts under, so the state being checked is the
         // state being converted.
         step(4, dependent_views_guard_sql("harvest_view_cutover_958")),
-        // Review finding: phase 1's trigger check has the identical gap
+        // Phase 1's trigger check has the identical gap
         // the view recheck above just closed. Recheck it too, under the
         // same lock.
         step(4, operator_triggers_guard_sql("harvest_trg_cutover_958")),
-        // Review finding: phase 1's constraint check has the identical gap
+        // Phase 1's constraint check has the identical gap
         // the view and trigger rechecks above just closed. Recheck it too,
         // under the same lock.
         step(
             4,
             unreplayable_constraints_guard_sql("harvest_constraint_cutover_958", &cutover_lit),
         ),
-        // Review finding: this in-lock block rechecked unique indexes,
+        // This in-lock block rechecked unique indexes,
         // views and triggers, but not row security or publications.
         // Those are phase 1's other two guards, with the identical
         // hours-long gap. Recheck both too, under the same lock.
@@ -6765,9 +6746,9 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
             4,
             format!("ALTER TABLE harvest_events RENAME TO {LEGACY_PARTITION}"),
         ),
-        // Renaming a table renames neither its indexes nor its constraints, so
-        // without this the new parent cannot reclaim their schema-scoped names
-        // — and `ADD CONSTRAINT harvest_events_pkey` below aborts.
+        // Renaming a table renames neither its indexes nor its constraints.
+        // Without this, the new parent cannot reclaim their schema-scoped
+        // names, and `ADD CONSTRAINT harvest_events_pkey` below aborts.
         //
         // The rename target is never a bare `obj.n || suffix`. See
         // `bounded_rename_fn_sql` for why that silently fails to free a name
@@ -6936,11 +6917,11 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
                  FOR VALUES FROM (MINVALUE) TO ({cutover_lit})"
             ),
         ),
-        // The write window, created here rather than left to the first
-        // retention tick: metadata-only, and deferring it would send every
-        // append for up to a tick interval into the DEFAULT partition, whose
-        // drain then holds ACCESS EXCLUSIVE while it moves them back — the
-        // append stall this whole change exists to avoid.
+        // The write window, created here, not left to the first retention
+        // tick. It is metadata-only. Deferring it would send every append for
+        // up to a tick interval into the DEFAULT partition. Its drain then
+        // holds ACCESS EXCLUSIVE while it moves them back. That is the append
+        // stall this change exists to avoid.
         step(
             4,
             format!(
@@ -6973,7 +6954,7 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
     // 1 would otherwise still have the plan refuse hours later. That
     // refusal would land at the lock window, over the same publication.
     //
-    // Review finding: narrowed to `explicit_publications_guard_sql`, not
+    // Narrowed to `explicit_publications_guard_sql`, not
     // removed. An explicit `FOR TABLE harvest_events` publication is
     // pinned to that relation's OID, so it does not follow the rename
     // phase 4 performs. `allow_incompatible_publications` documents a
@@ -6997,8 +6978,8 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
 /// Render the operator-run conversion script for a **large live**
 /// `harvest_events`.
 ///
-/// Every statement comes from [`migration_plan_steps`], so the script an
-/// operator runs and the statements CI executes are the same list — the plan
+/// Every statement comes from [`migration_plan_steps`]. So the script an
+/// operator runs and the statements CI executes are the same list. The plan
 /// cannot drift into prose that looks like SQL but does nothing.
 ///
 /// Steps 1–3 are online and may take a long time on a large table. Only step 4
@@ -7114,7 +7095,7 @@ mod tests {
 
     #[test]
     fn failed_reports_the_layout_as_unknown_not_unpartitioned() {
-        // Review finding: the owner-gap check, `ensure_partitions`, and
+        // The owner-gap check, `ensure_partitions`, and
         // `sweep` inside `maintain_inner` can all fail AFTER its own
         // probe already confirmed the shard partitioned. The error that
         // propagates out carries no memory of that. A caller wrapping
@@ -7287,12 +7268,12 @@ mod tests {
         let plan = migration_plan(&opts, now);
         let steps = migration_plan_steps(&opts, now);
 
-        // The window is phase 4, located BY PHASE rather than by the first
-        // `BEGIN;` in the rendered text. Phases 2 and 3 open short bounded
-        // transactions of their own now — an invalid-index cleanup and the
-        // constraint add — so a test that assumed the first `BEGIN` was the
-        // window would quietly start asserting about one of those instead, and
-        // pass or fail for reasons unrelated to what it is guarding.
+        // The window is phase 4, located BY PHASE, not by the first `BEGIN;`
+        // in the rendered text. Phases 2 and 3 open short bounded transactions
+        // of their own: an invalid-index cleanup and the constraint add. A
+        // test that assumed the first `BEGIN` was the window would assert
+        // about one of those instead. It would pass or fail for unrelated
+        // reasons.
         let window = steps
             .iter()
             .filter(|s| s.phase == 4)
@@ -7337,9 +7318,9 @@ mod tests {
     #[test]
     fn the_plan_builds_the_drop_gate_index_concurrently() {
         // It lives on `harvest_workflow_executions`, the busiest table in the
-        // schema. A plain build holds SHARE for its duration, which conflicts
-        // with the ROW EXCLUSIVE every insert, state update and retention
-        // delete takes — so on the large tables this plan exists for, a
+        // schema. A plain build holds SHARE for its duration. SHARE conflicts
+        // with the ROW EXCLUSIVE that every insert, state update and retention
+        // delete takes. So on the large tables this plan exists for, a
         // non-concurrent build is an outage.
         let step = migration_plan_steps(&EnableOptions::default(), Utc::now())
             .into_iter()
@@ -7382,7 +7363,7 @@ mod tests {
             "the broad guard, covering every publication mechanism, must be \
              present by default"
         );
-        // Review finding: the phase-4 cutover recheck of the same guard
+        // The phase-4 cutover recheck of the same guard
         // needs the identical override. Otherwise an operator who
         // already accepted the risk at phase 1 would still have the
         // plan refuse hours later. That refusal would land at the lock
@@ -7403,7 +7384,7 @@ mod tests {
             },
             now,
         );
-        // Review finding: an explicit `FOR TABLE harvest_events`
+        // An explicit `FOR TABLE harvest_events`
         // publication is pinned to that relation's OID, so it does not
         // follow the rename this plan performs at cutover. The override
         // is documented for a `FOR ALL TABLES` publication, which
@@ -7450,17 +7431,17 @@ mod tests {
     /// The operator-run plan and the executed script must perform the same
     /// conversion.
     ///
-    /// They are necessarily two texts — one is a transaction the engine runs,
-    /// the other is a numbered runbook a human follows — so they cannot share
+    /// They are necessarily two texts. One is a transaction the engine runs.
+    /// The other is a numbered runbook a human follows. So they cannot share
     /// an implementation. This pins the load-bearing statements to both. It is
     /// not a hypothetical: the plan really did drift once, and every one of
     /// these assertions is a bug it shipped with.
     ///
     /// - A stale trigger function name (`harvest_events_stamp_cohort`, which no
     ///   longer exists): the plan would have failed outright at step 4.
-    /// - A missing `ALTER COLUMN cohort SET DEFAULT`: silent, and far worse —
-    ///   every new row would keep the `-infinity` sentinel and land in the
-    ///   legacy partition forever, so nothing would ever become droppable and
+    /// - A missing `ALTER COLUMN cohort SET DEFAULT`: silent, and far worse.
+    ///   Every new row would keep the `-infinity` sentinel and land in the
+    ///   legacy partition forever. Nothing would ever become droppable, and
     ///   the operator would conclude partitioning does not work.
     /// - Missing legacy PK/unique drops: `ATTACH PARTITION` fails with
     ///   "multiple primary keys ... are not allowed" *after* the operator has
@@ -7520,11 +7501,11 @@ mod tests {
 
     /// The plan's cutover and the script's must be the same instant.
     ///
-    /// The script computes `harvest_event_cohort(now())` inside the database;
-    /// the plan bakes a literal in when it is printed. If the two used
-    /// different rules, an operator following the plan would attach the legacy
-    /// partition at a boundary the engine does not agree with — leaving either
-    /// a gap (rows with no partition) or an overlap (`ATTACH` fails).
+    /// The script computes `harvest_event_cohort(now())` inside the database.
+    /// The plan bakes a literal in when it is printed. With different rules,
+    /// an operator following the plan would attach the legacy partition at a
+    /// boundary the engine does not agree with. That leaves either a gap (rows
+    /// with no partition) or an overlap (`ATTACH` fails).
     #[test]
     fn the_plans_cutover_is_the_current_cohort_boundary() {
         let now = Utc.with_ymd_and_hms(2026, 8, 31, 17, 42, 9).unwrap();
@@ -7614,7 +7595,7 @@ mod tests {
         assert!(parts[2].is_default, "DEFAULT sorts last");
     }
 
-    // Review finding: an unconditional timer tick has no notion of
+    // An unconditional timer tick has no notion of
     // progress. A step that never returns would then tick forever, and
     // the scanner could never age into `Stale`/`Wedged`. `start_paused`
     // makes the tick count deterministic: under paused time, tokio

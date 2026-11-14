@@ -1,14 +1,14 @@
 //! `harvest partition` — the opt-in partitioned `harvest_events` layout
 //! (issue #958).
 //!
-//! Argument-surface guards, deliberately about the *shape* of the command
-//! rather than its effect: the effect is proven against a live Postgres in the
-//! core crate's `event_partitioning_tests`. What can only be checked here is
-//! that the two irreversible commands are hard to run by accident.
+//! Argument-surface guards. They check the *shape* of the command, not its
+//! effect. The core crate's `event_partitioning_tests` prove the effect
+//! against a live Postgres. Only this suite can check that the two
+//! irreversible commands are hard to run by accident.
 //!
 //! Both matter. `enable` takes a brief `ACCESS EXCLUSIVE` lock on
-//! `harvest_events` during which every append waits — and on a populated table
-//! that window covers two index builds and a full-table constraint validation.
+//! `harvest_events`, and every append waits. On a populated table that
+//! window covers two index builds and a full-table constraint validation.
 //! `disable` copies every surviving event row back into a plain table, which
 //! rewrites the whole thing. Neither should be a one-liner run by reflex.
 
@@ -37,8 +37,8 @@ fn partition_status_needs_only_a_shard_dsn() {
     assert!(rendered.contains("postgres://h/s0"), "{rendered}");
 }
 
-/// The plan is read-only advice — it prints SQL and touches no database — so it
-/// must not demand a shard DSN the operator may not have to hand yet.
+/// The plan is read-only advice. It prints SQL and touches no database. So it
+/// must not demand a shard DSN the operator may not have yet.
 #[test]
 fn the_migration_plan_needs_no_database_at_all() {
     parse(&["harvest", "partition", "plan"]).expect("plan parses with no arguments");
@@ -54,9 +54,8 @@ fn enabling_requires_acknowledging_the_lock_window() {
         "postgres://h/s0",
     ])
     .map(|rendered| {
-        // Parsing succeeding is fine — the guard is a runtime refusal — but
-        // the flag must exist and be off by default, or there is nothing to
-        // refuse on.
+        // The guard is a runtime refusal, so parsing may succeed. The flag
+        // must exist and be off by default, or there is nothing to refuse on.
         assert!(
             !rendered.contains("confirm: true"),
             "the lock-window acknowledgement must default to OFF: {rendered}"
@@ -111,10 +110,9 @@ fn reverting_requires_acknowledging_the_table_rewrite() {
     );
 }
 
-/// The cohort width and the lookahead are the two settings that decide both
-/// reclamation granularity and the live partition count, so both must be
-/// reachable from the command an operator actually runs — not only from the
-/// library defaults.
+/// The cohort width and the lookahead decide reclamation granularity and the
+/// live partition count. So the operator's command must reach both, not only
+/// the library defaults.
 #[test]
 fn the_cohort_width_and_lookahead_are_operator_settable() {
     let rendered = parse(&[

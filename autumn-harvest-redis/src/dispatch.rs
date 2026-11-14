@@ -111,7 +111,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-queue cap on [`RedisDispatch::read_across_queues`]'s blocking pass
-/// when more than one queue is in rotation (Codex review, issue #1429).
+/// when more than one queue is in rotation (issue #1429).
 ///
 /// One queue's stream carries its own hash tag. A single multi-key
 /// `XREADGROUP` across several queues therefore crosses Redis Cluster slots
@@ -130,14 +130,13 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// sibling queue to starve.
 ///
 /// This cap alone does not fit a lap with more than `wait /
-/// QUEUE_BLOCK_SLICE` queues (Codex review, issue #1429). The deadline
-/// would pass before the rotation reached every queue once. The tail
-/// queues would then never get a blocking slice at all, in this call or
-/// the next, since the rotation always restarts at 0. `read_across_queues`
-/// therefore shrinks each slice below this cap when the current lap needs
-/// it to. It divides the budget still left by the queues still left in
-/// the lap. Every queue then gets one blocking look within the same
-/// `wait`, regardless of how many queues are configured.
+/// QUEUE_BLOCK_SLICE` queues (issue #1429). The deadline would pass before the
+/// rotation reached every queue once. The tail queues would then never get a
+/// blocking slice at all, in this call or the next, since the rotation always
+/// restarts at 0. `read_across_queues` therefore shrinks each slice below this
+/// cap when the current lap needs it to. It divides the budget still left by
+/// the queues still left in the lap. Every queue then gets one blocking look
+/// within the same `wait`, regardless of how many queues are configured.
 const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
 /// Round trips one queue visit in `read_across_queues` can need. The common
@@ -778,53 +777,50 @@ impl RedisDispatch {
     /// Read every queue in `ordered`, one single-key call each. It runs a
     /// non-blocking pass first. Only if nothing was ready does it then
     /// block. It cycles the rotation across `wait`'s budget, in slices of
-    /// at most [`QUEUE_BLOCK_SLICE`] each (Codex review, issue #1429). That
-    /// keeps a sibling queue's arrival from starving behind the leader's
-    /// full timeout. See `QUEUE_BLOCK_SLICE`'s own doc comment.
+    /// at most [`QUEUE_BLOCK_SLICE`] each (issue #1429). That keeps a sibling
+    /// queue's arrival from starving behind the leader's full timeout. See
+    /// `QUEUE_BLOCK_SLICE`'s own doc comment.
     ///
     /// `ordered` pairs each stream key with its own queue name. A NOGROUP
     /// heal (via [`Self::read_with_heal`]) can then pass just that one
-    /// queue, rather than every configured queue (Codex review, issue
-    /// #1429 follow-up). An operator deleting one queue's consumer group
-    /// must not turn that queue's own recovery into a full
-    /// `ensure_groups` sweep. That sweep costs one `XGROUP CREATE` round
-    /// trip per *every* configured queue, on top of the read this call
-    /// already budgets one round trip for.
+    /// queue, rather than every configured queue (issue #1429 follow-up). An
+    /// operator deleting one queue's consumer group must not turn that queue's
+    /// own recovery into a full `ensure_groups` sweep. That sweep costs one
+    /// `XGROUP CREATE` round trip per *every* configured queue, on top of the
+    /// read this call already budgets one round trip for.
     ///
     /// Extracted from [`Self::next_inner`] to keep that function's line
     /// count under clippy's `too_many_lines` threshold (issue #1429).
     ///
     /// Each queue's `COUNT` is sized from the batch capacity `max` still
-    /// left, not an equal `max / ordered.len()` split (Codex review, issue
-    /// #1429). An even split throttles a single busy queue among many idle
-    /// ones to `max / N`, even though every one of `max`'s slots is free.
-    /// Filling a batch then needs roughly `N` such reads, each visiting
-    /// every queue: about `N²` commands where a single full-budget read
-    /// would do. Sizing from the remaining capacity lets one queue's first
-    /// read fill the whole batch. The loop then stops early once it does,
-    /// still visiting the rest only when an earlier queue came up short.
+    /// left, not an equal `max / ordered.len()` split (issue #1429). An even
+    /// split throttles a single busy queue among many idle ones to `max / N`,
+    /// even though every one of `max`'s slots is free. Filling a batch then
+    /// needs roughly `N` such reads, each visiting every queue: about `N²`
+    /// commands where a single full-budget read would do. Sizing from the
+    /// remaining capacity lets one queue's first read fill the whole batch.
+    /// The loop then stops early once it does, still visiting the rest only
+    /// when an earlier queue came up short.
     ///
     /// One queue's read failing must not discard entries an earlier queue
-    /// in this same pass already claimed into this consumer's PEL (Codex
-    /// review, issue #1429). Propagating the error immediately would drop
-    /// those entries on the floor. They would then sit stranded, invisible
-    /// to the caller, until visibility recovery reclaims them — a real
-    /// latency cost this batching should not add. Every queue is
-    /// attempted, mirroring the same attempt-every-queue-and-keep-going
-    /// shape `ack_many_inner` and `requeue_batch` already use.
+    /// in this same pass already claimed into this consumer's PEL (issue
+    /// #1429). Propagating the error immediately would drop those entries on
+    /// the floor. They would then sit stranded, invisible to the caller, until
+    /// visibility recovery reclaims them — a real latency cost this batching
+    /// should not add. Every queue is attempted, mirroring the same
+    /// attempt-every-queue-and-keep-going shape `ack_many_inner` and
+    /// `requeue_batch` already use.
     ///
     /// Returns the error alongside the reply rather than swallowing it
-    /// whenever some other queue's read still succeeded (Codex review,
-    /// issue #1429). A queue that persistently fails its read — a
-    /// wrong-typed key, say — must not go undrained forever. That is what
-    /// would happen if a busy sibling queue kept every pass "successful"
-    /// from the caller's point of view. [`Self::next_inner`] requeues
-    /// whatever this call did collect, and propagates the error in that
-    /// case. So the worker's degraded-mode fallback still engages instead
-    /// of silently masking a broken queue. The `Err` variant is reserved
-    /// for when nothing at all was read, so a genuine channel outage still
-    /// surfaces even with no
-    /// entries to requeue.
+    /// whenever some other queue's read still succeeded (issue #1429). A queue
+    /// that persistently fails its read — a wrong-typed key, say — must not go
+    /// undrained forever. That is what would happen if a busy sibling queue
+    /// kept every pass "successful" from the caller's point of view.
+    /// [`Self::next_inner`] requeues whatever this call did collect, and
+    /// propagates the error in that case. So the worker's degraded-mode
+    /// fallback still engages instead of silently masking a broken queue. The
+    /// `Err` variant is reserved for when nothing at all was read, so a
+    /// genuine channel outage still surfaces even with no entries to requeue.
     async fn read_across_queues(
         &self,
         ordered: &[(String, String)],
@@ -867,13 +863,12 @@ impl RedisDispatch {
             let deadline = Instant::now() + wait;
             let mut rotation = 0usize;
             // Consecutive immediate errors, reset on every successful read
-            // (Codex review, issue #1429 follow-up). An immediate error --
-            // a wrong-typed key, an ACL rejection -- returns at once. It
-            // consumes none of `slice`'s blocking wait, unlike a real
-            // timeout. A queue that keeps failing this way lets the loop
-            // spin far faster than one blocking call per `slice`. It
-            // issues Redis commands in a tight loop for the rest of
-            // `wait` instead.
+            // (issue #1429 follow-up). An immediate error -- a wrong-typed
+            // key, an ACL rejection -- returns at once. It consumes none of
+            // `slice`'s blocking wait, unlike a real timeout. A queue that
+            // keeps failing this way lets the loop spin far faster than one
+            // blocking call per `slice`. It issues Redis commands in a tight
+            // loop for the rest of `wait` instead.
             //
             // Once every queue in `ordered` has failed back to back, with
             // no successful read between them, a further lap cannot show
@@ -898,8 +893,8 @@ impl RedisDispatch {
                 // (see `QUEUE_BLOCK_SLICE`'s doc comment).
                 //
                 // A lap with more queues than `wait / QUEUE_BLOCK_SLICE`
-                // needs a smaller share per queue (Codex review, issue
-                // #1429). See `QUEUE_BLOCK_SLICE`'s own doc comment.
+                // needs a smaller share per queue (issue #1429). See
+                // `QUEUE_BLOCK_SLICE`'s own doc comment.
                 let lap_position = rotation % ordered.len();
                 let queues_left_in_lap = ordered.len() - lap_position;
                 let slice = if ordered.len() > 1 {
@@ -954,8 +949,8 @@ impl RedisDispatch {
         wait: Duration,
     ) -> RedisAdapterResult<Vec<DispatchLease>> {
         // Paired with its queue name so a NOGROUP heal during the read below
-        // can target just that one queue (Codex review, issue #1429
-        // follow-up). See `read_across_queues`'s own doc comment.
+        // can target just that one queue (issue #1429 follow-up). See
+        // `read_across_queues`'s own doc comment.
         let queue_and_key: Vec<(String, String)> = queues
             .iter()
             .map(|queue| (queue.clone(), self.stream_key(queue)))
@@ -969,9 +964,9 @@ impl RedisDispatch {
 
         // One queue's stream carries its own hash tag (issue #1429). So a
         // single multi-key `XREADGROUP` across several queues crosses Redis
-        // Cluster slots (Codex review). Read each queue's stream in its own
-        // call instead, which stays inside one slot no matter how many
-        // queues this worker serves.
+        // Cluster slots. Read each queue's stream in its own call instead,
+        // which stays inside one slot no matter how many queues this worker
+        // serves.
         //
         // A first, non-blocking pass over every queue costs one fast round
         // trip per queue. It finds an already-ready entry immediately,
@@ -1032,9 +1027,9 @@ impl RedisDispatch {
         // (`read_error`, from `read_across_queues`; see its own doc
         // comment). Deliver nothing and requeue every candidate instead of
         // the normal `max` cap. The caller then still sees the failure,
-        // rather than a quiet, apparently-successful read (Codex review,
-        // issue #1429). The failing queue would otherwise never surface
-        // its own trouble while a busy sibling keeps every pass "ready".
+        // rather than a quiet, apparently-successful read (issue #1429). The
+        // failing queue would otherwise never surface its own trouble while a
+        // busy sibling keeps every pass "ready".
         let deliver_cap = if read_error.is_some() { 0 } else { max };
         let mut leases = Vec::new();
         let mut surplus = Vec::new();
@@ -1096,14 +1091,14 @@ impl RedisDispatch {
     /// say which task it belongs to.
     ///
     /// One round trip per distinct stream in `entries`, not one atomic pipe
-    /// over all of them (Codex review, issue #1429). A multi-queue read's
-    /// malformed entries can span several queues, and each queue's stream
-    /// carries its own hash tag. One `MULTI`/`EXEC` spanning two queues'
-    /// keys would fail `CROSSSLOT` on a real Cluster, mirroring
+    /// over all of them (issue #1429). A multi-queue read's malformed entries
+    /// can span several queues, and each queue's stream carries its own hash
+    /// tag. One `MULTI`/`EXEC` spanning two queues' keys would fail
+    /// `CROSSSLOT` on a real Cluster, mirroring
     /// [`Self::ack_many_inner`]/[`Self::requeue_batch`]'s own reasoning for
-    /// the same split. One stream's pipeline failing must not abort the
-    /// rest, for the same reason those two document. Every stream is
-    /// attempted, and the first error, if any, is returned after the loop.
+    /// the same split. One stream's pipeline failing must not abort the rest,
+    /// for the same reason those two document. Every stream is attempted, and
+    /// the first error, if any, is returned after the loop.
     async fn discard_entries(&self, entries: &[(String, String)]) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
@@ -1145,9 +1140,9 @@ impl RedisDispatch {
             .ignore()
             .query_async::<()>(&mut conn)
             .await?;
-        // A separate, conditional call (Codex review, issue #1429). See
-        // `ACK_MARKER_LUA`'s own doc comment for why an unconditional `DEL`
-        // here would risk deleting a *different*, still-live entry's marker.
+        // A separate, conditional call (issue #1429). See `ACK_MARKER_LUA`'s
+        // own doc comment for why an unconditional `DEL` here would risk
+        // deleting a *different*, still-live entry's marker.
         let _: i64 = self
             .ack_marker_script
             .prepare_invoke()
@@ -1195,12 +1190,12 @@ impl RedisDispatch {
     /// tag.
     ///
     /// One queue's pipeline failing must not abort the rest of this batch
-    /// (Codex review, issue #1429). [`Self::requeue_batch`] already
-    /// documents the same reasoning. A transient error on whichever queue
-    /// the `HashMap` happens to visit first would otherwise leave every
-    /// later queue's references stuck. They would stay acked in Postgres
-    /// but still pending in Redis, until visibility recovery. Every queue
-    /// is attempted; the first error, if any, is returned after the loop.
+    /// (issue #1429). [`Self::requeue_batch`] already documents the same
+    /// reasoning. A transient error on whichever queue the `HashMap` happens
+    /// to visit first would otherwise leave every later queue's references
+    /// stuck. They would stay acked in Postgres but still pending in Redis,
+    /// until visibility recovery. Every queue is attempted; the first error,
+    /// if any, is returned after the loop.
     async fn ack_many_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
         if leases.is_empty() {
             return Ok(());
@@ -1227,19 +1222,19 @@ impl RedisDispatch {
             }
             if let Err(error) = pipe.query_async::<()>(&mut conn).await {
                 // Skip this queue's marker cleanup when its XACK/XDEL pipe
-                // itself failed (Codex review, issue #1429). The entry is
-                // then still pending, unacked. Deleting its marker here
-                // would let the reconcile sweep republish a duplicate ahead
-                // of the entry's own eventual visibility-timeout recovery.
-                // That recovery redelivers the very same duplicate again.
+                // itself failed (issue #1429). The entry is then still
+                // pending, unacked. Deleting its marker here would let the
+                // reconcile sweep republish a duplicate ahead of the entry's
+                // own eventual visibility-timeout recovery. That recovery
+                // redelivers the very same duplicate again.
                 first_error.get_or_insert(error);
                 continue;
             }
 
-            // A separate, conditional call (Codex review, issue #1429). See
+            // A separate, conditional call (issue #1429). See
             // `ACK_MARKER_LUA`'s own doc comment for why an unconditional
-            // `DEL` here would risk deleting a *different*, still-live
-            // entry's marker.
+            // `DEL` here would risk deleting a *different*, still-live entry's
+            // marker.
             let mut invocation = self.ack_marker_script.prepare_invoke();
             for lease in &batch {
                 invocation.key(self.marker_key(queue, lease.task_id));
@@ -1262,16 +1257,16 @@ impl RedisDispatch {
     /// queue in the batch, not one per lease.
     ///
     /// One lease's delay failing to convert must not skip the rest of the
-    /// batch (Codex review, issue #1429 follow-up). An oversized
+    /// batch (issue #1429 follow-up). An oversized
     /// `poll_interval`/`release_backoff_cap` on a direct embedder's
     /// `DispatchSettings` can make one lease's `std::time::Duration` land
     /// outside what `chrono::Duration` can represent. The `?` this used to
-    /// return on would abort before [`Self::requeue_batch`] ever ran.
-    /// Every other, unrelated lease in the batch then stayed pending until
+    /// return on would abort before [`Self::requeue_batch`] ever ran. Every
+    /// other, unrelated lease in the batch then stayed pending until
     /// visibility recovery, the exact blast radius this PR's own
-    /// `ack_many`/`requeue_batch` fixes closed elsewhere. Every lease
-    /// with a convertible delay is still requeued; the first conversion
-    /// error, if any, is returned after that call.
+    /// `ack_many`/`requeue_batch` fixes closed elsewhere. Every lease with a
+    /// convertible delay is still requeued; the first conversion error, if
+    /// any, is returned after that call.
     async fn release_many_inner(
         &self,
         leases: &[(DispatchLease, Duration)],
@@ -1410,15 +1405,15 @@ impl RedisDispatch {
     /// per-queue, so only a queue actually holding idle work pays for them.
     ///
     /// The scan reads each queue's raw reply through `req_packed_commands`
-    /// rather than `Pipeline::query_async` (Codex review, issue #1429).
-    /// This pipe is not a Redis transaction. Each `XPENDING` still runs
-    /// independently server-side. But `query_async`'s typed decode treats
-    /// any single command erroring (a wrong-typed key, an ACL denial) as a
-    /// failure of the whole call. That discards every other queue's own
-    /// reply too, not just the broken queue's. A single persistently bad
-    /// queue would then silently disable visibility recovery for every
-    /// queue this worker serves. One queue's `XPENDING` failing here costs
-    /// only that queue's own recovery this pass.
+    /// rather than `Pipeline::query_async` (issue #1429). This pipe is not a
+    /// Redis transaction. Each `XPENDING` still runs independently
+    /// server-side. But `query_async`'s typed decode treats any single command
+    /// erroring (a wrong-typed key, an ACL denial) as a failure of the whole
+    /// call. That discards every other queue's own reply too, not just the
+    /// broken queue's. A single persistently bad queue would then silently
+    /// disable visibility recovery for every queue this worker serves. One
+    /// queue's `XPENDING` failing here costs only that queue's own recovery
+    /// this pass.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
         if queues.is_empty() {
             return Ok(0);
@@ -1604,7 +1599,6 @@ fn claim_rate_limit_slot(slot: &AtomicI64, now_ms: i64, interval_ms: i64) -> boo
         .is_ok()
 }
 
-/// Read the `payload` field of a stream entry.
 fn entry_payload(map: &HashMap<String, redis::Value>) -> Option<String> {
     match map.get(PAYLOAD_FIELD)? {
         redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok().map(ToString::to_string),
@@ -1723,20 +1717,19 @@ return written
 /// the number of entries handled.
 ///
 /// The marker write is skipped, along with the requeue itself, when the
-/// marker no longer names this entry (Codex review, issue #1429). A batched
-/// worker defers a lease's ack until after its task has already been
-/// spawned, the same ordering [`ACK_MARKER_LUA`]'s own doc comment
-/// describes. A fast-completing task can re-pend and republish the same
-/// task id before that stale lease is ever settled. If the deferred ack
-/// then fails outright rather than merely running late, the stale entry is
-/// never acked at all. It sits in the pending entries list until this
-/// script's caller — visibility recovery — claims it. That happens long
-/// after the fresh entry already claimed the marker. An unconditional
-/// overwrite here would then publish a stray duplicate. It would also
-/// steal the marker back from the fresh entry, exactly like an
-/// unconditional marker `DEL` would in `ack`. The stale entry is still
-/// acked and deleted either way, so the pending entries list never keeps a
-/// reference no worker owns.
+/// marker no longer names this entry (issue #1429). A batched worker defers a
+/// lease's ack until after its task has already been spawned, the same
+/// ordering [`ACK_MARKER_LUA`]'s own doc comment describes. A fast-completing
+/// task can re-pend and republish the same task id before that stale lease is
+/// ever settled. If the deferred ack then fails outright rather than merely
+/// running late, the stale entry is never acked at all. It sits in the pending
+/// entries list until this script's caller — visibility recovery — claims it.
+/// That happens long after the fresh entry already claimed the marker. An
+/// unconditional overwrite here would then publish a stray duplicate. It would
+/// also steal the marker back from the fresh entry, exactly like an
+/// unconditional marker `DEL` would in `ack`. The stale entry is still acked
+/// and deleted either way, so the pending entries list never keeps a reference
+/// no worker owns.
 const REQUEUE_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1832,7 +1825,7 @@ return promoted
 ";
 
 /// Lua script that deletes a dedupe marker only if it still names the entry
-/// being acked (Codex review, issue #1429).
+/// being acked (issue #1429).
 ///
 /// Keys:
 /// - `KEYS[1..]`: one dedupe marker per acked lease.
@@ -2166,7 +2159,7 @@ mod tests {
 
     /// `next_inner` rotates `(queue, key)` pairs, not two separately
     /// rotated lists. A queue's name and its own stream key therefore stay
-    /// paired at every offset (Codex review, issue #1429 follow-up).
+    /// paired at every offset (issue #1429 follow-up).
     ///
     /// A NOGROUP heal during a read passes only the single queue name
     /// paired with the key that read used. Rotating the two lists

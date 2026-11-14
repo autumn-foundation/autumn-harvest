@@ -533,7 +533,7 @@ pub(crate) async fn run_admitted(
     next: Next,
 ) -> Response {
     // No role admitted a request with no role names. Only a public route
-    // gets here so, and it carries no principal.
+    // gets here that way, and it carries no principal.
     if names.is_empty() {
         return next.run(request).await;
     }

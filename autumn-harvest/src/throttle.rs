@@ -2,13 +2,13 @@
 //!
 //! # Overview
 //!
-//! The dominant trigger sources for harvest workflows — scheduled fan-outs,
-//! post-downtime backfills (#337), webhook storms (#344), and batch starts —
-//! routinely admit *hundreds of distinct, legitimate starts in a single tick*.
-//! When each of those workflows touches the same rate-limited downstream (a
-//! third-party API capped at 100 req/min, a fragile internal service, a vendor
-//! quota), the operator wants a front-door knob to **pace admissions to a
-//! sustained rate and defer the excess** — dropping nothing, rejecting nothing.
+//! Scheduled fan-outs, post-downtime backfills (#337), webhook storms (#344)
+//! and batch starts often admit *hundreds of distinct, legitimate starts in a
+//! single tick*. These workflows can all touch the same rate-limited
+//! downstream: a third-party API capped at 100 req/min, a fragile internal
+//! service, or a vendor quota. The operator then wants a front-door knob to
+//! **pace admissions to a sustained rate and defer the excess**. Nothing is
+//! dropped and nothing is rejected.
 //!
 //! `ThrottlePolicy` lets a workflow author declare a *rate*, a *burst*, and an
 //! optional *key expression* over the start input:
@@ -25,14 +25,14 @@
 //! # Semantics
 //!
 //! **Token bucket / GCRA:** admitted starts for a given throttle key never
-//! exceed `rate` (+ `burst`) over any window. Each admission (immediate or a
-//! later deferred-fire) reserves one token from the shared per-key bucket in
-//! `harvest_rate_limit_buckets`, the same battle-tested machinery the activity
-//! rate limiter (#332) uses.
+//! exceed `rate` (+ `burst`) over any window. Each admission, immediate or a
+//! later deferred fire, reserves one token from the shared per-key bucket in
+//! `harvest_rate_limit_buckets`. The activity rate limiter (#332) uses the
+//! same machinery.
 //!
-//! **Defer, don't drop:** when the bucket is empty, the start is **durably
-//! deferred** — a row is written to `harvest_start_throttle` *before*
-//! `WorkflowStarted` is appended — and a background scanner
+//! **Defer, do not drop:** when the bucket is empty, the start is **durably
+//! deferred**. A row is written to `harvest_start_throttle` *before*
+//! `WorkflowStarted` is appended. A background scanner
 //! ([`fire_due_throttled_starts`]) admits it later as tokens refill. Nothing is
 //! dropped (contrast debounce, #499) and nothing is rejected (contrast
 //! `RejectDuplicate`).
@@ -58,25 +58,25 @@
 //!
 //! # Known gaps — call-site duplication and ungated producers
 //!
-//! `reserve_or_defer` is invoked independently from **four** call sites (the
-//! HTTP start route and the batch-start handler in `autumn-harvest-plugin`'s
-//! `api.rs`, plus the scheduler-tick and scheduler-buffered/backfill-fire loops
-//! in `scheduler.rs`) rather than from one central choke point. This mirrors —
-//! and does not fix — the same per-producer duplication shape the admission-gate
-//! feature (#377) has (its full producer contract is enumerated by
-//! [`crate::admission_gate::producer_contract`]). A
-//! consolidated design would thread throttle admission into
-//! `execution::start_or_load_workflow_execution_collect` itself so every
-//! current *and future* producer gets it for free; that refactor was judged
-//! out of proportion for this feature (it touches code every producer
-//! depends on) and is left as a follow-up. Until then, the following
-//! producers of workflow starts do **not** consult a workflow's
-//! [`ThrottlePolicy`] at all:
+//! Four call sites invoke `reserve_or_defer` independently, with no central
+//! choke point. Two are in `autumn-harvest-plugin`'s `api.rs`: the HTTP start
+//! route and the batch-start handler. Two are in `scheduler.rs`: the
+//! scheduler-tick loop and the buffered/backfill-fire loop. The admission-gate
+//! feature (#377) has the same per-producer duplication, and this module does
+//! not fix it. [`crate::admission_gate::producer_contract`] lists the full
+//! producer contract of the gate.
+//!
+//! A consolidated design would put throttle admission into
+//! `execution::start_or_load_workflow_execution_collect`. Every current *and
+//! future* producer would then get it for free. That refactor touches code
+//! that every producer depends on. So it is out of proportion for this
+//! feature and is left as a follow-up. Until then, these producers of
+//! workflow starts do **not** consult a workflow's [`ThrottlePolicy`]:
 //!
 //! * **`signal_with_start_workflow_execution` / `update_with_start_workflow_execution`**
-//!   (`execution.rs`): an entity-workflow pattern fed by signals/updates can
-//!   generate exactly the same kind of start burst an HTTP `POST .../start`
-//!   caller can, with zero pacing.
+//!   (`execution.rs`): signals or updates can feed an entity workflow. That
+//!   makes the same start burst as an HTTP `POST .../start` caller, with no
+//!   pacing.
 //! * **Completion-trigger continuations** (`completion_trigger.rs`): a
 //!   terminal-state trigger that starts a follow-up workflow does not consult a
 //!   `ThrottlePolicy`. (It DOES honour the admission gate as of #618 — the
@@ -84,18 +84,18 @@
 //! * **The outbox relay** (`autumn-harvest-plugin`'s `outbox.rs`): replays
 //!   workflow-start events durably queued before a bucket was ever consulted.
 //!
-//! A workflow author relying on `#[workflow(throttle(...))]` to bound a
-//! rate-limited downstream should confirm none of these paths can also start
-//! that workflow, or the effective admitted rate can exceed the declared one.
+//! An author who uses `#[workflow(throttle(...))]` to bound a rate-limited
+//! downstream should confirm that none of these paths starts that workflow.
+//! Otherwise the admitted rate can exceed the declared rate.
 //!
 //! Separately, the scanner (`fire_due_on_conn`/`fire_claimed_throttle_row`/
-//! `fire_due_throttled_starts`) is a near-total structural copy of
-//! `debounce.rs`'s equivalent (`fire_due_on_conn`/`fire_claimed_debounce_row`/
-//! `fire_due_debounced_starts`) rather than a shared generic scanner — a bug
-//! fix to the shared shape (the `to_regclass` missing-table tolerance, the
-//! `FOR UPDATE SKIP LOCKED` claim-batch transaction structure, or the
-//! spawn-after-commit pattern for deferred trigger-starts) must currently be
-//! applied in both places.
+//! `fire_due_throttled_starts`) is a near-total structural copy of the
+//! `debounce.rs` scanner (`fire_due_on_conn`/`fire_claimed_debounce_row`/
+//! `fire_due_debounced_starts`). There is no shared generic scanner. So a bug
+//! fix to the shared shape must go in both places. That shape includes the
+//! `to_regclass` missing-table tolerance, the `FOR UPDATE SKIP LOCKED`
+//! claim-batch transaction and the spawn-after-commit pattern for deferred
+//! trigger-starts.
 
 use std::time::Duration;
 
@@ -112,49 +112,51 @@ pub const THROTTLE_FIRE_BATCH_SIZE: i64 = 100;
 
 /// Maximum number of rows drained from a single `bucket_key` in one scanner tick.
 ///
-/// Regardless of how large that key's backlog is (fairness fix, issue #607
-/// code review), this bounds one hot/starving key to at most this fraction of
-/// a tick's [`THROTTLE_FIRE_BATCH_SIZE`] budget so newer rows under *other*
-/// keys are never starved by an unbounded single-key backlog.
+/// The cap bounds one hot or starving key to this share of the
+/// [`THROTTLE_FIRE_BATCH_SIZE`] budget of a tick, however large its backlog is
+/// (issue #607). So an unbounded single-key backlog never starves newer rows
+/// under *other* keys.
 pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 
-/// Backoff applied to a throttle row's `deferred_at` when its fire is blocked by
-/// an admission gate (issue #1053, review finding B-G1).
+/// Backoff applied to a throttle row's `deferred_at` when an admission gate
+/// blocks its fire (issue #1053).
 ///
-/// A gate is **queue-scoped**, so the SQL candidate pre-filter cannot see it (it
-/// only knows token levels + `expires_at`). Without bumping `deferred_at`, a
-/// gate-blocked-but-tokened row keeps its original (older) `deferred_at`, so it
-/// stays at the front of the `ORDER BY deferred_at ASC` fire ordering and keeps
-/// being re-selected every tick. If ≥[`THROTTLE_FIRE_BATCH_SIZE`] such rows are
-/// gated together (a queue-wide incident gate over many tenant keys), they
-/// monopolize the fixed-size fire batch and **starve newer un-gated throttle
-/// keys on other queues indefinitely** — reopening exactly the cross-key
-/// fairness pathology the per-key cap + token pre-filter above closed.
+/// A gate is **queue-scoped**, so the SQL candidate pre-filter cannot see it.
+/// The pre-filter only knows token levels and `expires_at`. Without a bump, a
+/// gate-blocked row that has a token keeps its older `deferred_at`. It stays
+/// at the front of the `ORDER BY deferred_at ASC` fire ordering, so every
+/// tick selects it again. A queue-wide incident gate over many tenant keys can
+/// block ≥[`THROTTLE_FIRE_BATCH_SIZE`] such rows together. They then
+/// monopolize the fixed-size fire batch. They **starve newer un-gated throttle
+/// keys on other queues indefinitely**. That reopens the cross-key fairness
+/// pathology that the per-key cap and the token pre-filter close.
 ///
-/// Bumping `deferred_at` forward on re-defer rotates a gated row *behind* every
-/// un-gated row (whose `deferred_at` is its real, earlier deferral time) in the
-/// fire ordering, so un-gated keys are selected and fire first, and a gated row
-/// is re-attempted less often (fewer per-tick block-metric increments + log
-/// lines). It is a modest fixed tuning value, not a config knob.
+/// A re-defer bumps `deferred_at` forward. That rotates a gated row *behind*
+/// every un-gated row in the fire ordering, because an un-gated row keeps its
+/// real, earlier deferral time. Un-gated keys are then selected and fire
+/// first. A gated row is attempted less often, with fewer block-metric
+/// increments and log lines per tick. It is a modest fixed tuning value, not
+/// a config knob.
 ///
-/// This is safe against the `schedule_to_start` staleness drop (AC-c, issue
-/// #607): the candidate SELECT surfaces expired rows via an OR-`expires_at`
-/// clause that is independent of `deferred_at` (there is no `deferred_at <= NOW()`
-/// candidate floor), so pushing `deferred_at` into the future never hides an
-/// expired row from its drop — `expires_at` is left untouched, so a gated row
-/// still times out at its original deadline.
-// Gated to match its sole user (the db-only throttle scanner path,
-// `redefer_throttle_row`/`fire_claimed_throttle_row`): without this the const is
-// dead code under narrow feature sets (e.g. the CLI Lint job, which compiles
-// `autumn-harvest` without `db`), surfaced by clippy 1.97 `-D warnings`.
+/// The bump is safe against the `schedule_to_start` staleness drop (AC-c,
+/// issue #607). The candidate SELECT finds expired rows through an
+/// OR-`expires_at` clause that does not depend on `deferred_at`. There is no
+/// `deferred_at <= NOW()` candidate floor. So a future `deferred_at` never
+/// hides an expired row from its drop. The bump leaves `expires_at` unchanged,
+/// so a gated row still times out at its original deadline.
+// Gated like its only users, `redefer_throttle_row` and
+// `fire_claimed_throttle_row`, which need `db`. Without the gate, the const is
+// dead code under narrow feature sets. The CLI Lint job compiles
+// `autumn-harvest` without `db`, and clippy 1.97 `-D warnings` rejects it.
 #[cfg(feature = "db")]
 const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Re-defer backoff for a row blocked by an exhausted per-tenant quota
-/// (issue #946) at fire time — same value and same rationale as
-/// [`GATE_REDEFER_BACKOFF`] (a separate constant purely for the log/intent
-/// clarity of naming the two distinct block causes independently; nothing
-/// depends on them staying numerically equal).
+/// Re-defer backoff for a row that an exhausted per-tenant quota blocks at
+/// fire time (issue #946).
+///
+/// It has the value and rationale of [`GATE_REDEFER_BACKOFF`]. It is a
+/// separate constant only so that each block cause has its own name. Nothing
+/// depends on the two values staying equal.
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -207,20 +209,19 @@ impl ThrottlePolicy {
     /// `burst` defaults to the rate's per-period count (e.g. `"100/m"` → `100`)
     /// when `None`, so a single window's worth of starts can burst through.
     ///
-    /// The final `burst` (explicit or defaulted) must be `>= 1.0`. The token
-    /// debit path (`queue::try_consume_rate_limit_token`) only admits a start
-    /// when the refilled bucket reaches `>= 1.0`, and refill is capped at
-    /// `burst` — a bucket capacity below one token (e.g. an explicit
-    /// `burst = 0.5`, or a fractional per-unit rate like `"0.5/s"` with no
-    /// explicit burst) can therefore never successfully debit, deferring
-    /// every start under that key forever (or until `schedule_to_start` drops
-    /// it, if configured) rather than merely pacing them (code review, issue
-    /// #607).
+    /// The final `burst` (explicit or defaulted) must be `>= 1.0` (issue #607).
+    /// The token debit path (`queue::try_consume_rate_limit_token`) admits a
+    /// start only when the refilled bucket reaches `>= 1.0`. Refill is capped
+    /// at `burst`. So a bucket capacity below one token can never debit. An
+    /// explicit `burst = 0.5` has that capacity, and so does a fractional
+    /// per-unit rate like `"0.5/s"` with no explicit burst. Every start under
+    /// that key then defers forever, or until `schedule_to_start` drops it. It
+    /// is never merely paced.
     ///
     /// # Errors
-    /// Returns `Err(message)` when the rate string is malformed, the rate is
-    /// non-positive, or the final `burst` (explicit or defaulted from the
-    /// rate's per-period count) is below `1.0`.
+    /// Returns `Err(message)` when the rate string is malformed or the rate is
+    /// non-positive. It also fails when the final `burst`, explicit or
+    /// defaulted from the per-period count of the rate, is below `1.0`.
     pub fn from_rate_str(
         rate: &str,
         burst: Option<f64>,
@@ -231,12 +232,11 @@ impl ThrottlePolicy {
         let burst = match burst {
             Some(b) if b.is_finite() && b >= 1.0 => b,
             Some(b) if !b.is_finite() => {
-                // An infinite (or NaN) burst is inserted verbatim as the
-                // bucket's initial `tokens` (`ensure_throttle_bucket`), and
-                // `LEAST(burst, tokens + refill)` degrades to `tokens + refill`
-                // -- an unbounded, ever-growing allowance that never actually
-                // throttles anything, effectively disabling the throttle for
-                // that key (code review, issue #607).
+                // `ensure_throttle_bucket` inserts an infinite (or NaN) burst
+                // verbatim as the initial `tokens` of the bucket (issue #607).
+                // Then `LEAST(burst, tokens + refill)` degrades to
+                // `tokens + refill`. That allowance grows without bound and
+                // never throttles, so it disables the throttle for that key.
                 return Err(format!("throttle burst must be a finite number, got {b}"));
             }
             Some(b) => {
@@ -279,11 +279,11 @@ pub fn parse_rate(s: &str) -> Result<RateSpec, String> {
         .trim()
         .parse()
         .map_err(|_| format!("throttle rate count '{}' is not a number", count_str.trim()))?;
-    // `parse::<f64>()` accepts "nan"/"inf"/"infinity" literals, so reject
-    // both explicitly via `!is_finite()` rather than `!(count > 0.0)` (NaN
-    // comparisons are always false, which would make the negation silently
-    // pass NaN through as "valid"; infinity would otherwise pass `> 0.0` and
-    // produce an unbounded refill rate/burst that defeats the throttle).
+    // `parse::<f64>()` accepts "nan", "inf" and "infinity", so reject both
+    // through `!is_finite()`. A bare `count <= 0.0` test is false for NaN,
+    // because every NaN comparison is false. So it alone would silently pass
+    // NaN as valid. Infinity passes `> 0.0` and gives an unbounded refill rate
+    // and burst. That defeats the throttle.
     if !count.is_finite() || count <= 0.0 {
         return Err(format!(
             "throttle rate count must be a finite number > 0, got {count}"
@@ -337,8 +337,6 @@ pub fn compute_expiry(
     schedule_to_start: Option<Duration>,
 ) -> Option<DateTime<Utc>> {
     let d = schedule_to_start?;
-    // Clamp absurd/overflowing durations to a large-but-finite value and use
-    // checked addition so an extreme deadline can never panic.
     let chrono_d =
         chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
     Some(
@@ -354,10 +352,9 @@ pub fn compute_expiry(
 
 /// Parameters for [`reserve_or_defer`].
 ///
-/// `start_options` reuses [`crate::debounce::DebounceStartOptions`] verbatim so
-/// the persisted schema stays stable as `StartWorkflowParams` grows; it is only
-/// consulted on the defer branch (the reserve branch proceeds with the caller's
-/// own params).
+/// `start_options` reuses [`crate::debounce::DebounceStartOptions`] verbatim,
+/// so the persisted schema stays stable as `StartWorkflowParams` grows. Only
+/// the defer branch reads it. The reserve branch uses the params of the caller.
 #[cfg(feature = "db")]
 pub struct AdmitThrottleParams<'a> {
     pub workflow_name: &'a str,
@@ -383,15 +380,15 @@ pub struct ThrottleDeferOutcome {
     pub workflow_id: String,
     pub throttle_key: String,
     pub deferred_at: DateTime<Utc>,
-    /// `true` when this call durably inserted a brand-new pending row;
-    /// `false` when it instead resolved to an *already-existing* pending row
-    /// for this `workflow_id` via `reserve_or_defer`'s idempotency shortcut
-    /// (step 1) -- e.g. a client retry, or an operator repeating the same
-    /// `schedule_backfill` window while an earlier call's deferred slots are
-    /// still pending. A caller that tracks "how many new admissions did this
-    /// call make" (budget spend, dispatched counters) must gate on `fresh`
-    /// rather than treating every `Deferred` as a new admission (code
-    /// review, issue #607) -- otherwise a repeated call double-counts and
+    /// `true` when this call durably inserted a brand-new pending row.
+    ///
+    /// `false` when the idempotency shortcut of `reserve_or_defer` (step 1)
+    /// found an *already-existing* pending row for this `workflow_id`. A
+    /// client retry does that. So does an operator who repeats a
+    /// `schedule_backfill` window while the deferred slots of an earlier call
+    /// are still pending. A caller that counts new admissions, such as budget
+    /// spend or dispatched counters, must gate on `fresh` (issue #607). If it
+    /// counts every `Deferred`, a repeated call double-counts. It also
     /// double-spends budget for a no-op idempotent attach.
     pub fresh: bool,
 }
@@ -400,10 +397,12 @@ pub struct ThrottleDeferOutcome {
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub enum ThrottleAdmission {
-    /// A token was reserved: the caller should proceed with the normal start on
-    /// the same connection, then [`crate::queue::refund_rate_limit_token`] the
-    /// bucket if the start short-circuits (an id-reuse policy returned an
-    /// existing run without creating a fresh one).
+    /// A token was reserved: the caller should proceed with the normal start.
+    ///
+    /// The start uses the same connection. If the start short-circuits, the
+    /// caller passes the bucket to [`crate::queue::refund_rate_limit_token`].
+    /// An id-reuse policy short-circuits when it returns an existing run
+    /// without creating a fresh one.
     Reserved {
         /// The bucket key the token was reserved from, for the refund call.
         bucket_key: String,
@@ -412,14 +411,14 @@ pub enum ThrottleAdmission {
     /// caller must **not** start; over HTTP it returns `202 Accepted`.
     Deferred(ThrottleDeferOutcome),
     /// An active execution already exists for this `(workflow_name,
-    /// workflow_id)` under a reuse policy that makes admission a no-op
-    /// (`AllowDuplicate`, `RejectDuplicate`) or resolves against a
+    /// workflow_id)`. Its reuse policy makes admission a no-op
+    /// (`AllowDuplicate`, `RejectDuplicate`). Or the policy resolves against a
     /// non-terminal prior (`AllowDuplicateFailedOnly` when the existing row
-    /// isn't FAILED/CANCELLED). No token was reserved and no pending row was
-    /// written — the caller must proceed straight to
+    /// is not FAILED/CANCELLED). No token was reserved and no pending row was
+    /// written. The caller must proceed straight to
     /// `start_or_load_workflow_execution*`, which resolves the reuse policy
-    /// itself (returns the existing run, or rejects it under
-    /// `RejectDuplicate`).
+    /// itself. It returns the existing run, or rejects it under
+    /// `RejectDuplicate`.
     Bypassed,
 }
 
@@ -438,15 +437,15 @@ pub struct PendingThrottleRecord {
 
 /// One `(workflow_name, throttle_key)` backlog group for the admin read.
 ///
-/// Alongside the resolved state of that throttle's shared token bucket
-/// (issue #945): the declared baseline, any live TTL'd operator override,
-/// and the resulting effective rate-limit parameters.
+/// It also carries the resolved state of the shared token bucket of that
+/// throttle (issue #945). That state is the declared baseline, any live TTL'd
+/// operator override, and the resulting effective rate-limit parameters.
 ///
-/// The bucket-derived fields are `None`/`false` only in the (practically
-/// unreachable) case that a backlog row exists with no matching
-/// `harvest_rate_limit_buckets` row -- [`reserve_or_defer`] always creates
-/// the bucket before writing the backlog row, so this is a defensive
-/// fallback rather than an expected shape.
+/// The bucket-derived fields are `None`/`false` only when a backlog row has no
+/// matching `harvest_rate_limit_buckets` row. That case is practically
+/// unreachable: [`reserve_or_defer`] always creates the bucket before it
+/// writes the backlog row. So this is a defensive fallback, not an expected
+/// shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThrottleBacklogEntry {
     pub workflow_name: String,
@@ -481,11 +480,10 @@ pub struct ThrottleBacklogEntry {
 /// `LEFT JOIN`ed bucket columns (issue #945) -- the pure mapping
 /// [`throttle_backlog_by_key`] applies to each grouped row.
 ///
-/// `(declared_refill_rate, declared_burst)` are `None` only when the
-/// backlog row's `bucket_key` has no matching `harvest_rate_limit_buckets`
-/// row (a `LEFT JOIN` miss) -- practically unreachable since
-/// [`reserve_or_defer`] always creates the bucket first, but handled
-/// defensively rather than panicking.
+/// `(declared_refill_rate, declared_burst)` are `None` only on a `LEFT JOIN`
+/// miss: no `harvest_rate_limit_buckets` row matches the `bucket_key` of the
+/// backlog row. [`reserve_or_defer`] always creates the bucket first, so the
+/// miss is practically unreachable. The function handles it without a panic.
 #[cfg(feature = "db")]
 fn resolve_backlog_bucket_state(
     declared_refill_rate: Option<f64>,
@@ -517,13 +515,13 @@ fn resolve_backlog_bucket_state(
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
-/// Delegates to [`crate::queue::ensure_rate_limit_bucket`] rather than
-/// re-issuing the same `INSERT`: the two paths write the *same* table with the
-/// same "never reset a live bucket" contract, and since issue #1127 that
+/// Delegates to [`crate::queue::ensure_rate_limit_bucket`] and does not
+/// re-issue the same `INSERT`. The two paths write the *same* table with the
+/// same "never reset a live bucket" contract. Since issue #1127, that
 /// statement also carries the stale-row touch that interlocks a registration
-/// against the idle-bucket GC. A second copy of it here would silently miss
-/// that interlock, and a deferred start whose bucket was collected mid-flight
-/// can never debit a token again.
+/// against the idle-bucket GC. A second copy here would silently miss that
+/// interlock. A deferred start whose bucket the GC collects mid-flight can
+/// then never debit a token again.
 #[cfg(feature = "db")]
 async fn ensure_throttle_bucket(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -536,9 +534,9 @@ async fn ensure_throttle_bucket(
 
 /// Whether any pending-start row already exists for a bucket key.
 ///
-/// Used for the fast-path FIFO guard: if a backlog already exists, a new start
-/// is appended (deferred) rather than allowed to jump the queue by consuming a
-/// freshly-refilled token ahead of older waiters.
+/// The fast-path FIFO guard uses it. When a backlog exists, a new start is
+/// deferred behind it. It does not jump the queue by taking a freshly-refilled
+/// token ahead of older waiters.
 #[cfg(feature = "db")]
 async fn pending_backlog_exists(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -563,19 +561,19 @@ async fn pending_backlog_exists(
 /// Look up an already-pending row for this exact `(workflow_name, workflow_id)`,
 /// regardless of which bucket/key it was filed under.
 ///
-/// `workflow_id` is the natural idempotency boundary the rest of the engine
-/// already keys on (reuse policies, uniqueness indexes); reusing it here makes a
-/// retried admission for a start that is already durably deferred land on the
-/// *same* pending row instead of silently queuing a second, independent one
-/// that a later `reject_duplicate` fire would drop with no signal back to the
-/// original (retried) caller.
+/// `workflow_id` is the natural idempotency boundary that the rest of the
+/// engine keys on, through reuse policies and uniqueness indexes. With it, a
+/// retried admission for a durably deferred start lands on the *same* pending
+/// row. Without it, the retry silently queues a second, independent row. A
+/// later `reject_duplicate` fire would drop that row with no signal back to
+/// the retried caller.
 ///
 /// A row already past its `schedule_to_start` deadline is never returned,
-/// even if the scanner hasn't dropped it yet (code review, issue #607) --
-/// otherwise a retry would land on a row the scanner is about to time out
-/// and delete without ever starting a workflow, reporting `Deferred` for a
-/// start that will never actually run. Ignoring it here lets the retry
-/// proceed to a genuinely fresh admission instead.
+/// even if the scanner has not dropped it yet (issue #607). Otherwise a retry
+/// would land on a row that the scanner is about to time out and delete
+/// without ever starting a workflow. The retry would then report `Deferred`
+/// for a start that never runs. Ignoring the row here lets the retry proceed
+/// to a genuinely fresh admission instead.
 #[cfg(feature = "db")]
 async fn existing_pending_throttle_for_workflow_id(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -591,11 +589,6 @@ async fn existing_pending_throttle_for_workflow_id(
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         deferred_at: DateTime<Utc>,
     }
-    // Exclude a row already past its schedule_to_start deadline even if the
-    // scanner hasn't deleted it yet (code review, issue #607): otherwise a
-    // retry lands on a row the scanner is about to drop without ever
-    // starting a workflow, silently reporting `Deferred` for a start that
-    // will never run.
     let row: Option<Row> = diesel::sql_query(
         "SELECT throttle_key, deferred_at FROM harvest_start_throttle \
          WHERE workflow_name = $1 AND workflow_id = $2 \
@@ -659,15 +652,16 @@ async fn insert_pending_throttle_row(
 /// Whether an active execution for `(workflow_name, workflow_id)` already
 /// makes a throttle admission a no-op or an immediate reject under `reuse_policy`.
 ///
-/// `AllowDuplicate`/`RejectDuplicate` bypass unconditionally against any
-/// existing state; `AllowDuplicateFailedOnly` bypasses unless the existing row
-/// is FAILED/CANCELLED (a genuine fresh start); `TerminateIfRunning` never
-/// bypasses (it always starts fresh: cancel + replace).
+/// - `AllowDuplicate` and `RejectDuplicate` bypass against any existing state.
+/// - `AllowDuplicateFailedOnly` bypasses unless the existing row is
+///   FAILED/CANCELLED, which makes a genuine fresh start.
+/// - `TerminateIfRunning` never bypasses. It always starts fresh: cancel and
+///   replace.
 ///
-/// Extracted out of [`reserve_or_defer`] so both it and callers deciding
-/// whether to apply a *different* admission-time check (e.g. the workflow
-/// input byte-cap) can ask the identical question without duplicating the
-/// lookup or the reuse-policy matching.
+/// [`reserve_or_defer`] uses it. So does a caller that decides whether to
+/// apply a *different* admission-time check, such as the workflow input
+/// byte-cap. Both share one implementation of the lookup and of the
+/// reuse-policy match.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -700,9 +694,10 @@ pub async fn resolve_bypass(
 /// Whether a pending throttle row already exists for this exact
 /// `(workflow_name, workflow_id)`, regardless of which bucket/key it was filed under.
 ///
-/// A thin boolean wrapper over [`existing_pending_throttle_for_workflow_id`]
-/// for callers that only need the yes/no answer (e.g. deciding whether to
-/// apply the workflow input byte-cap), not the full [`ThrottleDeferOutcome`].
+/// A thin boolean wrapper over [`existing_pending_throttle_for_workflow_id`].
+/// It serves callers that need only the yes/no answer, not the full
+/// [`ThrottleDeferOutcome`]. An example is the decision to apply the workflow
+/// input byte-cap.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -727,15 +722,15 @@ pub async fn has_pending_throttle_for_workflow_id(
 /// defaulting to `AllowDuplicate` when unset or unrecognized — identical to
 /// [`reserve_or_defer`]'s own parsing.
 ///
-/// A caller applying a byte-cap check *before* ever calling [`reserve_or_defer`]
-/// (code-review fix, issue #607) must not reject a retry that
-/// [`reserve_or_defer`] would resolve via [`ThrottleAdmission::Bypassed`] (an
-/// active execution already satisfies the reuse policy) or via an idempotent
-/// attach to an already-pending row — neither case inserts a fresh row, so
-/// the cap must not apply to either. Composes [`resolve_bypass`] and
-/// [`has_pending_throttle_for_workflow_id`], the same two primitives
-/// [`reserve_or_defer`] itself now uses for its own steps (0) and (1), so
-/// there is exactly one implementation of each question.
+/// A caller can apply a byte-cap check *before* it calls [`reserve_or_defer`]
+/// (issue #607). It must not reject a retry that [`reserve_or_defer`] resolves
+/// through [`ThrottleAdmission::Bypassed`], where an active execution already
+/// satisfies the reuse policy. It must not reject an idempotent attach to an
+/// already-pending row either. Neither case inserts a fresh row, so the cap
+/// does not apply. This function composes [`resolve_bypass`] and
+/// [`has_pending_throttle_for_workflow_id`]. [`reserve_or_defer`] uses the
+/// same two primitives for its steps (0) and (1). So each question has
+/// exactly one implementation.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -762,22 +757,23 @@ pub async fn skip_size_check(
 ///
 /// 0. **Active-execution bypass:** unless the caller's reuse policy is
 ///    `TerminateIfRunning` (which always starts fresh), look up whether an
-///    active execution already exists for `(workflow_name, workflow_id)`. If
-///    the reuse policy makes this admission a no-op or an immediate reject —
-///    `AllowDuplicate`/`RejectDuplicate` (any existing state), or
-///    `AllowDuplicateFailedOnly` against a non-terminal prior — skip throttle
-///    admission entirely and return [`ThrottleAdmission::Bypassed`]: no token
-///    reserved, no pending row written. The caller proceeds straight to the
-///    normal start, which resolves the reuse policy itself.
-/// 1. **Idempotency, checked next:** if a pending row already exists for this
-///    exact `workflow_id` (a retried admission for a start that is already
-///    durably queued — possibly under a *different* throttle key than this
-///    call resolves to), return *that* row's outcome rather than reserving a
-///    fresh token under the new key and leaving the old row orphaned.
-/// 2. **FIFO fast-path guard:** if a pending backlog already exists for this
-///    key, defer (append) so a new start cannot jump ahead of older waiters or
-///    starve them.
-/// 3. Otherwise ensure the bucket exists and attempt a single-token debit
+///    active execution already exists for `(workflow_name, workflow_id)`. The
+///    reuse policy can make this admission a no-op or an immediate reject.
+///    `AllowDuplicate`/`RejectDuplicate` do so against any existing state.
+///    `AllowDuplicateFailedOnly` does so against a non-terminal prior. Then
+///    skip throttle admission and return [`ThrottleAdmission::Bypassed`]. No
+///    token is reserved and no pending row is written. The caller proceeds
+///    straight to the normal start, which resolves the reuse policy itself.
+/// 1. **Idempotency, checked next:** a pending row can already exist for this
+///    exact `workflow_id`. That is a retried admission for a durably queued
+///    start, possibly under a *different* throttle key. Return the outcome of
+///    *that* row. Do not reserve a fresh token under the new key and leave the
+///    old row orphaned.
+/// 2. **Bucket ensure:** ensure the bucket exists before either outcome below.
+///    Every later path persists a dependent on it (issue #1127).
+/// 3. **FIFO fast-path guard:** if a pending backlog already exists for this
+///    key, defer (append). A new start then cannot jump ahead of older
+///    waiters or starve them. Otherwise attempt a single-token debit
 ///    ([`crate::queue::try_consume_rate_limit_token`]):
 ///    - success → [`ThrottleAdmission::Reserved`] (caller proceeds to start;
 ///      refunds on an id-reuse short-circuit);
@@ -871,8 +867,8 @@ async fn admit(
 
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
-    // policy. TerminateIfRunning always starts fresh (cancel + replace), so
-    // it's excluded from the lookup and always proceeds to normal pacing.
+    // policy. TerminateIfRunning always starts fresh (cancel + replace). So
+    // it is excluded from the lookup and always proceeds to normal pacing.
     let reuse_policy = params
         .start_options
         .reuse_policy
@@ -883,13 +879,13 @@ async fn admit(
         return Ok(ThrottleAdmission::Bypassed);
     }
 
-    // (1) Idempotency: a retry of a request whose start is already durably
-    // deferred (e.g. after a client-side timeout that never saw the first
-    // 202) must land on the *same* pending row rather than queue a second one
-    // for the same workflow_id. Checked *before* attempting a fresh token
-    // reservation: otherwise a retry that resolves to a *different* throttle
-    // key with an available token could win Reserved while the original
-    // pending row under the old key sits orphaned.
+    // (1) Idempotency: a retry of a durably deferred start must land on the
+    // *same* pending row. It must not queue a second row for the same
+    // `workflow_id`. A client-side timeout that never saw the first 202 can
+    // cause such a retry. This check runs *before* a fresh token reservation.
+    // Otherwise a retry that resolves to a *different* throttle key with a
+    // free token could win Reserved. The original pending row under the old
+    // key would then sit orphaned.
     if let Some(existing) =
         existing_pending_throttle_for_workflow_id(conn, params.workflow_name, params.workflow_id)
             .await?
@@ -897,13 +893,12 @@ async fn admit(
         return Ok(ThrottleAdmission::Deferred(existing));
     }
 
-    // Both idempotent-retry shortcuts above (0 and 1) resolve entirely from
-    // `workflow_id` and never persist anything keyed by `throttle_key`, so
-    // neither may depend on the key's length -- a stale/new input resolving
-    // to an over-long key must still attach to the existing execution/pending
-    // row rather than fail (code review, issue #607). Only a genuinely fresh
-    // admission below actually persists a bucket/row keyed by `throttle_key`,
-    // so the length is validated here, not before steps 0/1.
+    // Shortcuts 0 and 1 resolve only from `workflow_id` and never persist
+    // anything keyed by `throttle_key`. So neither may depend on the key
+    // length (issue #607). An input that resolves to an over-long key must
+    // still attach to the existing execution or pending row, not fail. Only a
+    // fresh admission below persists a bucket or row keyed by `throttle_key`.
+    // So the length check is here, not before steps 0 and 1.
     if params.throttle_key.len() > THROTTLE_KEY_MAX_BYTES {
         return Err(crate::error::HarvestError::Config(format!(
             "throttle key length {} bytes exceeds maximum {} bytes; \
@@ -919,28 +914,28 @@ async fn admit(
     // (2) Ensure the bucket BEFORE either outcome below, backlog or not.
     //
     // It has to be before the FIFO guard, not inside its no-backlog branch
-    // (issue #1127, Codex review round 1 P1). Every path from here persists a
-    // dependent on this bucket — a reserved token, or a pending row the scanner
-    // will later debit — and the idle-bucket GC's anti-join can only see
-    // dependents that were already COMMITTED when it took its snapshot. On the
-    // append path the old code touched the bucket not at all: an observed
-    // backlog row that the scanner drops (a `schedule_to_start` stale-out
-    // debits no token) between the check and this insert leaves the sweep
-    // seeing an idle, full, dependent-free bucket, and the pending row we then
-    // commit references a bucket that no longer exists. `fire_claimed_throttle_row`
-    // fails closed on a missing bucket, so that start would sit deferred
-    // forever.
+    // (issue #1127). Every path from here persists a dependent on this bucket:
+    // a reserved token, or a pending row that the scanner later debits. The
+    // idle-bucket GC's anti-join can only see dependents that were already
+    // COMMITTED when it took its snapshot. On the append path the old code did
+    // not touch the bucket at all. Suppose the scanner drops an observed
+    // backlog row between the check and this insert. (A `schedule_to_start`
+    // stale-out debits no token.) The sweep then sees an idle, full,
+    // dependent-free bucket. The pending row that this transaction commits
+    // then references a bucket that no longer exists.
+    // `fire_claimed_throttle_row` fails closed on a missing bucket, so that
+    // start would sit deferred forever.
     //
-    // Ensuring here closes it the same way the enqueue path does: the
+    // Ensuring here closes it the same way the enqueue path does. The
     // registration touch locks any GC-eligible row for the rest of this
-    // transaction, so the sweep skips it (and an ensure that lost the race
-    // re-inserts the bucket). It is also a robustness win in its own right —
-    // the append path previously appended to a backlog whose bucket might not
-    // exist at all, which nothing would ever have created.
+    // transaction, so the sweep skips it. An ensure that lost the race
+    // re-inserts the bucket. It is also a robustness win in its own right. The
+    // append path previously appended to a backlog whose bucket might not
+    // exist at all, and nothing would ever have created it.
     ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
 
-    // (3) FIFO fast-path guard: an existing backlog means we must append, not
-    // jump the queue.
+    // (3) FIFO fast-path guard: with an existing backlog, the start appends
+    // and does not jump the queue.
     if !pending_backlog_exists(conn, &key).await?
         && crate::queue::try_consume_rate_limit_token(conn, &key).await?
     {
@@ -1091,17 +1086,16 @@ type FiredThrottle = (
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
-    // Whether this fire should count toward `harvest.schedule.runs` (issue
-    // #607 code review): true only when the deferred start's persisted
-    // `origin == "scheduled"` (set only by the scheduler-tick and
-    // buffered-run throttle branches, never by the HTTP manual-backfill
-    // endpoint even though it also persists a `schedule_id`) and it actually
-    // created a fresh execution, mirroring those callers' own immediate-path
-    // gate (`if outcome.created() { metrics.record_schedule_run(...) }`) so a
-    // throttled scheduled fire is counted exactly once, on the same terms as
-    // an unthrottled one -- never for HTTP-start/batch/backfill-originated
-    // throttled fires, which either carry no `schedule_id` at all or use a
-    // different `origin` and were never counted here either.
+    // Whether this fire counts toward `harvest.schedule.runs` (issue #607).
+    // It is true only when the persisted `origin == "scheduled"` and the
+    // start created a fresh execution. Only the scheduler-tick and
+    // buffered-run throttle branches set that origin. The HTTP manual-backfill
+    // endpoint never sets it, although it also persists a `schedule_id`. The
+    // gate mirrors the immediate path of those callers
+    // (`if outcome.created() { metrics.record_schedule_run(...) }`). So a
+    // throttled scheduled fire counts exactly once, on the same terms as an
+    // unthrottled one. HTTP-start, batch and backfill fires never count here.
+    // They carry no `schedule_id` or a different `origin`.
     bool,
 );
 
@@ -1121,14 +1115,14 @@ async fn delete_throttle_row(
 }
 
 /// Push a gate-blocked throttle row's `deferred_at` forward by
-/// [`GATE_REDEFER_BACKOFF`] (issue #1053, review finding B-G1) so it yields the
-/// oldest-candidate fire slot to un-gated keys and is re-attempted less often.
+/// [`GATE_REDEFER_BACKOFF`] (issue #1053).
+///
+/// The row then yields the oldest-candidate fire slot to un-gated keys and is
+/// attempted less often.
 ///
 /// `expires_at` is deliberately left untouched: the row still times out at its
 /// original `schedule_to_start` deadline (AC-c). Runs inside the caller's fire
 /// transaction so the row-level `FOR UPDATE` lock is held through the update.
-/// Mirrors [`delete_throttle_row`]'s parameterized `sql_query` style (the
-/// file-wide convention for row mutations).
 #[cfg(feature = "db")]
 async fn redefer_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1152,12 +1146,16 @@ async fn redefer_throttle_row(
 /// Returns:
 /// - `Ok(Some(FiredThrottle))` when a run was started (caller spawns deferred
 ///   trigger-starts + records metrics after commit);
-/// - `Ok(None)` when the row was dropped or held without starting — either it
-///   timed out past its `schedule_to_start` deadline (issue #607 AC-c), the
-///   bucket had no token yet (left for a later tick — **not** deleted), the
-///   start was a no-op under a reuse policy (deleted, token refunded), or the
-///   admission gate was closed on the workflow's real queue at fire time
-///   (left for a later tick — **not** deleted — token refunded; issue #1053).
+/// - `Ok(None)` when the row was dropped or held without starting, in these
+///   cases:
+///   - It timed out past its `schedule_to_start` deadline (issue #607 AC-c).
+///   - The bucket had no token yet. The row stays for a later tick and is
+///     **not** deleted.
+///   - The start was a no-op under a reuse policy. The row is deleted and the
+///     token is refunded.
+///   - The admission gate was closed on the real queue of the workflow at
+///     fire time (issue #1053). The row stays for a later tick and is **not**
+///     deleted. The token is refunded.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn fire_claimed_throttle_row(
@@ -1188,12 +1186,11 @@ async fn fire_claimed_throttle_row(
         return Ok(None);
     }
 
-    // A deserialize failure here (e.g. a schema mismatch across a rolling deploy,
-    // or a corrupted row) must never crash the scanner — but silently falling
-    // back to defaults would also silently drop this row's schedule_id/
-    // scheduled_for/origin (breaking #488 carryover / #534 run-history
-    // attribution) and every other persisted option with zero signal. Log it so
-    // the loss is observable instead of invisible.
+    // A deserialize failure must never crash the scanner. A schema mismatch
+    // across a rolling deploy or a corrupted row can cause one. But a silent
+    // fallback to defaults drops schedule_id, scheduled_for and origin of the
+    // row with no signal. That breaks #488 carryover and #534 run-history
+    // attribution, and it loses every other persisted option. So log the loss.
     let opts: crate::debounce::DebounceStartOptions = serde_json::from_value(row.start_options)
         .unwrap_or_else(|e| {
             tracing::error!(
@@ -1231,9 +1228,9 @@ async fn fire_claimed_throttle_row(
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
     // Restore the provenance captured at admission (issue #740). A pre-#740 row
-    // has no captured source, so derive a sensible default from the persisted
-    // dispatch origin: scheduled/backfill throttled fires stay attributed to
-    // their schedule, everything else defaults to `Api`.
+    // has no captured source, so derive a default from the persisted dispatch
+    // origin. Scheduled and backfill throttled fires stay attributed to their
+    // schedule. Everything else defaults to `Api`.
     let start_source = opts.start_source.as_deref().map_or_else(
         || match opts.origin.as_deref() {
             Some(o) if o == crate::execution::ORIGIN_SCHEDULED => {
@@ -1248,15 +1245,11 @@ async fn fire_claimed_throttle_row(
     );
     let start_source_ref = opts.start_source_ref;
     let started_by = opts.started_by;
-    // Only a scheduler-tick / buffered-run throttle branch should ever count
-    // toward `harvest.schedule.runs` -- gated on `origin == "scheduled"`, not
-    // merely `schedule_id.is_some()` (code review, issue #607): the HTTP
-    // manual-backfill endpoint also persists a `schedule_id` (for carryover
-    // lineage) but uses `origin = "backfill"` and its own immediate-path
-    // dispatch never calls `record_schedule_run` either, so a throttled
-    // backfill fire must not count here -- otherwise a throttled backfill
-    // would inflate the metric while an unthrottled one (going through the
-    // same handler) never does.
+    // Gate on `origin == "scheduled"`, not on `schedule_id.is_some()` (issue
+    // #607). The HTTP manual-backfill endpoint also persists a `schedule_id`
+    // for carryover lineage, but it uses `origin = "backfill"`. Its own
+    // immediate path never calls `record_schedule_run`. If a throttled
+    // backfill fire counted here, throttling alone would inflate the metric.
     let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
     // The stored JSON can mark a schedule policy. Keep that source (issue #2409).
@@ -1285,10 +1278,10 @@ async fn fire_claimed_throttle_row(
         severity: severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
-        // Carryover lineage (issue #488) is preserved across a throttle deferral:
-        // the scheduler/backfill paths persist schedule_id/scheduled_for/origin
-        // into the pending row's options so the eventual fire is attributed to
-        // the schedule exactly as an immediate fire would be.
+        // A throttle deferral keeps carryover lineage (issue #488). The
+        // scheduler and backfill paths persist schedule_id, scheduled_for and
+        // origin into the options of the pending row. So the fire is attributed
+        // to the schedule exactly as an immediate fire is.
         schedule_id: opts.schedule_id,
         scheduled_for: opts.scheduled_for,
         workflow_retry_policy: retry_policy,
@@ -1310,12 +1303,12 @@ async fn fire_claimed_throttle_row(
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
     // so follow-ups are collected and spawned only after commit.
-    // `Some(GateMode::CheckCached)` (issue #1053): honor the admission gate on
-    // this workflow's real queue at fire time — the throttle deferred-start
-    // `202` promise is "will run when tokens allow AND the gate is open at fire
-    // time", not merely "will run when tokens allow". `_collect` applies the
-    // gate iff the start will CREATE and records `harvest.admission.blocked` on
-    // the passed recorder when it blocks.
+    // `Some(GateMode::CheckCached)` (issue #1053) honors the admission gate on
+    // the real queue of this workflow at fire time. The `202` promise of a
+    // deferred start is "will run when tokens allow AND the gate is open at
+    // fire time". It is not merely "will run when tokens allow". `_collect`
+    // applies the gate iff the start will CREATE. When it blocks, it records
+    // `harvest.admission.blocked` on the passed recorder.
     match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
         conn,
         params,
@@ -1350,9 +1343,9 @@ async fn fire_claimed_throttle_row(
                 is_scheduled_fire && started.created,
             )))
         }
-        // The workflow_id is already taken under the reuse policy — drop the row
-        // (so the scanner doesn't retry a doomed start forever) and refund the
-        // reserved token (no run was admitted).
+        // The workflow_id is already taken under the reuse policy. Drop the row,
+        // so that the scanner does not retry a doomed start forever. Refund the
+        // reserved token, because no run was admitted.
         Err(crate::error::HarvestError::AlreadyExists { .. }) => {
             delete_throttle_row(conn, row_id).await?;
             crate::queue::refund_rate_limit_token(conn, &bucket).await?;
@@ -1382,38 +1375,33 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
-        // issue #1053: the admission gate is closed on this workflow's real
-        // queue at fire time. Halt-beats-pace — RE-DEFER: LEAVE the row (do NOT
-        // delete) so a later tick fires it once the gate opens, and refund the
-        // token reserved at the top (nothing was admitted). The block was
-        // already counted by `_collect` (`record_start_gate_block`). This
-        // deliberately DIFFERS from the completion-trigger cross-shard outbox
-        // relay (also `GatedAtRelay`), which DROPS its outbox row on block: a
-        // completion trigger has already fired its source-terminal decision, so
-        // a permanently-gated relay must not accumulate forever; a throttled
-        // start is a pending admission whose `202` promise is "nothing lost", so
-        // it is held (not dropped) until the gate opens or `expires_at` passes.
+        // Issue #1053: the admission gate is closed on the real queue of this
+        // workflow at fire time. Halt beats pace, so RE-DEFER. LEAVE the row
+        // (do NOT delete), so a later tick fires it once the gate opens. Refund
+        // the token reserved at the top, because nothing was admitted.
+        // `_collect` already counted the block (`record_start_gate_block`).
+        // This deliberately DIFFERS from the completion-trigger cross-shard
+        // outbox relay (also `GatedAtRelay`), which DROPS its outbox row on
+        // block. A completion trigger has already fired its source-terminal
+        // decision, so a permanently-gated relay must not accumulate forever.
+        // A throttled start is a pending admission with a `202` promise of
+        // "nothing lost". So it is held, not dropped, until the gate opens or
+        // `expires_at` passes.
         Err(crate::error::HarvestError::AdmissionBlocked { gate_id, reason }) => {
             crate::queue::refund_rate_limit_token(conn, &bucket).await?;
-            // Cross-key fairness (issue #1053, review finding B-G1): bump
-            // `deferred_at` forward by `GATE_REDEFER_BACKOFF` so this gated row
-            // rotates behind un-gated rows in the `ORDER BY deferred_at ASC` fire
-            // ordering. A queue-scoped gate is invisible to the SQL candidate
-            // pre-filter, so without this a gated-but-tokened row keeps its
-            // original (older) `deferred_at`, stays the oldest candidate, and is
-            // re-selected every tick — ≥100 such rows would monopolize the
-            // fixed-size fire batch and starve newer un-gated keys on other
-            // queues indefinitely. `expires_at` is untouched, so the row still
-            // times out at its original `schedule_to_start` deadline (AC-c), and
-            // the candidate SELECT surfaces expired rows independent of
-            // `deferred_at`, so the bump never hides the drop. Runs in the same
-            // fire transaction as the refund (the `FOR UPDATE` lock is held).
+            // Cross-key fairness (issue #1053): bump `deferred_at` forward by
+            // `GATE_REDEFER_BACKOFF`. This gated row then rotates behind
+            // un-gated rows in the `ORDER BY deferred_at ASC` fire ordering.
+            // The doc of `GATE_REDEFER_BACKOFF` explains the starvation that
+            // the bump prevents. It also explains why the bump never hides an
+            // expired row from its drop. The update runs in the same fire
+            // transaction as the refund, which holds the `FOR UPDATE` lock.
             redefer_throttle_row(conn, row_id, now + GATE_REDEFER_BACKOFF).await?;
             // `debug!`, not `info!`: this arm re-fires per gated row per scanner
-            // tick (the block metric is intentionally per-attempt, backed off by
-            // the bump above), so an `info!` here would flood logs during exactly
-            // the high-load incident window operators are reading — matching the
-            // silent no-token re-defer twin above.
+            // tick. The block metric is intentionally per attempt, and the bump
+            // above backs it off. An `info!` here would flood logs in the
+            // high-load incident window that operators read. The silent
+            // no-token re-defer above behaves the same way.
             tracing::debug!(
                 workflow_name = %workflow_name,
                 throttle_key = %throttle_key,
@@ -1425,21 +1413,20 @@ async fn fire_claimed_throttle_row(
             );
             Ok(None)
         }
-        // issue #946 (Task #7 hardening): a declared per-tenant quota (#946)
-        // is exhausted at fire time. Unlike `AlreadyExists` above this is
-        // TEMPORARY — the tenant's usage can free up as an existing execution
-        // completes or is deleted — so the row is RE-DEFERRED (left, token
-        // refunded, `deferred_at` bumped with backoff), mirroring the
-        // `AdmissionBlocked` arm's exact shape, rather than dropped or
-        // (via a bare `?`) allowed to abort this whole scanner-tick's claim
-        // transaction. Un-caught, that `?` would roll back every OTHER
-        // already-started row in the same batch and propagate out through
-        // `enforce_timeouts_once`, starving every later scanner duty
-        // (history-ceiling enforcement, broken-session/mutex-lease reclaim,
-        // start-idempotency sweep, …) on every tick for as long as one
-        // quota-blocked tenant sits at the head of the claim queue — the
-        // exact "runaway tenant" scenario #946 exists to contain, turned
-        // into a fleet-wide scanner stall instead.
+        // Issue #946: a declared per-tenant quota is exhausted at fire time.
+        // Unlike `AlreadyExists` above, this is TEMPORARY. The usage of the
+        // tenant can free up as an existing execution completes or is deleted.
+        // So the row is RE-DEFERRED, in the exact shape of the
+        // `AdmissionBlocked` arm: left, token refunded, `deferred_at` bumped
+        // with backoff. It is not dropped. A bare `?` must not abort the claim
+        // transaction of this whole scanner tick either. That `?` would roll
+        // back every OTHER already-started row in the same batch. It would
+        // propagate out through `enforce_timeouts_once` and starve every later
+        // scanner duty on every tick. Those duties include history-ceiling
+        // enforcement, broken-session and mutex-lease reclaim, and the
+        // start-idempotency sweep. The stall lasts while one quota-blocked
+        // tenant sits at the head of the claim queue. That turns the "runaway
+        // tenant" scenario that #946 contains into a fleet-wide scanner stall.
         Err(crate::error::HarvestError::QuotaExceeded {
             workflow_name,
             key,
@@ -1468,7 +1455,7 @@ async fn fire_claimed_throttle_row(
 
 /// Pre-acquire every distinct rate-limit bucket row a claimed due-row batch
 /// needs, in one deterministic (sorted) order, before any row fires (issue
-/// #1230 Finding 2 review).
+/// #1230).
 ///
 /// [`fire_claimed_throttle_row`] debits a bucket's token with a plain
 /// `UPDATE harvest_rate_limit_buckets ... WHERE key = $1`. Postgres holds
@@ -1551,8 +1538,7 @@ async fn pre_lock_rate_limit_buckets_for_claimed_batch(
 
 /// Pure half of [`pre_lock_rate_limit_buckets_for_claimed_batch`]: the
 /// distinct, sorted bucket keys a claimed batch needs locked. Split out so
-/// the ordering invariant is unit-testable without a database (issue #1230
-/// Finding 2 review).
+/// the ordering invariant is unit-testable without a database (issue #1230).
 #[cfg(feature = "db")]
 fn collect_distinct_bucket_keys(due_rows: &[FireDueRow]) -> std::collections::BTreeSet<String> {
     due_rows.iter().map(|row| row.bucket_key.clone()).collect()
@@ -1587,9 +1573,8 @@ async fn fire_due_on_conn(
 
     // Cheap emptiness pre-check: skip opening a claim transaction entirely
     // when there is nothing pending (the common steady-state case). A row
-    // inserted in the gap between this check and the next tick is simply
-    // picked up then -- identical to today's behavior when the claim query
-    // itself already returns zero rows.
+    // inserted after this check is picked up on the next tick. The same
+    // happens when the claim query itself returns zero rows.
     let has_rows: Present = diesel::sql_query(
         "SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present",
     )
@@ -1616,56 +1601,54 @@ async fn fire_due_on_conn(
                 conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(
                     async |conn| {
                         let now = Utc::now();
-                        // Per-key-fair claim (code review P1, issue #607): a flat
-                        // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
-                        // large backlog monopolize every scanner tick (its rows are
-                        // always the globally oldest), starving newer rows under other
-                        // keys indefinitely. The `candidates` CTE caps how many rows a
-                        // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
-                        // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
-                        // in the same query block as a window function, so the lock
-                        // must be taken on the outer, window-function-free SELECT
+                        // Per-key-fair claim (issue #607). A flat
+                        // `ORDER BY deferred_at ASC LIMIT N` lets one key with a large
+                        // backlog monopolize every scanner tick, because its rows are
+                        // always the globally oldest. Newer rows under other keys then
+                        // starve indefinitely. The `candidates` CTE caps the rows that
+                        // one `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
+                        // before the outer LIMIT applies.
+                        //
+                        // `candidates` keeps only rows that this tick can examine. A
+                        // row qualifies when it is past its `schedule_to_start`
+                        // deadline, so that AC-c can time it out. It also qualifies
+                        // when the *effective* token level of its bucket shows >= 1.0
+                        // available (`effective_available_tokens_expr`, issue #945).
+                        // That level honors a live TTL'd rate-limit override, not only
+                        // the declared baseline `refill_rate`/`burst`. A genuinely
+                        // exhausted bucket is out of the candidate set at any scale
+                        // (issue #607).
+                        //
+                        // A baseline-only formula here would silently defeat an
+                        // operator override (issue #945). An operator raises the rate
+                        // of a throttled workflow to unstick its deferred backlog. That
+                        // is the whole point of an override on this bucket family. The
+                        // pre-filter would still never admit those rows. Yet the debit
+                        // below (`fire_claimed_throttle_row` ->
+                        // `try_consume_rate_limit_token`) is already override-aware
+                        // and would fire them.
+                        //
+                        // Without this pre-filter, enough concurrently-exhausted keys
+                        // can permanently fill the batch with rows that never fire.
+                        // Ordering cannot help. Rank-then-date ordering alone only
+                        // bounds the damage to the first `THROTTLE_FIRE_BATCH_SIZE`
+                        // distinct exhausted keys. Beyond that, their rank-1 rows fill
+                        // the whole budget on every tick and starve a ready key
+                        // forever.
+                        //
+                        // A row with a missing bucket is a data anomaly, because
+                        // `reserve_or_defer` always creates the bucket before it
+                        // inserts the pending row. Such a row conservatively stays a
+                        // candidate. `try_consume_rate_limit_token` leaves it parked,
+                        // not deleted, when there is no bucket to debit.
+                        //
+                        // `selected` orders the *pre-filtered* candidates by per-key
+                        // rank first and `deferred_at` second. It still caps one key
+                        // at `THROTTLE_FIRE_PER_KEY_CAP`, so several ready keys share
+                        // the batch fairly. Postgres forbids `FOR UPDATE` in the same
+                        // query block as a window function. So the outer,
+                        // window-function-free SELECT takes the lock
                         // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
-                        // `candidates` is pre-filtered to rows that are actually
-                        // examinable this tick -- either already past their
-                        // `schedule_to_start` deadline (must be examined so AC-c can
-                        // time them out), or whose bucket's *effective* token level
-                        // (`effective_available_tokens_expr`, issue #945 -- honors a
-                        // live TTL'd rate-limit override, not just the declared
-                        // baseline `refill_rate`/`burst`) currently shows >= 1.0
-                        // available (a genuinely exhausted bucket is excluded from the
-                        // candidate set entirely, at any scale -- code review, issue
-                        // #607). Using the baseline-only formula here would silently
-                        // defeat an operator's own override: raising a throttled
-                        // workflow's rate specifically to unstick its already-deferred
-                        // backlog (the whole point of an override on this bucket
-                        // family) would never make the pre-filter admit those rows,
-                        // even though the debit below (`fire_claimed_throttle_row` ->
-                        // `try_consume_rate_limit_token`) is already override-aware and
-                        // would happily fire them if only they reached it (issue #945
-                        // review, P1). Without this pre-filter, enough
-                        // concurrently-exhausted keys can permanently occupy the
-                        // entire batch with rows that can never fire regardless of
-                        // ordering: this round's earlier fix (rank-then-date
-                        // ordering) only bounded the damage to the first
-                        // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
-                        // beyond that many, their rank-1 rows alone still fill the
-                        // whole budget on every tick, starving a ready key forever.
-                        // A row whose bucket happens to be missing (a data anomaly;
-                        // `reserve_or_defer` always creates the bucket before
-                        // inserting the pending row, so this should not occur in
-                        // practice) is conservatively still treated as a candidate,
-                        // matching this query's pre-existing behavior for that case
-                        // -- `try_consume_rate_limit_token` naturally leaves it
-                        // parked (not deleted) when there is truly no bucket to debit.
-                        // `selected` then orders the *pre-filtered* candidates by
-                        // per-key rank first, `deferred_at` second, still capping
-                        // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
-                        // simultaneously-ready keys share the batch fairly. Postgres
-                        // forbids `FOR UPDATE` in the same query block as a window
-                        // function, so the lock must be taken on the outer,
-                        // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
-                        // `FOR UPDATE`).
                         let effective_tokens = crate::queue::effective_available_tokens_expr("b");
                         let due_sql = format!(
                             "
@@ -1822,25 +1805,25 @@ pub(crate) async fn fire_due_throttled_starts_on_conn_shard(
                 .await;
             }
             crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
-            // A throttled scheduler-tick / buffered-backfill-fire dispatch is
-            // counted here, on the same terms its immediate-path sibling
-            // uses (`if outcome.created() { metrics.record_schedule_run(...) }`)
-            // -- otherwise `harvest.schedule.runs` silently undercounts every
-            // scheduled slot that happened to defer (issue #607 code review).
+            // Count a throttled scheduler-tick or buffered-backfill-fire
+            // dispatch here, on the terms of its immediate-path sibling
+            // (`if outcome.created() { metrics.record_schedule_run(...) }`).
+            // Otherwise `harvest.schedule.runs` silently undercounts every
+            // scheduled slot that deferred (issue #607).
             if is_scheduled_run {
                 metrics.record_schedule_run("workflow", &workflow_name);
             }
-            // issue #1053: `spawn_fired` only ever iterates the `fired` list —
-            // rows that genuinely started (the gate was OPEN at fire time, the
-            // relay proceeded). A fire BLOCKED by the admission gate returns
-            // `Ok(None)` from `fire_claimed_throttle_row` (row re-deferred,
-            // token refunded) and is therefore NOT in `fired`, so it counts a
-            // `harvest.admission.blocked` (recorded by `_collect`) and NEVER a
-            // bypass here — block-vs-bypass can never double-count for one fire.
-            // The Throttle producer is now `GatedAtRelay` (was `GatedAtAdmission`
-            // per #618-F1): a genuinely-fired start counts an exempt bypass so an
-            // open-gate relay never slips a gate silently. See
-            // `admission_gate::producer_contract`.
+            // Issue #1053: `spawn_fired` iterates only the `fired` list. Those
+            // rows genuinely started: the gate was OPEN at fire time and the
+            // relay proceeded. A fire that the admission gate BLOCKED returns
+            // `Ok(None)` from `fire_claimed_throttle_row`, with the row
+            // re-deferred and the token refunded. It is NOT in `fired`. So it
+            // counts a `harvest.admission.blocked` (recorded by `_collect`) and
+            // NEVER a bypass here. Block and bypass never double-count one fire.
+            // The Throttle producer is `GatedAtRelay`. It changed from
+            // `GatedAtAdmission` in #618. A genuinely-fired start counts an
+            // exempt bypass, so an open-gate relay never slips a gate silently.
+            // See `admission_gate::producer_contract`.
             metrics
                 .record_admission_bypassed(crate::admission_gate::StartProducer::Throttle.as_str());
             let _ = &queue_name;
@@ -1932,12 +1915,12 @@ pub async fn list_pending_throttle(
 /// Per-`(workflow_name, throttle_key)` backlog counts on this shard (admin
 /// read).
 ///
-/// Joined against that key's shared token bucket so the response also
-/// surfaces `override_active`, the resolved effective refill rate/burst,
-/// and the declared baseline (issue #945). The join is
-/// `LEFT JOIN ... ON b.key = t.bucket_key`, scoped to this
-/// shard's own tables exactly like the pre-existing `GROUP BY` -- shard-local,
-/// consistent with the rest of the throttle admission path.
+/// It joins the shared token bucket of each key (issue #945). So the response
+/// also surfaces `override_active`, the resolved effective refill rate/burst,
+/// and the declared baseline. The join is
+/// `LEFT JOIN ... ON b.key = t.bucket_key`. Like the `GROUP BY`, it reads
+/// only the tables of this shard, as the rest of the throttle admission path
+/// does.
 ///
 /// # Errors
 /// Returns `HarvestError` if the database query fails.
@@ -2026,17 +2009,16 @@ pub async fn throttle_backlog_by_key(
 /// scanner fires it. A caller enforcing a workflow-name-scoped concurrency
 /// bound (e.g. a schedule's `max_active_runs`/overlap policy, issue #241/#478)
 /// against a plain `COUNT(*) ... WHERE state IN ('RUNNING','PAUSED')` query
-/// would therefore under-count: a deferred fire is a logically in-flight run
-/// that just hasn't materialized yet, and omitting it lets the caller admit
-/// more concurrent runs than its own limit allows (code review, issue #607).
+/// would therefore under-count. A deferred fire is a logically in-flight run
+/// that has not materialized yet. Omitting it lets the caller admit more
+/// concurrent runs than its own limit allows (issue #607).
 /// Callers should add this count to their own running-count before
 /// comparing against a `max_active_runs`-style ceiling.
 ///
-/// Tolerates a missing `harvest_start_throttle` table (mixed-schema
-/// fixtures / a deployment mid-upgrade) by returning `0`, matching
-/// [`fire_due_throttled_starts`]'s own `to_regclass` tolerance -- this lets
-/// every pre-existing scheduler test fixture that never migrated the
-/// throttle table keep working unchanged.
+/// Returns `0` when the `harvest_start_throttle` table is missing, as in
+/// mixed-schema fixtures or a deployment mid-upgrade. That matches the
+/// `to_regclass` tolerance of [`fire_due_throttled_starts`]. Scheduler test
+/// fixtures that never migrated the throttle table then keep working.
 ///
 /// # Errors
 /// Returns `HarvestError` if the database query fails.
@@ -2078,15 +2060,16 @@ pub async fn pending_throttle_count_for_workflow(
 
 /// Batched form of [`pending_throttle_count_for_workflow`] for many names at once.
 ///
-/// One `to_regclass` existence check and one grouped
-/// `COUNT(*) ... GROUP BY workflow_name` query covering every name in
-/// `workflow_names`, instead of one existence check plus one count query per
-/// name (Ledger perf pass on `GET /admin/schedules`, called once per schedule
-/// row via `scheduler::schedule_running_basis`).
+/// It sends one `to_regclass` existence check and one grouped
+/// `COUNT(*) ... GROUP BY workflow_name` query for all of `workflow_names`.
+/// That replaces one existence check plus one count query per name. The
+/// per-name form ran once per schedule row through
+/// `scheduler::schedule_running_basis` (Ledger perf pass on
+/// `GET /admin/schedules`).
 ///
-/// A name with no pending throttle rows is absent from the returned map,
-/// matching what [`pending_throttle_count_for_workflow`] returns for it (`0`)
-/// -- callers should treat a missing key as zero.
+/// A name with no pending throttle rows is absent from the returned map.
+/// [`pending_throttle_count_for_workflow`] returns `0` for it, so callers
+/// should treat a missing key as zero.
 ///
 /// # Errors
 ///
@@ -2272,10 +2255,9 @@ mod tests {
         assert!(ThrottlePolicy::from_rate_str("100/m", Some(0.0), None, None).is_err());
     }
 
-    /// Code-review fix (issue #607): an explicit burst below 1.0 must be
-    /// rejected -- the token debit path (`LEAST(burst, refilled) >= 1.0`) can
-    /// never successfully reserve a token when `burst < 1.0`, deferring every
-    /// start under that key forever.
+    /// Issue #607: an explicit burst below 1.0 must be rejected. The token
+    /// debit path (`LEAST(burst, refilled) >= 1.0`) can never reserve a token
+    /// when `burst < 1.0`. Every start under that key would defer forever.
     #[test]
     fn from_rate_str_rejects_explicit_burst_below_one() {
         let err = ThrottlePolicy::from_rate_str("100/m", Some(0.5), None, None).unwrap_err();
@@ -2285,11 +2267,11 @@ mod tests {
         );
     }
 
-    /// Code-review fix (issue #607): an infinite (or NaN) explicit burst
-    /// passes `b >= 1.0` (IEEE 754 comparison) but, inserted verbatim as the
-    /// bucket's initial `tokens`, degrades `LEAST(burst, tokens + refill)` to
-    /// an unbounded, ever-growing allowance -- effectively disabling the
-    /// throttle for that key.
+    /// Issue #607: an infinite explicit burst passes `b >= 1.0` (IEEE 754
+    /// comparison). Unchecked, it is inserted verbatim as the initial `tokens`
+    /// of the bucket. Then `LEAST(burst, tokens + refill)` degrades to an unbounded,
+    /// ever-growing allowance, which disables the throttle for that key. The
+    /// `is_finite` check rejects it with a "finite" error.
     #[test]
     fn from_rate_str_rejects_infinite_explicit_burst() {
         let err =
@@ -2302,17 +2284,18 @@ mod tests {
         assert!(ThrottlePolicy::from_rate_str("100/m", Some(f64::NAN), None, None).is_err());
     }
 
-    /// Same bug, reached via a *defaulted* burst: a fractional per-unit rate
-    /// like `"0.5/s"` with no explicit burst defaults to `per_period_count`
-    /// (0.5), which is just as unusable as an explicit sub-one burst.
+    /// Same bug, reached through a *defaulted* burst. A fractional per-unit
+    /// rate like `"0.5/s"` with no explicit burst defaults to
+    /// `per_period_count` (0.5). That is as unusable as an explicit sub-one
+    /// burst.
     #[test]
     fn from_rate_str_rejects_fractional_rate_with_no_explicit_burst() {
         assert!(ThrottlePolicy::from_rate_str("0.5/s", None, None, None).is_err());
     }
 
-    /// An explicit burst >= 1.0 overrides a fractional rate's defaulted
-    /// per-period count -- the sub-unit *rate* is fine, only the resulting
-    /// bucket *capacity* must reach at least one token.
+    /// An explicit burst >= 1.0 overrides the defaulted per-period count of a
+    /// fractional rate. The sub-unit *rate* is fine. Only the resulting bucket
+    /// *capacity* must reach at least one token.
     #[test]
     fn from_rate_str_accepts_explicit_burst_overriding_a_fractional_rate() {
         let p = ThrottlePolicy::from_rate_str("0.5/s", Some(1.0), None, None).unwrap();
@@ -2406,10 +2389,10 @@ mod tests {
 
     // ── resolve_backlog_bucket_state (issue #945) ───────────────────────────
     //
-    // Pure mapping `throttle_backlog_by_key` applies to each LEFT-JOINed
-    // backlog row so `GET /admin/start-throttle` surfaces `override_active`,
-    // the resolved effective values, and the declared baseline alongside the
-    // existing backlog counts.
+    // `throttle_backlog_by_key` applies this pure mapping to each LEFT-JOINed
+    // backlog row. So `GET /admin/start-throttle` surfaces `override_active`,
+    // the resolved effective values and the declared baseline beside the
+    // backlog counts.
 
     #[cfg(feature = "db")]
     #[test]
@@ -2461,9 +2444,9 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn resolve_backlog_bucket_state_missing_bucket_row_is_defensive_none() {
-        // A `LEFT JOIN` miss (practically unreachable -- `reserve_or_defer`
-        // always creates the bucket before writing the backlog row) must not
-        // panic and must report no override / no effective values.
+        // A `LEFT JOIN` miss must not panic and must report no override and no
+        // effective values. It is practically unreachable: `reserve_or_defer`
+        // always creates the bucket before it writes the backlog row.
         let now = ts(12, 0, 0);
         let (active, refill, burst) =
             resolve_backlog_bucket_state(None, None, None, None, None, now);
@@ -2472,7 +2455,7 @@ mod tests {
         assert_eq!(burst, None);
     }
 
-    // ── collect_distinct_bucket_keys (issue #1230 Finding 2 review) ──────────
+    // ── collect_distinct_bucket_keys (issue #1230) ───────────────────────────
 
     #[cfg(feature = "db")]
     mod bucket_lock_ordering {

@@ -32,7 +32,6 @@ static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const PROMISE: &str = "harvest.promise:approval";
 
-/// Replaces the database name in `url` with `db`.
 fn with_db_name(url: &str, db: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),

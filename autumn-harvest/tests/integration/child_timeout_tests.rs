@@ -283,7 +283,8 @@ async fn child_fails_before_deadline_parent_gets_typed_err() {
     let handle = spawn_test_worker(Arc::clone(&worker), pool);
 
     // A child failure before the deadline propagates as an Err through the
-    // parent (which maps it to a String and returns via `?`), failing the run.
+    // parent. The parent maps it to a String and returns it via `?`, so the
+    // run fails.
     let parent = wait_for_execution_state(&database_url, parent_exec_id, "FAILED").await;
     worker.shutdown();
     handle.await.expect("join");
@@ -369,22 +370,22 @@ async fn two_sequential_child_timeouts_resolve_independently() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_completes_in_park_gap_self_wakes_parent() {
     // R3: exercises the RE-PARK path in `persist_child_timeout_race` and its
-    // post-commit self-wake re-check. A parent parked on a child-timeout race
-    // is woken by an UNRELATED wake while its child is still RUNNING — it
-    // reloads history, matches `InProgress`, and RE-PARKS, running the self-wake
-    // re-check (which correctly observes the child NOT-yet-terminal and does not
-    // double-wake). The child is then released and the parent resolves to Some.
+    // post-commit self-wake re-check. An UNRELATED wake wakes a parent parked on
+    // a child-timeout race while its child is still RUNNING. The parent reloads
+    // history, matches `InProgress`, and RE-PARKS. That runs the self-wake
+    // re-check, which sees the child not yet terminal and does not double-wake.
+    // The child is then released and the parent resolves to Some.
     //
-    // HONEST COVERAGE NOTE: this reliably drives the re-park machinery + the
-    // self-wake re-check code path, and proves the parent still reaches
-    // COMPLETED with Some across a spurious re-park. It does NOT deterministically
-    // force the branch where the re-check observes an ALREADY-terminal child (the
-    // child-completes-strictly-inside-the-park-gap interleaving): the child-row
-    // terminal state and the parent-history `ChildWorkflowCompleted` event are
-    // committed in ONE transaction (`persist_child_workflow_completion`), so that
-    // branch is only reachable via a genuine timing race against a stale history
-    // snapshot, which the current harness cannot pin without mid-transaction
-    // instrumentation. The re-park cycle here executes the exact same re-check.
+    // COVERAGE NOTE: this drives the re-park machinery and the self-wake
+    // re-check path. It proves the parent still reaches COMPLETED with Some
+    // across a spurious re-park. It does NOT force the branch where the
+    // re-check sees an ALREADY-terminal child. That needs the child to complete
+    // strictly inside the park gap. One transaction
+    // (`persist_child_workflow_completion`) commits both the child-row terminal
+    // state and the parent-history `ChildWorkflowCompleted` event. So only a
+    // real timing race against a stale history snapshot reaches that branch.
+    // The harness cannot pin it without mid-transaction instrumentation. The
+    // re-park cycle here runs the exact same re-check.
     let (database_url, _guard) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
@@ -418,9 +419,9 @@ async fn child_completes_in_park_gap_self_wakes_parent() {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
-    // The parent must NOT have terminated across the spurious re-parks (the
-    // self-wake re-check is a no-op while the child runs, and the 300s timer
-    // never fires) — proving the re-park cycles were benign.
+    // The parent must NOT terminate across the spurious re-parks. The self-wake
+    // re-check is a no-op while the child runs, and the 300s timer never fires.
+    // This proves the re-park cycles were benign.
     let mid_history = load_history_from_url(&database_url, parent_exec_id).await;
     assert!(
         !mid_history.events.iter().any(|e| matches!(
@@ -455,7 +456,7 @@ async fn child_completes_in_park_gap_self_wakes_parent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_win_tears_down_deadline_timer_no_retention_pin() {
-    // Codex P2 (#779): on a child-win the still-armed `__child_timeout:{seq}`
+    // Issue #779: on a child-win the still-armed `__child_timeout:{seq}`
     // durable timer must be proactively deleted. An unfired `harvest_timers`
     // row (`fired = false`) is treated as an in-flight dependency by
     // `retention::has_inflight_dependencies`, so leaving it would pin the
@@ -488,9 +489,9 @@ async fn child_win_tears_down_deadline_timer_no_retention_pin() {
         "child completed before the deadline → child-win branch"
     );
 
-    // The deadline timer must have been durably deleted (not merely left
-    // unfired): no `__child_timeout:` row may remain for the parent, and in
-    // fact no unfired timer at all should linger to pin retention.
+    // The deadline timer must be durably deleted, not just left unfired. No
+    // `__child_timeout:` row may remain for the parent. No unfired timer at all
+    // may linger to pin retention.
     let timers = load_timers_for_execution_from_url(&database_url, parent_exec_id).await;
     assert!(
         !timers
@@ -509,24 +510,23 @@ async fn child_win_tears_down_deadline_timer_no_retention_pin() {
     );
 }
 
-// ── #779 Codex P1: over-deadline out-of-band child terminal ordering ─────────
+// ── #779: over-deadline out-of-band child terminal ordering ────────────────
 
 const RACE_TIMER_ID: &str = "__child_timeout:1:timeout_child";
 
-/// Build a parent parked on a child-timeout race whose deadline is ALREADY in
-/// the past, WITHOUT the deadline having been ingested yet (the parent was not
-/// claimed at its deadline). Returns `(parent_exec_id, child_exec_id)`.
+/// Seeds a parent parked on a child-timeout race whose deadline is ALREADY in
+/// the past.
 ///
-/// History prefix: `WorkflowStarted, ChildWorkflowStarted, TimerStarted(deadline)`
-/// matching a first `spawn_child_workflow_timeout("timeout_child", .., 2s)` call
-/// (seq 1 → `__child_timeout:1:timeout_child`). A matching `harvest_timers` row
-/// is inserted OVERDUE (`fires_at = NOW() - 2s`, `fired = false`) — the exact
-/// state a child completing/failing after its deadline races against.
-/// Seed the parent's parked-on-overdue-child-timeout state: append the
-/// `WorkflowStarted, ChildWorkflowStarted(child), TimerStarted(deadline)` prefix
-/// and insert a matching OVERDUE `harvest_timers` row (`fires_at = NOW() - 2s`,
-/// `fired = false`) for `RACE_TIMER_ID`. Shared by the fake-child and real-child
-/// setups so both drive the exact recorded state a late-terminating child races.
+/// The deadline is not ingested yet, because nothing claimed the parent at its
+/// deadline.
+///
+/// History prefix: `WorkflowStarted, ChildWorkflowStarted, TimerStarted(deadline)`.
+/// It matches a first `spawn_child_workflow_timeout("timeout_child", .., 2s)`
+/// call (seq 1 → `__child_timeout:1:timeout_child`). A matching
+/// `harvest_timers` row for `RACE_TIMER_ID` is inserted OVERDUE
+/// (`fires_at = NOW() - 2s`, `fired = false`). A child that completes or fails
+/// after its deadline races against this state. The fake-child and real-child
+/// setups share it.
 async fn seed_overdue_child_race(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
@@ -560,6 +560,8 @@ async fn seed_overdue_child_race(
         .expect("insert overdue deadline timer");
 }
 
+/// Builds a parent racing an overdue child deadline, with a fake child (no
+/// execution row). Returns `(parent_exec_id, child_exec_id)`.
 async fn setup_parent_racing_overdue_child(
     conn: &mut AsyncPgConnection,
 ) -> (ExecutionId, ExecutionId) {
@@ -571,11 +573,11 @@ async fn setup_parent_racing_overdue_child(
 
 /// Like [`setup_parent_racing_overdue_child`], but the child is a REAL RUNNING
 /// `harvest_workflow_executions` row LINKED to the parent as an awaited child
-/// (`parent_id` set, `parent_close_policy` NULL) so the out-of-band operator
-/// paths (`cancel_workflow_execution` / `terminate_workflow_execution`) and the
-/// child's own execution-timeout scanner (`enforce_workflow_execution_timeouts`)
-/// can act on it. When `child_deadline_at` is `Some`, the child row's execution
-/// deadline is set (in the past) so the timeout scanner picks it up.
+/// (`parent_id` set, `parent_close_policy` NULL). So the out-of-band operator
+/// paths (`cancel_workflow_execution` / `terminate_workflow_execution`) can act
+/// on it. So can the child's own scanner (`enforce_workflow_execution_timeouts`).
+/// When `child_deadline_at` is `Some`, the child row gets that execution
+/// deadline (in the past), so the timeout scanner picks it up.
 async fn setup_parent_racing_overdue_real_child(
     conn: &mut AsyncPgConnection,
     child_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -588,10 +590,10 @@ async fn setup_parent_racing_overdue_real_child(
     let child_exec_id =
         insert_workflow_execution_with_id(conn, &format!("child-{}", uuid::Uuid::new_v4())).await;
 
-    // Link child → parent as an AWAITED child (parent_close_policy stays NULL,
-    // the invariant notify_awaited_parent_of_child_terminal / the execution
-    // timeout scanner both gate on) and, for the execution-timeout scenario, set
-    // its deadline in the past so enforce_workflow_execution_timeouts selects it.
+    // Link child → parent as an AWAITED child. parent_close_policy stays NULL:
+    // notify_awaited_parent_of_child_terminal and the execution timeout scanner
+    // both gate on that. For the execution-timeout scenario, also set the
+    // deadline in the past, so enforce_workflow_execution_timeouts selects it.
     diesel::update(dsl::harvest_workflow_executions.find(child_exec_id.as_uuid()))
         .set((
             dsl::parent_id.eq(Some(parent_exec_id.as_uuid())),
@@ -732,21 +734,21 @@ async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
     );
 }
 
-// ── #779 Codex P2-D: over-deadline OPERATOR/TIMEOUT out-of-band terminals ─────
+// ── #779: over-deadline OPERATOR/TIMEOUT out-of-band terminals ─────────────
 //
-// Beyond the worker's completion/failure wake paths (fixed in P1), three OTHER
-// out-of-band paths append a child terminal to a parent WITHOUT going through
-// wake_parent_for_child_completion/_failure: an operator CANCEL, an operator
-// TERMINATE (both via execution::notify_awaited_parent_of_child_terminal), and
-// the child's OWN execution timeout (via timeout::wake_parent_for_child_timeout).
-// Each must also materialize the parent's DUE __child_timeout deadline FIRST so
-// an over-deadline child resolves the parent's spawn_child_workflow_timeout to
-// None (not Err). These drive the REAL public entry points, mirroring the P1
-// tests that drive the real wake functions.
+// The section above covers the worker's completion/failure wake paths. Three
+// OTHER out-of-band paths append a child terminal to a parent WITHOUT
+// wake_parent_for_child_completion/_failure. Two are an operator CANCEL and an
+// operator TERMINATE, both via execution::notify_awaited_parent_of_child_terminal.
+// The third is the child's OWN execution timeout, via
+// timeout::wake_parent_for_child_timeout. Each must also materialize the
+// parent's DUE __child_timeout deadline FIRST. Then an over-deadline child
+// resolves the parent's spawn_child_workflow_timeout to None (not Err). These
+// tests drive the REAL public entry points, like the wake-path tests above.
 
 /// Assert the parent's history ends with `[TimerFired(deadline),
-/// ChildWorkflowFailed]` — the overdue deadline ordered ahead of the out-of-band
-/// child terminal — and that the primitive replays to `None`.
+/// ChildWorkflowFailed]`, with the overdue deadline ahead of the out-of-band
+/// child terminal. Also assert that the primitive replays to `None`.
 async fn assert_parent_resolves_none_after_overdue_terminal(
     database_url: &str,
     parent_exec_id: ExecutionId,
@@ -833,10 +835,10 @@ async fn over_deadline_child_operator_terminate_orders_deadline_first_and_resolv
     .await;
 }
 
-/// The child hitting its OWN execution timeout (issue #243) appends its terminal
-/// to the parent via `timeout::wake_parent_for_child_timeout` (post-fix it
-/// materializes the overdue `__child_timeout` deadline first) → the parent
-/// resolves `None`, not the child-timeout `Err`.
+/// A child that hits its OWN execution timeout (issue #243) appends its
+/// terminal to the parent via `timeout::wake_parent_for_child_timeout`. After
+/// the fix, that materializes the overdue `__child_timeout` deadline first. So
+/// the parent resolves `None`, not the child-timeout `Err`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolves_none() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -870,10 +872,11 @@ async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolve
     .await;
 }
 
-/// Focused helper coverage: `materialize_due_child_timeout_deadlines`
-/// (a) fires a DUE `__child_timeout` timer and appends `TimerFired`,
-/// (b) leaves a NOT-yet-due `__child_timeout` timer alone, and
-/// (c) ignores a DUE NON-`__child_timeout` timer (e.g. a plain `ctx.timer`).
+/// Focused coverage of `materialize_due_child_timeout_deadlines`.
+///
+/// - (a) It fires a DUE `__child_timeout` timer and appends `TimerFired`.
+/// - (b) It leaves a NOT-yet-due `__child_timeout` timer alone.
+/// - (c) It ignores a DUE NON-`__child_timeout` timer (e.g. a plain `ctx.timer`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_timers() {
     use autumn_harvest::schema::harvest_timers::dsl;
@@ -972,22 +975,21 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
 }
 
 /// Exactly-once coordination between the two `__child_timeout` deadline-fire
-/// paths (issue #779, Codex P2-A). Since the P1 fix there are two writers that
-/// can fire a due deadline: the parent-claim ingest
+/// paths (issue #779). Two writers can fire a due deadline: the parent-claim
+/// ingest
 /// (`ingest_due_timers_and_signals`) and the out-of-band materializer
-/// (`materialize_due_child_timeout_deadlines`). Both append `TimerFired` **and**
-/// set `fired = true` atomically in one transaction, so a second attempt for the
-/// same timer is excluded by the `fired = false` predicate — it never appends a
-/// duplicate `TimerFired`. This asserts the exclusion half of that guarantee:
-/// re-invoking the materializer over an already-fired timer returns `0` and
-/// appends nothing.
+/// (`materialize_due_child_timeout_deadlines`). Each appends `TimerFired`
+/// **and** sets `fired = true` atomically in one transaction. So the
+/// `fired = false` predicate excludes a second attempt for the same timer. It
+/// never appends a duplicate `TimerFired`. This asserts the exclusion half of
+/// that guarantee. A re-run of the materializer over a fired timer returns `0`
+/// and appends nothing.
 ///
-/// The complementary collision half — when a concurrent writer's `TimerFired`
-/// has not yet committed, so the second writer's stale-`start_id` append lands
-/// on the same `event_id` — is enforced by the `UNIQUE(workflow_exec_id,
-/// event_id)` constraint (`harvest_events`), which aborts the racing append. A
-/// durable duplicate `TimerFired` is therefore impossible without any
-/// compare-and-set on the shared ingest path.
+/// The collision half covers a concurrent writer whose `TimerFired` has not
+/// committed yet. The second writer's stale-`start_id` append then lands on
+/// the same `event_id`. The `UNIQUE(workflow_exec_id, event_id)` constraint
+/// (`harvest_events`) aborts that racing append. So a durable duplicate
+/// `TimerFired` is impossible without any compare-and-set on the ingest path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_timerfired() {
     use autumn_harvest::schema::harvest_timers::dsl;
@@ -1028,9 +1030,9 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
             .expect("first materialize");
     assert_eq!(first, 1, "the due child-timeout deadline fires once");
 
-    // Second fire (models a subsequent ingest or a re-run of the materializer
-    // over the same, already-fired timer): the `fired = false` predicate now
-    // excludes it, so nothing is fired and nothing is appended.
+    // Second fire: models a later ingest, or a materializer re-run over the
+    // same fired timer. The `fired = false` predicate now excludes it, so
+    // nothing fires and nothing is appended.
     let second =
         autumn_harvest::worker::materialize_due_child_timeout_deadlines(&mut conn, parent_exec_id)
             .await
@@ -1064,27 +1066,28 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
     );
 }
 
-/// #779 (Codex P2): event-id accounting for a race-loser CHILD cancellation that
-/// ALSO materializes a due `__child_timeout` deadline.
+/// #779: event-id accounting for a race-loser CHILD cancellation that ALSO
+/// materializes a due `__child_timeout` deadline.
 ///
 /// When `apply_race_loser_cancellations` cancels a losing child, the REAL
 /// `notify_awaited_parent_of_child_terminal` appends onto the PARENT's OWN
-/// history via self-computed `MAX(event_id)+1` ids. Since the P2-D
-/// deadline-materialization fix, that append is `[TimerFired(overdue deadline),
-/// ChildWorkflowFailed]` — TWO events — not one. The pre-fix caller advanced its
-/// in-memory `next_event_id` cursor by a hardcoded `+1`, leaving it short by the
-/// materialized-deadline count (N), so the winner-terminal
-/// `WorkflowCompleted`/`WorkflowFailed` append that the winner-persist path
-/// performs next reused a consumed id and hit `UNIQUE(workflow_exec_id,
-/// event_id)` — rolling back and wrongly failing the otherwise-healthy
-/// race-winning parent.
+/// history via self-computed `MAX(event_id)+1` ids. Since the over-deadline
+/// OPERATOR/TIMEOUT fix of #779, that path materializes the deadline first. So
+/// the append is `[TimerFired(overdue deadline), ChildWorkflowFailed]`, TWO
+/// events, not one.
+/// The pre-fix caller advanced its in-memory `next_event_id` cursor by a
+/// hardcoded `+1`. That left it short by the materialized-deadline count (N).
+/// The winner-persist path then appends the winner terminal
+/// (`WorkflowCompleted`/`WorkflowFailed`). That append reused a consumed id
+/// and hit `UNIQUE(workflow_exec_id, event_id)`. It rolled back and wrongly
+/// failed the healthy race-winning parent.
 ///
 /// Drives the REAL `apply_race_loser_cancellations` against a parent with an
-/// overdue deadline + an awaited RUNNING loser child, then performs the real
-/// subsequent terminal append at the returned cursor. RED (revert the count
-/// re-read → hardcoded `+1`): the cursor is `4` (still pointing AT the
-/// `ChildWorkflowFailed` id) and the terminal append collides. GREEN (re-read
-/// the true next id): the cursor is `5` and the append lands gap-free.
+/// overdue deadline and an awaited RUNNING loser child. Then performs the real
+/// terminal append at the returned cursor. RED (revert the count re-read to a
+/// hardcoded `+1`): the cursor is `4`, still AT the `ChildWorkflowFailed` id,
+/// and the terminal append collides. GREEN (re-read the true next id): the
+/// cursor is `5` and the append lands gap-free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_all_appends() {
     use autumn_harvest::WorkflowCommand;
@@ -1109,9 +1112,9 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     assert_eq!(entry_next, 3, "prefix seeds event ids 0..2");
 
     // Resolve the race by cancelling the losing child. It is an awaited child of
-    // the parent, so the REAL cancellation notifies the parent inline,
-    // materializing the overdue `__child_timeout` deadline (TimerFired) BEFORE
-    // the ChildWorkflowFailed — TWO events onto the parent's own history.
+    // the parent, so the REAL cancellation notifies the parent inline. That
+    // materializes the overdue `__child_timeout` deadline (TimerFired) BEFORE
+    // the ChildWorkflowFailed: TWO events onto the parent's own history.
     let commands = vec![WorkflowCommand::CancelRaceLosers {
         reason: autumn_harvest::context::LoserCancelReason::RaceLoser,
         activities: vec![],
@@ -1130,9 +1133,9 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     .await
     .expect("apply race loser cancellations");
 
-    // The cursor must have advanced past BOTH appended events (materialized
-    // TimerFired + ChildWorkflowFailed): entry(3) + 2 = 5 — NOT the pre-fix
-    // entry(3) + 1 = 4, which still points AT the ChildWorkflowFailed id.
+    // The cursor must advance past BOTH appended events (materialized
+    // TimerFired + ChildWorkflowFailed): entry(3) + 2 = 5. The pre-fix value
+    // entry(3) + 1 = 4 still points AT the ChildWorkflowFailed id.
     assert_eq!(
         next_event_id, 5,
         "cursor must skip the materialized deadline AND the child terminal that \
@@ -1182,39 +1185,39 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     );
 }
 
-/// #779 (Codex round-12 P2, HEALTHY-RUN-KILLER): the child-timeout SUSPENSION
-/// persist path ([`persist_child_timeout_race`]) must append its parent events
-/// with `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)`
-/// re-read per insert), byte-for-byte like the plain
-/// `persist_all_started_child_workflows` path — NOT a batch `append_events` at
-/// the stale pre-handler `next_event_id`.
+/// #779 (HEALTHY-RUN-KILLER): the child-timeout SUSPENSION persist path
+/// ([`persist_child_timeout_race`]) must append its parent events with
+/// `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)` re-read
+/// per insert). It matches the plain `persist_all_started_child_workflows`
+/// path byte for byte. It must NOT use a batch `append_events` at the stale
+/// pre-handler `next_event_id`.
 ///
 /// A resolved `ctx.race()` over children may push a `CancelRaceLosers` for a
 /// still-RUNNING loser child and, in the SAME cycle, `spawn_child_workflow_timeout`
 /// suspends. `extract_child_timeout_race` deliberately tolerates that
 /// `CancelRaceLosers`, so the batch is routed to `persist_child_timeout_race`.
 /// While that suspension transaction runs, the loser child can complete on its
-/// own worker and append `ChildWorkflowCompleted` onto the PARENT via
+/// own worker. It then appends `ChildWorkflowCompleted` onto the PARENT via
 /// `wake_parent_for_child_completion`'s own `append_single_event` (parent-row
 /// lock + MAX re-read). The two appends target the same `event_id`.
 ///
 /// RED (pre-fix): the suspension path used
 /// `store::append_events(parent, &events, stale_next_event_id)` with NO
-/// parent-row lock, so the concurrent committer's `event_id` was already taken
-/// and the batch insert hit `UNIQUE(workflow_exec_id, event_id)`. That `Err`
-/// flowed through `fail_execution_on_error` and terminally FAILED an
-/// otherwise-healthy parent. This models the concurrent committer as
-/// already-committed and asserts the pre-fix stale-`append_events` discipline
-/// conflicts and is classified as the transient event-id violation — the exact
-/// input the pre-fix path terminally failed on.
+/// parent-row lock. The concurrent committer had already taken that
+/// `event_id`, so the batch insert hit `UNIQUE(workflow_exec_id, event_id)`.
+/// That `Err` flowed through `fail_execution_on_error` and terminally FAILED a
+/// healthy parent. This test models the concurrent committer as already
+/// committed. It asserts that the pre-fix stale-`append_events` discipline
+/// conflicts. It also asserts that the conflict is classified as the transient
+/// event-id violation, the exact input the pre-fix path failed on.
 ///
-/// GREEN (post-fix): the same parent events appended via `append_single_event`
-/// (the fixed path's discipline) re-read `MAX(event_id)` under the parent-row
-/// lock and land gap-free PAST the committer — no collision, so the healthy
-/// parent is never failed. This is a store-layer discipline proof of the fix
-/// (mirroring the sibling `race_loser_child_cancel_*` test's approach), since
-/// `persist_child_timeout_race` and its `StartedChildWorkflowCommand` /
-/// `StartedTimerCommand` argument types are private to `worker.rs`.
+/// GREEN (post-fix): the fixed path appends the same parent events via
+/// `append_single_event`. Each re-reads `MAX(event_id)` under the parent-row
+/// lock and lands gap-free PAST the committer. No collision, so the healthy
+/// parent never fails. This is a store-layer proof of the fix, like the
+/// sibling `race_loser_child_cancel_*` test. `persist_child_timeout_race` and
+/// its `StartedChildWorkflowCommand` / `StartedTimerCommand` argument types
+/// are private to `worker.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_batch() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -1264,8 +1267,8 @@ async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_
         },
     ];
 
-    // RED: the pre-fix discipline — a batch append at the stale next_event_id (1,
-    // computed before the handler ran) — collides with the already-committed
+    // RED: the pre-fix discipline is a batch append at the stale next_event_id
+    // (1, computed before the handler ran). It collides with the committed
     // loser terminal on UNIQUE(workflow_exec_id, event_id). This is the exact
     // Err persist_child_timeout_race fed into fail_execution_on_error, terminally
     // failing the healthy parent. (Rolls back; nothing committed.)
@@ -1284,8 +1287,8 @@ async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_
          path terminally failed on; got: {red_err}"
     );
 
-    // GREEN: the fixed discipline — append_single_event per event (parent-row
-    // FOR UPDATE + MAX re-read) — serialises against the loser terminal, lands
+    // GREEN: the fixed discipline is append_single_event per event (parent-row
+    // FOR UPDATE + MAX re-read). It serialises against the loser terminal, lands
     // gap-free at ids 2 and 3, and never fails the parent.
     for event in suspension_events {
         autumn_harvest::store::append_single_event(&mut conn, parent_exec_id, event)
@@ -1328,25 +1331,26 @@ async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_
 /// Transient wake-event-ingest event-id conflict → the parent workflow task is
 /// re-driven (park + wake), NOT terminally failed (issue #779 shared-path fix).
 ///
-/// Deterministic reproduction of the pre-existing shared-path hazard that
-/// #779's child-timeout deadline materialization newly exercises (a child
-/// completing late while the parent is claimed for its due `__child_timeout`
-/// deadline), and that also already affected the `timeout.rs` /
-/// `external_task.rs` concurrent-`append_single_event` racers:
-/// `ingest_due_timers_and_signals` appends `TimerFired`/`SignalReceived` at a
-/// `next_event_id` precomputed from an earlier `load_history`, with no exec-row
-/// lock and no `MAX(event_id)` recompute. A concurrent committer that took that
-/// same `event_id` first makes the ingest's batch insert hit
+/// Deterministic reproduction of a pre-existing shared-path hazard. #779's
+/// child-timeout deadline materialization newly exercises it: a child
+/// completes late while the parent is claimed for its due `__child_timeout`
+/// deadline. It already affected the `timeout.rs` / `external_task.rs`
+/// concurrent-`append_single_event` racers. `ingest_due_timers_and_signals`
+/// appends `TimerFired`/`SignalReceived` at a `next_event_id` precomputed from
+/// an earlier `load_history`. It takes no exec-row lock and does no
+/// `MAX(event_id)` recompute. A concurrent committer that took that same
+/// `event_id` first makes the ingest's batch insert hit
 /// `UNIQUE(workflow_exec_id, event_id)`.
 ///
 /// RED (pre-fix): that raw `ingest_due_timers_and_signals` error flowed through
-/// `fail_execution_on_error` and terminally FAILED a healthy run — this test
-/// first asserts the raw error is classified as the transient conflict (the
-/// exact input the pre-fix path failed on). GREEN: `ingest_wake_events_or_requeue`
-/// re-drives the task instead (`Ok(None)`), leaves the run RUNNING, appends no
-/// event, and a fresh re-claim + re-drive advances past the winner's committed
-/// event so the ingest completes cleanly — the same conflict provably cannot
-/// recur (convergent in one retry, no hot loop).
+/// `fail_execution_on_error` and terminally FAILED a healthy run. This test
+/// first asserts that the raw error is classified as the transient conflict,
+/// the exact input the pre-fix path failed on. GREEN:
+/// `ingest_wake_events_or_requeue` re-drives the task instead (`Ok(None)`). It
+/// leaves the run RUNNING and appends no event. A fresh re-claim and re-drive
+/// then advances past the winner's committed event, so the ingest completes
+/// cleanly. The same conflict provably cannot recur: it converges in one
+/// retry, with no hot loop.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
@@ -1424,9 +1428,9 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     .await
     .expect("concurrent committer appends at event_id 1");
 
-    // RED: the raw ingest at the stale id hits UNIQUE(exec_id, event_id) — this
-    // is the exact Err the pre-fix code fed into fail_execution_on_error,
-    // terminally FAILING the run. (This call rolls back; nothing is committed.)
+    // RED: the raw ingest at the stale id hits UNIQUE(exec_id, event_id). The
+    // pre-fix code fed this exact Err into fail_execution_on_error, terminally
+    // FAILING the run. (This call rolls back; nothing is committed.)
     let raw_err = autumn_harvest::worker::ingest_due_timers_and_signals(
         &mut conn,
         exec_id,
@@ -1507,9 +1511,9 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         "the re-pended task is immediately claimable (scheduled_at in the past)"
     );
 
-    // Re-drive: a fresh re-claim + fresh history load advances next_event_id
-    // past the winner's committed event, so the ingest completes cleanly and
-    // the same conflict provably cannot recur.
+    // Re-drive: a fresh re-claim and history load advance next_event_id past
+    // the winner's committed event. So the ingest completes cleanly, and the
+    // same conflict provably cannot recur.
     let task2 = queue::claim_task(
         &mut conn,
         &["default".to_string()],
@@ -1571,32 +1575,32 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     );
 }
 
-/// Lock-order regression (issue #779, Codex round-11 review, P2 ABBA claim):
+/// Lock-order regression (issue #779, ABBA claim):
 /// [`materialize_due_child_timeout_deadlines`] MUST acquire the parent
 /// EXECUTION row `FOR UPDATE` **before** it takes the due `harvest_timers` rows
 /// `FOR UPDATE`.
 ///
 /// The operator cancel/terminate path
 /// (`execution::notify_awaited_parent_of_child_terminal`) locks the parent
-/// execution row first and then calls the materializer, whereas the worker-wake
+/// execution row first and then calls the materializer. The worker-wake
 /// (`wake_parent_for_child_completion`/`_failure`) and child-execution-timeout
 /// (`timeout::wake_parent_for_child_timeout`) callers reach the materializer
-/// with **no** outer parent lock. If the materializer took the timer lock
-/// first, those two orderings would invert (ABBA): two concurrent wakes of the
-/// same overdue parent — one via a normal child terminal (timer-first) and one
-/// via an operator cancel/terminate of a sibling child (execution-row first) —
-/// would deadlock, and Postgres would abort a healthy terminal notification.
+/// with **no** outer parent lock. Suppose the materializer took the timer lock
+/// first. Then those two orderings would invert (ABBA). Take two concurrent
+/// wakes of the same overdue parent. One comes via a normal child terminal
+/// (timer first). One comes via an operator cancel/terminate of a sibling
+/// child (execution row first). They would deadlock, and Postgres would abort
+/// a healthy terminal notification.
 ///
-/// This proves the unified execution-row → timer order **deterministically**
-/// (no timing-dependent deadlock forcing needed): hold the parent execution row
-/// lock open on a dedicated connection, invoke the materializer on another, wait
-/// until its backend is blocked on a lock (its FIRST acquisition), and — while
-/// it is blocked — assert the timer row is NOT yet locked via a
-/// `SELECT ... FOR UPDATE NOWAIT` probe that must succeed. Under the pre-fix
-/// timer-first order this probe would fail with `lock_not_available`, because
-/// the materializer would already hold the timer `FOR UPDATE` while blocked on
-/// the exec-row append. Releasing the held lock lets the materializer complete
-/// and fire the due deadline exactly once.
+/// This proves the unified execution-row → timer order **deterministically**,
+/// with no timing-dependent deadlock forcing. Hold the parent execution row
+/// lock open on a dedicated connection. Invoke the materializer on another.
+/// Wait until its backend is blocked on a lock (its FIRST acquisition). While
+/// it is blocked, a `SELECT ... FOR UPDATE NOWAIT` probe must succeed, so the
+/// timer row is NOT yet locked. Under the pre-fix timer-first order this probe
+/// fails with `lock_not_available`. The materializer would already hold the
+/// timer `FOR UPDATE` while blocked on the exec-row append. Releasing the held
+/// lock lets the materializer complete and fire the due deadline exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 #[allow(clippy::too_many_lines)]
 async fn materializer_locks_execution_row_before_timers_no_abba() {

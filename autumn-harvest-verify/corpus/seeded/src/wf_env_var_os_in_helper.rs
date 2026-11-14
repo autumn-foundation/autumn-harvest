@@ -5,10 +5,10 @@
 //! selects the child workflow's name, so a worker deployed with a different
 //! environment records a different `StartChildWorkflow` command.
 //!
-//! **Launder (a pattern-table gap, not just a hop).** DET004's substring list is
-//! `std::env::var(`, `env::var(`, `std::env::args(`, `env::args(`,
-//! `std::env::vars(`, `env::vars(` — there is **no** `var_os` entry, so this
-//! call would pass det_check even from a same-module helper. HVG003 *does* list
+//! **Launder (a pattern-table gap, not just a hop).** The DET004 substring
+//! list is `std::env::var(`, `env::var(`, `std::env::args(`, `env::args(`,
+//! `std::env::vars(` and `env::vars(`. It has **no** `var_os` entry. So this
+//! call passes `det_check` even from a same-module helper. HVG003 *does* list
 //! `env::var_os`, but the visitor only ever runs over the annotated body, and
 //! this body has no env token. Both layers are defeated, for two different
 //! reasons.

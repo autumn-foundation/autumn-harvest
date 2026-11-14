@@ -8,24 +8,21 @@
 //! `queue::enqueue` once. That is one single-row `INSERT INTO
 //! harvest_task_queue` statement per scheduled activity.
 //!
-//! A workflow can fan out to `N` parallel activities in one suspension,
-//! for example via `ctx.execute_activity_fan_out_raw`. Persisting that one
-//! decision then cost `N` round trips. This is the same shape this
-//! persona's own charter names: bookkeeping queries that are individually
-//! trivial but collectively dominant, found by `calls`, not buffers.
+//! A workflow can fan out to `N` activities in one suspension, for example
+//! with `ctx.execute_activity_fan_out_raw`. That one decision then cost `N`
+//! round trips. Each query is trivial, but together they dominate. `calls`
+//! finds them, not buffers.
 //!
 //! The fix adds `queue::enqueue_batch`. It builds the same
 //! [`autumn_harvest::models::NewTaskQueueItem`] rows the loop built, and
-//! inserts them in one multi-row `INSERT`. Both call sites now call it
-//! once instead of looping. See `queue::enqueue_batch`'s own doc comment
-//! for the rare per-row sticky-pin follow-up it still issues.
+//! inserts them in one multi-row `INSERT`. Both call sites now call it once.
+//! Its doc comment covers the rare sticky-pin follow-up that it still sends.
 //!
-//! Evidence here is `pg_stat_statements` call and buffer counts, never
-//! wall-clock. Wall-clock is not admissible on a shared-vCPU machine. This
-//! harness follows the same shape as `scheduler_overdue_pass_perf.rs` and
-//! `schedule_overdue_aux_perf.rs`: a fresh, uniquely-named, fully-migrated
-//! database per measurement. `pg_stat_statements` is reset immediately
-//! before each measured call and snapshotted immediately after it.
+//! The evidence is `pg_stat_statements` call and buffer counts. Wall-clock
+//! time is not admissible on a shared-vCPU machine. As in
+//! `scheduler_overdue_pass_perf.rs` and `schedule_overdue_aux_perf.rs`, each
+//! measurement gets a fresh, migrated database. `pg_stat_statements` resets
+//! just before each measured call and is read just after it.
 
 #![allow(clippy::too_many_lines)]
 
@@ -88,9 +85,8 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Seeds one real `harvest_workflow_executions` row (the FK
-/// `harvest_task_queue.workflow_exec_id` references) so the enqueued rows
-/// below are production-shaped, not orphaned test fixtures.
+/// Seed the execution row that `harvest_task_queue.workflow_exec_id`
+/// references, so the enqueued rows have an owner.
 async fn seed_execution(conn: &mut AsyncPgConnection, workflow_name: &str) -> uuid::Uuid {
     #[derive(diesel::QueryableByName)]
     struct IdRow {
@@ -112,12 +108,11 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_name: &str) -> uu
     row.id
 }
 
-/// Builds `n` production-shaped [`EnqueueParams`] for one fan-out decision.
+/// Build `n` [`EnqueueParams`] for one fan-out decision.
+///
 /// The fields mirror what `build_activity_enqueue_plan`
 /// (`autumn-harvest/src/worker.rs`) sets for a real `ScheduleActivity`
-/// command. Each row gets a distinct activity name and id, a resolved
-/// retry policy, a heartbeat timeout, a start-to-close timeout, and
-/// ambient context headers.
+/// command.
 fn build_fanout_params(exec_id: uuid::Uuid, n: usize) -> Vec<EnqueueParams> {
     (0..n)
         .map(|i| {
@@ -221,10 +216,10 @@ struct SizePoint {
     wal_bytes: i64,
 }
 
-/// Current WAL insert position, in bytes since the log's start. The
-/// difference of two readings around one operation is that operation's
-/// WAL cost -- the admissible evidence this persona's charter requires
-/// for any write-path claim.
+/// The WAL insert position, in bytes since the start of the log.
+///
+/// Two readings around one operation give its WAL cost. A write-path claim
+/// needs this evidence.
 async fn wal_bytes(conn: &mut AsyncPgConnection) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct WalRow {
@@ -258,10 +253,9 @@ async fn measure_one_fanout(admin: &str, label: &str, n: usize) -> SizePoint {
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
-    // The real public entry point under test: `queue::enqueue` (looped,
-    // "before") or `queue::enqueue_batch` (one call, "after"). These are
-    // the exact functions `persist_scheduled_activities` and
-    // `persist_mixed_suspension_batch` call to persist a fan-out decision.
+    // `persist_scheduled_activities` and `persist_mixed_suspension_batch`
+    // call these functions: `queue::enqueue` in a loop before the fix, and
+    // `queue::enqueue_batch` once after it.
     let wal_before = wal_bytes(&mut stats_conn).await;
     let ids = if label == "before" {
         let mut ids = Vec::with_capacity(params.len());
@@ -361,10 +355,11 @@ async fn zz_capture_activity_enqueue_batch_perf_evidence() {
 
 // ── Equivalence: enqueue_batch matches the per-row enqueue loop exactly ────
 
-/// Proves `enqueue_batch`'s inserted rows agree, column for column and in
-/// order, with what the original per-row `enqueue()` loop would have
-/// written. The fixture exercises the sticky-pin follow-up too (issue
-/// #606's worker-session case), not just the common unpinned path.
+/// The rows of `enqueue_batch` match the rows of the per-row `enqueue()`
+/// loop, column for column and in order.
+///
+/// The fixture also covers the sticky-pin follow-up (the worker-session case
+/// of issue #606).
 #[tokio::test]
 async fn enqueue_batch_matches_the_per_row_enqueue_loop() {
     use autumn_harvest::models::TaskQueueItem;
@@ -377,11 +372,10 @@ async fn enqueue_batch_matches_the_per_row_enqueue_loop() {
 
     let exec_id = seed_execution(&mut conn, &unique("enqueue_batch_equiv_wf")).await;
 
-    // "Before": the original per-row loop, called directly against the
-    // still-`pub`, unmodified `enqueue()`.
+    // "Before": the per-row loop, on the unchanged `pub` `enqueue()`.
     let mut before_params = build_fanout_params(exec_id, 12);
-    // Pin one row sticky, like a worker-session-bound activity would be, so
-    // the rare follow-up UPDATE path is exercised on both sides too.
+    // Pin one row, as a worker session does, so both sides run the rare
+    // follow-up `UPDATE`.
     before_params[3] = before_params[3]
         .clone()
         .with_sticky("perf-worker-0", StdDuration::from_secs(5));
@@ -401,7 +395,7 @@ async fn enqueue_batch_matches_the_per_row_enqueue_loop() {
         .await
         .expect("clear before rows");
 
-    // "After": one enqueue_batch call over an identically-shaped params set.
+    // "After": one `enqueue_batch` call over the same params.
     let mut after_params = build_fanout_params(exec_id, 12);
     after_params[3] = after_params[3]
         .clone()
@@ -432,8 +426,7 @@ async fn enqueue_batch_matches_the_per_row_enqueue_loop() {
         assert_eq!(b.start_to_close, a.start_to_close);
         assert_eq!(b.context_headers, a.context_headers);
         assert_eq!(b.state, a.state);
-        // Sticky columns: both rows carry the pin on the same logical
-        // (sorted) position, both NULL on the rest.
+        // Both sides pin the same sorted position and leave the rest NULL.
         assert_eq!(b.sticky_worker_id, a.sticky_worker_id);
         assert_eq!(b.sticky_timeout.is_some(), a.sticky_timeout.is_some());
         assert_eq!(
@@ -455,9 +448,9 @@ async fn enqueue_batch_on_empty_slice_is_a_no_op() {
     assert_eq!(ids, [] as [uuid::Uuid; 0]);
 }
 
-/// Order must round-trip exactly: `persist_scheduled_activities` zips the
-/// returned ids back against `scheduled_activities` positionally
-/// (`activity_task_ids` doc comment, `autumn-harvest/src/worker.rs`).
+/// The ids come back in input order. `persist_scheduled_activities` zips
+/// them with `scheduled_activities` by position (see `activity_task_ids` in
+/// `autumn-harvest/src/worker.rs`).
 #[tokio::test]
 async fn enqueue_batch_returns_ids_in_input_order() {
     use autumn_harvest::models::TaskQueueItem;
@@ -490,14 +483,13 @@ async fn enqueue_batch_returns_ids_in_input_order() {
 
 /// A batch past Postgres's bind-parameter ceiling must still succeed.
 ///
-/// `NewTaskQueueItem` carries 28 columns, so one unchunked multi-row
-/// `INSERT` hits Postgres's 65,535-bind-parameter ceiling at 2,341 rows
-/// (`65_535 / 28 = 2340`, floor). 3,000 rows spans that boundary: two
-/// chunks, not one. This is a direct regression test for the
-/// pre-chunking bug. `execute_activity_fan_out_raw` accepts an uncapped
-/// `Vec`, and a large-enough fan-out returned a DB error before
-/// `enqueue_batch` chunked its insert. Also checks order survives the
-/// chunk boundary, not just within one chunk.
+/// `NewTaskQueueItem` carries 30 columns (`NEW_TASK_QUEUE_ITEM_COLUMNS` in
+/// `queue.rs`). So one unchunked multi-row `INSERT` hits Postgres's
+/// 65,535-bind-parameter ceiling at 2,185 rows (`65_535 / 30 = 2184`, floor).
+/// 3,000 rows spans that boundary: two chunks, not one.
+/// `execute_activity_fan_out_raw` accepts an uncapped `Vec`. Before
+/// `enqueue_batch` chunked its insert, a large fan-out got a database error.
+/// The test also checks order in both chunks.
 #[tokio::test]
 async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
     use autumn_harvest::models::TaskQueueItem;
@@ -540,10 +532,10 @@ async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
         "every chunk's INSERT must commit"
     );
 
-    // Spot-check order at both ends and across the chunk boundary (row
-    // 2,427, zero-indexed). Each id must still resolve to its own
-    // positional activity name, the same contract
-    // `enqueue_batch_returns_ids_in_input_order` pins for a single chunk.
+    // Check order at both ends and at rows 2,426 to 2,428 (zero-indexed).
+    // Those rows sit in the second chunk, which starts at row 2,184. This is
+    // the contract that `enqueue_batch_returns_ids_in_input_order` pins for
+    // one chunk.
     for i in [0_usize, 1, 2_426, 2_427, 2_428, N - 1] {
         let row: TaskQueueItem = harvest_task_queue::table
             .filter(harvest_task_queue::id.eq(ids[i]))
@@ -559,7 +551,7 @@ async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
     }
 }
 
-// ── End-to-end: a real workflow's fan-out, driven through Worker::run ──────
+// ── End-to-end: a real workflow's fan-out, run through `run_workflow` ──────
 
 fn fan_out_handler<'a>(
     ctx: &'a WorkflowContext,
@@ -577,13 +569,12 @@ fn fan_out_handler<'a>(
     })
 }
 
-/// Drives a real workflow through `run_workflow`'s pure engine, with no
-/// database involved. It confirms the fan-out handler emits 10
-/// `ScheduleActivity` commands in one suspension. That is the exact shape
-/// `persist_scheduled_activities` persists with the now-batched insert.
-/// This is the public-entry-point proof: a real workflow decision reaches
-/// the batched insert, not only this file's direct `EnqueueParams`
-/// fixture above.
+/// A real workflow decision emits 10 `ScheduleActivity` commands in one
+/// suspension.
+///
+/// `run_workflow` runs the pure engine, with no database. The decision has
+/// the shape that `persist_scheduled_activities` sends to the batched insert.
+/// So the proof covers a real decision, not only the `EnqueueParams` fixture.
 #[tokio::test]
 async fn fan_out_handler_emits_ten_schedule_activity_commands_in_one_suspension() {
     use autumn_harvest::event::WorkflowEvent;

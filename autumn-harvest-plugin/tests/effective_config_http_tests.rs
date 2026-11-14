@@ -1,17 +1,15 @@
 //! No-database HTTP tests for the effective-config introspection endpoint
 //! (issue #695).
 //!
-//! `GET /admin/config` reads only the in-process snapshot carried by the
-//! installed `HarvestApiRuntime` — no database — so these drive the real
-//! `harvest_api_router` (including its `require_admin` route layer) against
-//! `AppState::for_test()` via `tower`, mirroring the `security.rs` pattern.
+//! `GET /admin/config` reads only the in-process snapshot on the installed
+//! `HarvestApiRuntime`, with no database. These tests drive the real
+//! `harvest_api_router`, `require_admin` layer included, against
+//! `AppState::for_test()` via `tower`, like the `security.rs` tests.
 //!
-//! Since the snapshot lives *on* the runtime (attached by the shared
-//! `HarvestRunner::start` bring-up seam that both the plugin web-app path and
-//! the standalone runner funnel through), installing a runtime is the only step
-//! needed to serve the endpoint — there is no separate `set_effective_config`
-//! call. These tests deliberately install the runtime *without* any such call,
-//! exercising the exact install shape the standalone runner uses
+//! The snapshot lives *on* the runtime. The shared `HarvestRunner::start`
+//! bring-up attaches it for the web-app path and the standalone runner. So an
+//! installed runtime is enough to serve the endpoint. These tests install the
+//! runtime with no `set_effective_config` call, as the standalone runner does
 //! (`api_state.install(runner.api_runtime())`).
 
 use std::collections::HashMap;
@@ -100,11 +98,9 @@ fn sample_view() -> EffectiveConfigView {
     )
 }
 
-/// Install a minimal, DB-free runtime carrying `view` — mirroring the standalone
-/// runner's `api_state.install(runner.api_runtime())` shape, where the snapshot
-/// rides on the runtime and no separate `set_effective_config` call is made
-/// (issue #695). The runtime shape otherwise mirrors what the crate's internal
-/// tests build.
+/// Install a minimal, DB-free runtime carrying `view`. This mirrors the
+/// standalone runner's `api_state.install(runner.api_runtime())` shape, with no
+/// `set_effective_config` call (issue #695).
 fn install_runtime_with_view(api_state: &HarvestApiState, view: EffectiveConfigView) {
     api_state.install(
         HarvestApiRuntime::new(
@@ -130,9 +126,9 @@ async fn eris_unauthenticated_effective_config_is_blocked() {
 
 #[tokio::test]
 async fn effective_config_fails_closed_when_runtime_not_installed() {
-    // Admin-authorized, but the runtime was never installed: the endpoint gates
-    // on `runtime()`, so a genuinely un-started deployment must fail closed with
-    // the standard "runtime not started" 400 — never 200 (P2#1 readiness gate).
+    // Admin-authorized, but the runtime was never installed. The endpoint gates
+    // on `runtime()`, so an un-started deployment must fail closed with the
+    // standard "runtime not started" 400, never 200.
     let app = app_with_api_state(HarvestApiState::new());
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
     assert_ne!(res.status(), StatusCode::OK);
@@ -167,12 +163,11 @@ async fn effective_config_served_from_installed_runtime_without_a_set_call() {
 
 #[tokio::test]
 async fn effective_config_fails_closed_when_runtime_has_no_captured_config() {
-    // Regression for the PR #987 review P2 (api.rs:268): `HarvestApiRuntime::new`
-    // is a *public* constructor. A runtime installed directly through it — without
-    // the shared runner's `with_effective_config` bring-up call — carries no
-    // captured snapshot. For an incident-triage endpoint a plausible-but-wrong
-    // fabricated defaults config is worse than an honest error, so the handler must
-    // fail closed (400) rather than serve a 200 placeholder.
+    // Regression for PR #987: `HarvestApiRuntime::new` is a *public*
+    // constructor. A runtime installed through it, without the runner's
+    // `with_effective_config` call, carries no snapshot. For an incident-triage
+    // endpoint, fabricated defaults are worse than an honest error. So the
+    // handler must fail closed (400), not serve a 200 placeholder.
     let api_state = HarvestApiState::new();
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -187,9 +182,8 @@ async fn effective_config_fails_closed_when_runtime_has_no_captured_config() {
     let app = app_with_api_state(api_state);
 
     let res = app.oneshot(get_as_admin("/admin/config")).await.unwrap();
-    // Admin-authorized and a runtime *is* installed (so this is not the
-    // "runtime not started" case), yet the response is the fail-closed 400 —
-    // never a 200.
+    // Admin-authorized, and a runtime *is* installed, so this is not the
+    // "runtime not started" case. The response is still the fail-closed 400.
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -219,9 +213,8 @@ async fn effective_config_fails_closed_when_runtime_has_no_captured_config() {
 #[tokio::test]
 async fn effective_config_happy_path_returns_secret_free_view() {
     let api_state = HarvestApiState::new();
-    // The snapshot rides on the installed runtime; the endpoint gates on
-    // `runtime()` being installed (P2#1), which this satisfies by installing a
-    // runtime carrying the sample view.
+    // The endpoint gates on an installed `runtime()`. This installs one that
+    // carries the sample view.
     install_runtime_with_view(&api_state, sample_view());
     let app = app_with_api_state(api_state);
 

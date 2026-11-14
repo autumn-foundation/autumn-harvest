@@ -6,8 +6,8 @@
 //! written into the activity input, so the recorded command carries a
 //! monotonic-clock reading.
 //!
-//! **Launder.** HVG001's path list and DET001's substring table both contain
-//! only the *constructors* `Instant::now` / `SystemTime::now` — neither has an
+//! **Launder.** The HVG001 path list and the DET001 substring table both hold
+//! only the *constructors* `Instant::now` / `SystemTime::now`. Neither has an
 //! `.elapsed()` pattern, and neither models a field or static of type
 //! `Instant`. So this escapes the syntactic layer **even written inline in a
 //! workflow body**; the two crate boundaries are belt-and-braces.

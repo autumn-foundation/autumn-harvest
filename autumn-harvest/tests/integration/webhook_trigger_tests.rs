@@ -3,9 +3,9 @@
 //! Pure, no-DB tests for `WebhookTriggerInfo`/`WebhookCtx`/`WebhookHandlerFn`/
 //! `validate_webhook_triggers`. These exercise the shape the `#[webhook]` macro
 //! (issue #344, Layer 2) generates and the plugin route layer (Layer 3) consumes.
-//! `WebhookHandlerFn` takes its payload by reference (the real dispatch shim
-//! deserializes from a borrowed `&Value` to avoid cloning the verified body),
-//! so these hand-written fixtures do too.
+//! `WebhookHandlerFn` takes its payload by reference, so these fixtures do too.
+//! The real dispatch shim deserializes from a borrowed `&Value` to avoid
+//! cloning the verified body.
 
 use autumn_harvest::types::WorkflowId;
 use autumn_harvest::webhook_trigger::{

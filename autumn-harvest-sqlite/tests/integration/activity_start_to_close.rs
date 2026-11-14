@@ -1,5 +1,5 @@
-//! FIX 2 (Codex #1069 P2, `runtime.rs:715`): the `SQLite` backend HONORS an activity's
-//! `start_to_close` timeout, and closes the dropped-`ScheduleActivity`-field class.
+//! The `SQLite` backend HONORS an activity's `start_to_close` timeout (issue #1069)
+//! and closes the dropped-`ScheduleActivity`-field class.
 //!
 //! The core `ScheduleActivity` command carries `start_to_close_override` (from both
 //! `execute_activity_with_opts` and `ActivityInfo::default_start_to_close`). Pre-fix
@@ -16,16 +16,16 @@
 //!
 //! The session fields (`session_id`/`session_worker_id`, issue #606) and the
 //! session-acquire-only `schedule_to_start_override` are OUTSIDE the single-writer
-//! subset and are now REJECTED LOUDLY rather than silently dropped — so a workflow
-//! using `ctx.create_session(...)` fails with a clear `Unsupported` error instead of
-//! running its activities un-pinned.
+//! subset. The backend REJECTS them LOUDLY instead of dropping them. So a workflow
+//! that uses `ctx.create_session(...)` fails with a clear `Unsupported` error. It
+//! does not run its activities un-pinned.
 
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
 #![allow(clippy::used_underscore_binding)]
-// The `work` activity fixture (and the terminal-only workflows) have trivial,
-// await-free bodies — the crate runs a registered `ActivitySpec`, not the `#[activity]`
-// body, and a terminal-failure workflow returns immediately.
+// The `work` activity fixture and the terminal-only workflows have await-free bodies.
+// The crate runs a registered `ActivitySpec`, not the `#[activity]` body. A
+// terminal-failure workflow returns immediately.
 #![allow(clippy::unused_async)]
 
 use std::time::Duration;
@@ -95,8 +95,8 @@ fn fast_body() -> ActivitySpec {
 
 // ── A body exceeding its per-call start-to-close records ActivityTimedOut ───────
 //
-// RED pre-fix: the budget was dropped, the ~40ms body ran to completion, and history
-// recorded `ActivityCompleted` (never `ActivityTimedOut`).
+// Regression: the budget was dropped, so the ~40ms body ran to completion and
+// history recorded `ActivityCompleted`, never `ActivityTimedOut`.
 #[tokio::test]
 async fn slow_activity_records_activity_timed_out_not_completed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -214,14 +214,14 @@ async fn worker_session_command_is_rejected_loudly_not_silently_dropped() {
     }
 }
 
-// ── FINDING B class audit: the RAW path honors the registered default_start_to_close ──
+// ── The RAW path honors the registered default_start_to_close ───────────────────────
 //
-// Sibling of the `default_retry_policy` finding (`runtime.rs:331`). The tests above prove
-// the TYPED path (which carries `start_to_close_override` on the ScheduleActivity command
-// from `ActivityInfo::default_start_to_close`). The RAW `execute_activity_raw` path
-// carries NO override, so — like `default_retry_policy` — the declared
-// `default_start_to_close` was silently dropped: a raw call to an info-registered activity
-// lost its per-attempt budget. The worker now resolves it BY NAME from the registered
+// The sibling of the `default_retry_policy` case. The tests above prove the TYPED path.
+// It carries `start_to_close_override` on the ScheduleActivity command, from
+// `ActivityInfo::default_start_to_close`. The RAW `execute_activity_raw` path carries
+// NO override. So the declared `default_start_to_close` was silently dropped, as
+// `default_retry_policy` was. A raw call to an info-registered activity lost its
+// per-attempt budget. The worker now resolves it BY NAME from the registered
 // ActivitySpec at CLAIM time, so the raw path honors the budget too.
 
 // Calls the RAW dispatch path BY NAME — no start_to_close_override on the command.
@@ -245,9 +245,9 @@ async fn raw_stc_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
-// RED pre-fix: the raw command carried no start_to_close_override and the registered spec
-// had no start_to_close field, so `task.start_to_close_ms == None` → the ~40ms body ran to
-// completion and recorded `ActivityCompleted`, ignoring the declared 1ms budget.
+// Regression: the raw command had no start_to_close_override, and the registered spec
+// had no start_to_close field. So `task.start_to_close_ms == None`, and the ~40ms body
+// recorded `ActivityCompleted` despite the declared 1ms budget.
 #[tokio::test]
 async fn raw_path_honors_registered_default_start_to_close() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();

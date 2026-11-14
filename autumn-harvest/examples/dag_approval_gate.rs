@@ -3,17 +3,16 @@
 //!
 //! ## The problem
 //!
-//! A `#[dag]` pipeline can wire activities into a graph, but the moment one
-//! step needs to *pause and wait for a human approval* (or any external
-//! event), authors previously had to abandon the DAG surface and hand-write a
-//! full `#[workflow]` — losing the declarative graph, the DAG trigger
-//! contract, and the graph-view tooling.
+//! A `#[dag]` pipeline can wire activities into a graph. Before this change, a
+//! step that had to *wait for a human approval* or another external event
+//! forced a hand-written `#[workflow]`. That lost the declarative graph, the
+//! DAG trigger contract, and the graph-view tooling.
 //!
 //! ## The solution: `signal_gate` / `signal_gate_with_timeout`
 //!
-//! A **gate node** is a graph node with no activity dispatch: it pauses the
-//! run until a named signal arrives, then makes the signal payload its output
-//! so downstream nodes can consume it. It composes exactly like any other
+//! A **gate node** is a graph node with no activity dispatch. It pauses the
+//! run until a named signal arrives. The signal payload becomes its output for
+//! downstream nodes. It composes exactly like any other
 //! node (`.upstream(&gate)`, `.map_activity(f).over(&gate)`, `.condition(...)`).
 //!
 //! ```text
@@ -47,15 +46,16 @@
 //! There is no bespoke branch-target mechanism. Under `Continue`, the gate's
 //! null-vs-payload output *is* the branch selector: attach a
 //! `.condition(...)` to each downstream node. The `order_approval_with_fallback`
-//! DAG below routes to `fulfill_order` when the signal arrived (payload present)
-//! and to `escalate_to_manager` when the deadline fired first (payload null) —
-//! two branches, expressed purely with conditions over the gate output.
+//! DAG below shows two branches, expressed only as conditions on the gate
+//! output. It routes to `fulfill_order` when the signal arrived (payload
+//! present). It routes to `escalate_to_manager` when the deadline fired first
+//! (payload null).
 //!
 //! ## Invariants
 //!
 //! - **Unified-DAG only.** Gates lower onto the unified workflow-execution
-//!   path; a classic DAG containing a gate is rejected at build time with a
-//!   `DagSignalGateRequiresUnifiedExecution` error naming the DAG and signal.
+//!   path. A classic DAG with a gate fails at build time. The
+//!   `DagSignalGateRequiresUnifiedExecution` error names the DAG and signal.
 //!   Build with `--features unified-dag-execution`.
 //! - **No new `WorkflowEvent` variant, no migration.** Gates reuse the #476
 //!   `TimerStarted`/`TimerFired`/`SignalReceived` machinery, so a gated run
@@ -91,8 +91,8 @@ async fn escalate_to_manager(_ctx: &ActivityContext) -> Result<Value, String> {
 
 /// **Primary teaching shape.** `extract → approval gate → load`, where the gate
 /// fails the whole run if no approval signal arrives within the SLA. This is
-/// the classic human-in-the-loop pipeline: do the work only after a human
-/// approves, and treat a missed SLA as a hard failure worth paging on.
+/// the classic human-in-the-loop pipeline. Work runs only after a human
+/// approves, and a missed SLA is a hard failure worth paging on.
 #[dag(default_queue = "approvals")]
 fn order_approval_pipeline(dag: &mut DagBuilder) {
     let extract = dag.activity(extract_order);
@@ -107,8 +107,8 @@ fn order_approval_pipeline(dag: &mut DagBuilder) {
 }
 
 /// **Declarative named-branch shape (AC2).** Same gate, but `Continue` on
-/// timeout: instead of failing, the run proceeds with a `Value::Null` gate
-/// output, and two downstream `.condition` branches select what happens next.
+/// timeout. The run proceeds with a `Value::Null` gate output. Two downstream
+/// `.condition` branches select what happens next.
 ///
 /// - `load_order` runs only when the gate output is a real payload (approved).
 /// - `escalate_to_manager` runs only when the gate output is null (timed out).
@@ -206,8 +206,8 @@ mod tests {
     }
 
     /// AC2a: no approval arrives, the deadline fires, and a `FailRun` gate fails
-    /// the whole DAG run — and the timer-first history replays deterministically
-    /// to that same FAILED outcome (never a non-determinism divergence).
+    /// the whole DAG run. The timer-first history replays to that same FAILED
+    /// outcome, never to a non-determinism divergence.
     #[tokio::test]
     async fn missing_approval_fails_the_run() {
         let outcome = WorkflowTestEnv::new()
@@ -252,8 +252,8 @@ mod tests {
     }
 
     /// AC2b + AC5 (timer branch): under `Continue`, a missed SLA routes to the
-    /// declarative `escalate_to_manager` branch (fulfil is skipped by its
-    /// condition), and the timer-first history replays deterministically.
+    /// declarative `escalate_to_manager` branch. Its condition skips fulfil. The
+    /// timer-first history replays deterministically.
     #[tokio::test]
     async fn timeout_routes_to_escalation_branch_and_replays() {
         let outcome = WorkflowTestEnv::new()

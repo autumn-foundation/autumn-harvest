@@ -398,9 +398,10 @@ async fn legacy_catchup_true_fires_all_slots_compat() {
     );
 }
 
-/// `Window` policy: 1-hour window on a schedule overdue by 2 hours on a
-/// 60-second interval → ~120 missed slots; only the ~60 within the last hour
-/// should fire, the rest are dropped.
+/// `Window` policy: 1-hour window on a 60-second schedule overdue by 2 hours.
+///
+/// That is ~120 missed slots. Only the ~60 within the last hour fire; the rest
+/// are dropped.
 #[tokio::test]
 async fn window_policy_fires_only_in_window_slots() {
     let (mut conn, url, _c) = setup_db().await;

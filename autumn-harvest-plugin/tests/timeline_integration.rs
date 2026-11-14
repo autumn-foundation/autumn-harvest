@@ -2,15 +2,15 @@
 //!
 //! Tests run against a real Postgres instance (testcontainers) and exercise:
 //!   (1) 404 for an unknown execution id.
-//!   (2) 200 with reconstructed steps for a COMPLETED execution whose seeded
-//!       history carries an activity (scheduled/started/completed) plus a timer;
-//!       the activity's wait/exec split is present and `slowest_step` is non-null.
+//!   (2) 200 with reconstructed steps for a COMPLETED execution. Its seeded
+//!       history carries an activity (scheduled/started/completed) and a timer.
+//!       The activity's wait/exec split is present and `slowest_step` is non-null.
 //!   (3) A RUNNING (non-terminal) execution → the open step reports outcome
 //!       "pending" with a null `ended_at`.
 //!   (4) 400 for a malformed execution id.
 //!
-//! The core duration math is unit-tested in `autumn-harvest/src/timeline.rs`;
-//! these tests verify the HTTP wiring (routing, 404/400, shape).
+//! Unit tests in `autumn-harvest/src/timeline.rs` cover the core duration math.
+//! These tests verify the HTTP wiring (routing, 404/400, shape).
 
 #![allow(clippy::too_many_lines)]
 
@@ -49,9 +49,9 @@ mod wire_contract;
 // `timeline_classic_dag_run_returns_404` inserts a classic DAG run row directly
 // into `harvest_dag_runs`, but migration 20260514000000_drop_harvest_dag_runs
 // (included in the full bundle) drops that table. This hand-rolled subset
-// intentionally applies the initial migration (which creates harvest_dag_runs)
-// WITHOUT the later drop, so the table remains available for the classic-DAG
-// timeline 404 assertion.
+// applies the initial migration, which creates harvest_dag_runs, WITHOUT the
+// later drop. So the table stays available for the classic-DAG timeline 404
+// assertion.
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
@@ -71,10 +71,10 @@ const INIT_SQL: &str = concat!(
     // issue #964: shard-rebalancing forwarding columns (read back by
     // WorkflowExecution::as_select()). Added inline rather than by including
     // the migration, which also alters `harvest_execution_summaries` -- a table
-    // this bundle never creates. Without them every seed in this suite fails
+    // this bundle never creates. Without them, every seed in this suite fails
     // with `column harvest_workflow_executions.migrated_to_shard does not
-    // exist`, and the not-found routes answer 503 instead of 404 because the
-    // lookup errors before it can miss.
+    // exist`. The not-found routes then answer 503, not 404, because the lookup
+    // errors before it can miss.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
@@ -402,9 +402,9 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: 
         .unwrap();
 }
 
-/// Insert one event row with an explicit `event_id` and `timestamp` so we control
-/// the reconstructed step durations (the engine's own `append_events` stamps the
-/// row with `NOW()`, which we deliberately bypass here).
+/// Insert one event row with an explicit `event_id` and `timestamp`, so the test
+/// controls the reconstructed step durations. It bypasses `append_events`, which
+/// stamps the row with `NOW()`.
 async fn insert_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -471,9 +471,9 @@ async fn timeline_malformed_id_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// (2) A COMPLETED execution whose history carries an activity (with a start
-/// event, so the wait/exec split is present) and a timer → 200 with the
-/// reconstructed steps and a non-null `slowest_step`.
+/// (2) A COMPLETED execution with an activity and a timer in its history → 200
+/// with the reconstructed steps and a non-null `slowest_step`. The activity has
+/// a start event, so the wait/exec split is present.
 #[tokio::test]
 async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
     let (url, _container) = setup_database().await;
@@ -657,9 +657,9 @@ async fn timeline_running_open_step_is_pending() {
     );
 }
 
-/// (5) AC6: a **classic** DAG run lives only in `harvest_dag_runs` and has NO
-/// matching `harvest_workflow_executions` row — classic DAGs are not on the
-/// standard execution path — so its timeline returns `404` with the explanatory
+/// (5) AC6: a **classic** DAG run lives only in `harvest_dag_runs`. It has NO
+/// matching `harvest_workflow_executions` row, because classic DAGs are off the
+/// standard execution path. So its timeline returns `404` with the explanatory
 /// message. This makes the AC6 promise falsifiable beyond a random unknown UUID.
 #[tokio::test]
 async fn timeline_classic_dag_run_returns_404() {
@@ -691,12 +691,11 @@ async fn timeline_classic_dag_run_returns_404() {
     );
 }
 
-/// (6) AC6/L1: a **unified** DAG run lowers onto the standard execution path — it
+/// (6) AC6/L1: a **unified** DAG run lowers onto the standard execution path. It
 /// IS a `harvest_workflow_executions` row with an ordinary
-/// `ActivityScheduled`/`ActivityStarted`/`ActivityCompleted` history — so its
-/// timeline reconstructs exactly like a plain workflow run and returns `200`.
-/// This is behaviorally identical to a plain workflow execution, which is the
-/// point: the route serves unified DAGs with no special-casing.
+/// `ActivityScheduled`/`ActivityStarted`/`ActivityCompleted` history. So its
+/// timeline reconstructs like a plain workflow run and returns `200`. The route
+/// serves unified DAGs with no special-casing.
 #[tokio::test]
 async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
     let (url, _container) = setup_database().await;

@@ -351,9 +351,9 @@ fn boundary_kind_names_are_unique_and_kebab_case() {
 #[test]
 fn an_unused_entry_on_a_proven_workflow_says_the_workflow_is_clean_now() {
     // The two ways an entry goes unused read very differently to the person who
-    // has to act on them: a path that no longer exists is a rename or a
-    // deletion, while a path that is now `proven-deterministic` is the good
-    // news — the bug the entry was written for is fixed. The warning must not
+    // has to act on them. A path that no longer exists is a rename or a
+    // deletion. A path that is now `proven-deterministic` is the good news: the
+    // bug the entry was written for is fixed. The warning must not
     // spell the second as "no analyzed workflow has that path".
     let mut r = report(vec![proven("clean::a")]);
     r.unused_allowlist = vec!["clean::a".to_string(), "clean::gone".to_string()];

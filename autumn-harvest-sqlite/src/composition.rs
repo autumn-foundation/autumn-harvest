@@ -513,9 +513,7 @@ struct SignalRequest<'a> {
     signal_id: ExternalSignalId,
     /// The run to signal.
     target: &'a ExternalTarget,
-    /// The signal name.
     signal_name: &'a str,
-    /// The signal payload.
     payload: &'a Value,
     /// The dedup key, if any.
     idempotency_key: Option<&'a str>,

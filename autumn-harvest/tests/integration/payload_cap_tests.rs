@@ -97,8 +97,8 @@ fn payload_kind_all_variants_exist() {
 
 #[test]
 fn payload_kind_is_non_exhaustive() {
-    // The non-exhaustive attribute means we can construct known variants
-    // but a match without a wildcard arm won't compile. We test via
+    // The non-exhaustive attribute allows construction of known variants,
+    // but a match without a wildcard arm does not compile. So the test uses
     // the Display (Debug) representation.
     let kind = PayloadKind::ActivityInput;
     let debug_str = format!("{kind:?}");
@@ -354,7 +354,7 @@ fn metric_payload_rejected_constant_exists() {
 
 #[tokio::test]
 async fn context_rejects_oversized_activity_input_at_schedule_time() {
-    // A 3 MiB input should be rejected when cap is 1 MiB
+    // A 2 MiB input should be rejected when cap is 1 MiB
     let ctx = WorkflowContext::new_test().with_payload_caps(
         1024 * 1024,
         2 * 1024 * 1024,
@@ -414,9 +414,9 @@ async fn context_accepts_activity_input_within_cap() {
     }
 }
 
-// AC (issue #524): when an offload threshold is configured, an oversized
-// payload that will be offloaded must NOT trip the #252 cap — it suspends
-// (offload happens at persist time) instead of returning PayloadTooLarge.
+// AC (issue #524): with an offload threshold set, an oversized payload that
+// will be offloaded must NOT trip the #252 cap. Offload happens at persist
+// time, so the call suspends instead of returning PayloadTooLarge.
 #[tokio::test]
 async fn context_skips_cap_when_payload_will_be_offloaded() {
     let ctx = WorkflowContext::new_test()
@@ -484,7 +484,6 @@ fn context_rejects_oversized_side_effect_value() {
         1024 * 1024,
     );
 
-    // Make a large string that exceeds the cap
     let large_value = "y".repeat(2 * 1024 * 1024); // 2 MiB string
 
     let result = ctx.side_effect("big_value", || large_value.clone());
@@ -553,7 +552,6 @@ fn replay_does_not_recheck_cap_on_existing_events() {
 
     match result {
         Ok(v) => {
-            // The stored value should be returned intact
             assert_eq!(
                 v.len(),
                 3 * 1024 * 1024,
@@ -601,9 +599,8 @@ async fn activity_cap_override_raises_global_cap() {
 
 #[tokio::test]
 async fn activity_cap_override_does_not_lower_global_cap() {
-    // Global cap: 4 MiB (generous)
-    // "Per-activity override": 1 MiB (trying to lower — should be ignored, global wins)
-    // Payload: 2 MiB — should STILL pass because effective cap = max(4 MiB, 1 MiB) = 4 MiB
+    // A 1 MiB override cannot lower the 4 MiB global cap. The effective cap is
+    // max(4 MiB, 1 MiB), so a 2 MiB payload still passes.
     let ctx = WorkflowContext::new_test()
         .with_payload_caps(
             4 * 1024 * 1024,
@@ -703,10 +700,9 @@ fn parse_byte_size_rejects_invalid() {
 }
 
 // ---------------------------------------------------------------------------
-// AC: #[workflow(max_input_bytes = "...")] macro attribute
-// (tested via macros_workflow.rs integration test file, not here)
-// The following test verifies that the WorkflowInfo field is accessible when
-// produced from the builder without the macro.
+// AC: the #[workflow(max_input_bytes = "...")] macro attribute. `macros_workflow.rs`
+// tests the macro. The test below checks that the WorkflowInfo field is
+// accessible when the builder produces it, without the macro.
 // ---------------------------------------------------------------------------
 
 #[test]

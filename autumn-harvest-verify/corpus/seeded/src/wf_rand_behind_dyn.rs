@@ -8,8 +8,8 @@
 //! **Launder.** There is no `rand` token in this body, in any same-module
 //! helper, or even at the call site: MIR shows `<dyn Jitter as Jitter>::ms`.
 //! HVG002 and DET002 both know `rand::random`, and both are body-only /
-//! same-module-one-hop, so neither can see through the crate boundary — and
-//! neither has any notion of virtual dispatch to see through in the first place.
+//! same-module-one-hop. So neither can see through the crate boundary. Neither
+//! has any notion of virtual dispatch to see through in the first place.
 //!
 //! **Devirtualization (deliberate).** `Live` is the *only* type unsized into
 //! `dyn Jitter` anywhere in the analyzed set, and the coercion

@@ -3,9 +3,9 @@
 //! A workflow that calls `continue_as_new` forks forward into a fresh execution
 //! that shares its `workflow_id` and shard but has a brand-new `exec_id`. Over a
 //! long-lived, self-continuing workflow this produces a *chain* of executions.
-//! This module turns a flat set of chain-member rows into an ordered, operator-
-//! facing view (`RunChainResponse`) so a single logical run's whole history is
-//! discoverable from any one of its members.
+//! This module turns a flat set of chain-member rows into an ordered view
+//! (`RunChainResponse`). An operator then finds the whole history of one
+//! logical run from any one of its members.
 //!
 //! This module is **pure** — it takes already-loaded rows and produces the wire
 //! response. The DB query that loads the rows and the HTTP route that serves the
@@ -92,9 +92,9 @@ pub struct RunChainRow {
 
 /// Collapse a raw DB execution state string to a stable terminal-outcome label.
 ///
-/// Non-terminal / active states (`RUNNING`, `PAUSED`, `SUSPENDED`) and any
-/// unknown value collapse to `"running"` — a safe default that never claims a
-/// run finished when it did not.
+/// Non-terminal states (`RUNNING`, `PAUSED`, `SUSPENDED`) and any unknown value
+/// collapse to `"running"`. This safe default never claims a run finished when
+/// it did not.
 ///
 /// ## Examples
 ///
@@ -159,23 +159,24 @@ fn index_chain_rows(
 /// 1. Start at the row whose `exec_id == head_exec_id` (or the earliest-started
 ///    row if none matches).
 /// 2. Hop forward via `continued_from_exec_id`: append the row that points back
-///    at the current one. When no such row exists but the current run is
-///    `CONTINUED_AS_NEW` and unvisited rows remain (a legacy chain lacking the
-///    back-link), append the remaining rows ordered by `(started_at, exec_id)`.
+///    at the current one. A legacy chain lacks that back-link. So when no such
+///    row exists, the current run is `CONTINUED_AS_NEW` and unvisited rows
+///    remain, append them ordered by `(started_at, exec_id)`.
 /// 3. Any still-unvisited rows are appended in `(started_at, exec_id)` order.
 ///
 /// The loop is bounded by `rows.len() + 1` iterations, so a corrupt cycle in the
 /// back-links can never hang.
 ///
 /// `continued_to_exec_id` on each record is the `exec_id` of the next ordered
-/// run (`None` for the tail), *except* when the next run names a different,
-/// absent predecessor — a retention gap — in which case it is `None` rather
-/// than a synthesized false continuation. Legacy rows (no column linkage) still
-/// derive it from ordering, so pre-feature chains are unaffected.
+/// run (`None` for the tail). One exception: the next run names a different,
+/// absent predecessor (a retention gap). Then it is `None`, not a false
+/// continuation. Legacy rows (no column linkage) still derive it from ordering,
+/// so pre-feature chains are unaffected.
 ///
 /// See the module docs and `head_unknown` for the head-confidence rule.
-// The rows are taken by value: this is the owned DB->wire boundary the plugin
-// hands over after loading the chain, and the function is the sole consumer.
+// The rows are taken by value. This is the owned DB->wire boundary that the
+// plugin hands over after it loads the chain, and this function is the sole
+// consumer.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChainResponse {
@@ -214,11 +215,10 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let mut current = start;
     for _ in 0..=n {
         // Prefer the explicit forward link: an unvisited row whose predecessor
-        // is `current`. A valid continue-as-new chain has an injective
-        // `continued_from` (reset forks and workflow retries set it to `None`, not
-        // a duplicate predecessor), so the first match is the only match; a stray
-        // corrupt-fork duplicate is still recovered by the defensive time-order
-        // pass below.
+        // is `current`. In a valid chain `continued_from` is injective. Reset
+        // forks and workflow retries set it to `None`, not to a duplicate
+        // predecessor. So the first match is the only match. The time-order
+        // pass in step 3 still recovers a stray corrupt-fork duplicate.
         let current_exec_id = rows[current].exec_id;
         let next = successor_by_predecessor
             .get(&current_exec_id)
@@ -234,10 +234,10 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
 
         // Legacy fallback: current is a CONTINUED_AS_NEW run with no stored
         // forward link but unvisited rows remain — append them in time order.
-        // This graceful-degradation path orders a mixed legacy->post-feature
-        // suffix by timestamp; it is correct under monotonic continue-as-new
-        // timing (successive runs are seconds/minutes apart) and only
-        // mis-orderable under clock skew between the runs.
+        // This path orders a mixed legacy->post-feature suffix by timestamp.
+        // It is correct under monotonic continue-as-new timing, where successive
+        // runs are seconds or minutes apart. Only clock skew between the runs
+        // can misorder it.
         if rows[current].state == "CONTINUED_AS_NEW" {
             let mut last_appended = None;
             for &idx in &by_time {
@@ -265,7 +265,6 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
         }
     }
 
-    // Build records with derived forward links and sequence numbers.
     let mut runs: Vec<RunChainRecord> = Vec::with_capacity(ordered.len());
     for (seq, &row_idx) in ordered.iter().enumerate() {
         let row = &rows[row_idx];
@@ -273,10 +272,10 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
         // to bridge a gap. `next` is the next ordered row (`None` for the tail).
         // A confirmed back-link (`next.continued_from == row.exec_id`) or a
         // legacy/order-based row (`next.continued_from == None`, no column
-        // linkage) is a genuine continuation. But when `next` names a
-        // *different*, absent predecessor (`Some(other) != row.exec_id`), the
-        // real successor between them was deleted (e.g. a retention gap) — do
-        // NOT synthesize a false direct `row -> next` continuation.
+        // linkage) is a genuine continuation. But `next` can name a
+        // *different*, absent predecessor (`Some(other) != row.exec_id`). Then
+        // the real successor between them was deleted (e.g. a retention gap).
+        // Do NOT synthesize a false direct `row -> next` continuation.
         let continued_to = ordered.get(seq + 1).and_then(|&next_idx| {
             let next = &rows[next_idx];
             match next.continued_from_exec_id {
@@ -304,19 +303,20 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
     let head_participates_in_can = rows.len() > 1 || head_row.state == "CONTINUED_AS_NEW";
     let head_lacks_backlink =
         head_row.continued_from_exec_id.is_none() && head_row.first_exec_id.is_none();
-    // Missing-predecessor gap: ANY gathered row whose `continued_from_exec_id`
-    // names a predecessor absent from the gathered set proves the chain has a
-    // hole — a run that was retention-deleted (per-execution legal hold, #747,
-    // can delete an expired middle run while a held head and tail survive).
-    // Flag `head_unknown` so we never present an incomplete chain as fully
-    // resolved. This subsumes the retention-pruned-origin case (the resolved
-    // head is itself a gathered row, so a missing head predecessor still trips
-    // this) AND the deleted-middle case (the tail names an absent middle). A
-    // genuine origin (post-feature, legacy, standalone, or the mixed-chain
-    // boundary run) has `continued_from_exec_id == None`, and a complete chain
-    // gathers every predecessor, so this term is false for all of those. Legacy
-    // rows carry `continued_from_exec_id == None` and never trip it — their head
-    // confidence stays governed by the lacks-backlink / participates rule.
+    // Missing-predecessor gap: a gathered row whose `continued_from_exec_id`
+    // names an absent predecessor proves a hole in the chain. Retention deleted
+    // that run. Per-execution legal hold (#747) can delete an expired middle
+    // run while a held head and tail survive. Flag `head_unknown`, so an
+    // incomplete chain never shows as fully resolved.
+    //
+    // This covers the retention-pruned origin: the resolved head is a gathered
+    // row, so its missing predecessor trips this. It also covers the deleted
+    // middle: the tail names an absent middle. A genuine origin (post-feature,
+    // legacy, standalone, or the mixed-chain boundary run) has
+    // `continued_from_exec_id == None`. A complete chain gathers every
+    // predecessor. So this term is false for all of those. Legacy rows carry
+    // `continued_from_exec_id == None` and never trip it. The lacks-backlink /
+    // participates rule governs their head confidence.
     let any_predecessor_missing = rows.iter().any(|row| {
         row.continued_from_exec_id
             .is_some_and(|pred| !exec_id_present.contains(&pred))
@@ -334,27 +334,27 @@ pub fn assemble_run_chain(rows: Vec<RunChainRow>, head_exec_id: Uuid) -> RunChai
 }
 
 /// Reconstruct the ordered member set of a *legacy* continue-as-new chain from
-/// `WorkflowContinuedAsNew`-event linkage, id-reuse-safe (issue #701, Codex P2).
+/// `WorkflowContinuedAsNew`-event linkage, id-reuse-safe (issue #701).
 ///
-/// Pre-feature chains carry no back-link columns, so a chain queried from its
-/// **tail** (or a **middle** run) cannot be resolved by the indexed
-/// `first_exec_id` gather — the tail has no successors carrying the back-link
-/// and no forward `WorkflowContinuedAsNew` event of its own. This function walks
-/// the chain purely through CAN-event linkage:
+/// Pre-feature chains carry no back-link columns. So the indexed
+/// `first_exec_id` gather cannot resolve a chain queried from its **tail** or a
+/// **middle** run. The tail has no successors carrying the back-link and no
+/// forward `WorkflowContinuedAsNew` event of its own. This function walks the
+/// chain purely through CAN-event linkage:
 ///
 /// - `queried` is the `exec_id` the operator asked about.
 /// - `links` is `(new_exec_id, predecessor_exec_id)` for every candidate that
 ///   recorded a `WorkflowContinuedAsNew { new_exec_id }` event — i.e. `predecessor`
 ///   continued into `new_exec_id`.
 ///
-/// The walk goes **backward** from `queried` toward the origin (following
-/// `new_exec_id -> predecessor`) and **forward** toward the tail (following the
-/// inverse `predecessor -> new_exec_id`), each bounded by `max_hops` and guarded
-/// against cycles. Only runs reachable through CAN linkage from `queried` are
-/// returned: a run that merely *reused the same `workflow_id`* for an unrelated
-/// logical run points its own CAN event at a **different** successor and is
-/// therefore never linked into this chain — id-reuse cannot contaminate the
-/// result by construction.
+/// The walk goes **backward** from `queried` toward the origin
+/// (`new_exec_id -> predecessor`). It goes **forward** toward the tail
+/// (`predecessor -> new_exec_id`). Each direction is bounded by `max_hops` and
+/// guarded against cycles. Only runs reachable through CAN linkage from
+/// `queried` are returned. A run that *reused the same `workflow_id`* for an
+/// unrelated logical run points its CAN event at a **different** successor.
+/// So it never joins this chain, and id reuse cannot contaminate the result by
+/// construction.
 ///
 /// Returns the member `exec_ids` ordered **origin-first**; the resolved chain head
 /// is the first element. When `queried` has no links at all the result is just
@@ -517,11 +517,9 @@ mod tests {
         assert_eq!(resp.runs[0].exec_id, origin.to_string());
         assert_eq!(resp.runs[1].exec_id, mid.to_string());
         assert_eq!(resp.runs[2].exec_id, tail.to_string());
-        // sequence numbering
         assert_eq!(resp.runs[0].sequence, 0);
         assert_eq!(resp.runs[1].sequence, 1);
         assert_eq!(resp.runs[2].sequence, 2);
-        // forward links
         assert_eq!(
             resp.runs[0].continued_to_exec_id.as_deref(),
             Some(mid.to_string().as_str())
@@ -534,7 +532,6 @@ mod tests {
             resp.runs[2].continued_to_exec_id, None,
             "tail has no forward link"
         );
-        // outcomes
         assert_eq!(resp.runs[2].outcome, "running");
     }
 
@@ -562,10 +559,10 @@ mod tests {
 
     #[test]
     fn head_unknown_true_when_resolved_head_declares_a_missing_predecessor() {
-        // Retention-pruned origin: the true origin row is gone, so a query from a
-        // surviving successor resolves the earliest survivor (mid) as head — but
-        // mid.continued_from_exec_id names the pruned origin, which is not in the
-        // gathered set. head_unknown must flag it.
+        // Retention-pruned origin: the true origin row is gone. A query from a
+        // surviving successor resolves the earliest survivor (mid) as head. But
+        // mid.continued_from_exec_id names the pruned origin, which is not in
+        // the gathered set. head_unknown must flag it.
         let origin = Uuid::new_v4(); // pruned: never inserted into `rows`
         let mid = Uuid::new_v4();
         let tail = Uuid::new_v4();
@@ -598,7 +595,7 @@ mod tests {
         );
     }
 
-    // ── deleted-middle gap in a POST-feature chain (issue #701, Codex P2) ─────
+    // ── deleted-middle gap in a POST-feature chain (issue #701) ──────────────
     //
     // Per-execution legal-hold retention (#747) can delete an expired middle run
     // while a held head and tail survive. The seed query

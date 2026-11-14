@@ -3,30 +3,30 @@
 //!
 //! `ctx.run_transactional` (see `docs/transactional-activities.md`) solves the
 //! dual-write problem at the activity -> completion boundary: a domain write
-//! and the `ActivityCompleted` event commit atomically.  Starting a workflow
-//! from *outside* harvest — e.g. an HTTP handler that inserts an `orders` row
-//! and then needs to kick off a `fulfill_order` workflow — has the identical
-//! problem one level up: the domain insert and the workflow's `WorkflowStarted`
-//! event are two separate commits unless something ties them together.
+//! and the `ActivityCompleted` event commit atomically.  A workflow start from
+//! *outside* harvest has the same problem one level up. An example is an HTTP
+//! handler that inserts an `orders` row and then starts a `fulfill_order`
+//! workflow. The domain insert and the `WorkflowStarted` event are two separate
+//! commits unless something ties them together.
 //!
 //! `WorkflowHandleClient::start_workflow_transactional` is that tie.  It
 //! accepts a caller-owned Diesel connection (or an already-open transaction on
-//! one) and stages the workflow start on it.  Nothing about the run — no
-//! `WorkflowStarted` event, no execution row, no dispatchable task-queue row —
-//! becomes visible to any worker until the caller's own transaction commits.
-//! Roll the transaction back and none of it ever existed.
+//! one) and stages the workflow start on it.  No worker sees any part of the
+//! run until the caller's own transaction commits: no `WorkflowStarted` event,
+//! no execution row, no dispatchable task-queue row. Roll the transaction back
+//! and none of it ever existed.
 //!
 //! `place_order_after` and `place_order_rejected` below are real functions
-//! that type-check against the actual `start_workflow_transactional` API —
+//! that type-check against the actual `start_workflow_transactional` API.
 //! `cargo build --example transactional_start_order --features db` (or the
 //! `cargo run` below) fails to compile if this example drifts from the real
 //! signature. `main()` itself is illustrative-only: it prints usage guidance
-//! and never opens a live Postgres connection, so it does NOT execute
-//! `place_order_after`/`place_order_rejected` against a database. The actual
-//! runtime proof — including the 500-iteration randomized fault-injection
-//! sweep and the dedicated ordering/rollback/idempotency/gate tests — lives
-//! entirely in `tests/integration/transactional_start_tests.rs`; see
-//! `docs/transactional-start.md`'s "Testing" section.
+//! and never opens a live Postgres connection. So it does NOT execute
+//! `place_order_after`/`place_order_rejected` against a database. The runtime
+//! proof lives in `tests/integration/transactional_start_tests.rs`. It includes
+//! the 500-iteration randomized fault-injection sweep and the dedicated
+//! ordering/rollback/idempotency/gate tests. See the "Testing" section of
+//! `docs/transactional-start.md`.
 //!
 //! Run with:
 //!   cargo run --example transactional_start_order --features db
@@ -41,9 +41,9 @@ use serde_json::json;
 
 /// The workflow the order-placement handler below starts.  Registration
 /// (`.with_workflows([fulfill_order_info()])` on the `WorkflowHandleClient`)
-/// is what lets `start_workflow_transactional` resolve this workflow's
-/// `WorkflowInfo` defaults — execution timeout, SLA, concurrency key,
-/// published input schema — the same way `POST /workflows/{name}/start` does.
+/// lets `start_workflow_transactional` resolve this workflow's `WorkflowInfo`
+/// defaults, as `POST /workflows/{name}/start` does. These are the execution
+/// timeout, SLA, concurrency key and published input schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FulfillOrderInput {
     order_id: String,
@@ -98,10 +98,9 @@ async fn place_order_after(
                 .await
                 .map_err(database_error)?;
 
-                // 2. Stage the workflow start on the SAME transaction. Nothing
-                //    about this run is visible to any worker yet — not until
-                //    the `conn.transaction(...)` block above returns `Ok` and
-                //    its caller (the surrounding code) commits.
+                // 2. Stage the workflow start on the SAME transaction. No
+                //    worker sees this run until the `conn.transaction(...)`
+                //    block above returns `Ok` and the surrounding code commits.
                 client
                     .start_workflow_transactional(
                         conn,
@@ -116,20 +115,20 @@ async fn place_order_after(
     )
     .await?;
 
-    // Past this point the transaction has committed: the `orders` row and the
-    // `WorkflowStarted` event both landed together, and a worker can now claim
-    // the run's first task. `finish()` is an optional latency optimization
-    // (eagerly dispatches any deferred completion-trigger follow-ups) — never
-    // a correctness requirement, since a periodic scanner delivers the same
-    // follow-ups if it's skipped.
+    // Past this point the transaction has committed. The `orders` row and the
+    // `WorkflowStarted` event landed together. A worker can now claim the
+    // run's first task. `finish()` is an optional latency optimization
+    // that eagerly dispatches any deferred completion-trigger follow-ups. It is
+    // never a correctness requirement, since a periodic scanner delivers the
+    // same follow-ups if it is skipped.
     let exec_id = outcome.exec_id;
     outcome.finish().await;
     Ok(exec_id)
 }
 
-/// A validation failure AFTER the domain insert rolls back BOTH writes — the
+/// A validation failure AFTER the domain insert rolls back BOTH writes. The
 /// workflow start never happened, and the `orders` row it would have referenced
-/// doesn't exist either. There is no half-written state to clean up.
+/// does not exist either. There is no half-written state to clean up.
 async fn place_order_rejected(
     conn: &mut AsyncPgConnection,
     client: &WorkflowHandleClient,

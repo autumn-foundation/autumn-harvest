@@ -1,9 +1,9 @@
 //! Broker event-source connectors for workflow triggers (issue #944).
 //!
 //! Bind a Kafka topic or an SQS queue to a workflow so an inbound message
-//! starts a run (or signal-with-starts an entity workflow), with idempotent
-//! redelivery, at-least-once ack ordering, poison-message isolation, and
-//! backpressure that composes with the start throttle (#607).
+//! starts a run, or signal-with-starts an entity workflow. The connector
+//! gives idempotent redelivery, at-least-once ack ordering and poison-message
+//! isolation. Its backpressure composes with the start throttle (#607).
 //!
 //! # The core crate gains ZERO broker dependencies
 //!
@@ -33,9 +33,9 @@
 //!
 //! A broker-triggered start is an ordinary start: it lands the same
 //! `WorkflowStarted` event any HTTP caller produces. The only durable state
-//! the connector owns is `harvest_connector_dead_letters`, a **plugin**-owned
-//! table (alongside `harvest_workflow_outbox`) for poison messages that never
-//! became executions — see [`dead_letter`] for why the engine's
+//! the connector owns is `harvest_connector_dead_letters`. It is a
+//! **plugin**-owned table, like `harvest_workflow_outbox`, for poison messages
+//! that never became executions. See [`dead_letter`] for why the engine's
 //! `harvest_dead_letters` cannot hold one.
 //!
 //! # Layering
@@ -59,13 +59,13 @@
 //!
 //! The runtime dispatches up to `max_in_flight` messages concurrently and does
 //! **not** preserve broker partition ordering across them. For per-key
-//! ordering, use a `SignalsWithStart` binding whose mapping function derives a
-//! stable `workflow_id` from the partition key (`ctx.key_str()` on Kafka, or a
-//! body field / header on a broker with no key): the entity workflow
-//! serializes its own signals. Set `.max_in_flight(1)` as well if messages for
-//! the *same* key must reach that workflow in queue order — the entity
-//! workflow serializes them either way, but the order it sees them in is the
-//! order they were dispatched, which concurrency does not preserve. See
+//! ordering, use a `SignalsWithStart` binding. Its mapping function derives a
+//! stable `workflow_id` from the partition key. On Kafka that is
+//! `ctx.key_str()`. A broker with no key uses a body field or header. The
+//! entity workflow then serializes its own signals. Also set
+//! `.max_in_flight(1)` if messages for the *same* key must reach that workflow
+//! in queue order. The entity workflow serializes them either way. It sees
+//! them in dispatch order, and concurrency does not preserve that order. See
 //! `docs/getting-started/13-broker-connectors.md`.
 //!
 //! # Example

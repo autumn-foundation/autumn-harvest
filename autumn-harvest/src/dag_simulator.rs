@@ -1,8 +1,7 @@
 //! In-memory simulator for Directed Acyclic Graphs (DAGs).
 //!
-//! Provides a fast, deterministic environment to test DAG configurations,
-//! evaluate trigger rules, and verify execution ordering without requiring
-//! a database or background workers.
+//! Tests DAG configurations, trigger rules and execution order
+//! deterministically, with no database or background workers.
 
 use std::collections::HashMap;
 
@@ -15,12 +14,12 @@ pub type DagActivityMockFn = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 /// The result of a simulated DAG execution.
 #[derive(Debug, Clone)]
 pub struct DagSimulatorResult {
-    /// The final status of each task in the DAG, indexed by their topological order index.
+    /// The final status of each task, by topological index.
     pub task_states: Vec<TaskStatus>,
 }
 
 impl DagSimulatorResult {
-    /// Helper to get the state of a specific task by its index.
+    /// The state of the task at topological `index`.
     #[must_use]
     pub fn get_status(&self, index: usize) -> Option<&TaskStatus> {
         self.task_states.get(index)
@@ -69,24 +68,20 @@ impl DagSimulator {
         let tasks = self.dag.tasks();
         let levels = self.dag.execution_levels();
 
-        // Initialize all states as Skipped (or we could use a pending state if needed)
-        // We will assign the final state when we visit the node.
+        // The loop below sets the final state of each task when it visits it.
         let mut task_states = vec![TaskStatus::Skipped; tasks.len()];
 
         for level in levels {
             for &task_index in level {
                 let task = &tasks[task_index];
 
-                // Gather states of all upstream dependencies
                 let upstream_statuses: Vec<TaskStatus> = task
                     .upstreams
                     .iter()
                     .map(|&up_idx| task_states[up_idx])
                     .collect();
 
-                // Evaluate trigger rule
                 if task.trigger_rule.should_run(&upstream_statuses) {
-                    // Task triggered! Run the mock.
                     let mock_res = self
                         .activity_mocks
                         .get(&task.activity_name)
@@ -97,7 +92,6 @@ impl DagSimulator {
                         Err(_) => TaskStatus::Failed,
                     };
                 } else {
-                    // Task not triggered, remains Skipped.
                     task_states[task_index] = TaskStatus::Skipped;
                 }
             }
@@ -168,7 +162,6 @@ mod tests {
         let a = builder.activity(activity_a); // Index 0
         let b = builder.activity(activity_b); // Index 1
 
-        // C waits for A or B to succeed
         let c = builder
             .activity(activity_c)
             .upstream(&a)

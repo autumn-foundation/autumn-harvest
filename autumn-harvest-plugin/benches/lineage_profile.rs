@@ -1,45 +1,39 @@
 //! Deterministic (non-criterion) instruction/allocation-count profiling
 //! harness for `lineage::LineageWalk` / `LineageTreeReport::finish` — the
-//! pure half of `GET /workflows/{id}/lineage` (issue #621). It covers a
+//! pure half of `GET /workflows/{id}/lineage` (issue #621). That is a
 //! bounded, cycle-safe frontier walk over `parent_id` edges, nested into a
-//! tree and summarised. The async cross-shard fan-out that *feeds* the walk
-//! lives in `crate::api::build_lineage_report`. That fan-out issues one
-//! batched query per level and is out of scope here. This harness measures
-//! only the CPU-bound part that runs after each level's rows are already
-//! in memory.
+//! tree and summarised. The async cross-shard fan-out in
+//! `crate::api::build_lineage_report` feeds the walk with one batched query
+//! per level. It is out of scope. This harness measures only the CPU-bound
+//! part after the rows of a level are in memory.
 //!
-//! `harness = false` plus its own `main()` matches the shape of
+//! `harness = false` plus its own `main()` matches
 //! `autumn-harvest/benches/awaitables_profile.rs` and
-//! `autumn-harvest-plugin/benches/dag_graph_profile.rs`. The compiled
-//! artifact is a plain executable. Point it directly at
-//! `valgrind --tool=callgrind` / `valgrind --tool=dhat`. Wall-clock timing
-//! is not admissible evidence on this (shared-vCPU) machine.
+//! `autumn-harvest-plugin/benches/dag_graph_profile.rs`. The artifact is a
+//! plain executable for `valgrind --tool=callgrind` / `valgrind --tool=dhat`.
+//! Wall-clock timing is not admissible evidence on this (shared-vCPU) machine.
 //!
 //! # Workload
 //!
-//! The module's own doc singles out the realistic case this harness builds:
+//! The `lineage` module doc names the realistic case:
 //! *"a saga or fan-out workflow spawns children that spawn grandchildren"*.
-//! This harness builds a `LINEAGE_PROFILE_LEVELS`-deep chain of generations
-//! below one root. `LINEAGE_PROFILE_NODES` descendants spread evenly across
-//! those levels. Each row is explicitly parented to a row in the level
-//! above, round-robin. Fan-out grows realistically once a level is wider
-//! than its parent level. The default (`999` descendants, `9` levels of
-//! `111` each) lands the walk's `node_count` at exactly `1_000` --
-//! `lineage::DEFAULT_LINEAGE_MAX_NODES`. That is an operator's default
-//! request against a family that just fits under budget without
-//! truncating. It is deliberately the *un-truncated* case: a truncated walk
-//! exits its `admit_level` loop early, over a smaller effective node count.
-//! That would measure less work, not more.
+//! This harness builds `LINEAGE_PROFILE_LEVELS` generations below one root.
+//! `LINEAGE_PROFILE_NODES` descendants spread evenly across those levels.
+//! Each row has a parent in the level above, chosen round-robin. A level
+//! wider than the level above gives each parent several children. The
+//! default (`999` descendants, `9` levels of `111` each) gives a
+//! `node_count` of exactly `1_000`, `lineage::DEFAULT_LINEAGE_MAX_NODES`.
+//! So a default request walks a family that just fits under budget.
+//! It is deliberately the *un-truncated* case. A truncated walk exits its
+//! `admit_level` loop early and measures less work, not more.
 //!
 //! The driver mirrors the real one in `crate::api::build_lineage_report`.
-//! Rows for one level are handed to `admit_level`, repeated per level, then
-//! `record_probe_result` (empty -- this fixture's leaves are provably
-//! childless) and `finish`. Per-level row `Vec`s are cloned fresh from a
-//! once-built template on every rep. That stands in for what would be a
-//! fresh batch of deserialized DB rows in production. `LineageWalk`'s API
-//! consumes rows by value, so a real driver clones or deserializes new
-//! owned data on every call too. This harness's clone cost is
-//! representative of that, not an artifact of the measurement.
+//! It calls `admit_level` once per level, then `record_probe_result` and
+//! `finish`. The probe result is empty, because the leaves of this fixture
+//! have no children. Each rep clones the per-level row `Vec`s from a
+//! template, in place of fresh DB rows. `LineageWalk` consumes rows by
+//! value, so a real driver also makes new owned data on every call. The
+//! clone cost is therefore representative, not a measurement artifact.
 //!
 //! # Running
 //!
@@ -61,9 +55,8 @@ use autumn_harvest::types::{ExecutionId, ParentClosePolicy};
 use autumn_harvest_plugin::lineage::{LineageLimits, LineageWalk, lineage_root_node};
 use chrono::{DateTime, TimeZone, Utc};
 
-/// Reads `key` as a `usize`, using `default` only when the variable is
-/// genuinely *absent*. A *present but malformed* value is a configuration
-/// error, not silently substituted for the default.
+/// Reads `key` as a `usize`. Only an *absent* variable gives `default`. A
+/// malformed value panics.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw
@@ -87,9 +80,8 @@ const WORKFLOW_NAMES: [&str; 4] = [
     "notification_fanout",
 ];
 
-/// The requested root's own row — `parent_id: None`. This mirrors what
-/// `root_row_from_execution` projects from a real `WorkflowExecution`. This
-/// harness has no database row to project from, so it builds one directly.
+/// The row of the requested root, with `parent_id: None`. It stands in for
+/// what `root_row_from_execution` projects from a real `WorkflowExecution`.
 fn root_row(root_id: uuid::Uuid) -> LineageChildRow {
     LineageChildRow {
         exec_id: ExecutionId::from_uuid(root_id),
@@ -105,9 +97,8 @@ fn root_row(root_id: uuid::Uuid) -> LineageChildRow {
     }
 }
 
-/// One row per descendant, keyed by an explicit parent uuid — the same shape
-/// `store::load_workflow_children`'s batch loader hands `admit_level` in
-/// production, one `Vec` per level.
+/// One descendant row with an explicit parent uuid. This is the shape that
+/// `store::load_workflow_children` hands `admit_level`, one `Vec` per level.
 fn child_row(i: usize, parent: uuid::Uuid, shard_id: i32) -> LineageChildRow {
     let detached = i.is_multiple_of(5);
     let closed = i.is_multiple_of(7);
@@ -133,9 +124,9 @@ fn child_row(i: usize, parent: uuid::Uuid, shard_id: i32) -> LineageChildRow {
     }
 }
 
-/// Build `levels` generations of `per_level` rows each, every row explicitly
-/// parented to a row round-robin-chosen from the generation above (the root
-/// seeds generation 1). Returns the level-by-level rows in admission order.
+/// Build `levels` generations of `per_level` rows. Each row has a parent in
+/// the generation above, chosen round-robin. The root is the parent of
+/// generation 1. Returns the rows level by level, in admission order.
 fn build_levels(root: uuid::Uuid, levels: usize, per_level: usize) -> Vec<Vec<LineageChildRow>> {
     let mut out = Vec::with_capacity(levels);
     let mut prev_ids: Vec<uuid::Uuid> = vec![root];
@@ -175,9 +166,8 @@ fn main() {
     let root_id = ExecutionId::new();
     let root_row_fixture = root_row(root_id.as_uuid());
     let template_levels = build_levels(root_id.as_uuid(), levels, per_level);
-    // Budget = exactly root + every descendant. A fully-realistic family
-    // this size is therefore never truncated -- see the module doc above
-    // for why that matters to the measurement.
+    // Budget = exactly root + every descendant, so the walk never truncates.
+    // The module doc says why that matters.
     let limits = LineageLimits {
         max_depth: u8::try_from(levels).unwrap_or(u8::MAX) + 1,
         max_nodes: total_nodes + 1,

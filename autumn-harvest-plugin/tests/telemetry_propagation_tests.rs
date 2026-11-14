@@ -1,10 +1,10 @@
 //! Integration tests for ADR-0001 trace-context propagation through the
 //! HTTP workflow-start boundary (issue #136 AC).
 //!
-//! Verifies that a `TraceContextCarrier` captured by the `TraceContextPropagator`
-//! at the `POST /workflows/{name}/start` call site is stored durably in the
-//! `harvest_task_queue.trace_context` column so the worker can restore it before
-//! invoking the workflow executor.
+//! The `TraceContextPropagator` captures a `TraceContextCarrier` at the
+//! `POST /workflows/{name}/start` call site. The carrier must persist in
+//! `harvest_task_queue.trace_context`. The worker restores it before it invokes
+//! the workflow executor.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -109,7 +109,6 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let expected_carrier = TraceContextCarrier::from_traceparent(traceparent);
 
-    // Build registry with mock propagator wired into TelemetryConfig.
     let telemetry = TelemetryConfig::builder()
         .propagator(Arc::new(FixedCarrierPropagator {
             carrier: expected_carrier.clone(),
@@ -193,7 +192,6 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
         "workflow start should succeed"
     );
 
-    // Read the task queue row and verify trace_context is stored.
     let mut conn = pool.get().await.expect("pool connection");
     let rows: Vec<autumn_harvest::models::TaskQueueItem> = harvest_task_queue::table
         .select(autumn_harvest::models::TaskQueueItem::as_select())

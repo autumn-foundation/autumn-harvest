@@ -6,9 +6,9 @@
 //!
 //! - the dashboard model parses, is versioned, and follows the Grafana ≥ 10
 //!   conventions (stable uid, schemaVersion, templated datasource);
-//! - **every** metric in the live catalogue (extracted from
-//!   `src/telemetry.rs` at test runtime, so a future `METRIC_*` constant
-//!   with no panel turns this red) appears on at least one panel;
+//! - **every** metric in the live catalogue appears on at least one panel.
+//!   The test extracts the catalogue from `src/telemetry.rs` at runtime, so a
+//!   future `METRIC_*` constant with no panel turns this red;
 //! - every `PromQL` token resolves to a real, correctly-suffixed Prometheus
 //!   series (`_total` on counters, `_bucket`/`_count`/`_sum` on histograms,
 //!   bare gauges — the docs/alerts/README.md normalization table);
@@ -47,24 +47,24 @@ const SUPPLEMENTAL_METRICS: &[&str] = &[
 ///
 /// Deliberately empty: the issue #754 adapter fix bridged
 /// `harvest.workflow.timeout`, `harvest.payload.bytes`, and
-/// `harvest.payload.rejected`. Note that bridged ≠ emitted:
+/// `harvest.payload.rejected`. Note that bridged ≠ emitted.
 /// `harvest.workflow.timeout` is emitted end-to-end (`timeout.rs` calls the
-/// recorder), but the two payload byte-cap metrics still have **zero engine
-/// emission call sites** (a pre-existing issue #252 gap — the cap sites
-/// construct `HarvestError::PayloadTooLarge` without calling the recorder),
-/// so their panels stay empty until emission is wired; the panels and the
-/// dashboards README say so. If a future `METRIC_*` constant ships without
-/// an adapter bridge, either bridge it or add it here with a comment naming
-/// the issue that tracks the gap — never silently drop dashboard coverage.
+/// recorder). The two payload byte-cap metrics still have **zero engine
+/// emission call sites**. This is a pre-existing issue #252 gap: the cap sites
+/// construct `HarvestError::PayloadTooLarge` without calling the recorder.
+/// So their panels stay empty until emission is wired, as the panels and the
+/// dashboards README say. A future `METRIC_*` constant may ship without an
+/// adapter bridge. Then bridge it, or add it here with a comment naming the
+/// issue that tracks the gap. Never silently drop dashboard coverage.
 const EXPECTED_UNBRIDGED: &[&str] = &[];
 
 /// Every Prometheus series name a dashboard query is allowed to reference.
 ///
-/// This is the type-suffix-aware ground truth, hand-mirrored from the
-/// instrument each metric is registered as in `metrics_rs_adapter.rs` and the
-/// normalization table in `docs/alerts/README.md` (dots → underscores;
-/// counters gain `_total`; histograms surface only as
-/// `_bucket`/`_count`/`_sum`; gauges are bare). A bare counter token or a
+/// This is the type-suffix-aware ground truth. It is hand-mirrored from the
+/// instrument type of each metric in `metrics_rs_adapter.rs`. It also follows
+/// the normalization table in `docs/alerts/README.md`: dots → underscores,
+/// counters gain `_total`, histograms surface only as
+/// `_bucket`/`_count`/`_sum`, and gauges are bare. A bare counter token or a
 /// suffixed gauge token is not in this list and fails the token check.
 const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // --- counters (`_total`) ------------------------------------------------
@@ -832,9 +832,9 @@ fn metric_types_are_handled_correctly() {
         }
 
         // Every histogram-quantile panel must carry a bucket-less fallback
-        // target (`_sum`/`_count`) on the same panel: the Prometheus exporter
-        // only renders `_bucket` series when `set_buckets_for_metric` is
-        // configured (docs/telemetry.md), so a quantile-only panel can be
+        // target (`_sum`/`_count`) on the same panel. The Prometheus exporter
+        // renders `_bucket` series only when `set_buckets_for_metric` is
+        // configured (docs/telemetry.md). So a quantile-only panel can be
         // permanently blank on a default exporter install.
         let bucket_bases: BTreeSet<String> = exprs
             .iter()
@@ -903,8 +903,8 @@ fn template_variables_apply_only_where_labels_exist() {
 #[test]
 fn template_variable_queries_reference_allowlisted_series() {
     // A broken `label_values(...)` query resolves to an empty value set in
-    // Grafana, silently emptying every `=~"$var"`-filtered panel — the one
-    // layer the panel-expr checks cannot see. Validate the templating layer
+    // Grafana. That silently empties every `=~"$var"`-filtered panel. The
+    // panel-expr checks cannot see this layer. Validate the templating layer
     // with the same allowlist / label / forbidden-token rigor.
     let labels_by_base: BTreeMap<&str, &[&str]> = SERIES_LABELS.iter().copied().collect();
     let allowed: BTreeSet<&str> = DASHBOARD_PROMETHEUS_SERIES.iter().copied().collect();
@@ -983,13 +983,13 @@ fn template_variable_queries_reference_allowlisted_series() {
 fn every_alert_rule_maps_to_a_panel() {
     let readme = read_doc(DASHBOARD_README_PATH);
     let dashboard_raw = read_doc(DASHBOARD_PATH);
-    // Data-driven off the alert pack's own rule list so a new rule (e.g. a
-    // saga alert) goes red here until the dashboard grows a matching panel.
+    // Data-driven off the alert pack's own rule list. A new rule (e.g. a saga
+    // alert) goes red here until the dashboard grows a matching panel.
     //
-    // Matching is exact-token (word-boundary), never substring: the pack has
+    // Matching is exact-token (word-boundary), never substring. The pack has
     // a real substring pair (`harvest_activity_retry_storm` ⊂
-    // `harvest_activity_retry_storm_critical`), so a naive `contains` lets
-    // the base rule's entire mapping silently vanish from both encodings.
+    // `harvest_activity_retry_storm_critical`). A naive `contains` lets the
+    // base rule's entire mapping silently vanish from both encodings.
     for rule_id in alert_rule_ids() {
         assert!(
             readme.contains(&format!("`{rule_id}`")),
@@ -1142,8 +1142,8 @@ fn dashboard_readme_documents_prerequisites() {
 fn documented_poison_reasons_match_the_emitted_labels() {
     // An operator builds an alert or a query by copying a `reason` value out
     // of these tables. A documented value the code never emits selects no
-    // series at all, which reads as "this never happens" rather than "you
-    // typed the wrong label" — so the docs must enumerate exactly what
+    // series at all. That reads as "this never happens" rather than "you typed
+    // the wrong label". So the docs must enumerate exactly what
     // `PoisonReason::as_str()` produces, no more and no less.
     //
     // The enum is the source of truth: a new variant appears here
@@ -1201,14 +1201,13 @@ fn runbook_cross_links_dashboard() {
     );
 }
 
-/// Issue #797, Codex review: the low-frequency scanner panel is the one an
-/// operator is told to judge `retention` on, because at a short `$__rate_interval`
-/// the hourly janitor's rate line sits indistinguishably near zero. That only
-/// works if the panel's window is longer than retention's **cadence** -- with a
-/// window shorter than one hour, a perfectly healthy janitor contributes zero
-/// increments to most evaluations, so the panel alternates to zero on its own
-/// and the "a bar at zero means wedged" reading is false exactly where it was
-/// supposed to be authoritative.
+/// Issue #797: operators judge `retention` on the low-frequency scanner panel.
+/// At a short `$__rate_interval`, the hourly janitor's rate line sits
+/// indistinguishably near zero. The panel works only if its window is longer
+/// than retention's **cadence**. With a window under one hour, a healthy
+/// janitor adds zero increments to most evaluations. The panel then drops to
+/// zero on its own. So the "a bar at zero means wedged" reading is false
+/// exactly where it should be authoritative.
 ///
 /// Pin that the window comfortably exceeds the default hourly cadence.
 #[test]
@@ -1254,11 +1253,11 @@ fn low_frequency_scanner_panel_window_outlasts_the_retention_cadence() {
 
 /// A scanner panel that groups by `shard` must also *render* it (issue #797).
 ///
-/// The `shard` dimension exists so a wedged shard's flat series is
-/// distinguishable from a healthy sibling's advancing one. Grouping by it while
-/// legending only `{{scanner}} @ {{instance}}` renders both series under the
-/// same name, so the legend and tooltip cannot tell them apart -- the series
-/// are separate, but the operator still cannot say which shard stalled.
+/// The `shard` dimension tells a wedged shard's flat series apart from a
+/// healthy sibling's advancing one. Grouping by it while legending only
+/// `{{scanner}} @ {{instance}}` renders both series under the same name. The
+/// legend and tooltip then cannot tell them apart. The series are separate,
+/// but the operator still cannot say which shard stalled.
 #[test]
 fn scanner_panel_legends_render_every_grouped_dimension() {
     let dashboard = read_dashboard();
@@ -1353,9 +1352,9 @@ fn workspace_path(relative: &str) -> PathBuf {
 /// Extracts every `METRIC_*` constant value from `src/telemetry.rs` and
 /// normalizes it to a Prometheus base series name (dots → underscores).
 ///
-/// This is the anti-drift device: a newly added `METRIC_*` constant appears
-/// here automatically and fails the coverage test until the dashboard grows
-/// a panel for it. Label constants (`METRIC_LABEL_*`) carry non-`harvest.`
+/// This is the anti-drift device. A newly added `METRIC_*` constant appears
+/// here automatically. It fails the coverage test until the dashboard grows a
+/// panel for it. Label constants (`METRIC_LABEL_*`) carry non-`harvest.`
 /// values and are skipped.
 fn extract_catalogue() -> BTreeSet<String> {
     let telemetry =
@@ -1471,8 +1470,8 @@ fn panel_name(panel: &Value) -> String {
 }
 
 /// Strips a type suffix back to the base series name when the stripped form
-/// is a known catalogue base (so gauge names that happen to contain no
-/// suffix pass through unchanged).
+/// is a known catalogue base. Gauge names carry no suffix, so they pass
+/// through unchanged.
 fn base_series(token: &str) -> String {
     let bases: BTreeSet<&str> = SERIES_LABELS.iter().map(|(base, _)| *base).collect();
     for suffix in ["_total", "_bucket", "_count", "_sum"] {
@@ -1494,10 +1493,10 @@ fn harvest_metric_tokens(expr: &str) -> Vec<String> {
 
 /// Resolves a markdown `## <heading>` section by exact heading-line match.
 ///
-/// A raw substring search would resolve a dangling anchor that happens to be
-/// a prefix of a real heading (`#harvest_activity_retry` "resolving" against
-/// `## harvest_activity_retry_storm`), or match `## x` mid-line/in a code
-/// block — so the heading must be a complete line of its own.
+/// A raw substring search would resolve a dangling anchor that is a prefix of
+/// a real heading (`#harvest_activity_retry` "resolving" against
+/// `## harvest_activity_retry_storm`). It would also match `## x` mid-line or
+/// in a code block. So the heading must be a complete line of its own.
 fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
     let marker = format!("## {heading}");
     let mut offset = 0usize;

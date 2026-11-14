@@ -4,28 +4,26 @@
 //! # The bug
 //!
 //! `drain_ready` claims the oldest-by-`seq` ready task (`ORDER BY seq LIMIT 1`).
-//! A retryable failure requeues the task via [`queue::requeue_task`], which — pre
-//! fix — kept the task's ORIGINAL `seq`. When the retry delay is zero (a
-//! `RetryPolicy::fixed(_, 0ms)` policy, or the raw/no-policy immediate-retry
-//! default) the requeue also lands at `run_at = now`, so the just-failed branch is
-//! *immediately re-claimable in the SAME drain pass* AND still holds the lowest
-//! `seq` — so `claim_next_ready_task_tx` re-selects it before any ready SIBLING branch
-//! gets a turn. Under a `ctx.race()`, a low-index branch that fails-and-retries can
-//! therefore monopolize the drain, exhaust all its attempts, terminal-out (even by
-//! FAILING), and *settle the race first* — cancelling a ready sibling that would
-//! have finished (e.g. an instant success) without ever running it. That biases the
-//! winner toward the lowest-index branch and violates "first branch to finish
-//! wins".
+//! A retryable failure requeues the task with [`queue::requeue_task`]. That once
+//! kept the task's ORIGINAL `seq`. A zero retry delay comes from a
+//! `RetryPolicy::fixed(_, 0ms)` policy or the raw/no-policy immediate-retry
+//! default. The requeue then lands at `run_at = now`. So the failed branch is
+//! *claimable again in the SAME drain pass* AND still holds the lowest `seq`.
+//! `claim_next_ready_task_tx` selects it again before any ready SIBLING branch.
+//! Under a `ctx.race()`, a low-index branch that retries can monopolize the drain.
+//! It exhausts its attempts and goes terminal, even by FAILING. It then *settles
+//! the race first*. A ready sibling that would finish, such as an instant success,
+//! is cancelled without ever running. That biases the winner toward the
+//! lowest-index branch and violates "first branch to finish wins".
 //!
 //! # The fix
 //!
-//! On an IMMEDIATE (zero-delay) retry requeue — `run_at <= now`, so the task would
-//! be re-claimable THIS pass — the task is moved to the BACK of the ready queue
-//! (assigned a fresh, highest `seq`), so `claim_next_ready_task_tx(ORDER BY seq)`
-//! yields to every other ready sibling before returning to the just-failed branch
-//! (round-robin fairness). A NON-immediate retry (a real positive backoff,
-//! `run_at > now`) already yields naturally — its future `run_at` makes it
-//! un-claimable this pass — and is left unchanged.
+//! An IMMEDIATE (zero-delay) retry has `run_at <= now`, so it is claimable THIS
+//! pass. Its requeue moves the task to the BACK of the ready queue with a fresh,
+//! highest `seq`. So `claim_next_ready_task_tx(ORDER BY seq)` gives every other
+//! ready sibling a turn first: round-robin fairness. A retry with a positive
+//! back-off (`run_at > now`) is not claimable this pass. It already yields, and
+//! stays unchanged.
 //!
 //! No wall-clock sleeping: driven with the deterministic `_as_of` clock seam.
 
@@ -59,19 +57,19 @@ const fn t0() -> DateTime<Utc> {
 /// all N times" (monopoly).
 const A_MAX_ATTEMPTS: u32 = 5;
 
-// Branch A: fixed(N, 0ms) — a genuine ZERO-DELAY retry policy on the info path.
-// A raw (`activity_raw`) race dispatch carries no override, so the worker falls
-// back to this registered `default_retry_policy` at claim time (the
-// `raw_path_falls_back_to_registered_default_retry_policy_backoff` contract), and
-// `compute_retry_delay(fixed(_, 0ms)) == 0` → an IMMEDIATE requeue at `now`.
+// Branch A: fixed(N, 0ms), a real ZERO-DELAY retry policy on the info path. A raw
+// (`activity_raw`) race dispatch carries no override. So the worker uses this
+// registered `default_retry_policy` at claim time. That is the
+// `raw_path_falls_back_to_registered_default_retry_policy_backoff` contract.
+// `compute_retry_delay(fixed(_, 0ms)) == 0`, so the requeue is IMMEDIATE.
 #[activity(retry = RetryPolicy::fixed(A_MAX_ATTEMPTS, Duration::ZERO))]
 async fn slow_branch_a(_ctx: &ActivityContext, _n: i64) -> Result<String, String> {
     Ok("never".to_string())
 }
 
-// The race: branch A (added FIRST → lower task `seq`) always fails and retries
-// with zero delay; branch B (added SECOND → higher `seq`) succeeds on the first
-// attempt. "First branch to finish wins" ⇒ B must win.
+// The race: branch A (added FIRST, lower task `seq`) always fails and retries with
+// zero delay. Branch B (added SECOND, higher `seq`) succeeds on the first attempt.
+// "First branch to finish wins", so B must win.
 #[workflow]
 async fn fairness_race(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
     let winner = ctx
@@ -88,10 +86,10 @@ async fn fairness_race(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
 /// Headline fairness test — a zero-delay-retry branch must YIELD to a faster
 /// sibling between immediate retries instead of monopolizing the drain.
 ///
-/// RED pre-fix: branch A (lowest `seq`, zero-delay retry) re-claims itself every
-/// immediate retry, exhausts all `A_MAX_ATTEMPTS`, terminal-outs by FAILING, and
-/// settles the race first — so the winner is A's failure (the workflow `Failed`),
-/// NOT B, and A's body ran `A_MAX_ATTEMPTS` times while B never ran.
+/// Regression: branch A (lowest `seq`, zero-delay retry) claimed itself again on
+/// every immediate retry. It exhausted `A_MAX_ATTEMPTS`, failed terminally, and
+/// settled the race first. So A's failure won and the workflow `Failed`. A's body
+/// ran `A_MAX_ATTEMPTS` times, and B never ran.
 #[tokio::test]
 async fn zero_delay_retry_branch_yields_to_a_faster_sibling() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -131,11 +129,10 @@ async fn zero_delay_retry_branch_yields_to_a_faster_sibling() {
          race by failing first)"
     );
 
-    // (2) Branch A yielded after its FIRST immediate retry rather than
-    // monopolizing the drain for all `A_MAX_ATTEMPTS` attempts. It ran exactly
-    // once: attempt 1 fails → requeue to the BACK of the ready queue → B is now
-    // the lowest-`seq` ready task → B runs → terminal → race settles on B → A is
-    // cancelled while PENDING.
+    // (2) Branch A yielded after its FIRST immediate retry. It did not monopolize
+    // the drain for all `A_MAX_ATTEMPTS` attempts. It ran exactly once. Attempt 1
+    // fails and requeues to the BACK. B is now the lowest-`seq` ready task. B runs
+    // and goes terminal. The race settles on B, and A is cancelled while PENDING.
     assert_eq!(
         a_calls.load(Ordering::SeqCst),
         1,
@@ -154,9 +151,9 @@ async fn zero_delay_retry_branch_yields_to_a_faster_sibling() {
         "the winning sibling (branch B) runs exactly once"
     );
 
-    // History: exactly one branch completes (B). A never reaches a terminal in
-    // history — it is cancelled while PENDING via the synthetic 'lost race'
-    // `ActivityFailed` (its retries are audit-only, not in the event log).
+    // History: exactly one branch completes (B). A has no real terminal in history.
+    // It is cancelled while PENDING with the synthetic 'lost race' `ActivityFailed`.
+    // Its retries are audit-only, not in the event log.
     let history = rt.load_history(exec).unwrap();
     let completed = history
         .iter()
@@ -195,10 +192,10 @@ async fn flaky_zero_delay_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, Strin
     Ok(out.as_i64().unwrap() * 2)
 }
 
-/// A single (non-race) activity with a zero-delay `fixed(3, 0ms)` policy that
-/// fails twice then succeeds must still converge in one drive — the fair-yield
-/// seq-bump (bumping a single task with no siblings) is harmless: with nothing
-/// else ready, the bumped task is simply re-claimed immediately.
+/// A single (non-race) activity with a zero-delay `fixed(3, 0ms)` policy fails
+/// twice, then succeeds. It must still converge in one drive. The fair-yield
+/// seq-bump of a task with no siblings is harmless. With nothing else ready, the
+/// bumped task is claimed again at once.
 #[tokio::test]
 async fn zero_delay_retry_still_converges_without_a_race() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -232,11 +229,10 @@ async fn zero_delay_retry_still_converges_without_a_race() {
 
 // ── Replay determinism: the fair-yield winner is pinned in history ────────────
 
-/// The fairness fix only changes CLAIM ORDER within a live drain — the winner is
-/// still recorded via the core `race_winner:{seq}` marker, so the produced history
-/// (a) replays deterministically on the core engine and (b) pins branch B (index
-/// 1) as the winner. This proves the fair-yield outcome is replay-deterministic by
-/// construction.
+/// The fairness fix only changes CLAIM ORDER within a live drain. The core
+/// `race_winner:{seq}` marker still records the winner. So the history (a) replays
+/// deterministically on the core engine and (b) pins branch B (index 1) as the
+/// winner. The fair-yield outcome is replay-deterministic by construction.
 #[tokio::test]
 async fn race_winner_is_replay_deterministic_after_fair_yield() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();

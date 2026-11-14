@@ -2,16 +2,18 @@
 //! ephemeral progress SSE subscriber for `ctx.publish_progress` (issue #791).
 //!
 //! End-to-end proof (AC3/AC4): a real worker runs a workflow that publishes
-//! ordered progress chunks then completes; a subscriber on the stream receives
-//! every chunk in publish order with monotonically increasing `id:` seq, the
-//! exact chunk JSON in each `event: progress` frame, and a terminal `event: end`
-//! when the workflow reaches a terminal state. Also: an already-terminal
-//! execution closes immediately with `event: end`, and an unknown execution id
-//! returns 404.
+//! ordered progress chunks, then completes. A subscriber on the stream gets:
 //!
-//! Dual-mode DB: prefers `HARVEST_TEST_DATABASE_URL` (creates a fresh uniquely
-//! named database on that server, migrates it) so the suite is runnable without
-//! Docker; falls back to testcontainers Postgres 16 (the mode CI runs).
+//! - every chunk in publish order, with a monotonically increasing `id:` seq;
+//! - the exact chunk JSON in each `event: progress` frame;
+//! - a terminal `event: end` when the workflow reaches a terminal state.
+//!
+//! An already-terminal execution closes immediately with `event: end`. An
+//! unknown execution id returns 404.
+//!
+//! Dual-mode DB: with `HARVEST_TEST_DATABASE_URL` set, the suite creates and
+//! migrates a fresh database on that server, so it runs without Docker.
+//! Otherwise it uses testcontainers Postgres 16, as CI does.
 
 #![allow(clippy::too_many_lines)]
 
@@ -46,8 +48,8 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 /// Keeps the backing database alive for the test's duration. In testcontainers
-/// mode this owns the container; in local-Postgres mode it is a marker (the
-/// created database is left in place — the sandbox is ephemeral).
+/// mode this owns the container. In local-Postgres mode it is a marker, and
+/// the created database stays in the ephemeral sandbox.
 #[allow(dead_code)]
 enum DbGuard {
     // Boxed to keep the enum small (clippy::large_enum_variant): the container
@@ -121,12 +123,11 @@ fn progress_workflow<'a>(
     })
 }
 
-/// A workflow that publishes one chunk, suspends on a durable 1-second timer
-/// (ending decision cycle 1), then resumes (decision cycle 2) and publishes a
-/// second chunk before completing. The timer's `TimerStarted`/`TimerFired`
-/// events grow the loaded-history length (the `seq` epoch) between the two
-/// cycles, so the second chunk's `seq` must land in a strictly higher epoch than
-/// the first — the AC6 cross-cycle monotonicity crux.
+/// A workflow that publishes one chunk, then suspends on a durable 1-second
+/// timer, which ends decision cycle 1. In cycle 2 it publishes a second chunk
+/// and completes. The timer events grow the loaded-history length (the `seq`
+/// epoch) between the cycles. So the second `seq` must land in a strictly
+/// higher epoch. That is the AC6 cross-cycle monotonicity crux.
 fn progress_multicycle_workflow<'a>(
     ctx: &'a autumn_harvest::context::WorkflowContext,
     input: Value,
@@ -553,12 +554,12 @@ async fn progress_stream_on_already_terminal_execution_closes_immediately() {
     );
 }
 
-/// AC6 (cross-cycle crux): a REAL workflow that publishes across TWO decision
-/// cycles (separated by a durable timer) must emit progress `seq`s whose EPOCH
-/// strictly grows across the cycle boundary — proving the epoch actually
-/// advances with the loaded-history length, not just the within-cycle local
-/// index. This exercises the real worker path (suspend → append timer events →
-/// resume) end-to-end and reads the real `seq`s off the live SSE stream.
+/// AC6 (cross-cycle crux): a REAL workflow publishes across TWO decision
+/// cycles, separated by a durable timer. The EPOCH of its progress `seq`s must
+/// grow strictly across the cycle boundary. So the epoch advances with the
+/// loaded-history length, not only the within-cycle index. The test drives the
+/// real worker path (suspend → append timer events → resume). It reads the
+/// real `seq`s off the live SSE stream.
 #[tokio::test]
 async fn progress_stream_seq_strictly_increases_across_decision_cycles() {
     let (url, _guard) = setup_database().await;
@@ -626,10 +627,9 @@ async fn progress_stream_seq_strictly_increases_across_decision_cycles() {
     );
 
     // The CRUX: the epoch (high bits, seq >> PROGRESS_SEQ_LOCAL_BITS=24) must be
-    // strictly higher for the second cycle — the loaded-history length grew when
-    // the timer's TimerStarted/TimerFired events were appended between cycles.
-    // A within-cycle local-index bump would leave the epoch unchanged; this
-    // asserts the epoch itself advanced across the decision-cycle boundary.
+    // strictly higher for the second cycle. The timer events between the cycles
+    // grew the loaded-history length. A within-cycle local-index bump would
+    // leave the epoch unchanged.
     let epoch0 = seqs[0] >> 24;
     let epoch1 = seqs[1] >> 24;
     assert!(

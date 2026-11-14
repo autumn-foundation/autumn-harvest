@@ -1,10 +1,10 @@
 //! The dev-only database safety gate (issue #525, AC4).
 //!
 //! The dev runtime applies migrations automatically and runs a worker that
-//! claims and mutates rows. Pointed at a real database that is exactly a
-//! destructive operation, so *refusing* is the default and the burden of proof
-//! is on the DSN: anything this module cannot positively establish as local
-//! development is rejected.
+//! claims and mutates rows. Pointed at a real database, that is a destructive
+//! operation. So *refusing* is the default, and the burden of proof is on the
+//! DSN. Anything this module cannot positively establish as local development
+//! is rejected.
 //!
 //! Every function here is pure — no I/O, no environment — so the whole policy
 //! is exhaustively testable without a database.
@@ -28,10 +28,10 @@
 //! * **`url` splits userinfo at the last `@`; `tokio_postgres` splits at the
 //!   first.** So the two disagree about where the host even begins.
 //!
-//! Delegating to the client's own parser removes that entire class at once: what
-//! this gate classifies and what `establish` connects to are the same list, by
-//! construction. A string the client cannot parse is refused rather than
-//! guessed at — it could not have connected anyway.
+//! Delegation to the client's own parser removes that entire class at once.
+//! This gate classifies the same list that `establish` connects to, by
+//! construction. A string the client cannot parse is refused, not guessed at.
+//! It could not have connected anyway.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -196,10 +196,10 @@ pub fn classify_database_url(dsn: &str) -> DatabaseSafety {
     }
 
     // TLS is checked from the DSN's own text FIRST, before the client parser
-    // gets a look. `tokio_postgres` models only `disable`/`prefer`/`require`,
-    // so `verify-ca` and `verify-full` — the two strongest signals that this is
-    // a remote managed database — would otherwise arrive as an opaque parse
-    // error rather than as the specific thing they are.
+    // gets a look. `tokio_postgres` models only `disable`/`prefer`/`require`.
+    // `verify-ca` and `verify-full` are the two strongest signals of a remote
+    // managed database. Without this, they would arrive as an opaque parse
+    // error, not as the specific thing they are.
     if let Some(mode) = tls_requiring_sslmode(trimmed) {
         return DatabaseSafety::Refused(RefusalReason::TlsRequired { sslmode: mode });
     }
@@ -213,12 +213,12 @@ pub fn classify_database_url(dsn: &str) -> DatabaseSafety {
         }
     };
 
-    // The authoritative TLS check. Both are needed, and neither subsumes the
-    // other: this one cannot tell `require` from `verify-full` — the client
-    // collapses every TLS mode it accepts into `Require` — while that one
-    // reads the DSN's text and so misses any spelling it declines to split on
-    // (a `?` swallowed into a URI's userinfo, say). This is the one that
-    // decides, and it sees exactly what the client will dial.
+    // The authoritative TLS check. Both checks are needed, and neither
+    // subsumes the other. This one cannot tell `require` from `verify-full`,
+    // because the client collapses every TLS mode it accepts into `Require`.
+    // The text check misses any spelling it declines to split on (a `?`
+    // swallowed into a URI's userinfo, say). This check decides, and it sees
+    // exactly what the client will dial.
     if config.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
         return DatabaseSafety::Refused(RefusalReason::TlsRequired {
             sslmode: "require".to_owned(),
@@ -289,13 +289,13 @@ fn refuse_non_local_host(name: &str) -> Option<RefusalReason> {
 /// The first TLS-demanding `sslmode` a DSN spells out, read the way the client
 /// reads it.
 ///
-/// **Syntax-aware, not positional.** This was a bare `dsn.find("sslmode=")`,
-/// which has no idea whether it landed on a key or on the inside of a value, so
-/// any DSN merely *containing* the text was refused as TLS-requiring — a legal
-/// loopback `password=\'sslmode=require\'` among them (issue #1286). Which
-/// syntax a DSN is in is decided first, by the same prefix test
-/// `Config::from_str` uses, and then only a real top-level `sslmode` key
-/// counts: an option of a keyword/value string, or a query parameter of a URI.
+/// **Syntax-aware, not positional.** This was a bare `dsn.find("sslmode=")`.
+/// It could not tell a key from the inside of a value. So any DSN merely
+/// *containing* the text was refused as TLS-requiring, a legal loopback
+/// `password=\'sslmode=require\'` among them (issue #1286). The syntax of the
+/// DSN is decided first, by the same prefix test that `Config::from_str` uses.
+/// Then only a real top-level `sslmode` key counts: an option of a
+/// keyword/value string, or a query parameter of a URI.
 ///
 /// Keys are matched case-insensitively and, in a URI, after percent-decoding —
 /// wider than the client, which would reject those spellings outright. Erring
@@ -303,14 +303,13 @@ fn refuse_non_local_host(name: &str) -> Option<RefusalReason> {
 /// lose a TLS demand the client cannot name at all.
 ///
 /// **Every** `sslmode` occurrence is considered, not the last one the client
-/// would keep. A DSN that says `verify-full` anywhere is one `Config::from_str`
-/// refuses anyway, so naming it costs nothing and stays on the failing-closed
-/// side of a duplicated key.
+/// would keep. `Config::from_str` refuses a DSN that says `verify-full`
+/// anywhere. So naming it costs nothing and stays on the failing-closed side
+/// of a duplicated key.
 ///
 /// Only ever used to refuse *more* than the client parser would, so a miss is
-/// safe: the authoritative `get_ssl_mode()` check in
-/// [`classify_database_url`] is the backstop, and it sees the spellings this
-/// does not.
+/// safe. The authoritative `get_ssl_mode()` check in [`classify_database_url`]
+/// is the backstop, and it sees the spellings this does not.
 fn tls_requiring_sslmode(dsn: &str) -> Option<String> {
     let demands_tls = |mode: &String| TLS_REQUIRING_SSLMODES.contains(&mode.as_str());
     if dsn::is_uri_dsn(dsn) {

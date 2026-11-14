@@ -151,10 +151,9 @@ async fn started_execution_completion_callbacks(
     .completion_callbacks
 }
 
-// Regression (issue #605 code review): a per-execution completion_callbacks
-// target must survive both batch admission paths, not just the direct
-// start path -- neither a size-triggered flush nor a scanner-driven
-// time-based flush may silently drop it.
+// Regression (issue #605): a per-execution completion_callbacks target must
+// survive both batch admission paths, not just the direct start path.
+// Neither a size-triggered flush nor a scanner-driven timed flush may drop it.
 #[tokio::test]
 async fn size_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
     let (mut conn, _container) = setup_db().await;
@@ -188,11 +187,10 @@ async fn size_triggered_flush_threads_completion_callbacks_into_the_started_exec
     }
 
     // Production CONCATENATES each admission's completion_callbacks (issue #921)
-    // and dedups only at DELIVERY time — so admitting the same single-target
-    // array on all 3 batch admissions stores the concatenated union
-    // `[hook, hook, hook]`, NOT `[hook]`. The passing sibling
+    // and dedups only at DELIVERY time. So the same single-target array on all
+    // 3 batch admissions stores `[hook, hook, hook]`, NOT `[hook]`. The sibling
     // `a_later_admissions_completion_callbacks_are_merged_not_dropped` encodes the
-    // same concatenate-and-merge contract with two *distinct* targets (→ len 2).
+    // same contract with two *distinct* targets (len 2).
     let stored = started_execution_completion_callbacks(&mut conn, "callback-batch-001").await;
     let hook = callbacks.as_array().expect("callbacks is an array")[0].clone();
     let expected = json!([hook, hook, hook]);
@@ -204,13 +202,12 @@ async fn size_triggered_flush_threads_completion_callbacks_into_the_started_exec
     );
 }
 
-// Regression (issue #921 review, Codex P2): the ON CONFLICT upsert only
-// ever updated buffered_payloads/fire_at, leaving the *first* admission's
-// start_options (including completion_callbacks) untouched. A later
-// admission into the same batch group that specified a *different*
-// completion_callbacks target would therefore be silently dropped -- that
-// caller's callback would never fire when the collapsed execution
-// completes. The two admissions' target arrays must instead be merged.
+// Regression (issue #921): the ON CONFLICT upsert only updated
+// buffered_payloads/fire_at. It left the *first* admission's start_options,
+// completion_callbacks included, untouched. So a later admission into the same
+// batch group with a *different* completion_callbacks target was dropped.
+// That caller's callback never fired when the collapsed execution completed.
+// The two admissions' target arrays must instead be merged.
 #[tokio::test]
 async fn a_later_admissions_completion_callbacks_are_merged_not_dropped() {
     let (mut conn, _container) = setup_db().await;

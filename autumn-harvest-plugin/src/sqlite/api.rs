@@ -527,7 +527,6 @@ async fn health_ready(State(state): State<ApiState>) -> Response {
     // A tenant route reads the tenant's own file. The control file does not
     // decide whether a tenant is ready.
     let handle = state.handle().ok();
-    // The Postgres probe gives its database check one second.
     let reachable = match &handle {
         Some(handle) => Some(matches!(
             tokio::time::timeout(READY_BUDGET, handle.ping()).await,

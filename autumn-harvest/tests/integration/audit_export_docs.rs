@@ -11,9 +11,8 @@
 //!
 //! These guards run in the `lint` job, unconditionally (see
 //! `guards_run_on_docs_only_changes` below). A docs-only PR skips the `test`
-//! matrix entirely, and it is exactly the change class most likely to
-//! quietly drop the caveat. `docs/performance.md`'s guards hit this same gap
-//! three rounds running. The fix there is copied here, not re-derived.
+//! matrix, and that change is the most likely to drop the caveat. The guards
+//! of `docs/performance.md` hit the same gap. This file copies their fix.
 
 use std::path::{Path, PathBuf};
 
@@ -24,8 +23,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Read a file with line endings normalised to `\n`, so a `\n`-anchored
-/// needle does not silently miss on a Windows checkout.
 /// The shipped-work entry for issue #953, collated from its changelog fragment.
 ///
 /// An entry starts at a `- **` line that cites the issue. It ends at the next
@@ -44,6 +41,8 @@ fn shipped_work_entry(text: &str, issue: &str) -> String {
         .join("\n")
 }
 
+/// Read a file with line endings normalised to `\n`, so a `\n`-anchored
+/// needle does not silently miss on a Windows checkout.
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -278,16 +277,14 @@ fn upgrade_guide_does_not_restate_the_false_claim() {
     );
 }
 
-/// Issue #1272's own fix added a "cost is bounded" claim. Two review rounds
-/// found more preconditions than one sentence can enumerate.
-/// `retention.rs`'s purge gate needs `audit_retention_days > 0` and
-/// `dry_run` false. `audit.rs`'s per-record guard adds a third: no
-/// non-retired export cursor for the shard, and no sink configured in the
-/// sweeping process. Naming a subset inline invites a fourth-round finding.
-/// Point at the existing "Retention interaction" section instead of
-/// re-deriving its conditions. Check that section still documents the
-/// cursor guard, so the pointer cannot go stale by losing the detail it
-/// names.
+/// Issue #1272's own fix added a "cost is bounded" claim. It has more
+/// preconditions than one sentence can list. `retention.rs`'s purge gate
+/// needs `audit_retention_days > 0` and `dry_run` false. `audit.rs`'s
+/// per-record guard adds a third: no non-retired export cursor for the
+/// shard, and no sink configured in the sweeping process. A subset named
+/// inline goes stale. So each source points at the "Retention interaction"
+/// section. This test checks that the section still documents the cursor
+/// guard, so the pointer cannot go stale.
 #[test]
 fn boundedness_claim_points_at_retention_interaction() {
     for rel in [

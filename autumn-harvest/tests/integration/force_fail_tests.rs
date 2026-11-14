@@ -3,8 +3,8 @@
 //!
 //! Operator force-fail for a single hung in-flight (RUNNING) activity task:
 //! - The task row transitions to FAILED with the typed `OperatorForceFailed`
-//!   envelope, an `ActivityFailed` event is appended (no new event variant),
-//!   and the parked workflow task is woken.
+//!   envelope. An `ActivityFailed` event is appended (no new event variant).
+//!   The parked workflow task is woken.
 //! - Remaining retry attempts are skipped regardless of retry policy.
 //! - Idempotent: a second call on an already-forced task is a no-op success.
 //! - 404 (`NotFound`) for unknown tasks / wrong workflow; 409 (`Config`) for
@@ -159,8 +159,8 @@ async fn insert_running_activity_task(
 }
 
 /// Insert a claimed, in-flight (RUNNING) activity task row with a NULL
-/// `activity_id` — the legacy pre-#516 row shape whose pending event is
-/// resolved by the name-based fallback in `pending_activity_id_for_task`.
+/// `activity_id`. This is the legacy pre-#516 row shape. The name-based
+/// fallback in `pending_activity_id_for_task` resolves its pending event.
 async fn insert_legacy_running_activity_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -507,8 +507,8 @@ async fn retry_after_forced_run_sealed_is_idempotent_no_op() {
         .len();
 
     // A retried fail-now (lost response / script retry) must stay the
-    // documented idempotent no-op success — NOT flip to the terminal 409
-    // (PR #974 Codex review): the already-forced short-circuit wins over the
+    // documented idempotent no-op success, NOT flip to the terminal 409
+    // (PR #974). The already-forced short-circuit wins over the
     // terminal-execution guard.
     let second = force_fail_activity(
         &mut conn,
@@ -522,9 +522,9 @@ async fn retry_after_forced_run_sealed_is_idempotent_no_op() {
     assert!(!second.forced);
     assert!(second.already_forced);
 
-    // Zero writes: no event appended, exactly one terminal event for the
-    // activity, the stored envelope keeps the FIRST reason, and neither the
-    // task row nor the execution row was touched.
+    // Zero writes: no event appended and exactly one terminal event for the
+    // activity. The stored envelope keeps the FIRST reason. Neither the task
+    // row nor the execution row changes.
     let history = store::load_history(&mut conn, exec_id)
         .await
         .expect("history");
@@ -749,10 +749,10 @@ async fn legacy_task_terminal_history_returns_conflict_not_404() {
     let activity_id = ActivityExecId::new();
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     append_activity_completed(&mut conn, exec_id, activity_id).await;
-    // Legacy row shape: activity_id NULL — resolution falls back to the
-    // name-based lookup, whose NotFound must NOT leak through as a 404 for
-    // the terminal-in-history case (it is the same documented 409 as the
-    // id-resolved branch).
+    // Legacy row shape: activity_id NULL, so resolution falls back to the
+    // name-based lookup. For the terminal-in-history case, its NotFound must
+    // NOT leak through as a 404. It is the same documented 409 as the
+    // id-resolved branch.
     let task_id = insert_legacy_running_activity_task(&mut conn, exec_id).await;
 
     let result = force_fail_activity(

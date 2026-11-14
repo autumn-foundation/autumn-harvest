@@ -1,14 +1,17 @@
 //! Integration tests for `GET /admin/queue-coverage` (issue #774).
 //!
-//! Verifies the core coverage predicate end to end against a real Postgres
-//! database: a queue with pending work and zero live pollers is reported
-//! uncovered; `Draining` workers still cover (AC1) while `Stopped`/stale
-//! workers do not; a paused queue is excluded from the uncovered list; the
-//! `?queue_name=` filter narrows the report; an unreachable shard degrades
-//! `status` to `partial`/`unavailable` without dropping the reachable
-//! shard's data (AC6); representative sample ids are capped at 5 (AC3); the
-//! top-level `uncovered`/`total_uncovered_queues` fields answer a CI gate
-//! with a single field (AC4); and the route is admin-gated.
+//! Checks the core coverage predicate end to end against a real Postgres:
+//!
+//! - A queue with pending work and zero live pollers is uncovered.
+//! - `Draining` workers still cover (AC1). `Stopped` and stale workers do not.
+//! - A paused queue is excluded from the uncovered list.
+//! - The `?queue_name=` filter narrows the report.
+//! - An unreachable shard degrades `status` to `partial`/`unavailable` and
+//!   keeps the reachable shard's data (AC6).
+//! - Sample ids are capped at 5 (AC3).
+//! - The top-level `uncovered`/`total_uncovered_queues` fields answer a CI
+//!   gate alone (AC4).
+//! - The route is admin-gated.
 
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
@@ -376,13 +379,14 @@ async fn set_worker_build_id(database_url: &str, worker_id: &str, build_id: &str
         .expect("failed to set worker build_id");
 }
 
-/// Scrubs `harvest_workflow_executions` (cascades to `harvest_task_queue`
-/// and every other execution-scoped table via `ON DELETE CASCADE`) plus the
-/// two standalone tables this suite writes with no FK back to an execution
-/// (`harvest_workers`, `harvest_queue_pauses`), so a shared migrated DB
-/// (the `HARVEST_TEST_DATABASE_URL` path, which points every test in this
-/// binary at the SAME physical database) stays isolated per test. Mirrors
-/// `retention_overrides_tests.rs`'s `scrub` idiom.
+/// Scrubs the tables this suite writes, so a shared migrated DB stays
+/// isolated per test.
+///
+/// Deleting `harvest_workflow_executions` cascades to `harvest_task_queue`
+/// and every other execution-scoped table. `harvest_workers` and
+/// `harvest_queue_pauses` have no FK to an execution, so they are scrubbed
+/// directly. With `HARVEST_TEST_DATABASE_URL`, every test in this binary
+/// shares one database. Mirrors the `scrub` idiom of `retention_overrides_tests.rs`.
 async fn scrub(database_url: &str) {
     let mut conn = connect(database_url).await;
     for stmt in [
@@ -516,9 +520,9 @@ async fn a_declared_queue_with_no_poller_is_named_unpolled() {
 
 #[tokio::test]
 async fn queue_with_no_workers_is_reported_uncovered() {
-    // AC1/AC4: a queue with pending work and zero live workers is uncovered,
-    // and the top-level `uncovered`/`total_uncovered_queues` fields alone
-    // answer a "is my fleet fully covered" CI gate.
+    // AC1/AC4: a queue with pending work and zero live workers is uncovered.
+    // The top-level `uncovered`/`total_uncovered_queues` fields alone answer
+    // an "is my fleet fully covered" CI gate.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     let (task_id, exec_id) =
@@ -643,16 +647,13 @@ async fn stopped_worker_does_not_cover_the_queue() {
 
 #[tokio::test]
 async fn many_historical_stopped_workers_do_not_prevent_correct_coverage_detection() {
-    // Issue #774 review: the coverage check must filter `Stopped` workers
-    // server-side (`status IN (Active, Draining)`) rather than loading every
-    // worker a shard's database has ever registered (including a long
-    // history of departed workers from restarts using random UUID worker
-    // IDs) and filtering client-side. This seeds a realistic-shaped
-    // historical pile of 30 `Stopped` rows on the SAME queue name a
-    // genuinely live worker also polls, so a regression that silently
-    // drops or mis-scopes the live/status-filtered query -- not just a
-    // regression that fails to bound the *unfiltered* scan -- would show up
-    // as a false "uncovered" report here.
+    // Issue #774: the coverage check filters `Stopped` workers server-side
+    // (`status IN (Active, Draining)`). It must not load every worker a shard
+    // ever registered and filter client-side. Restarts with random UUID
+    // worker IDs leave a long history of departed workers. This seeds 30
+    // `Stopped` rows on the queue name that a live worker also polls. A
+    // regression that drops or mis-scopes the status-filtered query then
+    // shows up as a false "uncovered" report.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(
@@ -701,22 +702,18 @@ async fn many_historical_stopped_workers_do_not_prevent_correct_coverage_detecti
 async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
     use autumn_harvest::schema::harvest_workers;
 
-    // Issue #774 review, third finding: `fetch_potentially_live_workers`'s
-    // `MAX_LIMIT` (500) truncation runs *inside* `list_workers` via
-    // `apply_worker_filters`, whose own doc comment states the limit is
-    // "intentionally applied after the in-process retain passes" -- but
-    // that guarantee only holds when the caller actually supplies the
-    // retain criteria it needs. A crashed worker's `status` column can
-    // stay `Active` forever (nothing ever calls `transition_status` on a
-    // dead process -- only its heartbeat goes stale), so a fleet with more
-    // than `MAX_LIMIT` such permanently-stale-but-`Active` rows must not
-    // be able to truncate away the one genuinely healthy poller before
-    // this endpoint's own health check ever sees it. Distinct from
-    // `many_historical_stopped_workers_do_not_prevent_correct_coverage_detection`
-    // above (which used `Stopped` status, filtered out server-side by the
-    // `status` predicate itself, well under the cap) -- this test's rows
-    // are all `status = 'Active'`, so only a health-*before*-truncate
-    // ordering (not the status filter) can save the healthy poller.
+    // Issue #774: the `MAX_LIMIT` (500) truncation of
+    // `fetch_potentially_live_workers` runs inside `list_workers` via
+    // `apply_worker_filters`. That doc says the limit applies "after the
+    // in-process retain passes". This holds only when the caller supplies
+    // the retain criteria it needs. A crashed worker's `status` can stay
+    // `Active` forever. Nothing calls `transition_status` on a dead process,
+    // so only its heartbeat goes stale. More than `MAX_LIMIT` such stale
+    // `Active` rows must not truncate away the one healthy poller before the
+    // health check sees it. Unlike
+    // `many_historical_stopped_workers_do_not_prevent_correct_coverage_detection`,
+    // every row here is `status = 'Active'`. So only a health-before-truncate
+    // order, not the status filter, can save the healthy poller.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(
@@ -790,17 +787,14 @@ async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
 
 #[tokio::test]
 async fn healthy_workers_exceeding_the_cap_do_not_crowd_out_a_covering_poller() {
-    // Issue #774 review, fourth finding: even after pre-filtering to
-    // `WorkerHealth::Healthy` (the previous fix), `fetch_potentially_live_workers`
-    // still truncated each status's result set at `WorkerFilters::MAX_LIMIT`
-    // (500). A shard running more than 500 concurrently healthy `Active`
-    // workers could have the ONE worker actually covering a pending queue
-    // fall outside that cap -- an unordered truncation, not a ranked one --
-    // producing a false "uncovered" verdict even though a live poller
-    // exists. `list_workers`'s SQL issues no server-side `LIMIT` at all (it
-    // always loads the full status-matching set before any client-side
-    // filtering), so the cap bought zero query-cost savings here; it has
-    // been removed entirely for this internal existence check.
+    // Issue #774: even after pre-filtering to `WorkerHealth::Healthy`,
+    // `fetch_potentially_live_workers` still truncated each status's result
+    // set at `WorkerFilters::MAX_LIMIT` (500). The truncation is unordered.
+    // With more than 500 healthy `Active` workers, the one worker that covers
+    // a pending queue could fall outside the cap. The result was a false
+    // "uncovered" verdict with a live poller present. The SQL of
+    // `list_workers` has no `LIMIT`, so the cap saved no query cost. This
+    // internal existence check no longer has the cap.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(
@@ -834,10 +828,9 @@ async fn healthy_workers_exceeding_the_cap_do_not_crowd_out_a_covering_poller() 
         .expect("failed to register noise worker");
     }
 
-    // The one worker that actually covers "email-workers", registered LAST
-    // so it lands past the (now-removed) 500-row cap under insertion-order
-    // sequential scan -- the exact ordering the pre-fix `truncate(500)`
-    // would have dropped.
+    // The one worker that covers "email-workers" registers LAST. Under an
+    // insertion-order sequential scan, it lands past the removed 500-row cap,
+    // where the old `truncate(500)` dropped it.
     insert_worker(
         &database_url,
         "worker-live",
@@ -930,9 +923,9 @@ async fn paused_queue_is_excluded_from_the_uncovered_list() {
         report.get("items").and_then(Value::as_array).map(Vec::len),
         Some(0)
     );
-    // The pause exclusion is not invisible: a paused, pollerless queue that
-    // has real pending work must still be named so it doesn't silently
-    // outlast `harvest_queue_paused_too_long`'s own grace window.
+    // The pause exclusion is not invisible. A paused, pollerless queue that
+    // has real pending work must still be named. Otherwise it silently
+    // outlasts the grace window of `harvest_queue_paused_too_long`.
     assert_eq!(
         report.get("excluded_paused_queues"),
         Some(&json!(["seasonal-batch"])),
@@ -942,9 +935,8 @@ async fn paused_queue_is_excluded_from_the_uncovered_list() {
 
 #[tokio::test]
 async fn paused_and_covered_queue_is_absent_from_excluded_paused_queues() {
-    // A paused queue that already has a live poller has nothing interesting
-    // to report -- it would not have been uncovered even if unpaused right
-    // now, so it must not clutter excluded_paused_queues either.
+    // A paused queue that already has a live poller is not uncovered even if
+    // unpaused, so it must not clutter excluded_paused_queues either.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(
@@ -1019,10 +1011,10 @@ async fn saturated_worker_still_covers_the_queue() {
 
 #[tokio::test]
 async fn build_incompatible_worker_still_covers_the_queue() {
-    // AC5: this endpoint answers "does any live worker poll this queue at
-    // all" -- never "...with a build compatible with the pending task's
-    // required_build_id", which is #171's build_reachability. Coverage
-    // must never depend on `build_id`.
+    // AC5: this endpoint answers "does any live worker poll this queue". It
+    // never checks build compatibility with the task's required_build_id,
+    // which is the build_reachability of #171. Coverage never depends on
+    // `build_id`.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(
@@ -1114,13 +1106,12 @@ async fn queue_name_filter_matching_nothing_is_fully_covered() {
 
 #[tokio::test]
 async fn duplicate_and_unknown_query_params_do_not_400() {
-    // AC8: invalid params return 400 with a JSON error body -- but a
-    // *duplicate* or *unknown* query key is not an invalid VALUE
-    // (queue_name has no invalid value), so per the codebase's
-    // `from_query_pairs` convention it must resolve, never reject. This is
-    // the end-to-end proof over the real axum route: the pre-hardening
-    // derive-based `Query<QueueCoverageQuery>` extractor 400'd a duplicate
-    // key with a `text/plain` body instead.
+    // AC8: invalid params return 400 with a JSON error body. A duplicate or
+    // unknown query key is not an invalid value (queue_name has no invalid
+    // value). By the `from_query_pairs` convention it resolves, never
+    // rejects. This proves it over the real axum route. The old derive-based
+    // `Query<QueueCoverageQuery>` extractor returned a `text/plain` 400 for a
+    // duplicate key.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(&database_url, ShardId::new(0), "typo_queue_b", "onboarding").await;
@@ -1150,18 +1141,16 @@ async fn duplicate_and_unknown_query_params_do_not_400() {
 
 #[tokio::test]
 async fn malformed_percent_encoded_query_param_returns_400() {
-    // Issue #774 review: axum's built-in `Query<Vec<(String, String)>>`
-    // extractor is backed by `serde_urlencoded`/`form_urlencoded`, which
-    // *always* succeeds by silently substituting U+FFFD for a malformed
-    // percent-encoded byte sequence -- so a corrupted `queue_name` would
-    // otherwise silently resolve to a DIFFERENT (nonexistent) queue and
-    // report a false-clean `uncovered: false`, defeating a scoped CI/CD
-    // deploy-gate request. `%FF` alone is not valid UTF-8 -- this is the
-    // exact repro from the review comment. End-to-end proof over the real
-    // axum route (not just the unit-level `parse_raw_query_pairs_strict`
-    // tests in `queue_coverage.rs`): the handler must reject with a genuine
-    // JSON 400 body (via `get_json`'s `.expect("response must be JSON")`),
-    // never a lossily-decoded 200 and never a bare `text/plain` 400.
+    // Issue #774: axum's `Query<Vec<(String, String)>>` extractor uses
+    // `serde_urlencoded`/`form_urlencoded`. It always succeeds and puts
+    // U+FFFD in place of a malformed percent-encoded byte sequence. A
+    // corrupted `queue_name` then resolves to a different, nonexistent queue.
+    // The report is a false-clean `uncovered: false`, which defeats a scoped
+    // CI/CD deploy gate. `%FF` alone is not valid UTF-8. This proves the fix
+    // over the real axum route, beyond the `parse_raw_query_pairs_strict` unit
+    // tests in `queue_coverage.rs`. The handler must return a JSON 400 body
+    // (via `get_json`'s `.expect("response must be JSON")`). A lossy 200 or a
+    // bare `text/plain` 400 fails.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(&database_url, ShardId::new(0), "typo_queue_a", "onboarding").await;
@@ -1186,11 +1175,9 @@ async fn malformed_percent_encoded_query_param_returns_400() {
 
 #[tokio::test]
 async fn malformed_percent_encoding_in_an_unknown_query_key_also_returns_400() {
-    // The decode-before-parse ordering means a malformed byte sequence in
-    // *any* key or value -- including a key `QueueCoverageQuery` does not
-    // even recognize -- is still rejected up front, rather than being
-    // silently dropped as an unknown param the way a genuinely-unknown
-    // *valid-UTF-8* key already is (see
+    // Decode-before-parse rejects a malformed byte sequence in any key or
+    // value up front. This includes a key that `QueueCoverageQuery` does not
+    // recognize. A valid-UTF-8 unknown key is dropped instead (see
     // `duplicate_and_unknown_query_params_do_not_400`).
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
@@ -1210,16 +1197,13 @@ async fn malformed_percent_encoding_in_an_unknown_query_key_also_returns_400() {
 
 #[tokio::test]
 async fn syntactically_invalid_percent_escape_also_returns_400() {
-    // Issue #774 review, second finding: `%FF` above covers a
-    // *well-formed* escape that decodes to invalid UTF-8. `%GG` is a
-    // distinct malformed-encoding shape -- `G` is not a hex digit, so
-    // `percent_encoding::percent_decode_str` leaves `%GG` as a literal,
-    // undecoded byte run rather than erroring, and since `%`/`G` are
-    // themselves valid ASCII the subsequent UTF-8 check trivially
-    // succeeds. Without the explicit hex-escape well-formedness check this
-    // silently queries the (almost certainly nonexistent) literal queue
-    // name "orders%GG" and reports a false-clean `uncovered: false`
-    // instead of rejecting the malformed request.
+    // Issue #774: `%FF` above is a well-formed escape that decodes to invalid
+    // UTF-8. `%GG` is a different malformed shape, because `G` is not a hex
+    // digit. `percent_encoding::percent_decode_str` leaves `%GG` as literal
+    // bytes and does not fail. Those bytes are valid ASCII, so the UTF-8 check
+    // passes. Without the hex-escape check, the route queries the literal
+    // queue name "orders%GG". It then reports a false-clean
+    // `uncovered: false` instead of rejecting the request.
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
     insert_pending_task(&database_url, ShardId::new(0), "typo_queue_b", "onboarding").await;

@@ -1,19 +1,18 @@
 //! Integration tests for partial-availability of cross-shard fan-out READ
 //! endpoints (issue #756).
 //!
-//! When one shard's pool is unreachable, the cross-shard list/aggregate read
+//! One shard's pool can be unreachable. Then the cross-shard list/aggregate read
 //! endpoints (`GET /workflows`, `/workers`, `/workers/health`, `/admin/schedules`,
-//! `/dead-letters`, `/dead-letters/aggregate`) must return `200 OK` with the
-//! union of the *reachable* shards' results plus a machine-readable
-//! `unavailable_shards` indicator — never a whole-request `500`. WRITES keep
-//! strict failure semantics, and the single-execution business-id resolver
-//! (#805) keeps its 503-to-avoid-false-404 behavior.
+//! `/dead-letters`, `/dead-letters/aggregate`) must return `200 OK`, never a
+//! whole-request `500`. The body holds the union of the *reachable* shards'
+//! results and a machine-readable `unavailable_shards` indicator. WRITES keep
+//! strict failure semantics. The business-id resolver (#805) keeps its 503,
+//! which avoids a false 404.
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which two fresh shard databases are created) when set — no
-//! Docker required — else boots a fresh testcontainers Postgres. Docker is not
-//! available in every sandbox, so these tests are compile-checked there and run
-//! Docker-backed in CI (matching the #543/#544/#601 precedent).
+//! Dual-mode: with `HARVEST_TEST_DATABASE_URL` set, the tests create two shard
+//! databases on that server. Otherwise they boot a testcontainers Postgres.
+//! A sandbox without Docker only compile-checks them. CI runs them
+//! Docker-backed (the #543/#544/#601 precedent).
 
 use std::collections::BTreeMap;
 
@@ -84,9 +83,9 @@ fn shard_url_preserves_query_params() {
 
 /// Two independent shard databases plus an optional container guard.
 ///
-/// With `HARVEST_TEST_DATABASE_URL` set, two fresh databases are created and
-/// migrated on that server (guard `None`); otherwise a fresh testcontainers
-/// Postgres backs both shard databases (guard `Some`).
+/// With `HARVEST_TEST_DATABASE_URL` set, two fresh migrated databases go on
+/// that server (guard `None`). Otherwise a testcontainers Postgres backs both
+/// (guard `Some`).
 async fn setup_two_shards() -> ((String, String), Option<ContainerAsync<Postgres>>) {
     let (admin_url, guard) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         (url, None)
@@ -312,10 +311,9 @@ fn assert_names_down_shard(body: &Value) {
 
 /// Seed a child execution under `parent` on `shard`.
 ///
-/// `GET /workflows/{id}/children` traverses `parent_id` across every shard, so a
-/// cross-shard child (issue #956) is discoverable only through that fan-out —
-/// which is exactly why the endpoint has to degrade rather than `500` when one
-/// shard is down.
+/// `GET /workflows/{id}/children` traverses `parent_id` across every shard.
+/// A cross-shard child (issue #956) is found only through that fan-out. So the
+/// endpoint must degrade, not `500`, when one shard is down.
 async fn seed_child_execution(
     url: &str,
     shard: i32,
@@ -385,13 +383,11 @@ async fn seed_child_execution(
 
 /// A parent's children view must report an unreachable shard rather than `500`.
 ///
-/// This traversal always spanned every shard — a child could live anywhere
-/// because it follows `parent_id` across the fleet — but it propagated a pool
-/// error with `?`, so one unreachable shard turned the whole call into a `500`.
-/// Cross-shard child *placement* (issue #956) makes that failure routine rather
-/// than exotic: a fan-out deliberately puts children on other shards, so a
-/// single shard being down is now the expected reason a parent's children view
-/// is incomplete.
+/// This traversal follows `parent_id` across every shard. It used to propagate
+/// a pool error with `?`, so one unreachable shard made the whole call a `500`.
+/// Cross-shard child *placement* (issue #956) makes that failure routine. A
+/// fan-out puts children on other shards on purpose. So a down shard is now
+/// the expected reason for an incomplete children view.
 #[tokio::test]
 async fn get_workflow_children_partial_names_down_shard_and_returns_reachable_children() {
     let ((url0, url1), _guard) = setup_two_shards().await;
@@ -440,9 +436,8 @@ async fn get_workflow_children_happy_path_reports_complete() {
     assert_eq!(body["items"].as_array().expect("items").len(), 1);
 }
 
-/// The depth-traversal variant degrades too: a shard that fails at *any* depth
-/// level is degraded for the whole walk, because a missed level's children are
-/// missed descendants.
+/// The depth-traversal variant degrades too. A shard that fails at *any* depth
+/// is degraded for the whole walk, because a missed level hides descendants.
 #[tokio::test]
 async fn get_workflow_children_tree_traversal_also_degrades() {
     let ((url0, url1), _guard) = setup_two_shards().await;
@@ -671,9 +666,8 @@ async fn by_id_read_still_503s_when_a_shard_is_down() {
     let ((url0, url1), _guard) = setup_two_shards().await;
     let app = build_app(&url0, &url1, true);
 
-    // The business-id resolver cannot confirm absence while a shard is down, so
-    // it returns 503 rather than a false 404 — this must not regress into a
-    // partial-availability 200.
+    // The business-id resolver cannot confirm absence while a shard is down.
+    // So it returns 503, not a false 404, and never a partial-availability 200.
     let status = get_json(&app, "/workflows/by-id/onboarding/does-not-exist")
         .await
         .0;

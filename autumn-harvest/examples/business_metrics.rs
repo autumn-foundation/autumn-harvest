@@ -1,14 +1,14 @@
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc, clippy::unused_async)]
 //! Replay-safe custom business metrics example (issue #758, shipped as #532).
 //!
-//! A workflow author emits the metrics their *business* cares about —
-//! `orders_fulfilled`, `orders_auto_rejected`, `order_amount_usd` — into the
-//! same `MetricsRecorder` pipeline the engine's `harvest.*` metrics already
-//! use, without double-counting on replay:
+//! A workflow author emits the metrics that the *business* cares about, such as
+//! `orders_fulfilled`, `orders_auto_rejected` and `order_amount_usd`. They go
+//! into the same `MetricsRecorder` pipeline as the engine's `harvest.*`
+//! metrics, with no double-counting on replay:
 //!
 //! - `ctx.metrics().counter(...)`   from a **workflow branch** — suppressed on
 //!   every replay cycle, emitted exactly once at the live execution frontier.
-//!   This is the shape activities can't cover: the meaningful event here is an
+//!   This is the shape activities cannot cover: the meaningful event here is an
 //!   orchestration *decision* ("took the auto-reject branch").
 //! - `ctx.metrics().histogram(...)` from an **activity** — never suppressed;
 //!   each retry attempt is a separate execution and emits independently.
@@ -62,11 +62,11 @@ pub async fn charge_card(ctx: &ActivityContext, order: Order) -> Result<String, 
 
 /// Fulfills an order, emitting business counters from workflow branches.
 ///
-/// The `ctx.metrics()` calls below are replay-safe: the executor re-runs this
-/// function on every replay cycle, but emission happens only at the live
-/// execution frontier (`ctx.is_replaying() == false`), so a counter
-/// incremented once in workflow code increments the backend exactly once.
-/// No `WorkflowEvent` is recorded — history stays byte-identical.
+/// The `ctx.metrics()` calls below are replay-safe. The executor re-runs this
+/// function on every replay cycle, but it emits only at the live execution
+/// frontier (`ctx.is_replaying() == false`). So a counter incremented once in
+/// workflow code increments the backend exactly once. No `WorkflowEvent` is
+/// recorded, so history stays byte-identical.
 #[workflow(description = "Order fulfillment emitting replay-safe business metrics")]
 pub async fn fulfill_order(ctx: &WorkflowContext, order: Order) -> Result<String, String> {
     // Counter from a workflow BRANCH — an orchestration decision an activity
@@ -102,10 +102,10 @@ fn main() {
     println!("Wire a backend with HarvestBuilder::telemetry(...) — see docs/telemetry.md.");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must
-// keep building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for external consumers only with the
+// `testing` feature.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! Integration tests for the `harvest det-check` subcommand (issue #778).
 //!
-//! Black-box tests over the crate's public det-check surface: they build small
-//! source trees on disk and drive the pure report/format/gate helpers and
+//! Black-box tests over the public det-check surface. They build small source
+//! trees on disk. They drive the pure report/format/gate helpers and
 //! `run_det_check` end to end.
 
 use std::path::PathBuf;
@@ -11,10 +11,10 @@ use autumn_harvest_cli::{
     format_det_findings_text, format_det_suppressions_list, run_det_check,
 };
 
-/// Writes a two-file source tree where a workflow reaches a clock-reading
-/// first-party helper **in its own module** (same file `a.rs`); `b.rs` is an
-/// unrelated clean file. One-hop resolution is same-module only, so the helper
-/// must share the workflow's module (issue #778, Codex r5); the second file
+/// Writes a two-file source tree. In `a.rs`, a workflow reaches a
+/// clock-reading first-party helper **in its own module**. `b.rs` is an
+/// unrelated clean file. One-hop resolution is same-module only, so the
+/// helper shares the workflow's module (issue #778). The second file
 /// exercises the multi-file `check_paths` index (dedup / shared scan).
 fn transitive_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -235,15 +235,15 @@ fn missing_path_is_a_read_error() {
     assert!(result.is_err(), "a missing path must surface a read error");
 }
 
-// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern
-// `det-check f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths`
-// still collects them into one shared index (dedup / robustness stand), but
-// one-hop resolution is same-module ONLY — so a helper defined in a DIFFERENT
-// file is deliberately NOT resolved (a documented safe false-negative). Never
-// resolving cross-module ends the r4/r5 false-positive family; for a CI gate a
-// false positive on innocent code is the worse outcome. #386 is body-only and
-// also misses these transitive skips; the backstop is runtime replay
-// (`WorkflowReplayer` / live `HistoryMatcher`) plus manual review, not #386.
+// BOUNDARY (issue #778): the changed-files CI pattern `det-check f1.rs f2.rs`
+// passes each file as a SEPARATE argument. `check_paths` still collects them
+// into one shared index (dedup / robustness stand). One-hop resolution is
+// same-module ONLY. So a helper in a DIFFERENT file is deliberately NOT
+// resolved, a documented safe false-negative. Never resolving cross-module
+// ends a family of false positives. For a CI gate, a false positive on
+// innocent code is the worse outcome. #386 is body-only and also misses these
+// transitive skips. The backstop is runtime replay (`WorkflowReplayer` / live
+// `HistoryMatcher`) plus manual review, not #386.
 #[test]
 fn two_separate_file_args_do_not_resolve_cross_file_transitive() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -277,8 +277,6 @@ pub fn shared_time() -> i64 {
     );
 }
 
-// FIX #3 (P2-2): overlapping arguments (a directory plus a file inside it) must
-// not double-count.
 #[test]
 fn overlapping_dir_and_file_args_do_not_double_count() {
     let dir = transitive_tree();
@@ -296,9 +294,8 @@ fn overlapping_dir_and_file_args_do_not_double_count() {
     );
 }
 
-// Codex P1 (issue #778): a `#[workflow]` declared inside a Rust module must be
-// scanned end to end — a module-scoped workflow with a direct hard-blocker must
-// trip the gate, not silently pass.
+// Issue #778: a `#[workflow]` declared inside a Rust module is scanned end to
+// end. A module-scoped workflow with a direct hard-blocker trips the gate.
 #[test]
 fn module_scoped_workflow_direct_violation_trips_the_gate() {
     let dir = tempfile::tempdir().expect("tempdir");

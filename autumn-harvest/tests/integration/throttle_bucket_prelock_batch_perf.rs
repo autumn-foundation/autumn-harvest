@@ -1,6 +1,4 @@
 #![cfg(feature = "db")]
-// Test-code style lints (consistent with throttle_tests.rs and the other perf
-// harnesses in this directory).
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 //! Ledger performance fix:
 //! `throttle::pre_lock_rate_limit_buckets_for_claimed_batch`'s per-bucket-key
@@ -157,8 +155,6 @@ async fn scalar_i64(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
         .expect("scalar query")
         .n
 }
-
-// ── Fixture seeding ──────────────────────────────────────────────────────
 
 /// A fully-refilled bucket: `tokens == burst`, so every claimed row is
 /// admissible regardless of the exact accrual formula.

@@ -1,9 +1,9 @@
 //! Metrics catalogue coverage tests.
 //!
 //! Verifies that every `METRIC_*` constant in the ADR-0001 §7 catalogue is
-//! reachable via the `MetricsRecorder` API, that label cardinality rules are
-//! enforced by construction (no `execution.id` on any metric), and that
-//! `record_dlq_entries` is included in the trait surface.
+//! reachable via the `MetricsRecorder` API. Construction enforces the label
+//! cardinality rules (no `execution.id` on any metric). The trait surface
+//! includes `record_dlq_entries`.
 //!
 //! These tests run without the `db` feature so they work on every platform
 //! and CI environment.
@@ -298,7 +298,7 @@ impl MetricsRecorder for RecordingMetrics {
     // ── Signal & update lifecycle counters (issue #684) ───────────────────
 
     fn record_signal_received(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        // Issue #684: no `name` label, because the send route is free-form.
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_SIGNAL_RECEIVED,
             labels: vec![
@@ -309,7 +309,7 @@ impl MetricsRecorder for RecordingMetrics {
     }
 
     fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        // Issue #684: no `name` label, because the send route is free-form.
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_SIGNAL_UNHANDLED,
             labels: vec![
@@ -561,12 +561,11 @@ fn cardinality_no_execution_id_label_on_any_metric() {
 #[test]
 fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     // Issue #684: the six signal/update lifecycle counters must be reachable
-    // via the trait with exactly the bounded label sets documented in
-    // telemetry.rs — execution.id is forbidden by construction (ADR-0001 §7).
-    // Scope note (mirrors saga_counters_...): the label keys asserted below
-    // belong to the RecordingMetrics test double, so this pins the trait's
-    // reachable surface; production label content is pinned by the
-    // metrics_rs_adapter bridge test and the context-level tests.
+    // via the trait with the bounded label sets in telemetry.rs. Construction
+    // forbids execution.id (ADR-0001 §7). The asserted label keys belong to
+    // the RecordingMetrics test double, so this pins the reachable surface.
+    // The metrics_rs_adapter bridge test and the context-level tests pin
+    // production label content.
     let rec = RecordingMetrics::default();
     rec.record_signal_received("wf", "default");
     rec.record_signal_unhandled("wf", "default");
@@ -578,13 +577,14 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
     let samples = rec.drain();
     assert_eq!(samples.len(), 6);
 
-    // Issue #684 (Codex P2): the signal counters AND update.admitted carry NO
-    // free-form `name` label — signal names come from the free-form send route,
-    // and admission happens at the free-form update route boundary before the
-    // name is resolved against a handler (declarative OR imperative), so neither
-    // can be bounded by construction. update.rejected/completed/failed keep the
-    // `name` label because it resolves against the registered/declared handler
-    // set (failed buckets an unregistered name to the __unregistered__ sentinel).
+    // Issue #684: the signal counters AND update.admitted carry NO free-form
+    // `name` label. Signal names come from the free-form send route. Admission
+    // happens at the free-form update route, before the name resolves against
+    // a handler (declarative OR imperative). So construction cannot bound
+    // either one.
+    // update.rejected/completed/failed keep `name`, because it resolves against
+    // the declared handler set. `failed` buckets an unregistered name to the
+    // __unregistered__ sentinel.
     let expected: &[(&str, &[&str])] = &[
         (METRIC_SIGNAL_RECEIVED, &["workflow", "queue"]),
         (METRIC_SIGNAL_UNHANDLED, &["workflow", "queue"]),
@@ -615,12 +615,12 @@ fn signal_update_lifecycle_counters_reachable_with_bounded_labels() {
 
 #[test]
 fn update_duration_histogram_reachable_with_bounded_labels() {
-    // Issue #781: the admit→terminal latency histogram must be reachable via the
-    // trait with exactly the bounded label set workflow/name/queue/outcome —
-    // execution.id is forbidden by construction (ADR-0001 §7). Scope note
-    // (mirrors saga/signal tests): the asserted keys belong to the
-    // RecordingMetrics test double; production label content is pinned by the
-    // metrics_rs_adapter bridge test.
+    // Issue #781: the admit→terminal latency histogram must be reachable via
+    // the trait with exactly the label set workflow/name/queue/outcome.
+    // Construction forbids execution.id (ADR-0001 §7). The asserted keys
+    // belong to the RecordingMetrics test double, so this pins only the
+    // reachable surface. The metrics_rs_adapter bridge test pins production
+    // label content.
     let rec = RecordingMetrics::default();
     rec.record_update_duration("wf", "set_priority", "default", "completed", 0.42);
     rec.record_update_duration("wf", "cancel", "default", "failed", 1.5);
@@ -728,10 +728,10 @@ fn schedule_skipped_reason_values_match_adr() {
 #[test]
 fn concurrency_superseded_counter_reachable_and_never_labeled_by_key() {
     // Issue #811: the latest-wins supersede counter must be reachable via the
-    // trait with exactly the workflow label. The concurrency key is resolved
-    // from workflow input (tenant/document ids) and is therefore unbounded --
-    // labeling by it would violate the ADR-0001 §7 cardinality rule, and the
-    // per-key view lives on `GET /admin/concurrency` instead.
+    // trait with exactly the workflow label. The concurrency key comes from
+    // workflow input (tenant/document ids), so it is unbounded. A label on it
+    // would break the ADR-0001 §7 cardinality rule. The per-key view lives on
+    // `GET /admin/concurrency`.
     let rec = RecordingMetrics::default();
     rec.record_concurrency_superseded("doc_index");
 
@@ -757,12 +757,12 @@ fn concurrency_superseded_counter_reachable_and_never_labeled_by_key() {
 #[test]
 fn concurrency_residual_over_limit_counter_reachable_and_never_labeled_by_key() {
     // Issue #1197, item 2: a nested self-referential `cancel_running`
-    // admission that cannot shed a protected in-flight run leaves its key
-    // transiently over its declared limit. This counter is the promotion of
-    // the pre-existing `tracing::warn!` in `concurrency::supersede_inner` to
-    // an alertable signal — same cardinality rule as its `superseded`
-    // sibling: the concurrency key is never a label, only the (bounded)
-    // workflow type name and the (small, `SUPERSEDE_SCAN_LIMIT`-bounded) gap.
+    // admission can fail to shed a protected in-flight run. Its key then
+    // stays over its declared limit for a time. This counter turns the
+    // `tracing::warn!` in `concurrency::supersede_inner` into an alertable
+    // signal. Its cardinality rule matches its `superseded` sibling. The
+    // concurrency key is never a label. The labels are the bounded workflow
+    // type name and the `SUPERSEDE_SCAN_LIMIT`-bounded gap.
     let rec = RecordingMetrics::default();
     rec.record_concurrency_residual_over_limit("doc_index", 1);
 
@@ -789,12 +789,11 @@ fn concurrency_residual_over_limit_counter_reachable_and_never_labeled_by_key() 
 #[test]
 fn saga_counters_reachable_and_never_labeled_by_execution_id() {
     // Issue #801: both saga counters must be reachable via the trait with
-    // exactly the workflow + queue labels — execution.id is forbidden by
-    // construction (ADR-0001 §7). Scope note (post-review): the label keys
-    // asserted below belong to the RecordingMetrics test double, so this
-    // test pins the trait's reachable surface, not production label content
-    // (which is pinned by the context-level label tests and the
-    // metrics_rs_adapter bridge test).
+    // exactly the workflow + queue labels. Construction forbids execution.id
+    // (ADR-0001 §7). The asserted label keys belong to the RecordingMetrics
+    // test double, so this test pins the reachable surface. The context-level
+    // label tests and the metrics_rs_adapter bridge test pin production
+    // label content.
     let rec = RecordingMetrics::default();
     rec.record_saga_compensated("book_trip", "payments");
     rec.record_saga_compensation_failed("book_trip", "payments");
@@ -854,12 +853,10 @@ fn noop_metrics_implements_all_catalogue_methods() {
 #[test]
 fn capability_miss_counter_reachable_with_bounded_labels() {
     // Issue #804 (AC5): the capability-miss counter must be reachable via the
-    // trait with exactly the bounded label set queue/task_type/outcome —
-    // execution.id is forbidden by construction (ADR-0001 §7). Scope note
-    // (mirrors the saga/signal/update tests above): the asserted keys belong to
-    // the RecordingMetrics test double, so this pins the trait's reachable
-    // surface; production label content is pinned by the metrics_rs_adapter
-    // bridge test.
+    // trait with exactly the label set queue/task_type/outcome. Construction
+    // forbids execution.id (ADR-0001 §7). The asserted keys belong to the
+    // RecordingMetrics test double, so this pins only the reachable surface.
+    // The metrics_rs_adapter bridge test pins production label content.
     let rec = RecordingMetrics::default();
     rec.record_task_capability_miss("email-workers", "workflow", "released");
     rec.record_task_capability_miss("email-workers", "activity", "escalated");
@@ -895,11 +892,10 @@ fn capability_miss_counter_reachable_with_bounded_labels() {
 #[test]
 fn activity_pause_actions_counter_reachable_with_bounded_labels() {
     // Issue #807: the pause/resume counter must be reachable via the trait with
-    // exactly the bounded label set activity/action — execution.id is forbidden
-    // by construction (ADR-0001 §7). Scope note (mirrors the capability-miss /
-    // saga / signal / update tests above): the asserted keys belong to the
-    // RecordingMetrics test double, so this pins the trait's reachable surface;
-    // production label content is pinned by the metrics_rs_adapter bridge test.
+    // exactly the label set activity/action. Construction forbids execution.id
+    // (ADR-0001 §7). The asserted keys belong to the RecordingMetrics test
+    // double, so this pins only the reachable surface. The metrics_rs_adapter
+    // bridge test pins production label content.
     let rec = RecordingMetrics::default();
     rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
     rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
@@ -917,9 +913,9 @@ fn activity_pause_actions_counter_reachable_with_bounded_labels() {
         );
     }
 
-    // A hold and a release must be separable on the counter: an operator
-    // graphing "how often is this lever pulled" needs to tell the two apart,
-    // and `increase(...)` over a merged series would be meaningless.
+    // A hold and a release must be separable on the counter. An operator who
+    // graphs "how often is this lever pulled" must tell them apart.
+    // `increase(...)` over a merged series means nothing.
     let actions: Vec<&str> = samples
         .iter()
         .map(|s| {

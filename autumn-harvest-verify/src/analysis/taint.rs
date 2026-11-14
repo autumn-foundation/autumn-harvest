@@ -1,24 +1,24 @@
 //! The taint lattice: facts, place-keyed state, aliasing and sanitizer kills (D4).
 //!
-//! A *fact* is one reason a place is non-deterministic: a kind
+//! A *fact* is one reason a place is non-deterministic. It holds a kind
 //! ([`TaintKind`]), the [`Site`] the taint started at, and the hop chain from
 //! the workflow entry to that site. Facts are deduplicated on
-//! `(kind, source function, source site)` and their hop chain is frozen the
-//! first time the fact reaches a place, which is what makes the fixpoint
-//! terminate: the fact *set* only grows, over a finite universe of sources, and
-//! a fact already present is never rewritten.
+//! `(kind, source function, source site)`. A fact's hop chain is frozen the
+//! first time the fact reaches a place. That makes the fixpoint terminate: the
+//! fact *set* only grows, over a finite universe of sources. A fact already
+//! present is never rewritten.
 //!
 //! # Read semantics (the rule the corpus pins)
 //!
-//! A read of place `P` is tainted when `P` itself, an **ancestor** of `P`
-//! (`_9` for `((_9 as Some).0).1`) or a **descendant** of `P` (`_3.0` when the
-//! whole tuple `_3` is read) carries a fact. The descendant direction is what
-//! makes `format!` work: the tainted `u64` is buried in a tuple that is then
-//! borrowed wholesale into `Arguments::new`.
+//! A read of place `P` is tainted when a fact is on `P` itself, on an
+//! **ancestor** of `P`, or on a **descendant** of `P`. `_9` is an ancestor of
+//! `((_9 as Some).0).1`. `_3.0` is a descendant when the whole tuple `_3` is
+//! read. The descendant direction makes `format!` work. The tainted `u64` is
+//! buried in a tuple that is then borrowed wholesale into `Arguments::new`.
 //!
 //! `discriminant(P)` is the single exception: it reads only `P` and its
 //! ancestors, never a descendant. Without that, every `async` body would be
-//! control-tainted the moment any workflow argument was — the coroutine's
+//! control-tainted as soon as any workflow argument was. The coroutine's
 //! resume-state switch reads `discriminant((*_8))` while the workflow's own
 //! locals live in `(*_8).1`, `(*_8).2`, ... .
 

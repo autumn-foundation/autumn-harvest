@@ -2,35 +2,27 @@
 //!
 //! Every management API route that consumes a raw `(key, value)` query-string
 //! pair list must reject a malformed percent-encoded byte sequence with a
-//! genuine `400` JSON error, never axum's built-in `Query<Vec<(String,
-//! String)>>` lossy fallback (silently substituting `U+FFFD` and returning
-//! `200` with a legitimate-looking but wrong filter value — see issue #774's
-//! original finding for `GET /admin/queue-coverage`, and issue #1151 for the
-//! sweep across the other 17 call sites that had the same gap).
+//! genuine `400` JSON error. It must never use axum's lossy
+//! `Query<Vec<(String, String)>>` fallback. That fallback substitutes `U+FFFD`
+//! and returns `200` with a wrong filter value. Issue #774 found it on
+//! `GET /admin/queue-coverage`. Issue #1151 swept the other 17 call sites.
 //!
-//! Every route fixed here decodes the raw query string as the very first
-//! statement in its handler body, *before* any path-parameter validation or
-//! database access (issue #1151 review: reordered so behavior does not
-//! depend on path validity) — so this suite needs no database, no
-//! testcontainer, and no admin session: a router built with no storage pool
-//! installed is enough to prove the malformed-query `400` fires before
-//! anything downstream would need one. `?queue_name=%FF` (an invalid
-//! standalone UTF-8 byte) is the exact repro from the issue #774 review
-//! comment.
+//! Every route here decodes the raw query string first in its handler body,
+//! *before* any path-parameter validation or database access (issue #1151).
+//! So behavior does not depend on path validity. This suite needs no database,
+//! no testcontainer and no admin session. A router with no storage pool proves
+//! that the malformed-query `400` fires first. `?queue_name=%FF` (an invalid
+//! standalone UTF-8 byte) is the exact repro from issue #774.
 //!
 //! The two "by-id" wrapper routes (`GET
 //! /workflows/by-id/{workflow_name}/{workflow_id}/result` and `.../children`)
-//! resolve the business id to an execution id (a real database lookup)
-//! *before* forwarding the raw query string unchanged to `get_workflow_result`
-//! / `list_workflow_children`. A first pass of this fix left the malformed-
-//! query check inside the delegate only, so a malformed query paired with an
-//! unresolvable business id (unknown workflow, or an unreachable shard) would
-//! surface the resolution failure (404/503) instead of the documented `400`,
-//! and would pay for a lookup on a request that was always going to be
-//! rejected (Codex review on PR #1334). Both wrappers now re-validate the raw
-//! query up front, before `resolve_workflow_by_business_id` runs, so they no
-//! longer need a database to prove the malformed-query `400` either -- both
-//! are included in the table below like every other route.
+//! resolve the business id with a database lookup. They then forward the raw
+//! query string to `get_workflow_result` / `list_workflow_children`. With the
+//! check only in the delegate, a malformed query and an unresolvable business
+//! id surfaced a 404/503, not the documented `400` (PR #1334). It also paid
+//! for a needless lookup. Both wrappers now re-validate the raw query before
+//! `resolve_workflow_by_business_id` runs. So the table below includes them,
+//! and they need no database either.
 
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
@@ -49,16 +41,15 @@ fn build_app() -> HarvestApiApp {
 
 /// Asserts a malformed-query `400` body carries the documented message.
 ///
-/// Every route's `400` body carries the same message text (asserted by field
-/// lookup, not full-body equality), but not in the same JSON shape: `GET
-/// /admin/queue-coverage` keeps its original, already-shipped `{"error":
-/// "..."}` shape (issue #774), while every other route -- whose *other*
-/// invalid-param `400`s are already `AutumnError`-shaped -- wraps the same
-/// message in `AutumnError`'s RFC-7807-flavored `{"detail": "...", ...}` body
-/// instead, so a route's malformed-query `400` never introduces a SECOND,
-/// inconsistent error shape alongside its own other `400`s (issue #1151
-/// review). See `strict_query.rs`'s `decode_or_bad_request` vs.
-/// `decode_or_autumn_error_response` doc comments for the full rationale.
+/// Every route's `400` body carries the same message text. The test asserts it
+/// by field lookup, not full-body equality, because the JSON shape differs.
+/// `GET /admin/queue-coverage` keeps its shipped `{"error": "..."}` shape
+/// (issue #774). Every other route already
+/// returns `AutumnError`-shaped `400`s. So it wraps the message in
+/// `AutumnError`'s RFC-7807-flavored `{"detail": "...", ...}` body. A route
+/// then never gets a SECOND error shape (issue #1151). See the
+/// `decode_or_bad_request` and `decode_or_autumn_error_response` doc comments
+/// in `strict_query.rs`.
 fn assert_malformed_query_body(name: &str, body: &Value) {
     let message = body
         .get("error")
@@ -85,11 +76,9 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-/// `(route template with a syntactically-arbitrary path segment already
-/// substituted in, human-readable name)`. The path segment value never
-/// matters for this suite — the malformed query 400 fires before any path
-/// validation runs — but each template still needs *a* value to produce a
-/// concrete, routable URI.
+/// `(human-readable name, route with an arbitrary path segment)`. The segment
+/// value never matters, because the malformed-query 400 fires before path
+/// validation. Each route still needs *a* value to form a routable URI.
 const MALFORMED_QUERY_ROUTES: &[(&str, &str)] = &[
     ("GET /workflows", "/workflows"),
     ("GET /workflows/summaries", "/workflows/summaries"),
@@ -156,10 +145,9 @@ async fn every_raw_pairs_route_400s_on_a_malformed_percent_encoded_value() {
 
 #[tokio::test]
 async fn every_raw_pairs_route_400s_on_a_malformed_percent_encoded_key() {
-    // The decode-before-parse ordering means a malformed byte sequence in
-    // *any* key -- including one a route's own filter type does not
-    // recognize -- is rejected up front, mirroring
-    // `queue_coverage_integration.rs`'s
+    // Decode comes before parse. So a malformed byte sequence in *any* key is
+    // rejected, even a key the route's filter type does not recognize. This
+    // mirrors `queue_coverage_integration.rs`'s
     // `malformed_percent_encoding_in_an_unknown_query_key_also_returns_400`.
     let app = build_app();
     for (name, path) in MALFORMED_QUERY_ROUTES {

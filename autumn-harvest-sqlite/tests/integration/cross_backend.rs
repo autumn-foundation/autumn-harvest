@@ -1,13 +1,13 @@
 //! Cross-backend replay guarantee (AC5).
 //!
 //! A history written by the `SQLite` backend replays cleanly on the core engine's
-//! own (Postgres-oriented) [`WorkflowReplayer`], because both backends serialize
-//! the *same* [`WorkflowEvent`] via `serde_json` in the shared adjacently-tagged
-//! form. The claim is **per-event encoding byte-identity + replay-equivalent
-//! event SETS**, not identical event streams: the Postgres engine additionally
-//! appends an `ActivityStarted` on claim that this backend never writes, and the
-//! two replay identically because `HistoryMatcher::scan_activity_terminal` skips
-//! `ActivityStarted` (exercised by the PG-shaped-history test below).
+//! own (Postgres-oriented) [`WorkflowReplayer`]. Both backends serialize the *same*
+//! [`WorkflowEvent`] with `serde_json` in the shared adjacently-tagged form. The
+//! claim is **per-event encoding byte-identity + replay-equivalent event SETS**,
+//! not identical event streams. The Postgres engine also appends an
+//! `ActivityStarted` on claim, which this backend never writes. The two replay the
+//! same because `HistoryMatcher::scan_activity_terminal` skips `ActivityStarted`.
+//! The PG-shaped-history test below exercises that.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -95,12 +95,11 @@ async fn each_event_json_roundtrips_byte_identically() {
 
     for event in &history {
         let once = serde_json::to_string(event).unwrap();
-        // Re-parse via the SAME adjacently-tagged `WorkflowEvent` derive the
-        // Postgres backend uses, and re-serialize: a stable, canonical encoding
-        // round-trips byte-identically. This is a *necessary condition* for
-        // cross-backend byte-identity given the shared derive — not a direct
-        // demonstration of identity against a PG-written stream (the golden
-        // assertion below pins one concrete encoding).
+        // Re-parse with the SAME adjacently-tagged `WorkflowEvent` derive that
+        // Postgres uses, and re-serialize. A canonical encoding round-trips
+        // byte-identically. That is a *necessary condition* for cross-backend
+        // byte-identity, not a proof against a PG-written stream. The golden
+        // assertion below pins one concrete encoding.
         let parsed: WorkflowEvent = serde_json::from_str(&once).unwrap();
         let twice = serde_json::to_string(&parsed).unwrap();
         assert_eq!(once, twice, "event JSON must be byte-stable: {once}");
@@ -113,11 +112,11 @@ async fn each_event_json_roundtrips_byte_identically() {
 
 // ── AC5: a concrete GOLDEN encoding — makes "byte-identical to the core" real ──
 //
-// `single_activity(3)` completes with output `6`. Its terminal `WorkflowCompleted`
-// event, as STORED by the SQLite backend, must equal this exact byte string — the
-// same bytes the Postgres backend's shared `WorkflowEvent` serde derive produces.
-// A concrete tripwire against an accidental core encoding change that a
-// self-round-trip test would not catch.
+// `single_activity(3)` completes with output `6`. The SQLite backend must STORE its
+// terminal `WorkflowCompleted` event as this exact byte string. The shared
+// `WorkflowEvent` serde derive of the Postgres backend produces the same bytes.
+// It is a tripwire for an accidental core encoding change that a self-round-trip
+// test would not catch.
 
 #[tokio::test]
 async fn stored_event_matches_golden_encoding() {
@@ -141,9 +140,9 @@ async fn stored_event_matches_golden_encoding() {
 // The Postgres engine appends an `ActivityStarted` on claim that this backend
 // never writes, so the two backends' event *streams* differ. They are
 // replay-equivalent because `HistoryMatcher::scan_activity_terminal` skips
-// `ActivityStarted`. This is proven directly against the core `WorkflowReplayer`
-// (in-memory — no SQLite import path needed): a PG-shaped history, including the
-// `ActivityStarted` this backend omits, replays cleanly.
+// `ActivityStarted`. The test proves it directly on the in-memory core
+// `WorkflowReplayer`. A PG-shaped history replays cleanly, including the
+// `ActivityStarted` that this backend omits.
 
 #[tokio::test]
 async fn pg_shaped_history_with_activity_started_is_replay_equivalent() {
@@ -234,15 +233,14 @@ async fn deterministic_side_effect_persists_and_replays_byte_identically() {
     assert_eq!(recorded_id.len(), 36, "the recorded UUID is a real v7 UUID");
 }
 
-// ── FIX C (Codex #1069): the real workflow_name reaches ctx.info() ─────────────
+// ── The real workflow_name reaches ctx.info() (issue #1069) ────────────────────
 //
-// A workflow that reads the documented replay-safe `ctx.info().workflow_type`
-// (issue #698) must observe the REAL registered handler name on this backend,
-// exactly as the Postgres worker (which injects it) does. The lighter core entry
-// point hard-codes an EMPTY workflow_name; driving through the caps-carrying entry
-// point with the real name populates `ctx.info().workflow_type`. This is a
-// cross-backend byte-identity concern: the value is recorded into an activity
-// input, so a divergent (empty) name would poison the shared-history guarantee.
+// A workflow that reads the replay-safe `ctx.info().workflow_type` (issue #698) must
+// see the REAL registered handler name. The Postgres worker injects it the same way.
+// The lighter core entry point hard-codes an EMPTY workflow_name. The caps-carrying
+// entry point passes the real name into `ctx.info().workflow_type`. This matters for
+// cross-backend byte-identity. An activity input records the value, so an empty name
+// would break the shared-history guarantee.
 
 #[workflow]
 async fn records_workflow_type(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
@@ -269,7 +267,7 @@ async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
         .unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
-    // The workflow observed its REAL registered type, NOT "" (FIX C; RED pre-fix).
+    // The workflow observed its REAL registered type, NOT "".
     assert!(
         matches!(state, RunState::Completed(ref v) if v == "records_workflow_type"),
         "ctx.info().workflow_type must be the real registered name, not empty, got {state:?}"
@@ -300,17 +298,15 @@ async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
     );
 }
 
-// ── FIX (Codex #1069 P2, runtime.rs:780): the real workflow_id reaches ctx.info() ──
+// ── The real workflow_id reaches ctx.info() (issue #1069) ──────────────────────────
 //
-// A workflow that reads the documented replay-safe `ctx.info().workflow_id` (issue
-// #698 — the run-scoped BUSINESS id, documented for minting idempotency keys) must
-// observe a NON-EMPTY, per-run-DISTINCT value on this backend, exactly as the
-// Postgres worker (which injects `StartWorkflowParams.workflow_id`) does. Pre-fix,
-// the drive path passed `span_meta = None`, so the core set `ctx.info().workflow_id`
-// to `""` for EVERY execution — collapsing all runs onto the same empty id and
-// silently diverging from Postgres on a documented core surface. The value is
-// routed through an activity input so it is recorded in history and must replay
-// byte-identically (the cross-backend byte-identity guarantee).
+// `ctx.info().workflow_id` is the replay-safe, run-scoped BUSINESS id (issue #698).
+// Its documented use is minting idempotency keys. A workflow must see a NON-EMPTY,
+// per-run-DISTINCT value, as on Postgres, which injects
+// `StartWorkflowParams.workflow_id`. The drive path once passed `span_meta = None`.
+// The core then set `ctx.info().workflow_id` to `""` for EVERY execution. All runs
+// collapsed onto one empty id, which silently diverged from Postgres. An activity
+// input carries the value, so history records it and it must replay byte-identically.
 
 #[workflow]
 async fn records_workflow_id(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
@@ -349,7 +345,7 @@ async fn workflow_id_is_never_empty_and_distinct_across_executions() {
     let id1 = v1.as_str().unwrap_or_default().to_string();
     let id2 = v2.as_str().unwrap_or_default().to_string();
 
-    // (a) never empty — RED pre-fix (both `""`).
+    // (a) never empty. The regression made both `""`.
     assert!(
         !id1.is_empty(),
         "workflow_id must never be empty, got e1={id1:?}"
@@ -358,8 +354,8 @@ async fn workflow_id_is_never_empty_and_distinct_across_executions() {
         !id2.is_empty(),
         "workflow_id must never be empty, got e2={id2:?}"
     );
-    // (c) distinct across distinct executions — RED pre-fix (both `""`, so equal →
-    // ALL runs would collapse onto one idempotency key).
+    // (c) distinct across distinct executions. Otherwise ALL runs collapse onto one
+    // idempotency key.
     assert_ne!(
         id1, id2,
         "distinct executions must observe distinct workflow_id (no collapse)"
@@ -409,11 +405,11 @@ async fn caller_supplied_workflow_id_is_observed_exactly_and_replays() {
         "the recorded activity input must carry the business workflow_id:\n{history:?}"
     );
 
-    // (b) Replay-stability: a core replay re-drives the recorded history across
-    // every cycle, threading the same business id; a per-cycle-varying workflow_id
-    // would diverge the recorded activity input and fail replay. The replayer sources
-    // `workflow_id` from the execution row (issue #698), so thread it explicitly —
-    // mirroring how the Postgres worker injects it.
+    // (b) Replay-stability: a core replay re-drives the recorded history in every
+    // cycle with the same business id. A workflow_id that varies per cycle would
+    // change the recorded activity input and fail replay. The replayer reads
+    // `workflow_id` from the execution row (issue #698). So pass it explicitly, as
+    // the Postgres worker injects it.
     let report = WorkflowReplayer::new()
         .register_fn("records_workflow_id", records_workflow_id_info().handler)
         .with_workflow_id("subscription-42")
@@ -425,14 +421,14 @@ async fn caller_supplied_workflow_id_is_observed_exactly_and_replays() {
     );
 }
 
-// ── FIX (Codex #1069 P2, runtime.rs:522): a NON-BLANK workflow_id is stored VERBATIM ──
+// ── A NON-BLANK workflow_id is stored VERBATIM (issue #1069) ─────────────────────────
 //
-// The rustdoc promises the workflow observes EXACTLY the caller-supplied id, and the
-// Postgres start path carries `workflow_id` verbatim. Pre-fix, the SQLite start path
-// TRIMMED a non-blank id before persisting it, so `"  tenant  "` was observed as
-// `"tenant"` — diverging from Postgres AND collapsing distinct external ids like
-// `"tenant"` and `"  tenant  "` onto one value. Trimming must be used ONLY for the
-// is-blank check; a blank/whitespace-only id still defaults to the exec-id string.
+// The rustdoc promises that the workflow sees EXACTLY the caller-supplied id. The
+// Postgres start path carries `workflow_id` verbatim. The SQLite start path once
+// TRIMMED a non-blank id before it persisted it. So `"  tenant  "` read as `"tenant"`.
+// That diverged from Postgres and collapsed distinct ids such as `"tenant"` and
+// `"  tenant  "` onto one value. Trimming is ONLY for the is-blank check. A
+// whitespace-only id still defaults to the exec-id string.
 #[tokio::test]
 async fn nonblank_workflow_id_is_stored_verbatim_not_trimmed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -442,8 +438,8 @@ async fn nonblank_workflow_id_is_stored_verbatim_not_trimmed() {
         ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
     );
 
-    // A non-blank id with surrounding whitespace must be observed VERBATIM — RED
-    // pre-fix (was trimmed to `"tenant"`).
+    // A non-blank id with surrounding whitespace must be observed VERBATIM, not
+    // trimmed to `"tenant"`.
     let padded = rt
         .start_workflow_with_id("records_workflow_id", "  tenant  ", json!(0))
         .unwrap();
@@ -493,16 +489,16 @@ async fn nonblank_workflow_id_is_stored_verbatim_not_trimmed() {
     );
 }
 
-// ── FIX 1 (Codex #1069 P2, runtime.rs:660): typed workflow failures preserve
-//    metadata and stay byte-equivalent to the Postgres path ─────────────────────
+// ── Typed workflow failures preserve metadata and stay byte-equivalent to the
+//    Postgres path (issue #1069) ─────────────────────────────────────────────────
 //
 // When a `#[workflow]` returns a typed `WorkflowFailure`, the macro shim encodes it
-// into a `harvest_workflow_failure_v1` envelope carried on the failure string. The
-// Postgres path DECODES that envelope and writes `WorkflowFailed` with
-// `error_type`/`details` (+ the human message), storing the human message in the
-// execution `error` column. Pre-fix this backend stored the RAW envelope and an
-// all-`None` untyped `WorkflowFailed`, losing the typed metadata and breaking the
-// crate's cross-backend byte-identity guarantee (AC5). This is RED pre-fix.
+// into a `harvest_workflow_failure_v1` envelope on the failure string. The Postgres
+// path DECODES that envelope. It writes `WorkflowFailed` with `error_type`, `details`
+// and the human message. It stores the human message in the execution `error` column.
+// This backend once stored the RAW envelope and an all-`None` untyped `WorkflowFailed`.
+// That lost the typed metadata and broke the cross-backend byte-identity guarantee
+// (AC5).
 
 #[workflow]
 async fn typed_failure_workflow(ctx: &WorkflowContext, _n: i64) -> Result<i64, WorkflowFailure> {
@@ -522,8 +518,8 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
         .start_workflow("typed_failure_workflow", json!(0))
         .unwrap();
 
-    // The run fails, and the SURFACED failure is the HUMAN message — not the raw
-    // wire envelope (RED pre-fix: the surfaced value was the whole envelope).
+    // The run fails, and the SURFACED failure is the HUMAN message, not the raw wire
+    // envelope.
     let state = rt.run_until_blocked(exec).await.unwrap();
     let RunState::Failed(msg) = state else {
         panic!("expected a Failed terminal state, got {state:?}");
@@ -546,10 +542,9 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
         other => panic!("expected a Failed outcome, got {other:?}"),
     }
 
-    // The stored `WorkflowFailed` event carries the DECODED typed fields, exactly as
-    // the Postgres path's `workflow_failed_typed` does — NOT an all-`None` untyped
-    // event (RED pre-fix: `error_type`/`details` were `None` and `error` was the
-    // raw envelope).
+    // The stored `WorkflowFailed` event carries the DECODED typed fields, as the
+    // Postgres `workflow_failed_typed` does. It is NOT an all-`None` untyped event
+    // with the raw envelope as `error`.
     let history = rt.load_history(exec).unwrap();
     let (error, error_type, details, non_retryable) = history
         .iter()
@@ -588,10 +583,10 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
         "the typed non_retryable flag must be preserved (RED pre-fix: None)"
     );
 
-    // AC5: the typed-failure history replays cleanly on the core engine — the
-    // handler deterministically re-fails (`WorkflowFailed`, the replayer's clean
-    // terminal for a failing workflow), with NO non-determinism divergence. The
-    // stored typed `WorkflowFailed` event is consistent with re-running the handler.
+    // AC5: the typed-failure history replays cleanly on the core engine. The
+    // handler re-fails deterministically with `WorkflowFailed`, the replayer's clean
+    // terminal for a failing workflow. There is NO non-determinism divergence. The
+    // stored typed `WorkflowFailed` event matches a re-run of the handler.
     let report = WorkflowReplayer::new()
         .register_fn(
             "typed_failure_workflow",
@@ -599,10 +594,10 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
         )
         .replay_from_events(history)
         .await;
-    // Issue #952: a history ending in a terminal `WorkflowFailed` that replays to
-    // the same failure is a CLEAN replay (`ReplaySucceeded`), and the reproduced
-    // error is read through `failure_message()`. The property under test is
-    // unchanged: no non-determinism divergence, and the typed failure reproduced.
+    // Issue #952: a history that ends in `WorkflowFailed` and replays to the same
+    // failure is a CLEAN replay (`ReplaySucceeded`). `failure_message()` reads the
+    // reproduced error. The property under test: no non-determinism divergence, and
+    // the typed failure is reproduced.
     assert!(
         !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a typed-workflow-failure history must replay without drift on the core \
@@ -614,9 +609,9 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
     );
 }
 
-// A legacy untyped `Err(String)` still stores its message unchanged (all typed
-// fields `None`) — the decode's back-compat path, so the fix does not regress the
-// common untyped failure.
+// A legacy untyped `Err(String)` still stores its message unchanged, with all typed
+// fields `None`. That is the back-compat path of the decode. It shows that the fix
+// does not regress the common untyped failure.
 #[workflow]
 async fn untyped_failure_workflow(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     let _ = ctx.info();
@@ -657,23 +652,20 @@ async fn untyped_workflow_failure_is_unchanged() {
     assert_eq!(*non_retryable, None);
 }
 
-// ── Codex #1069 P2 (`worker.rs:119`): caught activity panics carry the typed ─────
-//    `HandlerPanic` envelope, not a plain string ──────────────────────────────────
+// ── Caught activity panics carry the typed `HandlerPanic` envelope, not a plain ─────
+//    string (issue #1069) ───────────────────────────────────────────────────────────
 //
-// A registered activity that `panic!()`s is contained (issue #782 analog) and
-// routed through the crate's NORMAL retryable-failure path. Pre-fix the panic was
-// converted to a PLAIN string `"activity panicked: …"`, so it was the one
-// activity-failure that skipped the typed-envelope treatment the ordinary
-// `Err(String)` path now gets: the terminal `ActivityFailed` recorded
-// `error_type = "Error"` (RED here in `(a)`), and a retry policy marking
-// `HandlerPanic` non-retryable never matched, retrying the panic to exhaustion
-// (RED here in `(b)`). The fix encodes the caught panic as the typed
-// `harvest_activity_failure_v1` envelope carrying `error_type = "HandlerPanic"`,
-// byte-equivalent to the Postgres worker's caught-panic path.
+// A registered activity that `panic!()`s is contained (as in issue #782). It goes
+// through the crate's NORMAL retryable-failure path. The panic was once a PLAIN
+// string `"activity panicked: …"`. It skipped the typed envelope of the ordinary
+// `Err(String)` path. So the terminal `ActivityFailed` recorded `error_type = "Error"`
+// (test `(a)`). A retry policy that marks `HandlerPanic` non-retryable never matched,
+// and the panic retried to exhaustion (test `(b)`). The caught panic is now the typed
+// `harvest_activity_failure_v1` envelope with `error_type = "HandlerPanic"`. That
+// matches the caught-panic path of the Postgres worker byte for byte.
 
-// A workflow that CATCHES the activity failure and completes, so the run — and the
-// replay of its history on the core engine — reaches a clean terminal
-// `WorkflowCompleted` (`ReplaySucceeded`).
+// A workflow that CATCHES the activity failure and completes. The run and its core
+// replay both reach a clean terminal `WorkflowCompleted` (`ReplaySucceeded`).
 #[workflow]
 async fn catches_activity_panic(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
     match ctx
@@ -685,9 +677,9 @@ async fn catches_activity_panic(ctx: &WorkflowContext, _n: i64) -> Result<String
     }
 }
 
-// RED pre-fix: the terminal `ActivityFailed` recorded `error_type = "Error"` and
-// the raw `"activity panicked: …"` string, losing the `HandlerPanic` class the
-// Postgres worker records and breaking cross-backend byte-identity.
+// Regression: the terminal `ActivityFailed` recorded `error_type = "Error"` and the
+// raw `"activity panicked: …"` string. That lost the `HandlerPanic` class that the
+// Postgres worker records, and broke cross-backend byte-identity.
 #[tokio::test]
 async fn caught_activity_panic_records_handler_panic_error_type_and_replays() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -713,9 +705,9 @@ async fn caught_activity_panic_records_handler_panic_error_type_and_replays() {
         "the workflow catches the activity failure and completes, got {state:?}"
     );
 
-    // The terminal `ActivityFailed` carries the DECODED typed `HandlerPanic` class
-    // (not `"Error"`), the raw panic message is preserved, and there is no raw
-    // envelope leaking into the human message.
+    // The terminal `ActivityFailed` carries the DECODED `HandlerPanic` class, not
+    // `"Error"`. The raw panic message stays, and no raw envelope leaks into the
+    // human message.
     let history = rt.load_history(exec).unwrap();
     let mut failed = history.iter().filter_map(|e| match e {
         WorkflowEvent::ActivityFailed {
@@ -772,9 +764,8 @@ fn handler_panic_non_retryable_policy() -> RetryPolicy {
     }
 }
 
-// The per-call retry policy is carried on the typed `execute_activity(&info, ...)`
-// command (`retry_policy_override`) and persisted on the task row, so the worker's
-// failure classifier can see it.
+// The typed `execute_activity(&info, ...)` command carries the per-call retry policy
+// (`retry_policy_override`). The task row persists it for the failure classifier.
 #[activity(retry = handler_panic_non_retryable_policy())]
 async fn panicky_typed(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
@@ -789,12 +780,11 @@ async fn calls_panicky_typed(ctx: &WorkflowContext, n: i64) -> Result<i64, Strin
     Ok(out)
 }
 
-// RED pre-fix: a caught panic was a plain string with no typed `error_type`, so the
-// policy's `non_retryable_errors = ["HandlerPanic"]` never matched (it compares
-// against `error_type` OR the raw string). The panic was therefore retried to
-// `max_attempts` (3 body runs) and the terminal event recorded `error_type =
-// "Error"`. GREEN: the typed envelope carries `error_type = "HandlerPanic"`, the
-// policy matches, and the task fails terminally after ONE attempt.
+// Regression: a caught panic was a plain string with no typed `error_type`. So
+// `non_retryable_errors = ["HandlerPanic"]` never matched. It compares against
+// `error_type` OR the raw string. The panic retried to `max_attempts` (3 body runs),
+// and the terminal event recorded `error_type = "Error"`. Now the envelope carries
+// `error_type = "HandlerPanic"`, the policy matches, and ONE attempt fails terminally.
 #[tokio::test]
 async fn caught_activity_panic_honors_handler_panic_non_retryable_policy() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -802,9 +792,9 @@ async fn caught_activity_panic_honors_handler_panic_non_retryable_policy() {
     let body_calls = calls.clone();
 
     rt.register_workflow(&calls_panicky_typed_info());
-    // The registered spec allows 3 attempts; only the policy's non-retryable
-    // classification stops the retries — so pre-fix (no typed error_type) this body
-    // ran 3 times.
+    // The registered spec allows 3 attempts. Only the policy's non-retryable
+    // classification stops the retries. Without a typed error_type, the body ran
+    // 3 times.
     rt.register_activity_raw(
         "panicky_typed",
         ActivitySpec::new(3, move |_input: serde_json::Value| {

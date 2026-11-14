@@ -1,20 +1,22 @@
 //! Tests for issue #612 — serving query handlers on terminal (closed) workflows
 //! for post-mortem state inspection.
 //!
-//! These are **pure** tests (no DB, no testcontainers): they exercise the
-//! reusable, read-only replay driver `executor::drive_query_replay`, the pure
-//! terminal-query classifier `executor::classify_terminal_query` +
-//! `executor::history_reached_terminal_seal`, and the O(1) erasure row-check
-//! `erase::execution_input_is_erased` — the pieces the plugin's
-//! `hydrate_ctx_for_query` composes to decide, for a terminal execution, whether
-//! to serve a query (200), report an unregistered name (404), report an
-//! unqueryable history (410), or report a spinning replay (408).
+//! These are **pure** tests (no DB, no testcontainers). They exercise the
+//! pieces that the plugin's `hydrate_ctx_for_query` composes for a terminal
+//! execution:
 //!
-//! Crucially, a run the engine seals while its function is parked mid-command
-//! (`TIMED_OUT`, `CONTINUED_AS_NEW`, mid-await `CANCELLED`/`FAILED`) replays to
-//! a `Suspended` outcome, **not** `Poll::Ready` — yet its history carries a
-//! terminal lifecycle event, so it must still serve 200, not 410. These tests
-//! pin exactly that.
+//! - the read-only replay driver `executor::drive_query_replay`;
+//! - the classifier `executor::classify_terminal_query` and
+//!   `executor::history_reached_terminal_seal`;
+//! - the O(1) erasure row check `erase::execution_input_is_erased`.
+//!
+//! Together they decide between serve (200), unregistered name (404),
+//! unqueryable history (410) and spinning replay (408).
+//!
+//! A run can be sealed while its function is parked mid-command (`TIMED_OUT`,
+//! `CONTINUED_AS_NEW`, mid-await `CANCELLED`/`FAILED`). It replays to
+//! `Suspended`, **not** `Poll::Ready`. Yet its history carries a terminal
+//! lifecycle event, so it must still serve 200, not 410. These tests pin that.
 //!
 //! The HTTP status mapping (200/404/410/408) and the zero-writes guarantee are
 //! covered by `autumn-harvest-plugin/tests/query_integration.rs` (testcontainers,
@@ -79,11 +81,10 @@ fn progress_workflow<'a>(
     })
 }
 
-/// Like [`progress_workflow`], but instead of returning it calls
-/// `ctx.continue_as_new(...)` after processing every item. `continue_as_new`
-/// parks the function forever (it never returns), so driving this workflow
-/// always classifies as `Suspended` — even though the run is terminal
-/// (`CONTINUED_AS_NEW`) and its history carries the terminal seal.
+/// Like [`progress_workflow`], but it calls `ctx.continue_as_new(...)` after
+/// processing every item. `continue_as_new` never returns, so the drive always
+/// classifies as `Suspended`. The run is still terminal (`CONTINUED_AS_NEW`),
+/// and its history carries the terminal seal.
 fn continue_as_new_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -126,14 +127,16 @@ fn construction_panicking_query_workflow<'a>(
     panic!("boom constructing query workflow future");
 }
 
-/// Like [`progress_workflow`], but after processing every item it parks on
-/// `ctx.await_condition(|| false)` — a **command-less cold park**: its
-/// `Future::poll` returns `Pending` without pushing any workflow command and
-/// **without registering the waker** (it ignores `_cx`), so it never self-wakes.
-/// This is the exact case the three-way suspension discriminator (issue #612)
-/// must classify as an immediate `Suspended` (case 3), *not* busy-drive to the
-/// deadline: a RUNNING query over such a park must serve fast, and a terminal run
-/// sealed while parked on it must serve its partial state (200), not 408/410.
+/// Like [`progress_workflow`], but after every item it parks on
+/// `ctx.await_condition(|| false)`.
+///
+/// This is a **command-less cold park**. Its `Future::poll` returns `Pending`
+/// and pushes no workflow command. It ignores `_cx`, so it **registers no
+/// waker** and never self-wakes. The three-way suspension discriminator
+/// (issue #612) must classify it as an immediate `Suspended` (case 3). It must
+/// not busy-drive to the deadline. A RUNNING query over such a park must serve
+/// fast. A terminal run sealed while parked on it must serve its partial state
+/// (200), not 408 or 410.
 fn await_condition_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -167,12 +170,13 @@ fn await_condition_workflow<'a>(
     })
 }
 
-/// A workflow that spins forever via `tokio::task::yield_now()` — the in-runtime
-/// case the old waker-only heuristic misclassified. Inside a tokio runtime
-/// `yield_now` DEFERS its wake to the scheduler queue, so the async driver
-/// ([`drive_query_replay_async`]) must open its quiet window to observe the wake
-/// and keep driving to the deadline (case 2 → `TimedOut` → 408), rather than
-/// misread the first `Poll::Pending` as a suspension.
+/// A workflow that spins forever via `tokio::task::yield_now()`.
+///
+/// The old waker-only heuristic misclassified this in-runtime case. Inside a
+/// tokio runtime, `yield_now` DEFERS its wake to the scheduler queue. So the
+/// async driver ([`drive_query_replay_async`]) must open its quiet window to
+/// observe the wake. It then keeps driving to the deadline (case 2 →
+/// `TimedOut` → 408). It must not read the first `Poll::Pending` as a suspension.
 fn spinning_query_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -263,12 +267,12 @@ fn continued_as_new_history(items: &[&str]) -> (ExecutionId, Value, Vec<Workflow
     (exec_id, input, events)
 }
 
-/// A history the engine sealed while a workflow was parked mid-activity: full
-/// pairs for `completed`, then a bare `ActivityScheduled` for `pending` (no
-/// completion), then the `seal` terminal event. Driving `progress_workflow` with
-/// `items = completed ++ [pending]` processes `completed` (counter =
-/// `completed.len()`), then parks on the incomplete activity (→ `Suspended`),
-/// so the reconstructed partial count is `completed.len()`.
+/// A history the engine sealed while a workflow was parked mid-activity.
+///
+/// It holds full pairs for `completed`, a bare `ActivityScheduled` for
+/// `pending`, then the `seal` terminal event. `progress_workflow` with
+/// `items = completed ++ [pending]` processes `completed`, then parks on the
+/// incomplete activity (→ `Suspended`). The partial count is `completed.len()`.
 fn sealed_mid_activity_history(
     completed: &[&str],
     pending: &str,
@@ -342,12 +346,12 @@ fn completed_history_drives_to_terminal_and_query_reports_final_count() {
 
 #[test]
 fn construction_phase_panic_during_query_replay_is_contained() {
-    // Issue #782 / PR #1012 review: a hand-written handler that panics while
-    // *constructing* its future (before returning the boxed future) must be
-    // contained by the read-only query driver as `Panicked`, not unwind the
-    // caller (the plugin's query handler / axum request task). The poll-time
-    // `catch_unwind` cannot reach a construction panic — the construction call is
-    // wrapped too.
+    // Issue #782 (PR #1012). A hand-written handler can panic while it
+    // *constructs* its future, before it returns the boxed future. The query
+    // driver must contain that panic as `Panicked`. It must not unwind the
+    // caller (the plugin's query handler or axum request task). The
+    // poll-time `catch_unwind` cannot reach a construction panic, so the
+    // construction call is wrapped too.
     let (exec_id, input, events) = complete_history(&["a"], false);
     let ctx = build_ctx(exec_id, events);
 
@@ -390,10 +394,10 @@ fn failed_terminal_history_serves_internal_state_not_the_error() {
 
 #[test]
 fn truncated_history_with_no_seal_classifies_as_history_unavailable() {
-    // Expected 3 items, only 1 activity pair recorded AND no terminal lifecycle
-    // event → the history was genuinely truncated (pruned by retention / released
-    // on reset). Drive suspends, the seal check is false, so the terminal-query
-    // classifier returns HistoryUnavailable (→ 410).
+    // 3 items expected, 1 activity pair recorded, no terminal lifecycle event.
+    // Retention pruned the history, or a reset released it. The drive suspends
+    // and the seal check is false, so the classifier returns
+    // HistoryUnavailable (→ 410).
     let (exec_id, input, events) = insufficient_history(&["a", "b", "c"], 1);
     let sealed = history_reached_terminal_seal(&events);
     assert!(
@@ -413,9 +417,9 @@ fn truncated_history_with_no_seal_classifies_as_history_unavailable() {
 
 #[test]
 fn continued_as_new_sealed_history_serves_partial_state_not_gone() {
-    // continue_as_new parks the function forever → Suspended, but the recorded
-    // history ends with WorkflowContinuedAsNew (a terminal seal), so the query
-    // must serve the reconstructed partial state (200), NEVER 410.
+    // continue_as_new parks the function forever → Suspended. The history ends
+    // with WorkflowContinuedAsNew, a terminal seal. So the query must serve the
+    // partial state (200), NEVER 410.
     let (exec_id, input, events) = continued_as_new_history(&["a", "b"]);
     let sealed = history_reached_terminal_seal(&events);
     assert!(sealed, "a WorkflowContinuedAsNew history is sealed");
@@ -537,9 +541,8 @@ fn unregistered_query_on_terminal_is_not_found() {
 #[test]
 fn running_partial_history_still_serves_query_without_error() {
     // Regression guard: the running-workflow path stops at first suspension and
-    // serves the current partial state. A Suspended outcome must NOT prevent the
-    // ctx from answering the query (that is what the running path relies on, and
-    // it must never be turned into a 410).
+    // serves the current partial state. The running path relies on a Suspended
+    // ctx that still answers the query. It must never become a 410.
     let (exec_id, input, events) = insufficient_history(&["a", "b", "c"], 2);
     let ctx = build_ctx(exec_id, events);
 
@@ -560,14 +563,13 @@ fn running_partial_history_still_serves_query_without_error() {
 #[test]
 fn running_await_condition_park_suspends_fast_and_serves_partial_state() {
     // Issue #612 core bug proof (RED against the old `any_pending_command` guard).
-    // A RUNNING workflow that processed all its recorded activities and then
-    // parked on `ctx.await_condition(|| false)` — a COMMAND-LESS COLD PARK: it
-    // pushes no workflow command and never registers its waker, so nothing
-    // re-polls it during a query drive. The three-way discriminator must classify
-    // it as an immediate `Suspended` (case 3) so the query serves the partial
-    // state FAST, rather than busy-driving to `query_timeout` (which the old
-    // `!flag && any_pending_command(...)` guard did: no command was ever pushed,
-    // so the peek was false, and the drive fell to the deadline).
+    // A RUNNING workflow consumes all its recorded activities, then parks on
+    // `ctx.await_condition(|| false)`. That is a COMMAND-LESS COLD PARK: no
+    // command, no registered waker, so nothing re-polls it during a query drive.
+    // The three-way discriminator must classify it as an immediate `Suspended`
+    // (case 3), so the query serves the partial state FAST. The old
+    // `!flag && any_pending_command(...)` guard busy-drove to `query_timeout`
+    // instead. No command was pushed, so its peek was false.
     let (exec_id, input, events) = complete_history(&["a", "b", "c"], false);
     assert!(
         !history_reached_terminal_seal(&events),
@@ -606,13 +608,12 @@ fn running_await_condition_park_suspends_fast_and_serves_partial_state() {
 
 #[test]
 fn terminal_sealed_while_await_condition_parked_serves_partial_state() {
-    // Issue #612: a run the engine sealed (TIMED_OUT) while its function was
-    // parked command-less on `await_condition`. The drive parks at
-    // await_condition → Suspended, but the history carries a terminal lifecycle
-    // seal and all non-lifecycle history is consumed, so the terminal-query
-    // classifier must Serve (200) the reconstructed partial state — NOT 408
-    // (which the old any_pending_command guard produced by driving to the
-    // deadline) and NOT 410.
+    // Issue #612: the engine sealed this run (TIMED_OUT) while its function was
+    // parked command-less on `await_condition`. The drive parks there →
+    // Suspended. The history carries a terminal lifecycle seal, and all
+    // non-lifecycle history is consumed. So the classifier must Serve (200) the
+    // partial state. It must not return 410. It must not return 408, which the
+    // old any_pending_command guard produced by driving to the deadline.
     let (exec_id, input, mut events) = complete_history(&["a", "b"], false);
     events.push(WorkflowEvent::WorkflowExecutionTimedOut {
         deadline: Utc::now() - ChronoDuration::seconds(1),
@@ -644,9 +645,9 @@ fn terminal_sealed_while_await_condition_parked_serves_partial_state() {
 #[test]
 fn genuine_command_suspension_serves_partial_state() {
     // Case 1 of the three-way discriminator: the workflow parks on an UNRECORDED
-    // activity, which pushes a replay-significant command on THAT poll (a positive
-    // per-poll command delta). This must classify Suspended and remain answerable
-    // — distinct from the zero-delta cold-park (case 3) and spin (case 2) paths.
+    // activity. That pushes a replay-significant command on THAT poll, a positive
+    // per-poll command delta. This must classify Suspended and remain answerable.
+    // It differs from the zero-delta cold park (case 3) and spin (case 2) paths.
     let (exec_id, input, events) = insufficient_history(&["a", "b", "c"], 1);
     let ctx = build_ctx(exec_id, events);
 
@@ -666,11 +667,11 @@ fn genuine_command_suspension_serves_partial_state() {
 #[tokio::test]
 async fn async_driver_await_condition_cold_park_classifies_suspended_in_runtime() {
     // Async-driver counterpart to the sync cold-park test, run INSIDE a tokio
-    // runtime. `drive_query_replay_async` opens a `yield_now().await` quiet window
-    // on a zero-delta poll to observe tokio's deferred `yield_now` wake; a
-    // command-less `await_condition` park never wakes, so after the quiet window
-    // the flag is still cold → case 3 → Suspended immediately (fast serve), NOT
-    // misread as a self-wake spin.
+    // runtime. On a zero-delta poll, `drive_query_replay_async` opens a
+    // `yield_now().await` quiet window to observe a deferred `yield_now` wake. A
+    // command-less `await_condition` park never wakes. After the quiet window the
+    // flag is still cold → case 3 → Suspended at once (fast serve). The driver
+    // must not read it as a self-wake spin.
     let (exec_id, input, events) = complete_history(&["a", "b"], false);
     let ctx = build_ctx(exec_id, events);
 
@@ -686,19 +687,19 @@ async fn async_driver_await_condition_cold_park_classifies_suspended_in_runtime(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_driver_in_runtime_yield_now_spin_drives_to_deadline() {
-    // The exact in-runtime scenario the old waker-only PR-D heuristic got wrong,
-    // now covered WITHOUT testcontainers. `spinning_query_workflow` loops on
+    // The old waker-only PR-D heuristic got this in-runtime case wrong. This test
+    // covers it WITHOUT testcontainers. `spinning_query_workflow` loops on
     // `tokio::task::yield_now()`, whose wake tokio DEFERS to the scheduler queue
-    // inside a runtime. The async driver's quiet-window `yield_now().await`
-    // flushes that deferred queue → the flag flips → case 2 → keep driving to the
-    // deadline → TimedOut (→ 408). A `multi_thread` runtime also makes the drive
-    // future's `Send`-ness a compile-time regression guard.
+    // inside a runtime. The quiet-window `yield_now().await` flushes that queue.
+    // The flag flips → case 2 → drive to the deadline → TimedOut (→ 408). A
+    // `multi_thread` runtime also makes the drive future's `Send`-ness a
+    // compile-time regression guard.
     let (exec_id, input, events) = complete_history(&["a"], false);
     let ctx = build_ctx(exec_id, events);
 
-    // A small budget bounds the spin; the driver re-checks the deadline at the
-    // top of each cycle and yields the runtime between polls, so it never hangs
-    // or starves other tasks.
+    // A small budget bounds the spin. The driver re-checks the deadline in each
+    // cycle and yields the runtime between polls. So it never hangs or starves
+    // other tasks.
     let outcome = drive_query_replay_async(
         &ctx,
         spinning_query_workflow,
@@ -716,13 +717,12 @@ async fn async_driver_in_runtime_yield_now_spin_drives_to_deadline() {
 
 #[test]
 fn code_drift_reaching_terminal_early_with_unconsumed_history_is_gone() {
-    // Codex P2 (PR #986 follow-up): the recorded history was produced by code
-    // that ran THREE activities, but the handler driving replay now completes
-    // after only ONE (a code change / drift since the run executed). The drive
-    // reaches Poll::Ready (ReachedTerminal) while two recorded activity pairs
-    // remain unconsumed — the reconstructed state does NOT correspond to what
-    // actually happened, so the terminal-query classifier must return
-    // HistoryUnavailable (→ 410), never a misleading partial answer.
+    // PR #986 follow-up: the recorded run ran THREE activities. The replaying
+    // handler now completes after only ONE, because the code drifted since the
+    // run. The drive reaches Poll::Ready (ReachedTerminal) with two recorded
+    // activity pairs unconsumed. The reconstructed state does NOT match what
+    // happened. So the classifier must return HistoryUnavailable (→ 410), never a
+    // misleading partial answer.
     let (exec_id, _recorded_input, events) = complete_history(&["a", "b", "c"], false);
     let sealed = history_reached_terminal_seal(&events);
     assert!(
@@ -754,12 +754,11 @@ fn code_drift_reaching_terminal_early_with_unconsumed_history_is_gone() {
 
 #[test]
 fn completed_history_fully_consumed_still_serves() {
-    // AC2 non-regression: a faithfully-replayed completed run drives to
-    // Poll::Ready with NO unconsumed non-lifecycle history — the trailing
-    // WorkflowCompleted seal is excluded by has_non_lifecycle_unconsumed — so the
-    // drift gate does not fire and the query still Serves (200). This is the
-    // "trailing-lifecycle exclusion is why a truthfully-replayed sealed run still
-    // Serves" property the drift gate must not break.
+    // AC2 non-regression: a faithfully replayed completed run drives to
+    // Poll::Ready with NO unconsumed non-lifecycle history. The
+    // has_non_lifecycle_unconsumed check excludes the trailing WorkflowCompleted
+    // seal. So the drift gate does not fire, and the query still Serves (200).
+    // The drift gate must keep this trailing-lifecycle exclusion.
     let (exec_id, input, mut events) = complete_history(&["a", "b", "c"], false);
     events.push(WorkflowEvent::WorkflowCompleted {
         output: json!({ "processed": 3 }),
@@ -785,16 +784,15 @@ fn completed_history_fully_consumed_still_serves() {
 
 #[test]
 fn erased_execution_row_is_detected() {
-    // A clean execution-row input is not flagged.
     let clean_input = workflow_input(&["a", "b"], false);
     assert!(
         !erase::execution_input_is_erased(&clean_input),
         "a non-erased row input must not be flagged as erased"
     );
 
-    // `erase_workflow_payloads` always tombstones the row's own `input` column
-    // to exactly this value — the O(1) authoritative signal a terminal query
-    // uses to return 410 rather than replay a tombstoned history.
+    // `erase_workflow_payloads` always sets the row's own `input` column to
+    // exactly this tombstone. A terminal query uses it as the O(1) authoritative
+    // signal to return 410 rather than replay a tombstoned history.
     let erased_input = erase::erasure_tombstone();
     assert!(
         erase::execution_input_is_erased(&erased_input),
@@ -803,12 +801,13 @@ fn erased_execution_row_is_detected() {
     );
 }
 
-/// A workflow that registers a **push-based signal handler** (issue #546) plus a
-/// query reporting the handler's mutated state, and then completes with **no**
-/// further cursor-advancing call (no activity / timer / signal wait). Because
-/// nothing advances the matcher cursor after registration, no `match_history`
-/// post-hook pump fires during the drive — the recorded `SignalReceived` is only
-/// consumed by the end-of-cycle signal-handler flush.
+/// A workflow with a **push-based signal handler** (issue #546) and a query that
+/// reports the handler's state.
+///
+/// It completes with **no** further cursor-advancing call (activity, timer or
+/// signal wait). So no `match_history` post-hook pump fires during the drive.
+/// Only the end-of-cycle signal-handler flush consumes the recorded
+/// `SignalReceived`.
 fn signal_handler_only_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -830,13 +829,12 @@ fn signal_handler_only_workflow<'a>(
 
 #[test]
 fn signal_handler_completed_run_serves_not_gone() {
-    // Codex P2 (PR #993): a terminal/COMPLETED run that registered a push signal
-    // handler, received a `SignalReceived`, and completed WITHOUT any further
-    // cursor-advancing call. `drive_query_replay` must mirror the executor's
-    // completion-time signal-handler flush so the recorded signal is claimed
-    // before the caller's `history_has_unconsumed_events()` drift check — a
-    // truthfully replayed run must classify as Serve (200), never
-    // HistoryUnavailable (410).
+    // PR #993: a COMPLETED run registered a push signal handler, received a
+    // `SignalReceived`, and completed WITHOUT another cursor-advancing call.
+    // `drive_query_replay` must mirror the executor's completion-time
+    // signal-handler flush. That claims the recorded signal before the caller's
+    // `history_has_unconsumed_events()` drift check. A truthfully replayed run
+    // must classify as Serve (200), never HistoryUnavailable (410).
     //
     // Before the fix: the drive returned ReachedTerminal with the `SignalReceived`
     // still unconsumed, so `history_has_unconsumed_events()` was true and the
@@ -887,19 +885,18 @@ fn signal_handler_completed_run_serves_not_gone() {
     );
 }
 
-// ── Issue #772 (round 6): deadline-aware continue-as-new × query replay ──────
+// ── Issue #772: deadline-aware continue-as-new × query replay ────────────────
 //
 // A workflow with an `execution_timeout` that calls `should_continue_as_new()`
-// records a reserved `SideEffectRecorded { kind: Now, name:
-// "__harvest_deadline_probe" }` sentinel on the live frontier (the deadline
-// branch's tolerant clock read, #772). A query replay context that does NOT
-// thread the execution's `execution_timeout`/`deadline_at` returns from the
-// deadline guard *before* the tolerant clock read, so the recorded probe is left
-// UNCONSUMED at the cursor — the next replayed command (or the terminal-query
-// drift check) then treats an otherwise valid history as divergent. These pure
-// tests pin the mechanism the plugin's `hydrate_ctx_for_query` and the
-// in-process `execute_query_in_process` path both depend on: threading the
-// budget makes the probe replay cleanly.
+// records a reserved sentinel on the live frontier: `SideEffectRecorded { kind:
+// Now, name: "__harvest_deadline_probe" }`. It is the deadline branch's tolerant
+// clock read (#772). Some query replay contexts do NOT thread the execution's
+// `execution_timeout`/`deadline_at`. Such a context returns from the deadline
+// guard *before* the clock read, so the probe stays UNCONSUMED at the cursor.
+// The next replayed command, or the drift check, then treats a valid history
+// as divergent. These pure tests pin that threading the budget makes the probe
+// replay cleanly. The plugin's `hydrate_ctx_for_query` and the in-process
+// `execute_query_in_process` path both depend on it.
 
 /// Registers a `progress` query, performs the deadline-aware checkpoint check
 /// (recording/consuming the `__harvest_deadline_probe` when the run has an
@@ -947,11 +944,12 @@ const fn probe_t0() -> chrono::DateTime<Utc> {
     t0
 }
 
-/// `WorkflowStarted` + the reserved deadline probe + one scheduled/completed
-/// pair per item + `WorkflowCompleted` — a terminal history whose replay MUST
-/// consume the probe (via a budget-threaded context) to reach `Poll::Ready`
-/// cleanly. Returns the timeout/deadline the run was recorded with so the caller
-/// can thread them exactly as `hydrate_ctx_for_query` does from the row.
+/// A terminal history: `WorkflowStarted`, the reserved deadline probe, one
+/// scheduled/completed pair per item, then `WorkflowCompleted`.
+///
+/// Its replay MUST consume the probe, via a budget-threaded context, to reach
+/// `Poll::Ready` cleanly. It returns the recorded timeout and deadline. The
+/// caller threads them as `hydrate_ctx_for_query` does from the row.
 fn deadline_probe_history(
     items: &[&str],
 ) -> (
@@ -1002,7 +1000,7 @@ fn deadline_probe_history(
 
 /// Build a replay context that threads the execution row's
 /// `execution_timeout`/`deadline_at` exactly as the fixed query hydration paths
-/// (`hydrate_ctx_for_query`, `execute_query_in_process`) do (#772 round 6).
+/// (`hydrate_ctx_for_query`, `execute_query_in_process`) do (#772).
 fn build_ctx_with_deadline(
     exec_id: ExecutionId,
     events: Vec<WorkflowEvent>,
@@ -1021,9 +1019,9 @@ fn build_ctx_with_deadline(
 
 #[test]
 fn deadline_probe_history_replays_and_serves_when_budget_is_threaded() {
-    // GREEN: a context that threads the execution_timeout/deadline_at (the fix)
-    // consumes the recorded __harvest_deadline_probe, drives to Poll::Ready with
-    // no leftover unconsumed history, and serves the reconstructed count.
+    // GREEN: a context that threads execution_timeout/deadline_at (the fix)
+    // consumes the recorded __harvest_deadline_probe. It drives to Poll::Ready
+    // with no unconsumed history and serves the reconstructed count.
     let (exec_id, input, events, budget, deadline) = deadline_probe_history(&["a", "b", "c"]);
     let sealed = history_reached_terminal_seal(&events);
     assert!(sealed, "a WorkflowCompleted history is sealed");
@@ -1056,10 +1054,11 @@ fn deadline_probe_history_replays_and_serves_when_budget_is_threaded() {
 
 #[test]
 fn deadline_probe_history_diverges_when_budget_is_not_threaded() {
-    // RED (pre-fix behavior): a context that does NOT thread the budget — exactly
-    // what the query hydration paths did before #772 round 6 — leaves the recorded
-    // deadline probe UNCONSUMED, so the terminal-query drift check sees leftover
-    // non-lifecycle history and classifies the otherwise-valid history as 410.
+    // RED (pre-fix behavior): a context that does NOT thread the budget leaves
+    // the recorded deadline probe UNCONSUMED. The query hydration paths did
+    // exactly that before the #772 fix. The terminal-query drift check then
+    // sees leftover non-lifecycle history. It classifies the otherwise-valid
+    // history as 410.
     // This pins WHY threading is required at the hydration sites.
     let (exec_id, input, events, _budget, _deadline) = deadline_probe_history(&["a", "b", "c"]);
     let sealed = history_reached_terminal_seal(&events);

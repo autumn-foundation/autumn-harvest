@@ -32,20 +32,18 @@
 //! a stand-in. But the real activity of that name in
 //! `docs/getting-started/06-idempotency.md` returns
 //! `HarvestResult<serde_json::Value>`, a JSON object. A pin of `O = ()`
-//! would still compile. It would then fail at runtime with
-//! `HarvestError::Serialization` as soon as a reader wires the example to
-//! that real activity. That is a worse failure than the compile error that
-//! this guard exists to catch. Any output of an activity deserializes into
-//! `serde_json::Value`. So it is the one annotation that is safe for the
-//! real output shape of any activity.
+//! still compiles, then fails at runtime with `HarvestError::Serialization`
+//! once a reader wires the example to that real activity. That is worse than
+//! the compile error that this guard catches. Any activity output
+//! deserializes into `serde_json::Value`, so it is the one annotation that is
+//! safe for the real output shape of any activity.
 //!
 //! Neither failure is a syntax error. So the rustfmt-only check of
-//! `cargo xtask audit doc-snippet-syntax` passes this block clean. That
-//! audit only checks that the block parses, and never compiles it. This
-//! guard compiles the pinned block with `cargo check`, like its sibling
-//! guards, and does not pattern-match stand-in text. Whether a `?`
-//! conversion or a generic output type resolves is a property of the type
-//! checker, not a text shape.
+//! `cargo xtask audit doc-snippet-syntax` passes this block clean. That audit
+//! only checks that the block parses, and never compiles it. This guard compiles the pinned block with
+//! `cargo check`, like its sibling guards, and does not pattern-match
+//! stand-in text. Whether a `?` conversion or a generic output type resolves
+//! is a property of the type checker, not a text shape.
 
 use std::path::Path;
 use std::process::ExitCode;

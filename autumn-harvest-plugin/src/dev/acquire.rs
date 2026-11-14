@@ -1,16 +1,16 @@
 //! Acquiring `PostgreSQL` binaries on a machine that has none (issue #525, AC2).
 //!
-//! Only compiled under `dev-runtime-managed`. Discovery
-//! ([`super::discovery`]) is always tried first, so a developer who already has
-//! Postgres installed never downloads anything; this is the path that makes
-//! "a clean machine with only the Rust toolchain" literally true.
+//! Only compiled under `dev-runtime-managed`. Discovery ([`super::discovery`])
+//! always runs first, so a developer with Postgres installed never downloads
+//! anything. This path makes "a clean machine with only the Rust toolchain"
+//! literally true.
 //!
-//! The archive is fetched and verified by `postgresql_archive` (the same crate
-//! `autumn-web`'s own managed-Postgres provider builds on) and extracted into a
-//! per-user cache, so the download happens once per machine rather than once per
-//! run. **Only the binaries come from there.** The cluster is still initialised,
-//! started, and destroyed by our own lifecycle code, which is what keeps
-//! ephemerality and teardown under this crate's control.
+//! `postgresql_archive` fetches and verifies the archive. `autumn-web`'s own
+//! managed-Postgres provider builds on the same crate. The archive goes into a
+//! per-user cache, so the download happens once per machine, not once per run.
+//! **Only the binaries come from there.** This crate's own lifecycle code
+//! still initialises, starts and destroys the cluster. That keeps ephemerality
+//! and teardown under this crate's control.
 
 use std::path::PathBuf;
 
@@ -19,27 +19,27 @@ use super::discovery::{Platform, PostgresBinaries, REQUIRED_TOOLS};
 
 /// Major version acquired when none is installed.
 ///
-/// Pinned to a major rather than left open: two developers on the same commit
-/// should get the same *server*, and Postgres patch releases within a major are
-/// compatible, so letting the patch float costs nothing and avoids depending on
-/// one exact upstream artifact continuing to exist.
+/// Pinned to a major, not left open: two developers on the same commit should
+/// get the same *server*. Postgres patch releases within a major are
+/// compatible. So a floating patch costs nothing, and it avoids a dependency on
+/// one exact upstream artifact that may disappear.
 const MANAGED_VERSION_REQ: &str = "^16";
 
 /// Cache-directory segment for [`MANAGED_VERSION_REQ`].
 ///
-/// The requirement is a range, so the resolved patch version is not known until
-/// after a download — and checking the cache must not require the network. The
-/// cache is therefore keyed on the *major*, and a populated cache is reused
-/// as-is; clearing `HARVEST_DEV_CACHE_DIR` is how you take a newer patch.
+/// The requirement is a range, so the resolved patch version is known only
+/// after a download. A cache check must not require the network. So the cache
+/// is keyed on the *major*, and a populated cache is reused as-is. Clear
+/// `HARVEST_DEV_CACHE_DIR` to take a newer patch.
 const MANAGED_CACHE_KEY: &str = "16";
 
 /// Fetch (or reuse) a cached `PostgreSQL` install and return its binaries.
 ///
 /// # Errors
 ///
-/// [`DevError::Acquire`] if the archive cannot be fetched or extracted — most
-/// often no network on a machine that also has no Postgres, which the message
-/// says explicitly.
+/// [`DevError::Acquire`] if the archive cannot be fetched or extracted. The
+/// usual cause is no network on a machine that also has no Postgres. The
+/// message says so explicitly.
 pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
     let cache_root = cache_root()?;
     let version_req =
@@ -49,9 +49,9 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
             }
         })?;
 
-    // Refuse a cache another local user could write to BEFORE downloading 30 MB
-    // into it — and say why, rather than reporting the download as corrupt,
-    // which is what a bare `cached_install` miss looks like.
+    // Refuse a cache that another local user can write to BEFORE a 30 MB
+    // download into it. Say why. A bare `cached_install` miss would look like
+    // a corrupt download.
     if cache_root.exists() && !directory_is_private(&cache_root) {
         return Err(DevError::Acquire {
             detail: format!(
@@ -62,7 +62,7 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
         });
     }
 
-    // A previous run already extracted this version: use it and touch nothing.
+    // A previous run already extracted this version, so touch nothing.
     if let Some(binaries) = cached_install(&cache_root) {
         return Ok(binaries);
     }
@@ -85,20 +85,20 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
         ),
     })?;
 
-    // Extract to a private staging directory and rename it into place, so two
-    // `cargo dev`s racing on a cold cache cannot interleave their writes into a
-    // half-populated install that then fails in confusing ways. The loser's
-    // rename fails because the destination exists — which is success, not an
-    // error: the winner's install is already there.
+    // Extract to a private staging directory and rename it into place. Two
+    // `cargo dev`s that race on a cold cache then cannot interleave writes into
+    // a half-populated install that fails in confusing ways. The loser's rename
+    // fails because the destination exists. That is success, not an error: the
+    // winner's install is already there.
     let parent = cache_root.parent().unwrap_or(&cache_root).to_path_buf();
     std::fs::create_dir_all(&parent).map_err(|source| DevError::Acquire {
         detail: format!("could not create {}: {source}", parent.display()),
     })?;
-    // The staging directory must NOT exist yet: `postgresql_archive`'s theseus
+    // The staging directory must NOT exist yet. `postgresql_archive`'s theseus
     // extractor treats an existing output directory as "another process already
-    // extracted this" and returns success having written nothing — which would
-    // then be renamed into the cache as a permanently empty install, and every
-    // later run would re-download 30 MB and fail identically.
+    // extracted this". It then returns success with nothing written. The rename
+    // would put a permanently empty install into the cache. Every later run
+    // would re-download 30 MB and fail identically.
     let staging = parent.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
 
     let extracted = postgresql_archive::extract(
@@ -154,9 +154,9 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
 /// The extracted install under `cache_root`, if it is complete and ours.
 ///
 /// These files get executed, so a cache directory that another local user could
-/// write to is not usable. The default cache is per-user, but a container or CI
-/// image that points `XDG_CACHE_HOME` at a shared volume would otherwise turn
-/// "plant three files" into code execution in the developer's session.
+/// write to is not usable. The default cache is per-user. But a container or CI
+/// image can point `XDG_CACHE_HOME` at a shared volume. Without this check,
+/// "plant three files" becomes code execution in the developer's session.
 fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
     if !directory_is_private(cache_root) {
         tracing::warn!(

@@ -3,13 +3,13 @@
 //!
 //! When a downstream service an activity depends on goes hard-down, harvest's
 //! default behaviour is to retry every failing attempt across its full
-//! [`RetryPolicy`](crate::policy::RetryPolicy) curve. Across thousands of
-//! in-flight workflows that all call the same activity, this floods the task
-//! queue with retries against a dead target and piles up identical DLQ entries.
+//! [`RetryPolicy`](crate::policy::RetryPolicy) curve. Thousands of in-flight
+//! workflows can call the same activity. Their retries then flood the task
+//! queue against a dead target and pile up identical DLQ entries.
 //!
-//! A [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy) attached to
-//! an activity lets the worker track that activity's recent failures and
-//! **trip open** once they cross a threshold within a rolling window. While the
+//! A [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy) on an
+//! activity lets the worker track its recent failures. The breaker **trips
+//! open** once they cross a threshold within a rolling window. While the
 //! breaker is open, new dispatches short-circuit instead of running the doomed
 //! work. The policy's `open_mode` decides how (issue #1809). In `Defer` mode,
 //! the default, the task goes back to `PENDING` until the next probe. In
@@ -40,10 +40,10 @@
 //! breaker. An outage that hits every shard trips each independently,
 //! matching the per-shard ACID model.
 
-// Each public method intentionally holds the state lock for its whole body: it
+// Each public method intentionally holds the state lock for its whole body. It
 // reads and mutates the same `BreakerState` and returns a value derived from
-// it, so there is no meaningful window in which the guard could be released
-// earlier. The drop-tightening lint is a false positive here.
+// it. So no window exists in which the guard could be released earlier. The
+// drop-tightening lint is a false positive here.
 #![allow(clippy::significant_drop_tightening)]
 
 use std::collections::HashMap;
@@ -88,11 +88,11 @@ impl CircuitPhase {
 /// back to [`CircuitBreakerRegistry::on_result`].
 ///
 /// It carries the breaker's *generation* at dispatch time. Every state-resetting
-/// transition (trip, recover-to-closed, operator force-open, operator
-/// force-close) bumps the generation, so a result whose token predates the
-/// current generation is a **stale straggler** — an attempt that started before
-/// a trip or before a manual reset — and is fenced out: it can neither resolve
-/// the half-open probe early nor immediately re-trip a just-closed breaker.
+/// transition bumps the generation: trip, recover-to-closed, operator
+/// force-open and operator force-close. A result whose token predates the
+/// current generation is a **stale straggler**. Its attempt started before a
+/// trip or before a manual reset. It is fenced out: it can neither resolve the
+/// half-open probe early nor immediately re-trip a just-closed breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchToken {
     generation: u64,
@@ -181,9 +181,9 @@ pub enum DispatchDecision {
         /// Wall-clock instant at which the breaker last tripped, if known.
         opened_at: Option<DateTime<Utc>>,
         /// How long until a half-open probe will be admitted. `None` when the
-        /// breaker is **operator-forced open**: no probe is admitted on any
-        /// timer, so there is no meaningful retry-after to advertise — recovery
-        /// requires an explicit `force-close`.
+        /// breaker is **operator-forced open**. No timer then admits a probe,
+        /// so no retry-after is meaningful. Recovery requires an explicit
+        /// `force-close`.
         retry_after: Option<Duration>,
     },
 }
@@ -193,9 +193,11 @@ pub enum DispatchDecision {
 /// Only [`RetryableFailure`](Self::RetryableFailure) — a transient,
 /// downstream-style error — contributes to tripping the breaker. A
 /// [`NonRetryableFailure`](Self::NonRetryableFailure) is a permanent per-request
-/// error (bad input, validation) and proves the downstream is reachable enough
-/// to give a definitive answer, so it never trips the breaker (and counts as a
-/// healthy outcome for a half-open probe).
+/// error (bad input, validation). It can come from before the downstream was
+/// touched, so it is neither sickness nor proof of health. It never trips a
+/// closed breaker, and it leaves the failure window as it is. A half-open probe
+/// that ends with it is inconclusive: the breaker re-opens, re-arms its
+/// cooldown and reports no transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// The attempt succeeded.
@@ -322,9 +324,9 @@ impl BreakerState {
 
 /// In-process registry of per-activity circuit breakers.
 ///
-/// Constructed once from the registered activities' policies and shared (behind
-/// an `Arc`) between the worker dispatch path and the management API so that
-/// both observe the same state. Activities without a declared policy are never
+/// Constructed once from the policies of the registered activities. The worker
+/// dispatch path and the management API share it behind an `Arc`, so both
+/// observe the same state. Activities without a declared policy are never
 /// tracked: [`on_dispatch`](Self::on_dispatch) returns [`DispatchDecision::Allow`]
 /// and [`on_result`](Self::on_result) is a no-op for them.
 #[derive(Debug)]
@@ -396,8 +398,8 @@ impl CircuitBreakerRegistry {
     /// Decide whether to allow a dispatch of `activity_name` at `now`.
     ///
     /// Activities without a policy always return [`DispatchDecision::Allow`].
-    /// When the breaker is open and the cooldown has elapsed this call performs
-    /// the open → half-open transition and admits the returned dispatch as the
+    /// When the breaker is open and the cooldown has elapsed, this call performs
+    /// the open → half-open transition. It admits the returned dispatch as the
     /// single probe.
     #[must_use]
     pub fn on_dispatch(&self, activity_name: &str, now: Instant) -> DispatchDecision {
@@ -452,8 +454,8 @@ impl CircuitBreakerRegistry {
                 if st.probe_in_flight {
                     // A probe is already running; no further dispatch is admitted
                     // until it completes and transitions the breaker. Advertise
-                    // no retry-after so callers don't busy-loop on a `0s` hint —
-                    // the outcome is gated on the probe, not a timer.
+                    // no retry-after, so that callers do not busy-loop on a `0s`
+                    // hint. The probe gates the outcome, not a timer.
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
                         retry_after: None,
@@ -470,16 +472,18 @@ impl CircuitBreakerRegistry {
     ///
     /// `token` must be the [`DispatchToken`] returned by the matching
     /// [`on_dispatch`](Self::on_dispatch) call. Its generation fences stale
-    /// stragglers: any result whose token predates the breaker's current
-    /// generation — an attempt dispatched before a trip, a recovery, or an
-    /// operator force-open/force-close — is ignored, so it can neither resolve
-    /// the half-open probe early nor immediately re-trip a just-reset breaker.
+    /// stragglers. A stale result has a token that predates the current
+    /// generation of the breaker. Its attempt was dispatched before a trip, a
+    /// recovery, or an operator force-open/force-close. Such a result is
+    /// ignored. So it can neither resolve the half-open probe early nor
+    /// immediately re-trip a just-reset breaker.
     /// The probe transition is additionally gated on `token.is_probe`.
     ///
     /// Only [`AttemptOutcome::RetryableFailure`] contributes to tripping the
     /// breaker. A [`AttemptOutcome::NonRetryableFailure`] is a permanent
-    /// per-request error (bad input) that proves the downstream is reachable,
-    /// so it never trips the breaker and counts as a healthy probe result.
+    /// per-request error (bad input) that does not prove the downstream is
+    /// healthy. So it never trips a closed breaker. A half-open probe that ends
+    /// with it is inconclusive: the breaker re-opens and returns `None`.
     ///
     /// Returns `Some(transition)` when the breaker changed open/closed state so
     /// the caller can emit the corresponding metric. Activities without a
@@ -801,16 +805,18 @@ impl CircuitBreakerRegistry {
         }
     }
 
-    /// Record a retryable failure observed **out of band** — i.e. not from a
-    /// handler return value with a dispatch token, but from an enforcement path
-    /// such as an activity start-to-close / heartbeat timeout (issue #369).
+    /// Record a retryable failure observed **out of band**.
+    ///
+    /// The failure comes from an enforcement path, not from a handler return
+    /// value with a dispatch token. An example is an activity start-to-close /
+    /// heartbeat timeout (issue #369).
     ///
     /// A timeout against a protected downstream is a transient/downstream-style
-    /// failure that should count toward tripping the breaker, but the worker
-    /// that dispatched the attempt may be gone, so there is no token to pass.
+    /// failure, so it should count toward tripping the breaker. But the worker
+    /// that dispatched the attempt may be gone, so no token exists to pass.
     /// This applies closed-phase accounting (and trips at threshold) without a
-    /// token; it intentionally does **not** resolve a half-open probe (only the
-    /// admitted probe's own result does that) and is ignored while the breaker
+    /// token. It intentionally does **not** resolve a half-open probe. Only the
+    /// result of the admitted probe does that. It is ignored while the breaker
     /// is already open or operator-forced.
     ///
     /// Returns `Some(CircuitTransition::Tripped)` if this failure opened the
@@ -833,13 +839,13 @@ impl CircuitBreakerRegistry {
     /// the breaker and never resolves a probe as a successful downstream call.
     /// Ordinary closed-state cancellations are therefore a no-op.
     ///
-    /// The one case that *must* be handled: if the cancelled attempt held the
-    /// single half-open probe, simply dropping its outcome would leave the
-    /// breaker stuck in `HalfOpen` with `probe_in_flight = true` forever, so
-    /// every later dispatch would short-circuit and no probe could ever be
-    /// admitted. Here we release the probe slot and re-arm the cooldown (via the
-    /// same state reset as a trip) so a fresh probe is admitted after the next
-    /// cooldown — without emitting a trip/close transition.
+    /// One case *must* be handled: a cancelled attempt that held the single
+    /// half-open probe. Dropping its outcome would leave the breaker stuck in
+    /// `HalfOpen` with `probe_in_flight = true` forever. Every later dispatch
+    /// would short-circuit, and no probe could ever be admitted. So this
+    /// releases the probe slot and re-arms the cooldown, via the same state
+    /// reset as a trip. A fresh probe is admitted after the next cooldown. No
+    /// trip/close transition is emitted.
     ///
     /// Generation-fenced like [`on_result`](Self::on_result): a token predating
     /// the breaker's current generation is stale and ignored.
@@ -872,11 +878,11 @@ impl CircuitBreakerRegistry {
     ///
     /// Idempotent: if the breaker is **already** closed and not operator-forced,
     /// this is a no-op. A repeated force-close (operator retry / idempotency
-    /// replay) must not bump the generation or clear the failure window again —
-    /// doing so would fence out the results of attempts admitted by the first
-    /// close and discard failures they have since accumulated, which could mask
-    /// an outage re-emerging right after the reset. Only the first close fences
-    /// pre-close work.
+    /// replay) must not bump the generation or clear the failure window again.
+    /// That would fence out the results of attempts admitted by the first
+    /// close. It would also discard the failures they have since accumulated.
+    /// That can mask an outage that re-emerges right after the reset. Only the
+    /// first close fences pre-close work.
     pub fn force_close(&self, activity_name: &str) {
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
@@ -888,14 +894,16 @@ impl CircuitBreakerRegistry {
     }
 
     /// The sorted set of every activity name with a declared circuit-breaker
-    /// policy. Passed by the worker to [`crate::queue::claim_task`] so the claim
-    /// query can skip the rate-limit gate **and** token debit for these
-    /// activities: their rate limiting is enforced authoritatively at *dispatch*
-    /// instead (issue #369). Enforcing at dispatch — gated on the real
-    /// [`on_dispatch`](Self::on_dispatch) decision — is what lets `CircuitOpen`
-    /// short-circuits propagate at full speed during an outage while still
-    /// guaranteeing a genuine downstream call never runs without a token. The
-    /// set is static (fixed at construction), so this returns a cheap slice.
+    /// policy.
+    ///
+    /// The worker passes it to [`crate::queue::claim_task`]. The claim query
+    /// then skips the rate-limit gate **and** the token debit for these
+    /// activities. Their rate limiting is enforced authoritatively at
+    /// *dispatch* instead (issue #369). Dispatch enforcement is gated on the
+    /// real [`on_dispatch`](Self::on_dispatch) decision. So `CircuitOpen`
+    /// short-circuits propagate at full speed during an outage. A genuine
+    /// downstream call still never runs without a token. The set is static
+    /// (fixed at construction), so this returns a cheap slice.
     #[must_use]
     pub fn tracked_activity_names(&self) -> &[String] {
         &self.tracked_names
@@ -966,10 +974,6 @@ impl Default for CircuitBreakerRegistry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (red phase: written before the implementation above existed)
-// ---------------------------------------------------------------------------
-
 /// Apply one attempt outcome to an activity's breaker state.
 fn apply_result(
     st: &mut BreakerState,
@@ -983,25 +987,23 @@ fn apply_result(
         return None;
     }
 
-    // Generation fence: an attempt dispatched before the breaker's last
-    // state-resetting transition (trip / close / force-open / force-close)
-    // is stale and must not move the breaker. This subsumes the half-open
-    // straggler case AND the "pre-force-close failure re-trips the reset"
-    // case in one check.
+    // Generation fence. An attempt dispatched before the last state-resetting
+    // transition (trip / close / force-open / force-close) is stale. It must
+    // not move the breaker. This one check subsumes the half-open straggler
+    // case AND the "pre-force-close failure re-trips the reset" case.
     if token.generation != st.generation {
         return None;
     }
 
     match st.phase {
         CircuitPhase::Closed => match outcome {
-            // A success clears the rolling failure window.
             AttemptOutcome::Success => {
                 st.failures.clear();
                 None
             }
             // A non-retryable (permanent per-request) error is excluded from
-            // trip counts entirely: it is neither downstream sickness nor
-            // proof of health, so it leaves the rolling window untouched.
+            // trip counts. It is neither downstream sickness nor proof of
+            // health, so it leaves the rolling window untouched.
             AttemptOutcome::NonRetryableFailure => None,
             AttemptOutcome::RetryableFailure => {
                 st.failures.push_back(now);
@@ -1016,8 +1018,8 @@ fn apply_result(
         },
         CircuitPhase::HalfOpen => {
             // Only the admitted probe decides the half-open outcome. A
-            // same-generation non-probe (shouldn't normally happen, but be
-            // defensive) must not close the breaker early or restart cooldown.
+            // same-generation non-probe must not close the breaker early or
+            // restart cooldown. That case should not happen; this is defensive.
             if !token.is_probe {
                 return None;
             }
@@ -1033,11 +1035,11 @@ fn apply_result(
                     Some(CircuitTransition::Tripped)
                 }
                 // A non-retryable per-request error (e.g. bad input) does NOT
-                // prove the downstream recovered — the error may have been
-                // produced before the dependency was even touched. Treat the
-                // probe as inconclusive: release the probe slot and re-arm the
-                // cooldown so a fresh probe is admitted later, but emit no
-                // transition (it is neither a recovery nor a downstream trip).
+                // prove the downstream recovered. The error may come from
+                // before the dependency was even touched. Treat the probe as
+                // inconclusive. Release the probe slot and re-arm the cooldown,
+                // so a fresh probe is admitted later. Emit no transition: it is
+                // neither a recovery nor a downstream trip.
                 AttemptOutcome::NonRetryableFailure => {
                     st.trip(now);
                     None
@@ -1105,6 +1107,10 @@ fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) ->
     }
     false
 }
+
+// ---------------------------------------------------------------------------
+// Tests (red phase: written before the implementation above existed)
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1915,8 +1921,8 @@ mod tests {
     }
 
     // A repeated force-close on an already-closed, unforced breaker must be a
-    // no-op: it must not bump the generation (fencing post-close attempts) or
-    // clear failures those attempts have legitimately accumulated.
+    // no-op. It must not bump the generation (fencing post-close attempts). It
+    // must not clear failures that those attempts have legitimately accumulated.
     #[test]
     fn duplicate_force_close_is_a_noop() {
         let reg = registry();
@@ -1996,9 +2002,9 @@ mod tests {
     }
 
     // tracked_activity_names returns the static, sorted set of every activity
-    // with a declared policy regardless of current breaker phase — the worker
-    // passes it to claim_task to skip claim-time rate limiting (enforced at
-    // dispatch instead).
+    // with a declared policy, whatever the current breaker phase. The worker
+    // passes it to claim_task to skip claim-time rate limiting, which is
+    // enforced at dispatch instead.
     #[test]
     fn tracked_activity_names_lists_all_policies_sorted() {
         let mut p = HashMap::new();
@@ -2028,7 +2034,7 @@ mod tests {
     }
 
     // A half-open probe that returns a non-retryable (bad-input) error must NOT
-    // close the breaker: a per-request error doesn't prove the downstream
+    // close the breaker: a per-request error does not prove the downstream
     // recovered. It is inconclusive — the breaker re-arms its cooldown and waits
     // for another probe, emitting no transition.
     #[test]
@@ -2073,8 +2079,9 @@ mod tests {
     }
 
     // A cancellation that hits the single half-open probe must release the probe
-    // slot, or the breaker would stay HalfOpen with probe_in_flight=true forever
-    // and short-circuit every later dispatch with no probe ever admitted.
+    // slot. Otherwise the breaker stays HalfOpen with probe_in_flight=true
+    // forever. It then short-circuits every later dispatch and never admits a
+    // probe.
     #[test]
     fn cancelled_half_open_probe_is_released_and_rearms() {
         let reg = registry();
@@ -2091,7 +2098,6 @@ mod tests {
             DispatchDecision::ShortCircuit { .. }
         ));
 
-        // The probe attempt is cancelled out from under us.
         reg.on_cancelled("send_email", probe, probe_time);
 
         // The breaker is re-armed (open), NOT wedged half-open with a dangling
@@ -2107,7 +2113,7 @@ mod tests {
         );
     }
 
-    // A cancellation in the ordinary closed state must be a complete no-op: it is
+    // A cancellation in the ordinary closed state must be a complete no-op. It is
     // not a downstream failure and must not count toward tripping the breaker.
     #[test]
     fn cancelled_closed_state_attempt_is_a_noop() {

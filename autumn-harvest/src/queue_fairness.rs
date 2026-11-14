@@ -11,11 +11,11 @@
 /// - Under sustained saturation the empirical dispatch share per queue converges
 ///   to `weight_i / sum(all_weights)` — the classic Sidekiq model.
 /// - **No-starvation guarantee:** any queue with `weight >= 1` and available
-///   work always makes forward progress, because the ordering is a *permutation*
-///   of all non-zero-weight queues followed by all zero-weight queues. A claim
-///   attempt walks the permutation until `Some(task)` is returned, so every
-///   queue is reachable on every poll (zero-weight queues are reachable only
-///   when higher-weight queues have no work).
+///   work always makes forward progress. The ordering is a *permutation* of
+///   all non-zero-weight queues, then all zero-weight queues. A claim attempt
+///   walks the permutation until it gets `Some(task)`. So every queue is
+///   reachable on every poll. A zero-weight queue is reachable only when the
+///   higher-weight queues have no work.
 /// - **Default (empty weight map):** the caller should pass the full queue list
 ///   directly to `claim_task` with no ordering step, identical to today's
 ///   `ANY($2)` single-query behaviour. This function is only invoked when the
@@ -67,14 +67,14 @@ pub fn effective_queue_weights<'a, S: std::hash::BuildHasher>(
 /// Produce a weighted-random permutation of queue names.
 ///
 /// The algorithm is weighted-random sampling *without replacement*
-/// (Efraimidis-Spirakis key-based reservoir):
-/// each queue with `weight > 0` is assigned a key `U^(1/weight)` where `U`
-/// is uniform `(0, 1]`; queues are then sorted descending by key. This gives
-/// exactly the desired first-position frequency proportional to `weight`.
+/// (Efraimidis-Spirakis key-based reservoir). Each queue with `weight > 0`
+/// gets a key `U^(1/weight)`, where `U` is uniform on
+/// `[f64::MIN_POSITIVE, 1)`. The queues then sort descending by key. So the
+/// first-position frequency is proportional to `weight`.
 ///
-/// Queues with `weight == 0` are never placed before positive-weight queues;
-/// they appear at the end in their original (stable) order so the caller can
-/// still drain them as a fallback when all positive-weight queues are empty.
+/// Queues with `weight == 0` never come before positive-weight queues. They
+/// come last, in their original (stable) order. The caller can still drain
+/// them as a fallback when all positive-weight queues are empty.
 ///
 /// # Arguments
 ///
@@ -94,7 +94,6 @@ pub fn weighted_queue_order<'a>(
     pairs: &[(&'a str, u32)],
     rng: &mut impl rand::Rng,
 ) -> Vec<&'a str> {
-    // Separate positive-weight and zero-weight queues.
     let mut positive: Vec<(&str, f64)> = Vec::with_capacity(pairs.len());
     let mut zeros: Vec<&str> = Vec::new();
 
@@ -104,16 +103,15 @@ pub fn weighted_queue_order<'a>(
         } else {
             // Efraimidis-Spirakis: key = U^(1/weight).
             // Larger weight -> key closer to 1 on average -> sorts first.
-            // Exclusive upper bound so u is never exactly 1.0: if two queues
-            // both drew 1.0 they would tie at key=1.0 and sort order would
-            // depend on unstable-sort tie-breaking rather than the weights.
+            // Exclusive upper bound, so u is never exactly 1.0. Two queues
+            // that both drew 1.0 would tie at key=1.0. Their order would then
+            // depend on unstable-sort tie-breaking, not on the weights.
             let u: f64 = rand::RngExt::random_range(rng, f64::MIN_POSITIVE..1.0);
             let key = u.powf(1.0 / f64::from(*weight));
             positive.push((name, key));
         }
     }
 
-    // Sort descending by key so the highest key (highest-priority draw) comes first.
     positive.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     let mut result: Vec<&'a str> = positive.iter().map(|(n, _)| *n).collect();
@@ -567,9 +565,9 @@ mod tests {
         assert_eq!(order, [] as [&str; 0]);
     }
 
-    /// No-starvation property: the low-weight queue must appear somewhere in the
-    /// permutation (not just last) at least occasionally, and it always appears
-    /// — ensuring it can drain when claimed in order.
+    /// No-starvation property: the low-weight queue always appears in the
+    /// permutation, so it can drain when claimed in order. At least
+    /// occasionally, it appears before last.
     #[test]
     fn low_weight_queue_always_present_in_permutation() {
         let pairs: Vec<(&str, u32)> = vec![("heavy", 10u32), ("light", 1u32)];

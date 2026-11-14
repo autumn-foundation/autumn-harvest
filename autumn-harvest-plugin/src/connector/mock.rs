@@ -1,10 +1,10 @@
 //! An in-memory [`EventSource`] for tests and local development (issue #944).
 //!
-//! `MockSource` is a **supported, exported** adapter, not test-only scaffolding:
-//! it lets an embedder unit-test a mapping function and the whole dispatch
-//! path — idempotency, poison isolation, throttle deferral, ack ordering —
-//! with no broker and no Docker. It is also what makes the connector's own
-//! correctness suite runnable everywhere, including the deliberate-redelivery
+//! `MockSource` is a **supported, exported** adapter, not test-only scaffolding.
+//! An embedder uses it to unit-test a mapping function and the whole dispatch
+//! path with no broker and no Docker. That path covers idempotency, poison
+//! isolation, throttle deferral and ack ordering. It also lets the connector's
+//! own correctness suite run everywhere, including the deliberate-redelivery
 //! and crash-recovery scenarios.
 
 use async_trait::async_trait;
@@ -209,14 +209,14 @@ impl EventSource for MockSource {
 
     /// Release the committed prefix from custody.
     ///
-    /// Overridden rather than inherited because the default delegates to
-    /// [`EventSource::ack`] with a **token-less** handle, and this mock keys
-    /// custody by token: the default would look up `""`, match nothing, and
-    /// retain every positional (`push_kafka*`) message for the life of the
-    /// source — a long-running harness growing in proportion to all messages
-    /// ever processed. There is no token to look up *by design*; a positional
-    /// commit is a high-water mark over a contiguous prefix rather than one
-    /// message's acknowledgement, so it carries coordinates only.
+    /// This overrides the default, which delegates to [`EventSource::ack`] with
+    /// a **token-less** handle. This mock keys custody by token. The default would look up
+    /// `""`, match nothing, and retain every positional (`push_kafka*`)
+    /// message for the life of the source. A long-running harness would then
+    /// grow with every message it ever processed. The handle has no token *by
+    /// design*. A positional commit is a high-water mark over a contiguous
+    /// prefix, not one message's acknowledgement, so it carries coordinates
+    /// only.
     ///
     /// So the prefix is what is released: every retained copy for `partition`
     /// at or below `position`. A retained message with no `position` is left
@@ -248,9 +248,9 @@ impl EventSource for MockSource {
     ///
     /// The real SQS call resets visibility so the queue redelivers and counts
     /// the receive toward `maxReceiveCount`, eventually moving it to the
-    /// configured DLQ. The mock has no redrive policy to terminate that loop,
-    /// so redelivering here would spin any test that drains to empty; a test
-    /// exercising the redelivery laps re-pushes the message explicitly.
+    /// configured DLQ. The mock has no redrive policy to end that loop, so a
+    /// redelivery here would spin any test that drains to empty. A test of the
+    /// redelivery laps re-pushes the message explicitly.
     async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
         let mut state = self.lock();
         state.nacked_for_dead_letter.push(handle.clone());
@@ -263,15 +263,14 @@ impl EventSource for MockSource {
     /// message back.
     ///
     /// `receive` has already removed it, so recording alone would make an
-    /// abandoned message vanish — the opposite of what `abandon_redelivers()
-    /// == true` promises, and enough for a retry-path test to silently miss
-    /// the eventual successful delivery it is supposed to prove. Requeued at
-    /// the *back*: SQS guarantees no redelivery order, and taking the tail
-    /// keeps a permanently-failing message from starving its siblings in a
-    /// test that drains a batch.
+    /// abandoned message vanish. That breaks the `abandon_redelivers() ==
+    /// true` promise. A retry-path test would then silently miss the
+    /// successful delivery it must prove. The message goes to the *back*: SQS
+    /// guarantees no redelivery order. The tail keeps a permanently-failing
+    /// message from starving its siblings in a test that drains a batch.
     ///
     /// [`Self::without_redelivery`] keeps the drop, which is the accurate
-    /// Kafka behaviour: not committing is not a nack, and the consumer's local
+    /// Kafka behaviour. Not committing is not a nack, and the consumer's local
     /// position has already advanced past the record.
     async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
         let mut state = self.lock();
@@ -329,7 +328,6 @@ mod tests {
         let src = MockSource::new("orders");
         src.push_opaque("m1", b"x");
         src.close();
-        // Still drains what is queued...
         assert_eq!(
             src.receive(10, std::time::Duration::from_millis(1))
                 .await
@@ -337,7 +335,6 @@ mod tests {
                 .len(),
             1
         );
-        // ...then reports closed.
         assert!(matches!(
             src.receive(10, std::time::Duration::from_millis(1)).await,
             Err(ConnectorError::Closed)
@@ -378,11 +375,9 @@ mod tests {
     #[tokio::test]
     async fn a_redelivering_mock_actually_hands_an_abandoned_message_back() {
         // The default mock advertises `abandon_redelivers() == true` (SQS's
-        // visibility timeout). `receive` has already removed the message, so
-        // recording the handle alone would make an abandoned message vanish --
-        // the opposite of the advertised semantics, and enough for a
-        // retry-path test to silently miss the eventual successful delivery it
-        // exists to prove.
+        // visibility timeout). `receive` has already removed the message. If
+        // `abandon` only recorded the handle, the message would vanish. A
+        // retry-path test would then silently miss the delivery it must prove.
         let source = MockSource::new("orders");
         source.push_opaque("m-1", b"payload");
 
@@ -403,7 +398,6 @@ mod tests {
         assert_eq!(second.len(), 1, "so the retry genuinely redelivers");
         assert_eq!(second[0].handle.token, "m-1");
 
-        // Settling for real ends the loop.
         source.ack(&second[0].handle).await.unwrap();
         assert_eq!(source.pending(), 0);
         assert_eq!(source.acked().len(), 1);
@@ -411,9 +405,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_positional_mock_drops_an_abandoned_message() {
-        // The mirror image, and the accurate Kafka behaviour: not committing
-        // is not a nack, and the consumer's local position has already
-        // advanced past the record, so nothing hands it back in-session.
+        // The accurate Kafka behaviour: not committing is not a nack. The
+        // consumer's local position has already advanced past the record, so
+        // nothing hands it back in-session.
         let source = MockSource::new("orders").without_redelivery();
         source.push_kafka(0, 7, b"payload");
 
@@ -453,10 +447,10 @@ mod tests {
     #[tokio::test]
     async fn a_positional_commit_releases_the_prefix_from_custody() {
         // The sibling above covers only the opaque (SQS) shape. A positional
-        // message settles through `commit_position`, whose default hands `ack`
-        // a token-LESS handle -- so a token-keyed custody map removes `""` and
-        // retains every Kafka-shaped message forever, growing a long-running
-        // harness in proportion to all messages ever processed.
+        // message settles through `commit_position`. Its default hands `ack` a
+        // token-LESS handle. A token-keyed custody map then removes `""` and
+        // retains every Kafka-shaped message forever, so a long-running
+        // harness grows with every message it ever processed.
         let source = MockSource::new("orders");
         source.push_kafka(0, 1, b"a");
         source.push_kafka(0, 2, b"b");

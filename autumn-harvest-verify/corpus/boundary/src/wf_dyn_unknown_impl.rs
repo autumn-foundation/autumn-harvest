@@ -2,16 +2,16 @@
 //!
 //! **Boundary.** `dyn-dispatch`.
 //!
-//! Two distinct concrete types — `Fixed` (deterministic) and `Drifting`
-//! (`SystemTime::now`) — are unsized into `dyn Fetcher` inside the analyzed set,
-//! and which one reaches `.get()` depends on a runtime flag. RTA-lite over
-//! unsizing coercions therefore has **two** candidates for
-//! `<dyn Fetcher as Fetcher>::get` and must not pick one.
+//! Two concrete types are unsized into `dyn Fetcher` inside the analyzed set:
+//! `Fixed` (deterministic) and `Drifting` (`SystemTime::now`). A runtime flag
+//! picks the one that reaches `.get()`. So RTA-lite over unsizing coercions
+//! has **two** candidates for `<dyn Fetcher as Fetcher>::get` and must not
+//! pick one.
 //!
-//! Both wrong answers are unacceptable: reporting `proven-deterministic` would
-//! be unsound (the `Drifting` impl reads the clock), and reporting
-//! `nondeterminism-found` would be a false positive on the `Fixed` path. The
-//! honest verdict is `unknown` with the callee named.
+//! Both wrong answers are unacceptable. `proven-deterministic` is unsound,
+//! because the `Drifting` impl reads the clock. `nondeterminism-found` is a
+//! false positive on the `Fixed` path. The honest verdict is `unknown` with
+//! the callee named.
 //!
 //! Its deliberate contrast is
 //! `harvest_verify_corpus_seeded::wf_rand_behind_dyn`, where exactly **one**

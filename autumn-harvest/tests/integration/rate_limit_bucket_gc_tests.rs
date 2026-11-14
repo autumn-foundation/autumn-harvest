@@ -16,9 +16,9 @@
 //! - AC5: the sweep is shard-local.
 //! - AC7: a collected bucket re-registers on next use and admits work again.
 //! - AC12: `dry_run` collects nothing; the count is reported and metered.
-//! - R1/R2/R3: a bucket with a live dependent — a non-terminal task, or a
-//!   deferred throttled start — is retained (both consumers fail CLOSED on a
-//!   missing row, so collecting one would strand work forever).
+//! - R1/R2/R3: a bucket with a live dependent is retained. A dependent is a
+//!   non-terminal task or a deferred throttled start. Both consumers fail
+//!   CLOSED on a missing row, so collecting one would strand work forever.
 //! - R4: a partially drained bucket is retained (re-registration would reset
 //!   `tokens = burst` and hand out free capacity).
 //! - R5: a live TTL'd pacing override (#945) is never silently destroyed.
@@ -28,8 +28,8 @@
 //!   is not swept out from under the task that transaction is about to commit.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded, each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle.
+//! against it directly (single-threaded, each test scrubs first). Otherwise a
+//! fresh testcontainers Postgres boots with the full migration bundle.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -427,8 +427,10 @@ async fn run_one_tick_snapshot(
     snap
 }
 
-/// The GC outcome a tick reported, which must always be present when the pass
-/// is enabled — `None` is reserved for "the GC is switched off".
+/// The GC outcome a tick reported.
+///
+/// It is always present when the pass is enabled. `None` means only "the GC
+/// is switched off".
 const fn gc(result: &autumn_harvest::retention::RetentionTickResult) -> &RateLimitBucketGcOutcome {
     result
         .rate_limit_bucket_gc
@@ -481,9 +483,8 @@ async fn idle_full_buckets_in_both_unbounded_families_are_collected() {
 
 #[tokio::test]
 async fn a_bucket_that_never_drained_is_collected_once_it_is_idle() {
-    // AC2 "or continuously full": a bucket sitting at burst with no debit
-    // inside the window is inert, and re-registering it reproduces exactly the
-    // row that was deleted.
+    // AC2 "or continuously full": a bucket at burst with no debit inside the
+    // window is inert. Re-registering it reproduces exactly the deleted row.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -576,8 +577,8 @@ async fn a_partially_drained_bucket_is_retained() {
 #[tokio::test]
 async fn a_bucket_with_a_non_terminal_task_is_retained() {
     // Both the claim-time gate and `try_consume_rate_limit_token` fail CLOSED
-    // on a missing row, and nothing re-registers a bucket for an
-    // already-enqueued task — so collecting one strands that task forever.
+    // on a missing row. Nothing re-registers a bucket for an already-enqueued
+    // task. So collecting one strands that task forever.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -612,9 +613,9 @@ async fn a_bucket_with_a_non_terminal_task_is_retained() {
 
 #[tokio::test]
 async fn a_bucket_with_a_deferred_throttled_start_is_retained() {
-    // A deferred start whose bucket vanished can never debit a token, so it
-    // would sit deferred forever (it is not even expired unless it carries a
-    // schedule_to_start deadline).
+    // A deferred start whose bucket vanished can never debit a token. So it
+    // would sit deferred forever. It expires only if it carries a
+    // schedule_to_start deadline.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -739,9 +740,9 @@ async fn the_configured_window_is_honoured() {
 
 #[tokio::test]
 async fn dry_run_previews_without_deleting_or_metering() {
-    // A collector that is on by default must be previewable: `dry_run` reports
-    // what a real pass WOULD collect, deletes nothing, and moves no counter an
-    // operator reads as work done.
+    // A collector that is on by default must be previewable. `dry_run`
+    // reports what a real pass WOULD collect and deletes nothing. It moves no
+    // counter that an operator reads as work done.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -852,9 +853,9 @@ async fn ensuring_a_stale_bucket_touches_it_so_the_sweep_cannot_race_the_enqueue
 
     let key = "dyn-rate:t:stale";
     insert_idle_bucket(&mut conn, key, day_old()).await;
-    // A pre-#1127 row has never been registered at all, which must still be
-    // touchable — otherwise every bucket that predates the upgrade is
-    // permanently unprotected against the race.
+    // A pre-#1127 row was never registered, and it must still be touchable.
+    // Otherwise every bucket that predates the upgrade stays unprotected
+    // against the race.
     assert_eq!(bucket_last_registered_at(&mut conn, key).await, None);
     let updated_before = bucket_updated_at(&mut conn, key).await;
 
@@ -877,8 +878,8 @@ async fn ensuring_a_stale_bucket_touches_it_so_the_sweep_cannot_race_the_enqueue
     assert_eq!(collected(&result), 0);
     assert!(bucket_exists(&mut conn, key).await);
 
-    // A FRESH bucket is not written at all — the touch must never become a hot
-    // path write (nor, therefore, a hot path row LOCK) on every enqueue.
+    // A FRESH bucket is not written at all. The touch must never become a hot
+    // path write on every enqueue, and so never a hot path row LOCK.
     let touched = bucket_last_registered_at(&mut conn, key).await;
     autumn_harvest::queue::ensure_rate_limit_bucket(&mut conn, key, 1.0, 10.0)
         .await
@@ -893,13 +894,13 @@ async fn ensuring_a_stale_bucket_touches_it_so_the_sweep_cannot_race_the_enqueue
 #[tokio::test]
 async fn an_uncommitted_enqueue_is_not_swept_out_from_under_its_own_task() {
     // The regression this whole interlock exists for. The sweep's dependent
-    // anti-joins run against ONE snapshot, so an enqueue transaction that has
-    // not committed yet is invisible to them: its task row cannot be seen, and
-    // under the pre-#1127 `ON CONFLICT DO NOTHING` its `ensure` left the
-    // bucket row unlocked as well. The sweep would then delete the bucket, the
-    // enqueue would commit a task referencing nothing, and — because the claim
-    // gate and `try_consume_rate_limit_token` both fail CLOSED, with nothing to
-    // re-register the row — that task would never run again.
+    // anti-joins run against ONE snapshot. So they cannot see an enqueue
+    // transaction that has not committed yet, nor its task row. Under the
+    // pre-#1127 `ON CONFLICT DO NOTHING`, its `ensure` also left the bucket
+    // row unlocked. The sweep would then delete the bucket. The enqueue would
+    // commit a task that references nothing. The claim gate and
+    // `try_consume_rate_limit_token` both fail CLOSED, and nothing
+    // re-registers the row. So that task would never run again.
     //
     // Verified against a real concurrent transaction rather than reasoned
     // about: the ensure's `DO UPDATE` touch locks the row, and the sweep's
@@ -950,10 +951,10 @@ async fn an_uncommitted_enqueue_is_not_swept_out_from_under_its_own_task() {
 
 #[tokio::test]
 async fn the_per_tick_batch_budget_is_enforced_and_the_next_tick_drains_the_rest() {
-    // The bounded budget stops the first sweep of a table that grew for months
-    // from turning one janitor tick into an open-ended delete loop holding a
-    // pooled connection. Without the cap this test's first tick would collect
-    // all of them.
+    // A table can grow for months before its first sweep. The bounded budget
+    // keeps that sweep from turning one janitor tick into an open-ended
+    // delete loop that holds a pooled connection. Without the cap this test's
+    // first tick would collect all of them.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -992,8 +993,8 @@ async fn a_bucket_with_an_operator_written_baseline_is_retained() {
     // `POST /admin/rate-limits/{key}` writes a PERMANENT baseline straight onto
     // the row and validates nothing against the registry, so an operator can
     // clamp a per-tenant key with it. Collecting such a row would silently
-    // revert the clamp to the code-declared rate the next time that tenant
-    // appeared — the same intent-destruction the live-override guard prevents.
+    // revert the clamp to the code-declared rate when that tenant next
+    // appears. The live-override guard prevents the same loss of intent.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1025,9 +1026,9 @@ async fn a_bucket_with_an_operator_written_baseline_is_retained() {
 
 #[tokio::test]
 async fn an_uncommitted_debit_is_not_swept_out_from_under_the_dispatch_that_made_it() {
-    // The sweep must never take a bucket a concurrent claim/dispatch is
-    // debiting: it would delete a row mid-transaction and leave that dispatch's
-    // accounting pointing at nothing.
+    // The sweep must never take a bucket that a concurrent claim/dispatch is
+    // debiting. It would delete a row mid-transaction. That dispatch's
+    // accounting would then point at nothing.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1064,10 +1065,10 @@ async fn an_uncommitted_debit_is_not_swept_out_from_under_the_dispatch_that_made
 
 #[tokio::test]
 async fn a_slowly_refilling_bucket_below_burst_is_retained() {
-    // The realistic shape of the partial-drain guard: a positive (production-
-    // legal) refill rate so low that a bucket idle well past the window is
-    // still below burst. Collecting it would reset `tokens = burst` and hand
-    // the tenant a full bucket it had not earned.
+    // The realistic shape of the partial-drain guard. The refill rate is
+    // positive and production-legal, but so low that a bucket idle well past
+    // the window is still below burst. Collecting it would reset
+    // `tokens = burst` and hand the tenant a full bucket it had not earned.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1094,10 +1095,10 @@ async fn a_slowly_refilling_bucket_below_burst_is_retained() {
 
 #[tokio::test]
 async fn re_ensuring_a_live_bucket_never_disturbs_its_pacing_state() {
-    // The registration touch writes `last_registered_at` and nothing else: a
-    // partially drained bucket keeps its tokens, its declared rate/burst, and
-    // the operator-facing `updated_at` stamp that answers "when was this limit
-    // last changed".
+    // The registration touch writes `last_registered_at` and nothing else. A
+    // partially drained bucket keeps its tokens and its declared rate/burst.
+    // It also keeps the operator-facing `updated_at` stamp that answers "when
+    // was this limit last changed".
     let (url, _c) = setup_db().await;
     let _pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1127,9 +1128,9 @@ async fn re_ensuring_a_live_bucket_never_disturbs_its_pacing_state() {
 #[tokio::test]
 async fn the_throttle_path_registers_through_the_same_interlocked_statement() {
     // `throttle::ensure_throttle_bucket` delegates to
-    // `queue::ensure_rate_limit_bucket`; a second copy of the statement there
-    // would silently miss the touch, and a deferred start whose bucket was
-    // collected mid-flight can never debit a token again.
+    // `queue::ensure_rate_limit_bucket`. A second copy of the statement there
+    // would silently miss the touch. A deferred start whose bucket was
+    // collected mid-flight could then never debit a token again.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1167,14 +1168,13 @@ async fn the_throttle_path_registers_through_the_same_interlocked_statement() {
 
 #[tokio::test]
 async fn the_throttle_backlog_append_path_also_interlocks_the_bucket() {
-    // Codex review round 1, P1. `reserve_or_defer`'s FIFO fast path used to
-    // skip `ensure_throttle_bucket` whenever a backlog already existed, so the
-    // append path touched the bucket not at all: an observed backlog row that
-    // the scanner drops between the check and the insert leaves the sweep
-    // seeing an idle, full, dependent-free bucket — and the pending row that
-    // commits a moment later references a bucket that no longer exists.
-    // `fire_claimed_throttle_row` fails closed on a missing bucket, so that
-    // start sits deferred forever.
+    // `reserve_or_defer`'s FIFO fast path used to skip `ensure_throttle_bucket`
+    // whenever a backlog already existed. So the append path did not touch the
+    // bucket at all. Suppose the scanner drops an observed backlog row between
+    // the check and the insert. The sweep then sees an idle, full,
+    // dependent-free bucket. The pending row that commits a moment later
+    // references a bucket that no longer exists. `fire_claimed_throttle_row`
+    // fails closed on a missing bucket, so that start sits deferred forever.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1240,11 +1240,10 @@ async fn the_throttle_backlog_append_path_also_interlocks_the_bucket() {
 
 #[tokio::test]
 async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
-    // Codex review round 1, P2. A preview deletes nothing, so without a keyset
-    // cursor it re-reads its first batch forever and can only ever forecast
-    // `batch_size` — against a real pass that spends the whole per-tick budget.
-    // An operator derisking a 50k-row tick by previewing 1k of it is being
-    // misled by exactly the tool meant to prevent that.
+    // A preview deletes nothing. Without a keyset cursor it re-reads its first
+    // batch forever and can only forecast `batch_size`. A real pass spends the
+    // whole per-tick budget. An operator who previews 1k rows of a 50k-row tick
+    // is then misled by exactly the tool meant to prevent that.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1286,11 +1285,11 @@ async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
 
 #[tokio::test]
 async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() {
-    // Codex review round 4, P2. The sweep now pages by a keyset cursor instead
-    // of restarting its ordered scan every batch, so a retained prefix is walked
-    // once per tick rather than once per batch. The risk that buys is a paging
-    // bug: a cursor that advances wrongly would skip collectable rows entirely,
-    // and the rows most exposed are the ones sorting AFTER a retained block.
+    // The sweep pages by a keyset cursor and does not restart its ordered scan
+    // every batch. So a retained prefix is walked once per tick, not once per
+    // batch. The risk that buys is a paging bug. A cursor that advances wrongly
+    // would skip collectable rows entirely. The rows most exposed are the ones
+    // sorting AFTER a retained block.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1328,14 +1327,14 @@ async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() 
 
 #[tokio::test]
 async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() {
-    // Codex review round 5, P2. The cursor's next page is `key > $3` evaluated
-    // in the DATABASE's collation, so the boundary has to be the page's last row
-    // in THAT order. Deriving it in Rust compares bytewise, and the two orders
-    // disagree under any locale-aware collation: bytewise `B` (0x42) precedes
-    // `a` (0x61), while `en-US-x-icu` puts `a` first. A boundary below the
-    // page's true end re-serves rows the previous page already returned — which
-    // in a dry run, where nothing is deleted, inflates the forecast and burns
-    // the per-tick budget re-counting the same keys.
+    // The cursor's next page is `key > $3`, evaluated in the DATABASE's
+    // collation. So the boundary has to be the page's last row in THAT order.
+    // Deriving it in Rust compares bytewise. The two orders disagree under any
+    // locale-aware collation: bytewise `B` (0x42) precedes `a` (0x61), while
+    // `en-US-x-icu` puts `a` first. A boundary below the page's true end
+    // re-serves rows the previous page already returned. In a dry run, where
+    // nothing is deleted, that inflates the forecast. It also burns the
+    // per-tick budget re-counting the same keys.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1355,9 +1354,8 @@ async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() 
     .await
     .is_ok();
 
-    // Gather while switched, restore, and only THEN assert: a panic with the
-    // column still in a collation the rest of this file did not ask for would
-    // leak into every test that runs after it.
+    // Gather while switched, restore, and only THEN assert. A panic with the
+    // column still in the switched collation would leak into every later test.
     let outcome = if switched {
         let config = RetentionConfig {
             dry_run: true,
@@ -1391,7 +1389,7 @@ async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() 
 }
 
 // ---------------------------------------------------------------------------
-// Upgrade safety — the migration's two backfills (Codex review round 2, P1s)
+// Upgrade safety — the migration's two backfills
 // ---------------------------------------------------------------------------
 
 /// The migration's backfill statements, read from the migration itself so this
@@ -1458,9 +1456,9 @@ fn migration_statements() -> Vec<String> {
 
 /// The lock profile itself, asserted against the migration text.
 ///
-/// Codex review round 3, P1: the grace must come from the column default, and
-/// no statement in this migration may rewrite the whole bucket table while the
-/// ALTERs hold `ACCESS EXCLUSIVE` on it.
+/// The grace must come from the column default. No statement in this migration
+/// may rewrite the whole bucket table while the ALTERs hold `ACCESS EXCLUSIVE`
+/// on it.
 #[test]
 fn the_migration_grants_the_grace_without_rewriting_the_bucket_table() {
     let statements = migration_statements();
@@ -1512,11 +1510,11 @@ async fn make_pre_upgrade(conn: &mut AsyncPgConnection, key: &str) {
 
 #[tokio::test]
 async fn the_migration_preserves_an_operator_baseline_that_predates_the_column() {
-    // Codex review round 2, P1. `POST /admin/rate-limits/{key}` accepts any key
-    // and validates nothing against the registry, so an operator may already
-    // have clamped a per-tenant key before this release. Without the backfill
-    // that intent is indistinguishable from an ordinary bucket, and the first
-    // sweep after upgrade reverts the clamp to the code-declared rate.
+    // `POST /admin/rate-limits/{key}` accepts any key and validates nothing
+    // against the registry. So an operator may already have clamped a
+    // per-tenant key before this release. Without the backfill, that intent is
+    // indistinguishable from an ordinary bucket. The first sweep after upgrade
+    // then reverts the clamp to the code-declared rate.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1559,9 +1557,9 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
             .expect("run the migration backfill");
     }
 
-    // A real upgrade would stamp both rows through the ADD COLUMN default; set
-    // them old here so this test isolates what the operator-intent backfill
-    // decides (the grace itself is covered by the test above).
+    // A real upgrade would stamp both rows through the ADD COLUMN default.
+    // Set them old here, so this test isolates the operator-intent backfill.
+    // The test above covers the grace itself.
     diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1 WHERE TRUE")
         .bind::<Timestamptz, _>(old)
         .execute(&mut conn)
@@ -1580,14 +1578,14 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
 
 #[tokio::test]
 async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace() {
-    // Codex review round 2, P1. The GC's interlock is taken by the WRITER, and
-    // a worker still running the previous binary does not take it — its dynamic
-    // enqueue is a bare `INSERT ... ON CONFLICT DO NOTHING` and its throttle
-    // backlog append ensured no bucket at all. But the janitor starts sweeping
-    // as soon as the first upgraded instance runs, so a rolling restart would
-    // otherwise have a new janitor collecting while old workers write
-    // unprotected. Stamping `last_registered_at` at migration time makes every
-    // pre-upgrade row ineligible for a full retention window.
+    // The WRITER takes the GC's interlock. A worker that still runs the
+    // previous binary does not take it. Its dynamic enqueue is a bare
+    // `INSERT ... ON CONFLICT DO NOTHING`, and its throttle backlog append
+    // ensured no bucket at all. But the janitor starts sweeping as soon as the
+    // first upgraded instance runs. So during a rolling restart a new janitor
+    // would collect while old workers write unprotected. Stamping
+    // `last_registered_at` at migration time makes every pre-upgrade row
+    // ineligible for a full retention window.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1601,10 +1599,10 @@ async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace(
     // exercises the catalog-only default path an operator actually runs —
     // stamping rows that already exist — rather than a paraphrase of it.
     //
-    // Everything that can fail is resolved BEFORE the column is dropped, and the
-    // window between the drop and the re-add contains no assertion: a panic in
-    // there would leave the shared test database without a column every other
-    // test in this file needs, turning one failure into a cascade.
+    // Everything that can fail is resolved BEFORE the column is dropped. The
+    // window between the drop and the re-add contains no assertion. A panic
+    // there would leave the shared test database without a column that every
+    // other test in this file needs. One failure would become a cascade.
     let ddl = migration_last_registered_at_ddl();
     assert_eq!(
         ddl.len(),
@@ -1703,11 +1701,11 @@ async fn the_sweep_is_shard_local() {
 
 #[tokio::test]
 async fn a_shard_whose_sweep_fails_reports_the_failure_instead_of_a_silent_zero() {
-    // A permanently-failing shard must not read as an idle one: without the
-    // reported error, `GET /admin/retention` would keep serving a zero while
-    // that shard's table grew unbounded — the exact bug the GC exists to fix,
-    // made invisible. (A missing DELETE grant on a least-privilege role is the
-    // realistic cause; an unreachable database is the reproducible one.)
+    // A permanently-failing shard must not read as an idle one. Without the
+    // reported error, `GET /admin/retention` would keep serving a zero. That
+    // shard's table would meanwhile grow unbounded, the bug the GC exists to
+    // fix, made invisible. (A missing DELETE grant on a least-privilege role
+    // is the realistic cause; an unreachable database is the reproducible one.)
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;

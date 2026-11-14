@@ -5,11 +5,12 @@
 //! partition by execution id. The shared claim loop takes activities only. Each test
 //! runs on its own database, because owner mode is a per-database switch.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::decision_owner::{self, DecisionPartition, EnableOwnerMode};
+use autumn_harvest::decision_owner::{self, DecisionPartition, EnableOwnerMode, OwnerKey};
+use autumn_harvest::notify::{OwnerWakeListener, OwnerWakeWait};
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::{ClaimKind, MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::ExecutionId;
@@ -525,7 +526,6 @@ async fn a_due_timer_fires_through_the_owner_scan() {
     db.drop_db().await;
 }
 
-/// Seed one execution and its workflow task.
 async fn seed_task(
     conn: &mut AsyncPgConnection,
     queue: &str,
@@ -893,6 +893,13 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
         live_partitions(&mut conn).await == 512
     })
     .await;
+    // The wake task listens on a partition only after its lease. It sends
+    // one LISTEN per partition, so it can lag the leases. A wake before the
+    // LISTEN is lost, and the owner then learns of the run from a scan.
+    eventually("the owner listens on every partition", async || {
+        listens_on_every_partition(&node.worker)
+    })
+    .await;
     // A slow run holds the one permit. The backlog and the high-priority run
     // arrive behind it, as wakes. The next take frees the best of them.
     let slow = DeciderSlowStub::start_with_options(
@@ -912,13 +919,20 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
         running_workflow_tasks(&mut conn, &queue).await == 1
     })
     .await;
+    // The notify sender sends an owner wake after the commit of a start. A
+    // start returns before that send. So the test listens on the channels of
+    // the owner, and waits for each wake.
+    let mut wakes = OwnerWakeListener::connect(&db.url).await.expect("listen");
     let mut normal = Vec::new();
     for _ in 0..8 {
-        normal.push(start_instant(&mut conn, &client, &queue, None).await);
+        normal.push(start_instant(&mut conn, &client, &queue, None, &mut wakes).await);
     }
-    let high = start_instant(&mut conn, &client, &queue, Some(Priority::High)).await;
-    // Free the permit at once, while the key lookups of the hints may still
-    // run. A ready row of lower rank must not take the permit first.
+    wait_for_wakes(&mut wakes, &normal).await;
+    let high = start_instant(&mut conn, &client, &queue, Some(Priority::High), &mut wakes).await;
+    wait_for_wakes(&mut wakes, &[high]).await;
+    // The owner has the wake of each run now. Free the permit at once, while
+    // the key lookup of the high-priority hint may still run. A ready row of
+    // lower rank must not take the permit first.
     SLOW_GATE.notify_one();
     wait_for_execution_state_with_timeout(&db.url, slow, "COMPLETED", WAIT).await;
     for exec in normal.iter().copied().chain([high]) {
@@ -926,22 +940,46 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     }
     node.stop().await;
     let first = first_started(&mut conn, &queue).await;
-    assert_eq!(first, high.as_uuid(), "the high-priority run decides first");
+    if first != high.as_uuid() {
+        let dump = workflow_task_dump(&mut conn, &queue).await;
+        panic!(
+            "the high-priority run decides first: first {first}, high {high:?}, slow {slow:?}\n{dump}"
+        );
+    }
     assert_eq!(node.claims.count(ClaimKind::Workflow), 0, "all by take");
     db.drop_db().await;
 }
 
-/// Start one instant run on `queue`.
+/// Whether the owner wake task of `worker` listens on every partition.
+fn listens_on_every_partition(worker: &Worker) -> bool {
+    (0..decision_owner::DECISION_PARTITIONS)
+        .filter_map(DecisionPartition::new)
+        .all(|partition| {
+            worker.owner_wake_listening(OwnerKey {
+                shard: OwnerKey::pool_shard(None),
+                partition,
+            })
+        })
+}
+
+/// Start one instant run on `queue`. `wakes` listens on the channel of its
+/// owner before the start, so the owner wake of the run reaches it.
 async fn start_instant(
     conn: &mut AsyncPgConnection,
     client: &WorkflowHandleClient,
     queue: &str,
     priority: Option<Priority>,
+    wakes: &mut OwnerWakeListener,
 ) -> ExecutionId {
+    let workflow_id = unique("decider-instant-wf");
+    wakes
+        .listen(DecisionPartition::for_workflow_id(&workflow_id))
+        .await
+        .expect("listen");
     DeciderInstantStub::start_with_options(
         conn,
         client,
-        &unique("decider-instant-wf"),
+        &workflow_id,
         String::new(),
         TypedStartOptions {
             queue_name: Some(queue.to_string()),
@@ -952,6 +990,25 @@ async fn start_instant(
     .await
     .expect("start")
     .exec_id()
+}
+
+/// Wait until `wakes` has the owner wake of each run of `execs`, up to
+/// [`WAIT`]. Postgres sends a `NOTIFY` to every listener of its channel at
+/// once, so the owner gets the same wake.
+async fn wait_for_wakes(wakes: &mut OwnerWakeListener, execs: &[ExecutionId]) {
+    let mut left: HashSet<uuid::Uuid> = execs.iter().map(ExecutionId::as_uuid).collect();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !left.is_empty() {
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match wakes.wait(wait).await {
+            OwnerWakeWait::Woken(wake) => {
+                left.remove(&wake.payload.workflow_exec_id);
+            }
+            OwnerWakeWait::TimedOut | OwnerWakeWait::ChannelClosed => {
+                panic!("no owner wake for {left:?}")
+            }
+        }
+    }
 }
 
 /// The workflow tasks of `queue` that run now.
@@ -974,6 +1031,30 @@ struct Started {
 }
 
 /// The run whose workflow task started second on `queue`, after the slow run.
+/// One text row.
+#[derive(QueryableByName)]
+struct Dump {
+    #[diesel(sql_type = Text)]
+    dump: String,
+}
+
+/// The workflow tasks of `queue` in start order, one line each. A failed order
+/// assertion prints it, so a CI failure shows the order the owner took.
+async fn workflow_task_dump(conn: &mut AsyncPgConnection, queue: &str) -> String {
+    let row: Dump = diesel::sql_query(
+        "SELECT COALESCE(string_agg(format('%s state=%s prio=%s attempt=%s created=%s \
+         scheduled=%s started=%s completed=%s', workflow_exec_id, state, priority, attempt, \
+         created_at, scheduled_at, started_at, completed_at), E'\\n' \
+         ORDER BY started_at NULLS LAST, id), '') AS dump \
+         FROM harvest_task_queue WHERE queue_name = $1 AND task_type = 'workflow'",
+    )
+    .bind::<Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("task dump");
+    row.dump
+}
+
 async fn first_started(conn: &mut AsyncPgConnection, queue: &str) -> uuid::Uuid {
     let row: Started = diesel::sql_query(
         "SELECT workflow_exec_id AS exec FROM harvest_task_queue \

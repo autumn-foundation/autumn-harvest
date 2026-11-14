@@ -2,14 +2,13 @@
 //! to do** (issue #797, AC3).
 //!
 //! The pure tests in `scanner_liveness_tests.rs` cover the registry and the
-//! staleness policy. This file covers the property that actually
-//! distinguishes issue #797 from the metrics that came before it: a scanner
-//! pass that finds *nothing* still emits `harvest.scanner.tick` and still
-//! advances its liveness timestamp. Every pre-existing loop metric
-//! (`harvest.retention.deleted`, `harvest.schedule.fire_attempts`, the
-//! timeout/SLA/quarantine counters) emits only when there is work, which is
-//! exactly why a wedged loop was previously indistinguishable from an idle
-//! one.
+//! staleness policy. This file covers the property that sets issue #797 apart
+//! from the earlier metrics. A scanner pass that finds *nothing* still emits
+//! `harvest.scanner.tick` and still advances its liveness timestamp. Every
+//! pre-existing loop metric (`harvest.retention.deleted`,
+//! `harvest.schedule.fire_attempts`, the timeout/SLA/quarantine counters)
+//! emits only when there is work. That is why a wedged loop was
+//! indistinguishable from an idle one.
 //!
 //! Requires a database, because the no-work path runs the real
 //! `enforce_timeouts_once` sub-passes against a real (empty) schema.
@@ -95,12 +94,12 @@ const OWNED: [Scanner; 3] = [Scanner::Timeout, Scanner::Sla, Scanner::ExternalOu
 /// **process-global** scanner registry.
 ///
 /// These tests assert on registration-count *deltas* (`before` vs `after`)
-/// around a spawn/drain, which is only sound if no sibling test registers or
+/// around a spawn/drain. That is sound only if no sibling test registers or
 /// deregisters the same `Scanner` in between. CI runs this suite with
-/// `--test-threads=1`, but that is a property of the runner invocation, not of
-/// the tests: a developer running `cargo test ... scanner_tick_db_tests`
-/// locally gets the default parallel harness and would see genuine flakes.
-/// Correctness should not depend on a CLI flag, so the guard lives here.
+/// `--test-threads=1`, but that is a property of the runner, not of the tests.
+/// A local `cargo test ... scanner_tick_db_tests` uses the default parallel
+/// harness and, without this guard, would see genuine flakes. Correctness must
+/// not depend on a CLI flag, so the guard lives here.
 ///
 /// Mirrors the `TEST_SERIAL` precedent in `completion_callback_tests.rs`,
 /// which guards the same class of process-global state.
@@ -132,9 +131,11 @@ impl MetricsRecorder for TickRecorder {
     }
 }
 
-/// AC3, the headline property, through a **real spawned loop**: a pass over a
-/// completely empty database — zero timed-out tasks, zero SLA breaches, zero
-/// outbox rows — still emits a tick for every scanner the loop owns.
+/// AC3, the headline property, through a **real spawned loop**.
+///
+/// A pass over a completely empty database still emits a tick for every
+/// scanner the loop owns. The database has zero timed-out tasks, zero SLA
+/// breaches and zero outbox rows.
 #[tokio::test]
 async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
     // Serialize against sibling tests that touch the process-global registry;
@@ -165,8 +166,8 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
         0,
     );
 
-    // Poll (bounded) rather than sleeping a fixed span: fast when the loop is
-    // healthy, and a clear timeout rather than a flake when it is not.
+    // Poll (bounded), not a fixed sleep: fast when the loop is healthy, and a
+    // clear timeout, not a flake, when it is not.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let ticks = recorder.ticks();
@@ -214,10 +215,9 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
     let _ = handle.await;
 
     // A *graceful* stop releases this loop's own registration for every scanner
-    // it owns, so draining a worker while keeping the API up does not leave
-    // phantom scanners aging into `Wedged`. Asserted by refcount delta rather
-    // than by absence, because other tests in this binary may hold their own
-    // concurrent registrations.
+    // it owns. So a drained worker with the API still up leaves no phantom
+    // scanners aging into `Wedged`. Asserted by refcount delta, not absence.
+    // Other tests in this binary may hold their own concurrent registrations.
     for (scanner, before) in OWNED.iter().zip(&held_before) {
         assert_eq!(
             global_scanner_liveness().registrations(*scanner),
@@ -231,9 +231,8 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
 ///
 /// `enforce_timeouts_once` is `pub` and driven directly by ~40 tests and by
 /// embedders. If it recorded ticks, a hand-driven call would fabricate a
-/// scanner the process is not actually running — which would then age into
-/// `Wedged` and report a phantom outage. Liveness is owned by the loop that
-/// spawns it, never by the pass it drives.
+/// scanner the process is not running. That scanner would age into `Wedged`
+/// and report a phantom outage. The loop that spawns the pass owns liveness, never the pass.
 #[tokio::test]
 async fn enforce_timeouts_once_records_no_scanner_ticks() {
     // Serialize against sibling tests that touch the process-global registry;
@@ -374,10 +373,10 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
         before + 1,
         "the loop must register itself at spawn time, before its first iteration"
     );
-    // Issue #797, Codex review: the shard the spawner was given must survive
-    // into the snapshot, so `scanner_liveness` can name the unprotected
-    // database on a multi-shard worker. Asserted through a REAL spawner rather
-    // than a hand-built registry, so the plumbing is covered end to end.
+    // Issue #797: the shard the spawner was given must survive into the
+    // snapshot. Then `scanner_liveness` can name the unprotected database on a
+    // multi-shard worker. Asserted through a REAL spawner, not a hand-built
+    // registry, so the plumbing is covered end to end.
     assert!(
         global_scanner_liveness()
             .snapshot()
@@ -526,16 +525,15 @@ fn a_wedged_loop_is_detected_within_two_poll_intervals_of_its_threshold() {
 /// `timeout` and `poison_pill` are `pub mod`s, so `spawn_timeout_checker` and
 /// `spawn_poison_pill_reclaimer` are reachable public API that an embedder
 /// running its own worker loop may call directly. Issue #797 needed a shard to
-/// label the loop in the `scanner_liveness` check, but adding it as a mandatory
-/// argument would have broken every such caller for an observability feature
-/// they never asked for. The shard-aware variants are additive siblings
-/// (`*_for_shard`) and these two keep their original argument lists.
+/// label the loop in the `scanner_liveness` check. A mandatory argument would
+/// break every such caller for an observability feature they never asked for. The
+/// shard-aware variants are additive siblings (`*_for_shard`). These two keep
+/// their original argument lists.
 ///
-/// This is a **compile-time** assertion: coercing each function to a fn pointer
-/// of its exact expected type fails to build if any argument is added, removed,
-/// or reordered. It needs no database to be meaningful -- it is checked by
-/// `cargo clippy -p autumn-harvest --all-features --tests`, which CI runs on
-/// every push.
+/// This is a **compile-time** assertion. Each function is coerced to a fn
+/// pointer of its exact expected type. The build fails if any argument is
+/// added, removed, or reordered. It needs no database. CI checks it on every
+/// push with `cargo clippy -p autumn-harvest --all-features --tests`.
 #[test]
 fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
     type TimeoutCheckerFn = fn(

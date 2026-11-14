@@ -55,7 +55,6 @@ use crate::integration_e2e::{
 /// The fake model id that every step records.
 const MODEL: &str = "test-model-1";
 
-/// The step activity name.
 const STEP: &str = "llm_budget_step";
 
 /// Building a registry rewrites the process-global workflow metadata. Tests

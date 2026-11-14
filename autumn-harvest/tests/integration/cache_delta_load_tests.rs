@@ -8,10 +8,9 @@
 //! 1. A cold task (no cache entry) performs a full history reload from Postgres.
 //! 2. A warm task (cache entry present) performs only a delta reload — fetching
 //!    the events appended *since* the last suspension rather than all events.
-//! 3. With sticky routing *on*, a workflow that suspends N times and stays on
-//!    the same worker incurs exactly 1 full history reload (the very first task)
-//!    and `N-1` cheap delta reloads — matching the acceptance criterion of
-//!    ≤ 1 full reload across N follow-up tasks.
+//! 3. With sticky routing *on*, a workflow that suspends N times on one worker
+//!    incurs 1 full reload (the first task) and `N-1` delta reloads. That
+//!    meets the criterion of ≤ 1 full reload across N tasks.
 //! 4. With sticky routing *off* (empty cache), every task incurs a full reload,
 //!    giving ≈ N full reloads for N tasks on the same execution.
 //!
@@ -265,13 +264,11 @@ async fn warm_path_delta_load_reads_only_new_events() {
     );
 }
 
-/// Acceptance criterion: sticky routing ON (warm cache) → ≤ 1 full reload for
-/// N follow-up tasks; sticky routing OFF (no cache) → ≈ N full reloads.
+/// Sticky routing ON (warm cache) gives ≤ 1 full reload for N follow-up tasks.
+/// Sticky routing OFF (no cache) gives ≈ N full reloads.
 ///
-/// This test directly exercises the claim from issue #235 AC9:
-///   "a workflow that emits at least 50 history events sees its event-history
-///    reload count drop to ≤ 1 across N follow-up tasks once sticky routing is
-///    enabled, vs. ≈ N reloads with sticky routing off."
+/// Issue #235 AC9 makes this claim for a workflow that emits at least 50
+/// history events.
 #[tokio::test]
 async fn sticky_routing_on_vs_off_reload_count() {
     const INITIAL_EVENTS: usize = 50;

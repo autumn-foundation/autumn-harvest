@@ -1,14 +1,13 @@
 //! HTTP integration tests for the tiered/summary retention list route (issue #752).
 //!
 //! Exercises `GET /workflows/summaries` end-to-end (list, filter, keyset
-//! pagination, admin guard) plus the AC6 interaction: erasing a
-//! summary-only execution (whose full execution row was already
-//! retention-deleted) succeeds (200) and tombstones the summary's captured
-//! `result`/`search_attrs`.
+//! pagination, admin guard). It also covers the AC6 interaction. Retention
+//! already deleted the full row of a summary-only execution. Erasing it
+//! succeeds (200) and tombstones the summary's captured `result`/`search_attrs`.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (run this file `--test-threads=1`, since the tests scrub
-//! shared tables); otherwise a fresh testcontainers Postgres is booted with
+//! against it directly. Run this file with `--test-threads=1`, since the tests
+//! scrub shared tables. Otherwise a fresh testcontainers Postgres boots with
 //! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
@@ -270,18 +269,15 @@ async fn list_applies_filters() {
     )
     .await;
 
-    // Filter by workflow_name.
     let (status, body) = get_json(&app, "/workflows/summaries?workflow_name=billing", true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["summaries"].as_array().unwrap().len(), 2, "{body}");
 
-    // Filter by state.
     let (_, body) = get_json(&app, "/workflows/summaries?state=FAILED", true).await;
     let items = body["summaries"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["workflow_id"], json!("b-2"));
 
-    // Filter by search_attr containment.
     let (_, body) = get_json(&app, "/workflows/summaries?search_attr=tenant:globex", true).await;
     let items = body["summaries"].as_array().unwrap();
     assert_eq!(items.len(), 1);
@@ -380,9 +376,9 @@ async fn list_paginates_with_keyset_cursor() {
     }
 }
 
-// AC4 (tie-break): summaries sharing an identical `completed_at` still page
-// exactly once across the boundary via the `execution_id` keyset tie-break —
-// no drop, no dup (issue #752 review, FIX G).
+// AC4 (tie-break): summaries with an identical `completed_at` still page
+// exactly once across the boundary. The `execution_id` keyset tie-break
+// prevents a drop or a dup (issue #752).
 #[tokio::test]
 async fn list_paginates_across_identical_completed_at() {
     let (url, _c) = setup_database().await;

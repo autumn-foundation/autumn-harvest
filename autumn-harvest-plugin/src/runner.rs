@@ -132,13 +132,12 @@ impl HarvestRunnerResources {
     /// Declare that the boot-time orphaned-workflow-type gate has **already
     /// been run** by the caller, so [`HarvestRunner::start`] skips it.
     ///
-    /// [`HarvestRunner::start`] runs the gate itself (issue #1128), which is
-    /// what a standalone embedder wants: the fail-fast is automatic. The
-    /// `HarvestPlugin` boot path, however, runs the very same gate *earlier* —
-    /// before it publishes any process-global admission state — so that an
-    /// abort has nothing at all to unwind (issue #700 AC4). This marker keeps
-    /// that path from paying for a second identical scan and logging a second
-    /// identical warning.
+    /// [`HarvestRunner::start`] runs the gate itself (issue #1128), so a
+    /// standalone embedder gets the fail-fast automatically. The
+    /// `HarvestPlugin` boot path runs the same gate *earlier*, before it
+    /// publishes any process-global admission state. So an abort has nothing
+    /// to unwind (issue #700 AC4). This marker stops a second identical scan
+    /// and a second identical warning.
     ///
     /// An embedder driving its own custom boot sequence can use it for the same
     /// reason, having called [`run_startup_orphan_gate`] itself.
@@ -209,11 +208,11 @@ enum RuntimePoolSource<'a> {
 ///
 /// A runner-level `resources.sharded_pool` override wins, then a
 /// `WorkerConfig::with_sharded_pool` carried on the build, then the single
-/// `harvest_pool`. Pure SELECTION — installs no process global. Both the
-/// install path ([`resolve_runtime_storage_pool`]) and both read paths
-/// ([`select_runtime_gate_shards`], which the boot gate uses, and
-/// [`select_runtime_shard0_pool`]) route through it, so the
-/// `sharded_pool`-over-`harvest_pool` precedence can never drift between the
+/// `harvest_pool`. Pure SELECTION — installs no process global.
+///
+/// The install path ([`resolve_runtime_storage_pool`]) routes through it. So
+/// do both read paths: [`select_runtime_gate_shards`] for the boot gate, and
+/// [`select_runtime_shard0_pool`]. So the precedence cannot drift between the
 /// gate and the runner.
 const fn pick_runtime_pool_source<'a>(
     resources_sharded_pool: Option<&'a ShardedDbPool>,
@@ -238,14 +237,15 @@ const fn pick_runtime_pool_source<'a>(
 /// pool was constructed last — not the one this function's precedence selects.
 /// Build a multi-shard `HarvestRunnerResources::sharded_pool` and then a
 /// single-shard `WorkerConfig::with_sharded_pool`, and the global is left
-/// single-shard while the runtime runs multi-shard. Every consumer of the
-/// global then reads a pool the runtime is not using: the by-id fan-out, the
-/// timeout sweeps, completion triggers, and — the reason this was found —
-/// `external_target_location::deployment_is_multi_shard`, which would answer
-/// "single shard" and re-open issue #1146 on the inline path, recording a
-/// permanent `not_running` against a target that is running on another shard.
+/// single-shard while the runtime runs multi-shard.
+///
+/// Every consumer of the global then reads a pool the runtime is not using.
+/// Examples are the by-id fan-out, the timeout sweeps and completion triggers.
+/// `external_target_location::deployment_is_multi_shard` would answer "single
+/// shard" and re-open issue #1146 on the inline path. It would record a
+/// permanent `not_running` against a target that runs on another shard.
 /// Re-installing the selected pool makes the global agree with the effective
-/// topology for all of them (issue #1146 review).
+/// topology for all of them (issue #1146).
 ///
 /// The boot-time orphaned-workflow gate must NOT call this — an aborting gate
 /// must mutate no process global (issue #700 P4). It uses
@@ -282,11 +282,10 @@ pub fn resolve_runtime_storage_pool(
 /// read), or returns the `harvest_pool` handle directly — it never calls
 /// `ShardedDbPool::single`/`from_map`.
 ///
-/// This is the **single-shard** read selector. The boot-time orphaned-workflow
-/// gate read through it until issue #1128 made the gate cross-shard; it now uses
-/// [`select_runtime_gate_shards`], which enumerates every shard under the same
-/// precedence and the same no-install guarantee. Retained as public API — and
-/// exercised by `tests/gate_no_global_install.rs` — for callers that want only
+/// This is the **single-shard** read selector. Since issue #1128 the boot gate
+/// uses [`select_runtime_gate_shards`], which enumerates every shard under the
+/// same precedence and the same no-install guarantee. This stays public API,
+/// exercised by `tests/gate_no_global_install.rs`, for callers that want only
 /// shard 0.
 #[must_use]
 pub fn select_runtime_shard0_pool(
@@ -307,25 +306,24 @@ pub fn select_runtime_shard0_pool(
 /// Enumerate the shards the boot-time orphaned-workflow gate must inspect, as
 /// `shard id -> that shard's pool` (issue #1128).
 ///
-/// Honors the same pool precedence as [`resolve_runtime_storage_pool`] (both
-/// route through [`pick_runtime_pool_source`], the single source of truth), so
-/// the gate reads the databases the workers will actually poll — issue #700's
-/// P2 guarantee, now for every shard rather than only shard 0.
+/// Honors the same pool precedence as [`resolve_runtime_storage_pool`]. Both
+/// route through [`pick_runtime_pool_source`]. So the gate reads the databases
+/// the workers will poll, for every shard (issue #700 P2).
 ///
 /// **Installs no process global** (issue #700 P4). It reads each shard's pool
 /// from an already-constructed [`ShardedDbPool`], or returns the `harvest_pool`
-/// handle as shard 0; it never calls `ShardedDbPool::single`/`from_map`, so an
+/// handle as shard 0. It never calls `ShardedDbPool::single`/`from_map`. So an
 /// aborting gate leaves `GLOBAL_SHARDED_POOL` exactly as it found it.
 ///
-/// A shard the `router` names (readable, or the default) but for which this
-/// process has no pool maps to `None`: the report then marks it `unavailable`
-/// and its status degrades to `partial`, which
-/// [`startup_orphan_decision`] turns into a warning rather than an abort. That
-/// mirrors [`crate::shard_fanout::expected_shards`] — omitting the shard
-/// instead would let the gate claim a `complete` inspection of a fleet whose
-/// shard it never queried. (`PreparedHarvestRuntime::build` rejects that
-/// router/pool pair a moment later anyway, so this only ever converts a
-/// would-be abort into a warning followed by a hard startup error.)
+/// A shard the `router` names (readable, or the default) can have no pool in
+/// this process. It maps to `None`. The report marks it `unavailable`, and the
+/// status degrades to `partial`. [`startup_orphan_decision`] turns that into
+/// a warning, not an abort. That mirrors
+/// [`crate::shard_fanout::expected_shards`]. An omitted shard would let the
+/// gate claim a `complete` inspection of a fleet it never fully queried.
+/// `PreparedHarvestRuntime::build` rejects that router/pool pair a moment
+/// later anyway. So this only turns a would-be abort into a warning and then
+/// a hard startup error.
 #[must_use]
 pub fn select_runtime_gate_shards(
     resources_sharded_pool: Option<&ShardedDbPool>,
@@ -360,15 +358,15 @@ pub fn select_runtime_gate_shards(
 /// Reject classic (non-unified) DAGs — pure configuration validation, run
 /// before anything with a side effect.
 ///
-/// It lived inside `PreparedHarvestRuntime::build` until issue #1128 put the
-/// boot-time orphan gate ahead of `build`. Two reasons to hoist it rather than
-/// leave it behind the gate:
+/// Issue #1128 put the boot-time orphan gate ahead of
+/// `PreparedHarvestRuntime::build`. This check runs before the gate too, for
+/// two reasons:
 ///
 /// 1. **Diagnostics.** `registered_workflow_type_names` counts only *unified*
-///    DAGs, so a classic-DAG build's in-flight runs read as orphans and, under
-///    `orphaned_workflows = "fail"`, the operator would get an orphan refusal
-///    for what is really an unsupported-configuration error. Boot is refused
-///    either way; this decides which message they see.
+///    DAGs. So the in-flight runs of a classic-DAG build read as orphans.
+///    Under `orphaned_workflows = "fail"`, the operator would get an orphan
+///    refusal for an unsupported-configuration error. Boot is refused either
+///    way; this decides which message they see.
 /// 2. **Side effects.** Inside `build` this check ran *after*
 ///    `install_completion_callback_config`, so rejecting a configuration that
 ///    can never boot had already replaced a process-global. Run here, it
@@ -398,12 +396,13 @@ fn reject_classic_dags(built: &BuiltHarvest) -> autumn_web::AutumnResult<()> {
 /// names UNION unified-DAG names.
 ///
 /// The DAG half is load-bearing. A unified DAG's executions are stored with
-/// `workflow_name = <dag name>`, but `HandlerRegistry::workflows` does not carry
-/// DAG names — so a registered-set built from workflows alone would call every
-/// in-flight DAG run an orphan and refuse boot under `fail`. This replicates
-/// exactly the union
+/// `workflow_name = <dag name>`. `HandlerRegistry::workflows` does not carry
+/// DAG names. A set built from workflows alone would call every in-flight DAG
+/// run an orphan and refuse boot under `fail`.
+///
+/// This is the same union that
 /// [`build_workflow_reachability_report`](crate::workflow_reachability::build_workflow_reachability_report)
-/// makes from the started registry, so the boot gate and the management route
+/// makes from the started registry. So the boot gate and the management route
 /// classify the same names the same way.
 fn registered_workflow_type_names(built: &BuiltHarvest) -> BTreeSet<String> {
     built
@@ -432,42 +431,41 @@ fn registered_workflow_type_names(built: &BuiltHarvest) -> BTreeSet<String> {
 /// # Where it must run
 ///
 /// **Before any worker can claim a task.** Under `fail` + `worker_enabled`, a
-/// worker polling during the boot window would claim an orphaned-type execution
-/// and terminally fail it (no registered handler → `WorkflowFailed` + `FAILED`)
-/// *before* an after-the-fact abort tore the runtime down — defeating the very
-/// protection the gate exists to provide. Both callers run it before that is
-/// possible:
+/// worker polling during the boot window could claim an orphaned-type
+/// execution. With no registered handler it fails it terminally
+/// (`WorkflowFailed` + `FAILED`). That happens *before* an after-the-fact abort
+/// tears the runtime down, which defeats the gate. Both callers run it before
+/// that is possible:
 ///
-/// - [`HarvestRunner::start`] calls it as its first act after the pure
-///   configuration validation, and before
-///   `PreparedHarvestRuntime::build` — so an abort has installed no global
-///   router, no completion-callback config and no sharded pool, and synced no
-///   completion triggers.
-/// - the `HarvestPlugin` boot path calls it earlier still, before it publishes
-///   any admission global, and marks its resources with
-///   [`HarvestRunnerResources::with_startup_orphan_gate_already_run`] so this
+/// - [`HarvestRunner::start`] calls it right after the pure configuration
+///   validation, before `PreparedHarvestRuntime::build`. So an abort has
+///   installed no global router, completion-callback config or sharded pool,
+///   and synced no completion triggers.
+/// - The `HarvestPlugin` boot path calls it earlier still, before it publishes
+///   any admission global. It marks its resources with
+///   [`HarvestRunnerResources::with_startup_orphan_gate_already_run`], so this
 ///   runs exactly once per boot.
 ///
 /// # Read-only
 ///
 /// The check is a `GROUP BY workflow_name` over non-terminal executions and a
-/// pool *selection*; it writes no row and installs no process global, so an
+/// pool *selection*. It writes no row and installs no process global. So an
 /// aborted boot leaves the database and the process exactly as it found them.
 ///
 /// # Crash-loop safety
 ///
-/// A DB read failure is not an error here: it surfaces as an `unavailable`
+/// A DB read failure is not an error here. It surfaces as an `unavailable`
 /// shard, and [`startup_orphan_decision`] degrades an incomplete report to
-/// `Warn` — never `Abort`. A transient outage at boot can therefore never
-/// hard-fail startup, which matters because a boot loop has no human in it.
+/// `Warn`, never `Abort`. So a transient outage at boot never hard-fails
+/// startup. That matters because a boot loop has no human in it.
 ///
 /// # Public
 ///
-/// Exposed so an embedder driving its own custom boot sequence can run the
-/// check at whatever point in that sequence it needs to, then pass
-/// [`HarvestRunnerResources::with_startup_orphan_gate_already_run`] so
-/// [`HarvestRunner::start`] does not repeat it. That is exactly what the
-/// `HarvestPlugin` boot path does.
+/// An embedder with its own boot sequence can run the check at any point in
+/// it. It then passes
+/// [`HarvestRunnerResources::with_startup_orphan_gate_already_run`], so
+/// [`HarvestRunner::start`] does not repeat it. The `HarvestPlugin` boot path
+/// does exactly that.
 ///
 /// # Errors
 ///
@@ -499,22 +497,20 @@ pub async fn run_startup_orphan_gate(
 
     match startup_orphan_decision(action, report.orphaned, report.status) {
         StartupOrphanDecision::Continue => Ok(()),
-        // `startup_orphan_decision` returns `Warn` for two materially different
-        // situations, and they must not share a log line. An INCOMPLETE report
-        // warns regardless of `orphaned` — detection did not run everywhere — and
-        // on the multi-shard standalone path that is a routine case (one flaky
-        // shard), not the near-unreachable one it was on the plugin's single
-        // shard. Logging "orphaned workflow types detected" with an EMPTY list
-        // would either page an operator alerting on that string, or teach them to
-        // filter away the real detection.
+        // `startup_orphan_decision` returns `Warn` for two different situations,
+        // and they must not share a log line. An INCOMPLETE report warns
+        // regardless of `orphaned`, because detection did not run everywhere.
+        // On the multi-shard standalone path that is routine (one flaky shard).
+        // "orphaned workflow types detected" with an EMPTY list would page an
+        // operator who alerts on that string. Or it would teach them to filter
+        // away the real detection.
         //
-        // Codex round 1 (P2): key this on the report STATUS, not on whether any
-        // orphan happened to be seen. The mixed case — `fail`, an orphan found on
-        // a reachable shard, another shard unavailable — is exactly the one an
-        // operator most needs explained, and keying on `orphaned_types.is_empty()`
-        // sent it to the message below, which says nothing about the configured
-        // `fail` having been downgraded to a warning or about boot continuing.
-        // Status is also precisely what `startup_orphan_decision` keys on, so the
+        // Key this on the report STATUS, not on whether any orphan was seen.
+        // The mixed case is `fail`, an orphan on a reachable shard, and another
+        // shard unavailable. An operator most needs that case explained. A key on
+        // `orphaned_types.is_empty()` sent it to the message below. That message
+        // says nothing about the downgrade of `fail` to a warning, or about boot
+        // continuing. `startup_orphan_decision` also keys on status, so the
         // branch and the decision cannot disagree. The orphan details ride along,
         // so nothing is lost when some were found.
         StartupOrphanDecision::Warn if report.status != ReachabilityReportStatus::Complete => {
@@ -584,12 +580,11 @@ struct PreparedHarvestRuntime {
     history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
     /// Gets each aged event partition before the drop (issue #2009).
     partition_archiver: Option<Arc<dyn autumn_harvest::partition_archive::PartitionArchiver>>,
-    /// Secret-free effective-config snapshot (issue #695) captured here — the
-    /// single seam every `BuiltHarvest` consumer (the `HarvestPlugin` web-app
-    /// path and the standalone runner) funnels through — so it rides on the
-    /// resulting `HarvestApiRuntime` and is served by `GET /admin/config`
-    /// automatically, without a separate `set_effective_config` call the
-    /// integrator must remember.
+    /// Secret-free effective-config snapshot (issue #695).
+    ///
+    /// Every `BuiltHarvest` consumer funnels through this seam. So the snapshot
+    /// rides on the `HarvestApiRuntime`, and `GET /admin/config` serves it with
+    /// no separate `set_effective_config` call.
     effective_config: EffectiveConfigView,
     /// Held unpublished until `HarvestRunner::start` finishes every fallible
     /// step. Dropping this struct on an early return simply never publishes,
@@ -599,28 +594,12 @@ struct PreparedHarvestRuntime {
 
 /// Install the process-global completion-callback runtime config (issue #605).
 ///
-/// Extracted from `PreparedHarvestRuntime::build` so it sits alongside its
-/// audit-export sibling below; the reasoning is unchanged.
-// Install the process-global completion-callback runtime config
-// (issue #605): the deliverer/secret/allowlist/defaults/retry policy
-// the core scanner (`fire_due_completion_deliveries`) and enqueue
-// path (`enqueue_completion_deliveries`) read via
-// `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
-// `HarvestPlugin` web-app path and the standalone runner) funnels
-// through this one construction point, so this is set exactly once
-// regardless of which path started the runtime. Core ships no HTTP
-// client, so an embedder-supplied deliverer is used verbatim and a
-// `reqwest`-based default is substituted otherwise.
-// issue #605 code review: signing with an empty key is not a
-// silent no-op -- HMAC-SHA256 accepts any key length and
-// produces a valid, deterministic (and trivially
-// reproducible by anyone) signature, so a caller who never
-// configures `completion_callback_secret(...)` gets a
-// `X-Harvest-Signature` header that carries no real
-// authenticity guarantee at all. This is reachable for both
-// builder-default AND per-execution targets (the latter
-// bypass builder config entirely), so warn unconditionally
-// rather than only when default targets are configured.
+/// It holds the deliverer, secret, allowlist, defaults and retry policy. The
+/// core scanner (`fire_due_completion_deliveries`) and the enqueue path
+/// (`enqueue_completion_deliveries`) read it via `GLOBAL_CALLBACK_CONFIG`.
+/// Every `BuiltHarvest` consumer funnels through here, so it is set exactly
+/// once, whichever path started the runtime. Core ships no HTTP client. So an
+/// embedder-supplied deliverer is used verbatim, else a `reqwest` default.
 fn install_completion_callback_config(built: &BuiltHarvest) {
     let callback_config = built.completion_callback_config();
     let deliverer = callback_config
@@ -628,16 +607,12 @@ fn install_completion_callback_config(built: &BuiltHarvest) {
         .clone()
         .unwrap_or_else(|| Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new()));
     let secret = callback_config.secret.clone().unwrap_or_else(|| {
-        // issue #605 code review: signing with an empty key is not a
-        // silent no-op -- HMAC-SHA256 accepts any key length and
-        // produces a valid, deterministic (and trivially
-        // reproducible by anyone) signature, so a caller who never
-        // configures `completion_callback_secret(...)` gets a
-        // `X-Harvest-Signature` header that carries no real
-        // authenticity guarantee at all. This is reachable for both
-        // builder-default AND per-execution targets (the latter
-        // bypass builder config entirely), so warn unconditionally
-        // rather than only when default targets are configured.
+        // Signing with an empty key is not a silent no-op (issue #605).
+        // HMAC-SHA256 accepts any key length. It produces a valid signature
+        // that anyone can reproduce. So without
+        // `completion_callback_secret(...)`, `X-Harvest-Signature` proves
+        // nothing. Per-execution targets bypass builder config entirely. So
+        // warn unconditionally, not only when default targets are configured.
         tracing::warn!(
             "completion-callback HMAC secret was never configured via \
                  HarvestBuilder::completion_callback_secret(...) -- every \
@@ -663,22 +638,21 @@ fn install_completion_callback_config(built: &BuiltHarvest) {
 /// Resolve the audit-export runtime config from a `BuiltHarvest` (issue #953).
 ///
 /// **Pure**: it reads `built` and allocates, but touches no process-global
-/// state. Installing is a separate step ([`commit_audit_export_config`]) so
-/// that a runtime whose construction later *fails* cannot leave the global
-/// config replaced (issue #953, Codex review P1) — `PreparedHarvestRuntime::build`
-/// has several fallible steps after this point, and the config is a
-/// process-wide static shared with any runtime already running in this process.
-/// Clobbering it from a failed build would silently redirect a *live*
-/// runtime's audit records to the failed build's sink, or stop its export
-/// entirely.
+/// state. Installing is a separate step ([`commit_audit_export_config`]). So a
+/// runtime whose construction later *fails* cannot replace the global config
+/// (issue #953). `PreparedHarvestRuntime::build` has several fallible steps
+/// after this point. The config is a process-wide static, shared with any
+/// runtime already running in this process. A failed build that clobbers it
+/// would redirect a *live* runtime's audit records to the failed build's
+/// sink, or stop its export entirely.
 ///
-/// Core ships no HTTP client, so an embedder-supplied `AuditSink` is used
-/// verbatim and a `reqwest` signed-webhook sink is substituted when only a URL
-/// was configured.
+/// Core ships no HTTP client. So an embedder-supplied `AuditSink` is used
+/// verbatim. When only a URL is configured, a `reqwest` signed-webhook sink is
+/// used.
 ///
 /// Resolves to `None` when neither was configured. That `None` is meaningful
-/// and gets written: the config is a process-wide static, so a second runtime
-/// built without a sink must not keep shipping audit records to the first
+/// and gets written. The config is a process-wide static. So a second runtime
+/// built without a sink must not keep sending audit records to the first
 /// runtime's destination.
 fn prepare_audit_export_config(
     built: &BuiltHarvest,
@@ -692,10 +666,10 @@ fn prepare_audit_export_config(
             })
         });
     sink.map(|sink| {
-        // `HarvestBuilder::try_build` rejects a webhook with no secret, so
-        // reaching the empty-key fallback means an embedder-supplied sink that
-        // authenticates some other way (IAM, mTLS, a local file). Warn rather
-        // than fail: a signature is not always the relevant control there.
+        // `HarvestBuilder::try_build` rejects a webhook with no secret. So the
+        // empty-key fallback means an embedder-supplied sink that authenticates
+        // some other way (IAM, mTLS, a local file). Warn rather than fail: a
+        // signature is not always the relevant control there.
         let secret = audit_config.secret.clone().unwrap_or_else(|| {
             tracing::warn!(
                 "no audit-export HMAC secret was configured via \
@@ -730,26 +704,22 @@ fn commit_audit_export_config(
 }
 
 /// This runtime's audit-export config, held **unpublished** until every
-/// fallible step of `HarvestRunner::start` has succeeded (issue #953, Codex
-/// review rounds 2, 5, 16 and 19).
+/// fallible step of `HarvestRunner::start` has succeeded (issue #953).
 ///
-/// Publishing early is what the earlier revisions got wrong: the global is
-/// shared with any runtime already running in this process, so a build that
-/// then failed could redirect a live runtime's audit records to a sink that
-/// never came into service, or (for a webhook-only build, where the
-/// direct-worker path installs `None`) silence it outright.
+/// Do not publish early. The global is shared with any runtime already
+/// running in this process. A build that then failed could redirect a live
+/// runtime's audit records to a sink that never came into service. For a
+/// webhook-only build the direct-worker path installs `None`, which silences
+/// it outright.
 ///
-/// **Deliberately no restore-on-drop.** An earlier revision snapshotted the
-/// previous config and put it back if the guard dropped uncommitted. That was
-/// needed only while `into_worker_parts*` still wrote the global mid-build;
-/// once that write was suppressed at the source
-/// (`BuiltHarvest::deferring_audit_export_install`), a failed startup makes no
-/// global change at all and has nothing to undo — and restoring anyway is
-/// worse than doing nothing. Two overlapping `start` calls snapshot the same
-/// old value; if the first succeeds and publishes while the second fails, the
-/// second's restore silently replaces the *running* runtime's sink with a
-/// stale snapshot (round 19 P1). Doing nothing on failure is both simpler and
-/// correct under concurrency.
+/// **Deliberately no restore-on-drop.** `into_worker_parts*` no longer writes
+/// the global mid-build (`BuiltHarvest::deferring_audit_export_install`). So a
+/// failed startup makes no global change and has nothing to undo. Restoring
+/// the old config on drop is worse than doing nothing. Two overlapping
+/// `start` calls snapshot the same old value. Suppose the first succeeds and
+/// publishes while the second fails. The second's restore then silently
+/// replaces the *running* runtime's sink with a stale snapshot. Doing nothing
+/// on failure is both simpler and correct under concurrency.
 struct DeferredAuditExportInstall {
     pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
 }
@@ -889,16 +859,15 @@ impl PreparedHarvestRuntime {
         let partition_archiver = built.partition_archiver().cloned();
         install_completion_callback_config(&built);
         // Resolved here, while `built` is still owned, but NOT published until
-        // every fallible step below has succeeded (issue #953, Codex review
-        // P1). `install_completion_callback_config` above still publishes
-        // eagerly; that is #605's pre-existing behaviour and out of scope here.
+        // every fallible step below has succeeded (issue #953).
+        // `install_completion_callback_config` above still publishes eagerly.
+        // That is the older behaviour of issue #605.
         let audit_export_config = prepare_audit_export_config(&built);
-        // ...and the conversion below must not publish it either (round 5 P1).
-        // Suppressing that write is what keeps the global *untouched* for the
-        // whole build, rather than clobbered and later repaired: a live
-        // runtime's scanner can tick during `compile_dag_catalog`, and a
-        // restore afterwards cannot un-send the records it exported to a sink
-        // that never came into service.
+        // The conversion below must not publish it either. Suppressing that
+        // write keeps the global *untouched* for the whole build. A later
+        // repair is not enough: a live runtime's scanner can tick during
+        // `compile_dag_catalog`. A restore afterwards cannot un-send the records
+        // it exported to a sink that never came into service.
         let built = built.deferring_audit_export_install();
         let registered_dag_names = built
             .dags()
@@ -909,39 +878,35 @@ impl PreparedHarvestRuntime {
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let max_workflow_history_events = built.max_workflow_history_events;
         // Resolve the effective sharded storage pool *before* building handler
-        // state so the registry receives the same sharded HarvestDbPool;
-        // otherwise handlers fall back to the default shard's pool and can
+        // state, so the registry gets the same sharded HarvestDbPool.
+        // Otherwise handlers fall back to the default shard's pool and can
         // read/write the wrong database (issue #522). Precedence:
         //   1. resources.sharded_pool — explicit runner-level override
         //   2. WorkerConfig::with_sharded_pool — carried on the built config
         //   3. single-shard wrapper of the default harvest pool
-        // Honouring (2) here keeps a `HarvestBuilder::with_sharded_pool` from
-        // being silently narrowed to a single shard when the runner is started
-        // with only `HarvestRunnerResources::new(default_pool)` (the plugin
-        // path), which would strand all non-default-shard work.
-        // Capture the runner-provided sharded-pool provenance before the move
-        // below consumes `resources.sharded_pool`. The `WorkerConfig` knob is
-        // still readable afterwards from `built`, but this override is not — and
-        // the effective-config snapshot must report the resolved runtime pool's
-        // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
+        // Honouring (2) matters on the plugin path, which starts the runner
+        // with only `HarvestRunnerResources::new(default_pool)`. Without it a
+        // `HarvestBuilder::with_sharded_pool` narrows to a single shard and
+        // strands all non-default-shard work.
+        // Capture the runner-provided provenance before the move below
+        // consumes `resources.sharded_pool`. The effective-config snapshot must
+        // report the resolved pool's sharded-ness, not only the `WorkerConfig`
+        // field (issue #695).
         let resources_sharded_pool = resources.sharded_pool.is_some();
-        // Single source of truth for the pool-resolution precedence (issue #700
-        // P2): the boot-time orphan gate resolves its shard pools through the
-        // very same `pick_runtime_pool_source`, via `select_runtime_gate_shards`
-        // (the read-only sibling of this install helper), so it queries the exact
-        // databases the workers will poll and the
-        // `sharded_pool`-over-`harvest_pool` precedence can never drift between
-        // the two.
+        // The boot-time orphan gate resolves its pools through the same
+        // `pick_runtime_pool_source`, via `select_runtime_gate_shards` (issue
+        // #700 P2). So it queries the databases the workers will poll, and the
+        // precedence cannot drift between the two.
         let storage_pool = resolve_runtime_storage_pool(
             resources.sharded_pool.as_ref(),
             built.worker_config().sharded_pool.as_ref(),
             &resources.harvest_pool,
         );
         // Reject a misconfigured router-vs-pool pair before any I/O.
-        // `pool_for()` falls back to the default shard without warning, so a
-        // missing pool for shard N silently writes shard-N `ExecutionId`s into
-        // shard-0's database; those executions become permanently invisible
-        // once shard N is later added.  Fail loud at startup instead.
+        // `pool_for()` falls back to the default shard without warning. So a
+        // missing pool for shard N writes shard-N `ExecutionId`s into shard
+        // 0's database. Those executions become permanently invisible once
+        // shard N is added. Fail loud at startup instead.
         let mismatched = missing_router_shards(&shard_router, storage_pool.sharded_pool());
         if !mismatched.is_empty() {
             return Err(AutumnError::service_unavailable_msg(format!(
@@ -951,16 +916,14 @@ impl PreparedHarvestRuntime {
                  ShardedDbPool configuration"
             )));
         }
-        // Capture the secret-free effective-config snapshot (issue #695) while
-        // `built` is still owned — `built.into_worker_parts_*` below consumes it.
+        // Capture the snapshot (issue #695) now, while `built` is still owned.
+        // `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
-        // Carried on the returned `PreparedHarvestRuntime` so it stays
-        // unpublished for the whole of `HarvestRunner::start` — not just this
-        // function (issue #953, Codex review round 16 P1). `start` has more
-        // fallible work after `build` returns (completion-trigger sync, worker
-        // construction, shard-pool validation); an early return there drops
-        // this without publishing, leaving the global exactly as it was.
+        // Carried on the returned `PreparedHarvestRuntime`, so it stays
+        // unpublished for the whole of `HarvestRunner::start` (issue #953).
+        // `start` has more fallible work after `build` returns. An early
+        // return there drops this unpublished and leaves the global as it was.
         let audit_export_guard = DeferredAuditExportInstall::new(audit_export_config);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
@@ -974,23 +937,19 @@ impl PreparedHarvestRuntime {
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
         let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
-        // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
-        // when the builder did not set one (avoids silently disabling a ceiling
-        // that the embedder configured via WorkerConfig directly).
+        // The builder-level ceiling takes precedence. Keep the WorkerConfig
+        // ceiling when the builder set none, so an embedder's ceiling stays on.
         if let Some(ceiling) = max_workflow_history_events {
             worker_runtime_config.max_workflow_history_events = Some(ceiling);
         }
-        // Point the worker at the same resolved sharded pool so it claims from
-        // every assigned shard (issue #522). `storage_pool` already honours the
-        // resources/WorkerConfig precedence above, so this never narrows a
-        // configured `WorkerConfig::with_sharded_pool` to a single shard.
+        // The worker claims from every assigned shard of this pool (issue
+        // #522). `storage_pool` already honours the precedence above.
         worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
         // Resolve auto (empty) shard assignments now that `sharded_pool` is
-        // final (issue #961, AC1). `Worker::new` runs the same idempotent pass,
-        // but doing it here first means the warning below — and anything else
-        // reading `worker_runtime_config.shard_assignments` — sees the
-        // *effective* coverage rather than the raw "auto" sentinel.
+        // final (issue #961, AC1). `Worker::new` runs the same idempotent pass.
+        // Running it here first lets the warning below see the *effective*
+        // coverage, not the raw "auto" sentinel.
         worker_runtime_config.resolve_shard_assignments();
 
         warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
@@ -1056,9 +1015,8 @@ const NOTIFY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Running Harvest runtime ownership for a process.
 ///
-/// This owns any locally started worker and scheduler tasks while also
-/// exposing the management API snapshot and Harvest storage pool needed by a
-/// web app or control plane process.
+/// It owns any locally started worker and scheduler tasks. It also exposes
+/// the management API snapshot and the Harvest storage pool.
 pub struct HarvestRunner {
     api_runtime: HarvestApiRuntime,
     storage_pool: HarvestDbPool,
@@ -1075,24 +1033,22 @@ pub struct HarvestRunner {
     /// give it back (issue #1312). But only if a later runner in this same
     /// process has not since replaced it with its own install. `stop`
     /// passes this to `dispatch::uninstall_if_current`, which is a no-op
-    /// once the generation no longer matches (Codex review, issue #1429
-    /// follow-up). A runner that installed nothing carries `None`. It
-    /// leaves the slot alone unconditionally, same as before.
+    /// once the generation no longer matches (issue #1429). A runner that
+    /// installed nothing carries `None` and leaves the slot alone.
     dispatch_install_generation: Option<u64>,
     /// The shard + generation pairs `dispatch::install_for_shard` returned,
     /// if this runner installed the per-shard slots (issue #1429) instead
     /// of the single-shard one.
     ///
-    /// `stop` passes these to `dispatch::uninstall_all_shards_if_current`
-    /// instead of the unconditional `uninstall_all_shards` (Codex review,
-    /// issue #1429 follow-up). The reason matches
-    /// `dispatch_install_generation`'s own: a later runner may have
-    /// reinstalled one of these shards since this runner started. Empty
-    /// when this runner used the single-shard path or installed nothing.
+    /// `stop` passes these to `dispatch::uninstall_all_shards_if_current`,
+    /// not the unconditional `uninstall_all_shards` (issue #1429). A later
+    /// runner may have reinstalled one of these shards since this runner
+    /// started. Empty when this runner used the single-shard path or
+    /// installed nothing.
     dispatch_shard_generations: Vec<(ShardId, u64)>,
     /// The dropped-hints metrics sampler this runner owns. `Some` only for
     /// an API-only process — no `Worker`, which spawns its own copy instead
-    /// (issue #1429 review). `stop` cancels and joins it.
+    /// (issue #1429). `stop` cancels and joins it.
     dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
 }
 
@@ -1105,9 +1061,8 @@ struct BatchRuntime {
 impl BatchRuntime {
     /// Spawn a tick loop that drives every open batch job to terminal status.
     ///
-    /// The loop sleeps `tick_interval` between scans; each tick walks every
-    /// shard and dispatches per-target actions with bounded concurrency. The
-    /// loop exits cleanly when the cancellation token fires.
+    /// Each tick walks every shard and dispatches per-target actions with
+    /// bounded concurrency.
     fn spawn(
         pool: ShardedDbPool,
         executor_config: BatchExecutorConfig,
@@ -1237,21 +1192,22 @@ impl HarvestRunner {
     ///
     /// # Errors
     ///
-    /// Returns an error if the build registers classic (non-unified) DAGs, if
-    /// the boot-time orphaned-workflow-type gate refuses startup
-    /// (`[harvest.startup] orphaned_workflows = "fail"` with orphaned types
-    /// present and a complete report — see [`run_startup_orphan_gate`]), if the
-    /// workflow/activity registrations are invalid, or if the worker
-    /// configuration cannot be materialized.
+    /// Returns an error in any of these cases:
+    /// - The build registers classic (non-unified) DAGs.
+    /// - The boot-time orphaned-workflow-type gate refuses startup. That needs
+    ///   `[harvest.startup] orphaned_workflows = "fail"`, orphaned types and a
+    ///   complete report. See [`run_startup_orphan_gate`].
+    /// - The workflow/activity registrations are invalid.
+    /// - The worker configuration cannot be materialized.
     #[allow(clippy::too_many_lines)]
     pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
-        // Pure configuration validation first: it touches no database and no
-        // process global, so a build that can never boot is rejected with the
-        // error that actually names its problem (see `reject_classic_dags`).
+        // Pure configuration validation first. It touches no database and no
+        // process global. A build that can never boot gets the error that
+        // names its problem (see `reject_classic_dags`).
         reject_classic_dags(&built)?;
         // Issue #2479: config and the role pin narrow the declared queues.
         // This is pure validation too, so an undeclared queue stops the boot
@@ -1263,13 +1219,12 @@ impl HarvestRunner {
         )?;
 
         // Issue #1128: the boot-time orphaned-workflow-type gate, on the
-        // STANDALONE path. It runs HERE — the first act of `start`, before
-        // `PreparedHarvestRuntime::build` — so an abort spawns no worker poll
-        // loop (which could otherwise claim and terminally fail one of the very
-        // runs the gate is protecting), installs no global router / sharded pool
-        // / completion-callback config, and syncs no completion triggers. The
-        // plugin boot path runs the same gate earlier still and marks its
-        // resources, so this is a no-op there rather than a second scan.
+        // STANDALONE path. It runs before `PreparedHarvestRuntime::build`. So
+        // an abort spawns no worker poll loop that could claim and fail a
+        // protected run. It installs no global router, sharded pool or
+        // completion-callback config, and syncs no completion triggers. The
+        // plugin boot path runs the same gate earlier and marks its resources,
+        // so this is a no-op there.
         if resources.startup_orphan_gate_already_run() {
             tracing::debug!(
                 action = ?config.startup.orphaned_workflows,
@@ -1342,7 +1297,7 @@ impl HarvestRunner {
             ))
         })?;
 
-        // Sync static triggers before starting workers (issue #517)
+        // Sync static triggers before starting workers (issue #517).
         let single_pool = prepared.storage_pool.sharded_pool().len() == 1;
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
             // Issue #1823: a bump cannot commit while the sync writes. A single
@@ -1390,12 +1345,11 @@ impl HarvestRunner {
         }
 
         // Serialize this call's dispatch-install-through-commit-or-unwind
-        // span against every other overlapping `start` call (Codex review,
-        // issue #1429 follow-up). See `DISPATCH_START_LOCK`'s own doc
-        // comment for the race this closes. Held only until just after
-        // `dispatch_guard.commit()` below, not for the rest of this
-        // function. Everything after commit no longer touches dispatch
-        // state a racing start could observe mid-resolution.
+        // span against every other overlapping `start` call (issue #1429).
+        // See `DISPATCH_START_LOCK`'s own doc comment for the race this
+        // closes. Held only until just after `dispatch_guard.commit()` below.
+        // After commit, nothing here touches dispatch state that a racing
+        // start could observe mid-resolution.
         let dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
 
         // Issue #1312: install the process-global dispatch channel(s) BEFORE
@@ -1410,10 +1364,9 @@ impl HarvestRunner {
         // A span of one shard (or none) installs the single-shard channel,
         // named by that one shard's key family. A wider span installs one
         // channel per shard instead (issue #1429). `Worker::new` requires
-        // full per-shard coverage before it accepts the wider span. A
-        // partial install here — cut short by a shard connect failure —
-        // therefore fails startup, rather than leaving some shards silently
-        // uncovered.
+        // full per-shard coverage before it accepts the wider span. So a
+        // partial install, cut short by a shard connect failure, fails
+        // startup and leaves no shard silently uncovered.
         let (
             dispatch_guard,
             dispatch_installed,
@@ -1455,20 +1408,19 @@ impl HarvestRunner {
         let worker = if worker_enabled {
             // Pass the exact generations this call's own install stamped,
             // when it went through the multi-shard per-shard-channel path
-            // (Codex review, issue #1429 follow-up). A second, overlapping
-            // `start` call can install its own topology in the gap
-            // between the install above and this construction. At least
-            // one `.await` runs in between. `Worker::new` alone re-reads
-            // the global slot at construction time. It cannot tell this
-            // runtime's own channel from a stranger's that landed in that
-            // gap. `new_with_expected_shard_generations` can, via
+            // (issue #1429). A second, overlapping `start` call can install
+            // its own topology in the gap between the install above and this
+            // construction. At least one `.await` runs in between.
+            // `Worker::new` alone re-reads the global slot at construction
+            // time. It cannot tell this runtime's own channel from a
+            // stranger's that landed in that gap.
+            // `new_with_expected_shard_generations` can, via
             // `dispatch::installed_for_shard_if_current`.
             //
             // The single-shard branch has no per-shard generations to
             // compare. It installs through the independent global slot
-            // instead (`dispatch_install_generation`), which is not this
-            // race's shape, so it passes `None`, same as plain
-            // `Worker::new`.
+            // (`dispatch_install_generation`), which this race does not
+            // affect. So it passes `None`, same as plain `Worker::new`.
             let shard_generations_for_worker: Option<&[(ShardId, u64)]> =
                 (dispatch_shards.len() > 1).then_some(dispatch_shard_generations.as_slice());
             let worker = Worker::new_with_expected_shard_generations(
@@ -1478,11 +1430,10 @@ impl HarvestRunner {
             )
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
             // Fail the process at startup if any assigned shard is missing from
-            // the sharded pool (issue #522 review). The same condition is
-            // re-checked inside `Worker::run`, but that only aborts the spawned
-            // task — startup would otherwise return Ok and keep serving the API
-            // and scheduler with no local worker, leaving the assigned shards'
-            // work unclaimed behind a coverage view that still advertises them.
+            // the sharded pool (issue #522). `Worker::run` re-checks it, but
+            // that only aborts the spawned task. Startup would return Ok and
+            // serve the API and scheduler with no local worker. The assigned
+            // shards' work would sit unclaimed while coverage still lists them.
             let missing = worker.missing_assigned_shard_pools();
             if !missing.is_empty() {
                 return Err(AutumnError::service_unavailable_msg(format!(
@@ -1503,9 +1454,9 @@ impl HarvestRunner {
         // Every fallible step of startup has now succeeded -- `build`, the
         // completion-trigger sync above, worker construction and its shard-pool
         // validation. Only here may this runtime's sink replace whatever a
-        // previously started runtime installed (issue #953, Codex review round
-        // 16 P1). Returning `Err` anywhere above instead drops `prepared`,
-        // whose guard restores the previous config.
+        // previously started runtime installed (issue #953). Returning `Err`
+        // anywhere above instead drops `prepared` and its guard. The guard
+        // leaves the previous config in place.
         if let Some(guard) = prepared.audit_export_guard.take() {
             guard.commit();
         }
@@ -1519,16 +1470,12 @@ impl HarvestRunner {
         ));
 
         // A `Worker` already spawns its own copy of this sampler in
-        // `spawn_monitoring_tasks`. An API-only process (`worker_enabled =
-        // false`) owns no `Worker`, so nothing would otherwise sample
-        // `harvest_dispatch_dropped_hints` here. The dispatch background
-        // publisher this metric describes is installed unconditionally,
-        // above. That happens specifically because an API-only process
-        // still publishes references for the fleet (issue #1429 review).
-        // The same sampler also emits the notify gauges (issue #1796). An
-        // API-only process writes through the pools registered above, so it
-        // sends notifications and needs them too.
-        // Only spawn when there is no `Worker` to double up with.
+        // `spawn_monitoring_tasks`. An API-only process owns no `Worker`, so
+        // nothing else samples `harvest_dispatch_dropped_hints` there. It
+        // still publishes references for the fleet, so the dispatch publisher
+        // is installed above in every mode (issue #1429). The same sampler
+        // emits the notify gauges (issue #1796). An API-only process writes
+        // through the pools registered above, so it needs them too.
         let dispatch_metrics_sampler = if plan.dispatch_metrics_sampler() {
             let cancel = CancellationToken::new();
             let handle = spawn_dispatch_metrics_sampler(
@@ -1609,10 +1556,8 @@ impl HarvestRunner {
         };
         let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
         let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
-        // Batch operations executor (issue #102): drive open `harvest_batch_jobs`
-        // rows to completion in the background. Only the worker-owning
-        // process spawns it so we don't run multiple competing executors
-        // against the same job rows.
+        // Batch operations executor (issue #102). Only the worker-owning
+        // process spawns it, so no executors compete for the same job rows.
         let batch = if plan.batch() {
             Some(BatchRuntime::spawn(
                 prepared.storage_pool.sharded_pool().clone(),
@@ -1677,7 +1622,7 @@ impl HarvestRunner {
         })
     }
 
-    /// Clone the API runtime snapshot for management/query routes.
+    /// The API runtime snapshot for management/query routes.
     #[must_use]
     pub fn api_runtime(&self) -> HarvestApiRuntime {
         self.api_runtime.clone()
@@ -1695,27 +1640,25 @@ impl HarvestRunner {
     /// slot(s) are process wide, so a channel left behind would still carry
     /// references for a runtime that has stopped (issue #1312). It could
     /// also make a later runtime's own per-shard coverage check misread
-    /// stale state (issue #1429 review).
+    /// stale state (issue #1429).
     ///
     /// Uninstalls only if this runner's own install is still the current
-    /// occupant of the slot(s) it used (Codex review, issue #1429
-    /// follow-up). A process may start a replacement runner before calling
-    /// `stop` on this one. The replacement's install already overwrote the
-    /// slot(s) by then. An unconditional uninstall here would clear the
-    /// replacement's channel(s) instead of this runner's own. The
-    /// replacement's own effective-config snapshot would keep claiming
-    /// Redis dispatch is active, while every read and publish silently
-    /// falls through to Postgres. `dispatch::uninstall_if_current`/
-    /// `uninstall_all_shards_if_current` are no-ops once the generation(s)
-    /// this runner captured at install time no longer match.
+    /// occupant of the slot(s) it used (issue #1429). A process may start a
+    /// replacement runner before calling `stop` on this one. The
+    /// replacement's install already overwrote the slot(s) by then. An
+    /// unconditional uninstall here would clear the replacement's channel(s)
+    /// instead of this runner's own. The replacement's own effective-config
+    /// snapshot would keep claiming Redis dispatch is active. Every read and
+    /// publish would silently fall through to Postgres.
+    /// `dispatch::uninstall_if_current`/`uninstall_all_shards_if_current` are
+    /// no-ops once the generation(s) this runner captured no longer match.
     ///
-    /// Also serializes against `DISPATCH_START_LOCK` for that same check
-    /// (Codex review, issue #1429 follow-up, once more). Without it, this
-    /// call could run its generation check while a replacement `start`
-    /// sits between its own install and its eventual commit or unwind.
-    /// This runner's generation would not be current yet -- the
-    /// replacement's is -- so this call would correctly leave the slot
-    /// alone.
+    /// Also serializes against `DISPATCH_START_LOCK` for that same check.
+    /// Without it, this call could run its generation check while a
+    /// replacement `start` sits between its own install and its eventual
+    /// commit or unwind. This runner's generation would not be current yet
+    /// -- the replacement's is -- so this call would correctly leave the
+    /// slot alone.
     ///
     /// But suppose that replacement later fails. Its own unwind restores
     /// the snapshot it captured. That snapshot is this runner's
@@ -1802,31 +1745,21 @@ impl HarvestRunner {
     }
 }
 
-/// Returns shard IDs referenced by `router` that have no exact pool entry in
-/// `pool`.  An empty result means the router and pool are fully consistent.
-///
-/// `ShardedDbPool::pool_for` silently falls back to the default shard when a
-/// configured shard lacks a pool entry; if the caller never checks this gap,
-/// shard-N `ExecutionId`s are written into shard-0's database and become
-/// permanently invisible after shard N is provisioned later.  Call this at
-/// startup and fail if the result is non-empty.
 /// Build the secret-free effective-config snapshot (issue #695) from the
 /// resolved runtime parts.
 ///
-/// Payload caps come from `built`; the pool sizing is read from the
-/// already-resolved `storage_pool`, so it honours the full
-/// resources/`WorkerConfig` sharded-pool precedence and always describes the
-/// pool the runtime actually uses. `poll_interval` reads the side-effect-free
-/// [`DEFAULT_WORKER_POLL_INTERVAL`] — the single source of truth the
-/// `WorkerRuntimeConfig` conversion also uses — so this stays a pure read.
+/// Payload caps come from `built`. The pool sizing comes from the resolved
+/// `storage_pool`, so it describes the pool the runtime actually uses.
+/// `poll_interval` reads the side-effect-free [`DEFAULT_WORKER_POLL_INTERVAL`],
+/// which the `WorkerRuntimeConfig` conversion also uses. So this stays a pure
+/// read.
 ///
 /// `resources_sharded_pool` reports whether a runner-provided
-/// [`HarvestRunnerResources::with_sharded_pool`] override was supplied — that
-/// provenance is erased once `storage_pool` is built, so the caller captures it
-/// before the move. It, together with `WorkerConfig::with_sharded_pool` and the
-/// resolved `storage_pool` shard count, drives the two `WorkerConfigView`
-/// sharded-pool fields so they describe the resolved runtime pool, not solely
-/// the `WorkerConfig` knob (issue #695 review).
+/// [`HarvestRunnerResources::with_sharded_pool`] override was supplied.
+/// `storage_pool` erases that provenance, so the caller captures it first.
+/// With `WorkerConfig::with_sharded_pool` and the resolved shard count, it
+/// drives the two `WorkerConfigView` sharded-pool fields (issue #695). They
+/// then describe the resolved runtime pool, not only the `WorkerConfig` knob.
 fn capture_effective_config(
     built: &BuiltHarvest,
     storage_pool: &HarvestDbPool,
@@ -1857,10 +1790,9 @@ fn capture_effective_config(
         worker_pool_max_connections: storage_pool.default_pool().status().max_size,
         shard_pool_count: shard_count,
     };
-    // The runtime uses a sharded pool when either the runner supplied one or the
-    // WorkerConfig carried one; the fallback single pool (a 1-shard wrapper of
-    // `harvest_pool`) is not "sharded_pool_configured". Report the resolved
-    // pool's actual shard count when sharded, else 0.
+    // The fallback single pool (a 1-shard wrapper of `harvest_pool`) is not
+    // "sharded_pool_configured". Report the real shard count when sharded,
+    // else 0.
     let sharded_pool_configured =
         resources_sharded_pool || built.worker_config().sharded_pool.is_some();
     let resolved_sharding = ShardedInfo {
@@ -1870,12 +1802,11 @@ fn capture_effective_config(
         } else {
             0
         },
-        // Always the resolved pool's real shard ids — including the
-        // single-shard fallback wrapper — so the snapshot can report the
-        // worker's *effective* shard assignments (issue #961, AC1/AC8).
-        // Unlike `shard_count`, this is not zeroed for the non-sharded case:
-        // resolving "auto" needs the concrete shard list either way, and for
-        // the fallback wrapper it is exactly `[0]`.
+        // Always the resolved pool's real shard ids, the fallback wrapper
+        // included. So the snapshot can report the worker's *effective* shard
+        // assignments (issue #961, AC1/AC8). Unlike `shard_count`, this is not
+        // zeroed when unsharded. Resolving "auto" needs the concrete list, and
+        // for the fallback wrapper it is exactly `[0]`.
         shard_ids: storage_pool
             .iter_shards()
             .map(|(shard, _)| shard.as_i32())
@@ -2021,32 +1952,29 @@ enum DispatchInstallKind {
     /// slots from immediately before it ran.
     ///
     /// Unwinding calls `dispatch::restore_single_if_current` rather than
-    /// `dispatch::uninstall_if_current` (Codex review, issue #1429
-    /// follow-up). `install_single` destructively replaces the topology
-    /// before `Worker::new` and the shard-pool validation after it have run
-    /// — both of which can still fail. Merely clearing this install on
-    /// unwind would leave a still-running previous runner without the
-    /// dispatch channels it had before this replacement startup began.
-    /// Restoring the snapshot instead puts that previous topology back,
-    /// generations and all. It does so only while this install is still
-    /// the current occupant of its slot. See `restore_single_if_current`'s
-    /// own doc for the race that guards against.
+    /// `dispatch::uninstall_if_current` (issue #1429). `install_single`
+    /// destructively replaces the topology before `Worker::new` and the
+    /// shard-pool validation after it have run — both of which can still fail.
+    /// Merely clearing this install on unwind would leave a still-running
+    /// previous runner without the dispatch channels it had before this
+    /// replacement startup began. Restoring the snapshot instead puts that
+    /// previous topology back, generations and all. It does so only while this
+    /// install is still the current occupant of its slot. See
+    /// `restore_single_if_current`'s own doc for the race that guards against.
     Single(u64, autumn_harvest::dispatch::TopologySnapshot),
     /// The per-shard slots (`dispatch::install_shards`, issue #1429) this
     /// call populated, each stamped with its own generation, plus the
     /// [`TopologySnapshot`] that call returned.
     ///
-    /// Unwinding calls `dispatch::restore_shards_if_current` (Codex review,
-    /// issue #1429 follow-up), the per-shard mirror of `Single`'s own
-    /// reasoning.
+    /// Unwinding calls `dispatch::restore_shards_if_current` (issue #1429), the
+    /// per-shard mirror of `Single`'s own reasoning.
     Shards(
         Vec<(ShardId, u64)>,
         autumn_harvest::dispatch::TopologySnapshot,
     ),
     /// This call cleared both dispatch slots (`dispatch::uninstall_all_capturing`)
-    /// instead of installing anything. Redis dispatch is off for this
-    /// startup. Also carries the [`TopologySnapshot`] that call returned
-    /// (Codex review, issue #1429 follow-up).
+    /// instead of installing anything. Redis dispatch is off for this startup.
+    /// Also carries the [`TopologySnapshot`] that call returned (issue #1429).
     ///
     /// A still-running previous runtime may own exactly what this cleared.
     /// Unwinding calls `dispatch::restore_cleared_if_still_empty`. That
@@ -2058,9 +1986,9 @@ enum DispatchInstallKind {
     Cleared(autumn_harvest::dispatch::TopologySnapshot),
 }
 
-/// Serializes `start`'s dispatch-install-through-commit-or-unwind span,
-/// and `stop`'s own generation check, against every other overlapping
-/// call to either (Codex review, issue #1429 follow-up).
+/// Serializes `start`'s dispatch-install-through-commit-or-unwind span, and
+/// `stop`'s own generation check, against every other overlapping call to
+/// either (issue #1429).
 ///
 /// Two overlapping `start` calls can each install their own topology.
 /// Each one snapshots whatever the other's still-uncommitted install just
@@ -2087,13 +2015,12 @@ enum DispatchInstallKind {
 /// can never capture a concurrent start's own uncommitted,
 /// possibly-about-to-fail one.
 ///
-/// `HarvestRunner::stop` holds this too, for its own generation check
-/// (Codex review, issue #1429 follow-up). See its own doc comment for
-/// the matching race on that side. A `stop` call whose generation check
-/// runs while a replacement `start` is mid-span can see itself already
-/// superseded and correctly leave the slot alone. That same
-/// replacement's later unwind can then restore its own topology right
-/// back, with nothing left to notice and clean it up again.
+/// `HarvestRunner::stop` holds this too, for its own generation check (issue
+/// #1429). See its own doc comment for the matching race on that side. A `stop`
+/// call whose generation check runs while a replacement `start` is mid-span can
+/// see itself already superseded and correctly leave the slot alone. That same
+/// replacement's later unwind can then restore its own topology right back,
+/// with nothing left to notice and clean it up again.
 static DISPATCH_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Uninstall the process-global dispatch channel(s) when startup fails later.
@@ -2111,12 +2038,11 @@ struct DispatchInstallGuard {
 }
 
 impl DispatchInstallGuard {
-    /// A guard over what `install_dispatch_channel` did. Either a
-    /// single-shard install, carrying the generation and
-    /// [`TopologySnapshot`] `dispatch::install_single` returned. Or a
-    /// clear, carrying the [`TopologySnapshot`]
-    /// `dispatch::uninstall_all_capturing` returned when Redis dispatch is
-    /// off for this startup (Codex review, issue #1429 follow-up).
+    /// A guard over what `install_dispatch_channel` did. Either a single-shard
+    /// install, carrying the generation and [`TopologySnapshot`]
+    /// `dispatch::install_single` returned. Or a clear, carrying the
+    /// [`TopologySnapshot`] `dispatch::uninstall_all_capturing` returned when
+    /// Redis dispatch is off for this startup (issue #1429).
     fn new(installed: (Option<u64>, autumn_harvest::dispatch::TopologySnapshot)) -> Self {
         let (generation, snapshot) = installed;
         Self {
@@ -2127,12 +2053,11 @@ impl DispatchInstallGuard {
         }
     }
 
-    /// A guard over what `install_dispatch_channels_for_shards` did.
-    /// Either the per-shard installs `shards` names (issue #1429),
-    /// carrying the [`TopologySnapshot`] `dispatch::install_shards`
-    /// returned. Or a clear, carrying the [`TopologySnapshot`]
-    /// `dispatch::uninstall_all_capturing` returned when Redis dispatch is
-    /// off for this startup (Codex review, issue #1429 follow-up).
+    /// A guard over what `install_dispatch_channels_for_shards` did. Either the
+    /// per-shard installs `shards` names (issue #1429), carrying the
+    /// [`TopologySnapshot`] `dispatch::install_shards` returned. Or a clear,
+    /// carrying the [`TopologySnapshot`] `dispatch::uninstall_all_capturing`
+    /// returned when Redis dispatch is off for this startup (issue #1429).
     fn new_shards(
         shards: Vec<(ShardId, u64)>,
         snapshot: autumn_harvest::dispatch::TopologySnapshot,
@@ -2196,10 +2121,10 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
 /// Postgres claim path and this is a no-op.
 ///
-/// Returns the generation `dispatch::install` stamped on the channel when
-/// one is installed (Codex review, issue #1429 follow-up). The caller
-/// keeps this to undo specifically this install on a later startup
-/// failure, without also clearing a later one that may have replaced it.
+/// Returns the generation `dispatch::install` stamped on the channel when one
+/// is installed (issue #1429). The caller keeps this to undo specifically this
+/// install on a later startup failure, without also clearing a later one that
+/// may have replaced it.
 ///
 /// # Errors
 ///
@@ -2210,17 +2135,15 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// credential-free form.
 ///
 /// Clears the per-shard slot only after a Redis connect succeeds, or
-/// immediately on the redis-off branch (Codex review, issue #1429
-/// follow-up). An earlier version cleared it unconditionally on entry,
-/// before attempting to connect. A process may have previously run a
-/// multi-shard install and now start this single-shard one with no
-/// intervening `stop()`. If that connect then failed, the old version
-/// left the still-active multi-shard runner with every per-shard channel
-/// gone and nothing to replace them. It fell back to Postgres for no
-/// reason of its own. Connecting first, as
-/// [`install_dispatch_channels_for_shards`] also does, means a failed
-/// connect here leaves every existing channel exactly as this call found
-/// it.
+/// immediately on the redis-off branch (issue #1429). An earlier version
+/// cleared it unconditionally on entry, before attempting to connect. A process
+/// may have previously run a multi-shard install and now start this
+/// single-shard one with no intervening `stop()`. If that connect then failed,
+/// the old version left the still-active multi-shard runner with every
+/// per-shard channel gone and nothing to replace them. It fell back to Postgres
+/// for no reason of its own. Connecting first, as
+/// [`install_dispatch_channels_for_shards`] also does, means a failed connect
+/// here leaves every existing channel exactly as this call found it.
 ///
 /// The clear still needs to happen somewhere unconditionally reachable,
 /// though: on success, or on the redis-off branch. `run_poll_loop`
@@ -2230,20 +2153,19 @@ const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// runner consuming from the old endpoint or key prefix. `/admin/config`
 /// would report the newly installed global channel instead.
 ///
-/// The success path replaces both slots through `dispatch::install_single`
-/// in one atomic step (Codex review, issue #1429 follow-up). That
-/// replaces clearing the per-shard slot and then separately calling
-/// `dispatch::install`. A racing `dispatch::install_shards` call could
-/// otherwise land in the gap between those two calls. It would then end
-/// up installed alongside this one, instead of cleanly replaced by it.
+/// The success path replaces both slots through `dispatch::install_single` in
+/// one atomic step (issue #1429). That replaces clearing the per-shard slot and
+/// then separately calling `dispatch::install`. A racing
+/// `dispatch::install_shards` call could otherwise land in the gap between
+/// those two calls. It would then end up installed alongside this one, instead
+/// of cleanly replaced by it.
 ///
-/// The generation is `None` on the redis-off branch, since nothing is
-/// installed there; the [`TopologySnapshot`] is always present, whichever
-/// branch ran. [`DispatchInstallGuard`] can then restore the topology
-/// either branch replaced if a later startup step still fails (Codex
-/// review, issue #1429 follow-up). Installing here happens before
-/// `Worker::new`. That constructor's own dispatch-coverage check can
-/// still fail, or shard-pool validation after it can. See
+/// The generation is `None` on the redis-off branch, since nothing is installed
+/// there; the [`TopologySnapshot`] is always present, whichever branch ran.
+/// [`DispatchInstallGuard`] can then restore the topology either branch
+/// replaced if a later startup step still fails (issue #1429). Installing here
+/// happens before `Worker::new`. That constructor's own dispatch-coverage check
+/// can still fail, or shard-pool validation after it can. See
 /// [`DispatchInstallGuard`]'s doc for why undoing only this install is not
 /// enough on its own.
 #[cfg(feature = "redis")]
@@ -2265,22 +2187,21 @@ async fn install_dispatch_channel(
         // turned off.
         //
         // One atomic clear, not `uninstall()` then `uninstall_all_shards()`
-        // separately (Codex review, issue #1429 follow-up). A racing,
-        // overlapping runner's own `install_shards` call replaces both
-        // slots in one lock acquisition. Two separate clears here could
-        // straddle it, with the second one wiping out the topology that
-        // call just installed. See `dispatch::uninstall_all`'s own doc for
-        // what that runtime would observe.
+        // separately (issue #1429). A racing, overlapping runner's own
+        // `install_shards` call replaces both slots in one lock acquisition.
+        // Two separate clears here could straddle it, with the second one
+        // wiping out the topology that call just installed. See
+        // `dispatch::uninstall_all`'s own doc for what that runtime would
+        // observe.
         //
-        // `uninstall_all_capturing`, not `uninstall_all` (Codex review,
-        // issue #1429 follow-up). A still-running previous runtime may own
-        // exactly what this clears. Startup can still fail after this
-        // point -- `Worker::new` and the shard-pool validation after it
-        // are both still ahead. `DispatchInstallGuard` keeps the returned
-        // snapshot. It can then restore that previous topology on such a
-        // failure. That way the previous runtime is not left stranded on
-        // the Postgres fallback for a clear this startup never actually
-        // committed to.
+        // `uninstall_all_capturing`, not `uninstall_all` (issue #1429). A
+        // still-running previous runtime may own exactly what this clears.
+        // Startup can still fail after this point -- `Worker::new` and the
+        // shard-pool validation after it are both still ahead.
+        // `DispatchInstallGuard` keeps the returned snapshot. It can then
+        // restore that previous topology on such a failure. That way the
+        // previous runtime is not left stranded on the Postgres fallback for a
+        // clear this startup never actually committed to.
         let previous = autumn_harvest::dispatch::uninstall_all_capturing();
         return Ok((None, previous));
     };
@@ -2304,10 +2225,10 @@ async fn install_dispatch_channel(
         ))
     })?;
 
-    // Connected. Replace both slots atomically (Codex review, issue #1429
-    // follow-up). See the doc comment above for why the per-shard clear
-    // waits until here. `dispatch::install_single`'s own doc explains why
-    // this is one call rather than a separate clear and install.
+    // Connected. Replace both slots atomically (issue #1429). See the doc
+    // comment above for why the per-shard clear waits until here.
+    // `dispatch::install_single`'s own doc explains why this is one call rather
+    // than a separate clear and install.
     let (generation, previous) = autumn_harvest::dispatch::install_single(
         Arc::new(channel),
         autumn_harvest::dispatch::DispatchSettings {
@@ -2347,32 +2268,29 @@ async fn install_dispatch_channel(
 /// reconcile-interval latency, never a lost or duplicated dispatch: the
 /// reconcile sweep is the durability floor for every dispatch path.
 ///
-/// Returns the shards this call actually installed, paired with the
-/// generation `dispatch::install_for_shard` stamped on each. Alongside
-/// the [`TopologySnapshot`] from immediately before this call replaced or
-/// cleared the topology (`dispatch::install_shards` on the success path,
-/// `dispatch::uninstall_all_capturing` on the redis-off path). A later
-/// startup step can still fail. The caller's guard then restores that
-/// snapshot, rather than leaving the slots as this call left them (Codex
-/// review, issue #1429 follow-up).
+/// Returns the shards this call actually installed, paired with the generation
+/// `dispatch::install_for_shard` stamped on each. Alongside the
+/// [`TopologySnapshot`] from immediately before this call replaced or cleared
+/// the topology (`dispatch::install_shards` on the success path,
+/// `dispatch::uninstall_all_capturing` on the redis-off path). A later startup
+/// step can still fail. The caller's guard then restores that snapshot, rather
+/// than leaving the slots as this call left them (issue #1429).
 ///
 /// Connects every shard's channel first, into a local list, before touching
-/// either dispatch slot (Codex review, issue #1429 follow-up). An earlier
-/// version cleared both slots unconditionally on entry, then connected
-/// shards one at a time. A connection failure partway through that loop
-/// left this runtime with neither topology installed. The old channels were
-/// already cleared, and the new ones never finished connecting. Every shard
-/// then silently fell back to the Postgres claim path, instead of failing
-/// startup. Connecting first means a failure here leaves both slots exactly
-/// as this call found them.
+/// either dispatch slot (issue #1429). An earlier version cleared both slots
+/// unconditionally on entry, then connected shards one at a time. A connection
+/// failure partway through that loop left this runtime with neither topology
+/// installed. The old channels were already cleared, and the new ones never
+/// finished connecting. Every shard then silently fell back to the Postgres
+/// claim path, instead of failing startup. Connecting first means a failure
+/// here leaves both slots exactly as this call found them.
 ///
-/// Only once every shard in `shards` has connected does this function
-/// replace both slots, via `dispatch::install_shards`. That call clears
-/// and installs the whole topology in one atomic step (Codex review,
-/// issue #1429 follow-up). The replacement still needs to run
-/// unconditionally: a process may have previously run single-shard
-/// dispatch, or a differently shaped multi-shard install, with no
-/// intervening `stop()`:
+/// Only once every shard in `shards` has connected does this function replace
+/// both slots, via `dispatch::install_shards`. That call clears and installs
+/// the whole topology in one atomic step (issue #1429). The replacement still
+/// needs to run unconditionally: a process may have previously run single-shard
+/// dispatch, or a differently shaped multi-shard install, with no intervening
+/// `stop()`:
 ///
 /// - A stale single-shard slot: `Worker::new` prioritizes a populated
 ///   single-shard slot over per-shard coverage.
@@ -2406,15 +2324,14 @@ async fn install_dispatch_channels_for_shards(
         // channel a previous runtime installed (issue #1312) must not
         // outlive this process turning Redis off.
         //
-        // One atomic clear (Codex review, issue #1429 follow-up); see
-        // `install_dispatch_channel`'s matching fix and
-        // `dispatch::uninstall_all`'s own doc for the race two separate
-        // clears leaves open.
+        // One atomic clear (issue #1429); see `install_dispatch_channel`'s
+        // matching fix and `dispatch::uninstall_all`'s own doc for the race two
+        // separate clears leaves open.
         //
-        // `uninstall_all_capturing`, not `uninstall_all` (Codex review,
-        // issue #1429 follow-up). See `install_dispatch_channel`'s
-        // matching fix: a still-running previous runtime may own exactly
-        // what this clears, and startup can still fail after this point.
+        // `uninstall_all_capturing`, not `uninstall_all` (issue #1429). See
+        // `install_dispatch_channel`'s matching fix: a still-running previous
+        // runtime may own exactly what this clears, and startup can still fail
+        // after this point.
         let previous = autumn_harvest::dispatch::uninstall_all_capturing();
         return Ok((Vec::new(), previous));
     };
@@ -2442,11 +2359,10 @@ async fn install_dispatch_channels_for_shards(
         connected.push((shard, key_prefix, channel));
     }
 
-    // Every shard connected. Replace the whole topology in one atomic
-    // step (Codex review, issue #1429 follow-up). A loop that clears both
-    // slots, then installs each shard through its own separately locked
-    // call, is not atomic enough. See `dispatch::install_shards`'s own
-    // doc for why.
+    // Every shard connected. Replace the whole topology in one atomic step
+    // (issue #1429). A loop that clears both slots, then installs each shard
+    // through its own separately locked call, is not atomic enough. See
+    // `dispatch::install_shards`'s own doc for why.
     let mut key_prefixes = Vec::with_capacity(connected.len());
     let channels = connected
         .into_iter()
@@ -2508,14 +2424,13 @@ async fn install_dispatch_channels_for_shards(
 /// this path can only be reached with Redis dispatch off. The generation is
 /// always `None`, because nothing is installed.
 ///
-/// Both slots are still cleared, and the [`TopologySnapshot`] from
-/// immediately before that clear is still returned (Codex review, issue
-/// #1429 follow-up). Each slot is process wide. A channel another owner
-/// installed would otherwise stay live for a runtime that has Redis off
-/// (issue #1312). But that owner's runtime may still be running, and this
-/// process's own startup can still fail after this clear. The per-shard half
-/// mirrors the Codex review at issue #1429 this stub's `redis`-feature
-/// counterpart applies the same fix for.
+/// Both slots are still cleared, and the [`TopologySnapshot`] from immediately
+/// before that clear is still returned (issue #1429). Each slot is process
+/// wide. A channel another owner installed would otherwise stay live for a
+/// runtime that has Redis off (issue #1312). But that owner's runtime may still
+/// be running, and this process's own startup can still fail after this clear.
+/// The per-shard half mirrors the same fix in this stub's `redis`-feature
+/// counterpart (issue #1429).
 ///
 /// # Errors
 ///
@@ -2533,11 +2448,12 @@ async fn install_dispatch_channel(
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).
 ///
 /// Pure so the boot-time coverage warning is testable without a runtime. Under
-/// auto-assignment this is always empty by construction — `ShardRouter::new`
-/// asserts `writable ⊆ readable`, `missing_router_shards` fails startup when a
-/// readable shard has no pool, and auto-derived assignments are exactly the
-/// pool's shards — so a non-empty result means the worker was **explicitly**
-/// narrowed.
+/// auto-assignment this is always empty by construction:
+/// - `ShardRouter::new` asserts `writable ⊆ readable`;
+/// - `missing_router_shards` fails startup when a readable shard has no pool;
+/// - auto-derived assignments are exactly the pool's shards.
+///
+/// So a non-empty result means the worker was **explicitly** narrowed.
 fn uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId]) -> Vec<i32> {
     let covered: std::collections::BTreeSet<ShardId> = assignments.iter().copied().collect();
     let mut uncovered: Vec<i32> = router
@@ -2552,13 +2468,13 @@ fn uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId]) -> V
 
 /// Warn loudly about writable shards this worker will not poll (issue #961, AC6).
 ///
-/// This is the boot-time half of shard-coverage detection; the runtime half is
+/// This is the boot-time half of shard-coverage detection. The runtime half is
 /// the `harvest.shard.stranded_pending` gauge and the `harvest_shard_undrained`
-/// alert. It is a warning, not a hard failure: a one-worker-process-per-shard
-/// deployment deliberately narrows each process, so uncovered-here is only a
-/// problem when *no* process in the fleet covers the shard — which this process
-/// cannot know. The fleet-wide question is answered by
-/// `GET /admin/shards/health` (`no_live_worker`) and the stranded-work gauge.
+/// alert. It is a warning, not a hard failure. A one-worker-process-per-shard
+/// deployment deliberately narrows each process. An uncovered shard is a
+/// problem only when *no* process in the fleet covers it, which this process
+/// cannot know. `GET /admin/shards/health` (`no_live_worker`) and the
+/// stranded-work gauge answer the fleet-wide question.
 fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId]) {
     let uncovered = uncovered_writable_shards(router, assignments);
     if !uncovered.is_empty() {
@@ -2618,6 +2534,15 @@ fn reserved_shards_under_auto_assignment(
         .collect()
 }
 
+/// Returns shard IDs referenced by `router` that have no exact pool entry in
+/// `pool`.
+///
+/// An empty result means the router and pool are consistent.
+///
+/// `ShardedDbPool::pool_for` silently falls back to the default shard when a
+/// configured shard lacks a pool entry. Unchecked, shard-N `ExecutionId`s go
+/// into shard 0's database. They become permanently invisible once shard N is
+/// provisioned. Call this at startup and fail if the result is non-empty.
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()
@@ -2695,9 +2620,8 @@ mod tests {
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
-    /// A startup that fails must leave the process-global audit-export config
-    /// exactly as it found it — and, crucially, must do so by NOT publishing
-    /// rather than by restoring (issue #953, Codex review rounds 16 and 19).
+    /// A failed startup leaves the process-global audit-export config as it
+    /// found it. It does so by NOT publishing, not by restoring (issue #953).
     /// Restoring a snapshot races a concurrent successful startup: both
     /// snapshot the same old value, and the loser's restore would replace the
     /// winner's live sink.
@@ -2771,8 +2695,8 @@ mod tests {
         );
     }
 
-    /// Build a pool tagged by its `max_size` (readable without connecting) so    /// Build a pool tagged by its `max_size` (readable without connecting) so
-    /// two pools are distinguishable in a DB-free test.
+    /// A pool tagged by its `max_size`, which is readable without connecting.
+    /// So two pools are distinguishable in a DB-free test.
     fn tagged_pool(max_size: usize) -> DbPool {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
             "postgres://unused@127.0.0.1:1/none",
@@ -2783,12 +2707,14 @@ mod tests {
             .expect("build tagged pool")
     }
 
-    /// The single source of truth for the runtime pool-resolution precedence
-    /// (issue #700 P2). A `WorkerConfig::with_sharded_pool` MUST win over
-    /// `harvest_pool` — otherwise the boot-gate (which calls this exact
-    /// function) would validate `harvest_pool` while the workers poll the
-    /// sharded pool's database. The `max_size` tag identifies which pool was
-    /// resolved without opening a connection.
+    /// Pins the runtime pool-resolution precedence of
+    /// `resolve_runtime_storage_pool` (issue #700 P2). A
+    /// `WorkerConfig::with_sharded_pool` MUST win over `harvest_pool`. The boot
+    /// gate calls `select_runtime_gate_shards`, which shares this precedence
+    /// through `pick_runtime_pool_source`. A wrong order would make the gate
+    /// validate `harvest_pool` while the workers poll the sharded pool's
+    /// database. The `max_size` tag identifies which pool was resolved without
+    /// opening a connection.
     #[test]
     fn resolve_runtime_storage_pool_precedence() {
         let harvest = tagged_pool(3);
@@ -3080,8 +3006,8 @@ mod tests {
     ///
     /// The plugin's #700 gate reads shard 0 only, which is sound there because
     /// the plugin rejects multi-shard configs outright. The standalone runner
-    /// is exactly the path that supports them (#522), so a shard-0-only gate
-    /// would report a `complete`, clean fleet while shards 1..N host orphans.
+    /// supports them (#522). There, a shard-0-only gate would report a
+    /// `complete`, clean fleet while shards 1..N host orphans.
     /// Tagged by `max_size`, so no connection is opened and no global is read.
     #[test]
     fn select_runtime_gate_shards_covers_every_shard_of_a_sharded_pool() {
@@ -3113,11 +3039,10 @@ mod tests {
         );
     }
 
-    /// The gate honors the same pool precedence as the runner it guards
-    /// (issue #700 P2, via the shared `pick_runtime_pool_source`): a
-    /// runner-level override beats `WorkerConfig`'s pool, which beats
-    /// `harvest_pool`. Querying the wrong database would let the gate validate
-    /// a DB the workers never poll.
+    /// The gate honors the same pool precedence as the runner it guards, via
+    /// the shared `pick_runtime_pool_source` (issue #700 P2). A runner-level
+    /// override beats `WorkerConfig`'s pool, which beats `harvest_pool`. The
+    /// wrong database would let the gate validate a DB the workers never poll.
     #[test]
     fn select_runtime_gate_shards_honors_the_runtime_pool_precedence() {
         let harvest = tagged_pool(3);
@@ -3161,14 +3086,14 @@ mod tests {
         );
     }
 
-    /// A shard the ROUTER knows about but for which this process has no pool
-    /// must appear in the enumeration with no pool, so the report marks it
-    /// `unavailable` and the completeness status degrades to `partial` — which
-    /// `startup_orphan_decision` turns into a warning, never an abort.
+    /// A shard the ROUTER knows about, with no pool in this process, must
+    /// appear in the enumeration with no pool. The report marks it
+    /// `unavailable`, and the status degrades to `partial`.
+    /// `startup_orphan_decision` turns that into a warning, never an abort.
     ///
-    /// Omitting it instead would let the report read `complete` for a fleet
-    /// whose shard was never inspected: the one way a gate can report a
-    /// confident clean boot it did not earn.
+    /// An omitted shard would let the report read `complete` for a fleet
+    /// whose shard was never inspected. The gate would then report a clean
+    /// boot it did not earn.
     #[test]
     fn select_runtime_gate_shards_reports_a_router_shard_with_no_pool() {
         let harvest = tagged_pool(3);
@@ -3193,9 +3118,9 @@ mod tests {
 
     /// The registered set is workflow names UNION unified-DAG names.
     ///
-    /// The DAG half is load-bearing: a unified DAG's in-flight executions carry
-    /// the DAG's name in `workflow_name`, so omitting DAG names would report
-    /// every running DAG as an orphan and refuse boot under `fail`.
+    /// The DAG half is load-bearing. A unified DAG's in-flight executions carry
+    /// the DAG's name in `workflow_name`. Without DAG names, every running DAG
+    /// reads as an orphan, and boot is refused under `fail`.
     #[test]
     fn registered_workflow_type_names_unions_workflows_and_unified_dags() {
         let built = autumn_harvest::builder::HarvestBuilder::new()
@@ -3468,8 +3393,8 @@ mod tests {
         );
     }
 
-    /// A multi-shard install reports one prefix per covered shard, not the
-    /// bare configured prefix (Codex review, issue #1429).
+    /// A multi-shard install reports one prefix per covered shard, not the bare
+    /// configured prefix (issue #1429).
     ///
     /// `dispatch_shard` is `None` for a multi-shard install. `start` never
     /// resolves one shard to represent the whole span. So applying
@@ -3540,9 +3465,8 @@ mod tests {
         );
     }
 
-    /// A failed replacement startup restores the previous single-shard
-    /// channel, not just clears the one it failed to finish installing
-    /// (Codex review, issue #1429 follow-up).
+    /// A failed replacement startup restores the previous single-shard channel,
+    /// not just clears the one it failed to finish installing (issue #1429).
     ///
     /// `install_single` destructively replaces the topology before
     /// `Worker::new` and the shard-pool validation after it can still fail.
@@ -3619,8 +3543,8 @@ mod tests {
     }
 
     /// `DISPATCH_START_LOCK` must serialize `start`'s
-    /// install-through-commit-or-unwind span across overlapping calls
-    /// (Codex review, issue #1429 follow-up).
+    /// install-through-commit-or-unwind span across overlapping calls (issue
+    /// #1429).
     ///
     /// Without it, a second overlapping `start` could snapshot a first
     /// call's still-uncommitted, about-to-fail install. Suppose both then
@@ -3647,9 +3571,8 @@ mod tests {
         );
     }
 
-    /// A queue name the channel key
-    /// space cannot carry must fail startup, not degrade the process to the
-    /// Postgres fallback in silence.
+    /// A queue name the channel key space cannot carry must fail startup. It
+    /// must not degrade the process to the Postgres fallback in silence.
     #[test]
     fn redis_dispatch_rejects_a_queue_name_with_a_colon() {
         let queues = vec!["default".to_string(), "tenant:priority".to_string()];
@@ -3684,12 +3607,11 @@ mod tests {
     /// install time.
     ///
     /// `generation` is `None` for a runner that installed no single-shard
-    /// channel, or `Some` of the value `dispatch::install` actually
-    /// returned (Codex review, issue #1429 follow-up). A fabricated value
-    /// would not match the real slot's generation, so `stop`'s ownership
-    /// check would always treat it as stale. `stop` is driven through
-    /// this, so the case needs no database, no worker and no
-    /// scheduler.
+    /// channel, or `Some` of the value `dispatch::install` actually returned
+    /// (issue #1429). A fabricated value would not match the real slot's
+    /// generation, so `stop`'s ownership check would always treat it as stale.
+    /// `stop` is driven through this, so the case needs no database, no worker
+    /// and no scheduler.
     fn runner_owning_dispatch(generation: Option<u64>) -> super::HarvestRunner {
         let api_runtime = crate::api::HarvestApiRuntime::new(
             std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
@@ -3775,9 +3697,8 @@ mod tests {
             .block_on(future)
     }
 
-    /// A restart with Redis off must
-    /// not keep publishing and consuming through the channel of the previous
-    /// runtime.
+    /// A restart with Redis off must not keep publishing and consuming through
+    /// the channel of the previous runtime.
     #[test]
     fn a_disabled_start_clears_a_previously_installed_channel() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
@@ -3808,10 +3729,10 @@ mod tests {
         );
     }
 
-    /// Entering the single-shard install path clears a stale per-shard
-    /// slot too, the mirror of
-    /// `entering_the_multi_shard_path_clears_the_single_shard_slot` (Codex
-    /// review, issue #1429).
+    /// Entering the single-shard install path clears a stale per-shard slot
+    /// too, the mirror of
+    /// `entering_the_multi_shard_path_clears_the_single_shard_slot` (issue
+    /// #1429).
     ///
     /// `run_poll_loop` prioritizes an installed per-shard channel for its
     /// polled shard over the single-shard slot this call installs. A
@@ -3847,10 +3768,9 @@ mod tests {
         );
     }
 
-    /// A single-shard install whose connect fails leaves an active
-    /// multi-shard runner's per-shard channels untouched (Codex review,
-    /// issue #1429 follow-up), the single-shard mirror of
-    /// `a_shard_connect_failure_leaves_existing_channels_untouched`.
+    /// A single-shard install whose connect fails leaves an active multi-shard
+    /// runner's per-shard channels untouched (issue #1429), the single-shard
+    /// mirror of `a_shard_connect_failure_leaves_existing_channels_untouched`.
     ///
     /// An earlier version cleared every per-shard slot unconditionally on
     /// entry, before attempting to connect. A single-shard runner could
@@ -3927,9 +3847,8 @@ mod tests {
         );
     }
 
-    /// `stop`'s own generation check must wait for a racing `start` that
-    /// is mid install-through-resolution, not run ahead of it (Codex
-    /// review, issue #1429 follow-up).
+    /// `stop`'s own generation check must wait for a racing `start` that is mid
+    /// install-through-resolution, not run ahead of it (issue #1429).
     ///
     /// Without `DISPATCH_START_LOCK`, `stop`'s check could run while a
     /// replacement `start` sits between its own install and its eventual
@@ -4049,8 +3968,8 @@ mod tests {
         );
     }
 
-    /// `stop` on an old runner must not clear a replacement runner's
-    /// channel (Codex review, issue #1429 follow-up).
+    /// `stop` on an old runner must not clear a replacement runner's channel
+    /// (issue #1429).
     ///
     /// A process may start a replacement `HarvestRunner` before calling
     /// `stop` on the previous one. The replacement's own `install` already
@@ -4087,8 +4006,8 @@ mod tests {
     }
 
     /// The per-shard mirror of
-    /// `stop_does_not_clear_a_replacement_runners_single_shard_channel`
-    /// (Codex review, issue #1429 follow-up).
+    /// `stop_does_not_clear_a_replacement_runners_single_shard_channel` (issue
+    /// #1429).
     ///
     /// A replacement multi-shard runner may reinstall some, but not all, of
     /// the shards the old runner owned before the old runner's `stop`
@@ -4175,8 +4094,8 @@ mod tests {
         );
     }
 
-    /// A multi-shard install clears a stale single-shard slot too (Codex
-    /// review, issue #1429).
+    /// A multi-shard install clears a stale single-shard slot too (issue
+    /// #1429).
     ///
     /// `Worker::new` treats a populated single-shard slot as authoritative
     /// over per-shard coverage. A process that previously ran single-shard
@@ -4221,9 +4140,9 @@ mod tests {
         );
     }
 
-    /// Reinstalling for a smaller or differently shaped multi-shard span
-    /// clears every per-shard slot first. It clears more than just the
-    /// shards the new call names (Codex review, issue #1429).
+    /// Reinstalling for a smaller or differently shaped multi-shard span clears
+    /// every per-shard slot first. It clears more than just the shards the new
+    /// call names (issue #1429).
     ///
     /// A shard from an earlier, uncommitted-`stop()` multi-shard install
     /// may fall outside the new call's own `shards`. It must not survive
@@ -4262,8 +4181,8 @@ mod tests {
         );
     }
 
-    /// A shard that fails to connect leaves every existing channel exactly
-    /// as this call found it (Codex review, issue #1429 follow-up).
+    /// A shard that fails to connect leaves every existing channel exactly as
+    /// this call found it (issue #1429).
     ///
     /// An earlier version cleared both dispatch slots unconditionally on
     /// entry, then connected shards one at a time. A connect failure
@@ -4369,10 +4288,10 @@ mod tests {
         assert!(autumn_harvest::dispatch::installed_for_shard(shard_b).is_none());
     }
 
-    /// A failed replacement startup restores the previous per-shard
-    /// channels, the multi-shard mirror of
+    /// A failed replacement startup restores the previous per-shard channels,
+    /// the multi-shard mirror of
     /// `a_failed_replacement_startup_restores_the_previous_dispatch_channel`
-    /// (Codex review, issue #1429 follow-up).
+    /// (issue #1429).
     #[test]
     fn a_failed_shard_replacement_startup_restores_the_previous_channels() {
         let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {

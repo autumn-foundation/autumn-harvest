@@ -1,17 +1,16 @@
 //! HARDENING ITEM 2 (issue #1068): **`(workflow_name, workflow_id)` start-boundary
 //! reuse-policy matrix.**
 //!
-//! Before this change `start_workflow_with_id` ALWAYS minted a fresh
-//! [`ExecutionId`] — no `(workflow_name, workflow_id)` lookup, no uniqueness, no
-//! reuse policy — so a duplicate delivery (a retried webhook) started a second,
-//! independent run and repeated its side effects. This backend now mirrors the
-//! Postgres core PLAIN-start matrix in the single-writer start transaction:
-//! `start_workflow_with_id` is idempotent-by-default (`AllowDuplicate`), and
+//! `start_workflow_with_id` once ALWAYS minted a fresh [`ExecutionId`]. It had no
+//! `(workflow_name, workflow_id)` lookup, no uniqueness and no reuse policy. So a
+//! duplicate delivery, such as a retried webhook, started a second independent run
+//! and repeated its side effects. This backend now mirrors the Postgres core
+//! PLAIN-start matrix in the single-writer start transaction.
+//! `start_workflow_with_id` is idempotent by default (`AllowDuplicate`).
 //! `start_workflow_with_reuse_policy` exposes the full four-policy matrix.
 //!
-//! The core PLAIN-start matrix (restricted to the states this backend can hold —
-//! none / RUNNING / COMPLETED / FAILED, with a replaced prior SEALED to
-//! `CONTINUED_AS_NEW`):
+//! The core PLAIN-start matrix, for the states this backend can hold: none /
+//! RUNNING / COMPLETED / FAILED. A replaced prior is SEALED to `CONTINUED_AS_NEW`.
 //!
 //! | Prior state | AllowDuplicate | RejectDuplicate | AllowDuplicateFailedOnly | TerminateIfRunning |
 //! |-------------|----------------|-----------------|--------------------------|--------------------|
@@ -24,10 +23,9 @@
 //! reuse check, so ALL policies (incl. `RejectDuplicate`) create fresh over it —
 //! mirroring core's uniqueness-index-excludes-terminal nuance.
 //!
-//! No Docker: `SQLite` is embedded (`rusqlite` `bundled`); prior runs are driven
-//! to RUNNING / COMPLETED / FAILED with the in-process drivers, and the reuse
-//! decision is a pure application-code branch in the start transaction — nothing
-//! waits on wall time.
+//! No Docker: `SQLite` is embedded (`rusqlite` `bundled`). The in-process drivers
+//! take prior runs to RUNNING / COMPLETED / FAILED. The reuse decision is a pure
+//! application-code branch in the start transaction. Nothing waits on wall time.
 
 // The `#[workflow]` macro references its input params, so a deliberately-unused
 // param reads as a "used underscore binding" through expansion.
@@ -132,13 +130,12 @@ fn stage_legacy_signal(path: &std::path::Path, exec: ExecutionId) {
     .unwrap();
 }
 
-/// Directly seed a pre-#1068 RUNNING `harvest_executions` row (bypassing the reuse
-/// matrix, which the public start path now enforces) for `(name, id)` on the file
-/// at `path`, plus its `WorkflowStarted` event so a driver can replay/run it, plus
-/// one orphan PENDING task and one unfired timer so cleanup is observable. Returns
-/// the minted `exec_id`. Used to reconstruct the "multiple RUNNING duplicates for
-/// one key" state a database written by the pre-#1068 always-fresh
-/// `start_workflow_with_id` could already hold.
+/// Directly seed a pre-#1068 RUNNING `harvest_executions` row for `(name, id)` on
+/// the file at `path`. It bypasses the reuse matrix that the public start path
+/// enforces. It also seeds a `WorkflowStarted` event, so a driver can run it. One
+/// orphan PENDING task and one unfired timer make the cleanup observable. Returns
+/// the minted `exec_id`. Tests use it to rebuild the "multiple RUNNING duplicates
+/// for one key" state of the pre-#1068 always-fresh `start_workflow_with_id`.
 fn seed_legacy_running_row(path: &std::path::Path, name: &str, id: &str) -> ExecutionId {
     let raw = rusqlite::Connection::open(path).unwrap();
     let exec = ExecutionId::new();
@@ -473,9 +470,9 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
             matches!(state, RunState::WaitingTimer),
             "prior #{cycle} blocks on the timer, never on this signal"
         );
-        // A caller sends a signal the workflow's code never awaits before it is
-        // replaced — e.g. a stale webhook retry, or a signal sent to the wrong
-        // step of a long-running workflow.
+        // A caller sends a signal that the workflow never awaits before it is
+        // replaced. Examples are a stale webhook retry, or a signal sent to the
+        // wrong step of a long-running workflow.
         rt.send_signal(prior, "never_consumed", json!({"cycle": cycle}))
             .unwrap();
         assert_eq!(
@@ -513,9 +510,9 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
 
 // A signal staged while the prior is RUNNING can outlive it. Before issue #2020
 // this happened even when the prior reached COMPLETED on its own, if the
-// workflow never awaited that signal name. Old files still hold such rows. That prior is sealed via the same
-// "already-terminal" path, which skips the cancellation branch. So the signal
-// cleanup must not live inside that branch.
+// workflow never awaited that signal name. Old files still hold such rows. That
+// prior is sealed through the same "already-terminal" path, which skips the
+// cancellation branch. So the signal cleanup must not live inside that branch.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior() {
     let (_dir, path) = temp_db();
@@ -566,25 +563,23 @@ async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_comple
     );
 }
 
-// ── FINDING (Codex #1080 P2): TerminateIfRunning seals ALL legacy active rows ─────
+// ── TerminateIfRunning seals ALL legacy active rows (issue #1080) ───────────────────
 //
 // A database written by the PRE-#1068 always-fresh `start_workflow_with_id` can
 // already hold MULTIPLE `RUNNING` rows for one `(workflow_name, workflow_id)` key.
-// `TerminateIfRunning` must seal/cancel EVERY active row for the key (not just the
-// newest, which `find_active_execution_by_key`'s `ORDER BY rowid DESC LIMIT 1`
-// returns), so no orphaned RUNNING prior survives to be driven by `run_until_idle`,
-// defeating the terminate-and-restart guarantee for upgraded databases.
+// `TerminateIfRunning` must seal or cancel EVERY active row for the key. The
+// `ORDER BY rowid DESC LIMIT 1` of `find_active_execution_by_key` returns only the
+// newest. An orphaned RUNNING prior would survive, and `run_until_idle` would drive
+// it. That defeats the terminate-and-restart guarantee for upgraded databases.
 
-/// Seed THREE legacy RUNNING duplicates for one key (each with a WorkflowStarted
-/// event, an orphan pending task, and an unfired timer), then run
-/// `TerminateIfRunning`: EVERY prior must be sealed `CONTINUED_AS_NEW` with a
-/// `WorkflowCancelled` event and its orphan task/timer released, exactly ONE
-/// `RUNNING` row (the fresh run) must remain, and `run_until_idle` must drive ONLY
-/// the fresh run — never re-driving the sealed priors.
+/// Seed THREE legacy RUNNING duplicates for one key, then run `TerminateIfRunning`.
+/// Each has a WorkflowStarted event, an orphan pending task and an unfired timer.
+/// EVERY prior must be sealed `CONTINUED_AS_NEW` with a `WorkflowCancelled` event.
+/// Its orphan task and timer must be released. Exactly ONE `RUNNING` row, the
+/// fresh run, must remain. `run_until_idle` must drive ONLY the fresh run.
 ///
-/// RED against the pre-fix code: it seals only the NEWEST prior, leaving the two
-/// older RUNNING duplicates active — so their state stays `RUNNING` (not
-/// `CONTINUED_AS_NEW`) and `run_until_idle` drives them to `COMPLETED`.
+/// Regression: the old code sealed only the NEWEST prior. The two older RUNNING
+/// duplicates stayed `RUNNING`, and `run_until_idle` drove them to `COMPLETED`.
 #[tokio::test]
 async fn terminate_if_running_seals_all_legacy_active_duplicates() {
     let (_dir, path) = temp_db();
@@ -593,11 +588,10 @@ async fn terminate_if_running_seals_all_legacy_active_duplicates() {
     let mut rt = runtime_at(&path);
 
     // Reconstruct a pre-#1068 database holding THREE RUNNING rows for one key. The
-    // public start path now dedups, so it cannot create duplicates — seed them
-    // directly. Insertion order == rowid order, so `execs[2]` is the newest (the
-    // only one the pre-fix single-row lookup would seal). `echo_wf` COMPLETES when
-    // driven, so a prior left RUNNING is observably driven to COMPLETED by
-    // `run_until_idle` (a sealed prior is not driven at all).
+    // public start path dedups, so seed them directly. Insertion order is rowid
+    // order, so `execs[2]` is the newest. A single-row lookup would seal only it.
+    // `echo_wf` COMPLETES when driven. So `run_until_idle` visibly drives a prior
+    // left RUNNING to COMPLETED. It does not drive a sealed prior at all.
     let key_id = "legacy-dup";
     let execs: Vec<ExecutionId> = (0..3)
         .map(|_| seed_legacy_running_row(&path, "echo_wf", key_id))
@@ -652,9 +646,9 @@ async fn terminate_if_running_seals_all_legacy_active_duplicates() {
         "exactly one ACTIVE run (the fresh one) remains"
     );
 
-    // `run_until_idle` drives ONLY the fresh run: the sealed priors are filtered out
-    // of the running set and never re-driven (pre-fix, the two older RUNNING
-    // duplicates would be driven to COMPLETED here).
+    // `run_until_idle` drives ONLY the fresh run. The sealed priors leave the running
+    // set and are never driven again. With the bug, the two older RUNNING
+    // duplicates would reach COMPLETED here.
     rt.run_until_idle().await.unwrap();
     for &e in &execs {
         assert_eq!(
@@ -939,11 +933,10 @@ async fn sealed_prior_is_invisible_to_subsequent_attach() {
 }
 
 /// RejectDuplicate over a key whose ONLY prior is SEALED (`CONTINUED_AS_NEW`)
-/// creates fresh rather than erroring — the sealed row is invisible to the reuse
-/// lookup (mirrors core's uniqueness-index-excludes-terminal). The sealed-only
-/// state (no active row for the key) is set up directly via a raw seal, since
-/// every public "replace" path pairs a seal with a fresh start and so always leaves
-/// an active row behind.
+/// creates fresh instead of erroring. The reuse lookup does not see the sealed row,
+/// as core's uniqueness index excludes terminal rows. A raw seal sets up the
+/// sealed-only state directly. Every public "replace" path pairs a seal with a
+/// fresh start, so it always leaves an active row.
 #[tokio::test]
 async fn reject_duplicate_over_a_sealed_only_prior_creates_fresh() {
     let (_dir, path) = temp_db();
@@ -1039,14 +1032,14 @@ async fn driving_a_sealed_execution_is_terminal() {
     );
 }
 
-// ── FINDING 2 (Codex #1080 P2): outcome() of a superseded prior is TERMINAL ───────
+// ── outcome() of a superseded prior is TERMINAL (issue #1080) ──────────────────────
 //
-// When a reuse-policy decision SEALS a prior execution to `CONTINUED_AS_NEW`
-// (`TerminateIfRunning` over any prior; `AllowDuplicateFailedOnly` over a FAILED
-// prior), the pure `outcome()` accessor must report the superseded run TERMINALLY —
-// consistent with the driver's `erase::is_terminal_state` short-circuit — NOT as
-// `Running`. Pre-fix `outcome()` mapped every state other than COMPLETED/FAILED to
-// `Running`, so a client polling the superseded prior saw it active forever.
+// A reuse-policy decision can SEAL a prior execution to `CONTINUED_AS_NEW`.
+// `TerminateIfRunning` does so over any prior, `AllowDuplicateFailedOnly` over a
+// FAILED one. The pure `outcome()` accessor must then report the run TERMINALLY,
+// NOT as `Running`. That matches the `erase::is_terminal_state` short-circuit of the
+// driver. `outcome()` once mapped every state but COMPLETED/FAILED to `Running`. A
+// client polling the superseded prior then saw it active forever.
 
 /// A `TerminateIfRunning` replace seals a RUNNING prior to `CONTINUED_AS_NEW`; its
 /// `outcome()` must be `Terminated`, not `Running`.
@@ -1056,7 +1049,7 @@ async fn outcome_of_a_superseded_prior_is_terminal_not_running() {
     let mut rt = runtime_at(&path);
     let prior = seed_prior(&mut rt, "wait_wf", "term-1").await;
     assert_eq!(raw_state(&path, prior), "RUNNING");
-    // Pre-fix control: a RUNNING prior legitimately reports Running.
+    // Control: a RUNNING prior legitimately reports Running.
     assert!(
         matches!(rt.outcome(prior).unwrap(), ExecutionOutcome::Running),
         "precondition: the live prior reports Running"
@@ -1073,8 +1066,8 @@ async fn outcome_of_a_superseded_prior_is_terminal_not_running() {
     assert!(out.created);
     assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
 
-    // The superseded prior is TERMINAL, carrying the raw sealed state — NOT Running
-    // (RED pre-fix: outcome() returned Running for the CONTINUED_AS_NEW prior).
+    // The superseded prior is TERMINAL and carries the raw sealed state, NOT
+    // Running.
     match rt.outcome(prior).unwrap() {
         ExecutionOutcome::Terminated(state) => assert_eq!(
             state, "CONTINUED_AS_NEW",
@@ -1114,8 +1107,8 @@ async fn outcome_of_a_failed_only_replaced_prior_is_terminal_not_running() {
     assert!(out.created, "a FAILED prior is replaced");
     assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
 
-    // Once SEALED, the prior is Terminated (superseded), not Running and no longer
-    // Failed (RED pre-fix: outcome() returned Running for the sealed state).
+    // Once SEALED, the prior is Terminated (superseded). It is not Running and no
+    // longer Failed.
     match rt.outcome(prior).unwrap() {
         ExecutionOutcome::Terminated(state) => assert_eq!(state, "CONTINUED_AS_NEW"),
         other => panic!("expected Terminated for a sealed FAILED-replaced prior, got {other:?}"),

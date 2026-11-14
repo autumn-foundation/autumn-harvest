@@ -2,9 +2,9 @@
 
 //! Real-Postgres integration tests for [`WorkflowReplayer::replay_from_db`].
 //!
-//! Spins up a throwaway Postgres container per test (via testcontainers),
-//! inserts a workflow execution row and its event history directly, then
-//! replays using `replay_from_db` and asserts the outcome.
+//! Each test starts a throwaway Postgres container (via testcontainers).
+//! It inserts an execution row and its event history directly, then replays
+//! with `replay_from_db` and asserts the outcome.
 //!
 //! Run with:
 //! ```text
@@ -261,7 +261,7 @@ async fn replay_from_db_detects_non_determinism() {
     );
 }
 
-/// (c) `replay_from_db` fails gracefully when the execution ID doesn't exist.
+/// (c) `replay_from_db` fails gracefully when the execution ID does not exist.
 #[tokio::test]
 async fn replay_from_db_unknown_exec_id_returns_error() {
     let (mut conn, _container) = setup_test_db().await;
@@ -372,8 +372,8 @@ fn deadline_can_probe_workflow<'a>(
     Box::pin(async move {
         // The deadline branch consults the recorded clock here (issue #772).
         if ctx.should_continue_as_new() {
-            // In this fixture the deadline is far in the future, so this branch
-            // is never taken; it exists so the check is a genuine call site.
+            // The fixture deadline is far in the future, so this branch never runs.
+            // It exists so that the check is a genuine call site.
             return Ok(Value::Null);
         }
         ctx.execute_activity_raw("step_one", Value::Null, "default")
@@ -425,9 +425,9 @@ async fn persist_deadline_probe_history(
 }
 
 /// Issue #772 Finding A: `replay_from_db` must thread the execution row's own
-/// `execution_timeout`/`deadline_at`, NOT the replayer-global option. A row that
-/// recorded a `SideEffectRecorded{Now}` from the deadline branch replays cleanly
-/// (`ReplaySucceeded`) — the branch is enabled by the per-row timeout so the
+/// `execution_timeout`/`deadline_at`, NOT the replayer-global option. A row
+/// with a recorded `SideEffectRecorded{Now}` from the deadline branch replays
+/// cleanly (`ReplaySucceeded`). The per-row timeout enables the branch, so the
 /// recorded `Now` matches. Replaying the *same* events with the deadline branch
 /// disabled (no `execution_timeout` threaded) leaves the `Now` unmatched and
 /// diverges — proving the per-row threading is load-bearing.

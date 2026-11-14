@@ -4,12 +4,11 @@
 //! ## The problem
 //!
 //! The overwhelmingly common "wait for N seconds" primitive ([`WorkflowContext::timer`])
-//! is *fire-once*: once armed it always fires. But real orchestrations need to
-//! **cancel** a pending timer (the work finished early, so the SLA timer must
-//! not fire) and **reset** it (a sliding-window / idle-session timeout that
-//! renews on every event). Hand-rolling that with plain timers accumulates
-//! *orphaned firings* — a stale timer that fires late into a workflow that has
-//! already moved on.
+//! is *fire-once*: once armed it always fires. Real orchestrations must
+//! **cancel** a pending timer when the work finishes early. They must also
+//! **reset** it, for a sliding-window or idle-session timeout. Plain timers
+//! then accumulate *orphaned firings*: a stale timer fires late into a workflow
+//! that has moved on.
 //!
 //! ## The solution: `ctx.start_timer(id, secs)` + `TimerHandle`
 //!
@@ -37,15 +36,14 @@
 //!
 //! Arming records a single `TimerStarted`; cancel records a `TimerCancelled`
 //! (an event added for this feature) so no `TimerFired` is ever produced for a
-//! cancelled timer. A genuine fire-vs-cancel *race* is resolved deterministically
-//! by **recorded-history order** — whichever of `TimerFired` / `TimerCancelled`
-//! for the id is recorded first wins on every replay, regardless of wall-clock
-//! timing on the replaying worker.
+//! cancelled timer. **Recorded-history order** resolves a fire-vs-cancel *race*.
+//! Whichever of `TimerFired` / `TimerCancelled` is recorded first for the id
+//! wins on every replay, whatever the wall-clock timing of the replaying worker.
 //!
 //! ## Deadline is measured from `await_fire`, not from `start_timer`
 //!
-//! Arming records only the `TimerStarted` event — the durable `harvest_timers`
-//! row (which makes the timer fire-eligible) is inserted when the timer is
+//! Arming records only the `TimerStarted` event. The durable `harvest_timers`
+//! row makes the timer fire-eligible. It is inserted when the timer is
 //! **awaited**, with `fires_at = db_now + duration` at that instant. An
 //! armed-but-unawaited timer therefore never fires while the workflow is parked
 //! on some other wait, matching the "observed only at `await_fire()`" contract.
@@ -57,11 +55,11 @@
 //!
 //! ## Composition note
 //!
-//! This slice ships the core primitive. Composing an armed handle with a signal
-//! wait in one `select!`-style call (an idle-timeout that resets on the next
-//! event *signal*) is a natural follow-up: use `ctx.receive_signal_timeout`
-//! (issue #476) for the two-branch signal-or-deadline shape today, or drive the
-//! reset from workflow logic as below.
+//! This slice ships the core primitive. It does not yet compose an armed handle
+//! with a signal wait in one `select!`-style call. An example is an
+//! idle-timeout that resets on the next *signal*. Today, use `ctx.receive_signal_timeout` (issue
+//! #476) for the signal-or-deadline shape. Or drive the reset from workflow
+//! logic as below.
 //!
 //! Run the embedded tests with:
 //! ```bash

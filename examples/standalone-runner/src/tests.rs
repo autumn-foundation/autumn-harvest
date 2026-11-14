@@ -98,15 +98,14 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
     )));
 }
 
-/// HTTP-level coverage for the assembled router `server.rs` mounts (issue
-/// #1610). The three tests above assert only the workflow and config layer.
-/// Nothing before this exercised the router itself. That gap let two live
-/// defects go unnoticed until a real embedder hit them. The first was the
+/// HTTP-level coverage for the router that `server.rs` mounts (issue #1610).
+/// An untested router hid two defects from embedders. One was the
 /// `AppState::for_test()` call in the production entry point, now removed
-/// (issue #1607). The second was the always-`401` documented `preflight`
-/// step (issue #1609). No database is needed here. `HarvestApiState::new()`
-/// with nothing installed matches a router that has never received traffic.
-/// That is exactly the state these three routes must tolerate.
+/// (issue #1607).
+/// The other was the always-`401` documented `preflight` step (issue #1609).
+/// No database is needed. `HarvestApiState::new()` with nothing installed
+/// matches a router that has never received traffic, and these routes must
+/// tolerate that state.
 ///
 /// `run` gets its Harvest router from `HarvestEmbedding`, which needs a
 /// database. `harvest_mount` builds the same composition from a bare state.

@@ -1,25 +1,25 @@
-//! Regression tests for the Codex #1069 (P1/P2) and round-8 healthy-run-killer
-//! findings on the single-writer backend:
+//! Regression tests for the #1069 healthy-run-killer findings on the
+//! single-writer backend:
 //!
-//! - **FIX 1 (P1)** — engine-detected replay non-determinism is NON-TERMINAL: the
-//!   divergent decision cycle is discarded (nothing appended, execution stays
-//!   `RUNNING`/resumable) and surfaced as [`SqliteError::NonDeterministic`],
-//!   rather than sealing the run `FAILED` and poisoning history (mirrors the
-//!   Postgres engine's issue #603 gate).
-//! - **FIX 2 (P2)** — a workflow that schedules an UNREGISTERED activity releases
-//!   the just-claimed task back to `PENDING` (instead of stranding it `RUNNING`),
-//!   so a later drain re-claims it once the body is registered — no DB reopen.
-//! - **FIX 3 (round 8)** — a PANICKING activity body is contained and routed
-//!   through the normal retryable-failure path (retry per policy, else terminal
-//!   `ActivityFailed`) instead of unwinding past the finalize and wedging the run.
-//! - **FIX 4 (round 8)** — a single decision cycle emitting BOTH a timer and an
-//!   activity (`tokio::join!`) records its schedule events in command order and
-//!   replays cleanly on the core `WorkflowReplayer` (the matcher tolerates the
-//!   interleaved sibling terminals).
-//! - **`send_signal` validation (Codex #1069 P2)** — `send_signal` rejects a signal
-//!   to an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal one
-//!   ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no live
-//!   `wait_for_signal` could ever consume; a RUNNING target stages/consumes as
+//! - **FIX 1** — engine-detected replay non-determinism is NON-TERMINAL. The
+//!   divergent decision cycle is discarded: nothing is appended, and the
+//!   execution stays `RUNNING` and resumable. It surfaces as
+//!   [`SqliteError::NonDeterministic`]. The run is not sealed `FAILED`, so
+//!   history is not poisoned. This mirrors the Postgres issue #603 gate.
+//! - **FIX 2** — a workflow that schedules an UNREGISTERED activity releases
+//!   the just-claimed task back to `PENDING`, not stranded `RUNNING`. A later
+//!   drain re-claims it once the body is registered, with no DB reopen.
+//! - **FIX 3** — a PANICKING activity body is contained. It goes through the
+//!   normal retryable-failure path (retry per policy, else terminal
+//!   `ActivityFailed`). It does not unwind past the finalize and wedge the run.
+//! - **FIX 4** — a single decision cycle emitting BOTH a timer and an
+//!   activity (`tokio::join!`) records its schedule events in command order. It
+//!   replays cleanly on the core `WorkflowReplayer`, because the matcher
+//!   tolerates the interleaved sibling terminals.
+//! - **`send_signal` validation (#1069)** — `send_signal` rejects a signal to an
+//!   unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal one
+//!   ([`SqliteError::WorkflowNotRunning`]). It does not stage a row that no live
+//!   `wait_for_signal` can consume. A RUNNING target stages and consumes as
 //!   before.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
@@ -64,12 +64,11 @@ fn any_task_state(path: &std::path::Path, exec: ExecutionId) -> Option<String> {
 
 // ── FIX 1: engine non-determinism does NOT seal FAILED / poison history ────────
 
-/// A drift phase flag the workflow reads to change its command stream between
-/// drives — the injected-flag construction the reviewer suggested for a
-/// deterministic engine nd-divergence. `1` arms a long durable timer (records a
-/// suspension and blocks); `2` schedules an activity at the SAME command
-/// position, which diverges against the phase-1 history (expected `TimerStarted`,
-/// got `ActivityScheduled`). Only this test references the flag.
+/// A drift phase flag that changes the workflow's command stream between drives.
+/// It injects a deterministic engine nd-divergence. `1` arms a long durable
+/// timer, which records a suspension and blocks. `2` schedules an activity at the
+/// SAME command position. That diverges from the phase-1 history: expected
+/// `TimerStarted`, got `ActivityScheduled`. Only this test references the flag.
 static DRIFT_PHASE: AtomicU32 = AtomicU32::new(1);
 
 #[workflow]
@@ -389,32 +388,32 @@ async fn timer_and_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String
     Ok(out.as_i64().unwrap_or_default() * 2)
 }
 
-/// A single decision cycle emitting BOTH a timer and an activity drives cleanly
-/// to completion and the resulting history replays byte-identically on the core
-/// `WorkflowReplayer` — proving the backend dispatches a mixed batch in command
-/// order and the core matcher tolerates the interleaved sibling terminals
-/// (`ActivityCompleted` then `TimerFired`).
+/// A decision cycle with BOTH a timer and an activity drives cleanly to completion.
+/// Its history replays byte-identically on the core `WorkflowReplayer`. So the
+/// backend dispatches a mixed batch in command order, and the core matcher
+/// tolerates the interleaved sibling terminals (`ActivityCompleted`, then
+/// `TimerFired`).
 ///
-/// **Command/history-order note (Codex round 4).** `apply_commands` appends a
-/// cycle's schedule events in COMMAND order (the `drain_commands()` order), so
-/// the interleave the Codex spike saw go Stuck is a poll-order concern, not a
-/// schedule-order one: here the activity is the first joined future, so on
-/// replay it consumes its `ActivityScheduled`/`ActivityCompleted` before the
-/// timer's forward scan runs, and `match_timer_strict` then skips those
-/// (consumed) events to reach `TimerFired`. This backend needed NO drain-order
-/// change — the append is already command-ordered.
+/// **Command/history-order note.** `apply_commands` appends a cycle's schedule
+/// events in COMMAND order, which is the `drain_commands()` order. So the
+/// interleave that an earlier spike saw go Stuck is a poll-order concern, not a
+/// schedule-order one. Here the activity is the first joined future. On replay
+/// it consumes its `ActivityScheduled`/`ActivityCompleted` before the timer's
+/// forward scan runs. `match_timer_strict` then skips those consumed events to
+/// reach `TimerFired`. This backend needed NO drain-order change, because the
+/// append is already command-ordered.
 ///
-/// **Known CORE limitation (documented, not a backend bug).** The REVERSE join
-/// order — `tokio::join!(ctx.timer(..), ctx.execute_activity(..))`, i.e. the
-/// timer polled first — is unsupported by the *core* determinism engine itself:
+/// **Known CORE limitation (documented, not a backend bug).** The *core*
+/// determinism engine does not support the REVERSE join order, which polls the
+/// timer first: `tokio::join!(ctx.timer(..), ctx.execute_activity(..))`.
 /// `HistoryMatcher::match_timer_strict` (replay.rs) BREAKS its forward
-/// `TimerFired` scan at an UNCONSUMED `ActivityScheduled` (it skips consumed
+/// `TimerFired` scan at an UNCONSUMED `ActivityScheduled`. It skips consumed
 /// siblings, child workflows, signals, external, update, and cancellable-timer
-/// events, but stops on an unconsumed activity). Verified directly: the core
+/// events, but stops on an unconsumed activity. Verified directly: the core
 /// `WorkflowReplayer` rejects even an ideal timer-first history with
-/// `NonDeterminismDetected(EarlyCompletion)`. This is shared with the Postgres
-/// engine and is out of scope for this backend to change; put the activity
-/// branch first in a mixed `join!`.
+/// `NonDeterminismDetected(EarlyCompletion)`. The Postgres engine shares this
+/// limitation, and a change to it is out of scope for this backend. Put the
+/// activity branch first in a mixed `join!`.
 #[tokio::test]
 async fn mixed_timer_activity_batch_completes_and_replays() {
     let (_dir, _path) = temp_db();
@@ -426,9 +425,9 @@ async fn mixed_timer_activity_batch_completes_and_replays() {
     let exec = rt.start_workflow("timer_and_activity", json!(9)).unwrap();
 
     // Drive 1 at t0: the batch dispatches BOTH commands (ActivityScheduled + task
-    // row, TimerStarted + timer row), the activity runs to completion, and the run
-    // blocks CLEANLY on the still-armed 1s timer (deadline t0+1, not yet due at
-    // t0) — never Stuck.
+    // row, TimerStarted + timer row). The activity runs to completion. The run
+    // then blocks CLEANLY on the still-armed 1s timer (deadline t0+1, not due at
+    // t0), never Stuck.
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(
         matches!(state, RunState::WaitingTimer),
@@ -474,16 +473,16 @@ async fn mixed_timer_activity_batch_completes_and_replays() {
     );
 }
 
-// ── FIX 5 (Codex #1069 P1): a WORKFLOW-handler panic is bounded-retried, not ───
+// ── FIX 5 (#1069): a WORKFLOW-handler panic is bounded-retried, not ────────────
 //    sealed FAILED on the first strike (issue #782 analog, runtime.rs:460).
 //
-// A `#[workflow]` body that `panic!()`s (distinct from an activity-body panic,
-// FIX 3) used to fall through the terminal `Failed` arm and seal the run `FAILED`
-// on the FIRST strike — permanently closing a transiently-panicking or
-// hotfix-able run. The fix contains it: under a bounded budget the panicked cycle
-// is discarded (no event, execution stays `RUNNING`) and surfaced as
-// `SqliteError::WorkflowPanicked`; only after the budget is exhausted is the run
-// sealed with the typed `HandlerPanic` error.
+// A `#[workflow]` body that `panic!()`s is distinct from an activity-body panic
+// (FIX 3). It used to fall through the terminal `Failed` arm and seal the run
+// `FAILED` on the FIRST strike. That closed a transiently-panicking or hotfix-able
+// run for good. The fix contains it under a bounded budget. The panicked cycle is
+// discarded: no event, and the execution stays `RUNNING`. It surfaces as
+// `SqliteError::WorkflowPanicked`. Only an exhausted budget seals the run with the
+// typed `HandlerPanic` error.
 
 #[workflow]
 async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
@@ -586,9 +585,9 @@ async fn workflow_handler_panic_then_hotfix_resumes() {
         "the hotfixed workflow resumes and completes, got {state:?}"
     );
 
-    // No pending commands from the panicked cycle were persisted: the history is
-    // exactly [WorkflowStarted, WorkflowCompleted] — no stray WorkflowFailed /
-    // marker / side-effect from the discarded panicked cycle.
+    // No pending commands from the panicked cycle were persisted. The history is
+    // exactly [WorkflowStarted, WorkflowCompleted], with no stray WorkflowFailed,
+    // marker or side-effect from the discarded cycle.
     let history = rt.load_history(exec).unwrap();
     assert_eq!(
         history.len(),
@@ -602,10 +601,10 @@ async fn workflow_handler_panic_then_hotfix_resumes() {
     ));
 }
 
-// ── send_signal rejects unknown / terminal executions (Codex #1069 P2) ─────────
+// ── send_signal rejects unknown / terminal executions (#1069) ─────────────────
 //
-// `harvest_signals` has no FK/state check, so an unconditional stage returned
-// `Ok(())` for a typoed id or a sealed run and the wakeup was silently lost — no
+// `harvest_signals` has no FK/state check. So an unconditional stage returned
+// `Ok(())` for a typoed id or a sealed run, and the wakeup was silently lost. No
 // live `wait_for_signal` will ever consume it. `send_signal` now mirrors the
 // Postgres rejections: an unknown id → `ExecutionNotFound`; a terminal execution →
 // `WorkflowNotRunning`; a RUNNING execution stages (and is consumed) as before.

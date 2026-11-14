@@ -37,8 +37,8 @@ fn workflow() -> String {
 /// `\n  <name>:` header to the next top-level job header (or the end).
 ///
 /// Job blocks, not the whole file: "the command appears somewhere in ci.yml" is
-/// not the property under test — a gate command sitting in a job that never
-/// runs on pull requests would satisfy it and protect nothing.
+/// not the property under test. A gate command in a job that never runs on pull
+/// requests would satisfy it and protect nothing.
 fn job_block<'a>(workflow: &'a str, name: &str) -> &'a str {
     let header = format!("\n  {name}:\n");
     let start = workflow
@@ -194,8 +194,8 @@ fn the_analyzer_jobs_are_gated_like_the_rest_of_the_workflow() {
 
 #[test]
 fn job_block_stops_at_the_next_job() {
-    // Self-test of the helper: without the bound, a needle from a *later* job
-    // would satisfy an assertion about an earlier one, and the guard would pass
+    // Self-test of the helper. Without the bound, a needle from a *later* job
+    // would satisfy an assertion about an earlier one. The guard would then pass
     // while the step it names has been deleted.
     let workflow = "jobs:\n  first:\n    steps:\n      - run: alpha\n\
                     \n  second:\n    steps:\n      - run: beta\n";

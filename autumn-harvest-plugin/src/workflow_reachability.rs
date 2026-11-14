@@ -1,8 +1,8 @@
 //! Management read model for workflow-type handler reachability (issue #520).
 //!
-//! Answers a single safe-deploy question for deployments **without** build-id
-//! routing (#171): *"is it safe to delete or rename this `#[workflow]` handler,
-//! or would doing so strand in-flight runs in permanent replay failure?"*
+//! Answers one safe-deploy question for deployments **without** build-id
+//! routing (#171). *"Is it safe to delete or rename this `#[workflow]` handler,
+//! or would that strand in-flight runs in permanent replay failure?"*
 //!
 //! A non-terminal execution's `workflow_name` directly names the handler its
 //! next replay requires. So a read-only `GROUP BY workflow_name` over
@@ -22,18 +22,18 @@
 //!
 //! ## Partial answers
 //!
-//! When a shard is unreachable it is reported in `shards` (never silently
-//! dropped) and the report `status` is `partial` (some shards inspected) or
+//! An unreachable shard is reported in `shards`, never silently dropped.
+//! The report `status` is then `partial` (some shards inspected) or
 //! `unavailable` (none inspected). A `safe_to_remove` verdict is authoritative
-//! **only** when `status == complete`: an unreachable shard could host
-//! non-terminal executions, so a partial answer must never be mistaken for a
-//! safe one. The CLI gate fails closed on `partial`/`unavailable` for exactly
-//! this reason.
+//! **only** when `status == complete`. An unreachable shard could host
+//! non-terminal executions, so a partial answer is never a safe one. The CLI
+//! gate fails closed on `partial`/`unavailable` for exactly this reason.
 //!
 //! This is the **type-level** reachability question. It is orthogonal to
-//! **build-id** `build_reachability` (#171, "can I retire this worker build")
-//! and to the **`ctx.version()`** gate-retirement check ("can I remove this
-//! version branch inside a handler"). See the "Safe handler removal" runbook.
+//! **build-id** `build_reachability` (#171, "can I retire this worker build").
+//! It is also orthogonal to the **`ctx.version()`** gate-retirement check
+//! ("can I remove this version branch inside a handler"). See the "Safe
+//! handler removal" runbook.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -76,9 +76,9 @@ pub enum ReachabilityVerdict {
 
 /// Overall cross-shard completeness of the report.
 ///
-/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
-/// so the complete/partial/unavailable derivation rule lives in exactly one
-/// place, alongside `schedule_runs`' and `workflow_count`'s reports.
+/// A type alias onto the shared [`FanoutStatus`], not its own enum. So the
+/// complete/partial/unavailable rule lives in one place, shared with the
+/// `schedule_runs` and `workflow_count` reports.
 /// `safe_to_remove` verdicts are authoritative only when this is `complete`.
 pub type ReachabilityReportStatus = FanoutStatus;
 
@@ -102,11 +102,12 @@ pub struct WorkflowReachabilityReport {
     pub observed_at: DateTime<Utc>,
     /// Echo of the `workflow_type` filter, if any.
     pub filter: Option<String>,
-    /// Top-level summary (issue #700 AC3): `true` when any type has an
-    /// `orphaned` verdict, so a CI/CD gate asserts "zero orphans" against a
-    /// single boolean instead of walking `items`. Note this reflects **only**
-    /// the inspected shards; when `status` is `partial`/`unavailable` an
-    /// unreachable shard could still host an orphaned type.
+    /// Top-level summary (issue #700 AC3): `true` when any type is `orphaned`.
+    ///
+    /// A CI/CD gate asserts "zero orphans" against one boolean instead of
+    /// walking `items`. It reflects **only** the inspected shards. When
+    /// `status` is `partial`/`unavailable`, an unreachable shard could still
+    /// host an orphaned type.
     pub orphaned: bool,
     /// Total count of stranded **executions** (not types) across every
     /// `orphaned`-verdict type — the single number a "zero orphans" gate
@@ -136,9 +137,9 @@ pub struct WorkflowTypeReachability {
     /// A bounded (`REACHABILITY_SAMPLE_CAP`) set of representative non-terminal
     /// execution ids so an operator can drill into stuck runs (issue #700 AC2).
     /// Empty for `safe_to_remove` types. These are **representative and
-    /// bounded** — NOT a guaranteed global-oldest-across-shards set: each shard
-    /// pre-orders its own contribution oldest-first, and the cross-shard union
-    /// is capped in shard-iteration (ascending `shard_id`) order.
+    /// bounded**, NOT a guaranteed global-oldest-across-shards set. Each shard
+    /// pre-orders its own contribution oldest-first. The cross-shard union is
+    /// capped in shard-iteration (ascending `shard_id`) order.
     pub sample_execution_ids: Vec<uuid::Uuid>,
     /// Per-shard counts (only shards with ≥1 non-terminal execution of this
     /// type appear). Sorted by `shard_id`.
@@ -177,8 +178,10 @@ pub struct ReachabilityShardInspection {
 struct ReachabilityAccumulator {
     per_shard: BTreeMap<i32, (i64, DateTime<Utc>)>,
     /// Sample execution ids, appended per contributing shard in ascending
-    /// `shard_id` order (observations are iterated in sorted-shard order), so a
-    /// truncation favours lower shard ids — representative, not global-oldest.
+    /// `shard_id` order.
+    ///
+    /// Observations are iterated in sorted-shard order. So a truncation
+    /// favours lower shard ids: representative, not global-oldest.
     samples: Vec<uuid::Uuid>,
 }
 
@@ -251,12 +254,11 @@ pub async fn build_workflow_reachability_report(
         .collect();
 
     // The expected shard set is both the storage pool AND the router's
-    // readable_shards/default_shard: a shard the router knows about but for
-    // which this process has no pool (e.g. during a mixed-rollout or
-    // shard-add before the pool is wired up) must appear as "unavailable" in
-    // the report rather than being silently dropped — the report status then
-    // becomes "partial" and the CLI fails closed (exit 2), preventing a false
-    // "safe_to_remove" verdict from a shard that was never inspected. See
+    // readable_shards/default_shard. The router can know a shard that has no
+    // pool here, e.g. during a mixed rollout or a shard-add. That shard must
+    // appear as "unavailable", not be silently dropped. The report status then
+    // becomes "partial" and the CLI fails closed (exit 2). So a shard that was
+    // never inspected cannot yield a false "safe_to_remove" verdict. See
     // [`shard_fanout::expected_shards`] for the shared derivation.
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected_shards = shard_fanout::expected_shards(api_state, &pools);
@@ -285,19 +287,19 @@ pub async fn build_workflow_reachability_report(
 /// over [`build_reachability_report_for_shards`].
 ///
 /// [`build_workflow_reachability_report`] resolves `registered` from the
-/// installed handler registry and fans out across shards, so it can only run
+/// installed handler registry and fans out across shards. So it can only run
 /// *after* `HarvestRunner::start` has spawned the worker poll loop. That is too
-/// late for the `fail` action: a worker could claim and terminally fail an
-/// orphaned-type execution during the boot window before the abort tears the
-/// runner down. This family of entry points takes `registered` (derived
-/// directly from the owned `BuiltHarvest`) and pools, so a caller can run the
-/// check *before* any worker spawns.
+/// late for the `fail` action. A worker could claim and terminally fail an
+/// orphaned-type execution in the boot window, before the abort tears the
+/// runner down. This family of entry points takes pools and a `registered`
+/// set derived from the owned `BuiltHarvest`. So a caller can run the check
+/// *before* any worker spawns.
 ///
-/// The boot gate itself no longer calls this: since issue #1128 it goes through
-/// the cross-shard [`build_reachability_report_for_shards`] (the standalone
-/// runner path supports multi-shard deployments, which a shard-0-only read
-/// would silently under-report). This wrapper is kept for single-shard callers
-/// that have exactly one pool in hand.
+/// The boot gate itself no longer calls this. Since issue #1128 it uses the
+/// cross-shard [`build_reachability_report_for_shards`]. The standalone runner
+/// path supports multi-shard deployments, which a shard-0-only read would
+/// silently under-report. This wrapper stays for single-shard callers that
+/// have exactly one pool in hand.
 ///
 /// The plugin is single-shard-only (multi-shard configs are rejected upstream),
 /// so a single-shard query reads the identical rows the started-runtime
@@ -305,13 +307,11 @@ pub async fn build_workflow_reachability_report(
 /// [`build_report_from_observations`] helpers as
 /// [`build_workflow_reachability_report`], so the two cannot drift.
 ///
-///
-/// Infallible by construction: a DB read failure is encoded as an unreachable
-/// shard (`status == Unavailable`) inside the report rather than an `Err`, so
-/// the caller never blocks boot on the check's own failure — combined with
-/// [`startup_orphan_decision`]'s crash-loop rule (`Fail` + incomplete report →
-/// `Warn`, never `Abort`), a transient DB outage at boot can never hard-fail
-/// startup.
+/// Infallible by construction. The report encodes a DB read failure as an
+/// unreachable shard (`status == Unavailable`), not as an `Err`. So the caller
+/// never blocks boot on the check's own failure. [`startup_orphan_decision`]
+/// adds its crash-loop rule: `Fail` + incomplete report → `Warn`, never
+/// `Abort`. So a transient DB outage at boot can never hard-fail startup.
 pub async fn build_reachability_report_single_shard(
     registered: &BTreeSet<String>,
     pool: &DbPool,
@@ -331,23 +331,22 @@ pub async fn build_reachability_report_single_shard(
 /// (issue #522). A shard-0-only gate there would report a `complete`, clean
 /// fleet while shards 1..N host orphans.
 ///
-/// `shards` maps a shard id to that shard's pool, or to `None` for a shard this
-/// process knows about (its router names it) but has no pool for. A `None` shard
-/// is reported `unavailable` rather than silently dropped — exactly the
-/// [`shard_fanout::expected_shards`] rule the started-runtime fan-out follows —
-/// so an uninspected shard degrades the report to `partial`/`unavailable`
-/// instead of letting it claim a `complete` inspection it never performed.
+/// `shards` maps a shard id to that shard's pool. It maps to `None` a shard
+/// that the router names but that has no pool in this process. A `None` shard
+/// is reported `unavailable`, not silently dropped. That is the
+/// [`shard_fanout::expected_shards`] rule of the started-runtime fan-out.
+/// So an uninspected shard degrades the report to `partial`/`unavailable`.
+/// The report never claims a `complete` inspection it did not perform.
 ///
 /// Shares [`observe_shard`] and [`build_report_from_observations`] with
 /// [`build_workflow_reachability_report`], so the boot gate and the management
 /// route cannot drift.
 ///
-/// Infallible by construction: a DB read failure is encoded as an unreachable
-/// shard (`status == Unavailable`) inside the report rather than an `Err`, so
-/// the caller never blocks boot on the check's own failure — combined with
-/// [`startup_orphan_decision`]'s crash-loop rule (`Fail` + incomplete report →
-/// `Warn`, never `Abort`), a transient DB outage at boot can never hard-fail
-/// startup.
+/// Infallible by construction. The report encodes a DB read failure as an
+/// unreachable shard (`status == Unavailable`), not as an `Err`. So the caller
+/// never blocks boot on the check's own failure. [`startup_orphan_decision`]
+/// adds its crash-loop rule: `Fail` + incomplete report → `Warn`, never
+/// `Abort`. So a transient DB outage at boot can never hard-fail startup.
 pub async fn build_reachability_report_for_shards(
     registered: &BTreeSet<String>,
     shards: &BTreeMap<i32, Option<DbPool>>,
@@ -389,21 +388,22 @@ pub async fn build_reachability_report_for_shards(
 /// [`build_workflow_reachability_report`], which serves an HTTP request that
 /// carries its own deadline. It is not tolerable here: this core runs as the
 /// first act of [`HarvestRunner::start`](crate::runner::HarvestRunner::start),
-/// before anything exists that could time it out. A shard whose database is
-/// reachable-but-silent (a dropped security-group rule, a primary mid-failover,
-/// a wedged pooler) would park the boot **forever** — no error, no crash loop,
-/// just a process that never becomes ready, which is a worse outcome than the
-/// one the crash-loop rule exists to prevent. The multi-shard fan-out makes it
-/// worse still: one parked shard strands the whole gate.
+/// before anything exists that could time it out. A database can be
+/// reachable-but-silent: a dropped security-group rule, a primary
+/// mid-failover, a wedged pooler. Its shard would park the boot **forever**.
+/// There is no error and no crash loop, just a process that never becomes
+/// ready. That is worse than the outcome the crash-loop rule exists to
+/// prevent. The multi-shard fan-out makes it worse still: one parked shard
+/// strands the whole gate.
 ///
-/// An elapsed shard is reported `unavailable` exactly like any other unreadable
-/// shard, so it flows into the existing incomplete-report rule and
+/// An elapsed shard is reported `unavailable`, like any other unreadable
+/// shard. So it flows into the existing incomplete-report rule, and
 /// [`startup_orphan_decision`] degrades it to `Warn`, never `Abort`.
 ///
-/// Deliberately generous: the bound's job is to turn an *indefinite* park into a
-/// partial answer, not to police a merely-slow database — a gate that gave up on
-/// a healthy-but-loaded shard would report `partial` on every boot and train
-/// operators to ignore the warning.
+/// Deliberately generous. The bound turns an *indefinite* park into a partial
+/// answer. It does not police a merely-slow database. A gate that gave up on
+/// a healthy-but-loaded shard would report `partial` on every boot. That
+/// trains operators to ignore the warning.
 pub const STARTUP_GATE_SHARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn observe_shard(
@@ -436,7 +436,6 @@ fn build_report_from_observations(
         .filter(|observation| observation.error.is_some())
         .count();
 
-    // Aggregate observed non-terminal counts per workflow type.
     let mut accumulators = BTreeMap::<String, ReachabilityAccumulator>::new();
     for observation in &observations {
         for row in &observation.rows {
@@ -563,16 +562,17 @@ pub enum StartupOrphanDecision {
 /// - `Off` → always `Continue` (the check is disabled).
 /// - `Warn`/`Fail` + **incomplete report** (`Partial`/`Unavailable`) → `Warn`,
 ///   regardless of `orphaned`. An incomplete report means orphan detection did
-///   NOT fully run (e.g. a startup DB blip returns a successful report with
-///   `status == Unavailable` and no rows, so `orphaned == false`); the operator
-///   must be warned that detection was skipped rather than silently continued.
-///   **Crash-loop safety:** it is `Warn`, never `Abort` — a boot loop has no
+///   NOT fully run. For example, a startup DB blip returns a successful report
+///   with `status == Unavailable` and no rows, so `orphaned == false`. The
+///   operator must be warned that detection was skipped, not silently
+///   continued.
+///   **Crash-loop safety:** it is `Warn`, never `Abort`. A boot loop has no
 ///   human in the loop, so a transient unreachable shard must never hard-fail
-///   startup (asymmetric with the CLI gate, which fails *closed* on a partial
-///   report because a human reads its exit code).
-/// - `Warn`/`Fail` + **complete report** + no orphans → `Continue`; a
-///   CONFIRMED clean boot never warns (this deviation applies only to a
-///   `Complete` report — an incomplete one always warns, above).
+///   startup. The CLI gate is asymmetric: it fails *closed* on a partial
+///   report, because a human reads its exit code.
+/// - `Warn`/`Fail` + **complete report** + no orphans → `Continue`. A
+///   CONFIRMED clean boot never warns. This applies only to a `Complete`
+///   report; an incomplete one always warns, as above.
 /// - `Warn` + complete + orphaned → `Warn`.
 /// - `Fail` + complete + orphaned → `Abort` (the one refuse case).
 #[must_use]
@@ -832,10 +832,10 @@ mod tests {
 
     #[test]
     fn samples_are_capped_and_bounded_per_type() {
-        // Two shards each contribute the per-shard SQL cap (5) of samples; the
-        // cross-shard union (10) must be capped back down to
-        // REACHABILITY_SAMPLE_CAP (5), and every returned id must be drawn from
-        // the seeded set.
+        // Two shards each contribute the per-shard SQL cap (5) of samples.
+        // The cross-shard union (10) must be capped back down to
+        // REACHABILITY_SAMPLE_CAP (5). Every returned id must come from the
+        // seeded set.
         let shard0: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
         let shard1: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
         let all: BTreeSet<uuid::Uuid> = shard0.iter().chain(shard1.iter()).copied().collect();

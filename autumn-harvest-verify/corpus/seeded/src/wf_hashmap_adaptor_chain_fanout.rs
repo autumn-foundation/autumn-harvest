@@ -8,11 +8,11 @@
 //!
 //! **Launder (no cross-module hiding at all — this is the persuasive case).**
 //! HVG011 fires only from `visit_expr_for_loop`, and there is no `for` loop
-//! here. Even rewritten as one it would miss twice over: `local_binding_target`
-//! never tracks **struct fields**, and `iterated_hash_local` accepts only a
-//! bare ident, `&ident`, or a *single* argument-free method from
-//! `HASH_ITER_METHODS` — a four-adaptor chain is rejected by design. DET010
-//! mirrors both limitations. No DET substring table contains `HashMap`.
+//! here. Even rewritten as one it would miss twice over.
+//! `local_binding_target` never tracks **struct fields**. `iterated_hash_local`
+//! accepts only a bare ident, `&ident`, or a *single* argument-free method
+//! from `HASH_ITER_METHODS`, so it rejects a four-adaptor chain by design.
+//! DET010 mirrors both limitations. No DET substring table contains `HashMap`.
 //!
 //! **Expected trace hops.** `wf_hashmap_adaptor_chain_fanout` ⇒
 //! `<&HashMap<String, u32> as IntoIterator>::into_iter` on `cfg.limits` (the

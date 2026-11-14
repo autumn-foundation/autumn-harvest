@@ -1,9 +1,9 @@
 //! Background control-loop liveness heartbeats (issue #797).
 //!
 //! Harvest's correctness depends on ~7 background control loops that run as
-//! bare spawned Tokio tasks. A wedged loop fails *silently* today: the
-//! existing loop metrics only emit when there is work to do, so a healthy
-//! idle loop and a dead one are indistinguishable.
+//! bare spawned Tokio tasks. Without a heartbeat, a wedged loop fails
+//! *silently*. The loop metrics emit only when there is work to do. So a
+//! healthy idle loop and a dead one are indistinguishable.
 //!
 //! These tests pin the two halves of the fix:
 //!
@@ -83,8 +83,8 @@ fn metric_and_label_constants_have_the_documented_names() {
 #[test]
 fn record_scanner_tick_has_a_noop_default() {
     // A recorder that implements NOTHING but the required methods must still
-    // compile and accept record_scanner_tick — proving the trait method is
-    // purely additive and breaks no downstream implementor.
+    // compile and accept record_scanner_tick. So the trait method is purely
+    // additive and breaks no downstream implementor.
     struct Minimal;
     impl MetricsRecorder for Minimal {}
 
@@ -129,11 +129,11 @@ fn staleness_threshold_is_twice_the_poll_interval_with_a_60s_floor() {
 ///
 /// * a loop polling at or above 30 s is bounded by the `2x` multiplier, so
 ///   detection latency is literally `2 x poll_interval`;
-/// * a loop polling faster than 30 s is bounded by the 60 s floor, so its
-///   detection latency is *far better in absolute terms* (60 s rather than
-///   hours) but *worse as a multiple* of its interval. The floor is deliberate:
-///   `2 x 500ms` would flap on ordinary scheduler jitter and page on a healthy
-///   loop, which is a strictly worse failure than a 60 s detection delay.
+/// * a loop polling faster than 30 s is bounded by the 60 s floor. Its
+///   detection latency is *far better in absolute terms* (60 s, not hours) but
+///   *worse as a multiple* of its interval. The floor is deliberate.
+///   `2 x 500ms` flaps on ordinary scheduler jitter and pages on a healthy
+///   loop. That is a strictly worse failure than a 60 s detection delay.
 ///
 /// Pinned against the actual constants rather than a convenient 30 s example,
 /// so a future change to a poll interval surfaces here.
@@ -205,18 +205,18 @@ fn success_metric_detection_bound_holds_for_every_shipped_interval() {
 
 #[test]
 fn the_floor_tolerates_a_slow_but_healthy_iteration() {
-    // Guards the deliberate deviation in the other direction: someone reading
-    // the issue's literal "2x poll interval" success metric might be tempted
-    // to drop or shrink the floor so a 500 ms loop is flagged in 1 s. That
-    // would make the check flap on a busy-but-working system and, because the
-    // CLI exits 2 on `warn`, break deploy pipelines.
+    // Guards the deliberate deviation in the other direction. The issue's
+    // literal "2x poll interval" metric invites shrinking the floor, so a
+    // 500 ms loop is flagged in 1 s. The check would then flap on a
+    // busy-but-working system. The CLI exits 2 on `warn`, so that would break
+    // deploy pipelines.
     //
-    // A loop's ITERATION PERIOD is not its poll interval: each pass sleeps the
-    // interval and *then* does real work — the timeout checker calls
-    // `pool.get().await` (deadpool waits for a free connection, by default
-    // with no timeout at all) and then runs a multi-query enforcement pass. So
-    // the threshold must comfortably exceed a plausible slow-but-healthy
-    // iteration, not merely two sleeps.
+    // A loop's ITERATION PERIOD is not its poll interval. Each pass sleeps the
+    // interval and *then* does real work. The timeout checker calls
+    // `pool.get().await`, and deadpool by default waits for a free connection
+    // with no timeout. It then runs a multi-query enforcement pass. So the
+    // threshold must exceed a plausible slow-but-healthy iteration, not merely
+    // two sleeps.
     const PLAUSIBLE_SLOW_ITERATION: Duration = Duration::from_secs(30);
     assert!(
         MIN_SCANNER_STALENESS_THRESHOLD >= PLAUSIBLE_SLOW_ITERATION,
@@ -290,9 +290,8 @@ fn a_scanner_past_one_threshold_is_stale_and_past_two_is_wedged() {
 
 #[test]
 fn a_just_registered_scanner_is_healthy_before_its_first_tick() {
-    // Boot grace: a loop that sleeps its interval before the first iteration
-    // must not make a preflight run immediately after boot report the fleet as
-    // wedged.
+    // Boot grace: a loop sleeps its interval before the first iteration.
+    // A preflight run right after boot must not report the fleet as wedged.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
     let _owner = liveness.register_at(Scanner::Retention, Duration::from_secs(30), t0);
@@ -327,9 +326,9 @@ fn a_registered_scanner_that_never_ticks_eventually_goes_wedged() {
 fn a_wedged_instance_is_not_masked_by_a_healthy_peer() {
     // THE multi-shard money test. A worker assigned N shards spawns one
     // timeout checker / poison-pill reclaimer / pause auto-resumer PER SHARD,
-    // all sharing one `Scanner` label. If the registry collapsed them onto a
-    // single last-tick, three healthy shards would hide the fourth's panicked
-    // loop — precisely the failure this feature exists to detect.
+    // all sharing one `Scanner` label. A registry that collapses them onto one
+    // last-tick lets three healthy shards hide the fourth's panicked loop.
+    // That is the failure this feature exists to detect.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
     let healthy = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
@@ -365,8 +364,8 @@ fn a_wedged_instance_is_not_masked_by_a_healthy_peer() {
 #[test]
 fn a_freshly_registered_peer_does_not_regrant_grace_to_a_wedged_sibling() {
     // Restarting one loop (or spawning an extra shard's) must not reset the
-    // clock on a sibling that is already wedged: per-instance state is what
-    // keeps a new registration's boot grace from laundering a stuck peer.
+    // clock on a sibling that is already wedged. Per-instance state keeps a new
+    // registration's boot grace from laundering a stuck peer.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
     let wedged = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
@@ -420,8 +419,8 @@ fn a_clean_restart_regrants_grace_without_losing_tick_history() {
 #[test]
 fn a_slow_healthy_poller_is_not_falsely_stale_next_to_a_fast_sibling() {
     // Two workers in one process may poll the same scanner class at different
-    // cadences. The slow one must be judged against ITS OWN threshold: 100s of
-    // silence is stale for a 1s poller but perfectly healthy for a 300s one.
+    // cadences. The slow one must be judged against ITS OWN threshold.
+    // 100s of silence is stale for a 1s poller but healthy for a 300s one.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
     let fast = liveness.register_at(Scanner::Timeout, Duration::from_secs(1), t0);
@@ -442,13 +441,12 @@ fn a_slow_healthy_poller_is_not_falsely_stale_next_to_a_fast_sibling() {
 /// lenient sibling's.
 ///
 /// The fold reports one `ScannerStatus` per `Scanner`, but the verdict inputs
-/// (`age` and `poll_interval`) must come from the **same** instance. Sourcing
-/// `age` from the worst instance while sourcing `poll_interval` from the most
-/// lenient one silently launders a genuine outage: a 30s loop silent for 200s
-/// is `Wedged` by its own configuration, yet reads `Healthy` when measured
-/// against an hourly sibling's 7200s threshold — and `scanner_liveness`
-/// reports `pass` on a dead loop, the exact failure this feature exists to
-/// catch.
+/// (`age` and `poll_interval`) must come from the **same** instance. `age`
+/// from the worst instance with `poll_interval` from the most lenient one
+/// silently launders a genuine outage. A 30s loop silent for 200s is `Wedged`
+/// by its own configuration. Against an hourly sibling's 7200s threshold it
+/// reads `Healthy`. `scanner_liveness` then reports `pass` on a dead loop, the
+/// exact failure this feature exists to catch.
 #[test]
 fn a_wedged_instance_is_not_laundered_by_a_lenient_siblings_interval() {
     let liveness = ScannerLiveness::new();
@@ -478,13 +476,13 @@ fn a_wedged_instance_is_not_laundered_by_a_lenient_siblings_interval() {
     assert_eq!(status.age, Duration::from_secs(200));
 }
 
-/// Issue #797, Codex review: the fold already reports the *worst* instance,
-/// but reporting only the `Scanner` type leaves an operator unable to act on a
-/// multi-shard worker — which spawns one timeout/poison-pill/pause-auto-resume
-/// loop **per assigned shard**, all under one label. Both the dashboard and the
-/// alert notes send operators to `scanner_liveness` precisely because the
-/// counter carries no shard label and so cannot localize a single-shard wedge;
-/// the check has to actually deliver that.
+/// Issue #797: the fold reports the *worst* instance, and must name its shard.
+///
+/// The `Scanner` type alone leaves an operator unable to act on a multi-shard
+/// worker. That worker spawns one timeout/poison-pill/pause-auto-resume loop
+/// **per assigned shard**, all under one label. The dashboard and the alert
+/// notes send operators to `scanner_liveness` for this. The counter carries no
+/// shard label, so it cannot localize a single-shard wedge. The check must.
 ///
 /// The `ShardId` is already in hand at the spawn site (`shard_pools_for_monitors`
 /// is built by mapping over `shard_assignments`), so this is pure plumbing.
@@ -523,12 +521,14 @@ fn the_reported_instance_names_the_shard_that_is_wedged() {
     );
 }
 
-/// Issue #797, Codex review (P1): a multi-shard worker spawns one `timeout`
-/// loop **per assigned shard**. Without a per-shard dimension on the counter
-/// they all increment one series on one scrape target, so a healthy shard's
-/// ticks keep `rate(...) > 0` while another shard's loop is dead — the shipped
-/// paging alert would never fire. That is *masking*, not merely an inability
-/// to localize, so the metric carries a bounded `shard` label.
+/// Issue #797: a multi-shard worker spawns one `timeout` loop **per assigned
+/// shard**.
+///
+/// Without a per-shard dimension on the counter, they all increment one series
+/// on one scrape target. A healthy shard's ticks keep `rate(...) > 0` while
+/// another shard's loop is dead. The shipped paging alert never fires. That is
+/// *masking*, not merely an inability to localize. So the metric carries a
+/// bounded `shard` label.
 ///
 /// This is the falsifying test: drop the label from the recorder call and the
 /// two instances become indistinguishable at the metric layer.
@@ -592,8 +592,8 @@ fn each_per_shard_instance_ticks_its_own_metric_series() {
 }
 
 /// The process-wide loops (`retention`, `schedule`) and single-shard
-/// deployments have no shard id, but must still carry the label so the series
-/// family has a uniform label set rather than a sometimes-present dimension.
+/// deployments have no shard id, but must still carry the label. The series
+/// family then has a uniform label set, not a sometimes-present dimension.
 #[test]
 fn a_process_wide_loop_ticks_the_none_shard_label() {
     let liveness = ScannerLiveness::new();
@@ -605,11 +605,12 @@ fn a_process_wide_loop_ticks_the_none_shard_label() {
     );
 }
 
-/// Issue #797, Codex review: the worst-instance fold decides the *verdict*,
-/// but two shards can be wedged at once. Folding to one owner and reporting
-/// only its shard understates the blast radius on the surface an operator uses
-/// to decide what to restart -- so every stale instance's shard is carried
-/// through the snapshot alongside the worst one.
+/// Issue #797: the worst-instance fold decides the *verdict*, but two shards
+/// can be wedged at once.
+///
+/// One owner's shard alone understates the blast radius on the surface an
+/// operator uses to decide what to restart. So the snapshot carries every
+/// stale instance's shard alongside the worst one.
 #[test]
 fn the_snapshot_carries_every_stale_shard_not_just_the_worst() {
     let liveness = ScannerLiveness::new();
@@ -718,9 +719,9 @@ fn a_folded_status_reclassifies_to_the_worst_per_instance_verdict() {
 
 #[test]
 fn the_threshold_narrows_again_when_the_slow_instance_stops() {
-    // The widened interval must not be sticky: once the slow poller retires,
-    // the surviving fast one is judged on its own (floored) threshold rather
-    // than inheriting a permanently lenient one.
+    // The widened interval must not be sticky. Once the slow poller retires,
+    // the surviving fast one is judged on its own (floored) threshold. It does
+    // not inherit a permanently lenient one.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
     let fast = liveness.register_at(Scanner::Timeout, Duration::from_secs(1), t0);
@@ -961,11 +962,10 @@ impl RegisterCapture {
 fn registration_initializes_the_series_before_the_first_iteration() {
     // The shipped alert is `rate(harvest_scanner_tick_total{...}[5m]) == 0`, and
     // PromQL comparisons only evaluate series that *exist*. A loop that panics
-    // or hangs on its very first iteration never reaches `record_scanner_tick`,
-    // so without an explicit registration sample no series is ever created and
-    // the paging alert stays silent forever — the exact failure the alert is
-    // meant to catch. Registration therefore emits its own sample, at spawn
-    // time, before the loop body runs.
+    // or hangs on its first iteration never reaches `record_scanner_tick`.
+    // Without a registration sample, no series is created. The paging alert
+    // then stays silent forever, the exact failure it must catch. So
+    // registration emits its own sample at spawn time, before the loop body.
     let liveness = ScannerLiveness::new();
     let capture = RegisterCapture::default();
     let owner = autumn_harvest::scanner_health::register_scanner_on(
@@ -995,9 +995,8 @@ fn registration_initializes_the_series_before_the_first_iteration() {
 
 #[test]
 fn every_scanner_variant_initializes_its_own_series() {
-    // The series is keyed by the bounded `scanner` label, so a first-iteration
-    // wedge must be visible for *every* loop, not just the one that happens to
-    // be covered by a test.
+    // The series is keyed by the bounded `scanner` label. So a first-iteration
+    // wedge must be visible for *every* loop, not only one a test covers.
     let liveness = ScannerLiveness::new();
     let capture = RegisterCapture::default();
     for scanner in Scanner::ALL {
@@ -1045,21 +1044,19 @@ fn record_scanner_registered_has_a_noop_default() {
 
 /// Anti-drift source scan over every spawn site.
 ///
-/// Two of the loops (`Scheduler::spawn_sharded`'s ticker and
-/// `spawn_pause_auto_resumer`) are not directly constructible from a test —
-/// the first needs a full sharded runtime, the second is private — and a third
-/// (`RetentionRuntime::spawn`) needs a live pool. Rather than leave them
-/// unguarded, this scans the source for the register / tick / deregister triple
-/// at each site, mirroring the established source-extraction precedent in
-/// `dashboard_pack_docs.rs`.
+/// A test cannot construct two of the loops directly:
+/// `Scheduler::spawn_sharded`'s ticker needs a full sharded runtime, and
+/// `spawn_pause_auto_resumer` is private. A third (`RetentionRuntime::spawn`)
+/// needs a live pool. So this scans the source for the register / tick /
+/// deregister triple at each site. It mirrors the source-extraction precedent
+/// in `dashboard_pack_docs.rs`.
 ///
-/// It catches the specific drift this feature is vulnerable to: a loop wired
-/// to *tick* but not to *register* would never be part of the expected set (so
-/// a wedge would go unreported), and one wired to register but never
-/// deregister would report a phantom `wedged` scanner after a clean drain.
-/// It is a coarse guard by design — it proves the triple is present in the
-/// owning file, not that it is correctly sequenced; the behavioural tests in
-/// `scanner_tick_db_tests.rs` cover sequencing for the two loops a test can
+/// It catches the drift this feature is vulnerable to. A loop wired to *tick*
+/// but not to *register* is never in the expected set, so its wedge goes
+/// unreported. A loop that registers but never deregisters reports a phantom
+/// `wedged` scanner after a clean drain. It is a coarse guard by design. It
+/// proves the triple is present in the owning file, not correctly sequenced.
+/// `scanner_tick_db_tests.rs` covers sequencing for the two loops a test can
 /// drive directly.
 #[test]
 fn every_spawned_loop_registers_ticks_and_deregisters() {
@@ -1115,9 +1112,9 @@ fn every_spawned_loop_registers_ticks_and_deregisters() {
         );
     }
 
-    // The pure enforcement primitive must stay decoupled: it is `pub` and
-    // driven by ~40 tests and by embedders, so a tick there would fabricate a
-    // scanner the process is not running (which would then age into `Wedged`).
+    // The pure enforcement primitive must stay decoupled. It is `pub` and
+    // driven by ~40 tests and by embedders. A tick there fabricates a scanner
+    // the process is not running, which then ages into `Wedged`.
     let timeout_src = std::fs::read_to_string(src.join("timeout.rs")).expect("timeout.rs");
     let enforce = timeout_src
         .split("pub async fn enforce_timeouts_once")

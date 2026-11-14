@@ -147,11 +147,10 @@ fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
         // Sized at 8 for comfortable headroom under the concurrent-request money
-        // test. Since the Codex F4 fix, a single-shard backfill reuses the per-slot
-        // exec conn for budget accounting and holds exactly one connection at a time
-        // (proven pool-size-1 safe by
-        // `backfill_single_shard_pool_size_one_does_not_deadlock`), so 8 is generous
-        // rather than a floor.
+        // test. A single-shard backfill reuses the per-slot exec conn for budget
+        // accounting. So it holds exactly one connection at a time.
+        // `backfill_single_shard_pool_size_one_does_not_deadlock` proves that safe
+        // at pool size 1. So 8 is generous, not a floor.
         .max_size(8)
         .build()
         .expect("failed to build test pool")
@@ -5352,10 +5351,10 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
 
 // ── Backfill max_runs atomic reservation (issue #688) ─────────────────────────
 
-/// Register a pure workflow-only (`dag_name` = NULL) hourly-cron schedule with a
-/// given `max_runs` budget and stand up an app whose runtime knows the workflow,
-/// so backfill dispatches actually create executions. Returns the app plus the
-/// freshly-loaded schedule row (`runs_started` = 0 on insert).
+/// Register a workflow-only (`dag_name` = NULL) hourly-cron schedule with a
+/// given `max_runs` budget. The app runtime knows the workflow, so backfill
+/// dispatches create executions. Returns the app plus the freshly-loaded
+/// schedule row (`runs_started` = 0 on insert).
 async fn setup_workflow_backfill_app(
     database_url: &str,
     pool: DbPool,
@@ -5423,13 +5422,13 @@ async fn setup_workflow_backfill_app(
     (app, schedule)
 }
 
-/// Like `setup_workflow_backfill_app`, but the registered `WorkflowInfo` carries
-/// a `throttle` policy (so `workflow_resolving_throttle` returns `Some` and the
-/// backfill loop enters the throttle block, where the oversized-input check —
-/// and its `release_backfill_budget_slot` release path — lives) and the schedule
-/// input can be sized to overflow the workflow-input cap (issue #688 release
-/// test). The throttle policy has no key (`key_expr = None`), so every slot
-/// resolves the same empty key.
+/// Like `setup_workflow_backfill_app`, but the `WorkflowInfo` carries a
+/// `throttle` policy. So `workflow_resolving_throttle` returns `Some`, and the
+/// backfill loop enters the throttle block. That block holds the oversized-input
+/// check and its `release_backfill_budget_slot` release path. The schedule input
+/// can also overflow the workflow-input cap (issue #688 release test). The
+/// throttle policy has no key (`key_expr = None`), so every slot resolves the
+/// same empty key.
 async fn setup_throttled_workflow_backfill_app(
     database_url: &str,
     pool: DbPool,
@@ -5475,10 +5474,9 @@ async fn setup_throttled_workflow_backfill_app(
     let mut info = workflow_info_named(name);
     // A tiny per-workflow cap documents intent, but the effective cap is
     // max(per, registry-global), so it never *lowers* the cap below the
-    // registry's 2 MiB default. The test's input is instead sized past that
-    // default, forcing the oversized-input path without mutating the
-    // process-global GLOBAL_MAX_WORKFLOW_INPUT_BYTES (which would race parallel
-    // tests in this binary).
+    // registry's 2 MiB default. So the test input is sized past that default to
+    // force the oversized-input path. A change to the process-global
+    // GLOBAL_MAX_WORKFLOW_INPUT_BYTES would race parallel tests in this binary.
     info.max_input_bytes = Some(1);
     info.throttle = Some(
         autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
@@ -5524,10 +5522,10 @@ async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_on
     let uri = format!("/admin/schedules/{}/backfill", schedule.id);
     let body = json!({ "from": from, "to": to });
 
-    // Fire both requests genuinely concurrently on a multi-thread runtime (two
-    // spawned tasks, not cooperatively-scheduled `tokio::join!` futures on one
-    // thread) so the atomic reservation is exercised under real thread-level
-    // parallelism — a stale-snapshot gate would let BOTH dispatch here.
+    // Fire both requests concurrently on a multi-thread runtime: two spawned
+    // tasks, not `tokio::join!` futures on one thread. So the atomic
+    // reservation runs under real thread parallelism. A stale-snapshot gate
+    // would let BOTH dispatch here.
     let (app_a, app_b) = (app.clone(), app.clone());
     let (uri_a, uri_b) = (uri.clone(), uri.clone());
     let (body_a, body_b) = (body.clone(), body.clone());
@@ -5565,18 +5563,18 @@ async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_on
     );
 }
 
-/// F4 regression (issue #688 review, Codex): with a web DB pool of size 1
+/// Pool-size-1 deadlock regression (issue #688): with a web DB pool of size 1
 /// (single-shard), a non-dry-run backfill must NOT self-deadlock. Before the fix
-/// the route held a dedicated schedule-shard connection across the dispatch loop
-/// while each slot also checked out a per-slot exec conn — two concurrent
-/// connections against a size-1 pool wedge forever (the route waits on a
-/// connection it already holds). The fix reuses the per-slot exec conn for budget
-/// accounting when the schedule and exec shards share a pool, so the route holds
-/// exactly one connection at a time again (restoring pre-#688 pool-size-1 safety).
+/// the route held a schedule-shard connection across the dispatch loop. Each slot
+/// also checked out a per-slot exec conn. Two concurrent connections on a size-1
+/// pool wedge forever, because the route waits on a connection it already holds.
+/// The fix reuses the per-slot exec conn for budget accounting when the schedule
+/// and exec shards share a pool. So the route holds one connection at a time
+/// again, as before #688.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
     let (database_url, _container) = setup_test_database_url().await;
-    // Deliberately size the pool at 1: exercising the exact F4 self-deadlock
+    // Deliberately size the pool at 1: exercising the exact self-deadlock
     // condition (pool.rs only forbids size 0, so 1 is a valid production config).
     let pool = {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url.as_str());
@@ -5703,9 +5701,9 @@ async fn backfill_release_on_oversized_input_leaves_budget_intact() {
     let name = "backfill_release_oversized_wf";
     // A schedule input that serializes past the registry's default 2 MiB
     // workflow-input cap, so the throttle block's oversized-input guard trips
-    // for every slot. (The effective cap is max(per-workflow, registry-global);
-    // rather than lower the process-global cap — which would race parallel tests
-    // — the input is sized past the default.)
+    // for every slot. The effective cap is max(per-workflow, registry-global). A
+    // lower process-global cap would race parallel tests, so the input is sized
+    // past the default.
     let big = "x".repeat(2 * 1024 * 1024 + 1024);
     let input = json!({ "blob": big });
     // Budget of 5 with a 2-slot window: budget is never exhausted, so any
@@ -5844,20 +5842,20 @@ async fn backfill_unlimited_schedule_increments_runs_started() {
     );
 }
 
-/// A row with `max_runs = 0` in the column must be treated as UNLIMITED by the
-/// atomic reservation guard (issue #688 review, Codex F1) — matching
-/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
-/// projection, all of which read non-positive `max_runs` as "no cap". The
-/// builder normalizes `0 → None`, so this writes `0` to the column DIRECTLY via
-/// diesel to simulate a pre-existing / hand-written row. Without the
-/// `max_runs <= 0` clause in the reservation predicate, `0 < 0` is false and the
-/// backfill would wrongly skip every slot as `max_runs_exhausted`.
+/// The atomic reservation guard must treat a row with `max_runs = 0` as
+/// UNLIMITED (issue #688). So do `backfill_budget_reached`, the up-front
+/// exhaustion check, and the dry-run projection: each reads non-positive
+/// `max_runs` as "no cap". The builder normalizes `0 → None`, so this writes `0`
+/// to the column DIRECTLY via diesel to simulate a pre-existing / hand-written
+/// row. Without the `max_runs <= 0` clause in the reservation predicate, `0 < 0`
+/// is false and the backfill would wrongly skip every slot as
+/// `max_runs_exhausted`.
 ///
-/// NOTE: the release-clears-exhaustion path (F2b) is a concurrent-only scenario
-/// not deterministically reproducible in a single-request test: within one
-/// request, once a slot transitions the row to exhausted, subsequent
-/// reservations fail the `exhausted_at IS NULL` guard and set `budget_hit`, so no
-/// release-after-transition occurs intra-request. F2b is covered by the
+/// NOTE: the release-clears-exhaustion path is concurrent-only, so a
+/// single-request test cannot reproduce it. Within one request, once a slot marks
+/// the row exhausted, later reservations fail the `exhausted_at IS NULL` guard
+/// and set `budget_hit`. So no release after that transition occurs within one
+/// request. That path is covered by the
 /// `clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update` shape
 /// test plus code reasoning, matching the no-Docker precedent.
 #[tokio::test]
@@ -6131,16 +6129,15 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
     );
 }
 
-/// Issue #743 review (PR #1141, Finding #5): `POST /admin/schedules/{id}/backfill`
-/// for a DAG-kind schedule row must thread the DAG's declared
-/// `execution_timeout`/`sla`, and the fleet-wide
-/// `HandlerRegistry::max_workflow_execution_timeout` ceiling, into every
-/// backfilled execution -- exactly like the scheduler tick's dispatch path, a
-/// manual/MCP trigger (`trigger_unified_dag`), and a WORKFLOW-kind backfill.
-/// Declares a 10h `execution_timeout` + 5h sla against a 1h fleet-wide
-/// ceiling, so both the ceiling clamp on `execution_timeout` AND the
-/// clamp-sla-to-effective-timeout rule fire in one assertion (mirrors
-/// `resolve_schedule_deadline_secs_clamps_sla_to_execution_timeout`).
+/// Issue #743 (PR #1141): `POST /admin/schedules/{id}/backfill` for a DAG-kind
+/// schedule row must thread the DAG's declared `execution_timeout`/`sla` into
+/// every backfilled execution. It must also apply the fleet-wide
+/// `HandlerRegistry::max_workflow_execution_timeout` ceiling. The scheduler tick,
+/// a manual/MCP trigger (`trigger_unified_dag`) and a WORKFLOW-kind backfill do
+/// the same. The DAG declares a 10h `execution_timeout` + 5h sla against a 1h
+/// fleet-wide ceiling. So the ceiling clamp on `execution_timeout` AND the
+/// clamp-sla-to-effective-timeout rule fire in one assertion. This mirrors
+/// `resolve_schedule_deadline_secs_clamps_sla_to_execution_timeout`.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling() {
@@ -6234,8 +6231,8 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
         .unwrap()
         .with_timezone(&chrono::Utc);
     // Window boundaries are inclusive on both ends, so keep `to` just past
-    // `from` to land exactly the single 10:00 slot (a wider window would also
-    // dispatch 11:00, which is irrelevant to what this test asserts).
+    // `from` to land only the 10:00 slot. A wider window would also dispatch
+    // an irrelevant 11:00 slot.
     let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:01Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
@@ -6259,12 +6256,12 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
         Some(chrono::Duration::seconds(3600)),
         "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h",
     );
-    // `deadline_at`/`sla_deadline_at` are computed server-side from
-    // `target_start_time`, a distinct `Utc::now()` capture from the row's own
-    // `started_at` column -- comparing against `execution.started_at + 3600s`
-    // exactly is flaky by a few hundred microseconds of clock skew between the
-    // two captures, so assert the derived deadline lands within a generous
-    // tolerance of one hour after `started_at` instead of bit-for-bit equal.
+    // The server computes `deadline_at`/`sla_deadline_at` from
+    // `target_start_time`. That is a separate `Utc::now()` capture from the
+    // row's `started_at` column. An exact comparison with
+    // `execution.started_at + 3600s` is flaky by a few hundred microseconds.
+    // So assert the deadline lands within a generous tolerance of one hour
+    // after `started_at`.
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
@@ -6290,12 +6287,13 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     );
 }
 
-/// Issue #743 review (PR #1141, Finding #5 -- workflow-kind companion): the
-/// SAME `execution_timeout`/`max_execution_timeout_ceiling` gap existed in the
-/// WORKFLOW (non-DAG) branch of `schedule_backfill`'s direct (non-throttled)
-/// start path -- `info_execution_timeout` was already resolved (it fed the
-/// `sla` clamp) but never applied to `StartWorkflowParams.execution_timeout`.
-/// Fixed alongside the DAG branch for full consistency across both kinds.
+/// Issue #743 (PR #1141, workflow-kind companion): the SAME
+/// `execution_timeout`/`max_execution_timeout_ceiling` gap existed in the
+/// WORKFLOW (non-DAG) branch. It was in the direct (non-throttled) start path
+/// of `schedule_backfill`. `info_execution_timeout` was already resolved for
+/// the `sla` clamp. But it was never applied to
+/// `StartWorkflowParams.execution_timeout`. Fixed alongside the DAG branch for
+/// full consistency across both kinds.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceiling() {
@@ -8620,15 +8618,15 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
         .expect("insert running execution");
 }
 
-/// AC (issue #696, Codex round 2): the create/upsert HTTP **response** must
-/// report the same tick-exact, shard-local `at_capacity` as the list/get reads
-/// and the `harvest.schedule.overdue` gauge. A same-cadence re-register preserves
-/// the existing `next_run_at` (`apply_workflow_schedule_update` recomputes it only
-/// on a cadence change), so a wedged-in-the-past `next_run_at` survives the
-/// re-register. When the schedule is `Skip` + catchup AND at capacity, the tick
-/// legitimately holds `next_run_at` in the past (a deferred fire, not a wedge), so
-/// it must report `overdue == false`. Before the fix the response hardcoded
-/// `at_capacity = false`, so it reported `overdue == true` — disagreeing with the
+/// AC (issue #696): the create/upsert HTTP **response** must report the same
+/// tick-exact, shard-local `at_capacity` as the list/get reads and the
+/// `harvest.schedule.overdue` gauge. A same-cadence re-register preserves the
+/// existing `next_run_at` (`apply_workflow_schedule_update` recomputes it only on
+/// a cadence change), so a wedged-in-the-past `next_run_at` survives the
+/// re-register. A `Skip` + catchup schedule at capacity legitimately holds
+/// `next_run_at` in the past. That is a deferred fire, not a wedge, so it must
+/// report `overdue == false`. Before the fix the response hardcoded
+/// `at_capacity = false`, so it reported `overdue == true`. That broke the
 /// read == gauge == tick invariant.
 #[tokio::test]
 async fn schedule_create_response_at_capacity_is_not_overdue() {
@@ -8743,12 +8741,12 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
     );
 }
 
-/// Seed a daily-cron schedule whose `next_run_at` slot (3 days ago) sits inside an
-/// explicit calendar exclusion block spanning `[today-3 .. today+2]`, so a
-/// `run_next_business_day` policy rebases the effective fire to `today+3` (future).
-/// Returns `(deferred_id, control_id)`; the control has no calendar (same past
-/// slot). Dates are computed relative to the real `Utc::now()` (the read path uses
-/// the real clock), so the deferral is future regardless of which weekday CI runs.
+/// Seed a daily-cron schedule whose `next_run_at` slot (3 days ago) sits inside a
+/// calendar exclusion block `[today-3 .. today+2]`. A `run_next_business_day`
+/// policy rebases the effective fire to `today+3` (future). Returns
+/// `(deferred_id, control_id)`; the control has no calendar (same past slot). Dates are relative
+/// to the real `Utc::now()`, because the read path uses the real clock. So the
+/// deferral is future on any weekday CI runs.
 async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uuid, uuid::Uuid) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
@@ -8841,11 +8839,11 @@ async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uui
     (deferred_id, control_id)
 }
 
-/// Codex round 3: `GET /admin/schedules/{id}` must honor the tick's calendar
-/// deferral. A `run_next_business_day` schedule whose slot fell inside an
-/// exclusion block, rebased to a FUTURE business day, reports `overdue: false`;
-/// the same past slot WITHOUT a calendar reports `overdue: true` (control),
-/// proving the calendar resolution is what suppresses the false positive.
+/// `GET /admin/schedules/{id}` must honor the tick's calendar deferral. A
+/// `run_next_business_day` schedule with a slot inside an exclusion block
+/// rebases to a FUTURE business day. It reports `overdue: false`. The same past
+/// slot WITHOUT a calendar reports `overdue: true` (control). So the calendar
+/// resolution suppresses the false positive.
 #[tokio::test]
 async fn schedule_read_honors_calendar_deferred_fire() {
     let (database_url, _container) = overdue_read_database_url().await;
@@ -8900,11 +8898,11 @@ fn find_schedule_by_name<'a>(list: &'a Value, name: &str) -> &'a Value {
 }
 
 /// AC9: `GET /admin/schedules` (list) and `GET /admin/schedules/{id}` (single)
-/// surface the schedule's *effective* `execution_timeout_secs`/`sla_secs`,
-/// resolved from the registered `WorkflowInfo` -- including AC5's clamp (a
-/// declared `sla` larger than `execution_timeout` reads back already clamped
-/// down to it) and AC7's zero-regression case (neither attribute declared ->
-/// both fields are `null`).
+/// surface the schedule's *effective* `execution_timeout_secs`/`sla_secs`.
+/// They resolve from the registered `WorkflowInfo`. That includes AC5's clamp:
+/// a declared `sla` over `execution_timeout` reads back clamped to it. It also
+/// includes AC7's zero-regression case: with neither attribute declared, both
+/// fields are `null`.
 #[tokio::test]
 async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
     let (database_url, _container) = setup_test_database_url().await;

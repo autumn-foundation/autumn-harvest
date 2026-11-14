@@ -21,19 +21,17 @@
 //!
 //! This guard compiles each pinned snippet with `cargo check`. It does not
 //! pattern-match stand-in text. PR #1700 found text heuristics gameable here
-//! twice. The first heuristic was a loose window that an unrelated
-//! `.map_err(` could satisfy. The second accepted `.await.map_err(|e| e)?`, an
-//! identity closure. That text is "a `map_err` right after await", but
-//! `|e| e` keeps `HarvestError` and does not produce `String`. So it still
-//! fails to compile.
+//! twice. The first was a loose window that an unrelated `.map_err(` could
+//! satisfy. The second accepted the identity closure `.await.map_err(|e| e)?`.
+//! That text is "a `map_err` right after await", but `|e| e` keeps
+//! `HarvestError` and does not produce `String`. So it still fails to compile.
 //!
 //! Whether the return type of a closure satisfies the target of `?` is a
 //! property of the type checker, not a text shape. So no third regex is worth
-//! writing here, because the compiler already settles it.
-//! `cargo xtask audit doc-snippet-syntax` deliberately does not compile the
-//! whole corpus of about 93 blocks, and its own module doc explains why. That
-//! tradeoff does not apply to two pinned blocks that were broken before. The
-//! same `lint` job already builds the crate for clippy a few steps later.
+//! writing. `cargo xtask audit doc-snippet-syntax` deliberately does not
+//! compile its corpus of about 93 blocks, and its module doc explains why.
+//! That tradeoff does not apply to two pinned blocks that were broken before.
+//! The same `lint` job already builds the crate for clippy a few steps later.
 
 use std::path::Path;
 use std::process::ExitCode;

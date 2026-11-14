@@ -1041,9 +1041,8 @@ async fn ui_dead_letters_invalid_failed_before_redisplays_form_instead_of_aborti
     );
 }
 
-/// Codex-review-class regression guard, matching #1333/#1378's own
-/// follow-up: an invalid filter's raw text must survive into pagination
-/// instead of being dropped on the very next click.
+/// Regression guard, matching the follow-up of #1333/#1378: the raw text of an
+/// invalid filter must survive into pagination. The next click must not drop it.
 #[tokio::test]
 async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
@@ -1851,12 +1850,11 @@ async fn ui_workers_partial_shard_failure_degraded() {
 /// Issue #619 review — a shard whose pause state cannot be read must not leave
 /// the Workers page silently claiming dispatch is flowing.
 ///
-/// Nothing is paused on the reachable shard, so before this fix the paused-queue
-/// banner rendered *nothing at all* on a page where one shard's pause state was
-/// simply unknown — indistinguishable from a genuinely clean fleet, on exactly
-/// the page an operator lands on when investigating idle workers. A hold that
-/// exists only on the unread shard is likewise absent from the banner, which is
-/// why "we do not know" has to be said out loud.
+/// Nothing is paused on the reachable shard. Before this fix, the paused-queue
+/// banner rendered *nothing at all* when the pause state of one shard was
+/// unknown. That looked exactly like a clean fleet. Operators land on this page
+/// when they investigate idle workers. A hold on the unread shard is also absent
+/// from the banner. So the page must say "we do not know" out loud.
 #[tokio::test]
 async fn ui_workers_warns_when_a_shards_pause_state_is_unreadable() {
     let (good_url, _container) = setup_test_database_url().await;
@@ -2541,7 +2539,7 @@ async fn ui_schedules_delete_action_redirects() {
 /// Auto-refresh: `?refresh=30` emits a meta http-equiv refresh tag.
 ///
 /// The tag's `content` carries an explicit, flash-free `url=` target
-/// (Codex review, #1437 P2), not a bare interval. A repeating reload
+/// (#1437), not a bare interval. A repeating reload
 /// must land on the operator's current filtered view, instead of
 /// looping on a stale flash message — see `layout_schedules`'s own doc
 /// comment.
@@ -2554,7 +2552,7 @@ async fn ui_schedules_auto_refresh_meta_tag() {
     assert_eq!(status, StatusCode::OK);
     // Maud HTML-escapes attribute values. The rendered `&` between query
     // params comes back as `&amp;`, same as every other multi-param
-    // assertion in this file (Codex review, #1437).
+    // assertion in this file (#1437).
     assert!(
         html.contains(r#"content="30; url=schedules?page=0&amp;refresh=30""#)
             && html.contains("http-equiv=\"refresh\""),
@@ -2640,7 +2638,7 @@ async fn ui_schedules_bulk_pause_pauses_matching_rows() {
     );
 }
 
-/// Codex review on #1437 (P2): before this fix, a bulk-action redirect
+/// #1437: before this fix, a bulk-action redirect
 /// always landed on a bare, unfiltered `schedules?flash=…`. That dropped
 /// whatever filters the operator had set, including a still-unresolved
 /// invalid value and its inline error, on the very next Pause/Resume
@@ -2672,7 +2670,7 @@ async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
         "the redirect must preserve the operator's filtered view, not drop it: {location}"
     );
 
-    // Codex review on #1437 (P2): a relative `Location` resolves against
+    // #1437: a relative `Location` resolves against
     // the URL this test posted to (`/schedules/bulk-pause`), not the
     // list page. Follow it the way a browser does: RFC 3986 §5.3 has
     // `../` step back out of `bulk-pause`'s own directory. Confirm it
@@ -2696,7 +2694,7 @@ async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
     );
 }
 
-/// Codex review on #1437 (P2): a `return_to` with a form-decoded control
+/// #1437: a `return_to` with a form-decoded control
 /// character (`%0A` decodes to a raw newline) used to reach
 /// `axum::response::Redirect::to` unfiltered. `HeaderValue::try_from`
 /// rejects that byte, so the mutation succeeded but the response became
@@ -2730,7 +2728,7 @@ async fn ui_schedules_bulk_pause_rejects_control_characters_in_return_to() {
     );
 }
 
-/// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
+/// #1437: before this fix, an invalid `shard_id` in
 /// a bulk-action POST silently dropped to "no shard restriction". It
 /// paused schedules on every shard instead of rejecting the request —
 /// the exact scope-broadening a mutating endpoint must never allow.
@@ -2935,9 +2933,9 @@ async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'
     let mut conn = AsyncPgConnection::establish(database_url)
         .await
         .expect("failed to connect for schedule fixture insert");
-    // Quote-escape every interpolated literal so a fixture can seed a hostile
-    // name (the pure tests use one containing a single quote) and get a row
-    // rather than a syntax error.
+    // Quote-escape every interpolated literal. A fixture can then seed a hostile
+    // name and get a row, not a syntax error. The pure tests use a name with a
+    // single quote.
     let sql_lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
     let (dag_col, wf_col) = if fixture.kind == "Dag" {
         (sql_lit(fixture.name), "NULL".to_string())
@@ -2988,9 +2986,9 @@ async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'
     id
 }
 
-/// Seed one execution attributed to a schedule, as the scheduler/backfill/manual
-/// trigger paths do (`schedule_id` + `origin` + `scheduled_for`), so the run
-/// history drill-down has something to render.
+/// Seed one execution attributed to a schedule, so the run history drill-down
+/// has something to render. It sets `schedule_id` + `origin` + `scheduled_for`,
+/// as the scheduler/backfill/manual trigger paths do.
 async fn insert_schedule_run(
     database_url: &str,
     shard: ShardId,
@@ -3584,11 +3582,11 @@ async fn ui_schedules_runs_invalid_limit_redisplays_form_instead_of_aborting_pag
     );
 }
 
-/// Codex review finding on this PR: the "Rows" field became a text control
-/// with no browser-side floor (the previous `type="number" min="1"` blocked
-/// a `0` submission client-side). Without clamping, an operator-typed `0`
-/// would reach `ScheduleRunsParams::from_query_pairs`, which rejects it —
-/// reintroducing the whole-page-abort defect this PR exists to close.
+/// PR #1641: the "Rows" field became a text control with no browser-side
+/// floor. The previous `type="number" min="1"` blocked a `0` client-side.
+/// Without clamping, an operator-typed `0` would reach
+/// `ScheduleRunsParams::from_query_pairs`, which rejects it. That would bring
+/// back the whole-page-abort defect that PR closes.
 #[tokio::test]
 async fn ui_schedules_runs_zero_limit_clamps_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -3952,9 +3950,9 @@ async fn ui_schedules_rows_link_to_drilldowns() {
     }
 }
 
-/// AC4: the drill-downs mirror their endpoints' admin-auth posture — the run
-/// history is gated (as `GET /admin/schedules/{id}/runs` is), preview and
-/// backfill are not (as their API routes are not).
+/// AC4: the drill-downs mirror the admin-auth posture of their endpoints. The
+/// run history is gated, as `GET /admin/schedules/{id}/runs` is. Preview and
+/// backfill are not, as their API routes are not.
 #[tokio::test]
 async fn ui_schedules_drilldown_auth_matches_the_api_routes() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4282,10 +4280,10 @@ async fn ui_schedules_pause_redirect_resolves_to_the_list() {
     );
 }
 
-/// Codex round 1 #3: an auto-paused schedule (#360 sets `auto_paused_at`
-/// **without** `is_paused`) must be resumable from Vantage — per row and in
-/// bulk — and the resume must clear the auto-pause state the way the API's does,
-/// or the next tick immediately re-pauses it.
+/// An auto-paused schedule (#360 sets `auto_paused_at` **without**
+/// `is_paused`) must be resumable from Vantage, per row and in bulk. The resume
+/// must clear the auto-pause state the way the API's does, or the next tick
+/// immediately re-pauses it.
 #[tokio::test]
 async fn ui_schedules_auto_paused_row_can_be_resumed() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4391,9 +4389,9 @@ async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
     );
 }
 
-/// Codex round 1 #2: the preview drill-down must render for a schedule on a
-/// healthy shard even when an earlier shard is unreachable — the resilient
-/// resolver found the row, so a second fragile lookup must not undo that.
+/// The preview drill-down must render for a schedule on a healthy shard even
+/// when an earlier shard is unreachable. The resilient resolver found the row,
+/// so a second fragile lookup must not undo that.
 #[tokio::test]
 async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
     let (good_url, _container) = setup_test_database_url().await;
@@ -4448,10 +4446,9 @@ async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
     );
 }
 
-/// Codex round 2 #2: the backfill launcher must work for a schedule on a
-/// healthy shard while an earlier shard is unreachable. Round 1 fixed the
-/// preview instance; the shared lookup underneath is now resilient, so the
-/// backfill path is covered by the same rule.
+/// The backfill launcher must work for a schedule on a healthy shard while an
+/// earlier shard is unreachable. The preview and the backfill path share one
+/// resilient lookup, so the same rule covers both.
 #[tokio::test]
 async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
     let (good_url, _container) = setup_test_database_url().await;
@@ -4517,7 +4514,7 @@ async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
     );
 }
 
-/// Codex round 2 #3: a schedule that is terminal on its live bounds but whose
+/// A schedule that is terminal on its live bounds but whose
 /// tick never stamped `exhausted_at` must still read as unhealthy on the list.
 #[tokio::test]
 async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() {
@@ -4577,7 +4574,7 @@ async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() 
     );
 }
 
-/// Codex round 2 #1: a legacy `max_runs = 0` row is unlimited, and must not be
+/// A legacy `max_runs = 0` row is unlimited, and must not be
 /// rendered as a spent budget or flagged unhealthy.
 #[tokio::test]
 async fn ui_schedules_zero_run_cap_renders_as_unlimited() {
@@ -4952,25 +4949,26 @@ async fn list_page_has_time_range_filters() {
 }
 
 /// Wayfinder error-path fix: a malformed `started_after`/`started_before`
-/// used to `?`-abort `list_workflows_ui` with a bare 400 before the filter
-/// form was ever rendered — discarding every other filter the operator had
-/// typed and giving no way back to the list short of hand-editing the URL.
+/// used to `?`-abort `list_workflows_ui` with a bare 400. The filter form never
+/// rendered. Every other typed filter was lost, and only a hand-edited URL led
+/// back to the list.
 ///
-/// RED baseline (pre-fix, reproduced by checking out the parent commit and
-/// running this test): `GET /workflows?started_after=yesterday&workflow_name=billing`
-/// returned `400 Bad Request` with a body that did not contain the filters
-/// form, so `workflow_name=billing` (a valid, already-typed filter) was
-/// silently discarded along with the page.
+/// RED baseline (pre-fix, from the parent commit):
+/// `GET /workflows?started_after=yesterday&workflow_name=billing` returned
+/// `400 Bad Request` with no filters form in the body. So the valid, typed
+/// `workflow_name=billing` filter was silently lost with the page.
 ///
-/// GREEN (this commit): the request still renders the list page (`200`),
-/// preserves the other filter (`workflow_name=billing`, still in its
-/// input's `value=`), preserves the operator's exact invalid text
-/// (`started_after`'s `value="yesterday"`, not blanked out), and surfaces a
-/// `role="alert"` message adjacent to the offending field explaining the
-/// expected format — all four error-path booleans (adjacent to cause,
-/// persists until resolved, says how to recover, entered data preserved)
-/// now hold, where before only "says how to recover" did (in a 400 body the
-/// operator would only see by opening dev tools).
+/// GREEN (this commit): the request still renders the list page (`200`). It
+/// preserves:
+///
+/// - the other filter (`workflow_name=billing`, still in its input `value=`);
+/// - the exact invalid text (`value="yesterday"` on `started_after`).
+///
+/// It also shows a `role="alert"` message beside the offending field that
+/// explains the expected format. So all four error-path booleans now hold:
+/// adjacent to cause, persists until resolved, says how to recover, and
+/// entered data preserved. Before, only "says how to recover" held, in a 400
+/// body that the operator saw only in dev tools.
 #[tokio::test]
 async fn invalid_started_after_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -5513,9 +5511,9 @@ async fn detail_page_reset_action_redirects_with_flash() {
     // history range. Both outcomes redirected identically before this PR,
     // since every branch shared one `Redirect`. This test was passing
     // while silently exercising the *failure* path. A rejected submission
-    // now renders the page directly instead of redirecting (issue #1687
-    // review, Codex finding). A genuine success fixture is required to
-    // observe the redirect this test asserts on.
+    // now renders the page directly instead of redirecting (issue #1687).
+    // A genuine success fixture is required to observe the redirect this
+    // test asserts on.
     let (status, headers, body) = post_form(
         &app,
         &format!("/workflows/{exec_id}/reset"),
@@ -5782,8 +5780,8 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
         "metadata card should show the custom threshold 500: {html}"
     );
     // The default threshold value must NOT appear as the threshold.
-    // (It could appear elsewhere, e.g. as an event count or ID, so we verify
-    // the custom value is present rather than asserting the default is absent.)
+    // It could appear elsewhere, e.g. as an event count or ID. So the test checks
+    // that the custom value is present, not that the default is absent.
     assert!(
         html.contains('3'),
         "metadata card should show the event count 3: {html}"
@@ -5939,16 +5937,18 @@ async fn ui_trigger_preserves_dag_metadata() {
     assert_eq!(execution.severity.as_deref(), Some("sev3"));
 }
 
-/// Issue #743 review (PR #1141, Finding #6): `POST /schedules/{id}/trigger-now`
-/// (the Vantage UI manual-trigger route) is a DISTINCT DAG-start entry point
-/// from the scheduler tick, the buffered-drain, the direct HTTP/MCP trigger
-/// (`trigger_unified_dag`), and a backfill -- and its `execute_schedule_trigger_ui`
+/// Issue #743 (PR #1141): `POST /schedules/{id}/trigger-now` is the Vantage UI
+/// manual-trigger route. It is a DISTINCT DAG-start entry point. The others are
+/// the scheduler tick, the buffered-drain, the direct HTTP/MCP trigger
+/// (`trigger_unified_dag`) and a backfill. Its `execute_schedule_trigger_ui`
 /// handler hardcoded `execution_timeout`/`max_execution_timeout_ceiling` to
-/// `None`. Declares a 10h `execution_timeout` + 5h `sla` against a 1h
-/// fleet-wide ceiling, so both the ceiling clamp AND the clamp-sla-to-
-/// effective-timeout rule fire in one assertion (mirrors the sibling backfill
-/// test `backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling`
-/// in `api_scheduler_integration.rs`).
+/// `None`.
+///
+/// The test declares a 10h `execution_timeout` + 5h `sla` against a 1h
+/// fleet-wide ceiling. So the ceiling clamp AND the clamp-sla-to-effective-timeout
+/// rule fire in one assertion. It mirrors the sibling backfill test
+/// `backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling`
+/// in `api_scheduler_integration.rs`.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
@@ -5979,9 +5979,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let dag_catalog =
         Arc::new(autumn_harvest::compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
 
-    // The DAG's shadow WorkflowInfo, registered under `dag_name` -- exactly
-    // what `DagInfo::as_workflow_info()` would produce, hand-built here
-    // (matching the pre-existing sibling test's convention) since
+    // The DAG's shadow WorkflowInfo, registered under `dag_name`. It equals the
+    // output of `DagInfo::as_workflow_info()`, hand-built as in the sibling test.
     // `execute_schedule_trigger_ui` reads execution_timeout/sla from THIS
     // registry lookup, not from `DagInfo` directly.
     let registry = Arc::new(
@@ -6368,11 +6367,10 @@ async fn decode_audit_sources(database_url: &str) -> Vec<String> {
 }
 
 /// The `route_or_command` column of every `payload.decode_read` audit row
-/// (issue #1687 review, Codex finding). `render_workflow_detail_page` is
-/// shared by the `GET` route and the three rejected-action POST handlers.
-/// Each caller's decoded reads must be attributed to ITS OWN route, not a
-/// hard-coded `GET /ui/workflows/{id}` regardless of which request
-/// actually triggered the read.
+/// (issue #1687). `render_workflow_detail_page` is shared by the `GET` route
+/// and the three rejected-action POST handlers. The decoded reads of each
+/// caller must be attributed to ITS OWN route. A hard-coded
+/// `GET /ui/workflows/{id}` is wrong for any other request.
 async fn decode_audit_routes(database_url: &str) -> Vec<String> {
     use autumn_harvest::schema::harvest_audit_log;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
@@ -6513,19 +6511,21 @@ async fn workflow_detail_ui_renders_decoded_input() {
     .expect("workflow insert should succeed");
     reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
 
-    // Blocked-on panel + timeline fixtures (issue #608, AC4): an
-    // envelope-bearing timeline event, a pending activity whose stored
-    // heartbeat checkpoint is an envelope, and an unconsumed signal whose
-    // payload is an envelope. The panel renders the checkpoint and the
-    // timeline renders each event's data; the blocked-on activity *input*
-    // and signal *payload* are never rendered, so they are deliberately NOT
-    // decoded (PR #936 review, round 5) — their plaintext must not appear
-    // anywhere in the page.
+    // Blocked-on panel + timeline fixtures (issue #608, AC4):
+    //
+    // - an envelope-bearing timeline event;
+    // - a pending activity whose stored heartbeat checkpoint is an envelope;
+    // - an unconsumed signal whose payload is an envelope.
+    //
+    // The panel renders the checkpoint and the timeline renders each event's
+    // data. The blocked-on activity *input* and signal *payload* are never
+    // rendered, so they are deliberately NOT decoded (PR #936). Their
+    // plaintext must not appear anywhere in the page.
     {
         // `load_history_undecoded`: the seeded `WorkflowStarted` input is a
-        // "reverse"-codec envelope, and the strict `load_history` (identity-only
-        // registry) hard-errors `UnknownPayloadCodec` on it — the exact
-        // strict-loader behavior PR #936 round 2 documented. The raw loader is
+        // "reverse"-codec envelope. The strict `load_history` (identity-only
+        // registry) hard-errors `UnknownPayloadCodec` on it, which is the
+        // strict-loader behavior PR #936 documented. The raw loader is
         // the correct fixture tool for reading `next_event_id` here.
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
@@ -6616,7 +6616,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
         !html.contains("_harvest_codec_envelope"),
         "workflow detail must not render the raw envelope: {html}"
     );
-    // Hidden fields are not decoded (PR #936 round 5): their plaintext never
+    // Hidden fields are not decoded (PR #936): their plaintext never
     // reaches the page.
     assert!(
         !html.contains("pii-detail-task-input"),
@@ -6652,7 +6652,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
     );
 }
 
-/// GREEN (issue #1687 review, Codex finding). `render_workflow_detail_page`
+/// GREEN (issue #1687). `render_workflow_detail_page`
 /// is shared by the `GET` route and the three rejected-action POST
 /// handlers. A payload decoded while rendering a rejected signal directly
 /// must attribute its `payload.decode_read` audit row to the POST route
@@ -6744,11 +6744,11 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
     );
 }
 
-/// Issue #608 / PR #936 round 5: a detail render whose *only* envelopes live
-/// in fields the page never displays — the pending-activity `input`, the
-/// pending-signal payload, and the attempts/signals panel event copies
-/// (isolated from the timeline via `?event_page=1`) — must do zero decode
-/// work and write NO `payload.decode_read` audit row.
+/// Issue #608 / PR #936: a detail render whose *only* envelopes live in fields
+/// the page never displays must do zero decode work. It must write NO
+/// `payload.decode_read` audit row. Those fields are the pending-activity
+/// `input`, the pending-signal payload, and the attempts/signals panel event
+/// copies (isolated from the timeline via `?event_page=1`).
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_envelopes() {
@@ -6812,11 +6812,13 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
     .await
     .expect("workflow insert should succeed");
 
-    // Hidden-surface envelopes only: an attempts-panel activity event and a
-    // signals-panel signal event (kept off the requested timeline page via
-    // `?event_page=1`), a pending activity whose `input` is an envelope (no
-    // heartbeat checkpoint), and an unconsumed signal with an envelope
-    // payload.
+    // Hidden-surface envelopes only:
+    //
+    // - an attempts-panel activity event and a signals-panel signal event,
+    //   kept off the requested timeline page via `?event_page=1`;
+    // - a pending activity whose `input` is an envelope (no heartbeat
+    //   checkpoint);
+    // - an unconsumed signal with an envelope payload.
     {
         let history = autumn_harvest::store::load_history(&mut conn, exec_id)
             .await
@@ -6889,12 +6891,12 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #957 — Vantage DAG run graph view
 //
-// These exercise the enhanced `GET /dags/{dag_name}` page (server-rendered inline
-// SVG built from `dag_graph::build_run_graph`, the same in-process call the #690
-// API handler makes) plus the 3-click retry flow (node → dry-run confirm →
-// admin-gated commit) that delegates to the shipped #366 retry endpoint via the
-// extracted `retry_dag_run_inner`. Docker-backed (testcontainers); compile-checked
-// in sandboxes without Docker, run on Linux CI.
+// These exercise the enhanced `GET /dags/{dag_name}` page. It is inline SVG,
+// server-rendered from `dag_graph::build_run_graph`, the same in-process call as
+// the #690 API handler. They also exercise the 3-click retry flow (node →
+// dry-run confirm → admin-gated commit). It delegates to the shipped #366 retry
+// endpoint via the extracted `retry_dag_run_inner`. Docker-backed
+// (testcontainers); compile-checked in sandboxes without Docker, run on Linux CI.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[activity(queue = "default")]
@@ -7409,7 +7411,7 @@ async fn ui_dag_retry_error_preserves_submitted_reason() {
         body.contains("retrying after upstream API fix, ticket JIRA-4521"),
         "the operator's submitted reason must survive the failure: {body}"
     );
-    // Codex review (issue #1723): the redisplay's own refreshed dry run
+    // Issue #1723: the redisplay's own refreshed dry run
     // fails too in this exact race, since the source run is now sealed. So
     // the page renders the `Err` branch, not the `Ok` branch's inline
     // `span.field-error`. The reason survives there via the "Your submitted
@@ -7702,7 +7704,7 @@ async fn ui_dag_detail_invalid_refresh_redisplays_page_instead_of_aborting() {
     );
 }
 
-/// Codex review finding on this PR: a valid `refresh` alongside an invalid
+/// PR #1630: a valid `refresh` alongside an invalid
 /// `node` used to still set a meta refresh. `layout_dag_detail` emits a
 /// bare `meta http-equiv`, with no target URL to drop the bad `node` from.
 /// The browser reloaded the same malformed URL forever. Each reload redid
@@ -7744,10 +7746,10 @@ async fn ui_dag_detail_invalid_node_suppresses_a_valid_refresh() {
     );
 }
 
-// I-J — a real `skipped` node (via the #482 `dag_skip:` marker path, exactly as
-// `build_run_graph`/#690 read it) renders distinctly from a `pending` node end-
-// to-end, exercising #957 AC6 ("pending vs skipped visually distinct") through
-// the whole `build_run_graph` → SVG pipeline rather than the helpers in isolation.
+// I-J — a real `skipped` node renders distinctly from a `pending` node,
+// end-to-end. It uses the #482 `dag_skip:` marker path, as `build_run_graph`/#690
+// read it. That exercises #957 AC6 ("pending vs skipped visually distinct")
+// through the whole `build_run_graph` → SVG pipeline, not isolated helpers.
 #[tokio::test]
 async fn ui_dag_run_graph_skipped_node_distinct_from_pending() {
     let (url, _c) = setup_test_database_url().await;
@@ -7777,9 +7779,9 @@ async fn ui_dag_run_graph_skipped_node_distinct_from_pending() {
     let (status, html) = fetch_html(&app, &format!("/dags/dag957_fanout?run={exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "body: {html}");
 
-    // The node rect fill attribute is node-specific (the legend swatch uses a
-    // `style="background:…"` attribute, never `fill="…"`), so these prove the
-    // node itself carries the Skipped vs Pending status — distinct fills.
+    // The node rect fill attribute is node-specific. The legend swatch uses
+    // `style="background:…"`, never `fill="…"`. So these distinct fills prove
+    // that the node itself carries the Skipped vs Pending status.
     assert!(
         html.contains("fill=\"#475569\""),
         "the skipped node renders with the Skipped fill: {html}"
@@ -7803,9 +7805,9 @@ async fn ui_dag_run_graph_skipped_node_distinct_from_pending() {
 // I-K — index-alignment invariant (security review nit-1). `build_run_graph`
 // returns nodes in `def.tasks()` order, so `nodes[i]` ↔ `tasks()[i]` ↔ the index
 // used by `execution_levels()` (columns) and the SVG's `?node=i` anchors. A
-// future reorder in `build_run_graph` or the DAG topology would silently mis-map
-// a node's status/edges onto the wrong box; this pins the alignment the whole
-// render depends on. Pure — no DB (uses `DagBuilder` + `build_run_graph`, which
+// reorder in `build_run_graph` or the DAG topology would silently put a node's
+// status/edges on the wrong box. This pins the alignment the whole render
+// depends on. Pure — no DB (uses `DagBuilder` + `build_run_graph`, which
 // this integration test file already links).
 #[test]
 fn dag957_build_run_graph_nodes_align_with_task_indices() {
@@ -7861,12 +7863,12 @@ fn dag957_build_run_graph_nodes_align_with_task_indices() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #960 — Vantage execution timeline / Gantt view
 //
-// These exercise the standalone `GET /workflows/{id}/timeline` page (server-
-// rendered inline SVG built from `autumn_harvest::derive_timeline`, the same
-// in-process call the #739 API handler makes) plus the pause/ND-block bands
-// sourced from the execution row and the "Timeline" tab link on the detail
-// page. Docker-backed (testcontainers); compile-checked in sandboxes without
-// Docker, run on Linux CI.
+// These exercise the standalone `GET /workflows/{id}/timeline` page. It is
+// inline SVG, server-rendered from `autumn_harvest::derive_timeline`, the same
+// in-process call as the #739 API handler. They also cover the pause/ND-block
+// bands from the execution row and the "Timeline" tab link on the detail page.
+// Docker-backed (testcontainers); compile-checked in sandboxes without Docker,
+// run on Linux CI.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Set an event row's wall-clock timestamp so the derived timeline has
@@ -7891,9 +7893,9 @@ async fn tl960_set_event_ts(
         .expect("update event timestamp");
 }
 
-/// Seed a plain workflow run with the given events (appended after the
-/// `WorkflowStarted` at event 1), spread across wall-clock time starting at
-/// `base`, then apply the state/column overrides. Returns the exec id and the
+/// Seed a plain workflow run with the given events, appended after the
+/// `WorkflowStarted` at event 1. They spread across wall-clock time from
+/// `base`. Then apply the state/column overrides. Returns the exec id and the
 /// number of appended events.
 #[allow(clippy::too_many_arguments)]
 async fn tl960_seed_run(

@@ -13,8 +13,8 @@
 //! - `set_legal_hold` / `release_legal_hold` are idempotent (round-trip).
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded; each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle.
+//! against it directly (single-threaded; each test scrubs first). Otherwise a
+//! fresh testcontainers Postgres boots with the full migration bundle.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -226,11 +226,12 @@ async fn run_one_tick_with_archiver(
     result.expect("retention tick did not report a result in time")
 }
 
-/// A `HistoryArchiver` that records every archived `exec_id` and, when
-/// `place_hold_on` is set, places a legal hold on that execution FROM INSIDE
-/// `archive()` — deterministically injecting the "hold committed after
-/// candidate selection but before delete" race that the delete-tx `FOR UPDATE`
-/// re-check must honor (issue #747 BLOCKER 1).
+/// A `HistoryArchiver` that records every archived `exec_id`.
+///
+/// When `place_hold_on` is set, it places a legal hold on that execution FROM
+/// INSIDE `archive()`. That deterministically injects the race "hold
+/// committed after candidate selection but before delete". The delete-tx
+/// `FOR UPDATE` re-check must honor it (issue #747).
 struct RaceArchiver {
     url: String,
     archived: Mutex<Vec<uuid::Uuid>>,
@@ -528,9 +529,9 @@ async fn set_release_idempotency_round_trip() {
 
 // ── MINOR 2b: held child is SKIPPED (not failed) during cascade ───────────────
 
-// During cascade erasure, a child under an active legal hold is reported as a
-// SKIPPED child (with a legal-hold reason), NOT a failure; its events are left
-// intact while the parent's are tombstoned.
+// During cascade erasure, a child under an active legal hold is a SKIPPED
+// child with a legal-hold reason, NOT a failure. Its events stay intact while
+// the parent's are tombstoned.
 #[tokio::test]
 async fn held_child_is_skipped_not_failed_during_cascade() {
     let (url, _container) = setup_db().await;
@@ -612,9 +613,9 @@ async fn held_child_is_skipped_not_failed_during_cascade() {
 
 // ── BLOCKER 1: delete-time hold TOCTOU ────────────────────────────────────────
 
-// A hold placed AFTER candidate selection but before the delete transaction
-// (injected here from inside archive()) must be honored by the delete-tx
-// FOR UPDATE re-check: the row SURVIVES and the deletion metric reads zero.
+// The delete-tx FOR UPDATE re-check must honor a hold placed AFTER candidate
+// selection but before the delete transaction. This test injects that hold
+// from inside archive(). The row SURVIVES and the deletion metric reads zero.
 #[tokio::test]
 async fn hold_placed_mid_tick_is_not_deleted() {
     let (url, _container) = setup_db().await;
@@ -886,9 +887,9 @@ async fn release_of_expired_hold_clears_columns() {
     );
 }
 
-// Second-tick metric-zero: an indefinitely-held old row survives TWO ticks and
-// the deletion metric reads zero across both (the success metric's ">= 1 full
-// cycle beyond max_age" spirit).
+// An indefinitely-held old row survives TWO ticks, and the deletion metric
+// reads zero across both. This follows the success metric ">= 1 full cycle
+// beyond max_age".
 #[tokio::test]
 async fn indefinitely_held_row_survives_two_ticks_metric_zero() {
     let (url, _container) = setup_db().await;

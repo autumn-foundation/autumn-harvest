@@ -1,17 +1,17 @@
 //! Regression tests for `ctx.race()` over **activity** branches (issue #600) on
-//! the single-writer backend — Codex #1069 P1 (`worker.rs:76`).
+//! the single-writer backend (issue #1069).
 //!
-//! The `ctx.race()` contract: only the WINNING branch runs to completion; every
-//! still-pending losing branch is durably cancelled (a synthetic
-//! `ActivityFailed { "lost race to a sibling branch" }`), and the loser's body
-//! never runs. For a hedged-call / provider-race pattern this is what prevents a
-//! double-charge / double-send.
+//! The `ctx.race()` contract: only the WINNING branch runs to completion. Every
+//! still-pending losing branch is durably cancelled with a synthetic
+//! `ActivityFailed { "lost race to a sibling branch" }`. The loser's body never
+//! runs. For a hedged-call or provider-race pattern, that prevents a double charge
+//! or a double send.
 //!
-//! Pre-fix the `SQLite` worker's `drain_ready` drained EVERY ready branch to a
-//! terminal event before the workflow was re-polled, so by the time `settle_race`
-//! ran, every loser was already `DONE` (its body already ran) and there was
-//! nothing left for `CancelRaceLosers` to cancel — BOTH providers always ran, a
-//! real user-visible divergence from the Postgres backend.
+//! The `drain_ready` of the `SQLite` worker once drained EVERY ready branch to a
+//! terminal event before it re-polled the workflow. So when `settle_race` ran,
+//! every loser was already `DONE`, and its body had run. `CancelRaceLosers` had
+//! nothing left to cancel. BOTH providers always ran, which diverged visibly from
+//! the Postgres backend.
 //!
 //! These tests drive the runtime with the deterministic `_as_of` clock seam so no
 //! wall-clock sleeping is involved.
@@ -146,8 +146,8 @@ async fn race_two_activities_only_winner_runs_loser_is_cancelled() {
 
 /// A fan-out (wait-ALL) over N inputs: every branch body must run and every
 /// result must be collected. This proves the race drain-one fix did NOT regress
-/// fan-out, which schedules N activities in one batch but resolves only when all
-/// N complete and emits NO `CancelRaceLosers`.
+/// fan-out. A fan-out schedules N activities in one batch. It resolves only when
+/// all N complete, and emits NO `CancelRaceLosers`.
 #[workflow]
 async fn fan_out_all(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let inputs: Vec<(String, serde_json::Value, String)> = (0..n)

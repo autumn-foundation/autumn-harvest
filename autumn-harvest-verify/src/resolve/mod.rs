@@ -2,9 +2,9 @@
 //! async bodies, generic substitution and RTA-lite devirtualization (D7).
 //!
 //! Everything the taint analysis knows about *where a call goes* is decided
-//! here, and every answer is one of three shapes ([`Resolution`]): a body in the
-//! analyzed set, a body outside it that is modelled as a pure propagator, or a
-//! **named** analysis boundary. There is deliberately no fourth shape meaning
+//! here. Every answer is one of three shapes ([`Resolution`]). It is a body in
+//! the analyzed set, a body outside it that is modelled as a pure propagator, or
+//! a **named** analysis boundary. There is deliberately no fourth shape meaning
 //! "assume it is clean".
 //!
 //! # How a printed callee becomes a body
@@ -25,12 +25,12 @@
 //! | `analyzed_crate::gone` | [`BoundaryKind::MissingBody`] |
 //! | anything else without a body (`SystemTime::now`, `format`) | [`Resolution::External`] |
 //!
-//! The last row is the load-bearing default, and it is a *deliberate* asymmetry:
-//! rustc prints **trimmed** def-paths, so the overwhelming majority of std calls
-//! arrive as `String::clone` or `format` with no crate root at all. Treating
-//! those as boundaries would make every workflow `unknown` and the tool useless;
-//! treating them as opaque propagators keeps taint flowing through them while
-//! the `[[source]]` table stays the only thing that *starts* taint.
+//! The last row is the load-bearing default, and it is a *deliberate* asymmetry.
+//! rustc prints **trimmed** def-paths. So most std calls arrive as
+//! `String::clone` or `format` with no crate root at all. Treating those as
+//! boundaries would make every workflow `unknown` and the tool useless. Treating
+//! them as opaque propagators keeps taint flowing through them. The
+//! `[[source]]` table stays the only thing that *starts* taint.
 
 mod impls;
 mod subst;
@@ -62,9 +62,9 @@ pub struct SourceRoots {
 pub enum Resolution {
     /// A body present in the analyzed doc set, by its MIR path.
     Body(String),
-    /// Several bodies any of which this call site could reach, by their MIR
-    /// paths, sorted and deduplicated (always two or more), plus what made the
-    /// site ambiguous.
+    /// Several bodies this call site could reach, plus what made it ambiguous.
+    ///
+    /// The MIR paths are sorted and deduplicated, and there are always two or more.
     ///
     /// Two analyzed modules can define the same `(self type, method)` pair
     /// (`a::Worker::run` and `b::Worker::run`), and two expansions of one
@@ -83,9 +83,9 @@ pub enum Resolution {
 
 /// What the printed text failed to pin down at an ambiguous call site.
 ///
-/// It decides two things a reader needs: how the union may be narrowed (a
-/// receiver's declared type narrows impls and says nothing about closures) and
-/// which noun the hop and the report warning use.
+/// It decides two things a reader needs. First, how the union may be narrowed:
+/// a receiver's declared type narrows impls and says nothing about closures.
+/// Second, which noun the hop and the report warning use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ambiguity {
     /// Several `(self type, trait, method)` impl bodies answer to the callee.
@@ -127,8 +127,9 @@ struct DropCandidate {
     module: String,
     /// The glue body id.
     body: String,
-    /// Why the impl header could not be read, when it could not — in which case
-    /// nothing says this body is a `Drop` impl at all, only that it is a
+    /// Why the impl header could not be read, when it could not.
+    ///
+    /// Then nothing says this body is a `Drop` impl at all. It is only a
     /// `::drop` whose receiver type matches.
     unresolved: Option<String>,
 }
@@ -170,9 +171,9 @@ pub struct Program {
     /// `crate_name::path` → the body id.
     ///
     /// rustc prints *trimmed* def-paths, and how much it trims depends on what
-    /// else is in scope: `harvest_verify_corpus_helpers::origin_tag` at a call
-    /// site is the very same body the helpers crate's own dump printed as
-    /// `origin_tag`, lengthened only because `helpers_deep` exports the name too.
+    /// else is in scope. `harvest_verify_corpus_helpers::origin_tag` at a call
+    /// site is the same body the helpers crate's own dump printed as
+    /// `origin_tag`. It is longer only because `helpers_deep` exports the name too.
     qualified: BTreeMap<String, String>,
     /// `(self type, trait, method)` → every impl body that answers to it.
     impl_methods: BTreeMap<ImplKey, Vec<ImplCandidate>>,
@@ -181,12 +182,12 @@ pub struct Program {
     /// `{closure@FILE:l:c: l:c}` / `{async block@..}` → every body printed with
     /// that span.
     ///
-    /// A span is **not** a key: a closure written in a `macro_rules!` body
-    /// carries the macro *definition*'s span, so every expansion of it prints
-    /// the same `{closure@..}` for a different body — and so do the several
-    /// bodies one `#[workflow]` attribute expands to. Keeping the first one
-    /// resolved the other expansions' call sites into a body they never call,
-    /// which is a `proven-deterministic` over code that was never analyzed.
+    /// A span is **not** a key. A closure written in a `macro_rules!` body
+    /// carries the macro *definition*'s span. So every expansion of it prints
+    /// the same `{closure@..}` for a different body. So do the several bodies
+    /// one `#[workflow]` attribute expands to. Keeping the first one resolved
+    /// the other expansions' call sites into a body they never call. That is a
+    /// `proven-deterministic` over code that was never analyzed.
     closures: BTreeMap<String, Vec<String>>,
     /// `f` (and the path printed inside `{async fn body of f()}`) → `f::{closure#0}`.
     async_bodies: BTreeMap<String, String>,
@@ -196,7 +197,7 @@ pub struct Program {
     ///
     /// rustc 1.94-1.98 print both the `static PATH: Ty` item header and the
     /// `allocN (static: PATH, ..)` footer with the same trimmed-but-qualified
-    /// path, so `a::COUNTER: u64` and `b::COUNTER: AtomicU64` are two distinct
+    /// path. So `a::COUNTER: u64` and `b::COUNTER: AtomicU64` are two distinct
     /// keys here. Keying on the last segment collapsed them, and whichever the
     /// index happened to keep decided whether reading the *other* was ambient.
     statics: BTreeMap<String, StaticItem>,
@@ -229,9 +230,9 @@ pub struct Program {
     ///
     /// Nothing then rules out their being the glue of *any* dropped type, so
     /// while this is non-empty every drop is a boundary. In practice it stays
-    /// empty: MIR declares a glue body's receiver (`_1: &mut clean::Guard<'_>`)
-    /// even where no source root can be read, which is exactly why the index
-    /// falls back to it.
+    /// empty. MIR declares a glue body's receiver (`_1: &mut clean::Guard<'_>`)
+    /// even where no source root can be read. That is why the index falls back
+    /// to it.
     drop_glue_untyped: Vec<String>,
     /// `[[trusted]]` crate names from the **merged** model (builtin plus
     /// every `--model` overlay). [`is_trusted_crate`] reads this, never
@@ -349,8 +350,8 @@ impl Program {
     fn index_bodies(&mut self) {
         // A trimmed path is only unique *within* one dump: two analyzed crates
         // can both export `origin_tag`. Where that happens the body id carries
-        // the crate name, so a call never resolves to the wrong crate's body
-        // (which would look like recursion and lose the flow).
+        // the crate name. So a call never resolves to the wrong crate's body,
+        // which would look like recursion and lose the flow.
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for doc in &self.docs {
             for body in &doc.bodies {
@@ -487,8 +488,8 @@ impl Program {
 
     /// Index every doc's parse failures by the item path they name.
     ///
-    /// The recorded `item` is the raw header text (`fn helper((((_1: u64) -> …`),
-    /// so the path is recovered the same way the header parser recovers it: the
+    /// The recorded `item` is the raw header text (`fn helper((((_1: u64) -> …`).
+    /// So the path is recovered the same way the header parser recovers it: the
     /// text between `fn ` and the first top-level `(`.
     fn index_parse_failures(&mut self) {
         let mut failed: BTreeMap<String, String> = BTreeMap::new();
@@ -516,13 +517,13 @@ impl Program {
             };
             let Some(header) = self.sources.impl_header_at(&file, line, column) else {
                 // Two very different reasons land here. When the file *was*
-                // read, the span usually points at a `#[derive(..)]` attribute
-                // rather than at an `impl` keyword: derived impls are structural
-                // and following them buys nothing, so they stay silent. When the
-                // file could not be read at all (a remapped path, a path
-                // dependency outside the source roots, a deleted file), nothing
-                // about this impl is known and a call to one of its methods must
-                // not fall through to "body-less, assumed clean".
+                // read, the span usually points at a `#[derive(..)]` attribute,
+                // not at an `impl` keyword. Derived impls are structural and
+                // following them buys nothing, so they stay silent. The file can
+                // also be unreadable: a remapped path, a path dependency outside
+                // the source roots, a deleted file. Then nothing about this impl
+                // is known. A call to one of its methods must not fall through
+                // to "body-less, assumed clean".
                 if let Some(reason) = self.sources.unreadable.get(&file) {
                     let detail = format!("{prefix}: {reason}");
                     unresolved.entry(method.to_string()).or_insert(detail);
@@ -539,9 +540,9 @@ impl Program {
                 .map(|t| TypeName::parse(t).name)
                 .filter(|t| !t.is_empty());
             // rustc prints the impl body path with the module it sits in
-            // (`a::<impl at f.rs:30:5: 30:16>::run`), trimmed exactly the way
-            // the call site's `a::Worker::run` is trimmed — so the two agree
-            // and the module is all that tells two same-named impls apart.
+            // (`a::<impl at f.rs:30:5: 30:16>::run`). It trims it exactly as it
+            // trims the call site's `a::Worker::run`, so the two agree. The
+            // module is all that tells two same-named impls apart.
             let candidate = ImplCandidate {
                 module: module_of_impl(prefix, self.crate_of.get(path).map(String::as_str)),
                 body: path.clone(),
@@ -578,16 +579,15 @@ impl Program {
     ///
     /// Two sources for that type, and the difference is the whole point:
     ///
-    ///  * the impl **header**, when the source root could be read — and then the
-    ///    body counts as glue only if the header actually names `Drop`, so a
-    ///    user's inherent `fn drop(&mut self)` is not mistaken for glue;
+    ///  * the impl **header**, when the source root could be read. Then the
+    ///    body counts as glue only if the header actually names `Drop`. So a
+    ///    user's inherent `fn drop(&mut self)` is not mistaken for glue.
     ///  * the body's **receiver parameter** otherwise. Analyzing a pre-emitted
-    ///    dump has no source root, so no header can be read and nothing says
-    ///    this is a `Drop` impl — but `_1: &mut clean::Guard<'_>` still says
+    ///    dump has no source root. So no header can be read, and nothing says
+    ///    this is a `Drop` impl. But `_1: &mut clean::Guard<'_>` still says
     ///    which type's drop would run it. Such a body is recorded as
-    ///    *unresolved*: a drop of that type becomes a named boundary rather
-    ///    than the silent "this type has no glue" that a missing header used to
-    ///    mean.
+    ///    *unresolved*. A drop of that type becomes a named boundary. It is not
+    ///    the silent "this type has no glue" that a missing header used to mean.
     fn index_drop_glue(&mut self) {
         let mut glue: BTreeMap<String, Vec<DropCandidate>> = BTreeMap::new();
         let mut untyped: Vec<String> = Vec::new();
@@ -719,10 +719,10 @@ impl Program {
 
     /// Every `static` (or `thread_local!` key) an `allocN` footer entry could name.
     ///
-    /// The alloc footer sits in the same dump as the body that reads it, so the
-    /// doc's own map is authoritative; the merged map is a fallback for a body
-    /// whose doc is not in hand, and it keeps every doc's answer because alloc
-    /// ids are numbered per dump and collide freely across them.
+    /// The alloc footer sits in the same dump as the body that reads it. So the
+    /// doc's own map is authoritative. The merged map is a fallback for a body
+    /// whose doc is not in hand. It keeps every doc's answer, because alloc ids
+    /// are numbered per dump and collide freely across them.
     #[must_use]
     pub fn statics_of_alloc(&self, doc: Option<&MirDoc>, alloc: &str) -> Vec<&StaticItem> {
         if let Some(name) = doc.and_then(|d| d.alloc_statics.get(alloc)) {
@@ -752,8 +752,8 @@ impl Program {
     ///
     /// The printed name is normally a full path (`b::COUNTER`) and matches one
     /// item exactly. It can also be *more* qualified than the item's own dump
-    /// printed it (`mycrate::b::COUNTER`) or — for a name recovered from a
-    /// `const NAME` rvalue in a dump that trimmed harder — *less*. Both are
+    /// printed it (`mycrate::b::COUNTER`). A name recovered from a `const NAME`
+    /// rvalue in a dump that trimmed harder can be *less* qualified. Both are
     /// resolved by segment-suffix in the appropriate direction, and only a bare
     /// last segment that two modules both define comes back with two answers.
     #[must_use]
@@ -870,22 +870,22 @@ impl Program {
     /// `caller_body` can mean.
     ///
     /// Several bodies share a span whenever the closure was written inside a
-    /// macro, and the printed span is then the *only* thing the call site says
-    /// about which one it invokes — so the disambiguation has to come from
+    /// macro. The printed span is then the *only* thing the call site says
+    /// about which one it invokes. So the disambiguation has to come from
     /// where the call site sits, in this order:
     ///
-    ///  1. **Inside the caller.** `outer::{closure#0}` is a closure of `outer`,
-    ///     so a call in `outer` (or in one of `outer`'s own closures) that names
-    ///     the span means one of those, never a sibling expansion elsewhere.
+    ///  1. **Inside the caller.** `outer::{closure#0}` is a closure of `outer`.
+    ///     A call that names the span in `outer`, or in one of its own closures,
+    ///     means one of those, never a sibling expansion elsewhere.
     ///  2. **The same enclosing function.** Two closures of one function are
     ///     each other's siblings: `f::{closure#0}::{closure#1}` called from
     ///     `f::{closure#0}::{closure#0}` is still `f`'s.
     ///  3. **The same crate**, exactly as [`Self::real_path_near`] prefers a
     ///     free function from the crate the call site is in.
     ///
-    /// The closure's declared **type text** is deliberately not a fourth step:
-    /// MIR prints it as the span and nothing else, so every candidate carries
-    /// the identical text by construction — it is the map key. A future rustc
+    /// The closure's declared **type text** is deliberately not a fourth step.
+    /// MIR prints it as the span and nothing else. So every candidate carries
+    /// the identical text by construction: it is the map key. A future rustc
     /// that printed more would disambiguate them at step 0, because they would
     /// no longer share a key at all.
     ///
@@ -1071,7 +1071,7 @@ impl Program {
             }
         }
         // 5. A closure named only in the turbofish of a body-less callee
-        // (`LocalKey::<T>::with::<{closure@..}, R>`): the call goes into std,
+        // (`LocalKey::<T>::with::<{closure@..}, R>`). The call goes into std,
         // but the only analyzable code it runs is that closure.
         for argument in subst::turbofish(callee) {
             if let Some(resolution) = bodies_resolution(
@@ -1155,10 +1155,10 @@ impl Program {
         };
         let params = self.generic_params(&target);
         let is_param = |name: &str| params.iter().any(|p| p == name) || looks_like_type_param(name);
-        // (1) The turbofish, when it lines up one-for-one with the callee's
-        // declared parameters, is the most faithful spelling of the binding:
-        // it is what rustc printed at the call site, so the substituted callee
-        // path reads exactly as the monomorphised one would.
+        // (1) The turbofish is the most faithful spelling of the binding when
+        // it lines up one-for-one with the callee's declared parameters. It is
+        // what rustc printed at the call site. So the substituted callee path
+        // reads exactly as the monomorphised one would.
         let arguments = subst::turbofish(callee);
         let mut order = params.clone();
         if order.is_empty() {
@@ -1277,9 +1277,9 @@ impl Program {
 
     /// What dropping a place of type `ty` runs.
     ///
-    /// `ty` is a declared type as MIR prints it; references and the transparent
-    /// containers are peeled and generic arguments stripped before the lookup,
-    /// so `&mut Bomb<'_>` and `Box<Bomb>` both find `Bomb`'s glue.
+    /// `ty` is a declared type as MIR prints it. The lookup first peels
+    /// references and the transparent containers and strips generic arguments.
+    /// So `&mut Bomb<'_>` and `Box<Bomb>` both find `Bomb`'s glue.
     ///
     /// Three answers, and only the first two are ever silent:
     ///
@@ -1287,11 +1287,11 @@ impl Program {
     ///    type name, so the drop runs no user code. Every std type is here.
     ///  * **bodies** — one `Drop` impl, or several that the dropped type's own
     ///    module could not tell apart. MIR prints a local's type fully
-    ///    qualified (`_4: ambient::Guard<'_>`) and prints the glue body path
-    ///    with the same trimming (`ambient::<impl at ..>::drop`), so the module
-    ///    normally picks exactly one; where it does not, all of them are
-    ///    returned and the caller unions them. Returning *none* on that tie —
-    ///    as asking for a single body did — reads as "no glue" and silently
+    ///    qualified (`_4: ambient::Guard<'_>`). It prints the glue body path
+    ///    with the same trimming (`ambient::<impl at ..>::drop`). So the module
+    ///    normally picks exactly one. Where it does not, all of them are
+    ///    returned and the caller unions them. Asking for a single body
+    ///    returned *none* on that tie. That reads as "no glue" and silently
     ///    discards whatever the real one does.
     ///  * **unresolved** — a `::drop` body whose receiver type matches but
     ///    whose impl header could not be read. Nothing says whether it is glue
@@ -1390,8 +1390,8 @@ impl Program {
             return vec![only.body.clone()];
         }
         // `b::Worker::run` at the call site and `b::<impl at ..>::run` in the
-        // body path carry the same trimmed module, so the qualifier the caller
-        // wrote is enough — and it is the only evidence in the printed text.
+        // body path carry the same trimmed module. So the qualifier the caller
+        // wrote is enough, and it is the only evidence in the printed text.
         let wanted = receiver_path.and_then(split_last).map(|(module, _)| module);
         if let Some(module) = wanted.filter(|m| !m.is_empty()) {
             let narrowed: Vec<&ImplCandidate> = found
@@ -1444,8 +1444,9 @@ impl Program {
         Some(self.async_bodies.get(&real).cloned().unwrap_or(real))
     }
 
-    /// The id a body is indexed under, from any of the spellings a call site
-    /// can use: the id itself, the crate-qualified path, or the trimmed path.
+    /// The id a body is indexed under, from any spelling a call site can use.
+    ///
+    /// The spellings are the id itself, the crate-qualified path, or the trimmed path.
     fn real_path(&self, path: &str) -> Option<String> {
         self.real_path_near(None, path)
     }
@@ -1475,8 +1476,10 @@ impl Program {
             .cloned()
     }
 
-    /// The body id for `path` as seen from `crate_name` — how an entry point and
-    /// the pipeline name a body that several analyzed targets also define.
+    /// The body id for `path` as seen from `crate_name`.
+    ///
+    /// Entry points and the pipeline use it to name a body that several analyzed
+    /// targets also define.
     #[must_use]
     pub fn body_id_in(&self, crate_name: &str, path: &str) -> String {
         self.real_path_near(Some(crate_name), path)
@@ -1659,9 +1662,10 @@ fn push_candidate(into: &mut Vec<ImplCandidate>, candidate: ImplCandidate) {
     }
 }
 
-/// The module an impl body path sits in: everything before `<impl at`, with the
-/// body id's crate prefix (added only when two dumps print the same path)
-/// removed, because a call site never spells it.
+/// The module an impl body path sits in: everything before `<impl at`.
+///
+/// It drops the body id's crate prefix, because a call site never spells it.
+/// That prefix is added only when two dumps print the same path.
 fn module_of_impl(prefix: &str, crate_name: Option<&str>) -> String {
     let head = prefix
         .find("<impl at")
@@ -1678,9 +1682,9 @@ fn module_of_impl(prefix: &str, crate_name: Option<&str>) -> String {
 
 /// Do two printed module paths denote the same module?
 ///
-/// One side can be trimmed harder than the other (`deep::inner` vs `inner`),
-/// so a `::`-segment suffix in either direction counts — but never the empty
-/// path, which would match everything.
+/// One side can be trimmed harder than the other (`deep::inner` vs `inner`).
+/// So a `::`-segment suffix in either direction counts. The empty path never
+/// counts, because it would match everything.
 fn modules_agree(have: &str, want: &str) -> bool {
     if have.is_empty() || want.is_empty() {
         return have == want;

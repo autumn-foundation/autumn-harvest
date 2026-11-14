@@ -71,19 +71,15 @@ impl MetricsRecorder for UnfinishedHandlerRecorder {
     }
 }
 
-/// A deterministic, moderate-depth history. It holds one `WorkflowStarted`,
-/// a run of `SignalReceived` filler events, and -- for a fraction of
-/// children -- a trailing `UpdateAdmitted` with no matching
-/// `UpdateCompleted`/`UpdateFailed`. `SignalReceived` is a real,
-/// minimal-field event type, not one invented for this fixture. The
-/// trailing shape is exactly what `unfinished_update_handler_count_at_end`
-/// exists to detect.
+/// A deterministic, moderate-depth history: one `WorkflowStarted`, then
+/// `SignalReceived` filler events. For a fraction of children, a trailing
+/// `UpdateAdmitted` has no matching `UpdateCompleted`/`UpdateFailed`. That
+/// trailing shape is what `unfinished_update_handler_count_at_end` detects.
+/// `SignalReceived` is a real, minimal-field event type.
 ///
-/// `events_per_child` mirrors a real, moderately active workflow's history
-/// depth, not a toy 1-2 event fixture. It is large enough that the
-/// per-child `SELECT` this test measures touches a realistic number of
-/// heap/index pages. A single-row lookup would understate the loop's real
-/// cost.
+/// `events_per_child` mirrors the history depth of a moderately active
+/// workflow. The per-child `SELECT` then touches a realistic number of
+/// heap/index pages. A single-row lookup would understate the loop's cost.
 fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<WorkflowEvent> {
     let mut events = Vec::with_capacity(events_per_child);
     events.push(WorkflowEvent::WorkflowStarted {

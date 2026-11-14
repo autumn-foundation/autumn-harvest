@@ -18,29 +18,29 @@
 //! This example uses a **`signals_with_start`** binding rather than a plain
 //! start, which is the recommended shape whenever messages carry an entity key:
 //!
-//! * The first message for `device-dev-7` starts the entity workflow; every
-//!   later message for that device is delivered to the *same* run as a signal
-//!   (issue #244's atomic start-or-attach). That buys **affinity, not
-//!   ordering**: all of one device's readings land in one run, but the
-//!   connector dispatches up to `max_in_flight` messages concurrently — two
-//!   readings for the same device can race, and the later one can persist its
-//!   signal first. The workflow then replays them in database-recorded order,
-//!   which need not be queue order. Set `.max_in_flight(1)` on the binding if
-//!   you need queue order, trading throughput for it.
+//! * The first message for `device-dev-7` starts the entity workflow. Every
+//!   later message for that device goes to the *same* run as a signal (issue
+//!   #244's atomic start-or-attach). That buys **affinity, not ordering**.
+//!   All of one device's readings land in one run. But the connector
+//!   dispatches up to `max_in_flight` messages concurrently. Two readings for
+//!   the same device can race, and the later one can persist its signal
+//!   first. The workflow replays them in database-recorded order, which need
+//!   not be queue order. For queue order, set `.max_in_flight(1)` on the
+//!   binding and trade throughput for it.
 //! * The dedupe key is the message's own SQS coordinate — its broker-assigned
 //!   `MessageId`, which is stable across every redelivery of that message. A
 //!   genuine *re-publish* is a different message, so map a business key into
 //!   the workflow id when you need event-level identity.
 //!
 //! Deletion happens only after the signal durably committed or was recognised
-//! as a replay; a harvest-side failure leaves the message on the queue for its
-//! visibility timeout to expire. Poison messages are handed to the queue's own
-//! redrive policy via `broker_native_dead_letter()` — the visibility timeout is
-//! reset to 0 so SQS re-delivers, counts the receive, and moves the message to
+//! as a replay. A harvest-side failure leaves the message on the queue until
+//! its visibility timeout expires. `broker_native_dead_letter()` hands poison
+//! messages to the queue's own redrive policy. The visibility timeout resets
+//! to 0, so SQS re-delivers and counts the receive. SQS moves the message to
 //! the configured DLQ once `maxReceiveCount` is hit.
 //!
-//! That mode **requires a redrive policy on the queue**: `SqsSource::connect`
-//! probes for one, and the plugin refuses to start without it rather than
+//! That mode **requires a redrive policy on the queue**. `SqsSource::connect`
+//! probes for one. Without it, the plugin refuses to start, rather than
 //! quietly redelivering a poison message forever. Drop
 //! `.broker_native_dead_letter()` to use `harvest_connector_dead_letters`
 //! instead.

@@ -14,9 +14,9 @@
 //!
 //! Exercises the redrive primitive end-to-end against a real Postgres container:
 //!
-//! - AC3/AC7 — a FAILED owning execution is reactivated to RUNNING, a single
-//!   `WorkflowRedriven` event is appended (no prior event mutated), the DLQ row
-//!   is deleted, and a fresh task is enqueued on the original queue.
+//! - AC3/AC7 — a FAILED owning execution is reactivated to RUNNING. One
+//!   `WorkflowRedriven` event is appended and no prior event is mutated. The DLQ
+//!   row is deleted, and a fresh task is enqueued on the original queue.
 //! - AC4 — redriving the same entry twice is an idempotent no-op (skipped).
 //! - AC4 — a RUNNING owning execution is a skip no-op.
 //! - AC7 — a COMPLETED/CANCELLED owning execution is rejected with a clear error

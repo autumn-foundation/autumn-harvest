@@ -60,7 +60,6 @@ const DEFAULT_SEEDS: u64 = 12;
 /// Seeds for the mutant store. It must fail within them.
 const MUTANT_SEEDS: u64 = 60;
 
-/// The transaction manager of a diesel-async Postgres connection.
 type Tm = <AsyncPgConnection as AsyncConnection>::TransactionManager;
 
 /// A lock wait of 1 ms, so a held lock reads as `Busy` at once.

@@ -20,7 +20,7 @@ of them needs Python or PyYAML.
 | `cargo xtask audit vantage-label-association` | Form-label association on every Vantage dashboard `label` render site: the labelled control must resolve, by wrapping or by a `for="…"` matching a real `id="…"` in the file. Scoped to `label` sites — a control with no `label` at all is not separately enumerated | No — run manually after touching `autumn-harvest-plugin/src/ui.rs`'s form-rendering sites |
 | `cargo xtask audit openapi-response-coverage` | The API contract against the handlers. Every status a handler or its helpers return, through `StatusCode::` or an `AutumnError::` constructor, is declared. The contract marks each mandatory body field required and documents each field serde accepts. It documents each query key a hand-rolled parser matches. It marks a body required when the handler cannot run without it. Each `Query<T>` field has a param with the same type and required flag. The audit also reads bodies parsed from raw `Bytes`. A type it cannot resolve is a finding. `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `cargo xtask audit cli-flag-coverage` | The inverse of `cargo xtask audit config-cli-drift`: real `harvest` CLI `--flags`, extracted the same way, that no page in the corpus mentions at all — a coverage-matrix report for manual triage, not a gate (see the module docs for why) | No — report-only; run manually as Folio triage input |
-| `cargo xtask audit comment-hygiene` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `cargo xtask audit comment-hygiene` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges, review-round archaeology and contractions (all gated at zero), plus over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `cargo xtask audit audit-catalog-coverage` | Every `cargo xtask audit` subcommand (each variant of the `Command` enum in `xtask/src/audit/mod.rs`) has a row in this table, and every row names a real subcommand | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `cargo xtask audit tracked-artifacts` | No tracked file is binary or a patch leftover (`.orig`, `.rej`). The binary rule is git's: a NUL byte in the first 8000 bytes. The command lists each binary that the repository needs, with a reason (issue #1831). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `cargo xtask audit tenant-header-validation-sync` | The `authz.rs`/`tenant.rs` tenant-header-validation clone class (issue #2341, linked rather than merged — 2 instances, below rule-of-three) stays byte-identical past the one allowed difference (function name, length-constant spelling). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
@@ -44,14 +44,16 @@ of them needs Python or PyYAML.
 `cargo xtask audit comment-hygiene` is the one audit here that scans code rather than
 docs, and its tier split is deliberate.
 
-**Tier A is absolute.** CH001–CH004 are defects under any house style,
-they were driven to zero when the harness landed, and a new one fails the
-build. Fix the finding; there is no baseline to absorb it.
+**Tier A is absolute.** CH001–CH006 are defects under any house style.
+CH001–CH004 were driven to zero when the harness landed. CH005 (review-round
+archaeology) and CH006 (contractions) started in Tier B and moved here once
+their legacy population reached zero. A new one fails the build. Fix the
+finding; there is no baseline to absorb it.
 
-**Tier B is a ratchet against the merge base.** CH005–CH007 have a legacy
-population too large to fix in one change (CH007 alone is ~17.9k
-sentences), so the rule is simply: your change may not *add* one to a file
-it touches. Existing findings stay until someone chooses to fix them.
+**Tier B is a ratchet against the merge base.** The rule is simple: your
+change may not *add* a CH007 finding to a file it touches. The corpus held
+about 17k such sentences when the rule landed. A cleanup cleared all of
+them, so the corpus is at zero and a new finding fails the build.
 
 There is no checked-in baseline, deliberately. CI passes `--base`, and the
 harness re-scans each changed file as it stood at the merge base, read out

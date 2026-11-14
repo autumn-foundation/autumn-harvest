@@ -77,7 +77,6 @@ async fn sweep(
     sweep_on(db, model.clone(), WINDOW_SIZE, fixture, configs).await
 }
 
-/// The built-in fixture.
 fn fixture() -> RecallFixture {
     RecallFixture::builtin().expect("the built-in fixture is valid")
 }

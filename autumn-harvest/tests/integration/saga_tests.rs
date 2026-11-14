@@ -498,10 +498,10 @@ async fn saga_compensate_all_on_cancel_pattern() {
         "compensate_all fires in LIFO order when the author invokes it explicitly"
     );
 
-    // The cancel-and-compensate unwind is a real compensation sequence and
-    // must be counted exactly once, with its durable dedup marker recorded —
-    // a regression gating emission on !is_cancelled() would silently uncount
-    // exactly the population sagas serve (issue #801, AC1).
+    // The cancel-and-compensate unwind is a real compensation sequence. It
+    // counts exactly once and records its durable dedup marker. Gating
+    // emission on !is_cancelled() would uncount the population sagas serve
+    // (issue #801, AC1).
     assert_eq!(
         recorder.count(METRIC_SAGA_COMPENSATED),
         1,
@@ -641,10 +641,10 @@ async fn saga_compensation_idempotency_under_replay() {
     );
 
     // ── Non-idempotent anti-pattern: concrete failure mode ────────────────
-    // A compensation that reads from ambient state instead of the forward
-    // step's T result behaves differently on replay when that state has
-    // changed — e.g., a different order's reservation now occupies the
-    // "most recent" slot.
+    //
+    // A compensation that reads ambient state instead of the forward step's
+    // T result changes on replay when that state changes. For example, a
+    // different order's reservation now occupies the "most recent" slot.
     {
         // Shared mutable slot that simulates external booking state.
         let current_res: Arc<Mutex<String>> = Arc::new(Mutex::new("rsv-abc".to_string()));
@@ -797,9 +797,10 @@ fn marker_command_names(commands: &[WorkflowCommand]) -> Vec<String> {
         .collect()
 }
 
-/// One decision cycle of the three-step in-memory compensated saga used by
-/// the crash-replay test — mirrors `run_compensated_saga_once` but against a
-/// caller-supplied context so metrics/commands can be observed.
+/// One decision cycle of the three-step in-memory compensated saga.
+///
+/// It mirrors `run_compensated_saga_once` against a caller-supplied context,
+/// so the crash-replay test can observe metrics and commands.
 async fn run_three_step_compensated_saga(
     ctx: &WorkflowContext,
     comp_log: &Arc<Mutex<Vec<String>>>,
@@ -861,12 +862,12 @@ async fn run_three_step_compensated_saga(
 
 /// AC3 primary — exactly-once under crash + replay.
 ///
-/// Cycle 1 is the live unwind (history = `[WorkflowStarted]`): the counter
-/// fires once and the durable `saga_compensated:{seq}` dedup marker is pushed
-/// as a `RecordMarker` command in the same batch. Cycle 2 simulates the
-/// crash-resume: the worker persisted cycle 1's batch, so the marker is now in
-/// history; compensations re-run wholesale (the documented idempotency
-/// contract) but the counter must NOT double-count.
+/// Cycle 1 is the live unwind (history = `[WorkflowStarted]`). The counter
+/// fires once, and the same batch pushes the durable `saga_compensated:{seq}`
+/// dedup marker as a `RecordMarker` command. Cycle 2 simulates the
+/// crash-resume. The worker persisted cycle 1's batch, so the marker is in
+/// history. Compensations re-run wholesale (the documented idempotency
+/// contract), but the counter must NOT double-count.
 #[tokio::test]
 async fn saga_compensated_metric_emitted_once_across_crash_replay() {
     let recorder = Arc::new(SagaRecordingMetrics::default());
@@ -905,10 +906,10 @@ async fn saga_compensated_metric_emitted_once_across_crash_replay() {
     );
 }
 
-/// AC2 — the dangling-state case gets a distinct counter, emitted exactly
-/// once, independent of `harvest.workflow.terminal` (which this recorder
-/// never observes: emission happens in-Saga, not at the worker terminal
-/// boundary).
+/// AC2 — the dangling-state case gets a distinct counter, emitted once.
+///
+/// It is independent of `harvest.workflow.terminal`, which this recorder never
+/// observes. Emission happens in the saga, not at the worker terminal boundary.
 #[tokio::test]
 async fn saga_compensation_failed_metric_distinct_and_once() {
     let recorder = Arc::new(SagaRecordingMetrics::default());
@@ -1065,14 +1066,15 @@ async fn activity_backed_saga_flow(ctx: &WorkflowContext) -> HarvestResult<()> {
     saga.compensate_all().await
 }
 
-/// AC7 backward-compat money test — a pre-#801 history (no saga markers)
-/// replays untouched and uncounted:
+/// AC7 backward-compat test: a pre-#801 history replays uncounted.
 ///
-/// (a) a fully recorded legacy unwind replays to completion with no
-///     divergence, no metric, and no fresh marker command;
-/// (b) a legacy history captured *mid-unwind* (compensation activity
-///     scheduled but not yet completed) resumes by suspending on that
-///     activity — never a `NonDeterministic` failure, never an emission.
+/// Such a history has no saga markers. Two shapes:
+///
+/// (a) A fully recorded legacy unwind replays to completion. It shows no
+///     divergence, no metric and no fresh marker command.
+/// (b) A legacy history captured *mid-unwind* has its compensation activity
+///     scheduled but not completed. It resumes by suspending on that
+///     activity. It never fails `NonDeterministic` and never emits.
 #[tokio::test]
 async fn pre_801_history_mid_unwind_replays_clean_and_uncounted() {
     let reserve_id = autumn_harvest::types::ActivityExecId::new();
@@ -1140,17 +1142,15 @@ async fn pre_801_history_mid_unwind_replays_clean_and_uncounted() {
     );
 }
 
-/// P2-1 (post-review hardening): a trailing un-awaited signal at the
-/// failed-unwind end must NOT suppress `harvest.saga.compensation_failed`
-/// for a counted unwind.
+/// A trailing un-awaited signal must not suppress the failure counter.
 ///
-/// Shape (the review's empirical reproduction): the unwind was counted in an
-/// earlier cycle (its `saga_compensated:1` marker is in history), its
-/// activity-backed compensation terminally failed, and a duplicate/extra
-/// signal (e.g. a retried cancel webhook) was ingested after the
-/// compensation's terminal — landing exactly at the failed-observe cursor
-/// position. The failure marker must be recorded past the drained signal and
-/// the page-severity counter must fire, exactly once.
+/// The counter is `harvest.saga.compensation_failed`, for a counted unwind.
+/// The unwind was counted in an earlier cycle, so its `saga_compensated:1`
+/// marker is in history. Its activity-backed compensation terminally failed.
+/// A duplicate or extra signal, such as a retried cancel webhook, then
+/// arrived after that terminal event. It lands exactly at the failed-observe
+/// cursor position. The failure marker must go past the drained signal. The
+/// page-severity counter must fire exactly once.
 #[tokio::test]
 async fn trailing_unawaited_signal_does_not_suppress_the_failure_counter() {
     // One saga step: in-memory forward step, activity-backed compensation
@@ -1236,14 +1236,14 @@ async fn trailing_unawaited_signal_does_not_suppress_the_failure_counter() {
     );
 }
 
-/// P2-2 (post-review hardening): the `failed ≤ compensated` invariant.
+/// Pins the `failed ≤ compensated` invariant.
 ///
 /// Signal-with-start shape: the staged signal sits at the cursor when the
-/// unwind starts, so the whole unwind is conservatively uncounted (the same
-/// caveat `ctx.patched()` documents). The failure counter must FOLLOW that
-/// disposition — an uncounted unwind's failure stays uncounted, never
-/// producing `compensated=0, failed=1` (which breaks ratio dashboards and
-/// records an asymmetric marker set).
+/// unwind starts. So the whole unwind is conservatively uncounted, the same
+/// caveat that `ctx.patched()` documents. The failure counter must follow
+/// that disposition. An uncounted unwind's failure stays uncounted. The
+/// result `compensated=0, failed=1` breaks ratio dashboards and records an
+/// asymmetric marker set.
 #[tokio::test]
 async fn signal_with_start_shape_keeps_the_failed_counter_coupled_to_compensated() {
     async fn run_failing_in_memory_unwind(ctx: &WorkflowContext) -> HarvestError {
@@ -1293,10 +1293,11 @@ async fn signal_with_start_shape_keeps_the_failed_counter_coupled_to_compensated
     }
 }
 
-/// Mutant-killer for the seq counter (test-review P2-2): two compensation
-/// sequences in one workflow must get distinct seq-numbered markers and count
-/// independently — a frozen `next_saga_seq` would collide both unwinds on
-/// `saga_compensated:1`.
+/// Mutant-killer for the seq counter.
+///
+/// Two compensation sequences in one workflow get distinct seq-numbered
+/// markers and count independently. A frozen `next_saga_seq` would collide
+/// both unwinds on `saga_compensated:1`.
 #[tokio::test]
 async fn two_saga_unwinds_in_one_workflow_count_independently() {
     async fn run_two_compensated_sagas(ctx: &WorkflowContext) {
@@ -1347,33 +1348,32 @@ async fn two_saga_unwinds_in_one_workflow_count_independently() {
     );
 }
 
-/// Known pre-existing engine limitation, pinned (round-3 Codex review of
-/// PR #973): a **durable (activity-backed) compensation cannot run once a
-/// `WorkflowCancelled` event is recorded in history** — the cancel event has
-/// no workflow-command counterpart and is never consumed by `match_activity`,
-/// so the compensation's `execute_activity_raw` dispatch diverges
+/// Known pre-existing engine limitation, pinned (PR #973): a **durable
+/// (activity-backed) compensation cannot run once a `WorkflowCancelled` event
+/// is recorded in history**. The cancel event has no workflow-command
+/// counterpart and is never consumed by `match_activity`. So the
+/// compensation's `execute_activity_raw` dispatch diverges
 /// (`expected ActivityScheduled(..), got WorkflowCancelled`) instead of
 /// scheduling the activity.
 ///
-/// **This is NOT introduced by issue #801.** Verified empirically on pristine
-/// `trunk-dev` (pre-#801, 2026-07-08): the identical flow fails with the
-/// byte-identical error —
+/// **Issue #801 does not introduce this.** Pristine `trunk-dev` (pre-#801,
+/// 2026-07-08) fails the identical flow with the byte-identical error:
 /// `SagaCompensationFailed { compensation_errors: ["non-deterministic
 /// replay: activity mismatch: expected ActivityScheduled(cancel_flight),
-/// got WorkflowCancelled"] }` — `match_activity`/`execute_activity_raw`
-/// are untouched by the #801 branch. Only **in-memory** compensation
-/// closures can actually execute after cancellation (the canonical
+/// got WorkflowCancelled"] }`. The #801 branch leaves
+/// `match_activity`/`execute_activity_raw` untouched. Only **in-memory**
+/// compensation closures can execute after cancellation (the canonical
 /// `saga_compensate_all_on_cancel_pattern` above).
 ///
-/// What #801 adds on top is deliberate and truthful: the unwind **began**
-/// (counted at unwind start — `harvest.saga.compensated`) and **failed**
+/// What #801 adds is deliberate and truthful. The unwind **began** (counted
+/// at unwind start, `harvest.saga.compensated`). It also **failed**
 /// (`harvest.saga.compensation_failed`, the page-severity dangling-state
-/// signal), which is exactly the alert an operator needs, because the
-/// compensations genuinely did not run and the state IS dangling.
-/// Suppressing the count at a cancel frontier instead would (a) be
-/// impossible to scope — closures are opaque, so unwind-start cannot know a
-/// compensation is durable — and (b) uncount the working in-memory
-/// cancel-and-compensate population (regressing the mutant-k fix).
+/// signal). An operator needs exactly that alert: the compensations did not
+/// run, and the state IS dangling. Suppressing the count at a cancel
+/// frontier has two faults. (a) It is impossible to scope: closures are
+/// opaque, so unwind start cannot know that a compensation is durable.
+/// (b) It uncounts the working in-memory cancel-and-compensate population,
+/// which regresses the mutant-k fix.
 #[tokio::test]
 async fn known_limitation_durable_compensation_after_recorded_cancel_fails_and_is_counted() {
     async fn cancel_and_compensate_flow(ctx: &WorkflowContext) -> HarvestResult<()> {

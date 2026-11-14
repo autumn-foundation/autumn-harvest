@@ -5,11 +5,11 @@
 //! When the flag is on, an extra `mirror` activity is scheduled; when it is off
 //! it is not. The `primary` activity is emitted unconditionally.
 //!
-//! **Launder.** DET004's table has `env::var(`, `env::vars(`, `env::args(` — but
-//! **no** `var_os` spelling, so the underlying read escapes det_check even in a
-//! same-module helper; HVG003 does cover `env::var_os`, but only inside the
-//! annotated body, and this body has no env token. The memoizing `OnceLock` is
-//! unmodeled by both layers. Two crate boundaries seal it.
+//! **Launder.** The DET004 table has `env::var(`, `env::vars(` and
+//! `env::args(`, but **no** `var_os` spelling. So the read escapes `det_check`
+//! even in a same-module helper. HVG003 does cover `env::var_os`, but only
+//! inside the annotated body, and this body has no env token. The memoizing
+//! `OnceLock` is unmodeled by both layers. Two crate boundaries seal it.
 //!
 //! **Scope assertion (the point of this case).** The expected trace must name
 //! **exactly one** sink: `mirror`. `primary` post-dominates the branch join and

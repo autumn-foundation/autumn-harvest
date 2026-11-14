@@ -2,22 +2,26 @@
 //! Multi-shard runtime coverage (issue #961).
 //!
 //! Issue #961 asks the multi-shard runtime to *provably* drain every writable
-//! shard. Most of the architecture shipped piecemeal under #522 (per-shard poll
-//! loops, per-shard control loops, the stranded-work sampler), #796/#1157
-//! (per-shard scheduler ticks and DAG->shard pinning), and #797 (per-shard
-//! scanner liveness) — but there was **zero** multi-shard *runtime* test
-//! coverage: `sharding_unit.rs` exercises only the pure router, and
-//! `scheduler_ha_tests.rs` contains the string "shard" zero times.
+//! shard. Most of the architecture shipped piecemeal:
+//!
+//! - #522: per-shard poll loops, per-shard control loops, the stranded-work
+//!   sampler;
+//! - #796/#1157: per-shard scheduler ticks and DAG->shard pinning;
+//! - #797: per-shard scanner liveness.
+//!
+//! But there was **zero** multi-shard *runtime* test coverage.
+//! `sharding_unit.rs` exercises only the pure router. `scheduler_ha_tests.rs`
+//! contains the string "shard" zero times.
 //!
 //! This suite is the falsifiable bar. Each test names the acceptance criterion
 //! it discharges.
 //!
 //! Execution: honours `HARVEST_TEST_DATABASE_URL` (a migrated Postgres) for the
-//! **admin** connection and creates one fresh database per shard off it;
-//! otherwise boots a testcontainer and does the same. Every test therefore gets
-//! genuinely separate shard databases rather than one database pretending to be
-//! several — the distinction matters, because "which shard" *is* "which pool"
-//! (there is no `shard_id` column on `harvest_task_queue`).
+//! **admin** connection and creates one fresh database per shard off it.
+//! Otherwise it boots a testcontainer and does the same. So every test gets
+//! genuinely separate shard databases, not one database posing as several.
+//! That matters, because "which shard" *is* "which pool". `harvest_task_queue`
+//! has no `shard_id` column.
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::WorkflowExecution;
@@ -71,9 +75,9 @@ const SHARDS: [i32; 3] = [0, 1, 2];
 /// Boots (or reuses) a Postgres and creates one **fresh database per shard**.
 ///
 /// Returns the per-shard URLs plus the container guard (kept alive for the
-/// test's duration). Separate databases are load-bearing: a single database
-/// shared by three "shards" would make every cross-shard assertion vacuous,
-/// since the runtime distinguishes shards purely by which pool it claims from.
+/// test's duration). Separate databases are load-bearing. The runtime tells
+/// shards apart only by which pool it claims from. One database shared by three
+/// "shards" makes every cross-shard assertion vacuous.
 async fn setup_shard_databases(
     shards: &[i32],
 ) -> (BTreeMap<ShardId, String>, Option<ContainerAsync<Postgres>>) {
@@ -159,7 +163,7 @@ fn build_sharded_pool(urls: &BTreeMap<ShardId, String>) -> ShardedDbPool {
 /// Like [`build_sharded_pool`], but `saturated` gets a `max_size`-connection
 /// pool instead of the fixed default. A test can then hold every one of
 /// its connections and make further acquisition on that shard block
-/// (issue #961 review, Codex P1). Parameterized for issue #1426.
+/// (issue #961). Parameterized for issue #1426.
 ///
 /// Keep `max_size` well under Postgres's own `max_connections` (100 by
 /// default on this suite's test database). Every shard's pool is built
@@ -200,10 +204,11 @@ fn router_for(shards: &[i32]) -> ShardRouter {
 struct ShardMetrics {
     dispatched: Mutex<HashMap<u16, u64>>,
     stranded: Mutex<HashMap<u16, u64>>,
-    /// `harvest.schedule.fire_attempts{outcome}` counts (issue #350). The
-    /// metric carries no `shard` label, so this is a fleet-wide total — see
+    /// `harvest.schedule.fire_attempts{outcome}` counts (issue #350).
+    ///
+    /// The metric carries no `shard` label, so this is a fleet-wide total.
     /// [`per_shard_scheduler_ha_fires_each_slot_exactly_once_under_two_replicas`]
-    /// for why a global `claimed` count is still a per-slot exclusivity proof.
+    /// explains why a global `claimed` count still proves per-slot exclusivity.
     fire_attempts: Mutex<HashMap<String, u64>>,
 }
 
@@ -398,17 +403,17 @@ async fn wait_for_state(url: &str, exec_id: ExecutionId, want: &str, budget: Dur
 /// workflows on *every* writable shard.
 ///
 /// Scope note: the #961 success metric words this as "dispatch within ≤ 1 poll
-/// interval on all three". The round-robin loop meets that by construction —
-/// every iteration visits every assigned shard — but wall-clock latency is not
-/// assertable on shared CI, so this test certifies the *coverage* half ("zero
-/// permanently-undispatched workflows") against a generous deadline rather
-/// than pretending to time a 50 ms budget.
+/// interval on all three". The round-robin loop meets that by construction,
+/// because every iteration visits every assigned shard. Shared CI cannot assert
+/// wall-clock latency. So this test certifies the *coverage* half ("zero
+/// permanently-undispatched workflows") against a generous deadline. It does
+/// not pretend to time a 50 ms budget.
 ///
-/// This is the headline silent failure #961 exists to close: before the auto
+/// This is the headline silent failure #961 exists to close. Before the auto
 /// resolution, `WorkerConfig::default().shard_assignments` was a literal
-/// `[ShardId::new(0)]`, so this exact deployment shape (three shards in the
-/// pool, no `with_shard_assignments` call) drained shard 0 and left shards 1
-/// and 2 permanently undispatched with no error anywhere.
+/// `[ShardId::new(0)]`. This exact deployment shape (three shards in the pool,
+/// no `with_shard_assignments` call) drained shard 0. It left shards 1 and 2
+/// permanently undispatched with no error anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_shard_assignments_drain_every_writable_shard() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -471,16 +476,16 @@ async fn auto_shard_assignments_drain_every_writable_shard() {
     }
 }
 
-/// **AC1 / AC5 (Codex P1).** One shard whose pool is exhausted must not strand
-/// every other shard's work.
+/// **AC1 / AC5 (issue #961).** One shard whose pool is exhausted must not
+/// strand every other shard's work.
 ///
 /// `poll_once` opens with `pool.get().await`, and harvest configures no
 /// deadpool `Timeouts`, so that wait is unbounded. `run_poll_loop_multi` awaits
-/// each shard's `poll_once` in sequence, so before the fix a single saturated
-/// pool parked the one polling future and no peer shard was ever reached —
-/// round-robin rotation cannot help because the loop never gets back to the
+/// each shard's `poll_once` in sequence. Before the fix, one saturated pool
+/// parked the one polling future, and no peer shard was ever reached.
+/// Round-robin rotation cannot help, because the loop never gets back to the
 /// rotation. Auto-resolution makes this the *default* shape for any
-/// multi-shard pool, which is why it is fixed here.
+/// multi-shard pool, so it is fixed here.
 ///
 /// The test holds shard 0's only connection for the whole run and asserts that
 /// shards 1 and 2 still complete. Reverting `poll_acquire_bound` to always
@@ -1017,18 +1022,17 @@ async fn build_shard_listeners_bounded_by_a_stalled_handshake() {
 /// **AC5.** A deep backlog on one assigned shard must not starve dispatch on
 /// its siblings.
 ///
-/// The multi-shard poll loop rotates its start index so a shard that just
-/// claimed is tried *last* on the next hot iteration — a round-robin, which is
-/// a strictly stronger equal-share guarantee than #515's weighted queue
-/// draining.
+/// The multi-shard poll loop rotates its start index. A shard that just
+/// claimed is tried *last* on the next hot iteration. This round-robin is a
+/// strictly stronger equal-share guarantee than #515's weighted queue draining.
 ///
-/// **Why the backlog is self-replenishing.** A *finite* backlog does not
-/// falsify anything: even a strictly shard-0-first loop drains 40 queued tasks
-/// in well under the assertion window and then reaches the siblings, so the
-/// test passes with rotation disabled. Here a feeder task keeps shard 0
-/// permanently non-empty for the whole run, so a non-rotating loop would claim
-/// from shard 0 on *every* iteration and never poll shards 1 and 2 at all. The
-/// test therefore asserts both halves of the guarantee:
+/// **Why the backlog is self-replenishing.** A *finite* backlog falsifies
+/// nothing. Even a strictly shard-0-first loop drains 40 queued tasks well
+/// within the assertion window and then reaches the siblings. The test then
+/// passes with rotation disabled. Here a feeder task keeps shard 0 non-empty
+/// for the whole run. A non-rotating loop claims from shard 0 on *every*
+/// iteration and never polls shards 1 and 2. So the test asserts both halves
+/// of the guarantee:
 ///
 /// * the two singleton workflows on the starvable shards complete, **and**
 /// * shard 0 still had claimable pending work at that moment — proving the
@@ -1177,8 +1181,8 @@ async fn deep_backlog_on_one_shard_does_not_starve_the_others() {
 ///
 /// The signal's *name* is the point: `harvest.shard.stranded_pending{shard}`
 /// identifies which shard, so an operator is not left guessing. The literal
-/// "≤ 2 poll intervals" of the success metric is a cadence target set by the
-/// sampler interval and the fleet-liveness staleness window; this test asserts
+/// "≤ 2 poll intervals" of the success metric is a cadence target. The sampler
+/// interval and the fleet-liveness staleness window set it. This test asserts
 /// the signal appears within a CI-safe bound, not that bound itself. See
 /// [`killing_the_only_covering_worker_surfaces_stranded_pending`] for the
 /// success metric's literal *scenario*.
@@ -1226,8 +1230,8 @@ async fn uncovered_shard_surfaces_stranded_pending_within_a_bounded_window() {
         runner.run(&default_pool).await;
     });
 
-    // The sampler runs on the worker's poll interval (50 ms here); allow a
-    // generous multiple so a slow CI box is not the thing under test.
+    // The sampler runs on the worker's poll interval (50 ms here). Allow a
+    // generous multiple, so the test does not measure a slow CI box.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut saw_stranded = false;
     while tokio::time::Instant::now() < deadline {
@@ -1238,10 +1242,10 @@ async fn uncovered_shard_surfaces_stranded_pending_within_a_bounded_window() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Steady state for the covered shard: the gauge is last-write-wins, and a
-    // sample taken in the startup window (before this worker's own fleet
-    // registration commits) can legitimately see shard 0 as uncovered. Wait for
-    // it to settle rather than asserting on whichever sample happened to land.
+    // Steady state for the covered shard: the gauge is last-write-wins. A
+    // startup sample, taken before this worker's fleet registration commits,
+    // can legitimately see shard 0 as uncovered. Wait for it to settle. Do not
+    // assert on whichever sample happened to land.
     let settle = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < settle && metrics.stranded_for(0) > 0 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1386,14 +1390,14 @@ async fn killing_the_only_covering_worker_surfaces_stranded_pending() {
 
 /// **AC7.** A single-shard deployment dispatches exactly as before.
 ///
-/// With no sharded pool at all — the legacy shape — auto resolution PRESERVES
-/// the empty assignment list (issue #961 review, Codex P2) rather than
-/// fabricating a shard identity the plain `DbPool` does not carry, and the
-/// worker takes the single-shard fast path rather than the multi-shard loop.
+/// With no sharded pool at all (the legacy shape), auto resolution PRESERVES
+/// the empty assignment list (issue #961). It does not fabricate a shard
+/// identity that the plain `DbPool` does not carry. The worker takes the
+/// single-shard fast path, not the multi-shard loop.
 ///
-/// Empty is the legacy representation the rest of the engine already expects
-/// here: it yields an empty `shard_targets`, whose `[] => pool` arms resolve to
-/// the caller's default pool on the claim, listener and WASM-seed paths, and
+/// Empty is the legacy representation the rest of the engine expects here. It
+/// yields an empty `shard_targets`. Its `[] => pool` arms resolve to the
+/// caller's default pool on the claim, listener and WASM-seed paths.
 /// `shard_fanout::worker_covers_shard` normalizes the registered `[]` as
 /// "covers whatever shard this database is" (issue #1150).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1455,16 +1459,15 @@ async fn single_shard_deployment_is_unchanged() {
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 
-    // Issue #961 review (Codex P2): a pool-less worker has no shard identity,
-    // so it attributes NO per-shard dispatch rather than fabricating
-    // `{shard="0"}` — which would be wrong for any deployment whose single
-    // shard is numbered otherwise. Such a deployment has exactly one shard and
-    // therefore no split to observe; its dispatch stays visible on
+    // Issue #961: a pool-less worker has no shard identity. So it attributes
+    // NO per-shard dispatch. A fabricated `{shard="0"}` is wrong for any
+    // deployment whose single shard has another number. Such a deployment has
+    // one shard and no split to observe. Its dispatch stays visible on
     // `harvest.queue.dispatched{queue}` (issue #515).
     //
-    // The workflow reaching COMPLETED above is what proves dispatch happened,
-    // so this assertion is not vacuous: it pins that the metric was suppressed
-    // on a path that demonstrably DID dispatch.
+    // The workflow reached COMPLETED above, which proves dispatch happened. So
+    // this assertion is not vacuous. It pins that the metric was suppressed on
+    // a path that demonstrably DID dispatch.
     assert_eq!(
         metrics.dispatched.lock().unwrap().values().sum::<u64>(),
         0,
@@ -1477,20 +1480,21 @@ async fn single_shard_deployment_is_unchanged() {
 // ── AC3 + success metric ──────────────────────────────────────────────────
 
 /// **AC3 + success metric.** Per-shard scheduler ticks preserve the issue #350
-/// HA claim guarantee *per shard*: exactly one replica claims each due slot on
-/// its home shard, with zero double-fires, across 100 contested slots per shard.
+/// HA claim guarantee *per shard*.
 ///
-/// No migration is needed for this (AC3 asks it be flagged only *if* it is):
-/// the #350 claim is a row-level `UPDATE ... WHERE fire_claim_token IS NULL`,
-/// and each `harvest_schedules` row lives in exactly one shard database — so
-/// the claim is per-shard by construction. This test proves that rather than
-/// assuming it.
+/// Exactly one replica claims each due slot on its home shard. There are zero
+/// double-fires across 100 contested slots per shard.
+///
+/// No migration is needed (AC3 asks to flag one only *if* it is). The #350
+/// claim is a row-level `UPDATE ... WHERE fire_claim_token IS NULL`. Each
+/// `harvest_schedules` row lives in exactly one shard database. So the claim is
+/// per-shard by construction. This test proves that; it does not assume it.
 ///
 /// **Why this is falsifiable and the naive "no duplicate `workflow_id`" check
-/// is not.** A scheduled fire is started under `RejectDuplicate` against the
-/// partial unique index `harvest_we_workflow_name_workflow_id_active_key`, so
-/// the *database* already refuses a second execution row per slot — a test
-/// that only counts execution rows passes even with the entire `fire_claim_token`
+/// is not.** A scheduled fire starts under `RejectDuplicate` against the
+/// partial unique index `harvest_we_workflow_name_workflow_id_active_key`. So
+/// the *database* already refuses a second execution row per slot. A test that
+/// only counts execution rows passes even with the whole `fire_claim_token`
 /// mechanism deleted. So this test asserts on the **claim** instead, via the
 /// `harvest.schedule.fire_attempts{outcome}` counter:
 ///
@@ -1511,10 +1515,10 @@ async fn per_shard_scheduler_ha_fires_each_slot_exactly_once_under_two_replicas(
     let sharded = build_sharded_pool(&urls);
     let router = router_for(&SHARDS);
 
-    // A schedule registered on every writable shard. `max_active_runs` is
-    // raised because no worker runs in this test, so every fired execution
-    // stays non-terminal and the default overlap `Skip` would otherwise stand
-    // every round after the first down.
+    // A schedule registered on every writable shard. No worker runs in this
+    // test, so every fired execution stays non-terminal. `max_active_runs` is
+    // raised, or the default overlap `Skip` stands down every round after the
+    // first.
     let mut schedule =
         WorkflowSchedule::new("shard_probe", Schedule::Interval(Duration::from_secs(3600)));
     schedule.all_writable_shards = true;
@@ -1672,9 +1676,9 @@ fn build_worker_with(
 
 /// Insert a bare RUNNING execution row directly, pinned to `shard`.
 ///
-/// Deliberately raw SQL rather than `start_or_load_workflow_execution`: these
-/// AC2 fixtures want a row the *scanners* act on, with no task the poll loop
-/// could race them for.
+/// Deliberately raw SQL, not `start_or_load_workflow_execution`. These AC2
+/// fixtures want a row the *scanners* act on, with no task for the poll loop
+/// to race them for.
 async fn insert_running_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1711,11 +1715,11 @@ async fn task_state(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> String {
 /// **AC2 (timeout scanner).** The timeout/SLA enforcement scanner must run
 /// against **every** assigned shard, not just the default one.
 ///
-/// Each shard gets one activity task that is already past its
-/// `schedule_to_start` deadline, enqueued on a queue the worker does **not**
-/// poll — so the *only* thing that can move it is the per-shard timeout
-/// scanner. If the scanners were spawned for shard 0 alone (the pre-#961
-/// default-assignment bug), shards 1 and 2 stay `PENDING` forever.
+/// Each shard gets one activity task already past its `schedule_to_start`
+/// deadline. It is enqueued on a queue the worker does **not** poll. So *only*
+/// the per-shard timeout scanner can move it. If the scanners spawn for shard 0
+/// alone (the pre-#961 default-assignment bug), shards 1 and 2 stay `PENDING`
+/// forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_scanner_enforces_on_every_assigned_shard() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -1945,21 +1949,22 @@ async fn tick(pool: ShardedDbPool, router: ShardRouter, schedules: Arc<Vec<Workf
 }
 
 /// **AC4.** A DAG's home shard survives a process restart and a shard-set
-/// widening — asserted against the **production** registration path
-/// (`tick_once_sharded` -> `register_workflow_schedules_for_shard` ->
-/// `schedule_targets_shard`), not against the pure router.
+/// widening.
+///
+/// Asserted against the **production** registration path, not the pure router:
+/// `tick_once_sharded` -> `register_workflow_schedules_for_shard` ->
+/// `schedule_targets_shard`.
 ///
 /// Three phases, each against real per-shard databases:
 ///
 /// 1. **Pinning.** A DAG schedule registers on its rendezvous shard and on
 ///    **no other** — the `schedule_targets_shard` gate.
 /// 2. **Restart.** A freshly-constructed router, pool, registry and catalog
-///    (the stand-in for a new process) re-ticks and the row stays on the same
+///    (the stand-in for a new process) re-ticks. The row stays on the same
 ///    shard, still exactly one row, with no copy resurrected elsewhere.
 /// 3. **Widening.** A fourth shard joins. A name the new shard wins moves onto
-///    it, and #1157's `collect_stale_dag_workflow_schedule` removes the row
-///    from its former home — so the DAG is never registered on two shards at
-///    once.
+///    it. #1157's `collect_stale_dag_workflow_schedule` removes the row from
+///    its former home. So the DAG is never registered on two shards at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dag_home_shard_is_stable_across_restart_and_widening() {
     let (urls, _container) = setup_shard_databases(&WIDENED_SHARDS).await;
@@ -2048,10 +2053,12 @@ async fn dag_home_shard_is_stable_across_restart_and_widening() {
     }
 }
 
-/// **AC4 (property).** The rendezvous widening invariant the DB test above
-/// relies on: adding a shard may only move a DAG **onto the new shard**, never
-/// between two pre-existing shards. That is what makes #1157's stale-row
-/// collection sufficient — only names the new shard wins ever need collecting.
+/// **AC4 (property).** The rendezvous widening invariant behind
+/// `dag_home_shard_is_stable_across_restart_and_widening`.
+///
+/// Adding a shard may only move a DAG **onto the new shard**, never between two
+/// pre-existing shards. That makes #1157's stale-row collection sufficient:
+/// only names the new shard wins need collecting.
 #[test]
 fn dag_widening_only_moves_names_onto_the_new_shard() {
     let names: Vec<String> = (0..200).map(|i| format!("dag-{i}")).collect();

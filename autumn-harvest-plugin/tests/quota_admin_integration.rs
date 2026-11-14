@@ -8,15 +8,13 @@
 //! #946): `GET /admin/quotas` (AC5) and the `429` admission mapping (AC4) on
 //! `POST /workflows/{name}/start`.
 //!
-//! Direct-primitive coverage of the enforcement decision itself (active
-//! executions / history bytes / dead letters caps, per-key and
-//! per-workflow-type isolation, no-policy no-op, continue-as-new key
-//! propagation) already lives in
-//! `autumn-harvest/tests/integration/quota_enforcement_tests.rs`. This file
-//! covers what that suite explicitly does not: the HTTP route wiring, the
-//! cross-shard merge shape (sum + per-shard breakdown), partial-shard
-//! degradation, admin-gating, and the exact `429` JSON body + audit trail an
-//! HTTP caller observes.
+//! `autumn-harvest/tests/integration/quota_enforcement_tests.rs` covers the
+//! enforcement decision itself: the active-execution, history-byte and
+//! dead-letter caps, per-key and per-workflow-type isolation, the no-policy
+//! no-op and continue-as-new key propagation. This file covers the rest. It
+//! checks route wiring, the cross-shard merge shape (sum + per-shard
+//! breakdown) and partial-shard degradation. It also checks admin-gating and
+//! the exact `429` JSON body and audit trail that an HTTP caller observes.
 //!
 //! Dual-mode: `HARVEST_TEST_DATABASE_URL` (a locally migrated cluster, no
 //! Docker) or a fresh testcontainers Postgres, mirroring
@@ -51,18 +49,17 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-/// Serializes the tests below that rely on `GLOBAL_WORKFLOW_METADATA`
-/// (populated as a side effect of `HandlerRegistry::new`, read internally by
-/// `start_or_load_workflow_execution_collect` to resolve the declared
-/// [`QuotaPolicy`] for admission) actually carrying THIS test's own
-/// declaration when its HTTP call runs. CI runs `linux` integration suites
-/// with `--test-threads=1` (`.github/ci/integration-suites.txt`), but this
-/// guards a plain local `cargo test` too, mirroring
-/// `quota_enforcement_tests.rs`'s `TEST_SERIAL` and
-/// `admission_gate_authoritative_localpg.rs`'s identical pattern. The
-/// `GET /admin/quotas` read-path tests do not need it -- they read directly
-/// from already-committed rows and the per-app `HandlerRegistry` the route
-/// itself installs, never `GLOBAL_WORKFLOW_METADATA`.
+/// Serializes the tests that need `GLOBAL_WORKFLOW_METADATA` to carry this
+/// test's own declaration when its HTTP call runs.
+///
+/// `HandlerRegistry::new` fills that map as a side effect.
+/// `start_or_load_workflow_execution_collect` reads it to resolve the declared
+/// [`QuotaPolicy`] for admission. CI runs `linux` integration suites with
+/// `--test-threads=1` (`.github/ci/integration-suites.txt`). This guards a
+/// plain local `cargo test` too, like `TEST_SERIAL` in
+/// `quota_enforcement_tests.rs` and `admission_gate_authoritative_localpg.rs`.
+/// The `GET /admin/quotas` read-path tests do not need it. They read
+/// committed rows and the per-app `HandlerRegistry` that the route installs.
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn init_sql() -> Vec<u8> {
@@ -91,13 +88,12 @@ async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
     (url, Some(container))
 }
 
-/// Two genuinely separate shard databases -- the `dlq_aggregate_integration.rs`
-/// precedent -- so the cross-shard merge tests exercise real independent
-/// pools, not two logical shards on one DB. Dual-mode like [`setup_db`]: when
-/// `HARVEST_TEST_DATABASE_URL` is set, its server hosts two freshly created
-/// (never dropped -- matching every other local-Postgres fixture in this
-/// repo, which likewise leaves its scratch rows/DBs behind for the operator's
-/// own cluster) shard databases instead of spinning up a container.
+/// Two separate shard databases, as in `dlq_aggregate_integration.rs`, so the
+/// cross-shard merge tests use real independent pools.
+///
+/// Dual-mode like [`setup_db`]. When `HARVEST_TEST_DATABASE_URL` is set, its
+/// server hosts two freshly created shard databases instead of a container.
+/// They are never dropped, like every other local-Postgres fixture here.
 async fn setup_sharded_db() -> ((String, String), Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let prefix = base_url
@@ -121,10 +117,10 @@ async fn setup_sharded_db() -> ((String, String), Option<ContainerAsync<Postgres
     ((shard0_url, shard1_url), Some(container))
 }
 
-/// Connects to `admin_url` to create two fresh, uniquely named
-/// `harvest_shard_*` databases on the same server (`url_prefix` is everything
-/// up to -- and not including -- the trailing `/dbname`), migrates each, and
-/// returns their full connection URLs.
+/// Creates two uniquely named `harvest_shard_*` databases on the `admin_url`
+/// server, migrates each, and returns their full connection URLs.
+///
+/// `url_prefix` is everything before the trailing `/dbname`.
 async fn create_and_migrate_shard_pair(admin_url: &str, url_prefix: &str) -> (String, String) {
     let shard0_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
     let shard1_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
@@ -285,11 +281,8 @@ async fn post_start(app: &HarvestApiApp, wf: &str, body: Value) -> (StatusCode, 
     post_json(app, &format!("/workflows/{wf}/start"), body).await
 }
 
-/// Generic `POST {uri}` JSON helper -- used by [`post_start`] and by the
-/// `signal-with-start`/`update-with-start` 429-body-shape tests below (issue
-/// #946, the P2 test-coverage gap: both routes carry their own bespoke
-/// `HarvestError::QuotaExceeded` arm in `api.rs`, byte-identical to the plain
-/// start route's, and neither had HTTP-level coverage).
+/// Generic `POST {uri}` JSON helper for [`post_start`] and the
+/// `signal-with-start`/`update-with-start` 429-body-shape tests (issue #946).
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
@@ -480,11 +473,10 @@ async fn admin_quotas_isolates_by_key_within_one_workflow_type() {
     assert_eq!(globex["usage"]["active_executions"], json!(5));
 }
 
-/// The AC5 money test: a `(workflow_name, quota_key)` pair with usage spread
-/// across two genuinely independent shard databases must SUM for the
-/// fleet-wide total while still listing each shard's own count -- quota
-/// enforcement is shard-local (AC8), so collapsing to a single number without
-/// the per-shard breakdown would hide which shard(s) a tenant is capped on.
+/// The AC5 money test: usage for one `(workflow_name, quota_key)` pair on two
+/// independent shard databases sums for the fleet-wide total. The response
+/// still lists each shard's own count. Quota enforcement is shard-local (AC8),
+/// so a single number would hide which shard caps a tenant.
 #[tokio::test]
 async fn admin_quotas_sums_across_shards_and_lists_per_shard_breakdown() {
     let ((shard0_url, shard1_url), _c) = setup_sharded_db().await;
@@ -524,10 +516,9 @@ async fn admin_quotas_sums_across_shards_and_lists_per_shard_breakdown() {
     assert_eq!(by_shard.get(&1), Some(&7));
 }
 
-/// An unreachable shard must degrade the response to `partial` (naming the
-/// down shard) rather than failing the whole read with a `500`, mirroring the
-/// `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`
-/// precedent this route is built on.
+/// An unreachable shard degrades the response to `partial` and names the down
+/// shard, instead of a `500`. This follows the `/admin/concurrency`,
+/// `/admin/debounce` and `/admin/start-throttle` routes.
 #[tokio::test]
 async fn admin_quotas_reports_partial_status_when_a_shard_is_unreachable() {
     let ((shard0_url, shard1_url), _c) = setup_sharded_db().await;
@@ -537,9 +528,9 @@ async fn admin_quotas_reports_partial_status_when_a_shard_is_unreachable() {
     insert_running_execution(&shard1_url, 1, wf, "acme").await;
 
     // Retarget shard 1's pool at a database that does not exist, so its
-    // connection acquire fails deterministically at connect time -- the
-    // `fanout_degradation_integration.rs` precedent, avoiding the flakiness
-    // of tearing down a live container mid-test.
+    // connection acquire fails at connect time. This follows
+    // `fanout_degradation_integration.rs` and avoids the flakiness of tearing
+    // down a live container mid-test.
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), build_pool(&shard0_url));
     let dead_shard1_url = shard1_url.replace("harvest_shard_", "missing_db_");
@@ -679,13 +670,13 @@ async fn plain_start_writes_a_failed_audit_row_when_quota_exceeded() {
         .expect("a quota-rejected start must be audited");
     assert_eq!(row.status, "failed");
     assert_eq!(row.error_summary, "quota exceeded");
-    // Regression guard for the Codex round-5 finding on issue #946: routing
-    // has already resolved the target shard by the time the quota check
-    // rejects the start, so the audit row must record it (matching every
-    // other failure arm on this route, and the signal-with-start /
-    // update-with-start quota arms below) -- a quota-rejection audit row
-    // with a NULL shard is otherwise indistinguishable by shard in the
-    // audit trail precisely where enforcement is shard-local.
+    // Regression guard for issue #946: routing has already resolved the
+    // target shard by the time the quota check rejects the start. So the audit
+    // row must record it. That matches every other failure arm on this route,
+    // and the signal-with-start / update-with-start quota arms below. A
+    // quota-rejection audit row with a NULL shard is otherwise
+    // indistinguishable by shard in the audit trail. That is precisely where
+    // enforcement is shard-local.
     assert_eq!(
         row.shard_id,
         Some(0),
@@ -739,16 +730,14 @@ async fn plain_start_is_unaffected_when_workflow_has_no_quota_policy() {
 }
 
 // ---------------------------------------------------------------------------
-// Section C -- 429 admission mapping on the two other registry-aware fresh-
-// start entry points (issue #946 AC3/AC4): `signal-with-start` (#244) and
-// `update-with-start` (#479). Both carry their own bespoke
-// `HarvestError::QuotaExceeded` arm in `api.rs` -- copy-pasted from, and
-// byte-identical in shape to, the plain-start route's arm exercised in
-// Section B above -- but neither had HTTP-level coverage of that arm (a P2
-// test-coverage gap flagged by an earlier review agent). Neither route needs
-// a registered signal/update handler for this: the quota check runs inside
-// the shared core admission primitive before any signal/update-specific
-// validation is even reached for a name with no matching handler.
+// Section C -- 429 admission mapping on `signal-with-start` (#244) and
+// `update-with-start` (#479), issue #946 AC3/AC4.
+//
+// Each route has its own `HarvestError::QuotaExceeded` arm in `api.rs`. Each
+// arm copies the plain-start arm from Section B, but had no HTTP-level
+// coverage. Neither route needs a registered signal/update handler. The quota
+// check runs in the shared core admission primitive, before any
+// signal/update-specific validation.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -783,8 +772,8 @@ async fn signal_with_start_returns_429_with_structured_body_when_quota_exceeded(
     assert_eq!(body["current"], json!(1));
 
     // No fresh execution was admitted, and no signal was staged for the
-    // (never-created) target -- a rejected fresh admission must leave zero
-    // trace, exactly like the plain-start route.
+    // never-created target. A rejected fresh admission leaves zero trace,
+    // like the plain-start route.
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     #[derive(diesel::QueryableByName)]
     struct Count {

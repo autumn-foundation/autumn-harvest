@@ -5,20 +5,20 @@
 //! Every external-workflow primitive that existed before this issue —
 //! `signal_external_workflow` (#244), `request_cancel_external_workflow`
 //! (#492), `await_external_workflow` (#757) — targets an `ExecutionId`. That
-//! is exactly wrong for a long-lived *entity* workflow that periodically
-//! `continue_as_new`s to keep its history bounded (a device session, a
-//! per-tenant job queue, a subscription): the entity's `ExecutionId` changes
+//! is wrong for a long-lived *entity* workflow, such as a device session, a
+//! per-tenant job queue or a subscription. Such a workflow periodically
+//! `continue_as_new`s to keep its history bounded. Its `ExecutionId` changes
 //! on every continue-as-new, but its business `workflow_id` never does. A
-//! supervisor that stored the entity's `ExecutionId` at the moment it first
-//! started would silently signal a **sealed, `CONTINUED_AS_NEW` predecessor**
-//! after the very first rotation — the signal is durably recorded as
+//! supervisor might store the entity's `ExecutionId` when the entity starts.
+//! After the first rotation it then silently signals a **sealed,
+//! `CONTINUED_AS_NEW` predecessor**. The signal is durably recorded as
 //! delivered, and the running successor never sees it.
 //!
-//! This example demonstrates the fix: `ctx.signal_external_workflow_by_id`
+//! This example demonstrates the fix. `ctx.signal_external_workflow_by_id`
 //! and `ctx.request_cancel_external_workflow_by_id` resolve to *the current
-//! run* — the latest non-terminal execution of `(workflow_name, workflow_id)`
-//! **at delivery time**, not at request time — so the supervisor only ever
-//! needs to remember the entity's stable business key.
+//! run*. That is the latest non-terminal execution of
+//! `(workflow_name, workflow_id)` **at delivery time**, not at request time. So
+//! the supervisor only needs to remember the entity's stable business key.
 //!
 //! # Key semantics
 //!
@@ -28,29 +28,29 @@
 //!   interleaving — see the randomized tests in
 //!   `tests/integration/workflow_id_targeted_tests.rs`.
 //! * **Signal to a `workflow_id` with no live run** → typed failure after the
-//!   existing outbox grace window (`reason_code = "not_running"` when the
-//!   *current* run is terminal, `"target_unknown"` when no run has ever
-//!   existed) — never silently dropped.
+//!   existing outbox grace window, never a silent drop. The `reason_code` is
+//!   `"not_running"` when the *current* run is terminal, and `"target_unknown"`
+//!   when no run has ever existed.
 //! * **Cancel of an already-terminal `workflow_id`** → no-op success (the
 //!   goal — "not running" — is already met).
 //! * **Self-targeting** (own `workflow_name`/`workflow_id`) → immediate typed
 //!   failure (`"self_signal"` / `"self_cancel"`), no DB round trip.
-//! * Cross-shard: the owning shard is found by *observation* (issue #1146) —
-//!   delivery inspects every shard the deployment expects and merges the
-//!   answers — so a target works wherever it was placed, including one pinned
-//!   by an explicit `ShardPlacement` (issue #697) or left behind on a drained
-//!   shard. A single-shard deployment still delivers inline in the caller's own
-//!   transaction; a multi-shard one routes every by-id delivery through the
-//!   existing outbox (reusing the #492 same-shard/outbox split).
+//! * Cross-shard: delivery finds the owning shard by *observation* (issue
+//!   #1146). It inspects every shard the deployment expects and merges the
+//!   answers. So a target works wherever it was placed. That includes one
+//!   pinned by an explicit `ShardPlacement` (issue #697) or left behind on a
+//!   drained shard. A single-shard deployment still delivers inline in the
+//!   caller's own transaction. A multi-shard one routes every by-id delivery
+//!   through the existing outbox, with the #492 same-shard/outbox split.
 //!
 //! # Two correlated events per call (append-only, appended to the CALLER's
 //! history — unchanged from the `ExecutionId`-targeted primitives)
 //!
 //! 1. `ExternalSignalRequested` / `ExternalCancelRequested` — recorded on
 //!    first live call. The `target` field is the widened `ExternalTarget`
-//!    enum (`ExecutionId` | `WorkflowId { workflow_name, workflow_id }`), so
-//!    stored pre-#751 history — which only ever recorded `ExecutionId`
-//!    targets — deserializes and replays unchanged.
+//!    enum (`ExecutionId` | `WorkflowId { workflow_name, workflow_id }`).
+//!    Stored pre-#751 history recorded only `ExecutionId` targets, so it
+//!    deserializes and replays unchanged.
 //! 2. `ExternalSignalDelivered`/`Failed` or `ExternalCancelDelivered`/`Failed`
 //!    — the terminal outcome, replayed verbatim on every later pass.
 
@@ -62,11 +62,10 @@ pub struct Job {
     pub job_id: String,
 }
 
-/// `job_pool` is a long-lived entity workflow: it accumulates jobs delivered
-/// by signal, and once it has processed `ROTATE_AFTER` of them it
-/// `continue_as_new`s to keep its event history bounded. Its `workflow_id`
-/// (e.g. `"tenant-42"`) is stable forever; its `ExecutionId` is a fresh UUID
-/// after every rotation.
+/// `job_pool` is a long-lived entity workflow that accumulates jobs delivered
+/// by signal. After `ROTATE_AFTER` jobs it `continue_as_new`s to keep its
+/// event history bounded. Its `workflow_id` (e.g. `"tenant-42"`) is stable
+/// forever. Its `ExecutionId` is a fresh UUID after every rotation.
 const ROTATE_AFTER: u32 = 3;
 
 #[workflow]
@@ -74,7 +73,7 @@ async fn job_pool(ctx: &WorkflowContext, processed_so_far: u32) -> Result<(), St
     let mut processed = processed_so_far;
     loop {
         // Block until the supervisor delivers a job — addressed by
-        // `workflow_id`, so it doesn't matter which rotation of this entity
+        // `workflow_id`, so it does not matter which rotation of this entity
         // is currently live.
         let job: Job = ctx
             .receive_signal("add_job")

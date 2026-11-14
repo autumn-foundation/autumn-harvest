@@ -1,4 +1,4 @@
-//! Fixture (review round 2, finding 1): two statics that share a LAST path
+//! Fixture: two statics that share a LAST path
 //! segment but differ in module and in type.
 //!
 //! Compiled standalone (no workspace deps) with:
@@ -7,7 +7,7 @@
 //!
 //! rustc 1.98 prints both the `static` item header and the `allocN (static: ..)`
 //! footer with the FULL path (`static b::COUNTER: Atomic<u64>`,
-//! `alloc2 (static: b::COUNTER, ..)`), so indexing statics by their last segment
+//! `alloc2 (static: b::COUNTER, ..)`). So an index keyed on the last segment
 //! collapses `a::COUNTER` and `b::COUNTER` onto one entry. Whichever the index
 //! kept first then decided the verdict, and the immutable `a::COUNTER` made a
 //! read of the atomic `b::COUNTER` look clean.

@@ -196,9 +196,9 @@ fn batch_submit_dry_run_sets_body_flag() {
     );
 }
 
-/// Regression guard (AC6 byte-for-byte real submit): without `--dry-run`, the
-/// request body must NOT carry a `dry_run` key at all, so a real submit is
-/// byte-identical to a pre-#769 client. (Passes now and after green.)
+/// Regression guard (AC6 byte-for-byte real submit). Without `--dry-run`, the
+/// request body must NOT carry a `dry_run` key. A real submit then stays
+/// byte-identical to a pre-#769 client.
 #[test]
 fn batch_submit_without_dry_run_flag_defaults_false() {
     let req = parse(&[
@@ -218,9 +218,9 @@ fn batch_submit_without_dry_run_flag_defaults_false() {
     );
 }
 
-/// #769: `Signal --dry-run` WITHOUT `--signal-name` now parses (clap no longer
-/// enforces `required_if_eq`) and maps to a dry-run preview body carrying no
-/// `signal_name` — a preview reports blast radius, not signal validity.
+/// #769: `Signal --dry-run` WITHOUT `--signal-name` parses, because clap no
+/// longer enforces `required_if_eq`. It maps to a preview body with no
+/// `signal_name`. A preview reports blast radius, not signal validity.
 #[test]
 fn batch_submit_signal_dry_run_without_signal_name_ok() {
     let req = parse(&[

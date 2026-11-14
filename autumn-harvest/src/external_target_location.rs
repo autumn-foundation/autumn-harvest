@@ -8,8 +8,8 @@
 //! [`ShardRouter::pick_for_new_workflow`] — the rendezvous hash a *fresh start*
 //! of that key would use.
 //!
-//! That is a **prediction of where new work would be placed**, not an
-//! observation of where existing work *is*, and the two diverge in two ways:
+//! That is a **prediction of where new work would be placed**. It is not an
+//! observation of where existing work *is*. The two diverge in two ways:
 //!
 //! 1. **Explicit shard placement (issue #697).** A workflow started under
 //!    [`crate::shard::ShardPlacement::Shard`] or
@@ -17,28 +17,27 @@
 //!    a shard the pure hash may never compute.
 //! 2. **Writable-set drift.** [`ShardRouter::pick_for_new_workflow`] re-hashes
 //!    over the *current* `writable_shards` when the readable-set hash lands
-//!    outside it, so draining a shard moves where a key resolves *after* a
+//!    outside it. Draining a shard then moves where a key resolves *after* a
 //!    workflow was already placed there.
 //!
-//! In both cases the hash names a shard the target does not live on, the
-//! delivery attempt finds nothing, and — once the unknown-target grace window
-//! elapses — the caller's history durably records `target_unknown` for a
-//! target that was running the whole time.
+//! In both cases the hash names a shard the target does not live on, and the
+//! delivery attempt finds nothing. Once the unknown-target grace window
+//! elapses, the caller's history durably records `target_unknown`. The target
+//! was running the whole time.
 //!
 //! # The rule this module implements
 //!
-//! Resolve by **observation**: fan out across every shard the deployment
-//! expects to exist, ask each for its best run under this business key, and
-//! merge the answers with the canonical [`select_resolved_run`] ranking
-//! (active-run-first, else most-recent terminal). This is the same rule the
-//! management API's by-id resolution already uses
-//! (`api::resolve_workflow_by_business_id`, issue #805), now available to the
-//! engine itself so the two cannot disagree about *which shards count* or
-//! *which run wins*. The traversal itself is still separate — the management
-//! API keeps its own loop, which fails closed with a 503 on the first
-//! un-poolable shard and has no alias dedupe — so this is a shared rule, not a
-//! shared implementation. Converging the two is worth doing and is not done
-//! here.
+//! Resolve by **observation**. Fan out across every shard the deployment
+//! expects to exist, and ask each for its best run under this business key.
+//! Merge the answers with the canonical [`select_resolved_run`] ranking
+//! (active-run-first, else most-recent terminal). The by-id resolution of the
+//! management API already uses this rule (`api::resolve_workflow_by_business_id`,
+//! issue #805). The engine now has it too, so the two cannot disagree about
+//! *which shards count* or *which run wins*. The traversal is still separate.
+//! The management API keeps its own loop. That loop fails closed with a 503 on
+//! the first un-poolable shard and has no alias dedupe. So this is a shared
+//! rule, not a shared implementation. Converging the two is worth doing and is
+//! not done here.
 //!
 //! Issue #1308 reuses the same fan-out for a second question, via
 //! [`check_cross_shard_occupancy`]: not "where does this key live", but "is
@@ -50,28 +49,28 @@
 //!
 //! Two properties are load-bearing and are what a naive fan-out gets wrong:
 //!
-//! * **No first-hit short circuit.** A stale terminal run of the same key on
-//!   one shard and the live run on another is an ordinary state after a
-//!   `(workflow_name, workflow_id)` chain has moved shards (uniqueness is
-//!   shard-local). Stopping at the first shard that returns a row would signal
-//!   the dead one and report `not_running` while the target is alive, so every
-//!   expected shard is asked before a terminal answer is accepted.
-//! * **"Could not inspect" is not "not there."** A shard this process has no
-//!   pool for, or cannot get a connection to, leaves the answer
-//!   [`TargetLocation::Indeterminate`] — never [`TargetLocation::NotFound`].
-//!   `NotFound` is what the outbox converts into a permanent `target_unknown`
-//!   once the grace window expires, so treating an outage as absence would
-//!   turn a transient, retryable condition into a wrong answer written
-//!   irreversibly into the caller's append-only history.
+//! * **No first-hit short circuit.** Uniqueness is shard-local, and a
+//!   `(workflow_name, workflow_id)` chain can move shards. A stale terminal run
+//!   on one shard and the live run on another is then ordinary. Stopping at the
+//!   first shard that returns a row would signal the dead one and report
+//!   `not_running` while the target is alive. So every expected shard is asked
+//!   before a terminal answer is accepted.
+//! * **"Could not inspect" is not "not there."** A shard with no pool or no
+//!   connection leaves the answer [`TargetLocation::Indeterminate`], never
+//!   [`TargetLocation::NotFound`]. The outbox converts `NotFound` into a
+//!   permanent `target_unknown` once the grace window expires. Treating an
+//!   outage as absence would turn a transient, retryable condition into a wrong
+//!   answer. That answer is written irreversibly into the caller's append-only
+//!   history.
 //!
 //! # Cost, and the connection budget
 //!
-//! One or two queries per expected shard, per by-id delivery attempt
-//! ([`crate::execution::resolve_execution_id_by_workflow_id`] probes
-//! active-first and then, only when a shard holds no active run, most-recent
-//! terminal). By-id signal/cancel delivery is asynchronous and off the hot
-//! dispatch path — it runs in the outbox scanners — which is what makes an
-//! O(shards) resolution acceptable here and not, say, on task claim.
+//! One or two queries per expected shard, per by-id delivery attempt.
+//! [`crate::execution::resolve_execution_id_by_workflow_id`] probes
+//! active-first. Only when a shard holds no active run does it probe for the
+//! most-recent terminal run. By-id signal/cancel delivery is asynchronous and
+//! runs in the outbox scanners, off the hot dispatch path. That makes an
+//! O(shards) resolution acceptable here, and not, say, on task claim.
 //!
 //! **Connections are the scarce resource, not queries.** The outbox calls this
 //! from inside a transaction on a connection it already holds from its own
@@ -83,22 +82,21 @@
 //! keep that from happening here:
 //!
 //! * The caller's own shard is probed on the **connection the caller already
-//!   holds** ([`resolve_location_by_workflow_id_with`]'s `held` argument), so
-//!   the fan-out never re-enters that pool.
-//! * `resolve_delivery_route` short-circuits entirely when only one shard is
-//!   expected, so a single-shard deployment issues no fan-out at all and takes
-//!   the same route it took pre-#1146.
-//! * Every remaining peer probe — acquisition *and* query — is bounded by
-//!   [`FANOUT_PEER_BOUND`]; a shard that does not answer in time becomes an
-//!   [`UninspectedShard`] — i.e. `Indeterminate` and a retry — rather than an
-//!   indefinite park. Note this covers the probes this module makes; the
-//!   cross-shard *delivery* query that follows a resolution is deliberately
-//!   left unbounded, since timing out mid-write is a different risk calculation
-//!   than timing out a read-only probe.
+//!   holds** (the `held` argument of [`resolve_location_by_workflow_id_with`]),
+//!   so the fan-out never re-enters that pool.
+//! * `resolve_delivery_route` short-circuits when only one shard is expected.
+//!   A single-shard deployment then issues no fan-out at all and takes the
+//!   same route it took pre-#1146.
+//! * [`FANOUT_PEER_BOUND`] bounds every remaining peer probe, acquisition
+//!   *and* query. A shard that does not answer in time becomes an
+//!   [`UninspectedShard`], i.e. `Indeterminate` and a retry, not an indefinite
+//!   park. This covers only the probes this module makes. The cross-shard
+//!   *delivery* query that follows a resolution is deliberately unbounded.
+//!   Timing out mid-write is a different risk than timing out a read-only probe.
 //!
-//! [`UninspectableShards`] then memoizes, for the length of one sweep, the
-//! shards that already failed, so a backlog of N pending rows pays that bound
-//! once rather than N times.
+//! [`UninspectableShards`] then memoizes the shards that already failed, for
+//! the length of one sweep. A backlog of N pending rows pays that bound once,
+//! not N times.
 
 use diesel_async::AsyncPgConnection;
 
@@ -111,8 +109,8 @@ use crate::worker::DbPool;
 /// (issue #1307).
 ///
 /// `#[non_exhaustive]`: a probe fails in exactly these three ways today. A new
-/// failure shape must slot in as a new variant, not force a caller to guess
-/// from `reason`'s prose.
+/// failure shape must slot in as a new variant. A caller must never have to
+/// guess from the prose of `reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UninspectedReasonKind {
@@ -129,9 +127,8 @@ impl UninspectedReasonKind {
     /// The bounded metric-label value for this kind (issue #1307).
     ///
     /// Per ADR-0001 §7, only low-cardinality values may label a metric. This
-    /// is that value, kept separate from [`std::fmt::Display`] so a future
-    /// operator-facing rendering of `self` does not silently change a metric
-    /// label.
+    /// is that value. It stays separate from [`std::fmt::Display`], so a future
+    /// operator-facing rendering of `self` cannot silently change a metric label.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
         match self {
@@ -166,11 +163,11 @@ pub struct UninspectedShard {
 
 /// Where a `(workflow_name, workflow_id)`-addressed target actually lives.
 ///
-/// Named *location*, not *placement*, and the distinction is the whole point of
-/// this module: [`crate::shard::ShardPlacement`] is a policy for where **new**
+/// Named *location*, not *placement*. That distinction is the whole point of
+/// this module. [`crate::shard::ShardPlacement`] is a policy for where **new**
 /// work should go, decided before an execution exists. This is an observation
-/// of where an **existing** run is. Issue #1146 is precisely what happens when
-/// the first is used to answer the second.
+/// of where an **existing** run is. Issue #1146 is what happens when the first
+/// answers the second.
 ///
 /// `#[non_exhaustive]`: a design note, not a promise of future variants.
 /// `Found` already carries "several live runs" as its `other_live` field
@@ -188,9 +185,9 @@ pub struct UninspectedShard {
 pub enum TargetLocation {
     /// The key resolves to `run`, which lives on `shard`.
     ///
-    /// `run` may be terminal — the caller applies its own semantics to that
-    /// (issue #751: a terminal current run fails a signal `not_running` and
-    /// satisfies a cancel as a no-op success).
+    /// `run` may be terminal. The caller applies its own semantics to that
+    /// (issue #751). A terminal current run fails a signal `not_running` and
+    /// satisfies a cancel as a no-op success.
     #[non_exhaustive]
     Found {
         /// The shard whose database holds `run`.
@@ -198,39 +195,37 @@ pub enum TargetLocation {
         /// The winning run under the [`select_resolved_run`] ranking.
         run: ResolvedRun,
         /// Shards that could not be inspected, if any. **Non-empty means this
-        /// answer is a live run found over a partial view**, and the caller must
-        /// decide whether its operation may act on that (issue #1146, Codex
-        /// round 2).
+        /// answer is a live run found over a partial view.** The caller must
+        /// decide whether its operation may act on that (issue #1146).
         ///
-        /// A **signal** may. Delivering to a live run in hand is real delivery,
-        /// and re-delivery is not idempotent without an idempotency key — so
+        /// A **signal** may. Delivering to a live run in hand is real delivery.
+        /// Re-delivery is not idempotent without an idempotency key. So
         /// "deliver but stay pending" would duplicate the signal on the retry.
         ///
         /// A **cancel** may act but must not *report*. `ExternalCancelDelivered`
-        /// asserts something about the whole business key — "nothing is running
-        /// under it" — and because `(workflow_name, workflow_id)` uniqueness is
-        /// shard-local, the shard that could not be read may hold another live
-        /// run. Cancelling is idempotent, so the cancel path cancels what it
-        /// found and leaves the request pending, letting a later **complete**
-        /// fan-out be what makes the assertion.
+        /// asserts "nothing is running under it" about the whole business key.
+        /// `(workflow_name, workflow_id)` uniqueness is shard-local, so the
+        /// unread shard may hold another live run. Cancelling is idempotent. The
+        /// cancel path cancels what it found and leaves the request pending. A
+        /// later **complete** fan-out then makes the assertion.
         uninspected: Vec<UninspectedShard>,
         /// Shards that hold a **further live run** of the same key, besides the
-        /// one on `shard` (issue #1146, Codex round 3).
+        /// one on `shard` (issue #1146).
         ///
         /// Empty in every healthy deployment. Non-empty is the state
-        /// [`merge_locations`] warns about: `(workflow_name, workflow_id)`
-        /// uniqueness is shard-local, so pinning a key to one shard (#697) while
-        /// an unpinned start of the same key hashes to another produces two live
-        /// runs that no single shard's index can see.
+        /// [`merge_locations`] warns about. `(workflow_name, workflow_id)`
+        /// uniqueness is shard-local. A key pinned to one shard (#697) and an
+        /// unpinned start of the same key on another shard give two live runs.
+        /// No single shard's index can see both.
         ///
-        /// `run` is still the most recently started of them — the documented
-        /// "current run" rule, which a **signal** follows. But a **cancel** must
-        /// not report on a fan-out that saw more than one, for the same reason it
-        /// must not report on a partial one: cancelling the newest leaves the
-        /// other live, and the moment it does, *that* run becomes the current run
-        /// for the key. So the cancel path cancels what it found, withholds the
-        /// terminal, and retries — converging one live copy per sweep until none
-        /// is left and the answer is unambiguous.
+        /// `run` is still the most recently started of them. That is the
+        /// documented "current run" rule, which a **signal** follows. A
+        /// **cancel** must not report on a fan-out that saw more than one, for
+        /// the same reason as a partial one. Cancelling the newest leaves the
+        /// other live, and *that* run then becomes the current run for the key.
+        /// So the cancel path cancels what it found, withholds the terminal, and
+        /// retries. Each sweep removes one live copy, until none is left and the
+        /// answer is unambiguous.
         other_live: Vec<ShardId>,
     },
     /// **Every** expected shard was inspected and none holds a run for this
@@ -249,17 +244,17 @@ pub enum TargetLocation {
     /// Only ever produced when the caller passed an `idempotency_key`. Each
     /// per-shard probe this fan-out already runs also checks for a prior
     /// delivery of that key. The check runs on the same connection, so it
-    /// costs no extra connection. It short-circuits the fan-out the instant
-    /// it finds a hit — unlike [`Self::NotFound`], a positive answer does not
-    /// need every shard to agree.
+    /// costs no extra connection. It short-circuits the fan-out at the first
+    /// hit. Unlike [`Self::NotFound`], a positive answer does not need every
+    /// shard to agree.
     ///
-    /// `shard` names where the PRIOR delivery landed, which is deliberately
-    /// not "the current run's shard": that is the whole gap this closes. A
+    /// `shard` names where the PRIOR delivery landed. It is deliberately not
+    /// the shard of the current run, and that is the gap this closes. A
     /// continue-as-new or a terminate-and-restart can cross shards between
     /// two delivery attempts. That moves the current run, but a signal
-    /// already queued under this key must still dedupe. This closes what
-    /// [`crate::signal::resolve_and_signal_by_workflow_id`]'s own
-    /// shard-local pre-check cannot see across a shard boundary.
+    /// already queued under this key must still dedupe. The shard-local
+    /// pre-check of [`crate::signal::resolve_and_signal_by_workflow_id`]
+    /// cannot see across a shard boundary.
     #[non_exhaustive]
     AlreadyDelivered {
         /// The shard the earlier delivery's signal row lives on.
@@ -282,12 +277,12 @@ impl TargetLocation {
     }
 
     /// May a caller assert something about the **whole business key** from this
-    /// answer — as `ExternalCancelDelivered` does when it claims nothing is
-    /// running under it?
+    /// answer, as `ExternalCancelDelivered` does when it claims nothing runs
+    /// under it?
     ///
-    /// Two things can make an answer inauthoritative in that sense, and they are
-    /// deliberately folded into one predicate because they have the same
-    /// consequence — a live run of this key that the assertion would ignore:
+    /// Two things can make an answer inauthoritative in that sense. One
+    /// predicate covers both, because both have the same consequence: a live
+    /// run of this key that the assertion would ignore.
     ///
     /// * a shard that could not be inspected, which **may** hold one; and
     /// * a shard that was inspected and **does** hold one, besides the winner.
@@ -296,28 +291,27 @@ impl TargetLocation {
     /// and for an unambiguous [`Self::Found`]; `false` for every
     /// [`Self::Indeterminate`].
     ///
-    /// This says nothing about whether a caller may *act* — cancelling the run
+    /// This says nothing about whether a caller may *act*. Cancelling the run
     /// in hand is idempotent progress either way. It governs only what may be
     /// recorded.
     ///
-    /// # What `true` does not mean (issue #1146, Codex round 4)
+    /// # What `true` does not mean (issue #1146)
     ///
     /// It is authoritative over **the observations this fan-out made**, not over
     /// an instant in time. The shards are read sequentially, on separate
-    /// connections to separate databases, with no shared snapshot — Postgres has
-    /// no cross-shard transaction and this engine deliberately does not add a
+    /// connections to separate databases, with no shared snapshot. Postgres has
+    /// no cross-shard transaction, and this engine deliberately adds no
     /// coordinator. So a run of the key can start on shard 0 *after* shard 0
-    /// answered "nothing" and *before* shard 1 answers, and the merge will not
-    /// see it. A cancel can then report success while that run is live.
+    /// answered "nothing" and *before* shard 1 answers. The merge does not see
+    /// it. A cancel can then report success while that run is live.
     ///
-    /// Two things bound how much that matters. It requires two live runs of one
-    /// business key to be possible at all, which needs a deployment to mix
-    /// pinned and unpinned starts of the same `workflow_id` — the discipline
-    /// `docs/sharding.md` already asks operators to keep, precisely because
-    /// `(workflow_name, workflow_id)` uniqueness is shard-local. And it is
-    /// strictly better than the pre-#1146 behaviour, which consulted exactly one
-    /// hash-derived shard and so missed a second live run unconditionally rather
-    /// than only under a race.
+    /// Two things bound how much that matters. First, it needs two live runs of
+    /// one business key. That needs a deployment that mixes pinned and unpinned
+    /// starts of the same `workflow_id`. `docs/sharding.md` already asks
+    /// operators to avoid that, because `(workflow_name, workflow_id)`
+    /// uniqueness is shard-local. Second, it is strictly better than the
+    /// pre-#1146 behaviour. That consulted exactly one hash-derived shard, so it
+    /// missed a second live run always, not only under a race.
     ///
     /// The cancel path narrows it further, and that rule lives with the route
     /// rather than here. A cancel that ends a live run reports from a LATER
@@ -338,10 +332,9 @@ impl TargetLocation {
             } => uninspected.is_empty() && other_live.is_empty(),
             Self::NotFound => true,
             // `AlreadyDelivered` answers a delivery-dedup question, not a
-            // key-state one. It is never produced on the cancel path, the
-            // only caller of this method, since cancel carries no
-            // idempotency key. `false` is the conservative default
-            // regardless.
+            // key-state one. The cancel path is the only caller of this method.
+            // Cancel carries no idempotency key, so it never sees this variant.
+            // `false` is the conservative default regardless.
             Self::Indeterminate { .. } | Self::AlreadyDelivered { .. } => false,
         }
     }
@@ -353,12 +346,11 @@ impl TargetLocation {
 /// knows about (`readable_shards` plus `default_shard`), ascending and
 /// deduplicated.
 ///
-/// The union — rather than just the local pools — is what makes
-/// [`TargetLocation::Indeterminate`] meaningful. Mid a shard-add rollout the
-/// router's `readable_shards` is widened before every process has the new
-/// shard's pool wired up (see the "add a shard" procedure in
-/// `docs/sharding.md`); a resolution that silently omitted such a shard from
-/// its fan-out would report a confident `NotFound` for a key that lives there.
+/// The union, not just the local pools, makes [`TargetLocation::Indeterminate`]
+/// meaningful. During a shard-add rollout, the router widens `readable_shards`
+/// before every process has a pool for the new shard. See the "add a shard"
+/// procedure in `docs/sharding.md`. A fan-out that silently omitted such a
+/// shard would report a confident `NotFound` for a key that lives there.
 /// Naming it here instead turns that into an explicit uninspected shard.
 ///
 /// Falls back to `[ShardId(0)]` when neither a pool nor a router is available,
@@ -373,11 +365,10 @@ pub fn fanout_shards(pool_shards: &[ShardId], router: Option<&ShardRouter>) -> V
 
 /// [`fanout_shards`], taking the router's placement-relevant parts directly.
 ///
-/// Same rule, same result. Exists for callers that hold a `&ShardRouter` behind
-/// a guard or a `Result` they cannot keep borrowed across the call, so that
-/// reaching the canonical rule does not cost a `ShardRouter` clone —
-/// `ShardRouter` owns a `residency_map`, so cloning it per management-API
-/// request to answer a set question is pure waste.
+/// Same rule, same result. Some callers hold a `&ShardRouter` behind a guard or
+/// a `Result` they cannot keep borrowed across the call. This form spares them
+/// a `ShardRouter` clone. `ShardRouter` owns a `residency_map`, so a clone per
+/// management-API request to answer a set question is pure waste.
 #[must_use]
 pub fn fanout_shards_from_parts(
     pool_shards: &[ShardId],
@@ -397,28 +388,28 @@ pub fn fanout_shards_from_parts(
 /// Merge a fan-out's per-shard candidates into a single placement (pure, no
 /// DB).
 ///
-/// Ranking is delegated to [`select_resolved_run`] — the same function the
-/// management API's by-id resolution uses — so the engine and the HTTP surface
+/// Ranking is delegated to [`select_resolved_run`], the function that the by-id
+/// resolution of the management API uses. So the engine and the HTTP surface
 /// cannot drift about which run of a business key is "the current one".
 ///
 /// The completeness rules on top of that ranking:
 ///
 /// * A **live (non-terminal) winner is delivered to even when a shard was
-///   missed.** Note what this does *not* rest on: `(workflow_name,
-///   workflow_id)` uniqueness is shard-local, so two live runs of one key are
-///   possible in exactly the topologies this module exists for (pin key K to
-///   shard 2 while an unpinned start of K hashes to shard 0 — shard 0's partial
-///   unique index cannot see shard 2). The rule is therefore "deliver to the
-///   most recently started live run that was found", and a shard that could not
-///   be inspected may hold a newer one. That is deliberate and conservative in
-///   the direction that matters: a live run in hand is a real target, and
-///   withholding delivery from it because an *unrelated* shard is unreachable
-///   would strand a signal whose recipient is right there. The incomplete
-///   fan-out is logged by [`resolve_location_by_workflow_id_with`] so the
-///   ambiguity is visible rather than silent.
+///   missed.** Note what this does *not* rest on. `(workflow_name,
+///   workflow_id)` uniqueness is shard-local. So two live runs of one key are
+///   possible in exactly the topologies this module exists for. Example: pin
+///   key K to shard 2 while an unpinned start of K hashes to shard 0. The
+///   partial unique index of shard 0 cannot see shard 2. The rule is therefore
+///   "deliver to the most recently started live run that was found". A shard
+///   that could not be inspected may hold a newer one. That is deliberate and
+///   conservative in the direction that matters. A live run in hand is a real
+///   target. Withholding delivery because an *unrelated* shard is unreachable
+///   would strand a signal whose recipient is right there.
+///   [`resolve_location_by_workflow_id_with`] logs the incomplete fan-out, so
+///   the ambiguity is visible, not silent.
 /// * A **terminal winner with a shard missed is `Indeterminate`.** A terminal
 ///   run on an inspected shard does not rule out a live run on the shard that
-///   was not inspected, and the two lead to opposite outcomes for a signal
+///   was not inspected. The two lead to opposite outcomes for a signal
 ///   (`not_running` failure vs. delivery).
 /// * **No candidates at all with a shard missed is `Indeterminate`**, never
 ///   `NotFound`.
@@ -428,8 +419,8 @@ pub fn fanout_shards_from_parts(
 ///   covers the shards it actually reached. A shard it could not reach might
 ///   hold the prior delivery the key names. Delivering fresh to a live
 ///   winner found elsewhere would then double-deliver. `keyed` is `false` for
-///   a cancel (no idempotency-key concept) and for an unkeyed signal, so
-///   neither loses the live-winner-wins rule above.
+///   a cancel (no idempotency-key concept) and for an unkeyed signal. Neither
+///   loses the live-winner-wins rule above.
 #[must_use]
 pub fn merge_locations(
     candidates: Vec<(ShardId, ResolvedRun)>,
@@ -449,17 +440,11 @@ pub fn merge_locations(
         return TargetLocation::Indeterminate { uninspected };
     }
 
-    // `select_resolved_run` returns one of the candidates verbatim, so the
-    // owning shard is the one that contributed it. Match on `exec_id`, which is
-    // unique across every shard (it is a UUID primary key), rather than on the
-    // whole struct. The fallback is unreachable while `select_resolved_run`
-    // returns one of its inputs; decoding the id's own shard bits is the
-    // closest correct answer if that ever changes.
-    // Any OTHER live run of this key that a shard answered with. Only reachable
-    // when the winner itself is live (the ranking prefers live), and only in the
-    // topologies this module exists for — an explicit pin plus an unpinned start
-    // of the same key. Shard-local uniqueness cannot see it, so the fan-out is
-    // the first thing in the engine that can.
+    // Any OTHER live run of this key that a shard answered with. It is
+    // reachable only when the winner itself is live (the ranking prefers live).
+    // It needs the topologies this module exists for: an explicit pin plus an
+    // unpinned start of the same key. Shard-local uniqueness cannot see it, so
+    // the fan-out is the first thing in the engine that can.
     let other_live: Vec<ShardId> = candidates
         .iter()
         .filter(|(_, run)| {
@@ -481,6 +466,11 @@ pub fn merge_locations(
         );
     }
 
+    // `select_resolved_run` returns one of the candidates verbatim, so the
+    // owning shard is the one that contributed it. Match on `exec_id`, a UUID
+    // primary key unique across every shard, not on the whole struct. The
+    // fallback is unreachable while `select_resolved_run` returns one of its
+    // inputs. If that changes, the shard bits of the id are the closest answer.
     let shard = candidates
         .into_iter()
         .find(|(_, run)| run.exec_id == winner.exec_id)
@@ -494,68 +484,67 @@ pub fn merge_locations(
 }
 
 /// How long a fan-out will wait for a **peer** shard's connection before giving
-/// up on that shard for this attempt (issue #1146, Codex round 1 P1).
+/// up on that shard for this attempt (issue #1146).
 ///
 /// Deliberately far shorter than [`crate::audit_export::SHARD_ACQUIRE_BOUND`],
-/// and for a different reason. That bound exists to stop an *indefinite* park
-/// and is generous on purpose, so a merely-busy shard is not starved. This one
-/// exists to stop a **circular wait between per-shard scanners in one process**,
-/// where being generous is the problem rather than the cure.
+/// and for a different reason. That bound stops an *indefinite* park and is
+/// generous on purpose, so a merely-busy shard is not starved. This one stops a
+/// **circular wait between per-shard scanners in one process**. There, a
+/// generous bound is the problem, not the cure.
 ///
-/// The cycle: `Worker` spawns one timeout checker per assigned shard, and each
-/// holds its own shard pool's connection for the whole `enforce_timeouts_once`
-/// pass. With `shard_assignments = [0, 1]` and one connection per pool, checker
-/// 0 can sit waiting for pool 1 while checker 1 waits for pool 0. Nothing
-/// deadlocks — both bounds expire — but with a *generous* bound both scanners
-/// stall for it on every tick, delaying every other resident of that pass.
+/// The cycle: `Worker` spawns one timeout checker per assigned shard. Each
+/// holds a connection of its own shard pool for the whole
+/// `enforce_timeouts_once` pass. With `shard_assignments = [0, 1]` and one
+/// connection per pool, checker 0 can wait for pool 1 while checker 1 waits
+/// for pool 0. Nothing deadlocks, because both bounds expire. But with a
+/// *generous* bound, both scanners stall on every tick. That delays every other
+/// resident of that pass.
 ///
-/// **What this bound guarantees is bounded return, not progress**, and the
-/// distinction matters (Codex round 4). A one-connection pool has nothing to
-/// spare while its own scanner is mid-pass, so a peer read succeeds only if it
-/// lands during that scanner's sleep window. That is likely — passes are short
-/// relative to `poll_interval`, and two independent tasks doing different work
-/// do not stay in phase — but it is a probability, not a guarantee, and this
-/// constant does nothing to create it. An earlier version of this comment
-/// claimed the bound induced the drift; it does not.
+/// **What this bound guarantees is bounded return, not progress.** A
+/// one-connection pool has nothing to spare while its own scanner is mid-pass.
+/// So a peer read succeeds only if it lands in the sleep window of that
+/// scanner. That is likely. Passes are short relative to `poll_interval`, and
+/// two independent tasks that do different work do not stay in phase. But it is
+/// a probability, not a guarantee, and this constant does nothing to create it.
 ///
 /// **The guarantee is capacity, not timing.** A process that runs checkers for
-/// more than one shard should size each shard pool at **2 or more**: one
-/// connection for that shard's own scanner, one for a peer's cross-shard read.
-/// `docs/sharding.md` says so, and `Worker::run_multi_shard` now warns at
-/// startup when a multi-shard process is configured below it, so the
-/// degradation is visible rather than silent. This bound is what keeps such a
-/// deployment degraded-and-retrying rather than stalled, which is all it is for.
+/// more than one shard should size each shard pool at **2 or more**. One
+/// connection serves that shard's own scanner, and one serves a peer's
+/// cross-shard read. `docs/sharding.md` says so.
+/// `Worker::run_multi_shard` warns at startup when a multi-shard process is
+/// configured below it, so the degradation is visible. This bound keeps such a
+/// deployment degraded-and-retrying, not stalled. That is all it is for.
 ///
-/// Note the same circular shape applies to the *delivery* acquisition in the
-/// outbox scanners, which predates this issue (it existed for cross-shard
-/// `ExecutionId` targets) and was unbounded; `timeout.rs` now bounds it with
+/// The same circular shape applies to the *delivery* acquisition in the outbox
+/// scanners. That acquisition predates this issue (it existed for cross-shard
+/// `ExecutionId` targets) and was unbounded. `timeout.rs` now bounds it with
 /// this constant too.
 pub const FANOUT_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Total budget for one **peer** shard probe — acquisition *and* query
-/// (issue #1146, Codex round 2 P1).
+/// (issue #1146).
 ///
 /// [`FANOUT_ACQUIRE_BOUND`] bounds only the checkout. A connection that is
-/// handed over and then never answers is just as fatal: the peer database
-/// becomes a network black hole after checkout, or an `ACCESS EXCLUSIVE` DDL
-/// lock blocks the read, and the `await` on the query hangs forever. That
-/// wedges the *caller* shard's timeout checker, which also runs task timeouts,
-/// SLA enforcement, session reclaim and every other outbox — so one unhealthy
-/// peer halts unrelated enforcement on a healthy shard indefinitely.
+/// handed over and then never answers is just as fatal. The peer database can
+/// become a network black hole after checkout. An `ACCESS EXCLUSIVE` DDL lock
+/// can block the read. Then the `await` on the query hangs forever. That wedges
+/// the timeout checker of the *caller* shard. It also runs task timeouts, SLA
+/// enforcement, session reclaim and every other outbox. So one unhealthy peer
+/// halts unrelated enforcement on a healthy shard indefinitely.
 ///
 /// The whole peer probe is therefore wrapped in this bound, with the tighter
-/// acquisition bound nested inside it. Two bounds rather than one because they
-/// answer different questions: the inner one keeps per-shard scanners from
-/// waiting on each other's connections at all (a circular wait), while this one
-/// caps what a single unhealthy peer can cost. Expiry is classified exactly like
-/// a failed acquisition — an [`UninspectedShard`], hence `Indeterminate` and a
-/// retry, never "the key is not there".
+/// acquisition bound nested inside it. The two bounds answer different
+/// questions. The inner one keeps per-shard scanners from waiting on each
+/// other's connections at all (a circular wait). This one caps what a single
+/// unhealthy peer can cost. Expiry is classified exactly like a failed
+/// acquisition: an [`UninspectedShard`], hence `Indeterminate` and a retry,
+/// never "the key is not there".
 ///
 /// Generous relative to a healthy probe (an indexed lookup on
-/// `(workflow_name, workflow_id)`) so ordinary load never trips it, and small
-/// enough that N shards cannot dominate a scanner tick — the per-sweep
-/// [`UninspectableShards`] memo caps the cost at one bound per shard per sweep
-/// rather than per row.
+/// `(workflow_name, workflow_id)`), so ordinary load never trips it. Small
+/// enough that N shards cannot dominate a scanner tick. The per-sweep
+/// [`UninspectableShards`] memo caps the cost at one bound per shard per sweep,
+/// not per row.
 pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Shards a sweep has already found uninspectable, memoized for the length of
@@ -563,14 +552,14 @@ pub const FANOUT_PEER_BOUND: std::time::Duration = std::time::Duration::from_sec
 ///
 /// An outbox sweep processes one pending row per step and may see hundreds in a
 /// backlog. A shard that failed to hand over a connection on the first row has
-/// not recovered by the two-hundredth, and each re-probe costs the full
-/// [`FANOUT_PEER_BOUND`] — so without this, one
-/// unreachable shard turns a sweep into `rows × bound` of dead wall-clock,
-/// starving every scanner resident sequenced after the outbox.
+/// not recovered by the two-hundredth. Each re-probe costs the full
+/// [`FANOUT_PEER_BOUND`]. Without this memo, one unreachable shard turns a
+/// sweep into `rows × bound` of dead wall-clock. That starves every scanner
+/// resident sequenced after the outbox.
 ///
 /// Memoizing can only push an answer toward [`TargetLocation::Indeterminate`],
-/// which is the safe direction: a shard recorded here is reported uninspected,
-/// so the row is retried rather than resolved from a partial view. The memo is
+/// which is the safe direction. A shard recorded here is reported uninspected,
+/// so the row is retried, not resolved from a partial view. The memo is
 /// per-sweep, never process-wide, so a shard that comes back is re-probed on the
 /// very next sweep.
 #[derive(Clone, Debug, Default)]
@@ -627,26 +616,25 @@ pub async fn resolve_location_by_workflow_id(
 /// connection the caller already holds and memoizing unreachable shards
 /// (issue #1146).
 ///
-/// `router` is the topology snapshot used to widen the fan-out beyond this
-/// process's own pools; pass `None` when no router is installed (tests,
-/// embedders that never call [`crate::shard::install_global_router`]), in which
-/// case only the configured pools are inspected.
+/// `router` is the topology snapshot that widens the fan-out beyond this
+/// process's own pools. Pass `None` when no router is installed (tests,
+/// embedders that never call [`crate::shard::install_global_router`]). Then
+/// only the configured pools are inspected.
 ///
 /// `held` names a shard the caller is **already connected to**, with that
-/// connection. That shard is probed on it instead of acquiring a second
-/// connection from its pool — which is not an optimisation but the fix for a
-/// self-deadlock: the outbox calls this from inside a transaction on a
-/// connection checked out of that very pool, and `pool.get()` is an unbounded
-/// wait. Reading through the held connection is equivalent: the transaction is
-/// READ COMMITTED, so each statement takes a fresh snapshot and sees exactly
-/// what a separate connection would.
+/// connection. That shard is probed on it, with no second connection from its
+/// pool. This is not an optimisation. It is the fix for a self-deadlock. The
+/// outbox calls this inside a transaction on a connection from that very pool,
+/// and `pool.get()` is an unbounded wait. Reading through the held connection
+/// is equivalent. The transaction is READ COMMITTED, so each statement takes a
+/// fresh snapshot and sees exactly what a separate connection would.
 ///
 /// `memo` carries the shards this sweep has already failed to reach, so a
 /// backlog pays [`FANOUT_PEER_BOUND`] once per shard rather than once per row.
 /// The cross-shard *delivery* acquisition that follows a resolution is not
-/// memoized — it is a different pool reached on a different code path — so a
-/// target pool that was reachable during the fan-out and busy at delivery still
-/// costs its own bound per row.
+/// memoized. It is a different pool, reached on a different code path. A
+/// target pool that was reachable during the fan-out and busy at delivery
+/// still costs its own bound per row.
 ///
 /// The fan-out is **sequential**, and holds at most one connection beyond the
 /// caller's own at a time. Read-only: no row is locked and nothing is written.
@@ -685,10 +673,10 @@ pub async fn resolve_location_by_workflow_id_with(
 
     let placement = merge_locations(candidates, uninspected.clone(), idempotency_key.is_some());
 
-    // A `Found` reached over an incomplete fan-out is an answer with a caveat:
-    // shard-local uniqueness means the shard we could not read might hold a
-    // newer live run of the same key. Delivering to the run in hand is the right
-    // call (see `merge_locations`), but the ambiguity must not be silent.
+    // A `Found` over an incomplete fan-out is an answer with a caveat.
+    // Uniqueness is shard-local, so the unread shard might hold a newer live
+    // run of the same key. Delivering to the run in hand is the right call (see
+    // `merge_locations`), but the ambiguity must not be silent.
     if !uninspected.is_empty()
         && let Some(shard) = placement.found_shard()
     {
@@ -759,33 +747,33 @@ async fn fan_out_candidates(
     let expected = fanout_shards(&pool.shard_ids(), router);
     let mut candidates: Vec<(ShardId, ResolvedRun)> = Vec::new();
     let mut uninspected: Vec<UninspectedShard> = Vec::new();
-    // Underlying pools already probed by this fan-out. Several logical shards
-    // may be backed by clones of ONE physical pool — a supported topology (a
-    // pre-split staging deployment maps several shard ids onto one database),
-    // and the shape `ShardedDbPool::from_map` produces whenever the same
-    // `DbPool` is inserted under more than one id.
+    // Underlying pools already probed by this fan-out. Clones of ONE physical
+    // pool may back several logical shards. That is a supported topology: a
+    // pre-split staging deployment maps several shard ids onto one database.
+    // `ShardedDbPool::from_map` produces it whenever the same `DbPool` is
+    // inserted under more than one id.
     //
-    // Probing such an alias again is not merely wasteful, it is the bug Codex
-    // round 5 found: the resolver filters on `(workflow_name, workflow_id)` with
-    // no shard predicate, so an alias returns the rows its sibling already
-    // returned — while the acquisition it needs comes from the very pool that
-    // supplied `held`. On a one-connection pool that acquisition cannot succeed
-    // until this function returns, so the alias was reported uninspected on
-    // every sweep and a by-id cancel could never reach an authoritative answer:
-    // it cancelled the live run and then withheld its terminal forever.
+    // Probing such an alias again is not merely wasteful. It is a bug. The
+    // resolver filters on `(workflow_name, workflow_id)` with no shard
+    // predicate, so an alias returns the rows its sibling already returned.
+    // But the acquisition it needs comes from the very pool that supplied
+    // `held`. On a one-connection pool, that acquisition cannot succeed until
+    // this function returns. So the alias was reported uninspected on every
+    // sweep, and a by-id cancel never reached an authoritative answer. It
+    // cancelled the live run and then withheld its terminal forever.
     //
-    // An alias is *inspected*, not uninspected — its database was read through
-    // its sibling — so it is skipped silently and contributes nothing new.
+    // An alias is *inspected*, not uninspected: its database was read through
+    // its sibling. So it is skipped silently and contributes nothing new.
     let mut probed: Vec<&DbPool> = Vec::new();
 
     // SEED with the held connection's own pool, before the loop. The fan-out
-    // visits shards in ascending order, so seeding inside the `held_here` branch
-    // is too late whenever an alias sorts BEFORE the held shard: a checker
-    // holding shard 1 of an aliased {0, 1} pair would try to acquire "shard 0" —
-    // the pool it is itself holding — and, on a one-connection pool, time out and
-    // mark it uninspected on every sweep, permanently withholding a by-id
-    // cancel's terminal. Order must not decide correctness here (issue #1146,
-    // Codex round 6, on the round-5 fix).
+    // visits shards in ascending order. Seeding inside the `held_here` branch
+    // is too late when an alias sorts BEFORE the held shard. Example: a checker
+    // holds shard 1 of an aliased {0, 1} pair. It would try to acquire
+    // "shard 0", the pool it is itself holding. On a one-connection pool it
+    // times out and marks it uninspected on every sweep. A by-id cancel then
+    // withholds its terminal forever. Order must not decide correctness here
+    // (issue #1146).
     if let Some((held_shard, _)) = held.as_ref()
         && let Some(held_pool) = pool.exact_pool_for(*held_shard)
     {
@@ -845,31 +833,31 @@ async fn fan_out_candidates(
                 Ok(None) => {}
                 Err(e) => {
                     // A failed query on the HELD connection is not merely "this
-                    // shard is uninspected". It ran inside the caller's own open
-                    // transaction, and in Postgres any statement error aborts
-                    // that transaction: every later statement on `conn` fails
+                    // shard is uninspected". It ran inside the open transaction
+                    // of the caller. In Postgres, any statement error aborts
+                    // that transaction. Every later statement on `conn` fails
                     // with 25P02, including the append of the terminal event.
                     //
-                    // Carrying on would be actively unsafe rather than merely
-                    // incomplete. A live winner on a peer shard yields `Found`,
-                    // the delivery runs on the PEER's connection and commits
-                    // there independently, and only afterwards does the caller
-                    // discover it can no longer record that it delivered. The
-                    // row stays pending and the next sweep delivers again —
-                    // and a signal without an idempotency key is not idempotent,
-                    // so that is a duplicate signal, the exact hazard the signal
-                    // path refuses to take elsewhere.
+                    // Carrying on would be actively unsafe, not merely
+                    // incomplete. A live winner on a peer shard yields `Found`.
+                    // The delivery runs on the connection of the PEER and
+                    // commits there independently. Only afterwards does the
+                    // caller find it can no longer record that it delivered.
+                    // The row stays pending and the next sweep delivers again.
+                    // A signal without an idempotency key is not idempotent.
+                    // So that is a duplicate signal, the exact hazard the
+                    // signal path refuses to take elsewhere.
                     //
-                    // Stop the fan-out instead: `Indeterminate` routes to
+                    // Stop the fan-out instead. `Indeterminate` routes to
                     // `DeliveryRoute::Retry`, which returns without touching
-                    // `conn` again, so the aborted transaction rolls back
+                    // `conn` again. The aborted transaction rolls back
                     // harmlessly and the row is retried intact.
                     //
-                    // Deliberately NOT memoized: the abort scopes to this row's
-                    // transaction, not to the sweep. The next row opens a fresh
-                    // one, and recording the caller's shard as uninspectable
-                    // would degrade every remaining row over a fault that is
-                    // already gone.
+                    // Deliberately NOT memoized: the abort scopes to the
+                    // transaction of this row, not to the sweep. The next row
+                    // opens a fresh one. Recording the shard of the caller as
+                    // uninspectable would degrade every remaining row over a
+                    // fault that is already gone.
                     uninspected.push(UninspectedShard {
                         shard,
                         reason: format!(
@@ -905,15 +893,15 @@ async fn fan_out_candidates(
             continue;
         };
 
-        // An alias of a pool this fan-out has already probed — including the
-        // one that supplied `held`. Note "probed", not "read": the entry is
+        // An alias of a pool this fan-out has already probed, including the
+        // one that supplied `held`. Note "probed", not "read". The entry is
         // pushed before the probe runs, so a sibling whose probe FAILED also
-        // suppresses its aliases. That is still correct, and deliberately so —
-        // the failed sibling is already in `uninspected`, so the fan-out is
-        // non-authoritative either way — but the reason is "we have already
-        // paid for this database", not "we have read it". Re-acquiring would at
-        // best duplicate a row and at worst (a one-connection pool) deadlock
-        // against the connection the caller is still holding.
+        // suppresses its aliases. That is deliberately correct. The failed
+        // sibling is already in `uninspected`, so the fan-out is
+        // non-authoritative either way. The reason to skip is "this database
+        // is already paid for", not "it was read". Re-acquiring would at best
+        // duplicate a row. At worst (a one-connection pool) it would deadlock
+        // against the connection the caller still holds.
         if probed
             .iter()
             .any(|probed_pool| same_underlying_pool(probed_pool, shard_pool))
@@ -1045,13 +1033,13 @@ pub async fn check_cross_shard_occupancy(
 /// Are these two handles the **same underlying pool** — clones sharing one
 /// connection set — rather than two pools that merely look alike?
 ///
-/// `deadpool`'s `Pool` is a thin handle over an `Arc<PoolInner>`, and
-/// `Pool::manager()` borrows out of that shared allocation, so two clones return
-/// the same address and two independently built pools cannot. Comparing the
-/// handles themselves would not work: `ShardedDbPool` stores each shard's pool
-/// in its own map slot, so `std::ptr::eq` on `&DbPool` is really shard-id
-/// equality and reports two aliases of one pool as different (issue #1146,
-/// noted in review, load-bearing here).
+/// A `deadpool` `Pool` is a thin handle over an `Arc<PoolInner>`.
+/// `Pool::manager()` borrows out of that shared allocation. So two clones
+/// return the same address, and two independently built pools cannot.
+/// Comparing the handles themselves would not work. `ShardedDbPool` stores the
+/// pool of each shard in its own map slot. So `std::ptr::eq` on `&DbPool` is
+/// really shard-id equality, and it reports two aliases of one pool as
+/// different (issue #1146, noted in review, load-bearing here).
 pub(crate) fn same_underlying_pool(a: &DbPool, b: &DbPool) -> bool {
     std::ptr::eq(a.manager(), b.manager())
 }
@@ -1075,21 +1063,21 @@ enum ProbeOutcome {
 /// extra query, not an extra connection. It is skipped entirely for an
 /// unkeyed signal or a cancel, which never supplies one.
 ///
-/// `Err` is the single "this shard could not be inspected" outcome, carrying the
-/// operator-facing reason — a failed or timed-out acquisition, a failed query,
-/// or a probe that never returned. Collapsing all four into one error means the
-/// caller cannot forget to memoize one of them, which is exactly the bug this
-/// shape replaced: only the acquisition failures were recorded, so a peer whose
-/// *query* failed slowly was re-probed once per pending row instead of once per
-/// sweep (issue #1146, Codex round 3 P2).
+/// `Err` is the single "this shard could not be inspected" outcome. It carries
+/// the operator-facing reason: a failed or timed-out acquisition, a failed
+/// query, or a probe that never returned. With all four in one error, the
+/// caller cannot forget to memoize one of them. That is exactly the bug this
+/// shape replaced. Only the acquisition failures were recorded, so a peer whose
+/// *query* failed slowly was re-probed once per pending row, not once per sweep
+/// (issue #1146).
 ///
-/// A query that returns an error is `Err` and never `Ok(None)`: a shard that
-/// answered with a failure has not told us the key is absent.
+/// A query that returns an error is `Err`, never `Ok(None)`. A shard that
+/// answered with a failure has not said that the key is absent.
 ///
-/// Two nested bounds, for two different hazards — see [`FANOUT_ACQUIRE_BOUND`]
-/// (per-shard scanners waiting on each other's connections) and
-/// [`FANOUT_PEER_BOUND`] (one unhealthy peer wedging this shard's scanner,
-/// wherever it stalls).
+/// Two nested bounds cover two different hazards. [`FANOUT_ACQUIRE_BOUND`]
+/// covers per-shard scanners that wait on each other's connections.
+/// [`FANOUT_PEER_BOUND`] covers one unhealthy peer that wedges the scanner of
+/// this shard, wherever it stalls.
 async fn probe_peer_shard(
     shard_pool: &DbPool,
     workflow_name: &str,
@@ -1163,18 +1151,17 @@ async fn probe_peer_shard(
 /// pool to be at capacity with nothing free — only then does acquiring mean
 /// waiting for another task to release something.
 ///
-/// When the pool has an idle connection, or room to open one, `Pool::get()` is
-/// not queueing behind anybody: it is a DNS + TCP + TLS + Postgres startup and
-/// auth handshake. Holding that to 250 ms is a different decision than bounding
-/// a wait, and a badly wrong one, because it does not converge. `deadpool`
-/// records a new object only *after* `Manager::create()` resolves, so a
-/// cancelled connect leaves the pool exactly as cold as it found it, and the
+/// When the pool has an idle connection, or room to open one, `Pool::get()`
+/// queues behind nobody. It is a DNS + TCP + TLS + Postgres startup and auth
+/// handshake. Holding that to 250 ms is a different decision than bounding a
+/// wait. It is a badly wrong one, because it does not converge. `deadpool`
+/// records a new object only *after* `Manager::create()` resolves. So a
+/// cancelled connect leaves the pool exactly as cold as it found it. The
 /// per-sweep memo then allows only one attempt per shard per sweep. A peer
-/// whose handshake reliably takes longer than the bound is therefore
-/// uninspectable **forever**, not slow — and by-id delivery to it never
-/// completes. Peer pools are routinely cold: in the one-process-per-shard
-/// deployment `docs/sharding.md` recommends, nothing in the process ever uses
-/// them except this fan-out.
+/// whose handshake reliably takes longer than the bound is then uninspectable
+/// **forever**, not slow. By-id delivery to it never completes. Peer pools are
+/// routinely cold. `docs/sharding.md` recommends one process per shard. In
+/// that deployment, only this fan-out ever uses them.
 ///
 /// So the tight bound is applied only in the case it was written for, and
 /// everything else gets the whole probe budget. [`FANOUT_PEER_BOUND`] still
@@ -1192,12 +1179,12 @@ pub(crate) fn peer_acquire_bound(pool: &DbPool) -> std::time::Duration {
 /// Record that `shard` could not be inspected, in the fan-out's own list **and**
 /// in the per-sweep memo.
 ///
-/// The single funnel for every uninspected outcome. It exists because the
-/// previous shape had four of them written out separately and one — a failed
-/// resolution query — silently skipped the memo, so a peer failing slowly just
-/// under the probe bound was re-probed once per pending row instead of once per
-/// sweep (issue #1146, Codex round 3 P2). Routing them all through one place
-/// removes the class rather than the instance.
+/// The single funnel for every uninspected outcome. The previous shape had four
+/// of them written out separately. One of them, a failed resolution query,
+/// silently skipped the memo. So a peer failing slowly just under the probe
+/// bound was re-probed once per pending row, not once per sweep (issue #1146).
+/// Routing them all through one place removes the class rather than the
+/// instance.
 fn mark_uninspected(
     uninspected: &mut Vec<UninspectedShard>,
     memo: Option<&UninspectableShards>,
@@ -1227,23 +1214,24 @@ fn mark_uninspected(
 ///   **single-shard** deployment.
 ///
 /// The `WorkflowId` rule is the deliberate part. Inline delivery resolves the
-/// business key against the caller's shard alone, and
-/// `(workflow_name, workflow_id)` uniqueness is *shard-local* — so in a
-/// multi-shard deployment the caller's shard can hold a stale **terminal** run
-/// of the key while the live run sits elsewhere. Delivering inline from that
-/// view records `ExternalSignalFailed { reason_code: "not_running" }` against a
-/// target that is running, permanently, in the caller's append-only history.
-/// The previous rule (compare the caller's shard against the rendezvous hash of
-/// the key) did not prevent this: the hash lands on the caller's shard for
-/// 1-in-N keys regardless of where the target was actually placed.
+/// business key against the shard of the caller alone.
+/// `(workflow_name, workflow_id)` uniqueness is *shard-local*. So in a
+/// multi-shard deployment, the shard of the caller can hold a stale
+/// **terminal** run of the key while the live run sits elsewhere. Inline
+/// delivery from that view records
+/// `ExternalSignalFailed { reason_code: "not_running" }` against a running
+/// target. That record is permanent in the append-only history of the caller.
+/// The previous rule compared the shard of the caller against the rendezvous
+/// hash of the key. It did not prevent this. The hash lands on the shard of the
+/// caller for 1-in-N keys, wherever the target was actually placed.
 ///
-/// One shard means the caller's view *is* the whole deployment, so the
-/// hazard cannot arise and single-shard deployments — every pre-sharding
-/// deployment, and the default — keep inline delivery and are byte-for-byte
-/// unchanged. Multi-shard deployments defer to the outbox, which is one sweep
-/// of latency on an already-asynchronous path and is where they mostly went
-/// already: the pre-#1146 rule sent every key whose hash missed the caller's
-/// shard — `(N-1)/N` of them — down exactly this path.
+/// With one shard, the view of the caller *is* the whole deployment, so the
+/// hazard cannot arise. Single-shard deployments keep inline delivery and are
+/// byte-for-byte unchanged. That covers every pre-sharding deployment, and the
+/// default. Multi-shard deployments defer to the outbox. That costs one sweep
+/// of latency on an already-asynchronous path. Most of them went there
+/// already. The pre-#1146 rule sent every key whose hash missed the shard of
+/// the caller, `(N-1)/N` of them, down exactly this path.
 #[must_use]
 pub(crate) fn inline_delivery_allowed(
     target: &crate::types::ExternalTarget,
@@ -1271,26 +1259,24 @@ pub(crate) fn global_router_snapshot() -> Option<ShardRouter> {
 /// Does this deployment span more than one shard?
 ///
 /// Used to decide whether a `WorkflowId`-addressed delivery may be attempted
-/// **inline**, inside the caller's own decision transaction, against the
-/// caller's own shard. It may only when there is exactly one shard, because a
-/// single shard is trivially the shard the target lives on; with two or more,
-/// the caller's shard-local view can hold a stale terminal run of the same key
-/// while the live run sits on another shard, and inline delivery has no way to
-/// see that. Multi-shard deployments therefore defer every by-id delivery to
-/// the outbox, where the full [`resolve_location_by_workflow_id`] fan-out
-/// runs.
+/// **inline**, inside the decision transaction of the caller, against its own
+/// shard. It may only when there is exactly one shard. A single shard is
+/// trivially the shard the target lives on. With two or more, the
+/// shard-local view of the caller can hold a stale terminal run of the key.
+/// The live run then sits on another shard, and inline delivery cannot see it.
+/// Multi-shard deployments therefore defer every by-id delivery to the outbox,
+/// where the full [`resolve_location_by_workflow_id`] fan-out runs.
 ///
 /// Derived from the same expected-shard set the fan-out itself uses, so the
 /// two cannot disagree about what "single shard" means.
 ///
-/// **Fails closed.** The two answers are not symmetric in cost: answering
-/// "multi-shard" when the deployment is single-shard only routes a delivery
-/// through the outbox that could have gone inline, costing one poll interval;
-/// answering "single-shard" when it is not re-opens issue #1146 on the inline
-/// path, which is a wrong terminal in an append-only history. So a
-/// `GLOBAL_SHARDED_POOL` lock this cannot read — poisoned by a panic while a
-/// writer held it — is treated as "assume multi-shard" rather than allowed to
-/// collapse to the single-shard default via an empty shard list.
+/// **Fails closed.** The two answers are not symmetric in cost. A wrong
+/// "multi-shard" only routes an inline-capable delivery through the outbox,
+/// which costs one poll interval. A wrong "single-shard" re-opens issue #1146
+/// on the inline path, which writes a wrong terminal to an append-only
+/// history. So an unreadable `GLOBAL_SHARDED_POOL` lock (poisoned by a panic
+/// while a writer held it) means "assume multi-shard". It must not collapse to
+/// the single-shard default via an empty shard list.
 #[must_use]
 pub(crate) fn deployment_is_multi_shard() -> bool {
     let Ok(guard) = crate::shard::GLOBAL_SHARDED_POOL.read() else {
@@ -1306,8 +1292,8 @@ pub(crate) fn deployment_is_multi_shard() -> bool {
 
 /// [`deployment_is_multi_shard`] for integration tests in other crates.
 ///
-/// The gate is crate-internal, but whether it answers correctly for a given
-/// installed topology is observable behaviour worth pinning from outside —
+/// The gate is crate-internal. Its answer for an installed topology is still
+/// observable behaviour worth pinning from outside.
 /// `autumn-harvest-plugin/tests/resolve_installs_selected_pool.rs` asserts that
 /// a runtime resolving a multi-shard pool gates as multi-shard. Not part of the
 /// operator-facing surface.
@@ -1452,13 +1438,13 @@ mod tests {
 
     #[test]
     fn two_live_runs_on_different_shards_are_not_authoritative_even_when_complete() {
-        // Codex round 3. Pinning a key to one shard (#697) while an unpinned
-        // start of the same key hashes to another produces two live runs that no
-        // shard-local unique index can see. The fan-out DOES see both, and the
-        // ranking still picks the most recently started as the current run — the
-        // documented rule, which a signal follows. But a cancel that reported
-        // success here would leave the older run live, and the instant the
-        // newest is cancelled that older one becomes the current run for the key.
+        // A key pinned to one shard (#697) and an unpinned start of the same key
+        // on another shard give two live runs. No shard-local unique index can
+        // see both. The fan-out DOES see both. The ranking still picks the most
+        // recently started as the current run, the documented rule that a
+        // signal follows. But a cancel that reported success here would leave
+        // the older run live. Once the newest is cancelled, that older one
+        // becomes the current run for the key.
         let newer = run(1, "RUNNING", 50);
         let older = run(0, "RUNNING", 10);
         let merged = merge_locations(
@@ -1486,9 +1472,9 @@ mod tests {
 
     #[test]
     fn a_single_live_run_beside_terminals_is_still_authoritative() {
-        // Terminal siblings are not "another live run" — they cannot become the
+        // Terminal siblings are not "another live run". They cannot become the
         // current run for the key, so they must not block a cancel from
-        // reporting. Without this the rule would stall every cancel of a key
+        // reporting. Without this, the rule would stall every cancel of a key
         // that has ever continued-as-new across shards.
         let live = run(1, "RUNNING", 50);
         let dead = run(0, "COMPLETED", 90);
@@ -1717,9 +1703,9 @@ mod tests {
 
     #[test]
     fn one_run_reported_by_two_aliased_shards_is_not_two_live_runs() {
-        // Two logical shard ids backed by pools this fan-out could not prove are
-        // the same database (two independently built pools on one URL) each
-        // return the SAME row. That must not read as the ambiguous
+        // Two logical shard ids each return the SAME row. Their pools are two
+        // independently built pools on one URL, so this fan-out cannot prove
+        // they are the same database. That must not read as the ambiguous
         // "two live runs of one key" state, which would withhold every cancel's
         // terminal forever. `other_live` filters on `exec_id`, so it does not.
         let only = run(0, "RUNNING", 10);

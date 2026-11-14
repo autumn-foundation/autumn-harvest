@@ -15,9 +15,9 @@
 //! PROPTEST_CASES=100000 cargo test -p autumn-harvest --no-default-features --test property
 //! ```
 //!
-//! `PROPTEST_CASES` is proptest's own native knob; we read it here explicitly so
-//! that our low hardcoded default (128) is still *overridable* upward (an
-//! explicit `cases:` struct field would otherwise win over the env var).
+//! `PROPTEST_CASES` is the native knob of proptest. This module reads it so
+//! that the low hardcoded default (128) stays *overridable* upward. An explicit
+//! `cases:` struct field would otherwise win over the env var.
 //!
 //! # Failure persistence
 //!

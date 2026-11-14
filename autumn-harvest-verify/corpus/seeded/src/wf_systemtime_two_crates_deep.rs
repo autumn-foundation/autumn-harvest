@@ -8,10 +8,10 @@
 //!
 //! **Launder.** HVG001 knows `SystemTime::now` exactly — and only inside the
 //! annotated body, which contains no such token. DET001 knows the same spelling
-//! and resolves one hop, but only to a helper declared in the **same file and
-//! same module path** (`resolve_helper`); `batch_label` is one crate away and
-//! `stamp` is two. Neither layer follows a call across a crate boundary, so the
-//! best-known non-determinism source in the catalog sails straight through.
+//! and resolves one hop. But it resolves only to a helper in the **same file
+//! and same module path** (`resolve_helper`). `batch_label` is one crate away
+//! and `stamp` is two. Neither layer follows a call across a crate boundary,
+//! so the best-known non-determinism source in the catalog sails straight through.
 //!
 //! **Expected trace hops.** `wf_systemtime_two_crates_deep` ⇒
 //! `harvest_verify_corpus_helpers::batch_label` ⇒

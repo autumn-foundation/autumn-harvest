@@ -19,9 +19,9 @@ use crate::error::{HarvestError, HarvestResult, panic_message};
 
 /// A type-erased query handler: receives JSON args, returns JSON result or error.
 ///
-/// The `Arc` wrapper makes it cheap to clone out of the registry before invoking,
-/// which is the key to avoiding deadlocks when a handler calls back into the
-/// context (e.g., the deadlock regression test in `tests/query_deadlock.rs`).
+/// The `Arc` lets a caller clone the handler out of the registry before it
+/// runs. A handler can then call back into the context without a deadlock.
+/// `tests/integration/query_deadlock.rs` pins this.
 pub type QueryHandler = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
 /// Holds all registered query handlers for a running workflow execution.
@@ -99,14 +99,15 @@ impl QueryRegistry {
 
     /// Execute a registered query handler with the given `args`.
     ///
-    /// The registry lock is **not** held during handler invocation, so handlers
-    /// that call back into a `WorkflowContext` (which holds its own lock around
-    /// the registry) will not deadlock.
+    /// The registry lock is **not** held while the handler runs. A handler can
+    /// call back into a `WorkflowContext`, which locks the registry, without a
+    /// deadlock.
     ///
     /// # Errors
     ///
     /// - Returns [`HarvestError::QueryHandlerNotFound`] if `name` is not registered.
-    /// - Returns [`HarvestError::QueryHandlerPanicked`] if the handler returns `Err`.
+    /// - Returns [`HarvestError::QueryHandlerFailed`] if the handler returns `Err`.
+    /// - Returns [`HarvestError::QueryHandlerPanicked`] if the handler panics.
     ///
     /// # Examples
     ///
@@ -131,8 +132,7 @@ impl QueryRegistry {
             .cloned()
             .ok_or_else(|| HarvestError::QueryHandlerNotFound(name.to_string()))?;
 
-        // Lock released; call handler outside the borrow.
-        // Wrap in catch_unwind so a panicking handler doesn't crash the worker.
+        // A panicking handler must not crash the worker.
         // Panics → QueryHandlerPanicked (503); intentional Err returns → QueryHandlerFailed (400).
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)))
             .map_err(|e| HarvestError::QueryHandlerPanicked(panic_message(e)))?
@@ -140,8 +140,6 @@ impl QueryRegistry {
     }
 
     /// Execute a registered query handler with no arguments (`Value::Null`).
-    ///
-    /// Convenience alias for `execute_with_args(name, Value::Null)`.
     ///
     /// # Examples
     ///
@@ -163,6 +161,8 @@ impl QueryRegistry {
     /// # Errors
     ///
     /// Returns [`HarvestError::QueryHandlerNotFound`] if `name` is not registered.
+    /// Returns the other errors of [`Self::execute_with_args`] if the handler
+    /// fails or panics.
     pub fn execute(&self, name: &str) -> HarvestResult<Value> {
         self.execute_with_args(name, Value::Null)
     }

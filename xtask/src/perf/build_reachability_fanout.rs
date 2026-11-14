@@ -1,4 +1,5 @@
-//! `cargo xtask perf build-reachability-fanout`: the port of `autumn-harvest/scripts/build_reachability_fanout_perf_repro.sh`.
+//! `cargo xtask perf build-reachability-fanout`: the port of
+//! `autumn-harvest/scripts/build_reachability_fanout_perf_repro.sh`.
 //!
 //! The reproduction harness for the build-reachability fan-out fix (Ledger perf
 //! pass), documented in `docs/performance-build-reachability-fanout.md`.

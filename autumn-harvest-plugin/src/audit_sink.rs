@@ -7,24 +7,24 @@
 //! implementation the plugin auto-wires when an embedder configures
 //! `audit_export_webhook(...)` without supplying their own sink.
 //!
-//! The wire format is JSON lines — one audit record per line — POSTed with
+//! The wire format is JSON lines, one audit record per line. The POST carries
 //! `Content-Type: application/x-ndjson` and the `X-Harvest-Signature` HMAC
-//! header core computed over the exact bytes sent.
+//! header that core computed over the exact bytes sent.
 
 use autumn_harvest::audit_export::{AuditBatch, AuditSink, SinkAttempt, SinkFuture};
 use std::time::Duration;
 
 /// Default request timeout for one audit-export batch delivery.
 ///
-/// Longer than the completion-callback default (10s): a batch carries up to
+/// Longer than the completion-callback default (10s). A batch carries up to
 /// `MAX_EXPORT_BATCH_SIZE` records, and a SIEM ingest endpoint under load is
 /// slower than a single-event webhook. A timeout is a retry, never a loss.
 ///
 /// **Deliberately below the exporter's default 60s claim lease**
-/// ([`autumn_harvest::audit_export::DEFAULT_EXPORT_LEASE`]). A sink that can
-/// outlive its lease has every attempt superseded by the next tick's claim, so
-/// the cursor never advances while the sink receives the same batch forever.
-/// Core bounds the call at the lease as a backstop, but a sink whose own
+/// ([`autumn_harvest::audit_export::DEFAULT_EXPORT_LEASE`]). The next tick's
+/// claim supersedes every attempt of a sink that can outlive its lease. The
+/// cursor then never advances, and the sink receives the same batch forever.
+/// Core bounds the call at the lease as a backstop. But a sink whose own
 /// timeout fires first produces a much better error message. If you raise this
 /// with [`ReqwestAuditSink::with_timeout`], raise
 /// `HarvestBuilder::audit_export_lease(...)` to match.
@@ -40,13 +40,12 @@ pub const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 /// An [`AuditSink`] that POSTs signed JSON-lines batches to one endpoint.
 ///
 /// Redirects are never followed (`redirect::Policy::none()`), for the same
-/// reason as [`crate::callback_deliverer::ReqwestCallbackDeliverer`]: an
-/// allowlisted host answering 3xx with a pointer at a non-allowlisted (e.g.
-/// internal) address must never be silently chased, or the SSRF guard applied
-/// to the sink URL at build time would be bypassed at delivery time. A 3xx is
-/// reported as its literal status, which `SinkAttempt::is_success` classifies
-/// as a failure — so it flows through the normal backoff path and, crucially,
-/// **never advances the cursor**.
+/// reason as [`crate::callback_deliverer::ReqwestCallbackDeliverer`]. An
+/// allowlisted host can answer 3xx with a pointer at a non-allowlisted (e.g.
+/// internal) address. Chasing it would bypass the SSRF guard applied to the
+/// sink URL at build time. A 3xx is reported as its literal status.
+/// `SinkAttempt::is_success` classifies it as a failure. So it takes the normal
+/// backoff path and **never advances the cursor**.
 pub struct ReqwestAuditSink {
     client: reqwest::Client,
     endpoint: String,
@@ -62,8 +61,8 @@ impl ReqwestAuditSink {
     /// Build a sink with a custom per-request timeout.
     ///
     /// # Panics
-    /// Never panics in practice: the internal `expect` only guards against a
-    /// `reqwest::Client` builder failure, which cannot occur for this static,
+    /// Never panics in practice. The internal `expect` guards a
+    /// `reqwest::Client` builder failure. That cannot occur for this static,
     /// valid configuration (a timeout and a redirect policy).
     #[must_use]
     #[expect(
@@ -109,12 +108,11 @@ impl AuditSink for ReqwestAuditSink {
                 // `reqwest::Error`'s `Display` appends " for url (<url>)" with
                 // the full URL, query string included (issue #953 review).
                 // That string is persisted to `harvest_audit_export_cursor.
-                // last_error`, served by `GET /admin/audit-export`, and logged
-                // — so a SIEM endpoint that carries its ingest credential in
-                // the URL (Sumo Logic's `/receiver/v1/http/<secret>`, a
-                // `?dd-api-key=`, an `?api_key=`) would leak it into all
-                // three, permanently. Report the error's own chain without the
-                // URL instead.
+                // last_error`, served by `GET /admin/audit-export`, and logged.
+                // A SIEM endpoint can carry its ingest credential in the URL
+                // (Sumo Logic's `/receiver/v1/http/<secret>`, a `?dd-api-key=`,
+                // an `?api_key=`). It would leak into all three, permanently.
+                // So report the error's own chain without the URL.
                 Err(error) => SinkAttempt::transport_error(describe_without_url(&error)),
             }
         })
@@ -249,7 +247,7 @@ mod tests {
     }
 
     /// The sink must put the bytes core signed on the wire, untouched, with
-    /// every header core computed — re-serializing here would invalidate the
+    /// every header core computed. Re-serializing would invalidate the
     /// signature the receiver checks.
     #[tokio::test]
     async fn the_signed_body_and_headers_reach_the_wire_verbatim() {
@@ -296,9 +294,9 @@ mod tests {
     }
 
     /// A 3xx must surface as its literal status, never be followed. That is
-    /// the whole point of `redirect::Policy::none()`: an allowlisted host
-    /// answering with a pointer at an internal address must not be chased, and
-    /// the non-2xx must flow into the backoff path so the cursor is held.
+    /// the point of `redirect::Policy::none()`. A pointer at an internal
+    /// address must not be chased. The non-2xx must take the backoff path, so
+    /// the cursor is held.
     #[tokio::test]
     async fn a_redirect_is_reported_as_a_failure_and_never_followed() {
         let record = sample_record();
@@ -332,9 +330,9 @@ mod tests {
         );
     }
 
-    /// A transport error must never carry the sink URL: a SIEM endpoint that
-    /// holds its ingest credential in the path or query would otherwise leak
-    /// it into the cursor row, the admin API, and the logs.
+    /// A transport error must never carry the sink URL. A SIEM endpoint can
+    /// hold its ingest credential in the path or query. It would leak into the
+    /// cursor row, the admin API, and the logs.
     #[tokio::test]
     async fn a_transport_error_never_leaks_the_sink_url() {
         let record = sample_record();

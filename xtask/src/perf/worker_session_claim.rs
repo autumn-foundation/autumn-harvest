@@ -1,4 +1,5 @@
-//! `cargo xtask perf worker-session-claim`: the port of `autumn-harvest/scripts/worker_session_claim_perf_repro.sh`.
+//! `cargo xtask perf worker-session-claim`: the port of
+//! `autumn-harvest/scripts/worker_session_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the worker-sessions claim-predicate
 //! measurement (issue #606, Ledger perf pass).

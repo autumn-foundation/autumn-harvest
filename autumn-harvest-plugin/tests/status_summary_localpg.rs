@@ -2,17 +2,16 @@
 //!
 //! The primary coverage for this route lives in `status_summary_integration.rs`,
 //! which spins a real Postgres via testcontainers. In sandboxes that have a
-//! running Postgres but **no Docker daemon**, testcontainers can't start a
-//! container — so this file drives the identical app router (built with
+//! running Postgres but **no Docker daemon**, testcontainers cannot start a
+//! container. So this file drives the identical app router (built with
 //! `harvest_api_router` over `HarvestApiState`) against an operator-supplied
-//! `DATABASE_URL` instead, exercising the real HTTP route through the axum stack
-//! (not just the pure classifiers). It mirrors the #597 M9 precedent of
+//! `DATABASE_URL` instead. It exercises the real HTTP route through the axum
+//! stack, not just the pure classifiers. It mirrors the #597 M9 precedent of
 //! verifying routes end-to-end against a local Postgres by applying migrations
 //! directly.
 //!
-//! **Opt-in / CI-safe**: the test is a no-op unless `DATABASE_URL` is set, so it
-//! never runs (and never fails) in CI without an explicitly provided database.
-//! Run it locally with e.g.:
+//! **Opt-in / CI-safe**: the test is a no-op unless `DATABASE_URL` is set. So
+//! CI without an explicit database never runs it. Run it locally with e.g.:
 //!
 //! ```sh
 //! DATABASE_URL='postgres://harvest:harvest@localhost:5432/harvest_test' \
@@ -22,20 +21,20 @@
 //! All phases run in one `#[tokio::test]` sequentially, resetting the schema
 //! between phases, so the result is deterministic regardless of `--test-threads`.
 //!
-//! **Circuit-breaker-tracked backlog (PR #988 review, issue #679):** the
-//! per-shard queue-backlog scan now threads the runtime's circuit-breaker
-//! tracked-activity names into `claimable_pending_demand_by_queue` (so a
-//! breaker-tracked activity's rows count as claimable even with an empty
-//! rate-limit bucket — matching `claim_task` and the shard-health coverage
-//! gate). That non-empty-names path is intentionally **not** exercised here: this
-//! harness builds `HarvestApiState` with `install_storage_pool` only and never
-//! calls `install(runtime)`, so `api_state.runtime()` is `Err` and the resolved
-//! tracked-names set is always empty (the safe under-count-free fallback the plumbing
-//! degrades to at early boot). The non-empty branch is the byte-identical mirror
-//! of `shard_health.rs`'s already-tested coverage-gate call, so its correctness
-//! is covered there and by the core-crate tests for
-//! `queue::claimable_pending_demand_by_queue`; the compiler verifies the
-//! parameter threading.
+//! **Circuit-breaker-tracked backlog (PR #988, issue #679):** the per-shard
+//! queue-backlog scan passes the runtime's circuit-breaker tracked-activity
+//! names into `claimable_pending_demand_by_queue`. So a breaker-tracked
+//! activity's rows count as claimable even with an empty rate-limit bucket.
+//! That matches `claim_task` and the shard-health coverage gate.
+//!
+//! This file intentionally does **not** exercise that non-empty-names path.
+//! The harness builds `HarvestApiState` with `install_storage_pool` only and
+//! never calls `install(runtime)`. So `api_state.runtime()` is `Err`, and the
+//! tracked-names set is always empty. That is the safe early-boot fallback.
+//! The non-empty branch mirrors the tested coverage-gate call in
+//! `shard_health.rs` byte for byte. Those tests and the core-crate tests for
+//! `queue::claimable_pending_demand_by_queue` cover it. The compiler verifies
+//! the parameter threading.
 
 use std::collections::BTreeMap;
 
@@ -62,11 +61,10 @@ type HarvestApiApp = axum::Router;
 /// Drop and recreate the `public` schema, then apply the full migration set —
 /// giving each phase a clean, deterministic slate on the shared local database.
 ///
-/// Also creates and populates `__diesel_schema_migrations` from the on-disk
-/// migration directories so the shard-health readiness probe (which reads that
-/// table, `shard_health.rs`) sees a fully-migrated schema — exactly what a real
-/// `diesel migration run` deployment produces, and what raw `up.sql` application
-/// alone does not.
+/// Also fills `__diesel_schema_migrations` from the on-disk migration
+/// directories. The shard-health readiness probe in `shard_health.rs` reads that
+/// table. It then sees a fully-migrated schema, as after `diesel migration run`.
+/// Raw `up.sql` application alone does not give that.
 async fn reset_and_migrate(url: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -220,10 +218,9 @@ async fn seed_running_execution(url: &str, shard: i32) -> Uuid {
     exec_id.as_uuid()
 }
 
-/// Insert a fresh (`NOW()`) `harvest_events` row for `exec_id` so the execution
-/// is not counted as stalled (the stalled predicate is: active state with no
-/// `harvest_events` row newer than the no-progress window). This is the piece
-/// that distinguishes a *healthy, progressing* run from a stalled one.
+/// Insert a fresh (`NOW()`) `harvest_events` row for `exec_id`, so the execution
+/// is not stalled. A stalled run has an active state and no `harvest_events` row
+/// newer than the no-progress window. This row makes the run *healthy*.
 async fn seed_recent_event(url: &str, exec_id: Uuid) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -239,9 +236,9 @@ async fn seed_recent_event(url: &str, exec_id: Uuid) {
     .expect("seed recent event");
 }
 
-/// Insert a future-dated, unfired durable timer for `exec_id` — a workflow that
-/// is legitimately parked on a long `ctx.timer`/`receive_signal_timeout` and is
-/// therefore "correctly sleeping", NOT stalled (issue #679 review, FIX 1).
+/// Insert a future-dated, unfired durable timer for `exec_id` (issue #679).
+/// The workflow is parked on a long `ctx.timer`/`receive_signal_timeout`. It is
+/// "correctly sleeping", NOT stalled.
 async fn seed_future_timer(url: &str, exec_id: Uuid) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -437,10 +434,10 @@ async fn admin_status_localpg_end_to_end() {
     );
 
     // ── (e) a workflow correctly sleeping on a future timer is NOT stalled ───
-    // (issue #679 review, FIX 1) The exec has no recent event (so it passes the
-    // event-age stalled predicate) but its sole pending work is a future-dated
-    // timer, so the future-timer exclusion — copied verbatim from
-    // `load_stalled_workflows` — must keep it out of the stalled count.
+    // (issue #679) The exec has no recent event. So it passes the event-age
+    // stalled predicate. Its sole pending work is a future-dated timer. The
+    // future-timer exclusion, copied verbatim from `load_stalled_workflows`,
+    // must keep it out of the stalled count.
     reset_and_migrate(&url).await; // also populates the migration ledger
     let sleeper = seed_running_execution(&url, 0).await;
     seed_future_timer(&url, sleeper).await; // sole pending work is a future timer

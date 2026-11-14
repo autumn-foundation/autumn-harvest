@@ -2,14 +2,13 @@
 //! WebAssembly activities (issue #965, milestone 2).
 //!
 //! This module is the storage half of issue #965. It sits on top of the pure
-//! runtime in [`crate::wasm_activities`]: modules are published to and resolved
-//! from `harvest_wasm_modules`, and [`resolve_wasm_dispatch`] turns a resolved
+//! runtime in [`crate::wasm_activities`]. Modules are published to and resolved
+//! from `harvest_wasm_modules`. [`resolve_wasm_dispatch`] turns a resolved
 //! module into a ready-to-invoke [`PreparedWasmActivity`] for the worker
 //! dispatch seam.
 //!
-//! Everything here is gated behind the `wasm-activities` Cargo feature (which
-//! implies `db`), so a default build pulls in neither `wasmtime` nor this table
-//! access and is byte-for-byte unchanged.
+//! The `wasm-activities` Cargo feature (which implies `db`) gates everything
+//! here. A default build pulls in neither `wasmtime` nor this table access.
 //!
 //! # Content addressing and the single-active invariant
 //!
@@ -17,13 +16,13 @@
 //! ([`WasmModuleStore::compute_hash`]). The `harvest_wasm_modules` table has a
 //! composite primary key `(hash, activity_name)` so identical bytes can bind to
 //! two different activity names independently. A partial unique index
-//! (`WHERE active`) guarantees at most one **active** version per activity name,
-//! so a hot-swap (publish v2 → deactivate v1 → activate v2) can never leave two
+//! (`WHERE active`) enforces at most one **active** version per activity name.
+//! So a hot-swap (publish v2 → deactivate v1 → activate v2) never leaves two
 //! active versions racing.
 //!
-//! [`publish_wasm_module`] serialises concurrent publishes for the same activity
-//! name with a transaction-scoped advisory lock, so two workers publishing
-//! different versions of the same activity converge on exactly one active row.
+//! [`publish_wasm_module`] serialises concurrent publishes for one activity
+//! name with a transaction-scoped advisory lock. Two workers that publish
+//! different versions of one activity converge on exactly one active row.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +65,7 @@ pub struct WasmBinding {
 ///
 /// # Knobs a native `#[activity]` has that this deliberately omits
 ///
-/// These are absent by design in the spike, not oversights (issue #965 review):
+/// These are absent by design in the spike, not oversights (issue #965):
 ///
 /// * `heartbeat_timeout` — a guest cannot heartbeat. Delivering heartbeats into
 ///   the guest is the main GA gap; see `docs/rnd/wasm-activities-spike.md` §4.
@@ -79,9 +78,9 @@ pub struct WasmBinding {
 ///   parses it.
 /// * `schedule_to_start` — no WASM-specific queue-wait semantics exist.
 ///
-/// Because they are hardcoded `None` on the generated [`crate::info::ActivityInfo`],
-/// setting them elsewhere would silently do nothing; they are listed here so that
-/// is a documented decision rather than a surprise.
+/// They are hardcoded `None` on the generated [`crate::info::ActivityInfo`]. So
+/// setting them elsewhere does nothing. This list makes that a documented
+/// decision, not a surprise.
 #[derive(Debug, Clone)]
 pub struct WasmActivityRegistration {
     /// Snake-case activity name — the key both the task queue and the module
@@ -210,11 +209,11 @@ pub struct WasmModuleRow {
 
 /// Where a prepared activity's compiled module comes from.
 ///
-/// A cache hit at resolve time carries the already-compiled module
-/// ([`Self::Compiled`]); a cache miss defers the CPU-bound wasmtime compile to
-/// [`PreparedWasmActivity::invoke`] (which the worker runs on the blocking
-/// pool), carrying only the raw bytes ([`Self::Deferred`]) so no compilation
-/// ever runs on the async dispatch path (issue #965 review).
+/// A cache hit at resolve time carries the compiled module ([`Self::Compiled`]).
+/// A cache miss carries only the raw bytes ([`Self::Deferred`]). It defers the
+/// CPU-bound wasmtime compile to [`PreparedWasmActivity::invoke`], which the
+/// worker runs on the blocking pool. So no compilation runs on the async
+/// dispatch path (issue #965).
 enum WasmModuleSource {
     /// Cache hit: the module was already compiled and is served directly.
     Compiled(Arc<Module>),
@@ -226,9 +225,9 @@ enum WasmModuleSource {
 /// A resolved WASM activity ready to invoke against a JSON input.
 ///
 /// Holds the shared engine store plus the caller's capability/limit/deadline
-/// policy. The compiled module is either already cached (a resolve-time hit) or
-/// compiled lazily on first [`invoke`](Self::invoke) (a resolve-time miss), so
-/// the async dispatch path never runs wasmtime compilation.
+/// policy. A resolve-time hit holds the cached module. A resolve-time miss
+/// compiles lazily on the first [`invoke`](Self::invoke). So the async dispatch
+/// path never runs wasmtime compilation.
 pub struct PreparedWasmActivity {
     /// The shared engine + compiled-module cache (one per worker).
     pub store: Arc<WasmModuleStore>,
@@ -243,18 +242,17 @@ pub struct PreparedWasmActivity {
     pub deadline: Option<Duration>,
     /// Optional cancellation token: when set, a cancelled guest is
     /// cooperatively interrupted within ~1 epoch tick instead of running to the
-    /// wall-clock ceiling (issue #965 review).
+    /// wall-clock ceiling (issue #965).
     pub cancel: Option<CancellationToken>,
     /// The instant the activity's start-to-close clock began — the worker
     /// captures this as `ActivityStarted` is recorded, *before* dispatch
-    /// resolution (issue #965 review round 7). By the time the guest is about to
-    /// run, this clock has ticked through active-hash resolution, cold-cache
-    /// byte fetch from Postgres, the async→blocking handoff, and (on a cache
-    /// miss) module compilation. Measuring `dispatch_start.elapsed()` just
-    /// before the guest invoke charges that entire pre-guest interval against
-    /// the guest's epoch deadline in one measurement — subsuming the earlier
-    /// compile-only subtraction. `None` charges nothing (a non-worker
-    /// constructor that has no dispatch-start reference).
+    /// resolution (issue #965). Before the guest runs, this clock ticks
+    /// through active-hash resolution, cold-cache byte fetch from Postgres, the
+    /// async→blocking handoff, and (on a cache miss) module compilation.
+    /// `dispatch_start.elapsed()` just before the guest invoke measures that
+    /// whole pre-guest interval once. The invoke charges it against the guest's
+    /// epoch deadline. `None` charges nothing (a non-worker constructor that
+    /// has no dispatch-start reference).
     pub dispatch_start: Option<Instant>,
 }
 
@@ -264,43 +262,42 @@ impl PreparedWasmActivity {
     ///
     /// This is CPU-bound and blocking (it drives the guest to completion on the
     /// calling thread), so the worker calls it inside `spawn_blocking`. On a
-    /// resolve-time cache miss it also compiles the module here (on that same
-    /// blocking thread), verifying content integrity before compiling — so
-    /// wasmtime compilation never occupies an async worker thread.
+    /// resolve-time cache miss it also compiles the module on that blocking
+    /// thread. It verifies content integrity before it compiles. So wasmtime
+    /// compilation never occupies an async worker thread.
     ///
     /// # Errors
     ///
-    /// Returns the typed [`ActivityFailure`] classifying any sandbox denial,
-    /// resource exhaustion, guest trap, ABI violation, cooperative
-    /// cancellation, contained host-glue panic, or (on a deferred-compile miss)
-    /// a `WasmModuleInvalid` integrity/compile failure.
+    /// Returns the typed [`ActivityFailure`] for any sandbox denial, resource
+    /// exhaustion, guest trap, ABI violation, cooperative cancellation or
+    /// contained host-glue panic. A deferred-compile miss can also return a
+    /// `WasmModuleInvalid` integrity/compile failure.
     pub fn invoke(&self, input: &serde_json::Value) -> Result<serde_json::Value, ActivityFailure> {
-        // Resolve the module (compiling on a Deferred cache miss), then hand the
+        // Resolve the module (compiling on a Deferred cache miss). Then hand the
         // raw start-to-close deadline plus the `dispatch_start` instant to the
         // invoke path. ALL pre-guest overhead accounting happens there, at the
-        // last moment before the guest's epoch deadline is armed (issue #965
-        // review rounds 7 & 9): the whole pre-guest interval — active-hash
-        // resolution, cold-cache byte fetch from Postgres, the async→blocking
-        // handoff, module compilation (this function), and input serialization —
-        // is charged against the guest's deadline in ONE measurement, and an
-        // attempt whose overhead already spent the budget fails fast as a
-        // retryable `ResourceExhausted` *without invoking the guest*. Compile
-        // stays here because it happens on this blocking thread and needs the
+        // last moment before the guest's epoch deadline is armed (issue #965).
+        // ONE measurement charges the whole pre-guest interval against the
+        // guest's deadline. That interval covers active-hash resolution,
+        // cold-cache byte fetch from Postgres, the async→blocking handoff,
+        // module compilation (this function) and input serialization. An
+        // attempt whose overhead spent the budget fails fast as a retryable
+        // `ResourceExhausted` *without invoking the guest*. Compile stays here
+        // because it runs on this blocking thread and needs the
         // cancel-before-compile skip below.
         let module = match &self.source {
             WasmModuleSource::Compiled(module) => Arc::clone(module),
             WasmModuleSource::Deferred { hash, bytes } => {
                 // Skip a cold compile entirely if the attempt is already
-                // cancelled (issue #965 review). The cancellation-aware epoch
-                // deadline is only armed inside the invoke *after* this compile,
-                // so without this check a cancel arriving during a large cold
-                // compile drops the join handle while the blocking thread keeps
-                // compiling to completion. NB: a `Module::new` compile ALREADY in
-                // flight cannot be interrupted (wasmtime compilation is not
-                // cancellable); this only avoids *starting* one. The blast radius
-                // is bounded by the 32 MiB module-size cap, and the GA mitigation
-                // is to precompile at publish/seed time so no compile ever runs
-                // on the dispatch path.
+                // cancelled (issue #965). The invoke arms the cancellation-aware
+                // epoch deadline only *after* this compile. Without this check, a
+                // cancel during a large cold compile drops the join handle. The
+                // blocking thread then keeps compiling to completion. NB: a
+                // `Module::new` compile ALREADY in flight cannot be interrupted,
+                // because wasmtime compilation is not cancellable. This only
+                // avoids *starting* one. The 32 MiB module-size cap bounds the
+                // blast radius. The GA mitigation is to precompile at
+                // publish/seed time, so no compile runs on the dispatch path.
                 if self
                     .cancel
                     .as_ref()
@@ -311,9 +308,8 @@ impl PreparedWasmActivity {
                     ));
                 }
                 // Compile (and integrity-check) here, on the blocking pool. A
-                // concurrent dispatch may have compiled the same hash already;
-                // `get_or_compile` serves the cached `Arc` if so, otherwise
-                // compiles and caches it.
+                // concurrent dispatch may have compiled the same hash already.
+                // `get_or_compile` then serves the cached `Arc`.
                 self.store.get_or_compile(hash, bytes).map_err(|e| {
                     ActivityFailure::wasm_module_invalid(format!(
                         "wasm module {hash} is invalid: {e}"
@@ -335,18 +331,18 @@ impl PreparedWasmActivity {
 }
 
 /// The guest's remaining wall-clock budget after charging pre-guest overhead
-/// against the configured start-to-close deadline (issue #965 review).
+/// against the configured start-to-close deadline (issue #965).
 ///
 /// Distinguishes the three outcomes the caller must handle differently: fail
 /// fast without invoking, invoke with a reduced deadline, or invoke unbounded.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InvokeBudget {
     /// A start-to-close deadline was configured but pre-guest overhead already
-    /// met or exceeded it before the guest could start. The attempt has spent
-    /// its whole budget resolving/fetching/compiling, so it must fail fast as a
-    /// retryable `ResourceExhausted` **without invoking the guest** — a fast
-    /// guest handed a clamped 1-tick deadline could otherwise race to
-    /// completion and be recorded successful past its own deadline.
+    /// met or exceeded it before the guest could start. The attempt spent its
+    /// whole budget resolving/fetching/compiling. So it must fail fast as a
+    /// retryable `ResourceExhausted` **without invoking the guest**. Otherwise
+    /// a fast guest with a clamped 1-tick deadline could complete and be
+    /// recorded successful past its own deadline.
     Exhausted,
     /// A strictly-positive remaining budget; invoke the guest with this deadline.
     Remaining(Duration),
@@ -355,23 +351,23 @@ pub(crate) enum InvokeBudget {
     Unbounded,
 }
 
-/// Charge `pre_guest_elapsed` — the total time from when the activity's
-/// start-to-close clock began until just before the guest is invoked — against
-/// the guest's wall-clock `deadline` (issue #965 review rounds 7 & 9).
+/// Charge `pre_guest_elapsed` against the guest's wall-clock `deadline`
+/// (issue #965).
 ///
-/// This interval accrues against `start_to_close` from the moment the worker
-/// records `ActivityStarted`, and covers dispatch resolution (active-hash
-/// lookup), cold-cache byte fetch from Postgres, the async→blocking handoff,
-/// and (on a cache miss) module compilation — every millisecond of pre-guest
-/// overhead, not just compile. Resolving it here classifies the guest's real
-/// remaining budget:
+/// `pre_guest_elapsed` runs from the start of the start-to-close clock until
+/// just before the guest invoke. It accrues against `start_to_close` from the
+/// moment the worker records `ActivityStarted`. It covers dispatch resolution
+/// (active-hash lookup), cold-cache byte fetch from Postgres, the
+/// async→blocking handoff, and (on a cache miss) module compilation. So it is
+/// every millisecond of pre-guest overhead, not just compile. This function
+/// classifies the guest's real remaining budget:
 ///
-/// * `None` (no deadline configured) → [`InvokeBudget::Unbounded`] — the
+/// * `None` (no deadline configured) → [`InvokeBudget::Unbounded`]. The
 ///   mandatory `limits.max_wall_clock` ceiling still applies inside the invoke.
-/// * Pre-guest overhead that meets or exceeds the deadline
-///   (`pre_guest_elapsed >= d`) → [`InvokeBudget::Exhausted`], so the attempt
-///   fails fast **before** the guest is invoked rather than running under a
-///   zero-that-clamps-to-one-tick deadline it may win a race against.
+/// * Overhead that meets or exceeds the deadline (`pre_guest_elapsed >= d`) →
+///   [`InvokeBudget::Exhausted`]. The attempt fails fast **before** the guest
+///   is invoked. It does not run under a zero deadline that clamps to one
+///   tick, which the guest may win a race against.
 /// * A strictly-positive remainder → [`InvokeBudget::Remaining`], tightening the
 ///   guest's epoch deadline toward the real remaining budget. On a cache hit
 ///   with negligible resolution overhead this is effectively the full deadline.
@@ -476,11 +472,11 @@ pub async fn publish_signed_wasm_module(
         conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
             use crate::schema::harvest_wasm_modules::dsl as m;
 
-            // Serialise concurrent publishes for the SAME activity name so the
-            // deactivate + upsert pair is atomic and the partial unique index
-            // (`WHERE active`) can never see two active rows mid-swap. The lock
-            // is transaction-scoped (auto-released on commit/rollback), and
-            // keyed on the activity name so distinct names never contend.
+            // Serialise concurrent publishes for the SAME activity name. The
+            // deactivate + upsert pair is then atomic, and the partial unique
+            // index (`WHERE active`) never sees two active rows mid-swap. The
+            // lock is transaction-scoped (auto-released on commit/rollback). Its
+            // key is the activity name, so distinct names never contend.
             diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
                 .bind::<diesel::sql_types::Text, _>(&name)
                 .execute(conn)
@@ -531,18 +527,18 @@ pub async fn publish_signed_wasm_module(
 /// Seed `bytes` as a WASM module version for `activity_name` at worker startup
 /// (issue #965).
 ///
-/// **Seed, not publish.** Unlike [`publish_wasm_module`] — which always
-/// activates the given bytes (operator hot-swap intent) — seeding is
-/// *activate-only-if-absent*: it ensures the `(hash, activity_name)` row exists
-/// (so the bytes are fetchable by hash for in-flight pinned attempts and for
-/// this worker to run its own embedded version), but it activates the embedded
-/// version **only when no active version already exists** for the name.
+/// **Seed, not publish.** [`publish_wasm_module`] always activates the given
+/// bytes (operator hot-swap intent). Seeding is *activate-only-if-absent*. It
+/// ensures the `(hash, activity_name)` row exists. In-flight pinned attempts
+/// can then fetch the bytes by hash, and this worker can run its own embedded
+/// version. It activates the embedded version **only when no active version
+/// already exists** for the name.
 ///
-/// This is the fix for a rolling-deploy hazard: if the database has already been
-/// hot-swapped to v2 and an *older* worker embedding v1 restarts, a blind
-/// publish would flip the shard back to v1 (running stale code until another
-/// publisher wins). Seeding leaves the existing active v2 untouched while still
-/// making v1's bytes available.
+/// This fixes a rolling-deploy hazard. Say the database is already hot-swapped
+/// to v2 and an *older* worker embedding v1 restarts. A blind publish would
+/// flip the shard back to v1, which runs stale code until another publisher
+/// wins. Seeding leaves the active v2 untouched and still makes v1's bytes
+/// available.
 ///
 /// Idempotent, and serialised against concurrent publishes/seeds for the same
 /// name with the same transaction-scoped advisory lock `publish_wasm_module`
@@ -848,11 +844,11 @@ pub async fn list_wasm_modules(
 /// **Resolve-hash-first, compile-off-the-async-path**: cheaply resolve the
 /// active hash, then serve a compiled module from the store's in-process cache
 /// on a hit (no bytes fetch). On a miss, load the bytes but **defer** the
-/// CPU-bound wasmtime compile to [`PreparedWasmActivity::invoke`] (which the
-/// worker runs on the blocking pool), so the async dispatch thread never runs
-/// compilation, which could otherwise stall unrelated polling/heartbeats/
-/// cancellation (issue #965 review). So the async path only ever does the hash
-/// resolve, the cache probe, and (on a miss) the byte fetch.
+/// CPU-bound wasmtime compile to [`PreparedWasmActivity::invoke`]. The worker
+/// runs that on the blocking pool. So the async dispatch thread never runs
+/// compilation, which could stall unrelated polling/heartbeats/cancellation
+/// (issue #965). The async path only does the hash resolve, the cache probe,
+/// and (on a miss) the byte fetch.
 ///
 /// `cancel`, when set, is carried onto the prepared activity so a cancelled
 /// guest is cooperatively interrupted rather than running to its wall-clock
@@ -874,8 +870,8 @@ pub async fn resolve_wasm_dispatch(
     name: &str,
     deadline: Option<Duration>,
     cancel: Option<CancellationToken>,
-    // The instant the activity's start-to-close clock began (issue #965 review
-    // round 7). Threaded into the resolved `PreparedWasmActivity` so `invoke`
+    // The instant the activity's start-to-close clock began (issue #965).
+    // Threaded into the resolved `PreparedWasmActivity` so `invoke`
     // charges the whole resolution + fetch + compile interval against the
     // guest's deadline, not just compile.
     dispatch_start: Instant,
@@ -976,11 +972,11 @@ mod tests {
 
     #[test]
     fn registration_carries_schedule_to_close_into_activity_info() {
-        // Issue #965 review: `schedule_to_close` (#378) is the CROSS-RETRY wall
-        // clock — the only bound that stops a deterministically-failing guest
-        // (say, an infinite loop that burns its start-to-close every attempt)
-        // from walking the whole retry curve. A native `#[activity]` can set it;
-        // a WASM activity had no way to, and `ActivityInfo::wasm` hardcoded
+        // Issue #965: `schedule_to_close` (#378) is the CROSS-RETRY wall clock.
+        // It is the only bound that stops a deterministically-failing guest from
+        // walking the whole retry curve. An example is an infinite loop that
+        // burns its start-to-close every attempt. A native `#[activity]` can set
+        // it. A WASM activity could not, and `ActivityInfo::wasm` hardcoded
         // `None`, so the bound was structurally unreachable.
         let reg = WasmActivityRegistration::new("wasm_act", b"\0asm".to_vec())
             .with_schedule_to_close(Some(Duration::from_secs(300)));
@@ -1052,7 +1048,7 @@ mod tests {
     #[test]
     fn effective_deadline_subtracts_total_pre_guest_elapsed() {
         // Total pre-guest overhead (resolution + fetch + compile) that ate part
-        // of the budget tightens the remaining deadline (issue #965 round 7).
+        // of the budget tightens the remaining deadline (issue #965).
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(10)), Duration::from_secs(3)),
             InvokeBudget::Remaining(Duration::from_secs(7))
@@ -1061,9 +1057,9 @@ mod tests {
 
     #[test]
     fn effective_deadline_charges_resolution_plus_compile_not_just_compile() {
-        // The whole class this fix closes: a slow pool checkout + DB byte fetch
-        // (say 4s) plus a compile (say 2s) — 6s of pre-guest overhead — must be
-        // charged, so a 10s start-to-close leaves the guest 4s, not 8s.
+        // A slow pool checkout + DB byte fetch (say 4s) plus a compile (say 2s)
+        // is 6s of pre-guest overhead. All of it is charged, so a 10s
+        // start-to-close leaves the guest 4s, not 8s.
         let resolution = Duration::from_secs(4);
         let compile = Duration::from_secs(2);
         let total_pre_guest = resolution + compile;
@@ -1087,8 +1083,8 @@ mod tests {
     #[test]
     fn effective_deadline_over_budget_is_exhausted() {
         // Pre-guest overhead that EXCEEDED the deadline must fail fast without
-        // invoking the guest (issue #965 round 9) — not hand it a zero deadline
-        // that clamps to one epoch tick a fast guest could win a race against.
+        // invoking the guest (issue #965). It must not get a zero deadline. That
+        // clamps to one epoch tick, and a fast guest could win a race against it.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(2)), Duration::from_secs(5)),
             InvokeBudget::Exhausted
@@ -1119,10 +1115,10 @@ mod tests {
     #[test]
     fn cancelled_deferred_invoke_skips_compile() {
         // An already-cancelled token on a cache-miss (Deferred) invoke must skip
-        // the cold compile and return promptly (issue #965 review). The bytes are
-        // deliberately invalid wasm: had the compile run, `get_or_compile` would
-        // return `WasmModuleInvalid`; instead we get a cancelled
-        // `ResourceExhausted`, proving the compile was never started.
+        // the cold compile and return promptly (issue #965). The bytes are
+        // deliberately invalid wasm. A compile would make `get_or_compile` return
+        // `WasmModuleInvalid`. A cancelled `ResourceExhausted` proves the compile
+        // never started.
         let store = Arc::new(WasmModuleStore::new());
         let invalid = vec![0u8, 1, 2, 3];
         let hash = WasmModuleStore::compute_hash(&invalid);
@@ -1154,11 +1150,11 @@ mod tests {
     fn over_budget_invoke_fails_fast_without_running_the_guest() {
         // An attempt whose pre-guest overhead already spent the whole
         // start-to-close budget must fail fast as ResourceExhausted BEFORE the
-        // guest is invoked (issue #965 review round 9). The module is a valid,
+        // guest is invoked (issue #965). The module is a valid,
         // trivially-fast ECHO guest: had it run under the old zero→1-tick
         // deadline it would have completed and returned Ok(input). Getting the
         // specific "before guest start" ResourceExhausted instead proves the
-        // guest never ran and the deadline race can't be lost.
+        // guest never ran and the deadline race cannot be lost.
         const ECHO_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -1208,9 +1204,9 @@ mod tests {
 
     #[test]
     fn in_budget_invoke_runs_the_guest() {
-        // The complement of the fail-fast case: with pre-guest overhead well
-        // under the deadline (round-7 behaviour preserved), the guest IS invoked
-        // and the ECHO module returns Ok(input).
+        // The complement of the fail-fast case. Pre-guest overhead is well under
+        // the deadline, so the guest IS invoked and the ECHO module returns
+        // Ok(input).
         const ECHO_WAT: &str = r#"
             (module
               (memory (export "memory") 1)

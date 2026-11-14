@@ -10,21 +10,21 @@
 //! * `tests/integration/claim_budget_tests.rs` — the CI gate. Runs the single
 //!   headline scenario and fails the build if **p50** exceeds the published
 //!   budget ([`HEADLINE_P50_BUDGET_MS`]). p99 is measured, published and
-//!   printed on failure, but it is deliberately *not* the assertion: the
-//!   headline scenario oversubscribes the box on purpose, which makes the tail
-//!   a measurement of the run queue rather than of the claim path. See the
-//!   "Why p50 and not p99" section of `claim_budget_tests.rs` for the
-//!   derivation — and do not calibrate the budget against the tail.
+//!   printed on failure. It is deliberately *not* the assertion. The headline
+//!   scenario oversubscribes the box on purpose, so the tail measures the run
+//!   queue rather than the claim path. See the "Why p50 and not p99" section
+//!   of `claim_budget_tests.rs` for the derivation. Do not calibrate the
+//!   budget against the tail.
 //!
 //! # Why a hand-rolled harness rather than criterion
 //!
 //! `queue::claim_task` is **destructive**: it transitions a row `PENDING ->
-//! RUNNING`. Criterion's statistical machinery runs the measured closure
-//! thousands of times, which would drain the seeded backlog and end up timing
-//! "claim against an empty queue" — the opposite of the thing under test. This
-//! harness instead seeds a backlog of `N`, performs a bounded number of claims
-//! (never more than a fifth of `N`, see [`measured_claims_for`]), and reports
-//! true percentiles over the collected per-claim latencies.
+//! RUNNING`. Criterion runs the measured closure thousands of times. That
+//! drains the seeded backlog and ends up timing "claim against an empty
+//! queue", the opposite of the thing under test. This harness instead seeds a
+//! backlog of `N` and performs a bounded number of claims (at most a fifth of
+//! `N`, see [`measured_claims_for`]). It reports true percentiles over the
+//! collected per-claim latencies.
 //!
 //! # Measurement hygiene
 //!
@@ -33,11 +33,11 @@
 //! * `ANALYZE` runs after every seed. Without it the planner works from stale
 //!   statistics on a freshly bulk-loaded table and picks plans that are neither
 //!   representative nor stable.
-//! * A tenth of each claimer's observations is discarded as warmup, applied
-//!   **after** collection rather than by planned index (see
-//!   [`warmup_claims_for`]) — so a scenario cut short by its wall-clock budget
-//!   still reports the samples it took instead of discarding all of them and
-//!   printing a confident-looking `0.00ms`.
+//! * The harness discards a tenth of each claimer's observations as warmup.
+//!   It trims **after** collection rather than by planned index (see
+//!   [`warmup_claims_for`]). So a scenario cut short by its wall-clock budget
+//!   still reports the samples it took. It does not discard them all and
+//!   print a confident-looking `0.00ms`.
 //! * The connection pool is always sized at or above the claimer count, so the
 //!   measurement never includes pool-checkout queueing.
 //! * Every scenario truncates the queue first, so scenarios cannot contaminate
@@ -67,9 +67,9 @@
 /// columns null. No scenario here ever inserts a `harvest_queue_pauses` or
 /// `harvest_activity_pauses` row, so those subplans only ever see empty or
 /// null input. They are evaluated, not measured — the cheapest path each of
-/// them has. Adding one means a seed variant *and* a report row; see the
-/// "Known limitations" section of `docs/performance.md`, which ranks them by
-/// how much the omission is likely to matter.
+/// them has. Adding one means a seed variant *and* a report row. The "Known
+/// limitations" section of `docs/performance.md` ranks them by how much each
+/// omission is likely to matter.
 ///
 /// `db::seed_queue_pauses` and `db::seed_activity_pauses` do insert real
 /// pause rows, but only for the dedicated pause-array-size evidence capture
@@ -78,9 +78,9 @@
 pub enum ClaimGate {
     /// Plain rows: no build id, no concurrency key, no rate limit, no pauses.
     Baseline,
-    /// Rows carry `required_build_id`; the worker's build differs and matches
-    /// only via a `harvest_build_compat` declaration, forcing the `EXISTS`
-    /// branch of the build-routing filter (issue #171) rather than the cheap
+    /// Rows carry `required_build_id`. The worker's build differs and matches
+    /// only via a `harvest_build_compat` declaration. That forces the `EXISTS`
+    /// branch of the build-routing filter (issue #171), not the cheap
     /// `required_build_id = $3` equality.
     BuildPolicy,
     /// Rows carry `concurrency_key` + `concurrency_cap`, exercising both the
@@ -103,15 +103,14 @@ pub enum ClaimGate {
     ///
     /// `PausedRows - DoubleBacklog` is an **equal-total-depth comparison, not
     /// predicate isolation**. The anti-join is a `WHERE` predicate, so it runs
-    /// *before* the `ORDER BY`: `PausedRows` feeds 10 000 rows to the sort
-    /// where this control feeds 20 000. The delta is therefore the anti-join's
-    /// probe cost *minus* that sort saving — two effects with opposite signs
-    /// that this measurement cannot separate, and whose net sign flips between
-    /// runs. See "What that control does not establish" in
-    /// `docs/performance.md`.
+    /// *before* the `ORDER BY`. `PausedRows` feeds 10 000 rows to the sort, and
+    /// this control feeds 20 000. The delta is the anti-join's probe cost *minus*
+    /// that sort saving. These two effects have opposite signs. This measurement
+    /// cannot separate them, and their net sign flips between runs. See "What
+    /// that control does not establish" in `docs/performance.md`.
     DoubleBacklog,
     /// An *additional* `backlog` rows belong to `PAUSED` executions, on top of
-    /// the claimable backlog, so the scan walks past unclaimable rows via the
+    /// the claimable backlog. The scan walks past these unclaimable rows via the
     /// `NOT EXISTS` anti-join (issue #383). Total seeded depth is
     /// `2 * backlog`; compare against [`Self::DoubleBacklog`], not
     /// [`Self::Baseline`], so the delta is not charged for the extra depth.
@@ -121,10 +120,10 @@ pub enum ClaimGate {
     PausedRows,
     /// Every gate above at once.
     ///
-    /// Not a strict upper bound: the circuit-breaker tracked set short-circuits
-    /// the rate-limit `EXISTS` and the debit CTE (`= ANY($5)` wins), so a
-    /// deployment with rate limiting and *no* breaker executes strictly more
-    /// work than this scenario does.
+    /// Not a strict upper bound. The circuit-breaker tracked set short-circuits
+    /// the rate-limit `EXISTS` and the debit CTE (`= ANY($5)` wins). A deployment
+    /// with rate limiting and *no* breaker does strictly more work than this
+    /// scenario does.
     AllGates,
     /// Rows carry a `fairness_key`, and the claim runs with fairness keys on
     /// (issue #1976).
@@ -187,7 +186,7 @@ impl ClaimGate {
     /// comparand is the equal-total-depth [`Self::DoubleBacklog`] control.
     ///
     /// That pairing controls for table depth. It does **not** isolate the
-    /// `NOT EXISTS` anti-join — see [`Self::DoubleBacklog`] — so a report
+    /// `NOT EXISTS` anti-join (see [`Self::DoubleBacklog`]). A report
     /// republished from these pairings must not label the `vs` column as a
     /// predicate cost.
     #[must_use]
@@ -229,28 +228,28 @@ pub const fn headline_scenario() -> Scenario {
 
 /// The published budget CI defends for [`headline_scenario`], in milliseconds.
 ///
-/// **Applied to p50, not p99 — deliberately, from measurement.** The headline
-/// scenario runs 8 concurrent claimers against a 4-core reference box, so the
-/// database is genuinely oversubscribed and the *tail* stops describing the
-/// claim path. Measured across repeated runs on that box:
+/// It applies to **p50, not p99**, deliberately and from measurement. The
+/// headline scenario runs 8 concurrent claimers against a 4-core reference
+/// box. So the database is genuinely oversubscribed, and the *tail* stops
+/// describing the claim path. Measured across repeated runs on that box:
 ///
 /// | statistic | idle box | loaded box | spread |
 /// |:--|--:|--:|--:|
 /// | p50 | ~220 ms | ~516 ms | **~2.3x** |
 /// | p99 | ~300 ms | ~4 665 ms | **~15x** |
 ///
-/// A p99 gate at this budget failed roughly one run in three during review —
-/// on the *same hardware class and Postgres version* that produced the
+/// A p99 gate at this budget failed about one run in three during review. It
+/// ran on the *same hardware class and Postgres version* that produced the
 /// published numbers. It was not measuring a regression; it was measuring the
 /// run queue. p50 is the statistic that tracks the query under the same load,
-/// so it is the one asserted. p99 is still measured, still published, and still
-/// printed in the failure message for diagnosis — it is simply not the
-/// assertion, because a gate that flakes is a gate everyone learns to ignore.
+/// so it is the one asserted. p99 is still measured, published and printed in
+/// the failure message for diagnosis. It is not the assertion, because
+/// everyone learns to ignore a gate that flakes.
 ///
-/// The number itself is derived, not chosen: reference p50 sits near 220 ms
-/// idle and 516 ms loaded, so this is ~2.9x the worst observation and ~6.8x the
-/// idle one. That headroom is what makes it a **cliff detector, not a drift
-/// detector** — it will not catch a predicate that makes claims 50% slower.
+/// The number is derived, not chosen. Reference p50 sits near 220 ms idle and
+/// 516 ms loaded, so this is ~2.9x the worst observation and ~6.8x the idle
+/// one. That headroom makes it a **cliff detector, not a drift detector**. It
+/// will not catch a predicate that makes claims 50% slower.
 /// `docs/performance.md`'s per-gate table is the tool for that.
 ///
 /// Lives here rather than in the gate test so that
@@ -265,8 +264,8 @@ pub const BACKLOG_SWEEP: [usize; 3] = [1_000, 10_000, 100_000];
 ///
 /// `claim_task` is destructive, so every measured claim shrinks the backlog.
 /// Consuming at most a fifth keeps the queue between 80% and 100% of its seeded
-/// depth for the whole run, which is what makes "p99 at a 10k backlog" an
-/// honest statement rather than an average over a draining queue.
+/// depth for the whole run. That makes "p99 at a 10k backlog" an honest
+/// statement rather than an average over a draining queue.
 const MAX_DRAIN_FRACTION: usize = 5;
 
 /// Absolute cap on measured claim operations, so a 100k-row sweep stays a
@@ -275,19 +274,19 @@ const MAX_MEASURED_CLAIMS: usize = 800;
 
 /// Default wall-clock ceiling for a single scenario's measured phase.
 ///
-/// A hard operation count alone is not a bound: claim latency scales with
-/// backlog depth, so a deep sweep — or a regression that makes the query far
-/// slower — would otherwise turn a benchmark into a multi-minute load test and
-/// a CI gate into a timeout. Claimers stop early when this elapses and the
-/// report carries however many samples were collected, with
-/// [`ClaimReport::truncated`] set so a short sample is visible rather than
+/// A hard operation count alone is not a bound, because claim latency scales
+/// with backlog depth. A deep sweep, or a regression that makes the query far
+/// slower, would otherwise turn a benchmark into a multi-minute load test. It
+/// would also turn a CI gate into a timeout. Claimers stop early when this
+/// elapses. The report carries the samples collected so far and sets
+/// [`ClaimReport::truncated`], so a short sample is visible rather than
 /// silently thin.
 ///
 /// **It must be large enough that a run sitting exactly at
 /// [`HEADLINE_P50_BUDGET_MS`] still completes.** Otherwise a slow-but-passing
-/// run truncates first and the gate reports "measurement unsound" instead of
-/// the latency verdict it exists to give — the wall-clock ceiling would have
-/// silently become the real budget. At the headline scenario that floor is
+/// run truncates first, and the gate reports "measurement unsound" instead of
+/// its latency verdict. The wall-clock ceiling would silently become the real
+/// budget. At the headline scenario that floor is
 /// `(800 ops / 8 claimers) x 1.5s = 150s`;
 /// [`pure_tests::wall_clock_budget_admits_a_run_at_the_latency_budget`] pins the
 /// relationship so the two constants cannot drift into an incoherent pair.
@@ -311,18 +310,18 @@ pub fn scenario_time_budget() -> std::time::Duration {
 /// seed the backlog, `ANALYZE`.
 ///
 /// Deliberately **not** the caller's measured-phase budget. The
-/// `*_with_budget` runners exist so a test can inject a tiny ceiling and assert
-/// the measured phase stops at it; handing that same ceiling to setup makes the
-/// test depend on how fast the *server* seeds, which is the opposite of the
-/// determinism those tests are written for. A one-second injected budget would
-/// panic with "benchmark setup stalled" on a loaded runner or a remote server
-/// before a single write was measured.
+/// `*_with_budget` runners let a test inject a tiny ceiling and assert that
+/// the measured phase stops at it. The same ceiling on setup makes the test
+/// depend on how fast the *server* seeds. That defeats the determinism those
+/// tests are written for. A one-second injected budget would panic with
+/// "benchmark setup stalled" on a loaded runner or a remote server before a
+/// single write was measured.
 ///
-/// Setup still needs *a* ceiling — an unbounded await against a wedged server
-/// is what `with_setup_deadline` exists to stop — so it takes the process
-/// default, which is the ceiling a non-injecting run already gives it. For
-/// every ordinary run this is the same value as [`scenario_time_budget`] and
-/// nothing changes; only an injected budget makes the two differ.
+/// Setup still needs *a* ceiling, because `with_setup_deadline` exists to
+/// stop an unbounded await against a wedged server. So setup takes the
+/// process default, the ceiling a non-injecting run already gives it. For
+/// every ordinary run this equals [`scenario_time_budget`]. Only an injected
+/// budget makes the two differ.
 #[must_use]
 pub fn setup_time_budget() -> std::time::Duration {
     scenario_time_budget()
@@ -333,10 +332,10 @@ pub fn setup_time_budget() -> std::time::Duration {
 /// Distributes `total_ops` exactly: the first `total_ops % claimers` claimers
 /// take one extra operation and the sum over all claimers is exactly
 /// `total_ops`. A naive `(total_ops / claimers).max(1)` per claimer would
-/// *exceed* `total_ops` whenever `claimers > total_ops`, breaking the
-/// [`MAX_DRAIN_FRACTION`] guarantee that a run never consumes more than a fifth
-/// of the backlog. Claimers past `total_ops` get 0 and do no work, which is the
-/// correct outcome — the drain bound wins over keeping every task busy.
+/// *exceed* `total_ops` whenever `claimers > total_ops`. That breaks the
+/// [`MAX_DRAIN_FRACTION`] guarantee that a run never consumes more than a
+/// fifth of the backlog. Claimers past `total_ops` get 0 and do no work. That
+/// is correct: the drain bound wins over keeping every task busy.
 #[must_use]
 pub const fn claims_for_claimer(total_ops: usize, claimers: usize, index: usize) -> usize {
     if claimers == 0 {
@@ -350,14 +349,14 @@ pub const fn claims_for_claimer(total_ops: usize, claimers: usize, index: usize)
 /// The measured window for a scenario: earliest resume to last completion.
 ///
 /// Each worker reports the `(resume, finish)` pair from its **own** clock, and
-/// this folds them into one interval on the shared monotonic clock. That matters
-/// because the two are not interchangeable: with more workers than runtime
-/// threads a worker is not polled the instant the start barrier releases, so
-/// `max(finish_i - resume_i)` silently drops every worker's release-to-resume
-/// delay while still counting all of its work — a too-small denominator, i.e.
-/// throughput reported higher than it actually was. The earliest resume is the
-/// closest observable stand-in for the release itself, so folding against it
-/// charges that delay to every later worker.
+/// this folds them into one interval on the shared monotonic clock. The two
+/// are not interchangeable. With more workers than runtime threads, a worker
+/// is not polled the instant the start barrier releases. So
+/// `max(finish_i - resume_i)` silently drops each worker's release-to-resume
+/// delay but still counts all of its work. That gives a too-small
+/// denominator, and so a throughput higher than the real one. The earliest
+/// resume is the closest observable stand-in for the release itself, so
+/// folding against it charges that delay to every later worker.
 ///
 /// Returns `0.0` for an empty slice, which the callers' `wall_secs <= 0.0`
 /// guards already treat as "no measurement".
@@ -366,9 +365,9 @@ pub fn measured_window(spans: &[(std::time::Instant, std::time::Instant)]) -> f6
     let Some(start) = spans.iter().map(|&(s, _)| s).min() else {
         return 0.0;
     };
-    // `max(start)` keeps the interval non-negative even if a worker somehow
-    // reported a finish before the earliest resume; `duration_since` would
-    // otherwise saturate to zero anyway, but being explicit documents it.
+    // `max(start)` keeps the interval non-negative if a worker reports a
+    // finish before the earliest resume. `duration_since` would saturate to
+    // zero anyway; this makes the bound explicit.
     let end = spans
         .iter()
         .map(|&(_, e)| e)
@@ -404,22 +403,21 @@ pub const fn measured_claims_for(backlog: usize) -> usize {
 /// `WARMUP_DIVISOR`).
 ///
 /// The first claims on a fresh connection pay plan-cache and buffer-cache costs
-/// an order of magnitude above steady state. Left in, they dominate the tail:
-/// measured on a 4-core box at the headline scenario, dropping warmup from a
-/// tenth to a flat 3 moved p99 from ~420ms to ~2900ms while p50 barely moved —
-/// i.e. the "p99" became a cold-start metric rather than a claim-path one.
+/// an order of magnitude above steady state. Left in, they dominate the tail.
+/// On a 4-core box at the headline scenario, a flat warmup of 3 instead of a
+/// tenth moved p99 from ~420ms to ~2900ms. p50 barely moved, so the "p99"
+/// became a cold-start metric rather than a claim-path one.
 const WARMUP_DIVISOR: usize = 10;
 
 /// Warmup to discard from a claimer that **actually collected** `collected`
 /// observations.
 ///
-/// Deliberately a function of what was collected, not of what was planned. The
-/// measured phase stops on a wall-clock budget, so a planned-count warmup could
-/// discard every sample a truncated run managed to take and then report a
-/// confident-looking `0.00ms` for a run that measured nothing. Taking the
-/// fraction after the fact keeps both properties: a full run sheds its cold
-/// start, and a short run still reports the samples it has (`collected < 10`
-/// discards nothing).
+/// Deliberately a function of what was collected, not of what was planned.
+/// The measured phase stops on a wall-clock budget. A planned-count warmup
+/// could discard every sample a truncated run took, then report a
+/// confident-looking `0.00ms` for a run that measured nothing. Trimming after
+/// the fact keeps both properties. A full run sheds its cold start, and a
+/// short run still reports its samples (`collected < 10` discards nothing).
 #[must_use]
 pub const fn warmup_claims_for(collected: usize) -> usize {
     collected / WARMUP_DIVISOR
@@ -434,15 +432,15 @@ pub const fn warmup_divisor() -> usize {
 /// What one claimer task reports back, split into the two windows a report
 /// needs.
 ///
-/// Named rather than positional: three of these fields are `usize` and mean
-/// different things over different windows, so a tuple would make transposing
-/// `claimed` and `total_claimed` at the aggregation site a silent
-/// reintroduction of the numerator/denominator mismatch the second counter
-/// exists to prevent.
+/// Named rather than positional. Three of these fields are `usize` and mean
+/// different things over different windows. With a tuple, a swap of `claimed`
+/// and `total_claimed` at the aggregation site compiles silently. It brings
+/// back the numerator/denominator mismatch that the second counter exists to
+/// prevent.
 ///
-/// Lives in the pure section, away from the database code that produces it, so
-/// the window split is unit-tested on every OS — including the
-/// `--no-default-features` leg, where no claim ever runs.
+/// Lives in the pure section, away from the database code that produces it.
+/// So the window split is unit-tested on every OS, including the
+/// `--no-default-features` leg, where no claim runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimerOutcome {
     /// Post-warmup latencies, milliseconds.
@@ -462,13 +460,13 @@ impl ClaimerOutcome {
     ///
     /// `observed` is `(latency_ms, claimed_a_task)` in call order.
     ///
-    /// The head is trimmed as warmup for the *latency* statistics: the first
+    /// The head is trimmed as warmup for the *latency* statistics. The first
     /// calls on a fresh connection pay plan-cache and buffer-cache costs that
-    /// are not steady state, and left in they dominate the tail. The
-    /// *throughput* numerator deliberately does not trim, because its
-    /// denominator — the scenario wall clock — starts at the first warmup call.
-    /// Trimming one side and not the other understated `claims/s` by the warmup
-    /// fraction, about 10%.
+    /// are not steady state. Left in, they dominate the tail. The *throughput*
+    /// numerator deliberately does not trim, because its denominator (the
+    /// scenario wall clock) starts at the first warmup call. Trimming one side
+    /// and not the other understated `claims/s` by the warmup fraction, about
+    /// 10%.
     #[must_use]
     pub fn from_observed(observed: Vec<(f64, bool)>, truncated: bool) -> Self {
         let warmup = warmup_claims_for(observed.len());
@@ -496,9 +494,9 @@ impl ClaimerOutcome {
 
 /// Nearest-rank percentile over a sample of millisecond latencies.
 ///
-/// Nearest-rank (rather than an interpolating definition) is deliberate: it
-/// always returns an actually-observed sample, so a reported p99 is a real
-/// claim someone waited for, not an interpolation between two.
+/// Nearest-rank, not an interpolating definition, is deliberate. It always
+/// returns an observed sample, so a reported p99 is a real claim someone
+/// waited for, not an interpolation between two.
 ///
 /// Returns `0.0` for an empty sample.
 #[must_use]
@@ -510,9 +508,9 @@ pub fn percentile_ms(samples: &[f64], percentile: f64) -> f64 {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // Nearest-rank: ceil(p/100 * n), clamped to [1, n].
     //
-    // The clamp is applied in float space *before* the cast, so the value cast
-    // to `usize` is always in `[1.0, n]` and therefore exactly representable —
-    // the truncation and sign-loss the lints warn about cannot occur here. A
+    // The clamp runs in float space *before* the cast. So the value cast to
+    // `usize` is always in `[1.0, n]` and exactly representable. The
+    // truncation and sign-loss that the lints warn about cannot occur here. A
     // NaN percentile clamps to 1.0 (`f64::clamp` returns NaN, so the explicit
     // `is_finite` guard handles it) rather than casting to an unspecified value.
     #[allow(clippy::cast_precision_loss)]
@@ -596,8 +594,8 @@ pub const BUDGET_ENV_VAR: &str = "HARVEST_CLAIM_BUDGET_MS";
 /// `default_ms`.
 ///
 /// A missing, unparseable, non-finite, or non-positive override falls back
-/// rather than silently disabling the gate — a `0` budget would make the gate
-/// unsatisfiable and a negative one would make it vacuous.
+/// rather than silently disabling the gate. A `0` or negative budget would make
+/// the gate unsatisfiable, because every positive measurement exceeds it.
 #[must_use]
 pub fn budget_from_str(raw: Option<&str>, default_ms: f64) -> f64 {
     raw.and_then(|s| s.trim().parse::<f64>().ok())
@@ -616,10 +614,11 @@ pub fn budget_from_env(default_ms: f64) -> f64 {
 /// An **allowlist**, not a denylist of `password`, because this gates what
 /// reaches a CI log: a parameter nobody thought of has to default to hidden.
 /// libpq alone carries `password` *and* `sslpassword`, and `options` can carry
-/// arbitrary text — a denylist would have to stay ahead of all of them forever,
-/// while this only has to stay ahead of what is worth printing. `user` is
-/// deliberately absent: the URL form already replaces the whole `user:password@`
-/// segment, so printing it from the query would be inconsistent.
+/// arbitrary text. A denylist would have to stay ahead of all of them forever.
+/// This list only has to stay ahead of what is worth printing. `user` is
+/// deliberately absent. The URL form already replaces the whole
+/// `user:password@` segment, so printing it from the query would be
+/// inconsistent.
 const PRINTABLE_CONN_PARAMS: &[&str] = &[
     "application_name",
     "connect_timeout",
@@ -643,11 +642,12 @@ const fn hex_val(b: u8) -> Option<u8> {
 
 /// Percent-decode, matching `tokio-postgres`' `UrlParser::decode`.
 ///
-/// That is a plain `percent_decode(..).decode_utf8()`: a `%` not followed by two
-/// hex digits is literal, and `+` is **not** a space (this is a URI, not an HTML
-/// form). `None` when the result is not valid UTF-8 — precisely when the
-/// driver's own `decode` returns `Err` and the connection string is unusable, so
-/// a caller can treat that as "the driver will never connect with this anyway".
+/// That is a plain `percent_decode(..).decode_utf8()`. A `%` not followed by
+/// two hex digits is literal. `+` is **not** a space, because this is a URI,
+/// not an HTML form. `None` when the result is not valid UTF-8. That is
+/// exactly when the driver's own `decode` returns `Err` and the connection
+/// string is unusable. So a caller can treat `None` as "the driver will never
+/// connect with this anyway".
 fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -671,12 +671,12 @@ fn percent_decode(s: &str) -> Option<String> {
 ///
 /// `UrlParser::parse_params` runs `self.decode(key)?` before dispatching to
 /// `Config::param`, so `db%6Eame=admin` is a `dbname` override. Comparing the
-/// raw key therefore misses it — and for a filter that exists to *strip* an
-/// overriding parameter, missing it is the failure that matters.
+/// raw key misses it. For a filter that exists to *strip* an overriding
+/// parameter, that miss is the failure that matters.
 ///
 /// An undecodable key falls back to its raw form. The driver errors out on such
-/// a string, so it can never connect; matching the raw text is the conservative
-/// reading for a filter whose job is to remove things.
+/// a string, so it can never connect. Matching the raw text is the
+/// conservative reading for a filter that removes things.
 fn decoded_query_key(pair: &str) -> String {
     decode_or_raw(pair.split_once('=').map_or(pair, |(k, _)| k))
 }
@@ -728,24 +728,24 @@ struct DriverUrl<'a> {
 ///
 /// Byte-exact and **prefix-only**: the driver strips these with
 /// `str::strip_prefix` and, failing that, hands the *whole* string to the
-/// keyword/value parser. So the two forms are chosen by how the string begins,
-/// never by what it contains — `host=db password=http://hunter2` is keyword
-/// form, and a case variant like `POSTGRES://…` is too.
+/// keyword/value parser. So the start of the string picks the form, never its
+/// content. `host=db password=http://hunter2` is keyword form, and so is a
+/// case variant like `POSTGRES://…`.
 const URL_SCHEME_PREFIXES: [&str; 2] = ["postgres://", "postgresql://"];
 
 /// Split a URL-form connection string, or `None` for the keyword/value form.
 ///
 /// The split follows `UrlParser::parse`'s *order* — credentials, then host,
 /// then path, then query — rather than the RFC 3986 authority grammar. The
-/// difference is load-bearing: `parse_credentials` scans for the first `@` in
-/// the **whole** remaining string, so a password containing `/` or `?` still
-/// terminates at that `@`, whereas an authority-first split would stop short
-/// and never see it.
+/// difference is load-bearing. `parse_credentials` scans for the first `@` in
+/// the **whole** remaining string. So a password that contains `/` or `?`
+/// still ends at that `@`. An authority-first split would stop short and
+/// never see it.
 ///
 /// Form selection is likewise the driver's, not a guess: only the prefixes in
-/// [`URL_SCHEME_PREFIXES`] make a string a URL. Searching for `://` anywhere
-/// would read an ordinary keyword value such as `password=http://hunter2` as a
-/// scheme, and then redact none of the string that followed it.
+/// [`URL_SCHEME_PREFIXES`] make a string a URL. A search for `://` anywhere
+/// would read a keyword value such as `password=http://hunter2` as a scheme.
+/// It would then redact none of the string after it.
 fn split_driver_url(url: &str) -> Option<DriverUrl<'_>> {
     let (prefix, rest) = URL_SCHEME_PREFIXES
         .iter()
@@ -806,21 +806,21 @@ fn unquote_span(span: &str) -> &str {
 /// Re-emit a parsed value span so that it is **self-terminating**.
 ///
 /// A raw span is only safe to re-emit at the offset it was read from. An
-/// unquoted value ends at the first *unescaped* whitespace, so a span whose
-/// last character is a dangling `\` — `application_name=bench\`, which the
-/// driver reads as `bench` because at end of input the escape has nothing to
-/// escape — stops being a terminated value the moment anything is appended
-/// after it. The backslash then escapes the joining space and the value
-/// swallows the ` dbname=…` selector [`with_db_name`] appends last, leaving a
-/// connection string with no `dbname` at all: libpq falls back to the server's
-/// default database, and this harness runs migrations and `TRUNCATE` through
+/// unquoted value ends at the first *unescaped* whitespace. Take a span whose
+/// last character is a dangling `\`, such as `application_name=bench\`. The
+/// driver reads it as `bench`, because at end of input the escape has nothing
+/// to escape. Once anything is appended after it, it stops being a terminated
+/// value. The backslash then escapes the joining space. The value swallows the
+/// ` dbname=…` selector that [`with_db_name`] appends last. The connection
+/// string then has no `dbname` at all, so libpq falls back to the server's
+/// default database. This harness runs migrations and `TRUNCATE` through
 /// exactly these rewritten strings.
 ///
 /// Quoting removes the whole class instead of special-casing the trailing
-/// backslash — a *closed* single-quoted span ends at its closing quote whatever
+/// backslash. A *closed* single-quoted span ends at its closing quote whatever
 /// follows it, so no re-emitted pair can absorb the next one. The value is
 /// decoded first (one layer of quoting stripped, escapes processed) and then
-/// re-quoted, so the driver reads back exactly the string it would have read
+/// re-quoted. So the driver reads back exactly the string it would have read
 /// from the original span.
 ///
 /// One deliberate asymmetry: a span that decodes to empty (`key=\`, a lone
@@ -862,10 +862,10 @@ fn find_from(s: &str, i: usize, pred: impl Fn(char) -> bool) -> usize {
 /// Byte offset of the first non-whitespace char at or after `i`.
 ///
 /// The predicate is `char::is_whitespace`, matching `Parser::skip_ws` exactly.
-/// An ASCII-only predicate is not a harmless approximation: on
+/// An ASCII-only predicate is not a harmless approximation. On
 /// `host=db.internal\u{00A0}password=hunter2` it reads the no-break space as an
-/// ordinary value char, so the whole tail becomes the value of the *allowlisted*
-/// `host` key and the redactor prints the password verbatim.
+/// ordinary value char. The whole tail then becomes the value of the
+/// *allowlisted* `host` key, and the redactor prints the password verbatim.
 fn skip_ws(s: &str, i: usize) -> usize {
     find_from(s, i, |c| !c.is_whitespace())
 }
@@ -878,7 +878,6 @@ fn simple_value_end(s: &str, i: usize) -> usize {
     let mut it = s[i..].char_indices();
     while let Some((off, c)) = it.next() {
         if c == '\\' {
-            // Consume the escaped char, whatever its width.
             it.next();
         } else if c.is_whitespace() {
             return i + off;
@@ -887,8 +886,9 @@ fn simple_value_end(s: &str, i: usize) -> usize {
     s.len()
 }
 
-/// End offset *past* the closing quote of a quoted value starting at `i`, or
-/// `None` when the quote is never closed (which the driver treats as an error).
+/// End offset *past* the closing quote of a quoted value starting at `i`.
+///
+/// `None` when the quote is never closed, which the driver treats as an error.
 fn quoted_value_end(s: &str, i: usize) -> Option<usize> {
     // The opening quote is one ASCII byte.
     let open = i + 1;
@@ -908,11 +908,11 @@ fn quoted_value_end(s: &str, i: usize) -> Option<usize> {
 /// Every variant is a condition the driver's own parser also rejects, so a
 /// string that produces one would not have connected as written.
 ///
-/// The text is `&'static` **by design**, not by convenience: the whole point of
-/// reporting a reason is to give a caller something diagnostic to print that
-/// cannot contain any part of the input. At the stop offset the input may be an
-/// unterminated quoted value — i.e. an entire password — so there must be no
-/// interpolation site here for a later edit to widen.
+/// The text is `&'static` **by design**, not by convenience. A reason exists
+/// to give a caller something diagnostic to print that cannot contain any part
+/// of the input. At the stop offset the input may be an unterminated quoted
+/// value, which is an entire password. So there must be no interpolation site
+/// here for a later edit to widen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeywordStop {
     /// A `=` with no keyword before it.
@@ -939,16 +939,18 @@ impl KeywordStop {
 
 /// Parse a libpq keyword/value connection string into `(key, raw value)` pairs.
 ///
-/// Returns the pairs, the offset at which parsing stopped, and — when it stopped
-/// short — *why*, so a caller can **fail closed** on the remainder rather than
-/// printing it. The reason is `Some` exactly when the parse stopped short, so a
-/// caller can branch on it instead of comparing the offset against the length.
+/// Returns the pairs, the offset at which parsing stopped and, when it stopped
+/// short, *why*. A caller can then **fail closed** on the remainder rather
+/// than print it. The reason is `Some` exactly when the parse stopped short,
+/// so a caller can branch on it instead of comparing the offset against the
+/// length.
 ///
 /// Splitting on whitespace is not sufficient, and fails in the direction that
 /// leaks. libpq's own grammar (mirrored by `tokio_postgres::Config`'s
-/// `Parser::keyword`/`value`) reads a keyword up to whitespace *or* `=`, then
-/// skips whitespace on both sides of the `=`, then reads a value that may be
-/// single-quoted and may carry backslash escapes. So all of these are one pair:
+/// `Parser::keyword`/`value`) reads a keyword up to whitespace *or* `=`. It
+/// then skips whitespace on both sides of the `=`. It then reads a value that
+/// may be single-quoted and may carry backslash escapes. So all of these are
+/// one pair:
 ///
 /// ```text
 /// password=hunter2
@@ -957,8 +959,8 @@ impl KeywordStop {
 /// password='hun\'ter two'
 /// ```
 ///
-/// A whitespace split turns the third into `password`, `=` and a bare secret —
-/// and the secret has no embedded `=`, so a key/value redactor waves it through.
+/// A whitespace split turns the third into `password`, `=` and a bare secret.
+/// The secret has no embedded `=`, so a key/value redactor waves it through.
 fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize, Option<KeywordStop>) {
     let mut out = Vec::new();
     let mut i = skip_ws(s, 0);
@@ -1012,12 +1014,12 @@ fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize, Option<KeywordS
 /// Hide the value of every `key=value` pair outside [`PRINTABLE_CONN_PARAMS`].
 ///
 /// Keys stay visible: knowing *which* options were set is diagnostic, and a key
-/// is not a secret. A token with no `=` at all is passed through — it carries no
+/// is not a secret. A token with no `=` at all passes through. It carries no
 /// value, and under a *correct* tokenizer it cannot be the tail of one.
 ///
 /// Splits on `&` **only**, because that is the driver's own value terminator
-/// (see [`DriverUrl`]); a value containing `#` is one value, not a value plus a
-/// fragment. The allowlist is matched against the *decoded* key, so
+/// (see [`DriverUrl`]). A value that contains `#` is one value, not a value
+/// plus a fragment. The allowlist is matched against the *decoded* key, so
 /// `ho%73t=…` is recognised as `host` rather than hidden under a different
 /// spelling.
 fn redact_query_values(query: &str) -> String {
@@ -1033,19 +1035,19 @@ fn redact_query_values(query: &str) -> String {
 /// Rejoins as `key=value` separated by single spaces, so `password = 'x'`
 /// normalises to `password=***`. That is a cosmetic change to a log line.
 ///
-/// **Fails closed.** Anything the grammar cannot parse — an unterminated quote,
-/// a stray `=` — is replaced wholesale rather than echoed, because an
-/// unparseable remainder is exactly where a value would be hiding.
+/// **Fails closed.** The function replaces anything the grammar cannot parse,
+/// such as an unterminated quote or a stray `=`, wholesale. It does not echo
+/// it, because an unparseable remainder is exactly where a value would hide.
 ///
-/// A string with no `=` anywhere carries no `key=value` secret, so it is
-/// printed to keep a malformed-connection-string message diagnostic — *unless*
-/// it contains an `@`. That carve-out is not hypothetical: a case variant of a
+/// A string with no `=` anywhere carries no `key=value` secret. So it is
+/// printed, to keep a malformed-connection-string message diagnostic, *unless*
+/// it contains an `@`. That carve-out is not hypothetical. A case variant of a
 /// scheme, `POSTGRES://alice:hunter2@db/x`, is keyword form to the driver
-/// (`remove_url_prefix` is byte-exact) and reaches this function, and its
-/// secret is in userinfo rather than in a `key=value` pair. Everything through
-/// the **last** `@` is dropped — more than userinfo strictly requires, which is
-/// the right direction for a string whose grammar we have already failed to
-/// parse — while the tail after it is kept, so the endpoint stays readable.
+/// (`remove_url_prefix` is byte-exact) and reaches this function. Its secret
+/// is in userinfo rather than in a `key=value` pair. Everything through the
+/// **last** `@` is dropped. That is more than userinfo strictly requires, which
+/// is the right direction for a string whose grammar has already failed to
+/// parse. The tail after it is kept, so the endpoint stays readable.
 fn redact_keyword_values(params: &str) -> String {
     if !params.contains('=') {
         return params.rfind('@').map_or_else(
@@ -1086,17 +1088,17 @@ fn redact_one_token(token: &str) -> String {
 ///
 /// `HARVEST_TEST_DATABASE_URL` is an *admin* connection string and normally
 /// carries a password. Both the benchmark and the CI gate print the
-/// [`db::SkipReason`] they fail with, so an unredacted string in that message is
-/// a credential leaked into a CI log that anyone with read access can scroll
-/// back through.
+/// [`db::SkipReason`] they fail with. An unredacted string in that message
+/// leaks a credential into a CI log. Anyone with read access can scroll back
+/// through it.
 ///
 /// Host, port and database are kept — those are what make the message
 /// diagnostic. Three places can carry a secret, and all three are covered:
 ///
 /// 1. **Userinfo**, `postgres://user:pw@host/db` — replaced wholesale.
 /// 2. **Query parameters**, `postgres://host/db?user=u&password=pw`. This is a
-///    valid form, not a curiosity: `tokio-postgres`'s `UrlParser` feeds every
-///    query pair to the same `Config::param` that handles `password`, so it
+///    valid form, not a curiosity. `tokio-postgres`'s `UrlParser` feeds every
+///    query pair to the same `Config::param` that handles `password`. So it
 ///    authenticates exactly like userinfo does.
 /// 3. **The libpq keyword/value form**, `host=h password=pw` — no `://` at all,
 ///    which an earlier revision returned verbatim. `Config::from_str` falls
@@ -1109,9 +1111,9 @@ fn redact_one_token(token: &str) -> String {
 /// The drivers themselves were probed and do not echo their input:
 /// `diesel`/`tokio-postgres` reported only `"error connecting to server"` /
 /// `"invalid connection string"` across connection-refused, DNS-failure and
-/// malformed-string cases. So our own interpolation is the only leak — but the
-/// call site still passes the redacted form on principle, so a future driver
-/// that starts echoing its input cannot silently reopen it.
+/// malformed-string cases. So the harness's own interpolation is the only
+/// leak. The call site still passes the redacted form on principle. Then a
+/// future driver that starts to echo its input cannot silently reopen it.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
     let Some(parts) = split_driver_url(url) else {
@@ -1130,8 +1132,8 @@ pub fn redact_url(url: &str) -> String {
     }
 
     // Credentials are whatever the driver itself would authenticate with, so
-    // the whole span goes — a password holding `/`, `?` or a second `:` is
-    // covered because the split already followed the driver's parse order.
+    // the whole span goes. The split already follows the driver's parse
+    // order, so a password that holds `/`, `?` or a second `:` is covered.
     if parts.credentials.is_some() {
         format!("{}***@{}{tail}", parts.prefix, parts.host)
     } else {
@@ -1141,53 +1143,53 @@ pub fn redact_url(url: &str) -> String {
 
 /// Rewrite a connection URL to point at a different database.
 ///
-/// Replaces **only** the path component, preserving any query string. Naively
-/// splicing at the last `/` breaks two real cases: it silently drops
-/// `?sslmode=require` (so a server that requires TLS becomes unreachable via
-/// the advertised existing-server mode), and when a parameter value itself
-/// contains a slash — `?sslrootcert=/etc/ssl/root.crt` — it splices *inside the
+/// Replaces **only** the path component, preserving any query string. A naive
+/// splice at the last `/` breaks two real cases. It silently drops
+/// `?sslmode=require`, so a server that requires TLS becomes unreachable via
+/// the advertised existing-server mode. And when a parameter value contains a
+/// slash, such as `?sslrootcert=/etc/ssl/root.crt`, it splices *inside the
 /// query* and produces a malformed URL.
 ///
-/// The authority is located by the driver's own rule — the first `/` or `?`,
-/// with `#` deliberately *not* a terminator, because `UrlParser` has no
-/// fragment concept (see [`DriverUrl`]).
+/// The authority ends by the driver's own rule, at the first `/` or `?`. `#`
+/// is deliberately *not* a terminator, because `UrlParser` has no fragment
+/// concept (see [`DriverUrl`]).
 ///
 /// # Why the query cannot simply be carried over
 ///
 /// `dbname` is a legal *query* parameter as well as the path, and
-/// `tokio-postgres` applies it second: `UrlParser::parse` calls `parse_path`
-/// and then `parse_params`, both assigning the same `Config::dbname`. Carrying
-/// `?dbname=admin` past a path rewrite therefore leaves the connection pointing
-/// at the original admin database while the URL *reads* as though it targets
-/// the new one — and this harness runs migrations and `TRUNCATE` through
-/// exactly these rewritten strings. Any `dbname` parameter is dropped, so the
-/// path is the single selector.
+/// `tokio-postgres` applies it second. `UrlParser::parse` calls `parse_path`
+/// and then `parse_params`, and both assign the same `Config::dbname`. So a
+/// `?dbname=admin` carried past a path rewrite leaves the connection on the
+/// original admin database. The URL still *reads* as though it targets the
+/// new one. This harness runs migrations and `TRUNCATE` through exactly these
+/// rewritten strings. Any `dbname` parameter is dropped, so the path is the
+/// single selector.
 ///
-/// The match is against the **decoded** key: `parse_params` decodes before
-/// dispatching to `Config::param`, so `?db%6Eame=admin` is a `dbname` override
+/// The match is against the **decoded** key. `parse_params` decodes before it
+/// dispatches to `Config::param`. So `?db%6Eame=admin` is a `dbname` override
 /// that a raw comparison would carry straight through the rewrite.
 ///
-/// The libpq keyword/value form has no path at all, so there the database is
-/// selected by replacing `dbname` rather than by appending a path component —
-/// and that grammar is *not* percent-encoded, so its keys are compared raw.
-/// Every *carried* value in that form is re-quoted rather than re-emitted raw:
-/// appending the selector moves each span off the end of the string, which is
+/// The libpq keyword/value form has no path at all. There the database is
+/// selected by replacing `dbname`, not by appending a path component. That
+/// grammar is *not* percent-encoded, so its keys are compared raw. Every
+/// *carried* value in that form is re-quoted rather than re-emitted raw. The
+/// appended selector moves each span off the end of the string. The end is
 /// where an unquoted value ending in `\` was terminated. See
 /// [`requote_keyword_value`].
 ///
 /// `db` is written verbatim, so it must already be in the form the driver will
-/// read back — no percent escapes, since [`db_name_from_url`] (and the driver's
-/// own `parse_path`) decodes them. Every name this harness generates is
-/// `[a-z0-9_]` by construction — [`BENCH_DB_PREFIX`] plus a pid, a hex run
-/// token and a counter — so the constraint is satisfied without an encoder that
-/// would never run.
+/// read back. It must have no percent escapes, since [`db_name_from_url`] and
+/// the driver's own `parse_path` decode them. Every name this harness
+/// generates is `[a-z0-9_]` by construction: [`BENCH_DB_PREFIX`] plus a pid,
+/// a hex run token and a counter. So the constraint holds without an encoder
+/// that would never run.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the keyword/value form has a tail the tokenizer cannot
 /// consume. Every such stop is one libpq also rejects, so the input would not
-/// connect as written; it is refused rather than repaired because a repaired
-/// string could silently select a *different* database, and this harness runs
+/// connect as written. It is refused rather than repaired, because a repaired
+/// string could silently select a *different* database. This harness runs
 /// migrations and `TRUNCATE` through the result. The URL form is always
 /// rewritable and never errors.
 pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
@@ -1206,25 +1208,25 @@ pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
         // not dropped. Carrying it is unsafe in both possible orderings, and
         // dropping it would silently discard part of the operator's config.
         //
-        // Every stop condition here is one the driver itself rejects — a stray
-        // `=`, a keyword with no `=`, an empty value, an unterminated quote —
-        // so the tail is never valid text we are failing to understand. Carried
-        // *before* the selector, an incomplete pair swallows it: the driver
-        // skips whitespace after `=`, so `application_name= dbname=<db>` reads
-        // the selector as the application name, and with the original `dbname`
-        // already filtered out the string selects nothing and libpq falls back
-        // to the username database. Carried *after* the selector, a `dbname`
-        // hidden in the tail would win on libpq's last-wins rule. There is no
-        // third position, and the tail cannot be quoted because it is not a
-        // value.
+        // Every stop condition here is one the driver itself rejects: a stray
+        // `=`, a keyword with no `=`, an empty value, an unterminated quote. So
+        // the tail is never valid text that the parser fails to understand.
+        // Carried *before* the selector, an incomplete pair swallows it. The
+        // driver skips whitespace after `=`, so `application_name= dbname=<db>`
+        // reads the selector as the application name. The original `dbname` is
+        // already filtered out, so the string selects nothing and libpq falls
+        // back to the username database. Carried *after* the selector, a
+        // `dbname` hidden in the tail would win on libpq's last-wins rule. There
+        // is no third position, and the tail cannot be quoted because it is not
+        // a value.
         //
         // The rejection reports the offset and a **fixed** reason and quotes
-        // nothing. The tail is not safe to print: at an unterminated quote the
-        // stop offset sits at the *start* of the pair, so the "tail" is the
-        // whole rest of the string — a complete credential — and this error is
-        // not something the caller inspects and discards. It becomes a
-        // `SkipReason` that the benchmark and the CI gate both print verbatim,
-        // which is a path around `redact_url` into CI logs.
+        // nothing. The tail is not safe to print. At an unterminated quote the
+        // stop offset sits at the *start* of the pair. So the "tail" is the
+        // whole rest of the string, a complete credential. The caller does not
+        // inspect and discard this error. It becomes a `SkipReason` that the
+        // benchmark and the CI gate both print verbatim, which is a path around
+        // `redact_url` into CI logs.
         if let Some(stop) = stop {
             let reason = stop.as_str();
             return Err(format!(
@@ -1266,26 +1268,26 @@ pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
 
 /// Read the database name back out of a connection string.
 ///
-/// The inverse of [`with_db_name`], and deliberately its neighbour: reading the
-/// name back with a naive `rsplit('/')` reintroduces exactly the bug that
-/// function exists to avoid — against `?sslrootcert=/etc/ssl/root.crt` the last
-/// slash sits inside the *query*, so the "database name" comes back as
-/// `root.crt`. Parse the path first, then stop at the query.
+/// The inverse of [`with_db_name`], and deliberately its neighbour. A naive
+/// `rsplit('/')` reintroduces exactly the bug that function exists to avoid.
+/// Against `?sslrootcert=/etc/ssl/root.crt` the last slash sits inside the
+/// *query*, so the "database name" comes back as `root.crt`. Parse the path
+/// first, then stop at the query.
 ///
-/// Handles **both** connection-string forms `libpq` (and so `tokio-postgres`)
-/// accepts, because [`db::setup_bench_db`] hands back whichever form the
-/// operator supplied in `HARVEST_TEST_DATABASE_URL` and the gate suite unwraps
-/// this result — a `None` there is a panic, not a skip:
+/// Handles **both** connection-string forms that `libpq` (and so
+/// `tokio-postgres`) accepts. [`db::setup_bench_db`] hands back whichever form
+/// the operator supplied in `HARVEST_TEST_DATABASE_URL`. The gate suite
+/// unwraps this result, so a `None` there is a panic, not a skip:
 ///
 /// * **URL** (`postgres://host/db`): the regions come from
 ///   [`split_driver_url`], so this reads the *driver's* grammar rather than the
-///   RFC's — there is no fragment, and keys and values are percent-decoded (see
-///   [`decoded_query_key`]). A `dbname` *query* parameter wins over the path,
-///   matching `tokio-postgres`' `UrlParser::parse`, which runs `parse_path`
-///   before `parse_params`, so the later assignment survives. This is the same
-///   precedence [`with_db_name`] honours by stripping the query parameter; the
-///   two must agree or one could strip a `dbname` the other would not have
-///   found.
+///   RFC's. There is no fragment, and keys and values are percent-decoded (see
+///   [`decoded_query_key`]). A `dbname` *query* parameter wins over the path.
+///   That matches `tokio-postgres`' `UrlParser::parse`, which runs
+///   `parse_path` before `parse_params`, so the later assignment survives.
+///   [`with_db_name`] honours the same precedence by stripping the query
+///   parameter. The two must agree, or one could strip a `dbname` the other
+///   would not have found.
 /// * **keyword/value** (`host=h dbname=db`): the *last* `dbname` wins, matching
 ///   `Config::param`, which simply assigns on each occurrence. That grammar is
 ///   not percent-encoded, so the unquoted span is already the real name.
@@ -1325,8 +1327,8 @@ pub fn db_name_from_url(url: &str) -> Option<String> {
 
 /// Prefix of every database this harness creates against an admin URL.
 ///
-/// Lives beside [`sweep_step`] rather than in [`db`] so the one function that
-/// decides whether a name is ours owns the whole shape, and so that decision
+/// Lives beside [`sweep_step`] rather than in [`db`]. So the one function that
+/// decides whether a name is ours owns the whole shape. That decision also
 /// stays testable with no server and no `db` feature.
 pub const BENCH_DB_PREFIX: &str = "harvest_claim_bench_";
 
@@ -1361,35 +1363,36 @@ pub enum SweepStep {
 ///
 /// * **No pid liveness veto.** It protected another local run inside its
 ///   create-to-lease window, which the lock now makes unobservable. In a
-///   container it was actively harmful: the recorded pid is usually 1, pid 1 is
-///   always alive, so every stale database a previous container run left behind
-///   would be skipped forever.
-/// * **No run-token self-exemption.** It was meant to cover the database we are
-///   about to create — but the sweep runs *before* `CREATE DATABASE`, so that
-///   database does not exist yet and was never a candidate. What the exemption
-///   actually did was make a process unable to reclaim its **own** earlier
-///   databases: `run_token()` is constant for the life of a process, so a
-///   process calling [`db::setup_bench_db`] more than once (the benchmark, and
-///   the gate suite) left one migrated database behind per call until some
-///   other process happened to sweep. A prior database whose [`db::BenchDb`] is
-///   still alive holds its lease and is skipped by the server check anyway, so
-///   the lease already draws the line correctly — and draws it by *liveness*
-///   rather than by *ownership*, which is the question that actually matters.
+///   container it was actively harmful. The recorded pid is usually 1, and pid
+///   1 is always alive. So every stale database a previous container run left
+///   behind would be skipped forever.
+/// * **No run-token self-exemption.** It was meant to cover the database that
+///   the process is about to create. But the sweep runs *before*
+///   `CREATE DATABASE`, so that database does not exist yet and was never a
+///   candidate. In fact the exemption made a process unable to reclaim its
+///   **own** earlier databases. `run_token()` is constant for the life of a
+///   process. So a process that calls [`db::setup_bench_db`] more than once
+///   (the benchmark, and the gate suite) left one migrated database behind per
+///   call. It stayed until some other process happened to sweep. A prior
+///   database whose [`db::BenchDb`] is still alive holds its lease, so the
+///   server check skips it anyway. The lease already draws the line correctly.
+///   It draws it by *liveness* rather than by *ownership*, which is the
+///   question that matters.
 ///
-/// The run token still earns its keep in the database **name**, where it makes
-/// two containerised runs on different hosts — both reporting pid 1 — collide
-/// neither at `CREATE DATABASE` nor in each other's sweep.
+/// The run token still earns its keep in the database **name**. Two
+/// containerised runs on different hosts both report pid 1. The token stops
+/// them from colliding at `CREATE DATABASE` or in each other's sweep.
 ///
 /// # Why this takes the whole name
 ///
-/// It used to take an already-parsed `(pid, token)` pair, which put the parse —
-/// the part that decides whether a name is *ours at all* — outside everything
-/// this function is tested by. The parse was correspondingly loose: it required
-/// only a numeric first field and the mere presence of a second, so
-/// `harvest_claim_bench_123_production` read as pid `123`, token `production`,
-/// and a database nobody here minted reached `pg_terminate_backend` and
-/// `DROP DATABASE`. Taking `datname` means the shape check *is* the tested
-/// surface.
+/// It used to take an already-parsed `(pid, token)` pair. That put the parse,
+/// the part that decides whether a name is *ours at all*, outside every test
+/// of this function. The parse was correspondingly loose. It required only a
+/// numeric first field and the mere presence of a second. So
+/// `harvest_claim_bench_123_production` read as pid `123`, token
+/// `production`. A database nobody here minted then reached
+/// `pg_terminate_backend` and `DROP DATABASE`. Taking `datname` means the
+/// shape check *is* the tested surface.
 ///
 /// A name is ours only if it is exactly
 /// `harvest_claim_bench_{pid}_{token}_{seq}` with:
@@ -1401,9 +1404,9 @@ pub enum SweepStep {
 /// * and **nothing else**: no fourth component, no empty ones.
 ///
 /// Anything else is somebody's database. The asymmetry here is the whole
-/// argument for erring strict: refusing to reclaim one of ours leaks a
-/// database, while reclaiming one of theirs destroys data, so every ambiguous
-/// case resolves to [`SweepStep::Skip`].
+/// argument for erring strict. Refusing to reclaim one of ours leaks a
+/// database. Reclaiming one of theirs destroys data. So every ambiguous case
+/// resolves to [`SweepStep::Skip`].
 #[must_use]
 pub fn sweep_step(datname: &str) -> SweepStep {
     let Some(rest) = datname.strip_prefix(BENCH_DB_PREFIX) else {
@@ -1430,11 +1433,11 @@ pub fn sweep_step(datname: &str) -> SweepStep {
 /// A field whose text is exactly what `format!("{}", v: T)` would have printed.
 ///
 /// The round-trip is the whole check, and it is deliberately stricter than
-/// "digits that parse". `parse` is a *superset* of what we print: it accepts a
-/// leading `+` and any number of leading zeros, so `+1`, `01`, and `0007` all
-/// parse to values we could hold — while `{}` emits `1` and `7` and can never
-/// produce those spellings. Comparing against `to_string` rejects every such
-/// noncanonical form for free, without enumerating them.
+/// "digits that parse". `parse` accepts a *superset* of what `{}` prints. It
+/// accepts a leading `+` and any number of leading zeros, so `+1`, `01`, and
+/// `0007` all parse to values the harness could hold. But `{}` emits `1` and
+/// `7` and can never produce those spellings. Comparing against `to_string`
+/// rejects every such noncanonical form for free, without enumerating them.
 ///
 /// This gates a `DROP DATABASE`, so "could parse to something we might hold" is
 /// the wrong question. The right one is "is this byte-for-byte a name we would
@@ -1454,18 +1457,19 @@ pub fn is_canonical_decimal<T: std::str::FromStr + std::fmt::Display>(s: &str) -
 /// 1. It must be a **candidate** — inside `BENCH_DB_PREFIX`, and shaped so the
 ///    two-field check of an earlier round would have accepted it. A decoy the
 ///    sweep never looks at proves nothing.
-/// 2. It must **never** be a name this harness could mint, or the test would
-///    assert that a real bench database survives the sweep — the exact opposite
-///    of the contract, and a silent way to reintroduce the leak.
+/// 2. It must **never** be a name this harness could mint. Otherwise the test
+///    would assert that a real bench database survives the sweep. That is the
+///    exact opposite of the contract, and a silent way to reintroduce the leak.
 ///
-/// Rejection here is over-determined on purpose: `sweepprobe` can never be
-/// 16 hex digits (it contains `s`, `w`, `p`, `r`, `o`), *and* the extra
-/// components put the name past the exactly-three split. Either alone suffices.
+/// Rejection here is over-determined on purpose. `sweepprobe` can never be
+/// 16 hex digits (it contains `s`, `w`, `p`, `r`, `o`). *And* the extra
+/// components put the name past the exactly-three split. Either alone
+/// suffices.
 ///
 /// `token` makes the name run-unique. The probe drops its decoy by name before
-/// creating it, so without one, two runs sharing a cluster from different PID
-/// namespaces — both pid 1 under containers — would delete each other's live
-/// decoy and fail each other's survival assertion.
+/// it creates it. Without a token, two runs that share a cluster from
+/// different PID namespaces would both be pid 1 under containers. They would
+/// delete each other's live decoy and fail each other's survival assertion.
 pub fn sweep_probe_decoy_name(pid: u32, token: &str) -> String {
     format!("{BENCH_DB_PREFIX}123_sweepprobe_{pid}_{token}")
 }
@@ -1485,28 +1489,28 @@ pub fn is_run_token(s: &str) -> bool {
 
 /// Run one pre-measurement setup step under its own wall-clock ceiling.
 ///
-/// `connect` and `seed` run *before* the measured phase and therefore before
-/// its deadline exists, so neither was bounded by anything: a server that
-/// accepted the TCP connection and then stopped answering would park the
-/// bench — and the CI gate that calls it — until the outer workflow timeout,
-/// while the page advertises a per-scenario cap. Every other await in these
-/// runners is already bounded; these two were the hole.
+/// `connect` and `seed` run *before* the measured phase and its deadline.
+/// Nothing bounded either of them. A server that accepted the TCP connection
+/// and then went silent would park the bench and its CI gate until the outer
+/// workflow timeout. Meanwhile the page advertises a per-scenario cap. Every
+/// other await in these runners is already bounded; these two were the hole.
 ///
 /// Setup gets its *own* deadline rather than sharing the measured phase's.
-/// A single ceiling spanning both would let a slow seed eat the measurement
-/// window and report `truncated`, which says "the claim path is slow" about
-/// a run whose claim path was never the problem. Two phases, two ceilings:
-/// the worst case is bounded at twice the budget instead of unbounded, and
-/// each number means what it says. The same [`scenario_time_budget`] value
-/// is reused so that raising `HARVEST_BENCH_SCENARIO_SECS` for a slow
-/// machine widens setup with it.
+/// A single ceiling over both would let a slow seed eat the measurement
+/// window and report `truncated`. That says "the claim path is slow" about a
+/// run whose claim path was never the problem. Two phases, two ceilings: the
+/// worst case is bounded at twice the budget instead of unbounded, and each
+/// number means what it says. The same [`scenario_time_budget`] value is
+/// reused so that raising `HARVEST_BENCH_SCENARIO_SECS` for a slow machine
+/// widens setup with it.
 ///
 /// # Panics
 ///
 /// Panics when the step does not finish in time. That is the same contract
-/// the step already had — `connect` and `seed` both `expect` on failure —
-/// and the right one here: with no seeded backlog there is nothing to
-/// measure, so continuing would publish a number describing an empty table.
+/// the step already had, since `connect` and `seed` both `expect` on failure.
+/// It is also the right one here. With no seeded backlog there is nothing to
+/// measure, so continuing would publish a number that describes an empty
+/// table.
 pub async fn with_setup_deadline<T>(
     what: &str,
     deadline: std::time::Instant,
@@ -1527,26 +1531,26 @@ pub async fn with_setup_deadline<T>(
 ///
 /// The sibling of [`with_setup_deadline`], for the other end of a scenario.
 /// After the measured phase completes, the gate tests reconnect and count rows
-/// to verify the run was sound — the backlog was not drained, the enqueue
-/// really did write into a non-empty queue. Those awaits sit *after* the
-/// measured phase and therefore after its deadline has already been consumed,
-/// so nothing bounded them: a server that stopped answering between the last
+/// to verify the run was sound. They check that the backlog was not drained
+/// and that the enqueue really wrote into a non-empty queue. Those awaits sit
+/// *after* the measured phase, so after its deadline is already consumed.
+/// Nothing bounded them. A server that stopped answering between the last
 /// claim and the verification would park the gate until the outer CI workflow
-/// timeout, which is the same hole [`with_setup_deadline`] closed at the front.
+/// timeout. That is the same hole [`with_setup_deadline`] closed at the front.
 ///
 /// A fresh ceiling rather than a shared one, for the same reason setup gets its
-/// own: the measured phase legitimately consumes its entire budget, so a shared
-/// deadline would have nothing left and every verification would "time out"
-/// against a perfectly healthy server.
+/// own. The measured phase legitimately consumes its entire budget. A shared
+/// deadline would have nothing left, and every verification would "time out"
+/// against a healthy server.
 ///
 /// # Panics
 ///
 /// Panics when the check does not finish in time. The measurement itself
-/// succeeded, so the numbers are real — but the invariant that says they
-/// *describe what they claim to describe* could not be confirmed, and a gate
-/// that passes on an unverified measurement is worth less than one that fails
-/// loudly. The message says which check stalled so the failure is not confused
-/// with a genuine backlog-drain regression.
+/// succeeded, so the numbers are real. But the invariant that they *describe
+/// what they claim to describe* could not be confirmed. A gate that passes on
+/// an unverified measurement is worth less than one that fails loudly. The
+/// message says which check stalled, so the failure is not confused with a
+/// genuine backlog-drain regression.
 pub async fn with_verify_deadline<T>(
     what: &str,
     budget: std::time::Duration,
@@ -1568,12 +1572,11 @@ pub async fn with_verify_deadline<T>(
 
 #[cfg(test)]
 mod pure_tests {
-    // Cargo sets `cfg(test)` for bench targets too, but a `harness = false`
-    // bench has no test harness, so rustc strips every `#[test]` fn from this
-    // module when it is compiled into `benches/claim_bench.rs` — leaving these
-    // imports genuinely unused *there* while they are used in the `integration`
-    // test binary. Scoped to this module so a real unused import elsewhere in
-    // the file still warns.
+    // Cargo sets `cfg(test)` for bench targets too. A `harness = false` bench
+    // has no test harness, so rustc strips every `#[test]` fn from this module
+    // in `benches/claim_bench.rs`. These imports are then unused *there* but
+    // used in the `integration` test binary. Scoped to this module so a real
+    // unused import elsewhere in the file still warns.
     #![allow(unused_imports)]
 
     use super::{
@@ -1735,8 +1738,8 @@ mod pure_tests {
 
     #[test]
     fn claims_never_exceed_a_fifth_of_the_backlog() {
-        // Guards the "don't drain the queue" invariant: measuring must leave the
-        // backlog at >= 80% of its seeded depth, or we measure an empty queue.
+        // Guards the "do not drain the queue" invariant. Measuring must leave the
+        // backlog at >= 80% of its seeded depth, or the bench measures an empty queue.
         for backlog in BACKLOG_SWEEP {
             let claims = measured_claims_for(backlog);
             assert!(
@@ -1773,12 +1776,12 @@ mod pure_tests {
 
     #[test]
     fn wall_clock_budget_admits_a_run_at_the_latency_budget() {
-        // The gate asserts both "p99 within budget" AND "the run was not
+        // The gate asserts both "p50 within budget" AND "the run was not
         // truncated". Those two assertions are only coherent if a run sitting
-        // exactly at the p99 budget can finish inside the wall-clock ceiling.
-        // If it cannot, the wall clock silently becomes the real budget: a
-        // slow-but-passing run trips the truncation assertion first and the
-        // gate reports "measurement unsound" instead of a latency verdict.
+        // exactly at the p50 budget can finish inside the wall-clock ceiling.
+        // If it cannot, the wall clock silently becomes the real budget. A
+        // slow-but-passing run trips the truncation assertion first. The gate
+        // then reports "measurement unsound" instead of a latency verdict.
         let s = headline_scenario();
         let total = measured_claims_for(s.backlog);
         let per_claimer = claims_for_claimer(total, s.claimers, 0);
@@ -1840,8 +1843,8 @@ mod pure_tests {
     /// A password in the *query* authenticates exactly like one in userinfo.
     ///
     /// `tokio-postgres`'s URL parser feeds every query pair to the same
-    /// `Config::param` that handles `password`, so redacting only the authority
-    /// leaves a fully-working credential in the log line.
+    /// `Config::param` that handles `password`. So a redaction of only the
+    /// authority leaves a working credential in the log line.
     #[test]
     fn redact_url_removes_a_password_given_as_a_query_parameter() {
         let redacted =
@@ -1861,9 +1864,9 @@ mod pure_tests {
     ///
     /// `UrlParser::parse_params` terminates a value with `take_until(&['&'])`
     /// and the driver has no fragment concept anywhere, so `password=#hunter2`
-    /// authenticates with the literal `#hunter2`. Splitting the URL at `#` and
-    /// appending the tail unredacted therefore prints most of a live password
-    /// on the one line — a connection failure — that operators paste around.
+    /// authenticates with the literal `#hunter2`. A split at `#` that appends
+    /// the tail unredacted prints most of a live password. It prints it on the
+    /// connection-failure line that operators paste around.
     #[test]
     fn redact_url_removes_a_password_containing_a_hash() {
         let redacted = redact_url("postgres://db.internal:5432/harvest?password=#hunter2");
@@ -1880,11 +1883,11 @@ mod pure_tests {
     /// A percent-encoded key names the same parameter to the driver.
     ///
     /// `parse_params` runs `self.decode(key)?` before `Config::param`, so
-    /// `pass%77ord` *is* `password`. Comparing the raw key against the
-    /// printable allowlist would still redact it (anything unrecognised is
-    /// redacted), but the allowlist has to be consulted on the decoded key or
-    /// the reverse mistake — treating an encoded `sslmode` as unknown — becomes
-    /// the same class of bug in the other direction.
+    /// `pass%77ord` *is* `password`. A raw-key comparison against the printable
+    /// allowlist would still redact it, since anything unrecognised is redacted.
+    /// But the allowlist must see the decoded key. Otherwise the reverse
+    /// mistake, treating an encoded `sslmode` as unknown, is the same class of
+    /// bug in the other direction.
     #[test]
     fn redact_url_removes_a_percent_encoded_password_parameter() {
         let redacted = redact_url("postgres://db.internal:5432/harvest?pass%77ord=hunter2");
@@ -1902,12 +1905,12 @@ mod pure_tests {
 
     /// The measured window must span every worker, not the widest single one.
     ///
-    /// A worker that resumes late still does all of its work, so charging only
-    /// its own `finish - resume` to the denominator drops the release-to-resume
-    /// delay while keeping the numerator whole — the throughput figure then
-    /// reads higher than the run actually achieved. Here two workers each run
-    /// for 1 s but the second resumes 2 s late, so the true window is 3 s while
-    /// the per-worker maximum is 1 s.
+    /// A worker that resumes late still does all of its work. Charging only its
+    /// own `finish - resume` to the denominator drops the release-to-resume
+    /// delay but keeps the numerator whole. The throughput figure then reads
+    /// higher than the run achieved. Here two workers each run for 1 s, and the
+    /// second resumes 2 s late. The true window is 3 s, but the per-worker
+    /// maximum is 1 s.
     #[test]
     fn measured_window_spans_all_workers_not_the_widest_one() {
         let base = std::time::Instant::now();
@@ -1967,10 +1970,10 @@ mod pure_tests {
 
     /// The same misclassification corrupts a rewritten target.
     ///
-    /// Split at the `://` inside `password=http://hunter2`, everything before
-    /// it becomes an opaque "prefix" that is re-emitted untouched — so the real
-    /// `dbname=admin` survives and `/bench` is appended to the password,
-    /// producing a string that is no longer a connection string in either form.
+    /// A split at the `://` inside `password=http://hunter2` makes everything
+    /// before it an opaque "prefix" that is re-emitted untouched. So the real
+    /// `dbname=admin` survives and `/bench` is appended to the password. The
+    /// result is no longer a connection string in either form.
     /// Read as keyword form, `dbname` is replaced and every other pair is kept.
     #[test]
     fn with_db_name_treats_a_scheme_inside_a_value_as_keyword_form() {
@@ -1994,7 +1997,7 @@ mod pure_tests {
     ///
     /// `remove_url_prefix` is byte-exact, so `POSTGRES://` is *not* a URL to the
     /// driver. Such a string reaches the keyword redactor, where it has no `=`
-    /// at all: the passthrough that keeps a malformed-string message diagnostic
+    /// at all. The passthrough that keeps a malformed-string message diagnostic
     /// would otherwise print its userinfo verbatim. The endpoint after the last
     /// `@` is still shown.
     #[test]
@@ -2041,9 +2044,9 @@ mod pure_tests {
 
     /// The same split has to keep the URL *usable*, not just safe.
     ///
-    /// `with_db_name` rewrites the connection target, so a credential holding
-    /// `/` must be re-emitted verbatim — dropping or truncating it produces a
-    /// string that no longer authenticates.
+    /// `with_db_name` rewrites the connection target, so a credential that
+    /// holds `/` must be re-emitted verbatim. A dropped or truncated credential
+    /// no longer authenticates.
     #[test]
     fn with_db_name_preserves_credentials_containing_a_path_separator() {
         let rewritten = with_db_name(
@@ -2058,9 +2061,9 @@ mod pure_tests {
     ///
     /// `Parser::skip_ws` is `take_while(char::is_whitespace)` and both value
     /// readers break on `c.is_whitespace()` — all Unicode, not ASCII. So a
-    /// no-break space really does end the `host` value and start a new pair,
-    /// and an ASCII-only tokenizer folds the following `password=...` into the
-    /// allowlisted `host` value, which is then printed in full.
+    /// no-break space really does end the `host` value and start a new pair. An
+    /// ASCII-only tokenizer folds the following `password=...` into the
+    /// allowlisted `host` value and prints it in full.
     #[test]
     fn redact_url_splits_keyword_pairs_on_unicode_whitespace() {
         let redacted = redact_url("host=db.internal\u{00A0}password=hunter2");
@@ -2076,11 +2079,11 @@ mod pure_tests {
 
     /// libpq lets a keyword value be quoted, so it may contain spaces.
     ///
-    /// Splitting the form on whitespace therefore cuts `password='hunter two'`
-    /// in half: the first token redacts, and the second has no `=` in it, so it
-    /// is passed through as though it were a separator and the tail of the
-    /// password is printed. Round 13 advertised support for this form without
-    /// implementing its value grammar, which is the narrow gap this pins.
+    /// A whitespace split cuts `password='hunter two'` in half. The first token
+    /// redacts. The second has no `=`, so it passes through as though it were a
+    /// separator, and the tail of the password is printed. Support for this
+    /// form needs its value grammar, not a whitespace split. This test pins
+    /// that narrow gap.
     #[test]
     fn redact_url_removes_a_quoted_keyword_password_containing_spaces() {
         let redacted = redact_url("host=db.internal password='hunter two' sslmode=require");
@@ -2102,11 +2105,11 @@ mod pure_tests {
 
     /// libpq allows whitespace around the `=`, which splits a naive tokenizer.
     ///
-    /// `Parser::keyword` stops at whitespace *or* `=`, then `skip_ws`/`eat('=')`
-    /// /`skip_ws` runs before the value — so `password = 'hunter two'` is a
-    /// valid string that a whitespace tokenizer shreds into `password`, `=` and
-    /// the bare secret. The secret token has no embedded `=`, so the redactor's
-    /// pass-through rule printed it in full.
+    /// `Parser::keyword` stops at whitespace *or* `=`. Then `skip_ws`,
+    /// `eat('=')` and `skip_ws` run before the value. So `password = 'hunter
+    /// two'` is a valid string that a whitespace tokenizer shreds into
+    /// `password`, `=` and the bare secret. The secret token has no embedded
+    /// `=`, so the redactor's pass-through rule printed it in full.
     #[test]
     fn redact_url_removes_a_keyword_password_with_spaces_around_equals() {
         let redacted = redact_url("host=db.internal password = 'hunter two' sslmode=require");
@@ -2199,12 +2202,12 @@ mod pure_tests {
 
     /// A process must be able to reclaim its **own** earlier databases.
     ///
-    /// `run_token()` is constant for the life of a process, so a self-exemption
+    /// `run_token()` is constant for the life of a process. So a self-exemption
     /// keyed on it made every process leak one migrated database per
-    /// `setup_bench_db` call — the benchmark alone calls it a dozen times. The
-    /// exemption bought nothing: the sweep runs *before* `CREATE DATABASE`, so
-    /// the database being created is not a candidate, and a prior database
-    /// still in use holds its lease and is skipped by the server check.
+    /// `setup_bench_db` call, and the benchmark alone calls it a dozen times.
+    /// The exemption bought nothing. The sweep runs *before* `CREATE DATABASE`,
+    /// so the database being created is not a candidate. A prior database still
+    /// in use holds its lease, so the server check skips it.
     #[test]
     fn sweep_step_lets_the_lease_decide_for_our_own_earlier_databases() {
         assert_eq!(
@@ -2223,7 +2226,7 @@ mod pure_tests {
 
     /// A foreign run's database is always the server's call.
     ///
-    /// The pid in the name is only meaningful on the host that minted it, so it
+    /// The pid in the name is only meaningful on the host that minted it. So it
     /// can never answer "is this in use"; only the server sees every client.
     #[test]
     fn sweep_step_asks_the_server_for_a_foreign_run() {
@@ -2255,10 +2258,10 @@ mod pure_tests {
 
     /// A name this harness did not mint is never reclaimed.
     ///
-    /// This is the only thing standing between a same-prefix database belonging
-    /// to somebody else and `pg_terminate_backend` + `DROP DATABASE`, so it
-    /// checks the *whole* shape rather than the first field or two. Each case
-    /// below is a name that a looser check would have handed to the sweep.
+    /// This check is all that stands between another owner's same-prefix
+    /// database and `pg_terminate_backend` + `DROP DATABASE`. So it checks the
+    /// *whole* shape rather than the first field or two. Each case below is a
+    /// name that a looser check would have handed to the sweep.
     #[test]
     fn sweep_step_leaves_names_we_did_not_mint_alone() {
         for name in [
@@ -2315,9 +2318,9 @@ mod pure_tests {
 
     /// The shape accepted is exactly the shape minted.
     ///
-    /// Built from the same pieces `setup_bench_db` formats its name from, so a
-    /// change to either side that the other does not follow fails here rather
-    /// than by silently leaking databases nothing will ever reclaim.
+    /// Built from the same pieces `setup_bench_db` formats its name from. A
+    /// change to one side that the other does not follow fails here. It does
+    /// not silently leak databases that nothing will ever reclaim.
     #[test]
     fn sweep_step_accepts_a_freshly_minted_name() {
         let minted = format!(
@@ -2332,11 +2335,11 @@ mod pure_tests {
 
     /// The decoy is a sweep *candidate* that is never a *mintable* name.
     ///
-    /// Both halves are load-bearing and neither is obvious from the format
-    /// string, so they are pinned here rather than only inside the DB test that
-    /// uses them — this runs on every OS, including the `--no-default-features`
-    /// leg where no database exists. If the decoy stopped being a candidate the
-    /// DB test would pass vacuously; if it started being mintable, the test
+    /// Both halves are load-bearing, and neither is obvious from the format
+    /// string. So they are pinned here, not only inside the DB test that uses
+    /// them. This test runs on every OS, including the `--no-default-features`
+    /// leg where no database exists. If the decoy stopped being a candidate, the
+    /// DB test would pass vacuously. If it started being mintable, the test
     /// would assert that a *real* bench database survives the sweep.
     #[test]
     fn the_sweep_probe_decoy_is_a_candidate_but_never_mintable() {
@@ -2382,9 +2385,9 @@ mod pure_tests {
     /// `#` is an ordinary character to the driver: `parse_path` runs
     /// `take_until(&['?'])`, so with no query it takes the rest of the string.
     ///
-    /// The RFC would call `#frag` a fragment and stop before it. Reading it that
-    /// way would have this harness look for a database the driver never asked
-    /// for, so the *driver's* grammar is the one that matters.
+    /// The RFC would call `#frag` a fragment and stop before it. Read that way,
+    /// this harness would look for a database the driver never asked for. So
+    /// the *driver's* grammar is the one that matters.
     #[test]
     fn db_name_from_url_keeps_a_hash_in_the_path() {
         assert_eq!(
@@ -2445,14 +2448,15 @@ mod pure_tests {
         );
     }
 
-    /// A `dbname` query parameter silently outranks the path we just rewrote.
+    /// A `dbname` query parameter silently outranks the path `with_db_name` just
+    /// rewrote.
     ///
     /// `tokio-postgres`'s `UrlParser::parse` runs `parse_path` (`config.rs:997`)
     /// and *then* `parse_params` (`:998`), and both assign the same
     /// `Config::dbname` field — so the query wins. Carrying the query over
-    /// verbatim, which round 3 introduced to keep `sslmode` alive, therefore
-    /// pointed the sweep lock, the lease and the migration connection back at
-    /// the operator's admin database. The harness runs `TRUNCATE` there.
+    /// verbatim keeps `sslmode` alive. But it also points the sweep lock, the
+    /// lease and the migration connection back at the operator's admin
+    /// database. The harness runs `TRUNCATE` there.
     #[test]
     fn with_db_name_removes_an_overriding_dbname_query_parameter() {
         assert_eq!(
@@ -2465,9 +2469,9 @@ mod pure_tests {
             with_db_name("postgres://h:5432/admin?DBName=admin", "b").expect("valid"),
             "postgres://h:5432/b",
         );
-        // No fragment concept: the driver's `parse_params` terminates a value
-        // only at `&`, so `admin#frag` is the whole `dbname` value and the
-        // whole thing is what gets dropped.
+        // No fragment concept. The driver's `parse_params` ends a value only at
+        // `&`, so `admin#frag` is the whole `dbname` value, and all of it is
+        // dropped.
         assert_eq!(
             with_db_name("postgres://h/admin?dbname=admin#frag", "b").expect("valid"),
             "postgres://h/b",
@@ -2478,11 +2482,12 @@ mod pure_tests {
     ///
     /// `parse_params` decodes the key (`self.decode(key)?`) before dispatching,
     /// so `db%6Eame=admin` reaches `Config::dbname` exactly like `dbname=admin`
-    /// would. A raw-text filter leaves it in place, and then every connection
-    /// this harness opens — sweep lock, lease, migrations, and the benchmark's
-    /// own `TRUNCATE` — lands on the operator's admin database instead of the
-    /// isolated one. That is the same P1 as the plain-text case above, reached
-    /// through a spelling the previous filter could not see.
+    /// would. A raw-text filter leaves it in place. Then every connection this
+    /// harness opens lands on the operator's admin database instead of the
+    /// isolated one. That covers the sweep lock, the lease, the migrations, and
+    /// the benchmark's own `TRUNCATE`. That is the same hazard as the
+    /// plain-text case above, reached through a spelling the previous filter
+    /// could not see.
     #[test]
     fn with_db_name_removes_a_percent_encoded_dbname_query_parameter() {
         assert_eq!(
@@ -2526,12 +2531,10 @@ mod pure_tests {
 
     /// `db_name_from_url` must invert `with_db_name` for **both** forms.
     ///
-    /// Round 14 taught `with_db_name` to emit a proper keyword/value string,
-    /// which made its inverse return `None` for exactly the strings it now
-    /// produces — and both existing-server tests `.expect()` that value, so the
-    /// documented gate suite panicked for a supported connection-string form.
-    /// (Before round 14 the rewrite emitted a stray `/`, which this parser
-    /// happened to read as a path; the inverse worked only by accident.)
+    /// `with_db_name` emits a proper keyword/value string. An inverse that reads
+    /// only the URL form returns `None` for exactly the strings it produces.
+    /// Both existing-server tests `.expect()` that value, so the documented gate
+    /// suite would panic for a supported connection-string form.
     #[test]
     fn db_name_from_url_reads_the_keyword_value_form() {
         assert_eq!(
@@ -2565,12 +2568,11 @@ mod pure_tests {
     /// The URL form must read `dbname` with the same precedence `with_db_name`
     /// strips it: query over path.
     ///
-    /// Round 14 established that `tokio-postgres` runs `parse_path` *before*
+    /// `tokio-postgres` runs `parse_path` *before*
     /// `parse_params`, so `?dbname=` wins — which is why `with_db_name` drops
     /// it. If the inverse still read only the path, the two neighbours would
-    /// disagree about which parameter counts as the database for the same
-    /// string, and this reader would name a database the connection never
-    /// opens.
+    /// disagree about which parameter names the database. This reader would
+    /// then name a database the connection never opens.
     #[test]
     fn db_name_from_url_lets_a_dbname_query_override_the_path() {
         assert_eq!(
@@ -2601,9 +2603,9 @@ mod pure_tests {
     /// to replace the keyword instead.
     #[test]
     fn with_db_name_replaces_dbname_in_the_keyword_value_form() {
-        // Carried values come back quoted — see `requote_keyword_value`; the
-        // decoded value is unchanged, and the quoting is what stops a pair from
-        // absorbing the selector appended after it.
+        // Carried values come back quoted (see `requote_keyword_value`). The
+        // decoded value is unchanged. The quoting stops a pair from absorbing
+        // the selector appended after it.
         assert_eq!(
             with_db_name("host=h port=5432 dbname=admin", "b").expect("valid"),
             "host='h' port='5432' dbname=b",
@@ -2625,12 +2627,12 @@ mod pure_tests {
     ///
     /// `application_name=bench\` is a *valid* keyword string: the trailing
     /// backslash escapes nothing at end of input, so the driver reads the value
-    /// as `bench`. Re-emitting that raw span and joining ` dbname=<new>` onto
-    /// it moves the backslash off the end, where it escapes the joining space —
-    /// the value becomes `bench dbname=<new>` and the string then carries no
-    /// `dbname` at all. libpq falls back to the server's default database,
-    /// which is the database this harness would go on to run migrations and
-    /// `TRUNCATE` against.
+    /// as `bench`. A raw re-emit with ` dbname=<new>` joined on moves the
+    /// backslash off the end. There it escapes the joining space. The value
+    /// becomes `bench dbname=<new>`, and the string carries no `dbname` at all.
+    /// libpq falls back to the server's default database, which is the
+    /// database this harness would go on to run migrations and `TRUNCATE`
+    /// against.
     #[test]
     fn with_db_name_requotes_a_value_ending_in_a_dangling_escape() {
         let rewritten = with_db_name(r"host=h user=postgres application_name=bench\", "bench_1")
@@ -2646,9 +2648,9 @@ mod pure_tests {
     /// absorb the selector appended after it.
     ///
     /// Every entry here parses cleanly, so the rewrite has to resolve to *our*
-    /// database — an unparseable remainder is a different path, covered by
-    /// [`with_db_name_rejects_an_unparseable_keyword_remainder`], and is refused
-    /// outright rather than rewritten.
+    /// database. An unparseable remainder takes a different path.
+    /// [`with_db_name_rejects_an_unparseable_keyword_remainder`] covers it, and
+    /// it is refused outright rather than rewritten.
     #[test]
     fn with_db_name_keyword_pairs_cannot_absorb_the_appended_selector() {
         for admin in [
@@ -2674,16 +2676,16 @@ mod pure_tests {
     /// `host=h user=alice dbname=admin application_name=` stops the tokenizer at
     /// the empty assignment, and carrying that tail verbatim produced
     /// `application_name= dbname=<bench db>`. The driver skips whitespace *after*
-    /// the `=`, so it reads `dbname=<bench db>` as the application-name value —
-    /// and because the real `dbname=admin` has already been filtered out, the
-    /// string then carries no database selector at all. libpq falls back to the
-    /// username database, which usually exists, and setup runs migrations and
-    /// `TRUNCATE` against it.
+    /// the `=`, so it reads `dbname=<bench db>` as the application-name value.
+    /// The real `dbname=admin` is already filtered out, so the string carries no
+    /// database selector at all. libpq falls back to the username database,
+    /// which usually exists, and setup runs migrations and `TRUNCATE` against
+    /// it.
     ///
-    /// Rejecting is the only safe option: the tail cannot be quoted (it is not a
-    /// value), and it cannot be reordered either — placed *after* the selector a
-    /// `dbname` hidden inside it would win on libpq's last-wins rule, which is
-    /// why it was placed before in the first place.
+    /// Rejection is the only safe option. The tail cannot be quoted, because it
+    /// is not a value. It cannot be reordered either. Placed *after* the
+    /// selector, a `dbname` hidden inside it would win on libpq's last-wins
+    /// rule. That is why it was placed before in the first place.
     #[test]
     fn with_db_name_rejects_an_incomplete_trailing_pair() {
         let err = with_db_name(
@@ -2726,13 +2728,13 @@ mod pure_tests {
 
     /// The rejection error must not quote the text it could not parse.
     ///
-    /// `keyword_value_pairs` says so at the stop itself — "an unterminated
-    /// quote swallows the rest of the string; the caller must treat all of it
-    /// as potentially secret" — and the stop offset for
+    /// The comment at the stop in `keyword_value_pairs` says so. It reads: "an
+    /// unterminated quote swallows the rest of the string; the caller must
+    /// treat all of it as potentially secret". The stop offset for
     /// `host=h password='hunter2` points at `password`, so the tail *is* the
-    /// credential. This error is not a value the caller inspects: it becomes a
-    /// `SkipReason` that the benchmark and the CI gate both print verbatim, so
-    /// echoing the tail routes a password around [`redact_url`] into CI logs.
+    /// credential. This error is not a value the caller inspects. It becomes a
+    /// `SkipReason` that the benchmark and the CI gate both print verbatim. So
+    /// an echoed tail routes a password around [`redact_url`] into CI logs.
     ///
     /// The offset and a fixed reason are enough to fix the string and cannot
     /// carry any part of it. Every reason string here is `&'static` for that
@@ -2764,10 +2766,9 @@ mod pure_tests {
     /// All three dispositions were considered and only rejection is safe.
     /// *Dropping* it is the failure the URL branch is built to avoid: losing
     /// `sslmode=require` makes a TLS-requiring server unreachable through the
-    /// advertised existing-server mode. *Carrying* it — which this test asserted
-    /// until round 33 — is worse: the tail is an incomplete pair, so the value
-    /// reader consumes whatever follows it, and what follows is the selector we
-    /// just appended.
+    /// advertised existing-server mode. *Carrying* it is worse: the tail is an
+    /// incomplete pair, so the value reader consumes whatever follows it. What
+    /// follows is the selector the rewrite just appended.
     ///
     /// The error has to name the tail, because the operator's string is the only
     /// place the problem can be fixed.
@@ -2805,8 +2806,8 @@ mod pure_tests {
     #[test]
     fn every_gate_is_ordered_after_its_comparand() {
         // The report renders a row's `p50 vs` against its comparand's already
-        // measured p50, streaming each row as it completes rather than
-        // buffering the whole table — a full sweep takes tens of minutes and an
+        // measured p50. It streams each row as it completes rather than
+        // buffering the whole table. A full sweep takes tens of minutes, and an
         // operator should not stare at a blank table for all of it. That is
         // only sound if a comparand is always measured first. Reordering
         // `all()` without this test would silently print `n/a` deltas.
@@ -2832,7 +2833,7 @@ mod pure_tests {
     #[test]
     fn paused_rows_has_an_equal_depth_control() {
         // `paused_rows` seeds 2x the table depth of `baseline`, and claim
-        // latency is strongly superlinear in depth — so comparing it against
+        // latency is strongly superlinear in depth. So a comparison against
         // `baseline` charges the anti-join for the extra rows too. Its
         // comparand must be the equal-depth control.
         assert_eq!(ClaimGate::PausedRows.comparand(), ClaimGate::DoubleBacklog);
@@ -2862,21 +2863,22 @@ mod pure_tests {
     /// No cleanup here may reach for `DROP DATABASE ... WITH (FORCE)`.
     ///
     /// That clause is `PostgreSQL` 13+ and the engine supports 12+ (README).
-    /// Every cleanup site discards its result — a failed cleanup must not fail
-    /// the run — so on 12 the statement is a syntax error that vanishes and the
-    /// database leaks instead. [`db::drop_database_version_neutral`] is the
-    /// version-neutral replacement.
+    /// Every cleanup site discards its result, because a failed cleanup must
+    /// not fail the run. So on 12 the statement is a syntax error that
+    /// vanishes, and the database leaks instead.
+    /// [`db::drop_database_version_neutral`] is the version-neutral
+    /// replacement.
     ///
-    /// A source scan rather than a behavioural test because the claim is about
-    /// a server version CI does not run: the behavioural half (evicting a live
-    /// backend) is covered by `version_neutral_drop_evicts_a_live_backend` in
-    /// `claim_budget_tests.rs`, but nothing there can catch the clause coming
-    /// back on `PostgreSQL` 16. Comment lines are exempt — four of them explain
+    /// A source scan rather than a behavioural test, because the claim is about
+    /// a server version CI does not run. `version_neutral_drop_evicts_a_live_backend`
+    /// in `claim_budget_tests.rs` covers the behavioural half (evicting a live
+    /// backend). Nothing there can catch the clause coming back on
+    /// `PostgreSQL` 16. Comment lines are exempt, because four of them explain
     /// precisely why the clause is absent.
     #[test]
     fn no_cleanup_emits_the_postgres_13_only_force_clause() {
-        // Assembled rather than written out: this guard lives inside one of the
-        // files it scans, so spelling the needle here would match itself and the
+        // Assembled rather than written out. This guard lives inside one of the
+        // files it scans, so a literal needle here would match itself and the
         // test could never pass. Do not "tidy" it back into one literal.
         let needle = concat!("FOR", "CE");
 
@@ -2967,22 +2969,21 @@ pub mod db {
     /// A token unique to this *run*, mixed into every database name.
     ///
     /// A pid alone does not identify a run once an admin URL is shared across
-    /// hosts: PID 1 is the norm for a containerised process, so two runs on
+    /// hosts. PID 1 is the norm for a containerised process. So two runs on
     /// different machines would both mint `harvest_claim_bench_1_0` and race at
-    /// `CREATE DATABASE` — failing one perfectly valid benchmark. It would also
-    /// make the sweep's self-exemption wrong in the other direction, since a
-    /// foreign run's database would look like our own.
+    /// `CREATE DATABASE`, which fails one perfectly valid benchmark. It would
+    /// also make the sweep's self-exemption wrong in the other direction, since
+    /// a foreign run's database would look like our own.
     ///
-    /// `RandomState` is seeded from OS entropy per process, so hashing the
-    /// current time and pid through it yields a value that differs across hosts
-    /// and across runs on one host. Std-only: the harness deliberately pulls in
-    /// no RNG crate for a name suffix.
+    /// `RandomState` is seeded from OS entropy per process. A hash of the
+    /// current time and pid through it differs across hosts and across runs on
+    /// one host. Std-only: the harness deliberately pulls in no RNG crate for a
+    /// name suffix.
     ///
     /// Public because the gate suite's probes create databases of their own on
-    /// the same shared server and need the *same* uniqueness guarantee. Reusing
-    /// this rather than rolling a second uniquifier means there is one
-    /// definition of "which run minted this" for a human to reason about, and
-    /// nothing that can drift.
+    /// the same shared server and need the *same* uniqueness guarantee. With no
+    /// second uniquifier, there is one definition of "which run minted this"
+    /// for a human to reason about, and nothing that can drift.
     pub fn run_token() -> &'static str {
         static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         TOKEN.get_or_init(|| {
@@ -3012,45 +3013,35 @@ pub mod db {
         /// Idle connection held open for the whole lifetime of the database.
         ///
         /// The stale-database sweep asks the server "does anything hold a
-        /// backend against this database?" — but between scenarios (and in the
-        /// window right after setup) a run holds none of its own: each scenario
-        /// opens a connection, seeds, drops it, builds a pool, and drops that
-        /// too. A concurrent run on another host would see zero backends,
-        /// conclude the database is abandoned, and `DROP DATABASE ... WITH
+        /// backend against this database?". But between scenarios, and right
+        /// after setup, a run holds none of its own. Each scenario opens a
+        /// connection, seeds, drops it, builds a pool, and drops that too. A
+        /// concurrent run on another host would see zero backends and conclude
+        /// the database is abandoned. It would then `DROP DATABASE ... WITH
         /// (FORCE)` it out from under us.
         ///
-        /// So the migration connection is retained rather than dropped: an idle
-        /// backend still appears in `pg_stat_activity`, which makes ownership
-        /// continuously visible to every other client for exactly as long as
-        /// this `BenchDb` lives. Never used for queries — held purely as a
-        /// lease.
+        /// So the migration connection is retained rather than dropped. An idle
+        /// backend still appears in `pg_stat_activity`. That keeps ownership
+        /// visible to every other client for exactly as long as this `BenchDb`
+        /// lives. Never used for queries; held purely as a lease.
         ///
         /// `None` on the testcontainer path: nothing outside this process can
         /// see that server, so there is no one to defend against.
         _lease: Option<AsyncPgConnection>,
     }
 
-    /// Connect to a benchmark database, or explain why we cannot.
-    ///
-    /// * `HARVEST_TEST_DATABASE_URL` set: treated as an **admin** URL. A fresh,
-    ///   uniquely-named database is created and migrated, so a 100k-row backlog
-    ///   can never leak into a shared database and wreck sibling suites.
-    /// * Otherwise: a `postgres:16` testcontainer.
-    ///
-    /// Returns `Err(SkipReason)` when no Docker daemon and no env URL are
-    /// available, so `cargo bench` on a laptop without Docker prints a notice
-    /// and exits cleanly instead of failing.
     /// Run one provisioning step under a wall-clock ceiling.
     ///
-    /// `setup_bench_db` runs *before* any scenario, so its awaits are outside
-    /// both the measured phase's deadline and the setup deadline `connect_and_seed`
-    /// applies — the same hole one level up. A server that completes the TCP
-    /// handshake and then stops answering during authentication, `CREATE
-    /// DATABASE`, the lease connection or the migrations would park the bench
-    /// and the CI gate until the outer workflow timeout.
+    /// `setup_bench_db` runs *before* any scenario. So its awaits are outside
+    /// both the measured phase's deadline and the setup deadline that
+    /// `connect_and_seed` applies. That is the same hole one level up. Take a
+    /// server that completes the TCP handshake and then goes silent. It can
+    /// stall authentication, `CREATE DATABASE`, the lease connection or the
+    /// migrations. That parks the bench and the CI gate until the outer
+    /// workflow timeout.
     ///
     /// A timeout is reported as a [`SkipReason`], **not** a panic, because that
-    /// is this function's existing contract: every failure to provision skips
+    /// is this function's existing contract. Every failure to provision skips
     /// the benchmark rather than failing the build. A database that will not
     /// answer is an environment the gate cannot run in, which is exactly what
     /// `SkipReason` means. (`connect_and_seed` panics instead, because by then
@@ -3073,11 +3064,21 @@ pub mod db {
         })
     }
 
+    /// Connect to a benchmark database, or explain why not.
+    ///
+    /// * `HARVEST_TEST_DATABASE_URL` set: treated as an **admin** URL. A fresh,
+    ///   uniquely-named database is created and migrated, so a 100k-row backlog
+    ///   can never leak into a shared database and wreck sibling suites.
+    /// * Otherwise: a `postgres:16` testcontainer.
+    ///
+    /// Returns `Err(SkipReason)` when no Docker daemon and no env URL are
+    /// available. Then `cargo bench` on a laptop without Docker prints a notice
+    /// and exits cleanly instead of failing.
     pub async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
         // One ceiling for the whole provisioning phase, fixed before the first
         // await on *either* path. See `with_provision_deadline`. Hoisted above
-        // the branch deliberately: the container path is the one CI actually
-        // runs, so a ceiling that covered only the existing-server path would
+        // the branch deliberately. The container path is the one CI actually
+        // runs. A ceiling that covered only the existing-server path would
         // protect the mode nobody exercises.
         let deadline = Instant::now() + super::scenario_time_budget();
         if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -3089,16 +3090,16 @@ pub mod db {
             // This session is held from here until the lease connects, which
             // includes the whole wait for the sweep lock. If the operator's URL
             // named `template1`, that wait would leave a backend attached to the
-            // template — and the lock *holder's* plain `CREATE DATABASE` copies
-            // `template1` by default, so it would fail with "source database is
+            // template. The lock *holder's* plain `CREATE DATABASE` copies
+            // `template1` by default. So it would fail with "source database is
             // being accessed by other users". One client waiting would break
             // another client's create.
             //
-            // Costs no reachability: `take_sweep_lock` already refuses to start
-            // a run that cannot connect to `SWEEP_LOCK_DB`, so this adds no
-            // requirement the harness did not already have. Every statement
-            // this session issues — the sweep's catalog query and `DROP`s, the
-            // `CREATE DATABASE` — is cluster-scoped and works from anywhere.
+            // Costs no reachability. `take_sweep_lock` already refuses to start
+            // a run that cannot connect to `SWEEP_LOCK_DB`, so this adds no new
+            // requirement. Every statement this session issues — the sweep's
+            // catalog query and `DROP`s, the `CREATE DATABASE` — is
+            // cluster-scoped and works from anywhere.
             let admin_conn_url = admin_connection_url(&admin_url)?;
             let mut admin = with_provision_deadline(
                 "connect to the admin database",
@@ -3107,9 +3108,9 @@ pub mod db {
             )
             .await?
             .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
-            // Everything from here to the lease runs under an advisory lock, so
-            // no other client can sweep while we are between `CREATE DATABASE`
-            // and holding a backend on it. The lock lives on its own connection
+            // Everything from here to the lease runs under an advisory lock. So
+            // no other client can sweep between `CREATE DATABASE` and the
+            // backend this run holds on it. The lock lives on its own connection
             // to a fixed database — see `SWEEP_LOCK_KEY` for why that matters.
             let lock = with_provision_deadline(
                 "take the sweep lock",
@@ -3124,10 +3125,10 @@ pub mod db {
             )
             .await?;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-            // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
-            // cheap same-host liveness handle for the sweep; the run token is
-            // what actually makes the name unique when the admin URL is shared
-            // across hosts (see `run_token`).
+            // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The sweep
+            // does not read the pid as a liveness signal. The server-visible
+            // lease decides that. The run token makes the name unique when the
+            // admin URL is shared across hosts (see `run_token`).
             let db = format!(
                 "{BENCH_DB_PREFIX}{}_{}_{}",
                 std::process::id(),
@@ -3188,12 +3189,12 @@ pub mod db {
 
     /// Provision the Docker-backed database, under the same ceiling.
     ///
-    /// Split out so `setup_bench_db` stays readable, but bounded for a reason
-    /// that is not cosmetic: this is the path the checked CI manifest runs, so
-    /// leaving it unbounded would mean the provisioning ceiling only guards the
-    /// mode CI never exercises. A daemon that accepts the socket and then stops
-    /// answering — mid-pull, mid-create, mid-metadata — parks the gate until the
-    /// outer job timeout otherwise.
+    /// Split out so `setup_bench_db` stays readable. It is bounded for a reason
+    /// that is not cosmetic. This is the path the checked CI manifest runs.
+    /// Unbounded, the provisioning ceiling would guard only the mode CI never
+    /// exercises. A daemon that accepts the socket and then stops answering
+    /// (mid-pull, mid-create, mid-metadata) otherwise parks the gate until the
+    /// outer job timeout.
     async fn setup_container_bench_db(deadline: Instant) -> Result<BenchDb, SkipReason> {
         let container = with_provision_deadline(
             "start the benchmark container",
@@ -3201,18 +3202,19 @@ pub mod db {
             Postgres::default()
                 .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
                 .with_tag("16")
-                // Preload `pg_stat_statements` so the evidence-capture test's
-                // real-claim_task() snapshot (`zz_capture_queue_pause_claim_evidence`)
-                // works on the pure-Docker fallback path, not just against an
-                // external `HARVEST_TEST_DATABASE_URL` that happens to already
-                // have it configured -- the extension's C hooks only exist once
-                // preloaded at postmaster start; `CREATE EXTENSION` alone (which
-                // that test already runs) cannot retroactively enable them.
+                // Preload `pg_stat_statements` for the evidence-capture test's
+                // real `claim_task()` snapshot
+                // (`zz_capture_queue_pause_claim_evidence`). It then works on the
+                // pure-Docker fallback path too, not only against an external
+                // `HARVEST_TEST_DATABASE_URL` that already has it configured.
+                // The extension's C hooks exist only once preloaded at
+                // postmaster start. `CREATE EXTENSION` alone, which that test
+                // already runs, cannot enable them after the fact.
                 // `.with_cmd(...)` fully replaces `Image::cmd()` rather than
-                // merging with it, so the image's own `fsync=off` default
+                // merging with it. So the image's own `fsync=off` default
                 // (`Postgres::default()` never calls `.with_fsync_enabled()`) is
-                // repeated here explicitly to avoid silently re-enabling fsync
-                // and slowing down every Docker-fallback benchmark run.
+                // repeated here. Otherwise fsync is silently re-enabled, which
+                // slows down every Docker-fallback benchmark run.
                 .with_cmd([
                     "-c",
                     "shared_preload_libraries=pg_stat_statements",
@@ -3258,34 +3260,32 @@ pub mod db {
     ///
     /// The lease defends a running benchmark by *being* an idle backend, which
     /// is precisely the thing Postgres 14's `idle_session_timeout` exists to
-    /// kill. On a server that sets it — an entirely reasonable thing to do on
-    /// the shared cluster this mode is designed to point at — the lease is
-    /// terminated mid-run while [`BenchDb`] still holds the (now dead) handle,
-    /// so [`database_has_connections`] reports the live run's database as
-    /// abandoned and a concurrent sweep drops it out from under us. The failure
-    /// is silent on both sides: nothing tells the victim its lease is gone, and
-    /// the sweeper is behaving correctly on the evidence available to it.
+    /// kill. A shared cluster, which this mode targets, may reasonably set it.
+    /// There the lease is terminated mid-run while [`BenchDb`] still holds the
+    /// now-dead handle. So [`database_has_connections`] reports the live run's
+    /// database as abandoned, and a concurrent sweep drops it out from under
+    /// us. The failure is silent on both sides. Nothing tells the victim its
+    /// lease is gone, and the sweeper acts correctly on the evidence it has.
     ///
     /// `SET` is session-local and `idle_session_timeout` is `USERSET`, so this
     /// overrides a `postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` default
     /// without needing any privilege, and affects only the lease.
     ///
-    /// Disabling the timeout is preferred over heartbeating the lease: a
-    /// heartbeat needs a background task whose lifetime is tied to `BenchDb`,
-    /// and it would still leave a window one interval wide. This closes the
-    /// hole outright with one statement and no task.
+    /// Disabling the timeout is preferred over a heartbeat on the lease. A
+    /// heartbeat needs a background task whose lifetime is tied to `BenchDb`.
+    /// It would still leave a window one interval wide. This closes the hole
+    /// outright with one statement and no task.
     ///
     /// # Version tolerance and the read-back
     ///
-    /// The `SET` fails on Postgres 12/13, where the GUC does not exist — and
-    /// on those versions there is nothing to defend against, so the error is
-    /// ignored. That tolerance is exactly what could hide a *real* failure on
-    /// 14+, so the value is read back rather than assumed:
-    /// `current_setting(name, missing_ok := true)` returns `NULL` for an
-    /// unknown GUC, which distinguishes "too old to have the reaper" from "the
-    /// reaper is armed and we failed to disable it". Only the second case
-    /// warns, and it warns rather than aborting because an unprotected lease
-    /// degrades a concurrent run, and this mode is usually a single run.
+    /// The `SET` fails on Postgres 12/13, where the GUC does not exist. Those
+    /// versions have nothing to defend against, so the error is ignored. That
+    /// tolerance could hide a *real* failure on 14+, so the value is read back
+    /// rather than assumed. `current_setting(name, missing_ok := true)` returns
+    /// `NULL` for an unknown GUC. That separates "too old to have the reaper"
+    /// from "the reaper is armed and the `SET` failed to disable it". Only the
+    /// second case warns. It warns rather than aborts, because an unprotected
+    /// lease degrades a concurrent run, and this mode is usually a single run.
     pub async fn arm_lease_session(conn: &mut AsyncPgConnection) {
         #[derive(QueryableByName)]
         struct SettingRow {
@@ -3312,11 +3312,11 @@ pub mod db {
         };
 
         match row.value.as_deref() {
-            // Two ways to be safe, and they are genuinely different facts:
+            // Two ways to be safe, and they are genuinely different facts.
             // `NULL` means the GUC does not exist, so this server has no idle
-            // reaper at all, while `"0"` is how Postgres renders a timeout we
-            // successfully disabled. Neither leaves the lease exposed, so they
-            // share an arm; any other value means the reaper is still armed.
+            // reaper at all. `"0"` is how Postgres renders a timeout that the
+            // `SET` disabled. Neither leaves the lease exposed, so they share an
+            // arm; any other value means the reaper is still armed.
             None | Some("0") => {}
             Some(other) => eprintln!(
                 "warning: could not disable idle_session_timeout on the bench \
@@ -3331,23 +3331,23 @@ pub mod db {
 
     /// Advisory-lock key serializing sweep-and-create across clients.
     ///
-    /// A database is only defended once it has a backend in `pg_stat_activity`,
-    /// but it cannot have one until it exists — so between `CREATE DATABASE`
-    /// and the lease connection there is a window where a foreign sweep sees a
-    /// real database with zero connections and correctly concludes it is
-    /// abandoned. No amount of naming fixes that; the window has to be closed
-    /// by making the two operations mutually exclusive.
+    /// A database is only defended once it has a backend in `pg_stat_activity`.
+    /// It cannot have one until it exists. So between `CREATE DATABASE` and the
+    /// lease connection, a foreign sweep can see a real database with zero
+    /// connections and correctly conclude it is abandoned. No amount of naming
+    /// fixes that. The window closes only if the two operations are mutually
+    /// exclusive.
     ///
     /// Postgres advisory locks are scoped to the database the session is
-    /// connected to, **not** to the cluster: two sessions on different
-    /// databases can hold the same key simultaneously (verified against a live
-    /// server — `pg_try_advisory_lock` on the same key returns true from a
-    /// second database while the first still holds it). So the lock cannot ride
-    /// the admin connection, whose database is whatever the operator happened
-    /// to put in `HARVEST_TEST_DATABASE_URL`: two runs pointed at the same
-    /// cluster through different admin databases would not serialize at all,
-    /// which is the same as no lock. It is taken on its own connection to
-    /// [`SWEEP_LOCK_DB`] instead, so every client agrees on where it lives.
+    /// connected to, **not** to the cluster. Two sessions on different
+    /// databases can hold the same key at once. A live server confirmed it:
+    /// `pg_try_advisory_lock` on the same key returns true from a second
+    /// database while the first still holds it. So the lock cannot ride the
+    /// admin connection, whose database is whatever the operator put in
+    /// `HARVEST_TEST_DATABASE_URL`. Two runs that reach the same cluster through
+    /// different admin databases would not serialize at all, which is the same
+    /// as no lock. It is taken on its own connection to [`SWEEP_LOCK_DB`]
+    /// instead, so every client agrees on where it lives.
     ///
     /// The value is arbitrary but must never change: two harness versions using
     /// different keys would not serialize against each other either.
@@ -3361,9 +3361,9 @@ pub mod db {
     /// `postgres` because it is the one database every server is guaranteed to
     /// have and every admin URL can reach. Deliberately **not** `template1`,
     /// which is equally universal but is the default template for
-    /// `CREATE DATABASE`: holding a connection to it would make our own
-    /// create — the very operation the lock exists to protect — fail with
-    /// "source database is being accessed by other users".
+    /// `CREATE DATABASE`. A connection held to it would make the harness's own
+    /// create fail with "source database is being accessed by other users".
+    /// That create is the very operation the lock exists to protect.
     pub const SWEEP_LOCK_DB: &str = "postgres";
 
     /// How long to wait for a peer's sweep-and-create before giving up.
@@ -3378,11 +3378,11 @@ pub mod db {
     ///
     /// Always [`SWEEP_LOCK_DB`], never the database the operator named. That
     /// session is held from the first connect until the lease is armed, which
-    /// spans the whole wait for the sweep lock — so if the operator's URL named
-    /// `template1`, a client *waiting* here would keep a backend on the
-    /// template, and the lock holder's plain `CREATE DATABASE` (which copies
-    /// `template1`) would fail with "source database is being accessed by other
-    /// users". One client waiting would break another client's create.
+    /// spans the whole wait for the sweep lock. Suppose the operator's URL
+    /// named `template1`. A client *waiting* here would then keep a backend on
+    /// the template. The lock holder's plain `CREATE DATABASE` (which copies
+    /// `template1`) would fail with "source database is being accessed by
+    /// other users". One client waiting would break another client's create.
     ///
     /// Costs no reachability: [`take_sweep_lock`] already refuses to start a run
     /// that cannot reach `SWEEP_LOCK_DB`.
@@ -3405,13 +3405,13 @@ pub mod db {
     /// database rather than in whichever one the admin URL names.
     pub async fn take_sweep_lock(admin_url: &str) -> Result<AsyncPgConnection, SkipReason> {
         // No fallback to the admin URL's own database. That would take a lock
-        // scoped to whichever database the operator named, which is exactly the
-        // per-database scoping this fixed database exists to escape — two
-        // clients arriving through different admin databases would both enter
-        // the sweep/create section and one could drop the other's new database
-        // before its lease connects. A warning does not protect anybody's data,
-        // so an unreachable `SWEEP_LOCK_DB` is terminal: better a run that does
-        // not start than a run that silently cannot serialize.
+        // scoped to whichever database the operator named. This fixed database
+        // exists to escape exactly that per-database scoping. Two clients that
+        // arrive through different admin databases would both enter the
+        // sweep/create section. One could drop the other's new database before
+        // its lease connects. A warning does not protect anybody's data, so an
+        // unreachable `SWEEP_LOCK_DB` is terminal. A run that does not start is
+        // better than a run that silently cannot serialize.
         let lock_url = super::with_db_name(admin_url, SWEEP_LOCK_DB).map_err(SkipReason)?;
         let mut lock = AsyncPgConnection::establish(&lock_url).await.map_err(|e| {
             SkipReason(format!(
@@ -3454,15 +3454,15 @@ pub mod db {
 
     /// Drop benchmark databases left behind by earlier runs.
     ///
-    /// The admin-URL path creates a fresh database per run and — unlike the
-    /// testcontainer path, where dropping the container reclaims everything —
-    /// has no natural teardown: an async `Drop` cannot run a query. Without
-    /// this sweep, repeatedly benchmarking against a long-lived local server
+    /// The admin-URL path creates a fresh database per run and has no natural
+    /// teardown, because an async `Drop` cannot run a query. The testcontainer
+    /// path differs: dropping the container reclaims everything. Without this
+    /// sweep, repeatedly benchmarking against a long-lived local server
     /// accumulates 100k-row databases forever.
     ///
-    /// Sweeping at *setup* rather than teardown is deliberate: it also reclaims
-    /// databases orphaned by a run that panicked or was killed mid-measurement,
-    /// which a teardown hook could never do.
+    /// Sweeping at *setup* rather than teardown is deliberate. It also reclaims
+    /// databases orphaned by a run that panicked or was killed
+    /// mid-measurement. A teardown hook could never do that.
     ///
     /// Databases belonging to a **live** process are skipped, so concurrent
     /// runs (and the parallel test harness) cannot delete each other's working
@@ -3486,26 +3486,25 @@ pub mod db {
 
         for row in rows {
             // The authority on whether this name is ours at all. The `LIKE`
-            // above is only a prefilter — and a loose one, since `_` is a
-            // single-character wildcard — so every candidate is re-checked here
+            // above is only a prefilter, and a loose one, since `_` is a
+            // single-character wildcard. So every candidate is re-checked here
             // against the full minted shape before anything destructive runs.
             if super::sweep_step(&row.datname) == super::SweepStep::Skip {
                 continue;
             }
 
-            // The authority. A pid answers only for this host, so when several
-            // machines share one admin URL a foreign run looks dead and a
-            // forced drop would terminate it mid-measurement. The server is
-            // the one party that can see every client, and a live run holds a
-            // lease connection for the whole life of its database (see
+            // The authority. A pid answers only for this host. When several
+            // machines share one admin URL, a foreign run looks dead, and a
+            // forced drop would terminate it mid-measurement. The server is the
+            // one party that can see every client. A live run holds a lease
+            // connection for the whole life of its database (see
             // `BenchDb::_lease`), so any backend at all means "in use".
             if database_has_connections(admin, &row.datname).await {
                 continue;
             }
-            // We reach this line only for a database just observed to have zero
-            // connections, so the terminate inside the helper is belt-and-braces
-            // against a backend arriving in the gap between that check and the
-            // drop.
+            // Only a database just observed to have zero connections reaches
+            // this line. So the terminate inside the helper is belt-and-braces
+            // against a backend that arrives between that check and the drop.
             drop_database_version_neutral(admin, &row.datname).await;
         }
     }
@@ -3513,14 +3512,14 @@ pub mod db {
     /// `DROP DATABASE`, on every `PostgreSQL` the engine supports.
     ///
     /// `DROP DATABASE ... WITH (FORCE)` is tidier but is `PostgreSQL` 13+, and the
-    /// engine supports 12+ (see the README). On 12 it is a *syntax error* — and
-    /// every caller here ignores the result, because a cleanup that fails must
-    /// not fail the run — so the database silently accumulates forever instead.
+    /// engine supports 12+ (see the README). On 12 it is a *syntax error*.
+    /// Every caller here ignores the result, because a cleanup that fails must
+    /// not fail the run. So the database silently accumulates forever instead.
     /// Terminate-then-drop is version-neutral and equivalent in effect.
     ///
     /// Shared rather than written out at each site: the two callers leak in
     /// different ways when they disagree. A stale bench database at least
-    /// carries the harness prefix and is reclaimed by the next run's sweep; a
+    /// carries the harness prefix, and the next run's sweep reclaims it. A
     /// probe database does not, so nothing ever collects it.
     ///
     /// Best-effort by design — both statements' results are discarded.
@@ -3528,10 +3527,9 @@ pub mod db {
     /// # Safety
     ///
     /// `name` is interpolated, not bound (`PostgreSQL` does not accept a parameter
-    /// there). The caller must have **minted** it, or — for a name read back
-    /// from the server — cleared it through [`super::sweep_step`] first, which
-    /// is the check that keeps a database this harness did not create out of a
-    /// `DROP`.
+    /// there). The caller must have **minted** it. A name read back from the
+    /// server must first clear [`super::sweep_step`]. That check keeps a
+    /// database this harness did not create out of a `DROP`.
     pub async fn drop_database_version_neutral(conn: &mut AsyncPgConnection, name: &str) {
         let _ = diesel::sql_query(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
@@ -3543,15 +3541,15 @@ pub mod db {
 
         // One-argument `pg_terminate_backend` *signals*; it does not wait. A
         // backend unwinding a transaction can still hold the database when the
-        // `DROP` arrives, which fails with "is being accessed by other users" —
-        // and that error is discarded here, so the database would leak exactly
-        // as if we had never terminated anything. The two-argument form that
-        // waits is `PostgreSQL` 14+, and version-neutrality is this helper's
-        // whole reason to exist, so poll instead.
+        // `DROP` arrives. The `DROP` then fails with "is being accessed by other
+        // users". That error is discarded here, so the database would leak as
+        // if nothing had been terminated. The two-argument form that waits is
+        // `PostgreSQL` 14+, and version-neutrality is this helper's whole reason
+        // to exist, so poll instead.
         //
-        // Bounded, and the `DROP` runs either way: a backend that refuses to
-        // leave is not worth hanging a best-effort cleanup over, and attempting
-        // the `DROP` anyway is strictly no worse than the unpolled version.
+        // Bounded, and the `DROP` runs either way. A backend that refuses to
+        // leave is not worth hanging a best-effort cleanup over. A `DROP`
+        // attempted anyway is strictly no worse than the unpolled version.
         let wait_until = Instant::now() + TERMINATE_WAIT;
         while database_has_connections(conn, name).await {
             if Instant::now() >= wait_until {
@@ -3580,9 +3578,10 @@ pub mod db {
     /// Host-agnostic, unlike a local pid probe: the server sees every client
     /// regardless of which machine or PID namespace it runs in.
     ///
-    /// Conservative by design — a failed check reports "in use", so the worst
+    /// Conservative by design. A failed check reports "in use", so the worst
     /// outcome is a leaked database, never a live run dropped out from under
     /// itself.
+    ///
     /// Public so the e2e harness's own stale-database sweep reuses this
     /// server-visible liveness check rather than a second copy of the query.
     pub async fn database_has_connections(admin: &mut AsyncPgConnection, datname: &str) -> bool {
@@ -3673,8 +3672,8 @@ pub mod db {
     /// The build id the claiming worker advertises for this scenario.
     ///
     /// An empty string short-circuits the build-routing filter entirely
-    /// (`OR $3 = ''`), which is the legacy-worker fast path; the build scenarios
-    /// advertise a real id so the filter is genuinely evaluated.
+    /// (`OR $3 = ''`). That is the legacy-worker fast path. The build scenarios
+    /// advertise a real id, so the filter is genuinely evaluated.
     #[must_use]
     pub const fn worker_build_id(gate: ClaimGate) -> &'static str {
         match gate {
@@ -3783,8 +3782,8 @@ pub mod db {
     /// work — the scan must walk past them via the `NOT EXISTS` anti-join
     /// (issue #383).
     ///
-    /// Seeded IN ADDITION to the claimable backlog (rather than replacing part
-    /// of it) so the claimable pool stays identical to the baseline and the only
+    /// Seeded IN ADDITION to the claimable backlog, not in place of part of it.
+    /// So the claimable pool stays identical to the baseline, and the only
     /// variable is the presence of paused rows.
     async fn seed_paused_ballast(conn: &mut AsyncPgConnection, backlog: usize, queues: usize) {
         exec(
@@ -3923,9 +3922,9 @@ pub mod db {
     /// Seed a scenario's backlog.
     ///
     /// Set-based throughout: a 100k-row backlog is one `INSERT ... SELECT FROM
-    /// generate_series`, not 100k round trips. `ANALYZE` runs last — without it
-    /// the planner works from stale statistics on a freshly bulk-loaded table
-    /// and produces plans that are neither representative nor stable.
+    /// generate_series`, not 100k round trips. `ANALYZE` runs last. Without it
+    /// the planner works from stale statistics on a freshly bulk-loaded table.
+    /// Its plans are then neither representative nor stable.
     ///
     /// # Panics
     /// Panics if any seeding statement fails.
@@ -3985,7 +3984,7 @@ pub mod db {
         /// questions over different windows. `claimed` is a *post-warmup*
         /// count, paired with the post-warmup sample set for latency and for
         /// [`Self::claim_ratio`]. This one is paired with [`Self::wall_secs`],
-        /// which runs from the first warmup call, so a throughput fraction
+        /// which runs from the first warmup call. So a throughput fraction
         /// built from it shares a window with its denominator. Dividing the
         /// trimmed count by the untrimmed clock understated `claims/s` by the
         /// warmup fraction — about 10%.
@@ -3994,7 +3993,7 @@ pub mod db {
         pub wall_secs: f64,
         /// At least one claimer hit the wall-clock budget before completing its
         /// planned operations. The percentiles are still real, but they rest on
-        /// fewer samples than requested — a signal in itself that the claim path
+        /// fewer samples than requested. That alone signals that the claim path
         /// is slow at this depth.
         pub truncated: bool,
     }
@@ -4047,9 +4046,9 @@ pub mod db {
 
     /// Arrive at the scenario start barrier, bounded by the scenario deadline.
     ///
-    /// Every task arrives — including one that failed checkout and is about to
-    /// return — so a party that is never coming cannot park its peers here. The
-    /// deadline bound is the backstop for any future path that forgets: it
+    /// Every task arrives, even one that failed checkout and is about to
+    /// return. So a party that is never coming cannot park its peers here. The
+    /// deadline bound is the backstop for any future path that forgets. It
     /// keeps this await under the same ceiling as every other await in the
     /// task, so the advertised cap stays real.
     async fn arrive_at_start_gate(gate: &tokio::sync::Barrier, deadline: Instant) -> Instant {
@@ -4061,19 +4060,17 @@ pub mod db {
         Instant::now()
     }
 
-    /// Connect and seed under a setup ceiling, then hand back the connection.
-    ///
-    /// Both runners share this so the bound cannot exist on one path and not the
-    /// other — the same reason their budgets are passed the same way. The
-    /// connection is dropped here rather than returned: neither runner uses it
-    /// past seeding, and holding it open would keep a session the pool then has
-    /// to work around.
     /// Connect and seed under the *setup* ceiling.
     ///
+    /// Both runners share this, so the bound cannot exist on one path and not
+    /// the other. Their budgets are passed the same way for the same reason.
+    /// The connection is dropped here rather than returned. Neither runner uses
+    /// it past seeding, and an open one would keep a session the pool then has
+    /// to work around.
+    ///
     /// `setup_budget` is deliberately separate from the caller's measured-phase
-    /// budget: see [`super::setup_time_budget`] for why passing the measured
-    /// one here makes the injected-budget regression tests depend on seeding
-    /// speed.
+    /// budget. The measured one here would make the injected-budget regression
+    /// tests depend on seeding speed. See [`super::setup_time_budget`].
     async fn connect_and_seed(
         db: &BenchDb,
         scenario: Scenario,
@@ -4088,18 +4085,19 @@ pub mod db {
 
     /// [`run_claim_scenario`] with the wall-clock ceiling supplied directly.
     ///
-    /// The budget is a *parameter* rather than something this function reads
-    /// from the process so that a test wanting a different ceiling can ask for
-    /// one without writing to the environment. `HARVEST_BENCH_SCENARIO_SECS` is
-    /// process-global and `cargo test` runs a binary's tests in parallel by
-    /// default, so a test that set it would be reaching into every sibling
-    /// scenario running at that moment — handing them a budget they never asked
-    /// for and would report as truncated. No amount of care at the write site
-    /// fixes that: a restore-on-drop guard still leaves the window open for as
-    /// long as the test runs, which for these is the whole point of them.
+    /// The budget is a *parameter*, not something this function reads from the
+    /// process. A test that wants a different ceiling can then ask for one
+    /// without a write to the environment. `HARVEST_BENCH_SCENARIO_SECS` is
+    /// process-global, and `cargo test` runs a binary's tests in parallel by
+    /// default. A test that set it would reach into every sibling scenario
+    /// running at that moment. It would hand them a budget they never asked
+    /// for, and they would report as truncated. No amount of care at the write
+    /// site fixes that. A restore-on-drop guard still leaves the window open
+    /// for as long as the test runs, which for these tests is their whole
+    /// point.
     ///
     /// So the environment is read exactly once, at the edge, by the caller that
-    /// wants the default; everything below here takes the answer as an
+    /// wants the default. Everything below here takes the answer as an
     /// argument.
     ///
     /// # Panics
@@ -4111,9 +4109,7 @@ pub mod db {
         budget: std::time::Duration,
     ) -> ClaimReport {
         // Setup runs before the measured phase and so before its deadline; it
-        // carries its own. See `with_setup_deadline`. The comment used to say
-        // this while the code passed `budget` — the measured-phase ceiling —
-        // so an injected budget bounded seeding too.
+        // carries its own. See `with_setup_deadline`.
         let seed_outcome = connect_and_seed(db, scenario, super::setup_time_budget()).await;
         measure_seeded_claims(db, scenario, seed_outcome, budget).await
     }
@@ -4144,31 +4140,32 @@ pub mod db {
 
         let started = Instant::now();
         // One ceiling for the whole scenario, fixed *before* any claimer runs.
-        // Deriving it inside the task (after `pool.get()`) would restart the
-        // clock behind an unbounded await: a stalled or exhausted pool would
-        // park every claimer indefinitely with no deadline yet in existence,
-        // and the advertised cap would be a fiction. A scenario-wide deadline
-        // also means the cap bounds the scenario, not each claimer separately.
+        // A deadline derived inside the task, after `pool.get()`, would restart
+        // the clock behind an unbounded await. A stalled or exhausted pool would
+        // then park every claimer indefinitely, with no deadline yet in
+        // existence. The advertised cap would then be a fiction. A
+        // scenario-wide deadline also means the cap bounds the scenario, not
+        // each claimer separately.
         let deadline = started + budget;
         // Every claimer checks out its connection and then waits here, so the
         // measured phase begins with all of them contending at once. Without
         // it, claimer 0 could take its first samples while claimer N-1 was
-        // still inside `pool.get()`: the head of the sample would be measured
-        // under less contention than the scenario nominally models — flattering
-        // p50 for exactly the multi-claimer scenarios that exist to measure
-        // contention — and the throughput denominator would count the ramp-up
-        // as if it were measured work.
+        // still inside `pool.get()`. The head of the sample would then see less
+        // contention than the scenario nominally models. That flatters p50 for
+        // exactly the multi-claimer scenarios that exist to measure contention.
+        // The throughput denominator would also count the ramp-up as measured
+        // work.
         //
         // The deadline above is deliberately *not* re-anchored after this
-        // barrier: checkout is an unbounded await, so the ceiling has to exist
+        // barrier. Checkout is an unbounded await, so the ceiling has to exist
         // before it (see the comment on `deadline`). The measurement clock is
         // separate, and starts on release.
         //
         // Safe only because `build_pool` sizes the pool *above* the claimer
         // count: every party can hold a connection at once. A pool smaller than
-        // the party count would turn checkout into a genuine deadlock, since
-        // the claimers holding connections would be waiting here for one that
-        // cannot check out until they release.
+        // the party count would turn checkout into a genuine deadlock. The
+        // claimers that hold connections would wait here for one that cannot
+        // check out until they release.
         let gate = Arc::new(tokio::sync::Barrier::new(claimers));
         let mut handles = Vec::with_capacity(claimers);
         for c in 0..claimers {
@@ -4183,14 +4180,14 @@ pub mod db {
             handles.push(tokio::spawn(async move {
                 let worker = format!("{BENCH_PREFIX}-worker-{c}");
                 // (latency_ms, claimed_a_task) in observation order, so warmup
-                // can be trimmed from the front once we know how many
-                // observations this claimer actually managed to take.
+                // can be trimmed from the front once the observation count of
+                // this claimer is known.
                 let mut observed: Vec<(f64, bool)> = Vec::with_capacity(per_claimer);
-                // Bounded by the same deadline the claim loop uses: checkout is
+                // Bounded by the same deadline the claim loop uses. Checkout is
                 // an unbounded await, so a stalled or exhausted pool would
-                // otherwise hang here past the ceiling. Failing to check out is
-                // terminal for this claimer — it takes no samples and reports
-                // truncated, so the gate calls the measurement unsound rather
+                // otherwise hang here past the ceiling. A failed checkout is
+                // terminal for this claimer. It takes no samples and reports
+                // truncated. So the gate calls the measurement unsound rather
                 // than publishing a percentile from the claimers that did run.
                 let Ok(Ok(mut conn)) = tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
@@ -4198,9 +4195,9 @@ pub mod db {
                 )
                 .await
                 else {
-                    // Still reports a span: its resume is a valid observation
-                    // of when the gate released, and folding it in can only
-                    // move the shared window's start *earlier*, never later.
+                    // Still reports a span. Its resume is a valid observation
+                    // of when the gate released. Folding it in can only move
+                    // the shared window's start *earlier*, never later.
                     let resumed = arrive_at_start_gate(&gate, deadline).await;
                     return (
                         super::ClaimerOutcome::from_observed(Vec::new(), true),
@@ -4223,17 +4220,17 @@ pub mod db {
                     }
                     let t0 = now;
                     // Bound the call, not just the loop head. `claim_task` is
-                    // an unbounded await, so a single stalled claim — exactly
-                    // the regression or database stall this ceiling exists to
-                    // catch — would sit here for minutes while the loop-top
+                    // an unbounded await. A single stalled claim is exactly the
+                    // regression or database stall this ceiling exists to
+                    // catch. It would sit here for minutes while the loop-top
                     // check never runs again, and the advertised cap would be
                     // a fiction.
                     //
                     // A timeout abandons the connection mid-query, which can
-                    // leave it unusable. That is fine and terminal: we break
-                    // immediately, the pool recycles it, and `truncated` makes
-                    // the gate fail loudly rather than publish a percentile
-                    // computed from a partial run.
+                    // leave it unusable. That is fine and terminal. The loop
+                    // breaks at once, and the pool recycles the connection.
+                    // `truncated` makes the gate fail loudly rather than
+                    // publish a percentile computed from a partial run.
                     let claimed = tokio::time::timeout(
                         deadline - now,
                         queue::claim_task_with_fairness(
@@ -4403,9 +4400,9 @@ pub mod db {
     ///
     /// See [`run_claim_scenario_with_budget`] for why the budget is injected
     /// rather than read from the environment here. Both paths take it the same
-    /// way deliberately: the last two rounds of review on this file were both
-    /// cases of the write path missing a property the claim path had, and a
-    /// helper that exists on only one of them is how that happens again.
+    /// way deliberately. The write path has twice missed a property that the
+    /// claim path had. A helper that exists on only one of them is how that
+    /// happens again.
     ///
     /// # Panics
     ///
@@ -4436,18 +4433,18 @@ pub mod db {
         let queues = Arc::new(queue_names(scenario));
 
         let started = Instant::now();
-        // One ceiling for the whole scenario, fixed before any writer runs —
-        // the same contract as the claim path, and for the same reason: both
-        // `pool.get()` and `queue::enqueue` are unbounded awaits, so a stalled
-        // server would otherwise hang the bench (and the CI gate that calls
-        // this) until the outer workflow timeout, while the page advertises a
-        // per-scenario cap.
+        // One ceiling for the whole scenario, fixed before any writer runs. The
+        // claim path has the same contract for the same reason. Both
+        // `pool.get()` and `queue::enqueue` are unbounded awaits. A stalled
+        // server would otherwise hang the bench, and the CI gate that calls
+        // this, until the outer workflow timeout. Meanwhile the page advertises
+        // a per-scenario cap.
         let deadline = started + budget;
-        // Same start barrier as the claim path, for the same reason: a
-        // start-storm measured while some writers are still checking out is a
-        // smaller storm than the one advertised, and the ramp-up would inflate
-        // the throughput denominator. The deadline stays anchored before
-        // checkout; only the measurement clock moves.
+        // Same start barrier as the claim path, for the same reason. A
+        // start-storm measured while some writers still check out is smaller
+        // than the one advertised. The ramp-up would also inflate the
+        // throughput denominator. The deadline stays anchored before checkout;
+        // only the measurement clock moves.
         let gate = Arc::new(tokio::sync::Barrier::new(writers.max(1)));
         let mut handles = Vec::with_capacity(writers);
         for w in 0..writers.max(1) {
@@ -4456,8 +4453,8 @@ pub mod db {
             let gate = Arc::clone(&gate);
             handles.push(tokio::spawn(async move {
                 let mut samples = Vec::with_capacity(rows_per_writer);
-                // Failing to check out is terminal for this writer: it takes no
-                // samples and reports truncated, so the caller calls the
+                // A failed checkout is terminal for this writer. It takes no
+                // samples and reports truncated. So the caller calls the
                 // measurement unsound rather than publishing a rate computed
                 // only from the writers that did start.
                 let Ok(Ok(mut conn)) = tokio::time::timeout(
@@ -4481,11 +4478,12 @@ pub mod db {
                     let q = queues[(w + i) % queues.len()].clone();
                     let params = bench_enqueue_params(q);
                     let t0 = now;
-                    // Bound the call, not just the loop head: a single stalled
+                    // Bound the call, not just the loop head. A single stalled
                     // write would otherwise sit here past the ceiling while the
                     // loop-top check never runs again. A timeout abandons the
-                    // connection mid-query, which is fine and terminal — we
-                    // break, the pool recycles it, and `truncated` propagates.
+                    // connection mid-query, which is fine and terminal. The
+                    // loop breaks, the pool recycles the connection, and
+                    // `truncated` propagates.
                     let wrote =
                         tokio::time::timeout(deadline - now, queue::enqueue(&mut conn, &params))
                             .await;
@@ -4511,9 +4509,9 @@ pub mod db {
             spans.push(span);
             truncated |= writer_truncated;
             rows += samples.len();
-            // Same post-hoc warmup trim as the claim path: the first writes on
-            // a fresh connection pay plan-cache and connection setup costs that
-            // are not representative of a sustained start-storm.
+            // Same post-hoc warmup trim as the claim path. The first writes on
+            // a fresh connection pay plan-cache and connection setup costs.
+            // Those costs do not represent a sustained start-storm.
             let warmup = super::warmup_claims_for(samples.len());
             warmup_rows += warmup;
             all_samples.extend(samples.into_iter().skip(warmup));
@@ -4539,8 +4537,8 @@ pub mod db {
 
     /// `EXPLAIN (ANALYZE, BUFFERS)` of the claim query for a seeded scenario.
     ///
-    /// The single most useful artifact for a contributor about to add predicate
-    /// number twelve: it shows exactly which index the claim rides and what each
+    /// The most useful artifact for a contributor about to add predicate number
+    /// twelve. It shows exactly which index the claim rides and what each
     /// accreted subquery costs.
     ///
     /// Runs inside a transaction that is rolled back, so the `EXPLAIN ANALYZE`
@@ -4588,9 +4586,6 @@ pub mod db {
             sql = sql.replace(&format!("${}", i + 1), literal);
         }
 
-        // `EXPLAIN ANALYZE` really executes the statement — including the
-        // `UPDATE` CTEs — so it runs inside a transaction that is rolled back.
-        // Otherwise producing the plan would itself consume a task.
         exec(conn, "BEGIN").await;
         let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
             "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF) {sql}"
@@ -4636,9 +4631,9 @@ pub mod db {
     ///
     /// The per-gate cost table in `docs/performance.md` is only meaningful if
     /// each scenario genuinely puts its predicate on the execution path. A
-    /// scenario that silently stopped setting its column would still claim every
-    /// row at a 100% ratio — the claim would just take the cheap `IS NULL` leg —
-    /// so "did it claim?" cannot detect that failure. This census can.
+    /// scenario that silently stopped setting its column would still claim
+    /// every row at a 100% ratio. The claim would just take the cheap `IS NULL`
+    /// leg. So "did it claim?" cannot detect that failure. This census can.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct SeedCensus {
         /// Rows with `required_build_id` set (build-routing filter, #171).
@@ -4656,10 +4651,9 @@ pub mod db {
         pub build_compat_rows: i64,
         /// Pending rows *not* blocked by a PAUSED execution — i.e. the rows a
         /// claim can actually take. Load-bearing for the `double_backlog`
-        /// control: if it silently seeded one backlog instead of two, it would
-        /// stop being an equal-depth comparand and the `paused_rows`
-        /// attribution would quietly go back to conflating depth with
-        /// predicate cost.
+        /// control. If it silently seeded one backlog instead of two, it would
+        /// stop being an equal-depth comparand. The `paused_rows` attribution
+        /// would then quietly conflate depth with predicate cost again.
         pub claimable_rows: i64,
     }
 

@@ -2,10 +2,10 @@
 //! SSRF guarding (Tier B target 10).
 //!
 //! Contract under test:
-//! - a non-routable IP-literal target (loopback / private / link-local / CGNAT /
-//!   ULA / unspecified / multicast / broadcast) is **never** accepted — not even
-//!   under the maximally permissive policy (`allow_ip_literals = true`,
-//!   `allow_http = true`);
+//! - a non-routable IP-literal target is **never** accepted. That covers
+//!   loopback, private, link-local, CGNAT, ULA, unspecified, multicast and
+//!   broadcast. It holds even under the maximally permissive policy
+//!   (`allow_ip_literals = true`, `allow_http = true`);
 //! - `validate_target_url` is total (never panics) on arbitrary input.
 
 use autumn_harvest::completion_callback::{HostAllowlist, SsrfPolicy, validate_target_url};
@@ -22,9 +22,9 @@ fn permissive_policy() -> SsrfPolicy {
 }
 
 /// Strategy producing a URL string whose host is a guaranteed-non-routable
-/// IPv4 literal. (Note: `0.x.y.z` other than `0.0.0.0` is deliberately excluded
-/// — only `0.0.0.0` is `is_unspecified`, so a general `0.a.b.c` is not blocked
-/// by the guard and would be a false expectation.)
+/// IPv4 literal. It excludes `0.x.y.z` other than `0.0.0.0` on purpose. Only
+/// `0.0.0.0` is `is_unspecified`, so the guard does not block a general
+/// `0.a.b.c`.
 fn internal_ipv4_url() -> impl Strategy<Value = String> {
     let octet = 0u8..=255;
     prop_oneof![

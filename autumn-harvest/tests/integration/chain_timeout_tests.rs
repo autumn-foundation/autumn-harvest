@@ -1,8 +1,8 @@
 #![cfg(feature = "db")]
 //! Integration tests for the chain-scoped lifetime cap — issue #617.
 //!
-//! Distinct from #243's per-run `execution_timeout`, the chain cap is anchored at
-//! the FIRST run's start and CARRIED VERBATIM across every continue-as-new, so a
+//! Unlike #243's per-run `execution_timeout`, the chain cap anchors at the FIRST
+//! run's start. It is CARRIED VERBATIM across every continue-as-new, so a
 //! runaway loop cannot escape it by continuing-as-new. Enforced by the existing
 //! timeout scanner and the existing `WorkflowExecutionTimedOut` event.
 //!
@@ -56,9 +56,9 @@ use crate::integration_e2e::{
 
 /// Insert a RUNNING execution row with a caller-chosen UNIQUE `workflow_name` and
 /// `workflow_id`. The unique name lets scanner tests filter the metrics spy to
-/// exactly their own row, so the GLOBAL `enforce_workflow_execution_timeouts`
-/// scan — which times out every crossed-deadline RUNNING row in the shared CI
-/// database, not just this one — cannot make assertions flaky.
+/// exactly their own row. The GLOBAL `enforce_workflow_execution_timeouts` scan
+/// times out every crossed-deadline RUNNING row in the shared CI database. The
+/// filter keeps that scan from making assertions flaky.
 async fn insert_named_running(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -156,7 +156,6 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect")
 }
 
-/// Directly set the chain columns on an existing execution row.
 async fn set_chain_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -173,7 +172,6 @@ async fn set_chain_columns(
         .expect("set chain columns");
 }
 
-/// Load the two chain columns for an execution.
 async fn load_chain_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -247,7 +245,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
 }
 
 // ── AC2 / AC7: scanner fires on the chain cap where a per-run cap alone would
-//    not — the essence of the "runaway loop cannot escape via CAN" guarantee.
+//    not. This is the "runaway loop cannot escape via CAN" guarantee.
 #[tokio::test]
 async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -425,7 +423,7 @@ async fn inherited_chain_deadline_is_used_verbatim() {
     );
 }
 
-// ── AC4: the builder ceiling doubles as a fleet-wide DEFAULT — a workflow that
+// ── AC4: the builder ceiling doubles as a fleet-wide DEFAULT. A workflow that
 //    declares NO chain cap still inherits the ceiling as its chain deadline.
 #[tokio::test]
 async fn ceiling_acts_as_fleet_wide_default() {
@@ -528,9 +526,9 @@ fn chain_can_registry() -> Arc<HandlerRegistry> {
 }
 
 // ── AC9 (the falsifiable success metric): a continue-as-new successor CARRIES
-//    the chain deadline VERBATIM. A per-run cap alone would re-anchor on each CAN
-//    (and so a runaway loop could evade it); the chain cap does not, so after any
-//    number of continue-as-new hops the same absolute chain deadline persists.
+//    the chain deadline VERBATIM. A per-run cap alone re-anchors on each CAN,
+//    so a runaway loop could evade it. The chain cap does not. After any number
+//    of continue-as-new hops, the same absolute chain deadline persists.
 #[tokio::test]
 async fn continue_as_new_carries_chain_deadline_verbatim() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -672,9 +670,8 @@ fn chain_can_3hop_block_workflow<'a>(
                 .await;
             unreachable!("continue_as_new must not resolve");
         }
-        // count == 3: park on a 1-hour durable timer (never fires in the test)
-        // so this run stays RUNNING and is the "current" successor the chain
-        // scanner can fire against.
+        // count == 3: park on a 1-hour durable timer that never fires here. This
+        // run stays RUNNING as the "current" successor for the chain scanner.
         let _ = ctx.timer("chain_block", 3600).await;
         Ok(input)
     })
@@ -768,9 +765,9 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
     );
 }
 
-// ── T2: a reset FORK starts a fresh chain origin — `chain_deadline_at` is
-//    RE-ANCHORED to the fork's own start (now + chain_execution_timeout), NOT
-//    carried from the source's (already-past) value.
+// ── T2: a reset FORK starts a fresh chain origin. `chain_deadline_at` is
+//    RE-ANCHORED to the fork's own start (now + chain_execution_timeout). It is
+//    NOT carried from the source's already-past value.
 #[tokio::test]
 async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -816,8 +813,8 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
         "fork carries the chain-cap DURATION"
     );
     let dl = fork_deadline.expect("fork chain deadline must be set");
-    // Fresh anchor: ≈ now + 7d, definitely > now + 6d and in the FUTURE — NOT the
-    // source's 3-hours-ago value (which a carry-instead-of-reanchor mutant yields).
+    // Fresh anchor: ≈ now + 7d, so > now + 6d and in the FUTURE. A
+    // carry-instead-of-reanchor mutant yields the source's 3-hours-ago value.
     assert!(
         dl > before + ChronoDuration::days(6),
         "reset must RE-ANCHOR the chain deadline to the fork start (now + 7d), \
@@ -1061,9 +1058,9 @@ async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
     );
 }
 
-// ── T4(b) (AC7 behavioral): with a SHORT per-run cap (re-anchored every hop, never
-//    fires) and a chain deadline crossed after ≥3 hops, the CURRENT RUNNING
-//    successor (not the origin) times out; the CHAIN counter fires, the RUN
+// ── T4(b) (AC7 behavioral): a SHORT per-run cap re-anchors every hop and never
+//    fires. The chain deadline is crossed after ≥3 hops. The CURRENT RUNNING
+//    successor, not the origin, times out. The CHAIN counter fires, the RUN
 //    counter does not.
 #[tokio::test]
 async fn chain_cap_fires_on_a_can_successor_not_the_origin() {
@@ -1100,9 +1097,9 @@ async fn chain_cap_fires_on_a_can_successor_not_the_origin() {
     worker.shutdown();
     handle.await.expect("worker join");
 
-    // Cross the chain deadline for succ3, keep its per-run deadline in the FUTURE
-    // (so a per-run cap alone would NOT fire) — exactly the "chain fires where a
-    // per-run cap re-anchors" scenario.
+    // Cross the chain deadline for succ3, but keep its per-run deadline in the
+    // FUTURE, so a per-run cap alone would NOT fire. That is the "chain fires
+    // where a per-run cap re-anchors" scenario.
     set_chain_columns(
         &mut conn,
         succ3,

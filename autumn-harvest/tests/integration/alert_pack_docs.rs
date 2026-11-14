@@ -250,13 +250,13 @@ fn prometheus_examples_use_stable_bounded_harvest_metrics() {
 
 #[test]
 fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
-    // Round-4 hardening (issue #801, Codex review): a NEW or long-dormant
-    // workflow has no samples in the `offset 1h` baseline window, so a bare
-    // `> 4 * rate(... offset 1h)` comparison yields no series and the
-    // absolute 1/min floor never fires for the FIRST rollback wave — the
-    // exact case the alert exists for. The `or <current> * 0` arm defaults
-    // the baseline to a zero-valued series with matching labels; pin that
-    // fallback textually so it cannot be silently simplified away.
+    // Issue #801: a NEW or long-dormant workflow has no samples in the
+    // `offset 1h` baseline window. So a bare `> 4 * rate(... offset 1h)`
+    // comparison yields no series. The absolute 1/min floor then never fires
+    // for the FIRST rollback wave, which is the exact case the alert exists
+    // for. The `or <current> * 0` arm defaults the baseline to a zero-valued
+    // series with matching labels. Pin that fallback textually so it cannot be
+    // silently simplified away.
     let pack = read_pack();
     let rules = pack["rules"].as_array().expect("rules must be an array");
     let spike = rules
@@ -273,16 +273,16 @@ fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
     );
 }
 
-/// Round-10 hardening (issue #619, Codex review): the queue-pause alert's
-/// description originally said a pause is safe because "nothing fails, retries,
-/// or dead-letters". That is true of the *relative* `schedule_to_start` timer,
-/// which a pause suspends and credits back on resume, but **not** of the
-/// *absolute* `schedule_to_close` deadline (issue #378), which keeps running for
-/// the whole hold. This is the one alert an operator consults after the 1h/4h
-/// threshold, so an unqualified "nothing fails" there invites leaving a hold in
-/// place under the false assumption that all held work is protected. Pin the
-/// exception textually — the API contract and the runbook both carry it, and a
-/// future "tighten the wording" pass must not quietly drop it.
+/// Issue #619: the queue-pause alert's description must not say, unqualified,
+/// that a pause is safe because "nothing fails, retries, or dead-letters".
+/// That is true of the *relative* `schedule_to_start` timer, which a pause
+/// suspends and credits back on resume. It is **not** true of the *absolute*
+/// `schedule_to_close` deadline (issue #378), which keeps running for the whole
+/// hold. An operator consults this alert after the 1h/4h threshold. An
+/// unqualified "nothing fails" there invites leaving a hold in place on the
+/// false belief that all held work is protected. Pin the exception textually.
+/// The API contract and the runbook both carry it. A future "tighten the
+/// wording" pass must not quietly drop it.
 #[test]
 fn queue_pause_alert_states_the_schedule_to_close_exception() {
     let pack = read_pack();
@@ -374,9 +374,9 @@ fn shard_undrained_alert_does_not_infer_poller_absence_from_dispatches() {
 
 /// The replication-down alert must key on the standby count, not on lag.
 ///
-/// A dead standby produces **no lag reading at all** — the lag series is
-/// deliberately absent rather than `0`, because a dead standby reported as a
-/// perfect RPO is the most dangerous number this feature could publish. An
+/// A dead standby produces **no lag reading at all**. The lag series is
+/// deliberately absent rather than `0`. A dead standby reported as a perfect RPO
+/// is the most dangerous number this feature could publish. An
 /// alert written as `harvest_replication_lag_seconds > N` therefore stays
 /// silent through exactly the outage it was written for. Pin the shape.
 #[test]
@@ -408,7 +408,7 @@ fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
 }
 
 /// The dropped-hints alert must require sustained growth, not a single
-/// burst (Codex review, issue #1429 follow-up).
+/// burst (issue #1429).
 ///
 /// `harvest.dispatch.dropped_hints` is a running total. A bare
 /// `increase(m[15m]) > 0` clause goes true the moment any one hint drops
@@ -420,14 +420,13 @@ fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
 /// window, so a burst that already stopped climbing does not alone
 /// satisfy it.
 ///
-/// The `and` clause alone is still not enough (Codex review, issue #1429
-/// follow-up). A single dropped hint holds both clauses true for up to 5
-/// minutes. An importer with no minimum-duration gate still opens a
-/// ticket for that one-off burst. A `for` clause closes that gap. The AND
-/// expression decays to false once the burst's own 5-minute clause ages
-/// out, well short of 15 minutes. Only drops still recurring every
-/// 5-minute slice across the whole window keep the condition true long
-/// enough to satisfy `for: 15m`.
+/// The `and` clause alone is still not enough (issue #1429). A single dropped
+/// hint holds both clauses true for up to 5 minutes. An importer with no
+/// minimum-duration gate still opens a ticket for that one-off burst. A `for`
+/// clause closes that gap. The AND expression decays to false once the burst's
+/// own 5-minute clause ages out, well short of 15 minutes. Only drops still
+/// recurring every 5-minute slice across the whole window keep the condition
+/// true long enough to satisfy `for: 15m`.
 #[test]
 fn the_dropped_hints_alert_requires_sustained_growth_not_one_burst() {
     let pack = read_pack();
@@ -559,19 +558,20 @@ fn retention_alert_uses_mounted_management_api_paths() {
     );
 }
 
-/// Issue #797, Codex review: the scanner tick series is initialized at **zero**
-/// when each loop registers, at spawn time. That is what lets a loop wedging on
-/// its first iteration still page — but it also means a fresh
-/// retention-enabled process exports `harvest_scanner_tick_total{scanner="retention"} = 0`
-/// for the whole first hour, while its hourly janitor sleeps toward its first
-/// pass. Prometheus does not wait for a full `[3h]` history before evaluating
-/// `increase(...)`; two scrapes are enough for it to return `0`, so a bare
-/// `increase(...[3h]) == 0` pages through every healthy startup.
+/// Issue #797: the scanner tick series is initialized at **zero** when each loop
+/// registers, at spawn time. So a loop wedging on its first iteration still
+/// pages. But a fresh retention-enabled process then exports
+/// `harvest_scanner_tick_total{scanner="retention"} = 0` for the whole first
+/// hour, while its hourly janitor sleeps toward its first pass. Prometheus does
+/// not wait for a full `[3h]` history before evaluating `increase(...)`. Two
+/// scrapes are enough for it to return `0`. So a bare `increase(...[3h]) == 0`
+/// pages through every healthy startup.
 ///
 /// The pack's schema carries no `for:` field (only `mode`/`notes`/`expressions`),
 /// so the hold has to live in the expression. Gating on the counter's **own
-/// value** is the portable form: it needs no `process_start_time_seconds` (which
-/// the metrics exporter does not emit) and no assumption about scrape interval.
+/// value** is the portable form. It needs no `process_start_time_seconds`, which
+/// the metrics exporter does not emit. It needs no assumption about scrape
+/// interval.
 ///
 /// Pin it textually — a future "simplify the expression" pass must not drop the
 /// gate and reintroduce a rule that pages on every deploy.
@@ -601,8 +601,8 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
     );
 
     // The gate must be a FUNCTION result, not a bare selector. PromQL set
-    // operators match on the full label set INCLUDING `__name__`; `increase()`
-    // drops `__name__` while a bare selector keeps it, so
+    // operators match on the full label set INCLUDING `__name__`. `increase()`
+    // drops `__name__`, but a bare selector keeps it. So
     // `increase(...) == 0 and harvest_scanner_tick_total{...} > 0` matches
     // nothing and silently disables the alert. Both sides being functions over
     // the same selector keeps their label sets identical.
@@ -615,10 +615,10 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
          side does not, so the `and` would match no series and the alert would never fire: {gate}"
     );
 
-    // The sub-minute loops must NOT carry the gate: they tick within seconds of
-    // registration, so there is no startup window to ride out -- and the gate
-    // would blind the alert to a loop that wedges on iteration one, which is
-    // exactly what initializing the series at zero exists to catch.
+    // The sub-minute loops must NOT carry the gate. They tick within seconds of
+    // registration, so there is no startup window to ride out. The gate would
+    // also blind the alert to a loop that wedges on iteration one. Initializing
+    // the series at zero exists to catch exactly that.
     let sub_minute = exprs
         .iter()
         .find(|expr| expr.contains("scanner!=\"retention\""))
@@ -652,7 +652,7 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
     );
 }
 
-/// Codex review on PR #1520, follow-up P2: `audit_export` shares the same
+/// PR #1520: `audit_export` shares the same
 /// startup hazard as `retention`. Its series also starts at zero at
 /// registration. Its own first tick can legitimately still be in flight
 /// when Prometheus evaluates a partial `[10m]` window. A bare
@@ -703,9 +703,8 @@ fn scanner_stalled_audit_export_expression_carries_the_same_startup_gate() {
 
 /// Shared accessor for the capability-miss alert-shape pins below.
 ///
-/// Hoisted out of the test body when the pin was split in two (issue #804,
-/// review round 41) so both halves read the same rule set through the same
-/// severity check, rather than duplicating the closure.
+/// Both halves of the split pin (issue #804) read the same rule set through
+/// the same severity check, rather than duplicating the closure.
 fn capability_miss_rule_exprs(id: &str) -> Vec<String> {
     let pack = read_pack();
     let rules = pack["rules"].as_array().expect("rules must be an array");
@@ -731,20 +730,20 @@ fn capability_miss_rule_exprs(id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Issue #804, Codex review: the capability-miss counter is deliberately
-/// two-outcome. `outcome="escalated"` means a task exhausted its redelivery
-/// budget and an execution was FAILED — that is the page. `outcome="released"`
-/// means a worker handed a claim back for a capable peer and NOTHING failed;
-/// it is the expected, self-healing signature of the transient window in a
-/// rolling deploy that introduces a new workflow or activity type.
+/// Issue #804: the capability-miss counter is deliberately two-outcome.
+/// `outcome="escalated"` means a task exhausted its redelivery budget and an
+/// execution was FAILED. That is the page. `outcome="released"` means a worker
+/// handed a claim back for a capable peer and NOTHING failed. It is the
+/// expected, self-healing signature of the transient window in a rolling
+/// deploy that introduces a new workflow or activity type.
 ///
 /// Every rule in this pack carries a single `severity`, so every expression on
-/// a rule fires at that severity. Putting a `released` expression on the
-/// `page`-severity rule therefore pages on exactly the benign outcome the
-/// rule's own notes call "not a page" — one incapable pod releasing one task
-/// during a routine deploy is enough. Worse, an `increase(...[15m]) > 0` form
-/// tests whether ANY release happened in the window, not whether releases
-/// stayed sustained, so it cannot express "the skew is not resolving" either.
+/// a rule fires at that severity. A `released` expression on the
+/// `page`-severity rule pages on the benign outcome the rule's notes call "not
+/// a page". One incapable pod releasing one task during a routine deploy is
+/// enough. Also, an `increase(...[15m]) > 0` form tests whether ANY release
+/// happened in the window, not whether releases stayed sustained. So it cannot
+/// express "the skew is not resolving" either.
 ///
 /// The sustained-release signal lives on its own ticket-severity rule with the
 /// hold in the expression (the pack schema has no `for:` field). Pin both
@@ -767,14 +766,14 @@ fn capability_miss_released_outcome_never_pages() {
     );
 
     // Half 1b: ...and must page ONLY on true budget exhaustion. Two escalation
-    // causes fail the execution on its FIRST claim after ZERO releases -- a
-    // `capability_miss_max_redeliveries = 0` config, and a task pinned to a
-    // worker session (#606) whose host lacks the handler. Neither supports this
-    // rule's whole narrative ("no live worker on this queue registers the
-    // handler"): a capable peer may be live and idle on the queue the entire
-    // time, and this rule's `first_action` sends on-call to
-    // `GET /admin/workflow-types/reachability`, which then reports `in_use` and
-    // contradicts the page they are holding.
+    // causes fail the execution on its FIRST claim after ZERO releases. One is a
+    // `capability_miss_max_redeliveries = 0` config. The other is a task pinned
+    // to a worker session (#606) whose host lacks the handler. Neither supports
+    // this rule's narrative ("no live worker on this queue registers the
+    // handler"). A capable peer may be live and idle on the queue the entire
+    // time. This rule's `first_action` sends on-call to
+    // `GET /admin/workflow-types/reachability`. That endpoint then reports
+    // `in_use` and contradicts the page they are holding.
     //
     // They record `outcome="escalated_never_offered"` for that reason. PromQL
     // `=` is exact string equality, so the selector above already excludes it --
@@ -813,23 +812,23 @@ fn capability_miss_released_outcome_never_pages() {
 }
 
 /// The paging rule must not assert a fleet conclusion the outcome label does
-/// not support (issue #804, Codex round-43).
+/// not support (issue #804).
 ///
-/// `EscalationCause::outcome_label` maps BOTH the budget bounds and the ungated
-/// absolute release ceiling to `outcome="escalated"`, deliberately: executions
-/// are being failed either way and under-paging is the worse error. But the two
+/// `EscalationCause::outcome_label` deliberately maps BOTH the budget bounds and
+/// the ungated absolute release ceiling to `outcome="escalated"`. Executions
+/// are being failed either way, and under-paging is the worse error. But the two
 /// do not license the same conclusion. The gated bounds fire only once the
-/// registry confirms the recorded missers cover the live fleet; the ceiling
-/// fires precisely where that coverage could NOT be established, so a live,
-/// never-tried peer may still be capable.
+/// registry confirms the recorded missers cover the live fleet. The ceiling
+/// fires where that coverage could NOT be established. So a live, never-tried
+/// peer may still be capable.
 ///
-/// The rule's prose is what on-call reads first, so it must not send them to a
+/// On-call reads the rule's prose first. So it must not send them to a
 /// fleet-exhaustion investigation for an escalation that does not support one.
-/// This pins the cause-neutral phrasing rather than the wording: the reason
-/// string must be named as the discriminator, the ceiling's weaker conclusion
-/// must be stated, and the round-15-stale "a fleet smaller than the budget"
-/// claim must not reappear — a *registered* small fleet escalates at `N` via
-/// the configured-total bound, not via the ceiling.
+/// This pins the cause-neutral phrasing rather than the wording. The reason
+/// string must be named as the discriminator. The ceiling's weaker conclusion
+/// must be stated. The stale "a fleet smaller than the budget" claim must not
+/// reappear. A *registered* small fleet escalates at `N` via the
+/// configured-total bound, not via the ceiling.
 #[test]
 fn capability_miss_paging_rule_prose_is_cause_neutral() {
     let pack = read_pack();
@@ -849,9 +848,8 @@ fn capability_miss_paging_rule_prose_is_cause_neutral() {
     let first_action = field("first_action");
     let threshold = field("default_threshold");
 
-    // The discriminator must be named, and named FIRST in the triage step --
-    // every other check in `first_action` is only correct for one of the two
-    // conclusions.
+    // The discriminator must be named FIRST in the triage step. Every other
+    // check in `first_action` is only correct for one of the two conclusions.
     assert!(
         first_action.contains("reason") && first_action.contains("FIRST"),
         "first_action must send on-call to the execution's reason string before \
@@ -880,8 +878,8 @@ fn capability_miss_paging_rule_prose_is_cause_neutral() {
          conclusion that only some escalations support: {threshold}"
     );
 
-    // Round 15 gave the small-fleet case to the configured-total bound; the
-    // ceiling now covers unprovable coverage. The stale claim must not return.
+    // The configured-total bound owns the small-fleet case, and the ceiling
+    // covers unprovable coverage. The stale claim must not return.
     for (name, text) in [
         ("description", &description),
         ("first_action", &first_action),
@@ -896,17 +894,17 @@ fn capability_miss_paging_rule_prose_is_cause_neutral() {
 }
 
 /// The `escalated` metric-label docs must carry the same cause-neutral reading
-/// the paging rule does (issue #804, Codex round-44).
+/// the paging rule does (issue #804).
 ///
-/// Sibling of [`capability_miss_paging_rule_prose_is_cause_neutral`]: round 43
-/// fixed the alert pack and the runbook, but the label constant in
+/// Sibling of [`capability_miss_paging_rule_prose_is_cause_neutral`], which pins
+/// the alert pack and the runbook. The label constant in
 /// `src/telemetry.rs` is the surface a consumer writing a CUSTOM alert reads,
 /// and it carried the same false conclusion. Both must state it, so a future
 /// edit that repairs one and leaves the other still fails.
 ///
 /// The claim under test: `EscalationCause::outcome_label` maps BOTH
-/// `BudgetExhausted` and `ReleaseCeilingExhausted` to `escalated`, and since
-/// round 15 the ceiling is reachable ONLY on the two evidence states that mean
+/// `BudgetExhausted` and `ReleaseCeilingExhausted` to `escalated`. The ceiling
+/// is reachable ONLY on the two evidence states that mean
 /// coverage was never established (`CapablePeerMayExist`, `Unavailable`). So a
 /// sample carrying this label does not on its own prove the fleet was swept.
 #[test]
@@ -938,23 +936,22 @@ fn capability_miss_escalated_label_docs_are_cause_neutral() {
          place the actual cause is recorded: {doc}"
     );
 
-    // Round 15 gave the small-fleet case to the configured-total bound.
+    // The configured-total bound owns the small-fleet case.
     assert!(
         !doc.contains("fleet smaller than the budget"),
         "the ceiling has not owned the small-fleet case since review round 15: {doc}"
     );
 }
 
-/// The **operator-facing prose** must be cause-neutral too (issue #804, Codex
-/// round-47 P2).
+/// The **operator-facing prose** must be cause-neutral too (issue #804).
 ///
-/// Round 43 corrected the alert rule, round 44 the metric-label constant, and
-/// round 47 the runbook overview and the dashboard panel — three rounds of the
-/// same claim surviving in a surface the previous round did not touch. So this
-/// pins ALL of the operator-reachable prose at once: an on-call engineer reads
-/// whichever one their tooling put in front of them, and repairing one while
-/// leaving another still sends them toward a missing-deploy investigation when
-/// the real cause is an untried worker.
+/// The same false claim has survived in the alert rule, the metric-label
+/// constant, the runbook overview and the dashboard panel. Each time it hid in
+/// a surface the previous fix did not touch. So this pins ALL of the
+/// operator-reachable prose at once. An on-call engineer reads whichever one
+/// their tooling put in front of them. A repair of one surface that leaves
+/// another unfixed still sends them toward a missing-deploy investigation. The
+/// real cause is an untried worker.
 ///
 /// The claim is only false for the `ReleaseCeilingExhausted` bound, which fires
 /// under `CapablePeerMayExist` / `Unavailable` — where a live, untried worker
@@ -994,7 +991,7 @@ registers the handler at all**",
 }
 
 /// The escalation writes **no** dead-letter row, and no doc may say otherwise
-/// (issue #804, Codex round-47 P2).
+/// (issue #804).
 ///
 /// `escalate_capability_miss` routes through `fail_task_and_execution_with_history`,
 /// which fails the task and the execution without inserting into
@@ -1003,11 +1000,10 @@ registers the handler at all**",
 /// DLQ destination anywhere sends an operator to an empty recovery surface
 /// during exactly the incident this feature exists to make legible.
 ///
-/// The knob's rustdoc is **mirrored across three files**, and round 47 corrected
-/// only `effective_config.rs` — scoping this guard to that one file is what let
-/// the stale wording survive in the other two until Codex round 52. Every
-/// surface an operator can read the knob from is checked here, so the class
-/// cannot recur on whichever copy the next edit misses.
+/// The knob's rustdoc is **mirrored across three files**. A guard scoped to
+/// `effective_config.rs` alone let the stale wording survive in the other two.
+/// Every surface an operator can read the knob from is checked here, so the
+/// class cannot recur on whichever copy the next edit misses.
 #[test]
 fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1025,9 +1021,9 @@ fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
         let source = fs::read_to_string(manifest.join(path))
             .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
         let doc = rustdoc_above_field(&source, "capability_miss_max_redeliveries");
-        // Ban the DESTINATION constructions, not the token: these docs
-        // legitimately mention the DLQ in order to rule it out, and a bare
-        // `contains("dlq")` cannot tell a negation from a claim.
+        // Ban the DESTINATION constructions, not the token. These docs mention
+        // the DLQ to rule it out. A bare `contains("dlq")` cannot tell a
+        // negation from a claim.
         for banned in [
             "/ DLQ path",
             "DLQ path",
@@ -1043,9 +1039,9 @@ fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
             );
         }
         // And the operator-facing surfaces must rule the DLQ out POSITIVELY.
-        // Silence is not enough: an operator who has just read the poison-pill
-        // knob (which really does quarantine, #367) will otherwise assume this
-        // one behaves the same way.
+        // Silence is not enough. An operator may have just read the poison-pill
+        // knob, which really does quarantine (#367). Without a positive
+        // rule-out, they assume this one behaves the same way.
         if requires_positive_rule_out {
             assert!(
                 doc.contains("No dead-letter row is written"),
@@ -1057,17 +1053,17 @@ fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
 }
 
 /// The capability-miss fleet lookup uses a **floored** liveness window, and no
-/// doc may claim it shares the poison-pill one (issue #804, Codex round-48 P2).
+/// doc may claim it shares the poison-pill one (issue #804).
 ///
 /// `capability_miss_fleet_stale_secs` is
 /// `max(2 × worker_heartbeat_interval, CAPABILITY_MISS_MIN_FLEET_STALE_SECS)`,
-/// and the floor is 120 s — so at the default 5 s cadence the capability window
-/// is 120 s where the poison-pill reclaimer's is 10 s, a 12× divergence that
-/// round 19 introduced deliberately (judging *peers* whose cadence you cannot
-/// read needs a fleet-wide bound, not your own). An operator who reads
-/// "the same window" mispredicts when the configured-total bound becomes
-/// available: a pod silent for 30 s is long gone from poison-pill reclamation
-/// but still holds capability evidence at `CapablePeerMayExist`.
+/// and the floor is 120 s. So at the default 5 s cadence the capability window
+/// is 120 s where the poison-pill reclaimer's is 10 s. The 12× divergence is
+/// deliberate: judging *peers* whose cadence a worker cannot read needs a
+/// fleet-wide bound, not its own. An operator who reads "the same window"
+/// mispredicts when the configured-total bound becomes available. A pod silent
+/// for 30 s is long gone from poison-pill reclamation. It still holds
+/// capability evidence at `CapablePeerMayExist`.
 #[test]
 fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() {
     let builder = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builder.rs"))
@@ -1087,10 +1083,9 @@ fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() 
             fs::read_to_string(workspace_path("docs/runbooks/harvest-alerts.md"))
                 .expect("failed to read the alerts runbook"),
         ),
-        // The alert pack itself. Round 48 corrected the two runbooks and the
-        // builder knob but not the machine-readable pack an operator reads
-        // *first* — straight off the firing alert — which is how the stale
-        // claim survived to Codex round 53.
+        // The alert pack itself. An operator reads this machine-readable pack
+        // *first*, straight off the firing alert. So the stale claim must not
+        // survive here after the runbooks and the builder knob are fixed.
         (
             "alert pack",
             fs::read_to_string(workspace_path("docs/alerts/starter-pack-v0.1.0.json"))
@@ -1109,9 +1104,9 @@ fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() 
             .replace('×', "x")
             .replace('`', "")
             .replace("2 x ", "2x ");
-        // Ban the SAMENESS construction, not the window itself: a correct doc
-        // may well name 2x worker_heartbeat_interval in order to say the
-        // capability lookup is *not* that value.
+        // Ban the SAMENESS construction, not the window itself. A correct doc
+        // may name 2x worker_heartbeat_interval to say the capability lookup is
+        // *not* that value.
         for banned in [
             "same 2x worker_heartbeat_interval liveness window as",
             "same 2x worker_heartbeat_interval window as",
@@ -1139,17 +1134,17 @@ fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() 
 }
 
 /// `CapablePeerMayExist` withholds **both** evidence-derived bounds, and no doc
-/// may claim the distinct-worker one survives (issue #804, Codex round-48).
+/// may claim the distinct-worker one survives (issue #804).
 ///
 /// `capability_miss_decision` gates the distinct bound on
 /// `!CapablePeerMayExist` and the configured-total bound on
-/// `AllLiveWorkersMissed` specifically, so a live untried peer withholds them
-/// both and only the **ungated** bounds remain — chiefly the absolute `10 ×`
-/// release ceiling. Two rustdocs in `worker.rs` once disagreed about this and
-/// the wrong one reached three operator runbooks: an operator who believes the
-/// distinct bound still fires expects escalation after a handful of distinct
-/// incapable workers, when in fact nothing terminates the task until the
-/// ceiling — roughly an order of magnitude more redeliveries.
+/// `AllLiveWorkersMissed` specifically. So a live untried peer withholds them
+/// both, and only the **ungated** bounds remain. The chief one is the absolute
+/// `10 ×` release ceiling. Two rustdocs in `worker.rs` once disagreed about
+/// this, and the wrong one reached three operator runbooks. An operator who
+/// believes the distinct bound still fires expects escalation after a handful
+/// of distinct incapable workers. In fact nothing terminates the task until the
+/// ceiling, roughly an order of magnitude more redeliveries.
 #[test]
 fn capable_peer_may_exist_is_never_documented_as_withholding_only_one_bound() {
     let worker = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/worker.rs"))
@@ -1249,8 +1244,8 @@ fn rustdoc_above_const(name: &str) -> String {
 /// Half 2 of the capability-miss alert-shape pin (issue #804).
 ///
 /// Split from [`capability_miss_released_outcome_never_pages`] along the seam
-/// its doc already describes: half 1 pins WHICH outcomes may page, this pins
-/// that the released-outcome rule HOLDS rather than firing on a single sample.
+/// its doc describes. Half 1 pins WHICH outcomes may page. This half pins that
+/// the released-outcome rule HOLDS rather than firing on a single sample.
 /// They are independent properties over different rules, so a failure in one
 /// should not mask the other.
 #[test]
@@ -1281,14 +1276,13 @@ fn capability_miss_release_sustained_rule_holds_for_a_full_window() {
 
     // Half 2b: `min_over_time` alone does NOT deliver the 15m hold it looks
     // like it does. Prometheus range functions skip subquery steps that have no
-    // sample rather than treating them as zero, so on a series that was CREATED
-    // by this very deploy -- the exact scenario, since a brand-new
-    // (queue, task_type) capability-miss series appears the first time a new
-    // handler is rolled out -- the earlier steps are simply absent and the min
-    // is taken over only the few samples that exist. A routine deploy with one
-    // release burst then satisfies `== 1` within ~3 minutes (a 5m `rate` stays
-    // positive for 5m after the last release), firing the very ticket this rule
-    // was split out to suppress.
+    // sample rather than treating them as zero. A brand-new (queue, task_type)
+    // capability-miss series appears the first time a new handler is rolled
+    // out. On a series CREATED by this very deploy, the earlier steps are
+    // absent. The min is taken over only the few samples that exist. A routine
+    // deploy with one release burst then satisfies `== 1` within ~3 minutes. A
+    // 5m `rate` stays positive for 5m after the last release. That fires the
+    // very ticket this rule was split out to suppress.
     //
     // The window must therefore also be asserted PRESENT, not just positive.
     assert!(
@@ -1298,22 +1292,22 @@ fn capability_miss_release_sustained_rule_holds_for_a_full_window() {
          require the window to be present (count_over_time(...)): {expr}"
     );
     // Half 2c: the presence guard must actually deliver 15 minutes, and must
-    // stay satisfiable at every evaluation offset (issue #804, Codex round-41).
+    // stay satisfiable at every evaluation offset (issue #804).
     //
     // Prometheus aligns a subquery's steps to absolute multiples of the
-    // resolution, so `expr[Rm:1m]` yields `R` or `R + 1` points depending on
-    // whether the evaluation instant happens to land on a minute boundary. Two
+    // resolution. So `expr[Rm:1m]` yields `R` or `R + 1` points, depending on
+    // whether the evaluation instant lands on a minute boundary. Two
     // consequences, and they pull in opposite directions:
     //
     //   * `[15m:1m] >= 15` is satisfiable by 15 points, which span only 14
     //     minutes — so it opens the ticket a minute before the hold it promises.
-    //   * `[15m:1m] >= 16` would demand the aligned case, so on a rule group
-    //     evaluating off a minute boundary the count is 15 and the alert could
-    //     never fire at all. Tightening the count on a 15m window is therefore
-    //     the wrong repair — strictly worse than the bug.
+    //   * `[15m:1m] >= 16` would demand the aligned case. A rule group that
+    //     evaluates off a minute boundary counts 15, so the alert could never
+    //     fire. Tightening the count on a 15m window is therefore the wrong
+    //     repair — strictly worse than the bug.
     //
-    // Widening the window instead fixes both: `[16m:1m]` yields at least 16
-    // points at every alignment, and 16 points one minute apart span a full 15
+    // Widening the window instead fixes both. `[16m:1m]` yields at least 16
+    // points at every alignment. 16 points one minute apart span a full 15
     // minutes. So `>= 16` over a 16m window is both honest and always reachable.
     assert!(
         expr.contains("[16m:1m]"),
@@ -1344,7 +1338,7 @@ fn capability_miss_release_sustained_rule_holds_for_a_full_window() {
 /// both escalation rules must also carry set-difference detection (issue #804).
 ///
 /// Split out of `capability_miss_released_outcome_never_pages` because it pins a
-/// different property: that one is about which *outcome* may page, this one is
+/// different property. That test is about which *outcome* may page. This one is
 /// about whether the expression can observe the outcome at all.
 #[test]
 fn capability_miss_escalation_rules_detect_a_brand_new_series() {
@@ -1366,25 +1360,24 @@ fn capability_miss_escalation_rules_detect_a_brand_new_series() {
 
     // `increase(...) > 0` cannot see the FIRST sample of a new series.
     //
-    // The adapter creates a counter by incrementing it, so a
+    // The adapter creates a counter by incrementing it. So a
     // (queue, task_type, outcome) series that has never fired appears in the
-    // scrape already at 1 -- there is no preceding zero sample. `increase`
+    // scrape already at 1, with no preceding zero sample. `increase`
     // needs two points and reports `last - first`, so every point in the
     // window reads 1 and the delta is 0. The first escalation on a series is
     // therefore invisible, and if it is also the ONLY one, the rule never
     // fires at all.
     //
-    // That is exactly the scenario these two rules exist for: a new handler
-    // rolls out, no worker registers it, and the very first escalated task
-    // creates the series. A low-volume queue can escalate exactly once.
+    // These two rules exist for exactly that scenario. A new handler rolls out,
+    // no worker registers it, and the first escalated task creates the series.
+    // A low-volume queue can escalate exactly once.
     //
-    // Zero-initialising the label sets at worker startup is the usual remedy
-    // and is NOT sufficient here: the zero must be *scraped* before the
-    // increment, and both never-offered causes (a
-    // `capability_miss_max_redeliveries = 0` rollback switch, and a
-    // session-pinned task) escalate on the task's FIRST claim, which can land
-    // inside the same scrape interval as worker startup. The detection has to
-    // live in the expression.
+    // Zero-initialising the label sets at worker startup is the usual remedy.
+    // It is NOT sufficient here, because the zero must be *scraped* before the
+    // increment. Both never-offered causes escalate on the task's FIRST claim:
+    // a `capability_miss_max_redeliveries = 0` rollback switch, and a
+    // session-pinned task. That claim can land inside the same scrape interval
+    // as worker startup. So the detection has to live in the expression.
     for (id, outcome) in [
         ("harvest_no_capable_worker", "escalated"),
         (
@@ -1407,9 +1400,9 @@ fn capability_miss_escalation_rules_detect_a_brand_new_series() {
             "{id}'s new-series arm must select its own outcome: {exprs:?}"
         );
         // The set difference must compare against a RANGE, not a bare instant
-        // `offset 5m` (Codex round-14 P2). A bare offset is empty whenever the
-        // target was unscrapeable for the whole lookback, so a monitoring gap
-        // re-selects an unchanged counter as "new" and pages spuriously. Asking
+        // `offset 5m`. A bare offset is empty whenever the target was
+        // unscrapeable for the whole lookback. A monitoring gap then re-selects
+        // an unchanged counter as "new" and pages spuriously. Asking
         // whether ANY sample exists in the preceding hour tells a genuinely
         // created series apart from a scrape or remote-write outage.
         assert!(
@@ -1418,8 +1411,8 @@ fn capability_miss_escalation_rules_detect_a_brand_new_series() {
         );
         // Both sides of the `unless` must be wrapped identically. A bare
         // instant selector on the left and `max_over_time` on the right do not
-        // agree on whether `__name__` survives; a mismatch makes `unless` match
-        // nothing, which silently turns the arm into an unconditional `M > 0`.
+        // agree on whether `__name__` survives. A mismatch makes `unless` match
+        // nothing. That silently turns the arm into an unconditional `M > 0`.
         assert_eq!(
             joined
                 .matches("max_over_time(harvest_task_capability_miss_total")
@@ -1464,26 +1457,27 @@ fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
 }
 
 /// A capability-miss alert must never send a responder to `/dead-letters`
-/// (issue #804, Codex round-54 P2).
+/// (issue #804).
 ///
 /// Escalation routes through `fail_task_and_execution_with_history`, which
-/// inserts no `harvest_dead_letters` row, so that endpoint physically cannot
+/// inserts no `harvest_dead_letters` row. So that endpoint physically cannot
 /// surface the affected execution or its `no_capable_worker:` reason. A
 /// `management_checks` entry naming it hands the on-call an empty result set
-/// mid-incident — worse than saying nothing, because an empty DLQ reads as
-/// evidence the alert was spurious.
+/// mid-incident. That is worse than saying nothing, because an empty DLQ reads
+/// as evidence the alert was spurious.
 ///
-/// This is the *endpoint* half of the round-47/52 prose guard: those ban a
-/// dead-letter DESTINATION in rustdoc, and a check-list entry saying
-/// "GET /dead-letters" trips neither of them. The failed-workflows lookup the
+/// This is the *endpoint* half of the dead-letter prose guard
+/// (`capability_miss_escalation_is_never_documented_as_dead_lettering`). That
+/// guard bans a dead-letter DESTINATION in rustdoc, and a check-list entry
+/// saying "GET /dead-letters" does not trip it. The failed-workflows lookup the
 /// sibling `harvest_capability_miss_never_offered` rule already uses is the
 /// correct target, so this also keeps the two rules consistent.
 ///
-/// Bans the DIRECTIVE (`GET .../dead-letters`), not the token: a check may
-/// legitimately *mention* `/dead-letters` in order to rule it out, and a bare
+/// Bans the DIRECTIVE (`GET .../dead-letters`), not the token. A check may
+/// *mention* `/dead-letters` to rule it out. A bare
 /// `contains("/dead-letters")` cannot tell a negation from a referral. That is
-/// the same distinction the round-47 prose guard draws, and writing this one
-/// naively tripped on its own corrected text during development.
+/// the same distinction the dead-letter prose guard draws. A naive version of
+/// this guard trips on its own corrected text.
 #[test]
 fn capability_miss_alerts_never_send_responders_to_the_dead_letter_endpoint() {
     let pack: serde_json::Value = serde_json::from_str(

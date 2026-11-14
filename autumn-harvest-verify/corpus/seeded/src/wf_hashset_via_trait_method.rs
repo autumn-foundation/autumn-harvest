@@ -5,13 +5,13 @@
 //! `set.steps()` and dispatches one activity per step, so the recorded command
 //! order is hash-seeded.
 //!
-//! **Launder.** The call site in MIR is `<HashSet<String> as Plan>::steps` — a
-//! *trait* call, not a free function — so resolving it needs the `<impl at
+//! **Launder.** The call site in MIR is `<HashSet<String> as Plan>::steps`, a
+//! *trait* call, not a free function. Resolving it needs the `<impl at
 //! file:l:c>` body header mapped back through syn to `(self_ty, trait,
-//! method)`. Syntactically: HVG011 and DET010 only flag a `for … in` over a
-//! locally-bound hash ident, and the loop here iterates a `Vec<String>`
-//! returned by a method; the `iter()` that actually causes the trouble is in
-//! another crate inside a trait impl. No DET substring table mentions
+//! method)`. Syntactically, HVG011 and DET010 only flag a `for … in` over a
+//! locally-bound hash ident. The loop here iterates a `Vec<String>` returned
+//! by a method. The `iter()` that causes the trouble is in another crate,
+//! inside a trait impl. No DET substring table mentions
 //! `HashSet`.
 //!
 //! **Expected trace hops.** `wf_hashset_via_trait_method` ⇒

@@ -371,9 +371,8 @@ async fn standalone_signal_header_wins_over_query() {
     let (_, b1) = post_signal(&app, &uri_hk, Some("hk"), json!({})).await;
     assert_eq!(b1["signal_delivered"], json!(true));
 
-    // A later call whose *query* key equals the header value "hk" (no header)
-    // collides with the first delivery — proving the header value was the
-    // effective key, not the query value "qk".
+    // A later call with query key "hk" and no header collides with the first
+    // delivery. That proves the header value was the effective key, not "qk".
     let uri_proves = format!("/workflows/{exec}/signal/approval?idempotency_key=hk");
     let (_, b2) = post_signal(&app, &uri_proves, None, json!({})).await;
     assert_eq!(

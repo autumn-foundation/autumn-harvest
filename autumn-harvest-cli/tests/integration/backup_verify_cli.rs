@@ -1,12 +1,11 @@
 //! Integration tests for the `harvest backup verify` subcommand (issue #943).
 //!
-//! Black-box tests over the crate's public backup-verify surface: the pure
-//! guard/format/gate helpers. `run_backup_verify` itself needs a live database
-//! and is not exercised here; its parts (guard, format, gate) are, and the DB
-//! half is
-//! covered by the core crate's `backup_verify_tests` integration suite; these
-//! tests own the *operator-facing contract*: the scratch-DSN guard (AC4), the
-//! exit-code mapping (`AC2d`), and the machine-readable report shape.
+//! Black-box tests over the pure guard/format/gate helpers of backup verify.
+//! `run_backup_verify` needs a live database, so only its parts run here. The
+//! core crate's `backup_verify_tests` suite covers the database half.
+//!
+//! These tests own the *operator-facing contract*: the scratch-DSN guard (AC4),
+//! the exit-code mapping (`AC2d`), and the machine-readable report shape.
 
 use autumn_harvest::backup_verify::{
     Finding, FindingClass, ReplaySummary, RestoreVerifyReport, ShardVerifyReport, VerifyStatus,
@@ -178,10 +177,10 @@ fn an_empty_shard_list_is_rejected() {
 /// An `ExecutionId` carries its shard in the UUID's first two bytes as
 /// `shard & 0xFFFF`, and `0xFFFF` is the reserved `ShardId::UNENCODED`
 /// sentinel. A shard id outside `0..=0xFFFE` therefore does NOT survive the
-/// round trip: `65536` truncates to `0`, so every target id read out of the
-/// database the operator supplied under `65536=` decodes as shard `0`, is not
-/// found in the supplied map, and is written off as "on an uninspected shard"
-/// -- an advisory, exit 0, with the shard silently never checked.
+/// round trip: `65536` truncates to `0`. Every target id from the database
+/// supplied under `65536=` then decodes as shard `0` and misses the map. It is
+/// written off as "on an uninspected shard": an advisory, exit 0, with the
+/// shard silently never checked.
 ///
 /// Reject it at parse time with the same rule the shard router uses.
 #[test]
@@ -294,9 +293,9 @@ fn a_clean_report_passes_the_gate() {
 
 #[test]
 fn json_output_says_whether_replay_actually_ran() {
-    // A JSON consumer must be able to tell "the data is coherent" from "your
-    // workflow code still replays it" WITHOUT re-deriving the rule -- the
-    // shipped CLI can never do the latter.
+    // A JSON consumer must tell "the data is coherent" from "your workflow
+    // code still replays it" WITHOUT re-deriving the rule. The shipped CLI
+    // can never check the latter.
     let mut s = shard(Vec::new());
     s.replay = ReplaySummary {
         sampled: 4,
@@ -537,11 +536,11 @@ fn the_default_output_format_is_text() {
     assert_eq!(BackupVerifyFormat::default(), BackupVerifyFormat::Text);
 }
 
-/// The regression the CLI smoke test caught: an unmigrated (empty) "restore"
-/// makes every probe fail, and folding that into an advisory reported
-/// `resumable_with_reclaim` + exit 0 — telling an operator to start workers
-/// against a database with no harvest schema. Must be exit 2, and the message
-/// must name the real cause (failed probes, not unreachable shards).
+/// Pins the regression the CLI smoke test caught. An unmigrated (empty)
+/// "restore" makes every probe fail. Folding that into an advisory reported
+/// `resumable_with_reclaim` + exit 0. That told an operator to start workers
+/// against a database with no harvest schema. It must be exit 2, and the
+/// message must name the real cause (failed probes, not unreachable shards).
 #[test]
 fn a_report_whose_probes_never_ran_exits_two_and_says_why() {
     let r = report(vec![Finding::new(

@@ -206,7 +206,6 @@ async fn a_crash_mid_retry_records_one_result_and_never_asks_a_completed_stage()
         "the child dies inside attempt 2 of the DOM stage"
     );
 
-    // The parent finishes the run.
     let parent = proposer(&log_path, "parent", false);
     let mut rt = runtime(&db, Arc::clone(&parent));
     let exec: ExecutionId = std::fs::read_to_string(exec_file(&db))

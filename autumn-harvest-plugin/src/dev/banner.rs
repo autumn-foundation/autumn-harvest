@@ -1,13 +1,13 @@
 //! The start banner (issue #525, AC3 and AC4).
 //!
-//! Two jobs, and they pull in opposite directions: a brand-new developer has to
-//! reach a running workflow without reading anything else, and nobody may ever
-//! mistake this runtime for something you deploy. So the banner leads with the
+//! It has two jobs, and they pull in opposite directions. A brand-new developer
+//! must reach a running workflow without reading anything else. Nobody may ever
+//! mistake this runtime for something to deploy. So the banner leads with the
 //! UI URL and exactly one copy-pasteable command, and says plainly that it is
 //! not for production.
 //!
-//! Pure string rendering, so what it promises is asserted rather than assumed —
-//! notably that it never promises to delete a database it did not create.
+//! It is pure string rendering, so tests assert what it promises. Notably, it
+//! never promises to delete a database it did not create.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -78,8 +78,8 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
         StorageDescription::BringYourOwn { redacted_dsn } => {
             let _ = writeln!(out, "  Storage     {redacted_dsn}");
             // Deliberately precise. Migrations ARE applied to a supplied
-            // database — that is exactly what the refusal gate exists to make
-            // safe — so the promise here is only about deletion.
+            // database, and the refusal gate exists to make that safe. So the
+            // promise here is only about deletion.
             let _ = writeln!(
                 out,
                 "              You supplied this database: migrations are applied to it,"
@@ -113,12 +113,11 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
     );
     let _ = writeln!(out, "  history you can read there, event by event.");
     // Deliberately NOT "kill it mid-timer and restart to watch it resume".
-    // With provisioned storage that demonstration cannot work: the cluster is
-    // deleted on exit, and a killed run's directory is reclaimed by the next
-    // start — so a new user following it would see a fresh, empty run and
-    // conclude the engine had lost their workflow. The one configuration where
-    // it does work is a database we did not create, so that is where it is
-    // offered.
+    // With provisioned storage that demonstration cannot work. The cluster is
+    // deleted on exit, and the next start reclaims a killed run's directory. A
+    // new user would see a fresh, empty run and conclude that the engine lost
+    // the workflow. It works only with a database this runtime did not create,
+    // so only that case offers it.
     match &inputs.storage {
         StorageDescription::Provisioned { .. } => {
             let _ = writeln!(
@@ -161,21 +160,20 @@ pub fn render_banner(inputs: &BannerInputs) -> String {
 /// has to cover *every* spelling, not just the obvious one:
 ///
 /// * `user:password@` in a URI's userinfo — the obvious one;
-/// * `?password=` in a URI's query string — also accepted by the client, and
-///   present even when there is no `:` in the userinfo (or no userinfo at all);
+/// * `?password=` in a URI's query string. The client accepts it too, even
+///   with no `:` in the userinfo, or with no userinfo at all;
 /// * `password=` in a keyword/value connection string.
 ///
 /// Conservative by construction: everything between the first `:` of the
-/// userinfo and its `@` is replaced wholesale, so a password containing `@` or
-/// `:` cannot survive by confusing the parser.
+/// userinfo and its `@` is replaced wholesale. So a password that contains `@`
+/// or `:` cannot survive by confusing the parser.
 ///
 /// **Syntax is decided before anything is split.** `?` starts a query string in
-/// a URI and is an ordinary character everywhere else, so splitting on it first
-/// cut `password='abc?def ghi'` in a keyword/value string in half and printed
-/// the tail. Which syntax a DSN is in is exactly the question
-/// `tokio_postgres::Config::from_str` answers before dialling, and it answers it
-/// by prefix — so this asks the same way, and cannot disagree with the client
-/// about what the string means.
+/// a URI and is an ordinary character everywhere else. A split on it first cut
+/// `password='abc?def ghi'` in a keyword/value string in half and printed the
+/// tail. `tokio_postgres::Config::from_str` decides the syntax of a DSN before
+/// it dials, by prefix. This asks the same way, so it cannot disagree with the
+/// client about what the string means.
 ///
 /// **A keyword-shaped token that is not a keyword withholds the whole DSN.**
 /// `postgres` in `postgres=//alice:hunter2@db` scans as an "option" with no
@@ -189,17 +187,17 @@ pub fn redact_dsn(dsn: &str) -> String {
         // has to see the whole string to consume quoted values whole.
         return redact_keyword_value(dsn);
     }
-    // The query is located the way the client locates it — after the userinfo —
-    // so a `?` inside a username cannot hide the real `password=` behind it.
+    // Find the query as the client does, after the userinfo. So a `?` inside a
+    // username cannot hide the real `password=` behind it.
     let Some(query) = dsn::query_start(dsn) else {
         return redact_userinfo(dsn);
     };
     let question = query - 1;
     let mut out = redact_userinfo(&dsn[..question]);
-    // Splice over each password value's span, exactly as the keyword/value
-    // branch does, so every other byte of the query string — including a
-    // percent-encoded `password` key, which is not itself a secret — reaches
-    // the banner as the developer typed it.
+    // Splice over each password value's span, as the keyword/value branch
+    // does. Every other byte of the query string reaches the banner as the
+    // developer typed it. That includes a percent-encoded `password` key, which
+    // is not itself a secret.
     let mut copied = question;
     for parameter in dsn::uri_query_parameters(dsn) {
         if !parameter.key.eq_ignore_ascii_case("password") {
@@ -217,7 +215,7 @@ pub fn redact_dsn(dsn: &str) -> String {
 /// in a keyword/value string.
 fn redact_userinfo(base: &str) -> String {
     // `redact_dsn` only reaches here for a URI, so the `else` is a guard, not a
-    // path — but it fails safe rather than returning the string untouched.
+    // path. It still fails safe and does not return the string untouched.
     let Some(scheme_end) = base.find("://") else {
         return redact_keyword_value(base);
     };
@@ -246,9 +244,9 @@ fn redact_userinfo(base: &str) -> String {
 /// `password='foo` and leaves `hunter2'` standing. That string's entire
 /// purpose is to be safe to paste into an issue.
 ///
-/// Rewriting is a splice over each password value's byte span, so every byte
-/// the scanner did not identify as a password value is emitted unchanged — the
-/// redaction cannot reshape a DSN it merely walked past.
+/// The rewrite is a splice over each password value's byte span. Every byte
+/// that the scanner did not identify as a password value is emitted unchanged.
+/// So the redaction cannot reshape a DSN it merely walked past.
 ///
 /// Withholds the whole DSN, rather than splicing anything, the moment the
 /// scanner meets a token that is not a real libpq keyword. Such a token
@@ -273,10 +271,10 @@ fn redact_keyword_value(dsn: &str) -> String {
         if !dsn::is_connection_keyword(option.key) {
             return WITHHELD.to_owned();
         }
-        // Exactly the `password` keyword, as before this shared the scanner:
-        // everything else (host, dbname, user, port) is what makes one database
-        // tellable from another in a banner, and widening the match is a
-        // behaviour change that belongs in its own change, not in a refactor.
+        // Exactly the `password` keyword, as before this shared the scanner.
+        // The other keys (host, dbname, user, port) tell one database from
+        // another in a banner. A wider match is a behaviour change, and it
+        // belongs in its own change, not in a refactor.
         if !option.key.eq_ignore_ascii_case("password") {
             continue;
         }

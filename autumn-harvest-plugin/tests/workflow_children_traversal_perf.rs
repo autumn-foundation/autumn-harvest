@@ -2,43 +2,40 @@
 //!
 //! `load_workflow_children_tree_from_shards` (in
 //! `autumn-harvest-plugin/src/api.rs`) walks the traversal frontier one
-//! **parent at a time**, issuing one query per parent per shard per depth
-//! level -- `O(nodes x shards)` round trips. Its own proven-fixed sibling,
-//! `GET /workflows/{id}/tree` (issue #621), batches the *whole* frontier into
-//! one `parent_id = ANY($1)` query per shard per depth level via
-//! `store::load_workflow_children_batch` -- `O(depth x shards)` -- and says so
-//! directly in a doc comment on that function:
-//!
-//! > "That turns a depth-`D` tree over `S` shards from `O(nodes x S)` round
-//! > trips (one query per parent per shard -- what a naive recursion over
-//! > `load_workflow_children` costs) into `O(D x S)`"
+//! **parent at a time**. It sends one query per parent per shard per depth
+//! level: `O(nodes x shards)` round trips. Its proven-fixed sibling,
+//! `GET /workflows/{id}/tree` (issue #621), batches the *whole* frontier.
+//! `store::load_workflow_children_batch` sends one `parent_id = ANY($1)` query
+//! per shard per depth level: `O(depth x shards)`. The doc comment on that
+//! function says so. A naive recursion over `load_workflow_children` costs
+//! `O(nodes x S)` round trips for a depth-`D` tree over `S` shards. The batch
+//! costs `O(D x S)`.
 //!
 //! `load_workflow_children_tree_from_shards` is exactly that naive
 //! recursion: it calls the single-parent `store::load_workflow_children`
 //! inside a `for parent in &frontier { for shard { .. } }` loop instead of a
-//! batched `parent_id = ANY($1)` call. This is precisely the class of bug
-//! Harvest's own performance-agent playbook calls out by name: "bookkeeping
-//! queries that are individually trivial but collectively dominant -- these
-//! won't show up in a buffers ranking, only in a `calls` ranking."
+//! batched `parent_id = ANY($1)` call. Harvest's own performance-agent
+//! playbook calls out this class of bug by name: bookkeeping queries that are
+//! individually trivial but collectively dominant. They do not show up in a
+//! buffers ranking, only in a `calls` ranking.
 //!
-//! This file is the harness + evidence generator for that investigation, and
-//! (in its non-skipped test) a permanent regression guard for the fix's
-//! correctness under real branching (multiple parents at one depth level,
-//! spread across shards -- exactly the code path the batched query replaces).
-//! It is not a duplicate of the 7 functional-correctness tests already
-//! covering `GET /workflows/{id}/children` in `api_scheduler_integration.rs`
-//! (filters, cursors, single-branch cross-shard recursion, depth caps, the
-//! empty-vs-missing-parent distinction) -- those are untouched by this
-//! change and still pass unmodified.
+//! This file is the harness + evidence generator for that investigation. Its
+//! non-skipped test is also a permanent regression guard for the fix under
+//! real branching. Multiple parents at one depth level, spread across shards,
+//! take exactly the code path the batched query replaces.
+//! `api_scheduler_integration.rs` has 7 functional-correctness tests for
+//! `GET /workflows/{id}/children`. They cover filters, cursors, single-branch
+//! cross-shard recursion, depth caps and the empty-vs-missing-parent
+//! distinction. This file does not duplicate them, and they still pass
+//! unmodified.
 //!
-//! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres **admin** URL (a
-//! per-test database is created off it) to run without Docker; otherwise a
-//! fresh testcontainers Postgres is booted for the non-skipped test (the
-//! skipped-by-default evidence-capture test additionally needs
-//! `pg_stat_statements` preloaded via `shared_preload_libraries`, which the
-//! Docker fallback does not configure -- run it against a
-//! `HARVEST_TEST_DATABASE_URL` target with
-//! `shared_preload_libraries = 'pg_stat_statements'`). See
+//! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres **admin** URL to
+//! run without Docker. Each test creates its own database off it. Otherwise the
+//! non-skipped test boots a fresh testcontainers Postgres. The skipped-by-default
+//! evidence-capture test also needs `pg_stat_statements` in
+//! `shared_preload_libraries`. The Docker fallback does not configure that. So
+//! run it against a `HARVEST_TEST_DATABASE_URL` target with
+//! `shared_preload_libraries = 'pg_stat_statements'`. See
 //! `docs/performance-workflow-children-traversal.md` for how the committed
 //! evidence in `docs/perf-artifacts/workflow-children-traversal/` was
 //! produced.
@@ -153,9 +150,9 @@ fn build_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     harvest_api_router(api_state)
 }
 
-/// Two independent shard databases behind one router -- the shape that makes
-/// the buggy loop's `for parent { for shard { .. } }` nesting actually cost
-/// `shards` round trips per parent, not just 1.
+/// Two independent shard databases behind one router. With that shape, the
+/// buggy loop's `for parent { for shard { .. } }` nesting costs `shards` round
+/// trips per parent, not 1.
 async fn two_shard_app(admin_url: &str) -> (HarvestApiApp, [String; 2]) {
     let url0 = create_shard_db(admin_url, &unique("children_perf_s0")).await;
     let url1 = create_shard_db(admin_url, &unique("children_perf_s1")).await;
@@ -258,10 +255,10 @@ async fn insert_root(conn: &mut AsyncPgConnection, root: ExecutionId) {
         .expect("insert root");
 }
 
-/// Bulk-insert `nodes` (all sharing `workflow_name`), chunked at 500 rows per
-/// statement (`NewWorkflowExecution` has 34 columns; 500 x 34 = 17,000 bind
-/// params, comfortably under Postgres's ~65,535 per-statement limit) and
-/// grouped so each chunk lands on the connection for its own shard.
+/// Bulk-insert `nodes` (all sharing `workflow_name`), grouped so each chunk
+/// lands on the connection for its own shard. Each statement takes 500 rows.
+/// `NewWorkflowExecution` has 34 columns, so that is 17,000 bind params. That
+/// is well under the Postgres limit of about 65,535 per statement.
 async fn bulk_insert(conns: &mut [AsyncPgConnection; 2], nodes: &[Node], workflow_name: &str) {
     for (shard, conn) in conns.iter_mut().enumerate() {
         // `shard` only ever ranges over `0..2` (the fixed two-shard array),
@@ -321,9 +318,9 @@ async fn bulk_insert(conns: &mut [AsyncPgConnection; 2], nodes: &[Node], workflo
 }
 
 /// Mark every node whose fixture index is a multiple of 20 (within `ids`) as
-/// FAILED, via one bulk `id = ANY($1)` UPDATE per shard rather than one
-/// UPDATE per row -- deliberately not part of the code path under
-/// investigation, so it must not itself distort the query-count evidence.
+/// FAILED. It sends one bulk `id = ANY($1)` UPDATE per shard, not one per row.
+/// This is not the code path under investigation, so it must not distort the
+/// query-count evidence.
 async fn mark_every_20th_failed(conns: &mut [AsyncPgConnection; 2], nodes: &[Node]) {
     let mut failed_ids: [Vec<uuid::Uuid>; 2] = [Vec::new(), Vec::new()];
     for (idx, node) in nodes.iter().enumerate() {
@@ -361,9 +358,9 @@ struct SeededTree {
     gen3: Vec<Node>,
 }
 
-/// Seed a 3-generation tree rooted at a fresh execution, round-robining every
-/// generation across both shards so a real fan-out (not a single-shard
-/// happy path) is exercised at every depth level.
+/// Seed a 3-generation tree rooted at a fresh execution. Each generation is
+/// spread round-robin across both shards. So every depth level exercises a real
+/// fan-out, not a single-shard happy path.
 async fn seed_tree(conns: &mut [AsyncPgConnection; 2], shape: &TreeShape) -> SeededTree {
     let root = ExecutionId::new_for_shard(ShardId::new(0));
     insert_root(&mut conns[0], root).await;
@@ -441,22 +438,21 @@ struct ExplainRow {
     query_plan: String,
 }
 
-/// `pg_stat_statements` is a per-cluster (not per-database) shared catalog:
-/// once the extension's view objects exist in *one* database reachable from
-/// this connection, the rows it returns cover every database in the cluster,
-/// filterable by `dbid`. So one connection (to shard 0) can snapshot both
-/// shards' traversal-query cost in a single query.
+/// `pg_stat_statements` is a per-cluster (not per-database) shared catalog.
+/// The extension's view objects need to exist in only *one* database on this
+/// connection. Its rows then cover every database in the cluster, filterable by
+/// `dbid`. So one connection (to shard 0) can snapshot both shards'
+/// traversal-query cost in a single query.
 async fn ensure_pg_stat_statements(conn: &mut AsyncPgConnection) {
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(conn)
         .await;
 }
 
-/// Scoped to the two shard databases' `dbid`s so a concurrent capture
-/// against an unrelated database on the same cluster cannot pollute (or be
-/// polluted by) this reset -- the argument-free cluster-wide reset form
-/// would wipe a concurrent run's still-accumulating counters out from under
-/// it.
+/// Scoped to the two shard databases' `dbid`s. A concurrent capture against
+/// another database on the same cluster then cannot pollute this reset, or be
+/// polluted by it. The argument-free, cluster-wide reset would wipe the live
+/// counters of a concurrent run.
 async fn reset_stats_for_shards(conn: &mut AsyncPgConnection, shard_db_names: &[&str; 2]) {
     for name in shard_db_names {
         diesel::sql_query(format!(
@@ -474,12 +470,11 @@ async fn reset_stats_for_shards(conn: &mut AsyncPgConnection, shard_db_names: &[
     }
 }
 
-/// Every statement whose text touches `harvest_workflow_executions` and
-/// **filters** on `parent_id` (the `WHERE ... parent_id" = ` shape, not
-/// merely a query that happens to *select* the `parent_id` column -- the
-/// parent-existence lookup's `SELECT ... "parent_id", ... WHERE "id" = $1`
-/// would otherwise false-positive-match a bare `%parent_id%` substring),
-/// across both shard databases, ordered by total buffers touched.
+/// Every statement on both shard databases whose text touches
+/// `harvest_workflow_executions` and **filters** on `parent_id`. Ordered by total
+/// buffers touched. The match needs the `WHERE ... parent_id" = ` shape. A bare
+/// `%parent_id%` substring would also match the parent-existence lookup,
+/// `SELECT ... "parent_id", ... WHERE "id" = $1`, which only *selects* it.
 async fn traversal_statements(
     conn: &mut AsyncPgConnection,
     shard_db_names: &[&str; 2],
@@ -585,16 +580,14 @@ async fn zz_capture_children_traversal_perf_evidence() {
         .expect("stats connection");
     reset_stats_for_shards(&mut stats_conn, &db_names).await;
 
-    // The one, real, public entry point -- the exact request an operator's
-    // Vantage UI / CLI would make to inspect a run's fan-out. `limit=500`
-    // (the endpoint's own MAX_WORKFLOW_CHILDREN_LIMIT ceiling) requests the
-    // largest single page the API allows -- but the traversal that produces
-    // it walks and queries every one of the ~3,900 descendants internally
-    // *before* the final response is paginated down to `limit` rows (the
-    // traversal_filters passed to the per-depth store calls carry
-    // `limit: None` -- pagination is applied only to the flattened result,
-    // never to the walk itself), so the query-count cost under investigation
-    // is unaffected by what limit is requested here.
+    // The one real, public entry point: the request an operator's Vantage UI
+    // or CLI makes to inspect a run's fan-out. `limit=500` is the
+    // MAX_WORKFLOW_CHILDREN_LIMIT ceiling, the largest page the API allows.
+    // The traversal still queries all ~3,900 descendants *before* it paginates
+    // the response down to `limit` rows. The per-depth store calls get
+    // traversal_filters with `limit: None`. Pagination applies only to the
+    // flattened result, never to the walk. So the limit here does not change
+    // the query-count cost under investigation.
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{}/children?depth=2&limit=500", tree.root),
@@ -640,12 +633,11 @@ async fn zz_capture_children_traversal_perf_evidence() {
     .expect("write pg_stat_statements artifact");
     eprintln!("total_calls={total_calls} total_buffers={total_buffers}");
 
-    // A representative EXPLAIN for a single-parent lookup (the shape every
-    // one of the pre-fix loop's per-parent queries takes) and for a
-    // depth-2-sized batched lookup (the shape the fix's per-shard,
-    // per-depth query takes at its most expensive level) -- both against a
-    // real gen1/gen2 id set from this fixture, so the plan reflects the
-    // actual index (`idx_harvest_we_parent_id`) and row cardinality.
+    // Representative EXPLAINs for two shapes. A single-parent lookup is each
+    // per-parent query of the pre-fix loop. A depth-2-sized batched lookup is
+    // the per-shard, per-depth query of the fix at its most expensive level.
+    // Both use a real gen1/gen2 id set from this fixture. So the plan reflects
+    // the actual index (`idx_harvest_we_parent_id`) and row cardinality.
     let one_parent = tree.gen1[0].id.as_uuid();
     let single_sql = format!(
         "SELECT id, workflow_name, state, started_at, completed_at, error, shard_id, \
@@ -709,14 +701,14 @@ async fn zz_capture_children_traversal_perf_evidence() {
 
 // ── Regression: fix correctness under real multi-parent branching ─────────
 
-/// Moderate-scale, permanent CI test: a 3-generation tree where **multiple
-/// parents exist at every depth level, spread across both shards** -- the
-/// exact shape that exercises the fix's batched-frontier query differently
-/// from a single-branch chain (which a `parent_id = ANY($1)` call over a
-/// one-element frontier can't meaningfully distinguish from the old
-/// single-parent call). Asserts the full descendant set, per-depth stamps,
-/// and the FAILED subset are exactly right by `workflow_id`, independent of
-/// row order.
+/// Moderate-scale, permanent CI test over a 3-generation tree.
+///
+/// **Multiple parents exist at every depth level, spread across both shards.**
+/// That shape exercises the batched-frontier query of the fix. A single-branch
+/// chain does not. There, `parent_id = ANY($1)` over a one-element frontier
+/// acts like the old single-parent call. The test asserts the full descendant
+/// set, per-depth stamps and the FAILED subset by `workflow_id`. Row order does
+/// not matter.
 #[tokio::test]
 async fn depth_traversal_with_branching_frontiers_returns_the_exact_descendant_set() {
     let (admin, _guard) = setup_server().await;
@@ -740,9 +732,9 @@ async fn depth_traversal_with_branching_frontiers_returns_the_exact_descendant_s
     assert_eq!(tree.gen2.len(), 18);
     assert_eq!(tree.gen3.len(), 36);
 
-    // `limit=100` comfortably exceeds this fixture's 60 descendants so the
-    // whole set fits on one page -- the default page size is 50, which would
-    // otherwise silently truncate this exact-set comparison.
+    // `limit=100` exceeds the 60 descendants of this fixture, so the whole set
+    // fits on one page. The default page size of 50 would silently truncate
+    // this exact-set comparison.
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{}/children?depth=2&limit=100", tree.root),
@@ -756,10 +748,9 @@ async fn depth_traversal_with_branching_frontiers_returns_the_exact_descendant_s
         "every non-root descendant, 3 generations"
     );
 
-    // `WorkflowChildResponse` carries `exec_id` (not the business
-    // `workflow_id` string) -- `exec_id` is just as good a unique identity
-    // key for this comparison, since it's the primary key every node was
-    // generated with.
+    // `WorkflowChildResponse` carries `exec_id`, not the business `workflow_id`
+    // string. `exec_id` is the primary key of each generated node, so it is an
+    // equally unique identity key here.
     let mut by_depth: std::collections::HashMap<u64, Vec<String>> =
         std::collections::HashMap::new();
     let mut failed_exec_ids: Vec<String> = Vec::new();

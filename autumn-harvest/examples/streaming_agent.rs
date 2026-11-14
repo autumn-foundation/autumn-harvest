@@ -6,8 +6,8 @@
 //! You are building a durable AI agent (or a long import, or any interactive
 //! flow) on Harvest. The run executes reliably, but the end user staring at a
 //! spinner sees *nothing* until it finishes. Polling a query handler is a
-//! snapshot pull; `set_current_details` (#473/#593) is one overwriting status
-//! line; the engine-event SSE tail (#324) streams `ActivityScheduled` machinery
+//! snapshot pull. `set_current_details` (#473/#593) is one overwriting status
+//! line. The engine-event SSE tail (#324) streams `ActivityScheduled` machinery
 //! and is admin-only. None of them push the author's *content* — the tokens,
 //! the reasoning steps, the per-item progress — to the user as it happens. The
 //! usual escape hatch is to stand up an external message bus.
@@ -26,7 +26,7 @@
 //!
 //! ## Consuming the stream (the other half of AC8)
 //!
-//! An example binary can't cleanly host a live HTTP server, so here is exactly
+//! An example binary cannot cleanly host a live HTTP server. So here is exactly
 //! how a client subscribes with `curl`. Start your Autumn app (which mounts the
 //! Harvest management API), trigger this workflow to get an `{exec_id}`, then:
 //!
@@ -48,12 +48,13 @@
 //! data: {"reason":"completed"}
 //! ```
 //!
-//! `event: progress` frames carry the raw chunk in `data:` and the monotonic
-//! sequence number in `id:` (use it to detect gaps after a reconnect); `event:
-//! end` closes the stream when the run reaches a terminal state; `event: error`
-//! closes it if the underlying LISTEN connection drops. The route is **not**
-//! admin-gated (AC5) — it is an end-user read path; front it with your app's own
-//! auth. See `docs/streaming-progress.md` for the full contract.
+//! `event: progress` frames carry the raw chunk in `data:`. The monotonic
+//! sequence number is in `id:`. Use it to detect gaps after a reconnect.
+//! `event: end` closes the stream when the run reaches a terminal state.
+//! `event: error` closes it if the underlying LISTEN connection drops. The
+//! route is **not** admin-gated (AC5), because it is an end-user read path.
+//! Front it with your app's own auth. See `docs/streaming-progress.md` for the
+//! full contract.
 //!
 //! ## Determinism contract (AC7)
 //!
@@ -84,22 +85,23 @@ struct AgentResult {
     tokens_emitted: u32,
 }
 
-/// An AI-agent-shaped workflow that streams a chunk at every reasoning step,
-/// interleaved with a mock "LLM call" activity. Because each `execute_activity`
-/// await suspends the workflow into a fresh decision cycle, successive
-/// `publish_progress` calls genuinely span multiple cycles — this is live,
-/// per-step streaming, not one batched flush at the end.
+/// An AI-agent-shaped workflow that streams a chunk at every reasoning step.
+///
+/// A mock "LLM call" activity runs between the chunks. Each `execute_activity`
+/// await suspends the workflow into a fresh decision cycle. So successive
+/// `publish_progress` calls span multiple cycles. This is live, per-step
+/// streaming, not one batched flush at the end.
 ///
 /// NOTE ON `allow_nondeterministic_apis`: this workflow reads the wall clock
 /// (`std::time::SystemTime::now`) to build a "how long did this token take"
-/// field. That call would normally be a hard determinism error (guardrail
-/// HVG001) — and it is suppressed here **only** to demonstrate AC7. It is safe
-/// in this exact spot because the wall-clock value flows *exclusively* into a
-/// `publish_progress` chunk, which is never recorded and never replayed, so it
-/// cannot affect the run's history or result. Do NOT copy this pattern for a
-/// value that reaches an activity input, a workflow command, or the return
-/// value — there, a fresh timestamp corrupts replay. For a deterministic clock
-/// use `ctx.now()` / `ctx.system_now()` instead.
+/// field. That call is normally a hard determinism error (guardrail HVG001).
+/// It is suppressed here **only** to demonstrate AC7. It is safe in this spot,
+/// because the wall-clock value flows *only* into a `publish_progress` chunk.
+/// A chunk is never recorded or replayed, so it cannot affect the run's
+/// history or result. Do NOT copy this pattern for a value that reaches an
+/// activity input, a workflow command, or the return value. There, a fresh
+/// timestamp corrupts replay. For a deterministic clock, use `ctx.now()` /
+/// `ctx.system_now()`.
 #[workflow(allow_nondeterministic_apis)]
 async fn streaming_agent(ctx: &WorkflowContext, req: AgentRequest) -> Result<AgentResult, String> {
     // First chunk: the run has begun. Deterministic structural content.
@@ -131,11 +133,11 @@ async fn streaming_agent(ctx: &WorkflowContext, req: AgentRequest) -> Result<Age
         answer.push_str(&token);
 
         // Token chunk AFTER the activity. This carries `emitted_after_ms`, a
-        // wall-clock delta that is genuinely NON-DETERMINISTIC — it differs on
-        // every run and every replay. Publishing it is SAFE (AC7) precisely
-        // because a chunk never enters `harvest_events` and is never replayed:
-        // during a replay pass `publish_progress` is a no-op, so this value is
-        // computed and then discarded, and the recorded history is unaffected.
+        // wall-clock delta that is genuinely NON-DETERMINISTIC: it differs on
+        // every run and every replay. Publishing it is SAFE (AC7), because a
+        // chunk never enters `harvest_events` and is never replayed. During a
+        // replay pass `publish_progress` is a no-op. So this value is computed
+        // and discarded, and the recorded history is unaffected.
         let emitted_after_ms = started.elapsed().as_millis() as u64;
         ctx.publish_progress(serde_json::json!({
             "step": step,
@@ -176,10 +178,10 @@ fn main() {
     println!("See docs/streaming-progress.md for the full contract.");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must keep
-// building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled. Run with:
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for external consumers only with the
+// `testing` feature. Run with:
 //   cargo test -p autumn-harvest --features testing --example streaming_agent
 #[cfg(all(test, feature = "testing"))]
 mod tests {
@@ -214,9 +216,9 @@ mod tests {
     #[tokio::test]
     async fn agent_run_leaves_zero_event_footprint() {
         // The falsifiable AC2 bar: publishing N chunks must add 0 bytes to
-        // `harvest_events`. The only events recorded are the three activity
-        // dispatches/completions — the many publish_progress calls (one at
-        // start, two per step, one at the end = 8 chunks) leave no trace.
+        // `harvest_events`. The only recorded events are the three activity
+        // dispatches/completions. The 8 publish_progress calls (one at start,
+        // two per step, one at the end) leave no trace.
         let outcome = run_env()
             .run(
                 streaming_agent_info().handler,
@@ -253,8 +255,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_self_check_succeeds() {
-        // AC2: a replay of a history whose workflow publishes chunks (including a
-        // non-deterministic wall-clock chunk) must report ReplaySucceeded — the
+        // AC2: a replay of a history whose workflow publishes chunks must report
+        // ReplaySucceeded, even with a non-deterministic wall-clock chunk. The
         // chunks never enter history, so replay sees byte-identical events.
         let outcome = run_env()
             .run(

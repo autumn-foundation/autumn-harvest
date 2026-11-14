@@ -77,6 +77,11 @@ fn repr_pairs<'a>(pairs: impl IntoIterator<Item = &'a (&'static str, usize)>) ->
     format!("[{}]", parts.join(", "))
 }
 
+/// A legacy Tier B finding: one sentence of 26 words.
+const LEGACY: &str = "// One two three four five six seven eight nine ten eleven twelve \
+    thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one twenty-two \
+    twenty-three twenty-four twenty-five twenty-six.\n";
+
 /// The Tier B findings in `source`, in a file named `f.rs`.
 fn tier_b(source: &str) -> Vec<Finding> {
     findings_for_source("f.rs", source)
@@ -94,9 +99,8 @@ fn tier_b(source: &str) -> Vec<Finding> {
 /// that they never wrote. So each candidate is named, with a count of how
 /// many are new.
 pub fn ratchet_reporting_test() -> (bool, Vec<String>) {
-    let legacy = "// It doesn\u{2019}t matter here.\n";
-    let base_source = format!("// filler one\n{legacy}{}", "// filler\n".repeat(12));
-    let head_source = format!("{base_source}// tail filler\n{legacy}");
+    let base_source = format!("fn one() {{}}\n{LEGACY}{}", "fn filler() {{}}\n".repeat(12));
+    let head_source = format!("{base_source}fn tail() {{}}\n{LEGACY}");
     let head = tier_b(&head_source);
     let base = tier_b(&base_source);
     let scope: HashSet<String> = std::iter::once("f.rs".to_string()).collect();
@@ -125,10 +129,9 @@ pub fn ratchet_reporting_test() -> (bool, Vec<String>) {
 /// not a lexer question, so it cannot be a fixture. It checks the pair of
 /// flags on the one function that now answers for both paths.
 pub fn tier_a_only_test() -> (bool, Vec<String>, Vec<String>) {
-    let legacy = "// It doesn\u{2019}t matter here.\n";
-    let head = tier_b(&format!("// filler\n{legacy}"));
+    let head = tier_b(&format!("fn filler() {{}}\n{LEGACY}"));
     let current: Tally = tally(&head);
-    let baseline: Tally = tally(&tier_b("// filler\n"));
+    let baseline: Tally = tally(&tier_b("fn filler() {}\n"));
     let scope: HashSet<String> = std::iter::once("f.rs".to_string()).collect();
     let renames = HashMap::new();
     let gated = tier_b_gate(&current, &baseline, Some(&scope), &renames, &head, false);

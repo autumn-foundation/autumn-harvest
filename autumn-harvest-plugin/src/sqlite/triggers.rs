@@ -17,15 +17,15 @@ use super::api::{signal_with_start_reply, start_reply};
 use super::{HarvestSqlite, SignalWithStartParams};
 
 /// Start `workflow_name` with an optional business id, under the Postgres
-/// default reuse policy, `allow_duplicate`. It answers the Postgres `POST /workflows/{name}/start`
-/// response: `201` for a new run, `200` for an attach.
+/// default reuse policy, `allow_duplicate`. It answers the Postgres
+/// `POST /workflows/{name}/start` response: `201` for a new run, `200` for
+/// an attach.
 pub async fn start(
     handle: &HarvestSqlite,
     workflow_name: &str,
     workflow_id: Option<String>,
     input: Value,
 ) -> Response {
-    // The Postgres default of a request with no `reuse_policy`.
     let mut options = StartOptions::new().reuse_policy(WorkflowIdReusePolicy::AllowDuplicate);
     options.workflow_id = workflow_id;
     start_reply(handle, workflow_name, input, options).await
