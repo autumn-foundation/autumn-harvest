@@ -201,7 +201,6 @@ fn py_int(text: &str) -> Result<i128> {
     Ok(if negative { -value } else { value })
 }
 
-/// Parses a line number.
 fn py_line(text: &str) -> Result<i64> {
     i64::try_from(py_int(text)?).context("OverflowError: a line number is out of range")
 }
@@ -297,7 +296,6 @@ fn key<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Va
     value.get(key).ok_or_else(|| anyhow!("KeyError: {key:?}"))
 }
 
-/// A JSON array, or an error.
 fn list(value: &serde_json::Value) -> Result<&[serde_json::Value]> {
     value
         .as_array()
@@ -305,7 +303,6 @@ fn list(value: &serde_json::Value) -> Result<&[serde_json::Value]> {
         .ok_or_else(|| anyhow!("TypeError: expected a list, found {value}"))
 }
 
-/// A JSON integer, or an error.
 fn int(value: &serde_json::Value) -> Result<i128> {
     value
         .as_i64()
@@ -585,7 +582,6 @@ pub fn summarize(records: &Records) -> BTreeMap<String, FileRow> {
         .collect()
 }
 
-/// A count as a JSON integer.
 fn count_value(n: usize) -> Value {
     Value::Int(i128::try_from(n).unwrap_or(i128::MAX))
 }
@@ -890,12 +886,10 @@ pub fn ratchet_markdown(
 
 // ── The steps ───────────────────────────────────────────────────────────────
 
-/// Reads a UTF-8 text file.
 fn read_text(path: &str) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
 }
 
-/// Writes a text file.
 fn write_text(path: &str, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {path}"))
 }

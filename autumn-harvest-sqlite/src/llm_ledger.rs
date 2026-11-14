@@ -189,7 +189,6 @@ pub fn rows_between(
     rows.map(|raw| parse(raw?)).collect()
 }
 
-/// True if the file has the ledger table.
 fn table_exists(conn: &Connection) -> SqliteResult<bool> {
     let found: Option<i64> = conn
         .query_row(

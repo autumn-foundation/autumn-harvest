@@ -1,18 +1,18 @@
-//! Issue #700 P4: the boot-time orphaned-workflow gate must be side-effect-free
-//! on `Abort` — it must mutate NO process global. The pool-precedence fix (P2)
-//! introduced a latent side effect: `resolve_runtime_storage_pool`'s single
-//! case goes through `HarvestDbPool::from` → `ShardedDbPool::single`, which
-//! writes `GLOBAL_SHARDED_POOL`. If the gate used that install helper, an
-//! aborted second-runtime startup in the same process would leave
-//! completion-trigger / timeout code pointing at the aborted runtime's DB.
+//! Issue #700: the boot-time orphaned-workflow gate must be side-effect-free
+//! on `Abort`. It must mutate NO process global. The single case of
+//! `resolve_runtime_storage_pool` goes through `HarvestDbPool::from` →
+//! `ShardedDbPool::single`, which writes `GLOBAL_SHARDED_POOL`. The
+//! pool-precedence fix added that latent side effect. Suppose the gate used
+//! that install helper. An aborted second-runtime startup in the same process
+//! would then leave completion-trigger and timeout code on the aborted
+//! runtime's DB.
 //!
-//! The gate instead uses a READ-ONLY selector, which reads pools from an
-//! already-constructed `ShardedDbPool` (or returns `harvest_pool` directly) and
-//! installs nothing. Since issue #1128 that selector is the cross-shard
-//! `select_runtime_gate_shards`; `select_runtime_shard0_pool` is its
-//! single-shard sibling, kept as public API and still pinned here because it
-//! shares the same precedence and the same no-install guarantee. This test lives
-//! in its own binary so `GLOBAL_SHARDED_POOL` starts unset and no parallel test
+//! The gate uses a READ-ONLY selector instead. It reads pools from an existing
+//! `ShardedDbPool`, or returns `harvest_pool`, and installs nothing. Since
+//! issue #1128 that selector is the cross-shard `select_runtime_gate_shards`.
+//! Its single-shard public sibling `select_runtime_shard0_pool` has the same
+//! precedence and no-install guarantee, so this test pins it too. The test has
+//! its own binary, so `GLOBAL_SHARDED_POOL` starts unset and no parallel test
 //! races it.
 
 use autumn_harvest::shard::{GLOBAL_SHARDED_POOL, ShardedDbPool};
@@ -93,10 +93,9 @@ fn gate_pool_selection_does_not_install_global_pool() {
         "select_runtime_shard0_pool (single case) must NOT install harvest_pool globally",
     );
 
-    // Issue #1128: the multi-shard gate selector must be equally side-effect
-    // free. It enumerates every shard of an already-constructed pool (a read),
-    // or returns the `harvest_pool` handle as shard 0 — never constructing a
-    // `ShardedDbPool`, which is the thing that installs the global.
+    // Issue #1128: the multi-shard gate selector must be side-effect free too.
+    // It reads every shard of an existing pool, or returns `harvest_pool` as
+    // shard 0. It never constructs a `ShardedDbPool`, which installs the global.
     let shards = select_runtime_gate_shards(None, Some(&sharded), &harvest, None);
     assert_eq!(
         shards
@@ -133,9 +132,9 @@ fn gate_pool_selection_does_not_install_global_pool() {
         "select_runtime_gate_shards (single case) must NOT install harvest_pool globally",
     );
 
-    // Contrast: the INSTALL helper the normal startup path uses DOES overwrite
-    // the global (single case) — proving the two helpers differ exactly in this
-    // side effect, and that the gate correctly uses the read-only one.
+    // Contrast: the INSTALL helper of the normal startup path DOES overwrite
+    // the global (single case). So the two helpers differ in this side effect,
+    // and the gate uses the read-only one.
     let _installed = resolve_runtime_storage_pool(None, None, &harvest);
     assert_eq!(
         global_shard0_tag(),

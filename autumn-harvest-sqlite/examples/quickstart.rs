@@ -1,9 +1,8 @@
 //! Quickstart for the embedded, single-writer `SQLite` backend.
 //!
-//! A complete, runnable order-processing workflow: two activities (reserve
-//! inventory, then charge payment) orchestrated by one `#[workflow]`, run to
-//! completion on an in-memory database with no server, no Docker, and no
-//! Postgres.
+//! A complete, runnable order-processing workflow. One `#[workflow]` runs two
+//! activities: reserve inventory, then charge payment. It runs to completion on
+//! an in-memory database with no server, no Docker, and no Postgres.
 //!
 //! Run it with:
 //!

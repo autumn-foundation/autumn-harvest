@@ -3,16 +3,16 @@
 //!
 //! Exercises the observation-only scanner `timeout::enforce_workflow_sla_breaches`:
 //! - AC#3/#4: an execution past its `sla_deadline_at` is flipped to
-//!   `sla_breached = true` and the metric is recorded **exactly once**; a second
-//!   scan is a no-op (idempotent across repeated scans / restarts / replicas).
+//!   `sla_breached = true`, and the metric is recorded **exactly once**. A
+//!   second scan is a no-op (idempotent across scans / restarts / replicas).
 //! - AC#5: a breached run is **never** terminated — it can still reach COMPLETED.
 //! - AC#7: the scan leaves **zero footprint** in `harvest_events`.
-//! - The scanner compares `sla_deadline_at` against `COALESCE(completed_at, NOW())`,
-//!   so RUNNING rows are judged against now and already-terminal rows against
-//!   their actual completion instant (a run that finished before its deadline is
-//!   never a breach; one that crossed it just before going terminal still is).
-//!   PAUSED rows are excluded (pause suspends the SLA clock); NULL-sla is never
-//!   selected.
+//! - The scanner compares `sla_deadline_at` against `COALESCE(completed_at, NOW())`.
+//!   RUNNING rows are judged against now. Terminal rows are judged against
+//!   their actual completion instant. A run that finished before its deadline
+//!   is never a breach. One that crossed it just before going terminal still
+//!   is. PAUSED rows are excluded (pause suspends the SLA clock). NULL-sla is
+//!   never selected.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::sync::Mutex;

@@ -8,10 +8,10 @@
 )]
 //! Last-completion-result carryover tests — issue #488.
 //!
-//! Verifies that a scheduled workflow can read the output of the previous
-//! successful run via `ctx.last_completion_result()` and `ctx.last_error()`,
-//! that the value is frozen deterministically in the `WorkflowStarted` event,
-//! and that skipped / manual starts never advance carryover.
+//! A scheduled workflow reads the output of the previous successful run via
+//! `ctx.last_completion_result()` and `ctx.last_error()`. The value is frozen
+//! deterministically in the `WorkflowStarted` event. Skipped and manual starts
+//! never advance carryover.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -277,7 +277,7 @@ async fn two_scheduled_runs_carry_cursor_forward() {
     let run1_ids = wait_for_state(&url, wf_name, "COMPLETED", 1).await;
     assert_eq!(run1_ids.len(), 1, "run 1 must complete");
 
-    // Load run 1's output and assert it's {value:1}.
+    // Load run 1's output and assert it is {value:1}.
     let mut check = AsyncPgConnection::establish(&url).await.unwrap();
     let run1_output: Option<serde_json::Value> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::dsl::id.eq(run1_ids[0]))
@@ -525,7 +525,6 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     // Wait for run 3 to complete (2nd COMPLETED overall)
     wait_for_state(&url, wf_name, "COMPLETED", 2).await;
 
-    // Load run 3's output.
     let mut check = AsyncPgConnection::establish(&url).await.unwrap();
     let run3_outputs: Vec<serde_json::Value> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -594,23 +593,16 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     worker.shutdown();
 }
 
-/// A schedule that fires two slots but only one runs (the other is not yet past
-/// carryover semantics for Skip). Skipped fires do not advance last_completion_result.
-/// We verify this by checking that the second run sees the first run's output, not
-/// any stale or reset value.
+/// A schedule with `OverlapPolicy::Skip` fires two slots in sequence. Run 1 finishes
+/// before the second tick, so no fire is skipped. The test checks that the second
+/// run sees the first run's output, not any stale or reset value.
 #[tokio::test]
 async fn skip_policy_does_not_advance_carryover() {
-    // This tests that OverlapPolicy::Skip dropping a fire doesn't corrupt carryover.
-    // Effectively: run 1 completes {value:1}, one slot is skipped (max_active_runs=1
-    // with run 1 still running), run 2 fires next tick and sees {value:1}.
-    // We can verify skip indirectly: two ticks with max_active_runs=1 while run 1
-    // is still running → second slot is skipped → run 2 later fires and still
-    // sees the correct cursor from run 1 (not None, not reset).
+    // OverlapPolicy::Skip must not corrupt carryover. The test waits for run 1
+    // to complete before the second tick, so no slot is skipped here. Run 2
+    // sees run 1's cursor, not None and not a reset value.
     //
-    // Full overlap-skip scenario is exercised by a simpler assertion: the
-    // carryover integration test above already confirms the scheduler-side path.
-    // This test focuses on the "skipped slot count doesn't advance cursor"
-    // invariant via the recovery_aware_handler.
+    // The carryover integration test above covers the full scheduler-side path.
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "carryover_skip_wf";
     let pool = make_pool(&url);

@@ -6,12 +6,11 @@
 //! and a public alias `{fn_name}_info()`, collected by `webhooks![]`.
 //!
 //! Signature verification, timestamp tolerance, replay protection, and secret
-//! rotation are **not** configured here — autumn-web 0.5's
-//! `[security.webhooks.endpoints]` / `SignedWebhook` extractor owns all of
-//! that, upstream of this macro. `verifier`/`idempotency_header` attributes
-//! (from the original issue #344 spec, predating that autumn-web capability)
-//! are rejected at compile time with a pointer to the real configuration
-//! surface.
+//! rotation are **not** configured here. autumn-web 0.5's
+//! `[security.webhooks.endpoints]` / `SignedWebhook` extractor owns them,
+//! upstream of this macro. The original issue #344 spec had `verifier` and
+//! `idempotency_header` attributes. They are rejected at compile time with a
+//! pointer to the real configuration surface.
 //!
 //! Attributes:
 //! - `path = "/hooks/..."` (required) — the exact HTTP path this webhook
@@ -215,10 +214,9 @@ pub fn webhook_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_harvest::WorkflowId,
                 ::autumn_harvest::WebhookHandlerError,
             > {
-                // Deserialize from a borrowed `&Value` (via its `Deserializer`
-                // impl) instead of `serde_json::from_value`, which requires an
-                // owned `Value` -- avoids a clone of the whole verified body on
-                // every dispatch.
+                // Deserialize from a borrowed `&Value` through its
+                // `Deserializer` impl. `serde_json::from_value` needs an owned
+                // `Value`, which costs a clone of the whole body per dispatch.
                 let typed = <_ as ::autumn_harvest::serde::Deserialize>::deserialize(payload)
                     .map_err(|e| {
                         ::autumn_harvest::WebhookHandlerError::Deserialize(e.to_string())

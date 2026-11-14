@@ -2,8 +2,8 @@
 //!
 //! A thin ratatui view over an already-built
 //! [`ReplayTrace`](autumn_harvest::debugger::ReplayTrace). All navigation state
-//! lives in the pure [`StepperState`], which is unit-tested without a terminal;
-//! the terminal layer only draws it and maps key presses onto its methods.
+//! lives in the pure [`StepperState`], which is unit-tested without a terminal.
+//! The terminal layer only draws it and maps key presses onto its methods.
 //!
 //! Stepping "backward" is free: the trace is materialised up front, so moving
 //! to a lower index is a cursor move, not a re-replay.
@@ -122,11 +122,11 @@ pub fn run(trace: &ReplayTrace, cursor: usize) -> Result<(), CliError> {
         return Ok(());
     }
 
-    // Setup is rolled back step by step on failure. A `?` straight out of any
-    // of these would return *past* the restore block at the bottom and leave
-    // the user's shell in raw mode (and possibly on the alternate screen) —
-    // on a partially-supported terminal, a debugger that wrecks the shell it
-    // was launched from is worse than the bug being chased.
+    // Setup is rolled back step by step on failure. A bare `?` here would
+    // return *past* the restore block at the bottom. That leaves the user's
+    // shell in raw mode, and possibly on the alternate screen. On a
+    // partially-supported terminal, a debugger that wrecks its own shell is
+    // worse than the bug being chased.
     enable_raw_mode().map_err(terminal_error("enable raw mode"))?;
     let mut stdout = io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
@@ -144,7 +144,7 @@ pub fn run(trace: &ReplayTrace, cursor: usize) -> Result<(), CliError> {
     };
 
     // A panic inside the loop would unwind past the restore below and leave the
-    // user's shell in raw mode — so restore from the panic hook as well.
+    // user's shell in raw mode. So the panic hook restores the terminal too.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         disable_raw_mode().unwrap_or_default();
@@ -156,16 +156,16 @@ pub fn run(trace: &ReplayTrace, cursor: usize) -> Result<(), CliError> {
     }));
     std::panic::set_hook(previous_hook);
 
-    // Restore the terminal even if the loop failed — a debugger that leaves the
-    // user's shell in raw mode is worse than the bug they were chasing.
+    // Restore the terminal even if the loop failed.
     //
-    // **Every step is attempted, and a failure is reported rather than
-    // swallowed.** Discarding these (the earlier `unwrap_or_default()`) meant a
-    // shell genuinely left in raw mode — the failure the panic hook and the
-    // setup rollback above exist to prevent — exited `0` with no diagnostic, so
-    // the user is left in a broken shell with nothing pointing at why. Each
-    // step still runs regardless of the previous one's outcome; only the
-    // *first* failure is reported, since a later one is usually a consequence.
+    // **Every step is attempted, and a failure is reported, not swallowed.**
+    // A discarded error can leave the shell in raw mode while the command exits
+    // `0` with no diagnostic. The user then has a broken shell and nothing that
+    // points at why. The panic hook and the setup rollback above exist to
+    // prevent that raw-mode failure. Each step runs whatever the previous
+    // outcome was.
+    // Only the *first* failure is reported, because a later one is usually a
+    // consequence.
     let steps: [(&'static str, Result<(), io::Error>); 3] = [
         ("disable raw mode", disable_raw_mode()),
         (

@@ -6,8 +6,8 @@
 //! is written into the activity's input.
 //!
 //! **Launder.** `Cell` and `LocalKey::with` appear in no HVG rule and no DET
-//! pattern table — the ambient-state surface both layers model is exactly one
-//! rule (HVG007, `.lock()` on an uppercase receiver in the body). The read is
+//! pattern table. Both layers model ambient state with exactly one rule:
+//! HVG007, `.lock()` on an uppercase receiver in the body. The read is
 //! also one crate away, which independently defeats det_check's same-module
 //! one-hop resolver and the body-only HVG visitor.
 //!

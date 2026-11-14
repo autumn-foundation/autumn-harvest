@@ -86,7 +86,6 @@ fn bench_1000_fixtures(c: &mut Criterion) {
     c.bench_function("verify_1000_fixtures_1k_events", |b| {
         b.iter_batched(
             || {
-                // Create a temp dir with 1000 fixture files.
                 let dir = tempfile::tempdir().unwrap();
                 let fixture_json = build_fixture_json(500); // 500 activities = 1001 events
                 for i in 0..1000 {

@@ -1,9 +1,9 @@
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc, clippy::unused_async)]
 //! Activity execution interceptors (issue #680).
 //!
-//! An interceptor wraps *every* activity execution on the worker — regular and
-//! local — with cross-cutting behavior added **once**, at registration time,
-//! rather than editing every `#[activity]` function.
+//! An interceptor wraps *every* activity execution on the worker, regular and
+//! local. It adds cross-cutting behavior **once**, at registration time. No
+//! `#[activity]` function needs an edit.
 //!
 //! This example defines a single `LoggingMetricsInterceptor` that:
 //!
@@ -12,9 +12,9 @@
 //! - runs the rest of the chain (`next.run(input)`),
 //! - logs a finish line with the elapsed wall-clock duration (or the error),
 //! - records a per-activity `activity.duration_ms` histogram via
-//!   `ctx.metrics()` (the replay-safe custom-metrics API from issue #532;
-//!   activity metrics are **not** replay-suppressed — each attempt is a
-//!   separate execution).
+//!   `ctx.metrics()`, the replay-safe custom-metrics API from issue #532.
+//!   Activity metrics are **not** replay-suppressed, because each attempt is a
+//!   separate execution.
 //!
 //! It is registered ONCE with `.activity_interceptor(...)` and applies across
 //! *both* `#[activity]` functions below with zero per-activity code.
@@ -174,9 +174,8 @@ mod tests {
             vec![Arc::new(LoggingMetricsInterceptor)];
         let invocation = ActivityInvocation::for_test("charge_card", false, "default");
 
-        // Drive the interceptor chain directly over a terminal that returns a
-        // value — the interceptor must record a duration metric and pass the
-        // result through unchanged.
+        // The interceptor must record a duration metric and pass the
+        // terminal's result through unchanged.
         let out = run_interceptor_chain_for_test(
             &interceptors,
             &invocation,
@@ -223,9 +222,9 @@ mod tests {
         assert_eq!(metrics.histograms.lock().unwrap().len(), 1);
     }
 
-    /// An interceptor that captures the `CORRELATION_HEADER` value it read from
-    /// the `ActivityContext`, so the test can assert the interceptor genuinely
-    /// observes a propagated context header (issue #481).
+    /// Captures the `CORRELATION_HEADER` value read from the `ActivityContext`.
+    /// The test asserts that an interceptor observes a propagated context
+    /// header (issue #481).
     struct CaptureHeaderInterceptor {
         observed: Arc<Mutex<Option<String>>>,
     }

@@ -158,12 +158,10 @@ async fn read_only_command_does_not_send_source_header() {
 
 #[tokio::test]
 async fn execute_sends_explicit_json_accept_header() {
-    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
-    // server's error-page negotiation treat the request as browser
-    // navigation. It then returns an HTML error page, not the
-    // documented JSON body, on a validation error. An explicit
-    // `Accept: application/json` avoids that regardless of what a
-    // client library's own default would have sent.
+    // Issue #1579: the server treats a bare `Accept: */*` (the curl
+    // default) as browser navigation. A validation error then gets an HTML
+    // page, not the documented JSON body. An explicit
+    // `Accept: application/json` avoids that, whatever the client default.
     let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
     let cli = Cli::try_parse_from(["harvest", "--base-url", &base_url, "health"])
         .expect("CLI args should parse");

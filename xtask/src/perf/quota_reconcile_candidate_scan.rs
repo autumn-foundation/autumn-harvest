@@ -1,4 +1,5 @@
-//! `cargo xtask perf quota-reconcile-candidate-scan`: the port of `autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
+//! `cargo xtask perf quota-reconcile-candidate-scan`: the port of
+//! `autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
 //!
 //! The reproduction harness for the residual `workflow_name` filter of
 //! `quota_reconcile::CANDIDATE_SQL` (issue #1226).
@@ -47,9 +48,10 @@
 //! - `fixture-summary.txt`: the row counts per size and the tick and backfill
 //!   totals of the full pass.
 //!
-//! Preconditions: a Rust toolchain that can build this crate. The command also needs Docker
-//! for the testcontainer fallback of the harness, or a reachable Postgres that
-//! `HARVEST_TEST_DATABASE_URL` names. That server needs `pg_stat_statements` in `shared_preload_libraries`.
+//! Preconditions: a Rust toolchain that can build this crate. The command
+//! also needs Docker for the testcontainer fallback of the harness, or a
+//! reachable Postgres that `HARVEST_TEST_DATABASE_URL` names. That server
+//! needs `pg_stat_statements` in `shared_preload_libraries`.
 
 use std::process::ExitCode;
 

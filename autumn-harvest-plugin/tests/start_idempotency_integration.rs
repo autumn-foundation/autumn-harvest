@@ -11,9 +11,9 @@
 //! Exercises the plugin `POST /workflows/{name}/start` idempotency path against
 //! a real Postgres container:
 //! - **Header dedup** — two starts with the same `Idempotency-Key` header (and
-//!   auto-generated workflow_ids) converge on one execution; first `201`
-//!   (`started_fresh: true`), second `200` (`deduplicated: true`) with the same
-//!   `execution_id`.
+//!   auto-generated workflow_ids) converge on one execution. The first is `201`
+//!   (`started_fresh: true`). The second is `200` (`deduplicated: true`) with the
+//!   same `execution_id`.
 //! - **Body-field dedup** — same, keyed via the body `idempotency_key`.
 //! - **No-key byte-identical** — a start without a key omits the two #808 flags.
 //! - **Empty key → 400.**
@@ -56,11 +56,11 @@ type HarvestApiApp = axum::Router;
 
 /// Serializes any test that mutates the *process-global* admission-gate cache
 /// (`admission_gate::set_global_admission_gate_cache`), mirroring the
-/// `TEST_SERIAL` pattern in the admission-gate authoritative suites. Every test
+/// `TEST_SERIAL` pattern in the admission-gate authoritative suites. Each test
 /// in this binary gets its own Postgres container (`setup_database`), so the DB
-/// is not a serialization point — but the gate cache is a single process-wide
-/// static, so a gate-manipulating test must never run concurrently with another
-/// one. Poison-tolerant so a panic in one holder does not wedge the rest.
+/// is not a serialization point. The gate cache is one process-wide static, so
+/// two gate-manipulating tests must never run at the same time. The lock is
+/// poison-tolerant, so a panic in one holder does not wedge the rest.
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
@@ -174,10 +174,9 @@ async fn post_start(
 ) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method("POST")
-        // `harvest_api_router` mounts routes at the root (`/workflows/...`), not
-        // under `/api/harvest` (the plugin nests that prefix outside this router);
-        // sibling integration tests (e.g. `workflow_result_integration`,
-        // `erase_payloads_integration`) hit the root path for the same reason.
+        // `harvest_api_router` mounts routes at the root (`/workflows/...`). The
+        // plugin nests the `/api/harvest` prefix outside this router. Sibling
+        // suites (e.g. `workflow_result_integration`) use the root path too.
         .uri(format!("/workflows/{wf}/start"))
         .header("content-type", "application/json")
         .header("x-harvest-admin", "true");
@@ -201,9 +200,8 @@ async fn post_start(
     (status, json)
 }
 
-/// Like [`post_start`] but sends an arbitrary raw request body (which may be
-/// malformed/undeserializable JSON), so tests can exercise the JSON-extractor
-/// rejection path (issue #808, Codex P2).
+/// Like [`post_start`], but sends a raw request body that may be malformed JSON.
+/// Tests use it to exercise the JSON-extractor rejection path (issue #808).
 async fn post_start_raw_body(
     app: &HarvestApiApp,
     wf: &str,
@@ -440,8 +438,8 @@ async fn concurrent_same_key_starts_create_one_execution() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
 }
 
-/// FIX 3 (issue #808 review): an oversized key is a clean 400 at the boundary —
-/// never a 500 from overflowing the composite-PK btree tuple limit at INSERT.
+/// Issue #808: an oversized key is a clean 400 at the boundary. It is never a
+/// 500 from an overflow of the composite-PK btree tuple limit at INSERT.
 #[tokio::test]
 async fn over_length_key_is_rejected_with_400() {
     let (url, _c) = setup_database().await;
@@ -464,9 +462,8 @@ async fn over_length_key_is_rejected_with_400() {
     );
 }
 
-/// FIX 4 (issue #808 review): an out-of-range `execution_timeout_secs` on the
-/// keyed path is a 400, not a panic/500 (the debounce/batch range guard is
-/// skipped for keyed starts).
+/// Issue #808: an out-of-range `execution_timeout_secs` on the keyed path is a
+/// 400, not a panic/500. Keyed starts skip the debounce/batch range guard.
 #[tokio::test]
 async fn keyed_start_with_out_of_range_timeout_is_rejected_with_400() {
     let (url, _c) = setup_database().await;
@@ -491,9 +488,9 @@ async fn keyed_start_with_out_of_range_timeout_is_rejected_with_400() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 0);
 }
 
-/// FIX 7 (issue #808 review): a same-key hit returns the cached outcome
-/// regardless of `reuse_policy` — a second same-key start with `reject_duplicate`
-/// is a 200 dedup (same execution_id), NOT a 409.
+/// Issue #808: a same-key hit returns the cached outcome, whatever the
+/// `reuse_policy`. A second same-key start with `reject_duplicate` is a 200
+/// dedup (same execution_id), NOT a 409.
 #[tokio::test]
 async fn same_key_hit_short_circuits_reject_duplicate() {
     let (url, _c) = setup_database().await;
@@ -520,11 +517,10 @@ async fn same_key_hit_short_circuits_reject_duplicate() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
 }
 
-/// FIX 1 (issue #808 review): in a MULTI-shard deployment, two same-key starts
-/// with auto-generated (omitted) workflow_ids converge on exactly ONE execution
-/// — because the shard is derived from the KEY, not the per-request workflow_id.
-/// Pre-fix (workflow_id routing) they could land on different shards → two
-/// distinct claim rows → two executions.
+/// Issue #808: in a MULTI-shard deployment, two same-key starts with omitted
+/// workflow_ids converge on exactly ONE execution. The shard comes from the KEY,
+/// not the per-request workflow_id. With workflow_id routing, they could land on
+/// different shards, with two claim rows and two executions.
 #[tokio::test]
 async fn multi_shard_same_key_converges_on_one_execution() {
     let (url0, _c0) = setup_database().await;
@@ -593,14 +589,15 @@ async fn multi_shard_same_key_converges_on_one_execution() {
     assert_eq!(total, 1, "exactly one execution across both shards");
 }
 
-/// FINDING 1 (Codex P1, issue #808): when the caller supplies an EXPLICIT
-/// `workflow_id`, a keyed start must route by `workflow_id` (not the key) so the
-/// reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
-/// invariant are preserved. Here a prior run with an explicit `workflow_id`
-/// exists on the `workflow_id`-derived shard; a same-`workflow_id` keyed start
-/// with `reject_duplicate` must see it and 409 — NOT create a second run on the
-/// key-derived shard. The (wid, key) pair is chosen so the two rules genuinely
-/// route to different shards, so a regression to key-routing would 201 instead.
+/// Issue #808: a keyed start with an EXPLICIT `workflow_id` routes by
+/// `workflow_id`, not by the key.
+///
+/// That keeps the reuse-policy matrix and the shard-local `(name, workflow_id)`
+/// uniqueness invariant. A prior run exists on the `workflow_id`-derived shard.
+/// A same-`workflow_id` keyed start with `reject_duplicate` must see it and 409.
+/// It must NOT create a second run on the key-derived shard. The (wid, key) pair
+/// routes to different shards under the two rules. So a regression to
+/// key-routing returns 201 instead.
 #[tokio::test]
 async fn explicit_workflow_id_keyed_start_preserves_reject_duplicate() {
     let (url0, _c0) = setup_database().await;
@@ -681,10 +678,10 @@ async fn explicit_workflow_id_keyed_start_preserves_reject_duplicate() {
     assert_eq!(total, 1, "no duplicate run created on the key shard");
 }
 
-/// FINDING 1 (Codex P1, issue #808): an explicit-`workflow_id` keyed start still
-/// dedups a same-`(workflow_id, key)` retry — both route by `workflow_id` to the
-/// same shard, hit the same claim row, and the second returns the same
-/// execution_id as a 200 no-op.
+/// Issue #808: an explicit-`workflow_id` keyed start still dedups a
+/// same-`(workflow_id, key)` retry. Both route by `workflow_id` to the same shard
+/// and hit the same claim row. The second returns the same execution_id as a 200
+/// no-op.
 #[tokio::test]
 async fn explicit_workflow_id_keyed_retry_dedups() {
     let (url, _c) = setup_database().await;
@@ -705,13 +702,13 @@ async fn explicit_workflow_id_keyed_retry_dedups() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
 }
 
-/// FINDING (Codex P2, issue #808): when a keyed start OMITS `workflow_id`, the
-/// server auto-generates it AND routes by the key. The auto-generated
-/// `workflow_id` must be MINTED onto the key-shard so that its later explicit
-/// reuse routes (via `pick_for_new_workflow`) to the same shard the execution
-/// lives on. Here we assert that the RETURNED `workflow_id` hashes to the SAME
-/// shard as the RETURNED `execution_id`'s encoded shard — i.e. the minting
-/// worked.
+/// Issue #808: when a keyed start OMITS `workflow_id`, the server generates it
+/// AND routes by the key.
+///
+/// The generated `workflow_id` must be MINTED onto the key-shard. A later
+/// explicit reuse then routes (via `pick_for_new_workflow`) to the shard of the
+/// execution. The test asserts that the RETURNED `workflow_id` hashes to the
+/// encoded shard of the RETURNED `execution_id`.
 #[tokio::test]
 async fn auto_generated_workflow_id_belongs_to_the_key_shard() {
     let (url0, _c0) = setup_database().await;
@@ -769,13 +766,14 @@ async fn auto_generated_workflow_id_belongs_to_the_key_shard() {
     );
 }
 
-/// FINDING (Codex P2, issue #808): because the auto-generated `workflow_id` is
-/// minted onto the key-shard, a later request that reuses that RETURNED
-/// `workflow_id` explicitly (with `reject_duplicate`, no key) routes to the same
-/// shard, SEES the existing execution, and 409s — preserving the shard-local
-/// `(workflow_name, workflow_id)` uniqueness invariant. Pre-fix, the random
-/// auto-generated `workflow_id` could hash to a different shard, so the explicit
-/// reuse would miss the run and create a second execution with the same id.
+/// Issue #808: the generated `workflow_id` is minted onto the key-shard.
+///
+/// A later request reuses that RETURNED `workflow_id` explicitly, with
+/// `reject_duplicate` and no key. It routes to the same shard, SEES the
+/// execution, and 409s. That keeps the shard-local `(workflow_name, workflow_id)`
+/// uniqueness invariant. Before the fix, a random generated `workflow_id` could
+/// hash to a different shard. The explicit reuse then missed the run and
+/// created a second execution with the same id.
 #[tokio::test]
 async fn explicit_reuse_of_a_keyed_auto_workflow_id_is_seen_uniqueness_preserved() {
     let (url0, _c0) = setup_database().await;
@@ -846,28 +844,26 @@ async fn explicit_reuse_of_a_keyed_auto_workflow_id_is_seen_uniqueness_preserved
     );
 }
 
-/// FINDING 2 (Codex P2, issue #808): a keyed replay of an already-successful
-/// start must bypass a raised admission gate (the reserve path resolves it to a
-/// 200 no-op — not fresh admission). A genuinely fresh keyed start is still
-/// gated.
+/// Issue #808: a keyed replay of an already-successful start bypasses a raised
+/// admission gate. The reserve path resolves it to a 200 no-op, not a fresh
+/// admission. A genuinely fresh keyed start is still gated.
 #[tokio::test]
 async fn keyed_replay_bypasses_a_raised_admission_gate() {
     use autumn_harvest::admission_gate::set_global_admission_gate_cache;
     use autumn_harvest::{AdmissionGate, AdmissionGateId, GateScope};
 
     // Serialize against any other test in this binary that mutates the
-    // process-global gate cache (Codex P2). The DB is per-test, but the gate
-    // cache is process-wide — two gate-manipulating tests must never overlap.
+    // process-global gate cache. The DB is per-test, but the gate cache is
+    // process-wide. Two gate-manipulating tests must never overlap.
     let _serial = TEST_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // RAII teardown: clear the process-global gate cache when this test's scope
-    // ends — including on a mid-test panic (Codex P2). A bare
-    // `set_global_admission_gate_cache(None)` at the end of the body would leak
-    // the installed gate into the *next* serial test if any assertion below
-    // regressed and panicked. Declared *after* `_serial` so it drops *first*:
-    // the global is torn down while the serialization lock is still held.
+    // ends, also on a mid-test panic. A bare `set_global_admission_gate_cache(None)`
+    // at the end of the body is skipped when an assertion panics. The gate then
+    // leaks into the *next* serial test. The guard is declared *after* `_serial`,
+    // so it drops *first*, while the serialization lock is still held.
     struct GateGuard;
     impl Drop for GateGuard {
         fn drop(&mut self) {
@@ -877,18 +873,16 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     let _gate_guard = GateGuard;
 
     // Use a workflow name NO sibling test starts. The gate scope is
-    // `WorkflowName(..)`, so even if the process-global handle were somehow
-    // observed by a concurrent sibling, `check_admission` only blocks a start
-    // whose workflow name *matches* the gate's scope — a sibling starting
-    // `order_flow` can never be spuriously gated by this test's `wf` gate. This
-    // makes the cross-talk (Codex P2) structurally impossible, not merely
-    // reset-window-dependent.
+    // `WorkflowName(..)`. `check_admission` blocks only a start whose workflow
+    // name *matches* that scope. So a concurrent sibling that starts `order_flow`
+    // is never gated by this test's `wf` gate, even if it sees the global handle.
+    // That makes cross-talk structurally impossible, not reset-window-dependent.
     let wf = "order_flow_gate";
 
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
 
-    // Build the app inline so we can manipulate the gate cache.
+    // Build the app inline, so the test can manipulate the gate cache.
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -907,10 +901,10 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     // PR #1051 (issue #618) made the CORE start primitive authoritative for
     // admission gating: `execution::evaluate_start_gate` reads the *process-global*
     // cache (`admission_gate::global_admission_gate_cache()`), not this api_state
-    // -local one. So mutating the local cache below is invisible to enforcement
-    // unless we also publish the (interior-mutable) cache handle to the global
-    // static — exactly as `admission_gate_authoritative_localpg.rs` does. The
-    // global is torn down by `GateGuard` above (even on panic).
+    // -local one. A change to the local cache is invisible to enforcement until
+    // the test publishes the interior-mutable cache handle to the global static.
+    // `admission_gate_authoritative_localpg.rs` does the same. `GateGuard` above
+    // tears the global down, even on panic.
     let raise_gate = || {
         api_state.initialize_gate_cache(vec![AdmissionGate {
             id: AdmissionGateId(uuid::Uuid::new_v4()),
@@ -962,11 +956,10 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
     // `GateGuard` tears down the process-global cache on scope exit (incl. panic).
 }
 
-/// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits to the
-/// 200 no-op BEFORE fresh-start-only input-schema validation (#373). The first
-/// start passes the schema; a same-key retry with a body that WOULD now fail the
-/// schema is not re-validated — it returns the original execution as a 200 dedup,
-/// never a 400.
+/// Issue #808: a committed keyed replay short-circuits to the 200 no-op BEFORE
+/// fresh-start-only input-schema validation (#373). The first start passes the
+/// schema. A same-key retry with a body that WOULD now fail is not re-validated.
+/// It returns the original execution as a 200 dedup, never a 400.
 #[tokio::test]
 async fn keyed_replay_bypasses_input_schema_validation() {
     let (url, _c) = setup_database().await;
@@ -1014,11 +1007,10 @@ async fn keyed_replay_bypasses_input_schema_validation() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
 }
 
-/// FINDING (Codex P2, issue #808): a committed keyed replay short-circuits BEFORE
-/// completion-callback SSRF validation (#605). The first start has no callback; a
-/// same-key retry carrying a callback target that WOULD be rejected by the SSRF
-/// policy is not re-validated — it returns the original execution as a 200 dedup,
-/// never a 422.
+/// Issue #808: a committed keyed replay short-circuits BEFORE completion-callback
+/// SSRF validation (#605). The first start has no callback. A same-key retry
+/// carries a callback target that the SSRF policy WOULD reject. It is not
+/// re-validated and returns the original execution as a 200 dedup, never a 422.
 #[tokio::test]
 async fn keyed_replay_bypasses_callback_validation() {
     let (url, _c) = setup_database().await;
@@ -1030,9 +1022,9 @@ async fn keyed_replay_bypasses_callback_validation() {
     let bad_callback =
         json!([{ "url": "https://evil.example.com/hook", "filter": {"type": "CompletedOnly"} }]);
 
-    // Sanity: a fresh start (different key) carrying the bad callback IS rejected
-    // (the SSRF-rejection path returns 422 Unprocessable Entity) — proving the
-    // callback-validation path is live in this harness.
+    // Sanity: a fresh start (different key) with the bad callback IS rejected
+    // with 422 Unprocessable Entity. That proves the callback-validation path is
+    // live in this harness.
     let (s_bad, b_bad) = post_start(
         &app,
         "order_flow",
@@ -1072,22 +1064,23 @@ async fn keyed_replay_bypasses_callback_validation() {
     assert_eq!(execution_count(&mut conn, "order_flow").await, 1);
 }
 
-/// FINDING 1 (Codex P2): the committed-replay dedup probe runs BEFORE the
-/// throttle/debounce/batch mutual-exclusion `400`. So a keyed start that
-/// succeeded while the workflow had NO throttle policy must, on an
-/// at-least-once retry made AFTER the workflow gained one, still return the
-/// existing execution as a `200` no-op — never the mutual-exclusion `400`
-/// (the retry creates no deferred start). A FRESH keyed start against the
+/// Issue #808: the committed-replay dedup probe runs BEFORE the
+/// throttle/debounce/batch mutual-exclusion `400`.
+///
+/// A keyed start succeeds while the workflow has NO throttle policy. Later the
+/// workflow gains one, and an at-least-once retry arrives. The retry still
+/// returns the existing execution as a `200` no-op, never the mutual-exclusion
+/// `400`. The retry creates no deferred start. A FRESH keyed start against the
 /// throttled workflow (a probe miss) still `400`s.
 #[tokio::test]
 async fn keyed_replay_against_a_throttled_workflow_dedups() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
 
-    // 1. Original delivery: the workflow has NO throttle policy yet, so a keyed
-    //    start goes through the normal reserve+start path and writes the
-    //    `harvest_start_idempotency` claim + execution row (the real path,
-    //    simulating a delivery made before the policy existed).
+    // 1. Original delivery: the workflow has NO throttle policy yet. A keyed
+    //    start takes the normal reserve+start path. It writes the
+    //    `harvest_start_idempotency` claim and the execution row, like a
+    //    delivery made before the policy existed.
     let plain_app = build_app(&pool, vec![plain_info("sync_tenant")]);
     let (s1, b1) = post_start(
         &plain_app,
@@ -1158,10 +1151,10 @@ async fn keyed_replay_against_a_throttled_workflow_dedups() {
 const MALFORMED_START_BODY: &str =
     r#"{"input": {"n": 1}, "execution_timeout_secs": "not-a-number"}"#;
 
-/// issue #808 (Codex P2): a retry that carries its exactly-once key in the
-/// `Idempotency-Key` HEADER, but whose JSON body is now malformed, must still
-/// return the advertised `200` no-op for a committed claim — the body is
-/// irrelevant on a key hit, so the JSON-extractor rejection must not win.
+/// Issue #808: a retry carries its exactly-once key in the `Idempotency-Key`
+/// HEADER, but its JSON body is now malformed. It must still return the
+/// advertised `200` no-op for a committed claim. The body is irrelevant on a key
+/// hit, so the JSON-extractor rejection must not win.
 #[tokio::test]
 async fn header_key_replay_survives_a_malformed_body() {
     let (url, _c) = setup_database().await;
@@ -1197,9 +1190,9 @@ async fn header_key_replay_survives_a_malformed_body() {
 }
 
 /// AC1: a malformed body with NO idempotency key returns the exact JSON-extractor
-/// rejection (a client error, never a `200`) — byte-for-byte the no-key behavior,
-/// unchanged by the #808 header-probe fix. A header-key malformed body with no
-/// committed claim (a probe miss) returns the IDENTICAL rejection, proving the
+/// rejection (a client error, never a `200`). That is byte-for-byte the no-key
+/// behavior, unchanged by the #808 header-probe fix. A header-key malformed body with no
+/// committed claim (a probe miss) returns the IDENTICAL rejection. So the
 /// fallback never fabricates a start.
 #[tokio::test]
 async fn malformed_body_returns_the_extractor_rejection_when_not_a_committed_replay() {

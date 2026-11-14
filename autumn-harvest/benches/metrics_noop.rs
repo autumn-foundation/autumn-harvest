@@ -1,9 +1,9 @@
 //! Benchmark: cost of metrics hot-path calls when the default `NoOpMetrics`
 //! recorder is in use.
 //!
-//! The acceptance criterion from ADR-0001 / issue #138 is that sampling cost
-//! on the hot paths is *zero* (or nanosecond-level) when no custom recorder
-//! is configured. These benchmarks measure:
+//! ADR-0001 / issue #138 requires a *zero* (or nanosecond-level) sampling
+//! cost on the hot paths when no custom recorder is configured. These
+//! benchmarks measure:
 //!
 //! - `noop/workflow_started` — counter on the workflow dispatch entry point
 //! - `noop/workflow_completed` — histogram on the workflow exit point

@@ -1,9 +1,9 @@
 //! The built-in sample workflow (issue #525, AC2/AC3).
 //!
 //! What a first-time reader needs to see in their first minute is not
-//! throughput — it is **durability**. So the sample runs an activity, waits on a
-//! durable timer, and runs another: kill the process mid-timer, start it again,
-//! and the run resumes from history instead of re-executing. That is the one
+//! throughput. It is **durability**. So the sample runs an activity, waits on a
+//! durable timer, and runs another. Kill the process mid-timer and start it
+//! again: the run resumes from history and does not re-execute. That is the one
 //! property that distinguishes this engine from a job queue, and the banner
 //! points straight at it.
 
@@ -77,8 +77,8 @@ pub struct DevDashboardPath(pub String);
 
 /// Sends a browser straight to the Vantage dashboard.
 ///
-/// This route is also what makes the app *legal*: `AppBuilder::run` asserts at
-/// least one route is registered, and `HarvestPlugin::api()` mounts through
+/// This route also makes the app *legal*. `AppBuilder::run` asserts that at
+/// least one route is registered. `HarvestPlugin::api()` mounts through
 /// `nest`, which does not count. Without it the whole runtime panicked on boot
 /// and then timed out waiting for a server that had already given up.
 #[get("/")]

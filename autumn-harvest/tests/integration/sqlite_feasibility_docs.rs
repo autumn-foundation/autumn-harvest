@@ -1,13 +1,12 @@
 //! Guards that keep the issue-#966 R&D report honest against the code it audits.
 //!
-//! `docs/rnd/sqlite-feasibility.md` is a leadership decision document whose
+//! `docs/rnd/sqlite-feasibility.md` is a leadership decision document. Its
 //! central claim is an *exhaustive* module-by-module inventory of every
-//! Postgres-coupled surface in core — the issue words it as "verifiable
-//! against a `grep`-level audit". A hand-written inventory of 40-odd modules
-//! is exactly the kind of artefact that is true the day it is written and
-//! quietly false one merge later: a new module lands with a `SKIP LOCKED`
-//! claim, nobody re-reads the R&D doc, and the "exhaustive" claim silently
-//! becomes a lie that still renders perfectly.
+//! Postgres-coupled surface in core. The issue calls it "verifiable against a
+//! `grep`-level audit". A hand-written inventory of 40-odd modules is true the
+//! day it is written and quietly false one merge later. A new module lands
+//! with a `SKIP LOCKED` claim, and nobody re-reads the R&D doc. The
+//! "exhaustive" claim then becomes a lie that still renders perfectly.
 //!
 //! These guards make the claim falsifiable. They re-derive the coupling
 //! inventory from `autumn-harvest/src/*.rs` at test runtime and assert the
@@ -23,13 +22,13 @@
 //!   * the evidence the report cites (the cross-backend replay test, the
 //!     `default-features = false` seam) actually exists.
 //!
-//! The detector below is deliberately *precise* rather than generous: a bare
-//! `INTERVAL` token matches Rust constants such as `DEFAULT_WORKER_POLL_INTERVAL`,
-//! and a bare `diesel` matches the guardrail lint's prose listing forbidden
-//! crates. Both were false positives in the first cut of this audit. Matching
+//! The detector is deliberately *precise*, not generous. A bare `INTERVAL`
+//! token matches Rust constants such as `DEFAULT_WORKER_POLL_INTERVAL`. A bare
+//! `diesel` matches the guardrail lint's prose that lists forbidden crates.
+//! Both were false positives in the first cut of this audit. Matching
 //! `INTERVAL '`/`make_interval(` and `diesel::`/`diesel_async` keeps the
-//! inventory signal rather than noise — an inventory padded with false
-//! positives would discredit the report just as badly as one with holes.
+//! inventory signal, not noise. An inventory padded with false positives
+//! discredits the report as badly as one with holes.
 //!
 //! Deliberately *not* covered: the report's prose judgements — the seam
 //! sizing, the cost estimates, the go/no-go reasoning. Those are argument, not
@@ -53,13 +52,13 @@ fn report_path() -> PathBuf {
 /// Read a file with line endings normalised to `\n`.
 ///
 /// Every guard here does byte-offset arithmetic over the document (section
-/// slicing) or exact cell matching. Under a CRLF checkout — the Windows CI leg
-/// — `str::lines()` strips the `\r` while the raw text still contains it, so
-/// reconstructing offsets from line lengths under-counts one byte per line.
-/// On this report that is a ~90-byte shift by the inventory table, and it can
-/// land mid-character (the report contains em dashes and middots), panicking
-/// on a non-char-boundary slice. Normalising once on read removes the whole
-/// class; it mirrors `performance_docs::read_normalized`.
+/// slicing) or exact cell matching. The Windows CI leg uses a CRLF checkout.
+/// There `str::lines()` strips the `\r` but the raw text still contains it.
+/// Offsets rebuilt from line lengths then under-count one byte per line. On
+/// this report that is a ~90-byte shift by the inventory table. It can land
+/// mid-character (the report has em dashes and middots) and panic on a
+/// non-char-boundary slice. Normalising once on read removes the whole class.
+/// It mirrors `performance_docs::read_normalized`.
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
@@ -89,27 +88,26 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     ),
     ("skip-locked", &["SKIP LOCKED"]),
     // Blocking pessimistic row lock, distinct from the non-blocking claim
-    // above. Detected through the Diesel DSL rather than the raw `FOR UPDATE`
-    // text: the codebase has no `.skip_locked()` DSL call, so `.for_update()`
-    // is unambiguously a blocking lock, and the DSL set is a superset of the
-    // modules issuing real raw-SQL row locks (`queue`, `timeout` — both also
-    // use the DSL). Matching the raw text instead would be actively wrong: it
-    // flags `mutex` for a doc comment reading "No `FOR UPDATE`" and for a unit
-    // test asserting `!expr.contains("FOR UPDATE")`, and it cannot separate
+    // above. Detected through the Diesel DSL, not the raw `FOR UPDATE` text.
+    // The codebase has no `.skip_locked()` DSL call, so `.for_update()` is
+    // always a blocking lock. The DSL set is a superset of the modules that
+    // issue raw-SQL row locks (`queue`, `timeout`; both also use the DSL).
+    // Matching the raw text would be wrong. It flags `mutex` for a doc comment
+    // reading "No `FOR UPDATE`" and for a unit test asserting
+    // `!expr.contains("FOR UPDATE")`. It also cannot separate
     // `FOR UPDATE OF t SKIP LOCKED` from a blocking lock.
     ("row-lock", &[".for_update()"]),
-    // Postgres-only raw SQL that Diesel does not abstract: a module can look
+    // Postgres-only raw SQL that Diesel does not abstract. A module can look
     // like plain CRUD through the ORM and still be unportable because of the
     // SQL it embeds. Every token here is genuinely Postgres-only:
-    //   `#>>`            JSONB path extract (SQLite JSON1 has no equivalent operator)
-    //   `EXTRACT(EPOCH`  (SQLite uses `strftime('%s', …)`)
-    //   `JOIN LATERAL`   (SQLite has no LATERAL)
-    //   `~ '`            POSIX regex (SQLite has no REGEXP without a UDF)
-    //   `::TYPE`         Postgres cast syntax (SQLite uses `CAST(x AS t)`)
-    // `JOIN LATERAL` rather than bare `LATERAL` for the same reason the row
-    // lock is matched through the DSL: `queue` and `execution` both *talk
-    // about* `LATERAL` in doc comments, and a module must not be reported as
-    // coupled because it documents a construct.
+    //   `#>>`            JSONB path extract (SQLite JSON1 has no equivalent operator).
+    //   `EXTRACT(EPOCH`  (SQLite uses `strftime('%s', …)`).
+    //   `JOIN LATERAL`   (SQLite has no LATERAL).
+    //   `~ '`            POSIX regex (SQLite has no REGEXP without a UDF).
+    //   `::TYPE`         Postgres cast syntax (SQLite uses `CAST(x AS t)`).
+    // `JOIN LATERAL`, not bare `LATERAL`, for the same reason as the row lock.
+    // `queue` and `execution` both *talk about* `LATERAL` in doc comments. A
+    // module must not count as coupled because it documents a construct.
     //
     // On the cast tokens: an earlier revision listed only UPPERCASE type names
     // and so missed every lowercase spelling of the *same* construct
@@ -117,17 +115,17 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     // defect from the open-enumeration problem below — case is a *bounded*
     // dimension, so it is closable, and it is closed here.
     //
-    // The first two tokens close it structurally rather than by listing types:
-    // a Postgres cast is `<expr>::<type>`, and `'::` / `)::` match on the
-    // *cast position* (after a literal or a closing paren) regardless of the
-    // type named or its case. Neither is valid Rust syntax, so both are
+    // The first two tokens close it structurally, not by listing types. A
+    // Postgres cast is `<expr>::<type>`. `'::` and `)::` match the *cast
+    // position* (after a literal or a closing paren), whatever the type or its
+    // case. Neither is valid Rust syntax, so both are
     // SQL-only by construction. The remaining lowercase type names cover the
     // `$1::bigint` and `ident::text` forms, which have no such anchor.
     //
-    // Deliberately NOT matched, because each has a real Rust false positive:
-    // bare `::` (every path — `Self::Variant`, `std::fmt`); `::uuid` (the
-    // re-exported `autumn_harvest::uuid`, named in a doc comment and in
-    // `lib.rs`); `::interval` (`tokio::time::interval`). Case-insensitive
+    // Deliberately NOT matched, because each has a real Rust false positive.
+    // Bare `::` matches every path (`Self::Variant`, `std::fmt`). `::uuid`
+    // matches the re-exported `autumn_harvest::uuid` in a doc comment and in
+    // `lib.rs`. `::interval` matches `tokio::time::interval`. Case-insensitive
     // matching is likewise rejected: it would flag `diesel::sql_types::Text`
     // and its siblings as Postgres casts.
     (
@@ -158,11 +156,11 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     // Reaches for Diesel's raw-SQL escape hatch at all.
     //
     // This is the *closed* rule, and it exists because the list above is not
-    // one. Three review rounds each found another dialect construct the token
-    // list missed (the blocking row lock, then JSONB/`LATERAL`/regex, then
-    // JSONB `@>`/`||` and `NOW()`), which is the tell that enumerating dialect
-    // features cannot terminate: the set of Postgres-only syntax is open, and
-    // every miss silently understates the port.
+    // one. Each of three reviews found a dialect construct that the token list
+    // missed. First the blocking row lock, then JSONB/`LATERAL`/regex, then
+    // JSONB `@>`/`||` and `NOW()`. That shows that enumerating dialect features
+    // cannot terminate. The set of Postgres-only syntax is open, and every miss
+    // silently understates the port.
     //
     // Detecting the escape hatch instead cannot miss a construct, because it
     // does not enumerate constructs. It is a weaker claim — raw SQL *may* be
@@ -185,17 +183,16 @@ const MECHANISMS: &[(&str, &[&str])] = &[
         ],
     ),
     ("listen/notify", &["pg_notify", "LISTEN "]),
-    // Both prefixes are required and, together, are exhaustive: every one of
-    // Postgres's ten advisory-lock functions is named `pg_advisory_*` or
-    // `pg_try_advisory_*` (session/transaction x shared/exclusive x try/block,
-    // plus the two unlocks). An earlier revision matched only `pg_advisory`,
-    // which does not substring-match `pg_try_advisory_xact_lock` — `try_` is
-    // infixed — and so missed the concurrency-cap claim in `queue` and the
-    // fleet-wide registration lock in `scheduler`.
+    // Both prefixes are required, and together they are exhaustive. Each of the
+    // ten Postgres advisory-lock functions is named `pg_advisory_*` or
+    // `pg_try_advisory_*`. That is session/transaction x shared/exclusive x
+    // try/block, plus the two unlocks. An earlier revision matched only
+    // `pg_advisory`. That does not substring-match `pg_try_advisory_xact_lock`,
+    // because `try_` is infixed. So it missed the concurrency-cap claim in
+    // `queue` and the fleet-wide registration lock in `scheduler`.
     //
-    // Unlike the dialect list above, this family is *closed*: it is a fixed,
-    // documented set of Postgres functions, so a prefix pair can cover it
-    // exhaustively rather than approximately.
+    // Unlike the dialect list above, this family is *closed*. It is a fixed,
+    // documented set of Postgres functions, so a prefix pair covers it exactly.
     ("advisory-lock", &["pg_advisory", "pg_try_advisory"]),
     ("to_regclass", &["to_regclass"]),
     ("gen_random_uuid", &["gen_random_uuid"]),
@@ -208,19 +205,19 @@ const MECHANISMS: &[(&str, &[&str])] = &[
 /// Modules deliberately excluded from the core Postgres-coupling audit.
 ///
 /// This report sizes the cost of porting the *engine* to an embedded `SQLite`
-/// backend, so "core module" means a production engine surface a port would
-/// have to carry. `chaos` is the issue-#940 deterministic fault-injection
-/// **test harness**: its `points` half is a zero-cost const catalogue with no
-/// Postgres coupling, and its only `diesel::`/`pg_notify` tokens live entirely
-/// in the `#[cfg(feature = "chaos")]` controller — a `From<ChaosError> for
-/// diesel::result::Error` conversion that *simulates* DB errors at injection
-/// points — plus one doc comment. It is never compiled into a production or
-/// default build, is never ported to `SQLite`, and is not an engine surface this
-/// report exists to judge. Auditing it would list a test scaffold among the
-/// modules leadership must decide to port — the opposite of the report's
-/// signal. So it is skipped here, exactly like the `bin` directory below, as an
-/// *explicit, documented* decision rather than a silent hole (the property
-/// `excluded_modules_all_exist` keeps the list from rotting past a rename).
+/// backend. So "core module" means a production engine surface that a port
+/// must carry. `chaos` is the issue-#940 deterministic fault-injection
+/// **test harness**. Its `points` half is a zero-cost const catalogue with no
+/// Postgres coupling. Its only `diesel::`/`pg_notify` tokens are in one doc
+/// comment and the `#[cfg(feature = "chaos")]` controller. There a
+/// `From<ChaosError> for diesel::result::Error` conversion *simulates* DB
+/// errors at injection points. No production or default build compiles it,
+/// and no port carries it to `SQLite`. It is not an engine surface that this
+/// report judges. Auditing it would list a test scaffold among the modules
+/// leadership must decide to port, the opposite of the report's signal. So
+/// it is skipped, like the `bin` directory, as an *explicit, documented*
+/// decision, not a silent hole. `excluded_modules_all_exist` keeps the list
+/// from rotting past a rename.
 const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 
 /// Subdirectories of `autumn-harvest/src` that the flat scan skips, with the
@@ -258,11 +255,10 @@ const SPIKE_SUBDIRS: &[(&str, &str)] = &[("atomicity", "atomicity-spike")];
 /// Every auditable core `.rs` module directly under `autumn-harvest/src`, as
 /// `(module name, path)`.
 ///
-/// The single source of truth for "core module", shared by the coupling
-/// detector and the derived-totals denominator so the two can never disagree
-/// about what is in scope. It asserts the tree is still flat (a nested module
-/// could carry coupling the inventory never sees) and applies the documented
-/// test-only exclusions above.
+/// The single source of truth for "core module". The coupling detector and the
+/// derived-totals denominator share it, so the two never disagree about scope.
+/// It asserts the tree is still flat (a nested module could carry coupling the
+/// inventory never sees). It applies the documented test-only exclusions.
 fn core_module_files() -> Vec<(String, PathBuf)> {
     let src = repo_root().join("autumn-harvest/src");
     let entries = std::fs::read_dir(&src)
@@ -275,10 +271,9 @@ fn core_module_files() -> Vec<(String, PathBuf)> {
         if path.is_dir() {
             // The scan is deliberately flat: core is a flat module tree, and a
             // flat scan keeps module names unambiguous (`foo.rs` -> `foo`).
-            // But a *silently* flat scan would let a nested module carry
-            // coupling the inventory never sees, which is the exact rot these
-            // guards exist to prevent — so a new subdirectory has to be an
-            // explicit decision, not an accident.
+            // A *silently* flat scan would let a nested module carry coupling
+            // that the inventory never sees. These guards exist to prevent that
+            // rot. So a new subdirectory is an explicit decision, not an accident.
             let name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -359,11 +354,11 @@ struct InventoryRow {
 /// The report's inventory rows: Markdown table lines whose first cell is a
 /// backticked module name.
 ///
-/// Parses *by cell index* rather than searching the whole row. Whole-row
-/// substring matching would let the coupling cell say `diesel` while the note
-/// cell happened to contain the word "skip-locked", or let a note reading
-/// "not (c)" satisfy a classification check — both pass a containment test and
-/// both mean the table is lying.
+/// Parses *by cell index*, not by searching the whole row. Whole-row matching
+/// passes a coupling cell of `diesel` when the note cell contains
+/// "skip-locked". It also lets a note reading "not (c)" satisfy a
+/// classification check. Both pass a containment test, and both mean the
+/// table is lying.
 fn inventory_rows(report: &str) -> BTreeMap<String, InventoryRow> {
     let section = markdown_section(report, "Postgres-coupling inventory").unwrap_or_else(|| {
         panic!(
@@ -423,10 +418,9 @@ fn inventory_rows(report: &str) -> BTreeMap<String, InventoryRow> {
 /// next heading of the same-or-shallower depth.
 ///
 /// Offsets come from `split_inclusive('\n')`, which keeps the terminator in the
-/// slice, so the running offset is exact for any line ending rather than
-/// reconstructed as `line.len() + 1` (which is off by one per line under CRLF
-/// and can slice mid-character). A `#` inside a fenced code block is not a
-/// heading.
+/// slice. So the running offset is exact for any line ending. A rebuilt
+/// `line.len() + 1` is off by one per line under CRLF and can slice
+/// mid-character. A `#` inside a fenced code block is not a heading.
 fn markdown_section<'a>(document: &'a str, heading_contains: &str) -> Option<&'a str> {
     let mut start: Option<usize> = None;
     let mut depth = 0usize;
@@ -558,9 +552,9 @@ fn report_exists_and_is_decision_ready() {
 
 /// The audit's own exceptions must be falsifiable.
 ///
-/// A skip list is only honest while every entry names a module that actually
-/// exists — otherwise a rename or deletion leaves a stale exclusion that could
-/// silently swallow a *different*, real module later given the same file name.
+/// A skip list is only honest while every entry names a module that exists. A
+/// rename or deletion leaves a stale exclusion. It could later swallow a
+/// *different*, real module that gets the same file name.
 /// This mirrors `inventory_lists_no_module_that_is_not_actually_coupled`, which
 /// forbids the report itself from carrying phantom rows.
 #[test]
@@ -737,18 +731,16 @@ fn is_module_count(cell: &str) -> bool {
 
 /// A module that hand-writes SQL cannot be "plain CRUD through Diesel".
 ///
-/// This is the guard that ends the whack-a-mole. Class (a) is *defined* in the
-/// report as "plain query/CRUD through Diesel with no Postgres-specific
-/// semantics" — a claim that is false by construction the moment a module
-/// reaches for `sql::<…>` or `sql_query`, because that SQL is not going
-/// through Diesel's abstraction at all and its portability has to be read by a
-/// human.
+/// This guard ends the whack-a-mole. The report *defines* class (a) as "plain
+/// query/CRUD through Diesel with no Postgres-specific semantics". That claim
+/// is false by construction once a module uses `sql::<…>` or `sql_query`.
+/// That SQL bypasses the Diesel abstraction, so a human must judge its
+/// portability.
 ///
-/// Unlike the `raw-pg-sql` token list, this rule is **closed**: it cannot miss
-/// a dialect construct, because it does not enumerate constructs. Three review
-/// rounds each found one the token list had missed; this rule independently
-/// catches all three classes at once, and would have caught them the first
-/// time.
+/// Unlike the `raw-pg-sql` token list, this rule is **closed**. It cannot miss
+/// a dialect construct, because it does not enumerate constructs. Each of three
+/// reviews found a construct that the token list missed. This rule catches all
+/// three classes at once, and would have caught them the first time.
 ///
 /// It deliberately does *not* force a class — raw SQL may be portable ANSI, so
 /// (b) is often right. It only forbids the one classification that asserts the
@@ -917,9 +909,9 @@ fn zero_regression_to_the_postgres_path_is_structurally_true() {
     // The spike's first invariant: saying "no" stays free, and the Postgres
     // build is untouched. Both halves are checkable from the manifests rather
     // than asserted in prose.
-    // Compare against *directives*, not raw text: a comment explaining why core
-    // has no rusqlite dependency would fail a raw `contains`, and a comment
-    // mentioning `default-features = false` would satisfy one.
+    // Compare against *directives*, not raw text. A comment explaining why core
+    // has no rusqlite dependency fails a raw `contains`. A comment mentioning
+    // `default-features = false` satisfies one.
     let core_directives = manifest_directives(&repo_root().join("autumn-harvest/Cargo.toml"));
     // Issue #2258: the opt-in owner disk cache may pull `rusqlite`, but only as
     // an optional dependency that the `owner-disk-cache` feature enables. The
@@ -975,20 +967,19 @@ fn zero_regression_to_the_postgres_path_is_structurally_true() {
 
 /// `markdown_section` must be line-ending agnostic.
 ///
-/// This is pinned directly rather than left to the report's own content,
-/// because the failure mode is *content-dependent* and therefore an unreliable
-/// canary. The original implementation reconstructed byte offsets as
-/// `line.len() + 1` from `str::lines()`, which strips `\r` — so under a CRLF
-/// checkout the running offset drifts one byte per line. The drift only
-/// *panics* when it happens to land inside a multi-byte character, and only
-/// silently mis-slices otherwise.
+/// This is pinned directly, not left to the report's own content. The failure
+/// mode is *content-dependent*, so the report is an unreliable canary. The
+/// original code rebuilt byte offsets as `line.len() + 1` from `str::lines()`,
+/// which strips `\r`. Under a CRLF checkout the running offset drifts one byte
+/// per line. The drift *panics* only when it lands inside a multi-byte
+/// character. Otherwise it silently mis-slices.
 ///
-/// That is exactly how it escaped review: the guards passed locally against a
-/// CRLF copy of the working-tree report (the drift landed on a char boundary)
-/// and panicked on the Windows CI leg against the committed one, at
+/// That is how it escaped review. The guards passed locally against a CRLF
+/// copy of the working-tree report, where the drift landed on a char boundary.
+/// They panicked on the Windows CI leg against the committed one, at
 /// `byte index 14684 ... inside '→'`. A one-line edit anywhere above an em dash
-/// flips which of those happens. So the invariant is asserted on a fixture with
-/// a known multi-byte character rather than on the live document.
+/// flips which of those happens. So a fixture with a known multi-byte
+/// character asserts the invariant, not the live document.
 #[test]
 fn markdown_section_is_line_ending_agnostic() {
     let lf = "# Title\n\nIntro — with an em dash.\n\n## Wanted\n\nBody → arrow.\n\n## Next\n\nElsewhere.\n";
@@ -997,8 +988,8 @@ fn markdown_section_is_line_ending_agnostic() {
     let from_lf = markdown_section(lf, "Wanted").expect("LF section found");
     let from_crlf = markdown_section(&crlf, "Wanted").expect("CRLF section found");
 
-    // Same content modulo line endings, and — the part that panicked — the
-    // CRLF slice must be a valid, complete section rather than a shifted one.
+    // Same content modulo line endings. The CRLF slice must also be a valid,
+    // complete section, not a shifted one. That is the part that panicked.
     assert_eq!(
         from_crlf.replace("\r\n", "\n"),
         from_lf,
@@ -1037,33 +1028,17 @@ fn markdown_section_ignores_headings_inside_code_fences() {
     );
 }
 
-/// These guards must actually execute on a docs-only pull request.
-///
-/// The change most likely to rot this report is a pull request that edits
-/// *only* `docs/rnd/sqlite-feasibility.md` — and that is precisely the change
-/// CI would skip: the `changes` job classifies `docs/**` and `*.md` as
-/// `code=false`, and every step of the `test` matrix is gated on
-/// `code == 'true'`. The `lint` job runs ungated, but Clippy only *compiles*
-/// this file.
-///
-/// So the guards need a `cargo test` step in the ungated `lint` job. This
-/// asserts that step is there and has not acquired a condition that would put
-/// it back behind the same gate. It mirrors
-/// `performance_docs::performance_guards_run_on_docs_only_changes`, which
-/// exists because that suite spent three rounds unable to fire on the change
-/// class it was written for.
 /// The **whole** workflow step stanza containing `needle`, from its `- name:`
 /// through to the line before the next step's `- name:` (or the end of the
 /// block).
 ///
-/// Bounding at the *next* step rather than at `needle` is the load-bearing
-/// part. An earlier revision sliced only up to the matched text, which sits
-/// inside the step's `run:` line — so every key written *after* `run:` was
-/// invisible. GitHub Actions does not care about key order within a step, so
-/// moving an `if:` below the `run:` line was enough to re-gate the guards while
-/// the test that exists to prevent exactly that kept passing. A guard that a
-/// two-line reordering can evade is worse than no guard, because it also
-/// reports success.
+/// Bounding at the *next* step, not at `needle`, is the load-bearing part. An
+/// earlier revision sliced only up to the matched text, inside the `run:` line.
+/// So every key written *after* `run:` was invisible. GitHub Actions ignores key
+/// order within a step. Moving an `if:` below `run:` re-gated the guards, and
+/// the test that exists to prevent that kept passing. A guard that a two-line
+/// reordering can evade is worse than no guard, because it also reports
+/// success.
 fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
     const STEP: &str = "\n      - name:";
     let at = block.find(needle)?;
@@ -1105,14 +1080,28 @@ fn step_stanza_covers_keys_written_after_run() {
     );
 }
 
+/// These guards must actually execute on a docs-only pull request.
+///
+/// The change most likely to rot this report is a pull request that edits
+/// *only* `docs/rnd/sqlite-feasibility.md`. CI would skip exactly that change.
+/// The `changes` job classifies `docs/**` and `*.md` as `code=false`, and every
+/// step of the `test` matrix is gated on `code == 'true'`. The `lint` job runs
+/// ungated, but Clippy only *compiles* this file.
+///
+/// So the guards need a `cargo test` step in the ungated `lint` job. This
+/// asserts that the step is there and has no condition that puts it back
+/// behind the same gate. It mirrors
+/// `performance_docs::performance_guards_run_on_docs_only_changes`. That guard
+/// exists because its suite once could not fire on the change class it was
+/// written for.
 #[test]
 fn guards_run_on_docs_only_changes() {
     const FILTER: &str = "--test integration sqlite_feasibility_docs::";
     let workflow = read_normalized(&repo_root().join(".github/workflows/ci.yml"));
 
-    // The step must exist, and must name this module as its filter — a step
-    // running some *other* test satisfies a looser check while leaving these
-    // guards just as unexecuted.
+    // The step must exist and must name this module as its filter. A step that
+    // runs some *other* test satisfies a looser check but leaves these guards
+    // unexecuted.
     let step = workflow
         .lines()
         .find(|line| line.contains(FILTER))

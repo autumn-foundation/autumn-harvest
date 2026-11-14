@@ -36,7 +36,6 @@ pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
     // so a build error leaves the terminal usable.
     let client = crate::http_client(cli.http_timeout().min(REFRESH_TIMEOUT))?;
 
-    // Setup terminal
     enable_raw_mode().map_err(|e| CliError::ReadJson {
         label: "setup raw mode",
         path: "terminal".to_string(),
@@ -59,7 +58,6 @@ pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
 
     let res = run_app(&mut terminal, &client, &url, cli).await;
 
-    // Restore terminal
     disable_raw_mode().unwrap_or_default();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap_or_default();
     terminal.show_cursor().unwrap_or_default();

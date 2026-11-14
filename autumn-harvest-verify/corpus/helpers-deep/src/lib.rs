@@ -12,9 +12,9 @@
 //!   `#[workflow]` bodies plus **one hop** of helpers resolved **same-file +
 //!   same-module**. This crate is two crates and many files away.
 //!
-//! Consequently a corpus workflow that reaches any of these through
-//! `harvest-verify-corpus-helpers` is invisible to the entire syntactic layer
-//! while being flagrantly non-deterministic — which is exactly the point.
+//! So a corpus workflow that reaches these through
+//! `harvest-verify-corpus-helpers` is invisible to the whole syntactic layer.
+//! It is still flagrantly non-deterministic, which is the point.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -29,9 +29,10 @@ pub fn stamp() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Wall-clock sub-second nanos — the leaf of the three-hop chain, chosen so the
-/// value differs between two runs a second apart *and* two runs a millisecond
-/// apart.
+/// Wall-clock sub-second nanos, the leaf of the three-hop chain.
+///
+/// The value differs between two runs a second apart *and* two runs a
+/// millisecond apart.
 #[must_use]
 pub fn fine_stamp() -> u64 {
     SystemTime::now()
@@ -41,10 +42,10 @@ pub fn fine_stamp() -> u64 {
 
 /// Monotonic elapsed seconds since `since`.
 ///
-/// `Instant::elapsed` is deliberate: neither HVG001 nor DET001 has an
-/// `.elapsed()` pattern — both match only the `Instant::now` / `SystemTime::now`
-/// *constructors* — so this call escapes the syntactic layer even when written
-/// directly in a workflow body.
+/// `Instant::elapsed` is deliberate. Neither HVG001 nor DET001 has an
+/// `.elapsed()` pattern. Both match only the `Instant::now` / `SystemTime::now`
+/// *constructors*. So this call escapes the syntactic layer even in a workflow
+/// body.
 #[must_use]
 pub fn elapsed_secs(since: Instant) -> u64 {
     since.elapsed().as_secs()

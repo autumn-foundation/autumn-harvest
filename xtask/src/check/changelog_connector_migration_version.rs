@@ -7,11 +7,11 @@
 //! Mechanism this guards against: the `[0.6.0]` entry "Add broker
 //! event-source connectors" (issue #944) names the poison-message sink as
 //! "the plugin-owned `harvest_connector_dead_letters` table (migration
-//! `20260719000000`)". That version was wrong. It is the version of a
-//! different core migration that already shipped,
+//! `20260719000000`)". That version was wrong. It belongs to a core
+//! migration that already shipped,
 //! `autumn-harvest/migrations/20260719000000_harvest_workflow_logs` (issue
-//! #790). The same `CHANGELOG.md` section cites that one correctly two
-//! entries below.
+//! #790). The same `CHANGELOG.md` section cites it correctly two entries
+//! below.
 //!
 //! The real version of the connector migration on disk is `20260719900000`.
 //! The `900000` time component is a deliberate bump, per the `up.sql` header

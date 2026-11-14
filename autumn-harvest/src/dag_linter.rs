@@ -1,8 +1,7 @@
 //! DAG configuration analyzer and linter.
 //!
-//! Provides rules and an engine to statically analyze workflow `DagDefinition`s
-//! for anti-patterns, missing resilience configurations, and suspicious topologies
-//! before they are executed.
+//! Rules that check a `DagDefinition` before it runs. They flag anti-patterns,
+//! missing resilience settings and suspicious topologies.
 
 use crate::dag::DagDefinition;
 
@@ -71,8 +70,7 @@ impl Default for DagLinter {
 
 /// Flags tasks that do not have a configured `RetryPolicy`.
 ///
-/// In distributed systems, transient failures are common. Tasks without
-/// retry policies are brittle.
+/// A task with no retry policy fails on its first transient error.
 pub struct MissingRetryPolicyRule;
 
 impl MissingRetryPolicyRule {

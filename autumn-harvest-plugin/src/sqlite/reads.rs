@@ -1,8 +1,9 @@
 //! The read routes of the SQLite management API (issue #2468).
 //!
 //! Each route keeps its Postgres path, status codes and JSON shape. A route
-//! that reads no query key refuses one, as the core routes do. A route reads the file through `SqliteReader`, never the writer
-//! task. It then calls the same pure step as the Postgres route:
+//! that reads no query key refuses one, as the core routes do. A route reads
+//! the file through `SqliteReader`, never the writer task. It then calls the
+//! same pure step as the Postgres route:
 //!
 //! | Route | Pure step |
 //! |---|---|
@@ -79,7 +80,6 @@ impl Run {
     }
 }
 
-/// A `400` for a parse error message.
 fn bad_request(message: impl Into<String>) -> AutumnError {
     AutumnError::bad_request_msg(message.into())
 }

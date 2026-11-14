@@ -3,8 +3,8 @@
 //!
 //! Demonstrates how a client collapses the racy *fetch-then-start-then-update*
 //! trio into a single `update_with_start` call.  The update is admitted in the
-//! same Postgres transaction as (or atomically against) the workflow start, so
-//! there is no window where the workflow is alive but the update is lost.
+//! same Postgres transaction as the workflow start, or atomically against it.
+//! So no window exists where the workflow is alive but the update is lost.
 //!
 //! The canonical use-case is a cart service: the first `add_item` call creates
 //! the cart workflow and admits the update atomically.  Subsequent calls attach
@@ -151,7 +151,7 @@ async fn add_item_atomic(
             update_id,
             update_name: "add_item".to_string(),
             update_args: serde_json::to_value(&item).unwrap(),
-            // Caller-supplied idempotency key so retried HTTP requests don't
+            // Caller-supplied idempotency key so retried HTTP requests do not
             // admit the same item twice.
             idempotency_key,
             max_workflow_input_bytes: 0,

@@ -2,14 +2,13 @@
 //!
 //! **Boundary.** `ffi`.
 //!
-//! `helpers::native_abs` calls `abs` from an `unsafe extern "C"` block. There is
-//! no MIR for a foreign function — the compiler never produces a body — so the
-//! analyzer has nothing to summarize and no way to know whether the callee
-//! consults the clock, a global, or nothing at all.
+//! `helpers::native_abs` calls `abs` from an `unsafe extern "C"` block. A
+//! foreign function has no MIR body, so the analyzer has nothing to summarize.
+//! It cannot know whether the callee reads the clock, a global, or nothing.
 //!
-//! `abs` happens to be pure, which is exactly why this is the right shape for
-//! the test: the analyzer must report `unknown` because it **cannot know**, not
-//! because the call is suspicious. Assuming purity for unmodeled FFI is the
+//! `abs` is pure, which is why this shape suits the test. The analyzer must
+//! report `unknown` because it **cannot know**, not because the call is
+//! suspicious. Assuming purity for unmodeled FFI is the
 //! unsoundness AC2 exists to forbid; assuming impurity would flag every
 //! workflow that touches a C library.
 

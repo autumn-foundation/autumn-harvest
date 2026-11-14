@@ -198,7 +198,6 @@ fn name_missing_table(error: diesel::result::Error) -> diesel::result::Error {
     }
 }
 
-/// The wall clock in epoch milliseconds.
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -270,7 +269,6 @@ pub async fn warn_if_stranded(state: &autumn_web::AppState) {
     }
 }
 
-/// One due row.
 #[derive(Debug, diesel::QueryableByName)]
 struct DueRow {
     #[diesel(sql_type = BigInt)]
@@ -543,7 +541,6 @@ fn database(error: &diesel::result::Error) -> DrainError {
     DrainError::Database(format!("outbox: {error}"))
 }
 
-/// The start options of `row`.
 fn options_of(row: &DueRow) -> Result<StartOptions, String> {
     let mut options = StartOptions::new().workflow_id(row.workflow_id.clone());
     if let Some(memo) = &row.memo {

@@ -10,9 +10,9 @@
 //! (`webhook_start_records_webhook_source`), which already carries the full
 //! `[security.webhooks]` + HMAC-signed-delivery harness.
 //!
-//! Execution: honours `HARVEST_TEST_DATABASE_URL` (a migrated Postgres) so it
-//! runs directly against a local instance; otherwise a fresh testcontainers
-//! Postgres is booted with the full migration bundle.
+//! Execution: with `HARVEST_TEST_DATABASE_URL` set to a migrated Postgres, the
+//! suite runs directly against it. Otherwise it boots a fresh testcontainers
+//! Postgres with the full migration bundle.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -226,9 +226,8 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 
 /// Directly insert a workflow-execution row with a chosen `start_source`
 /// (`None` = a NULL / pre-upgrade column). Returns the new `id` (UUID text).
-/// This exercises the *read* filter over the `start_source` column regardless
-/// of which start path wrote it — the correctness of each write path is
-/// covered by the `*_records_*_source` tests elsewhere.
+/// It exercises the *read* filter over the `start_source` column, whatever
+/// start path wrote it. The `*_records_*_source` tests cover each write path.
 async fn seed_execution(
     pool: &DbPool,
     workflow_name: &str,
@@ -385,8 +384,8 @@ async fn list_filter_rejects_invalid_start_source_with_400() {
 }
 
 /// AC4 (issue #740): a describe response surfaces `start_source = "unknown"` for
-/// a NULL / pre-upgrade row and omits `start_source_ref`/`started_by` when NULL;
-/// a row with a concrete source + ref + actor surfaces all three.
+/// a NULL / pre-upgrade row. It omits `start_source_ref`/`started_by` when NULL.
+/// A row with a concrete source + ref + actor surfaces all three.
 #[tokio::test]
 async fn describe_surfaces_start_source_and_omits_absent_fields() {
     let (url, _c) = setup_database().await;
@@ -539,10 +538,10 @@ async fn batch_start_immediate_records_batch_source() {
     );
 }
 
-/// BLOCKER 2 (issue #740): the manual trigger-now schedule route's *immediate*
-/// (non-throttled) start branch records `start_source = "schedule"`, references
-/// the schedule id in `start_source_ref`, and attributes the operator in
-/// `started_by` — NOT the placeholder `api`.
+/// BLOCKER 2 (issue #740): the *immediate* (non-throttled) start branch of the
+/// manual trigger-now schedule route records `start_source = "schedule"`. It
+/// puts the schedule id in `start_source_ref` and the operator in `started_by`,
+/// NOT the placeholder `api`.
 #[tokio::test]
 async fn trigger_now_immediate_records_schedule_source() {
     let (url, _c) = setup_database().await;

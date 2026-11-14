@@ -2,13 +2,12 @@
 //! `docs/runbooks/cross-region-failover.md` actually parse against the real
 //! CLI.
 //!
-//! A runbook is read under pressure during a live failover, and a flag that
-//! only exists on `dr status`/`dr fence`/`dr promote`/`partition ...` (which
-//! each declare their own local `-o` short alias) does not carry over to
-//! `backup verify` or `worker health`, which accept only the long
-//! `--format`/`--output` form. Extracted from the doc's own fenced examples so
-//! a future edit that reintroduces a bogus short flag fails here instead of
-//! during an incident.
+//! A runbook is read under pressure during a live failover. `dr status`,
+//! `dr fence`, `dr promote` and `partition ...` each declare a local `-o`
+//! short alias. That alias does not carry over to `backup verify` or
+//! `worker health`, which accept only the long `--format`/`--output` form.
+//! The commands come from the doc's own fenced examples. So a bogus short
+//! flag fails here, not during an incident.
 
 use clap::Parser as _;
 use std::path::{Path, PathBuf};
@@ -30,10 +29,9 @@ fn runbook() -> String {
 }
 
 /// Every `harvest ...` command line inside a fenced ` ```bash ` block.
-/// Backslash line-continuations are joined into their one command; comment
-/// lines and blank lines are dropped; a block with several independent
-/// command lines (no continuation between them) yields several commands, not
-/// one concatenated string.
+/// Backslash line-continuations join into one command. Comment lines and
+/// blank lines are dropped. Several independent command lines in one block
+/// yield several commands, not one concatenated string.
 fn harvest_invocations(doc: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut lines = doc.lines();

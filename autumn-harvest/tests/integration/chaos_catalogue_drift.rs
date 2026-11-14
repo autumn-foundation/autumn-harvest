@@ -2,16 +2,15 @@
 //!
 //! A no-DB, no-`chaos`-feature source scan asserting that every point in
 //! `autumn_harvest::chaos::points::ALL` is wired at **exactly one** production
-//! call site in `src/` via the matching macro. `points` is unconditional
-//! (compiled into every build), so this test runs in the normal test build and
-//! can never silently pass while a catalogue entry has lost its wiring — the
-//! failure mode that would otherwise make an injection point a dead no-op.
+//! call site in `src/` via the matching macro. `points` is compiled into every
+//! build, so this test runs in the normal test build. It can never pass while
+//! a catalogue entry has lost its wiring, which makes the point a dead no-op.
 //!
 //! The scan lexes each source into a `proc_macro2::TokenStream` and matches the
 //! `<macro> ! ( IDENT )` token pattern, rather than scanning raw text. Lexing
-//! drops comments and delimits string / raw-string / char literals, so a
-//! commented-out or stringified `chaos_point!(NAME)` is **not** miscounted as
-//! live wiring — the precise drift this guard exists to catch.
+//! drops comments and delimits string / raw-string / char literals. So a
+//! commented-out or stringified `chaos_point!(NAME)` is **not** counted as
+//! live wiring. That is the precise drift this guard exists to catch.
 
 use std::path::{Path, PathBuf};
 
@@ -43,12 +42,13 @@ fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Recursively lex every `.rs` file under `src/` into a token stream, EXCEPT the
-/// two files where the chaos vocabulary is *defined* rather than *used*:
-/// `chaos.rs` (the point consts + catalogue) and `lib.rs` (the
-/// `chaos_point!` / `chaos_fallible!` / `chaos_drop_notify!` `macro_rules`
-/// definitions, whose bodies and doc examples reference the macro names and a
-/// `NAME` placeholder). Neither is production wiring.
+/// Recursively lex every `.rs` file under `src/` into a token stream.
+///
+/// Two files *define* the chaos vocabulary rather than *use* it, so the scan
+/// skips them. `chaos.rs` holds the point consts and catalogue. `lib.rs` holds
+/// the `chaos_point!` / `chaos_fallible!` / `chaos_drop_notify!` `macro_rules`.
+/// Their bodies and doc examples name the macros and a `NAME` placeholder.
+/// Neither is production wiring.
 fn production_sources() -> Vec<(String, TokenStream)> {
     let mut out = Vec::new();
     let mut stack = vec![src_dir()];
@@ -78,9 +78,9 @@ fn production_sources() -> Vec<(String, TokenStream)> {
 ///
 /// Walks the token tree, matching the `Ident(<chaos macro>) Punct('!')
 /// Group('(' … ')')` sequence and extracting the single ident argument. A call
-/// whose parenthesised argument is not exactly one ident is recorded with a
-/// `<non-ident:N>` sentinel so [`no_orphan_chaos_macro_call_sites`] flags it
-/// (production wiring always passes a bare catalogue ident). Recurses into every
+/// with any other argument gets a `<non-ident:N>` sentinel, so
+/// [`no_orphan_chaos_macro_call_sites`] flags it. Production wiring always
+/// passes a bare catalogue ident. Recurses into every
 /// group (blocks, `if` bodies, …) so a wrapped call — e.g.
 /// `if cond { crate::chaos_point!(NAME); }` — is still found.
 fn all_chaos_calls(sources: &[(String, TokenStream)]) -> Vec<(String, String, String)> {
@@ -161,10 +161,10 @@ fn expected_list_matches_catalogue_all() {
         EXPECTED.len(),
         ALL.len()
     );
-    // Every catalogue point's `name()` uses dotted namespacing and is unique;
-    // the count assertion above binds `ALL` and `EXPECTED` to the same length,
-    // and `every_catalogue_point_is_wired_exactly_once` binds each `EXPECTED`
-    // ident to a real wired call site — so neither list can drift alone.
+    // Every catalogue point's `name()` uses dotted namespacing and is unique.
+    // The count assertion above binds `ALL` and `EXPECTED` to the same length.
+    // `every_catalogue_point_is_wired_exactly_once` binds each `EXPECTED` ident
+    // to a real wired call site. So neither list can drift alone.
     let mut names: Vec<&str> = ALL.iter().map(|p| p.name()).collect();
     let before = names.len();
     names.sort_unstable();
@@ -172,9 +172,9 @@ fn expected_list_matches_catalogue_all() {
     assert_eq!(before, names.len(), "two catalogue points share a name()");
 }
 
-/// No production wiring may reference an ident that is not in the catalogue —
-/// otherwise a stray `chaos_point!(TYPO)` would compile-fail (good) or a
-/// renamed-but-not-removed point would leave an orphan call site.
+/// No production wiring may reference an ident outside the catalogue. A stray
+/// `chaos_point!(TYPO)` fails to compile. A renamed but not removed point
+/// would leave an orphan call site.
 #[test]
 fn no_orphan_chaos_macro_call_sites() {
     let sources = production_sources();
@@ -189,9 +189,9 @@ fn no_orphan_chaos_macro_call_sites() {
     }
 }
 
-/// The token scan must ignore a `chaos_point!(NAME)` that appears only in a
-/// comment or a string literal — the exact drift (a commented-out call still
-/// leaving one textual match) a raw-text scan cannot catch.
+/// The token scan must ignore a `chaos_point!(NAME)` in a comment or a string
+/// literal. A raw-text scan cannot catch that drift: a commented-out call still
+/// leaves one textual match.
 #[test]
 fn token_scan_ignores_comments_and_strings() {
     let src = r##"

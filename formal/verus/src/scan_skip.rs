@@ -4,8 +4,8 @@
 //! The activity terminal scan asks for the first unconsumed position in a
 //! sorted list. `SkipList::first_unconsumed` answers through `first_live`.
 //! Each entry holds a link to itself or to a later entry. Every entry that
-//! a link jumps over is dead. A dead entry is a consumed event, and it never comes back
-//! to life.
+//! a link jumps over is dead. A dead entry is a consumed event, and it never
+//! comes back to life.
 //!
 //! The copy below proves that `first_live` returns the first live entry at
 //! or after its start, or the end. It also proves that each call keeps the

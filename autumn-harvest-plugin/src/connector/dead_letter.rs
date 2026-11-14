@@ -6,9 +6,9 @@
 //! `original_task_id` is `NOT NULL` and `task_type` carries a
 //! `CHECK (task_type IN ('workflow','activity'))`. A poison broker message has
 //! neither — it never became a task, and by definition never produced an
-//! execution. Reusing that table would mean relaxing a **core** schema
-//! constraint; issue #944 explicitly forbids a core migration for the trigger
-//! path and explicitly sanctions a plugin-owned table instead.
+//! execution. Reusing that table would relax a **core** schema constraint.
+//! Issue #944 forbids a core migration for the trigger path and sanctions a
+//! plugin-owned table instead.
 //!
 //! `harvest_connector_dead_letters` therefore lives in the plugin's own
 //! migrations directory, alongside `harvest_workflow_outbox` — both are
@@ -53,20 +53,19 @@ pub struct ConnectorDeadLetter {
 /// Whether a [`DeadLetterSink::write`] created the record or found it already
 /// there.
 ///
-/// Dead-lettering is idempotent by idempotency key, so the *same physical
-/// message* can reach a sink more than once — the runtime acks only after the
-/// write succeeds and `ack` is deliberately best-effort, so a lost commit (or a
-/// process death between the two) brings the message back. The in-process
-/// poison tracker dedupes that within one process; this is what still knows
-/// across a **restart**, which is precisely when the redelivery is most likely.
+/// Dead-lettering is idempotent by idempotency key. The *same physical
+/// message* can reach a sink more than once. The runtime acks only after the
+/// write succeeds, and `ack` is deliberately best-effort. So a lost
+/// commit, or a process death between the two, brings the message back.
+/// The in-process poison tracker dedupes that within one process. This
+/// outcome still knows across a **restart**, when a redelivery is most likely.
 ///
 /// The runtime counts `harvest.connector.poisoned` only on
-/// [`Self::Recorded`], so one poison message contributes one sample however
-/// many times it is redelivered or however often the process restarts.
+/// [`Self::Recorded`]. So one poison message contributes one sample, however
+/// often it is redelivered or the process restarts.
 ///
-/// A sink that genuinely cannot tell — because its store has no conflict
-/// signal — returns `Recorded`, which is the pre-existing behaviour: at worst
-/// the metric over-counts a redelivery, exactly as it did before.
+/// A sink whose store has no conflict signal returns `Recorded`. At worst the
+/// metric then over-counts a redelivery, as it did before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadLetterOutcome {
     /// This write created the record: a new poison message.
@@ -89,11 +88,11 @@ pub trait DeadLetterSink: Send + Sync {
     /// returns `Ok`, so a sink failure leaves the message for redelivery
     /// rather than losing it.
     ///
-    /// Must be **idempotent by [`ConnectorDeadLetter::idempotency_key`]**: the
-    /// same physical message can arrive more than once (see
-    /// [`DeadLetterOutcome`]), and a second record for it would double-count
-    /// every dashboard built on the table. Report which of the two happened —
-    /// a sink whose store cannot tell returns [`DeadLetterOutcome::Recorded`].
+    /// Must be **idempotent by [`ConnectorDeadLetter::idempotency_key`]**.
+    /// The same physical message can arrive more than once (see
+    /// [`DeadLetterOutcome`]). A second record would double-count every
+    /// dashboard built on the table. Report which of the two happened. A sink
+    /// whose store cannot tell returns [`DeadLetterOutcome::Recorded`].
     ///
     /// # Errors
     ///
@@ -221,16 +220,15 @@ pub async fn insert_dead_letter(
     use diesel::sql_types::{Binary, Int4, Text, Timestamptz, Uuid as SqlUuid};
     use diesel_async::RunQueryDsl;
 
-    // `ON CONFLICT (idempotency_key) DO NOTHING` makes dead-lettering itself
-    // idempotent: a redelivery that dead-letters again (e.g. after a
-    // connector restart reset the strike counter) must not create a second
-    // record for the same message.
+    // `ON CONFLICT (idempotency_key) DO NOTHING` makes dead-lettering
+    // idempotent. A redelivery that dead-letters again, e.g. after a restart
+    // reset the strike counter, must not create a second record.
     //
-    // The affected-row count is that conflict made observable: zero rows means
-    // the record was already there, which is the only durable answer to "is
-    // this a NEW poison message" once a restart has emptied the in-process
-    // tracker. Discarding it left `harvest.connector.poisoned` counting one
-    // sample per restart-redelivery of a message already quarantined.
+    // The affected-row count makes that conflict observable. Zero rows means
+    // the record was already there. After a restart empties the in-process
+    // tracker, this is the only durable answer to "is this a NEW poison
+    // message". Without it, `harvest.connector.poisoned` counted one sample
+    // per restart-redelivery of a message already quarantined.
     let inserted = diesel::sql_query(
         "INSERT INTO harvest_connector_dead_letters \
          (id, binding, stream, coordinates, idempotency_key, workflow_name, reason, detail, \
@@ -292,20 +290,18 @@ impl DeadLetterSink for NoopDeadLetterSink {
 
 /// The default sink for a runtime nobody has given one to.
 ///
-/// A binding defaults to
-/// [`DeadLetterMode::HarvestSink`][hs], so a runtime built directly — via
-/// [`ConnectorRuntime::new`][new] or [`for_binding`][fb], both public — would
-/// otherwise pair "record this poison message" with a sink that records
-/// nothing, acknowledge the message, and lose it permanently with no trace in
-/// any table or broker.
+/// A binding defaults to [`DeadLetterMode::HarvestSink`][hs]. A runtime can
+/// be built directly with the public [`ConnectorRuntime::new`][new] or
+/// [`for_binding`][fb]. A sink that records nothing would then ack each poison
+/// message and lose it, with no trace in any table or broker.
 ///
-/// Failing is the safe default: the runtime only acknowledges a dead letter
-/// *after* the sink write succeeds, so an error here leaves the message on the
-/// broker for redelivery and logs loudly, turning silent data loss into a
-/// visible misconfiguration. Install a real sink with
-/// [`with_dead_letter_sink`][wds], or let the broker own dead-lettering with
-/// [`SourceBinding::broker_native_dead_letter`][bn] — that mode abandons
-/// rather than writing, so it never reaches a sink at all.
+/// Failing is the safe default. The runtime acks a dead letter only *after*
+/// the sink write succeeds. So an error here leaves the message on the broker
+/// for redelivery and logs loudly: silent data loss becomes a visible
+/// misconfiguration. Install a real sink with [`with_dead_letter_sink`][wds].
+/// Or let the broker own dead-lettering with
+/// [`SourceBinding::broker_native_dead_letter`][bn]. That mode abandons rather
+/// than writes, so it never reaches a sink.
 ///
 /// [hs]: super::disposition::DeadLetterMode::HarvestSink
 /// [new]: super::runtime::ConnectorRuntime::new
@@ -333,9 +329,9 @@ impl DeadLetterSink for UnconfiguredDeadLetterSink {
 
 /// A sink that records into memory, exported for tests and local development.
 ///
-/// Lets an embedder assert *what* would have been dead-lettered — reason,
-/// coordinates, raw payload — without provisioning a database, and is what the
-/// connector's own poison-isolation suite runs against.
+/// Lets an embedder assert *what* would have been dead-lettered (reason,
+/// coordinates, raw payload) without a database. The connector's own
+/// poison-isolation suite runs against it.
 #[derive(Debug, Default, Clone)]
 pub struct RecordingDeadLetterSink {
     entries: std::sync::Arc<std::sync::Mutex<Vec<ConnectorDeadLetter>>>,
@@ -349,9 +345,10 @@ impl RecordingDeadLetterSink {
         Self::default()
     }
 
-    /// Make every subsequent [`DeadLetterSink::write`] fail, so a caller can
-    /// assert the runtime leaves the message for redelivery rather than
-    /// acknowledging a dead letter it never durably recorded.
+    /// Make every subsequent [`DeadLetterSink::write`] fail.
+    ///
+    /// A caller can then assert that the runtime leaves the message for
+    /// redelivery and does not ack a dead letter it never recorded.
     pub fn fail_writes(&self, fail: bool) {
         self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
     }
@@ -475,9 +472,8 @@ mod tests {
         sink.write(&entry()).await.unwrap();
         let mut second = entry();
         second.coordinates = "orders:0:2".to_string();
-        // Distinct messages carry distinct keys -- the key is derived from the
-        // coordinates, so sharing one here would model two deliveries of the
-        // SAME message rather than two different ones.
+        // The key derives from the coordinates. A shared key here would model
+        // two deliveries of the SAME message, not two different ones.
         second.idempotency_key = "k2".to_string();
         sink.write(&second).await.unwrap();
 
@@ -523,9 +519,9 @@ mod tests {
     async fn concurrent_writes_of_one_key_report_exactly_one_recorded() {
         // The multi-replica shape: two consumers hold the same SQS message
         // because its visibility expired mid-write, and both dead-letter it.
-        // Exactly one may be told it created the record, or both process-local
-        // poison trackers call their handoff the first and `poisoned` counts a
-        // message that produced one row. The check and the push therefore share
+        // Exactly one may be told it created the record. Otherwise both
+        // process-local poison trackers call their handoff the first, and
+        // `poisoned` counts twice for one row. So the check and the push share
         // one guard, as `ON CONFLICT DO NOTHING` is one statement.
         let sink = RecordingDeadLetterSink::new();
         let (first, second) = (entry(), entry());

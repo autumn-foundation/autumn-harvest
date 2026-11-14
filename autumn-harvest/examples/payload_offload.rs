@@ -1,17 +1,17 @@
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Large-payload offloading via claim-check — issue #524.
 //!
-//! Demonstrates how an embedder enables transparent offloading of oversized
-//! payloads to external storage by implementing **one trait** ([`PayloadStore`])
-//! and adding **one builder call** ([`HarvestBuilder::payload_store`]) — with no
-//! change to any workflow or activity function signature.
+//! Demonstrates how an embedder offloads oversized payloads to external
+//! storage. It implements **one trait** ([`PayloadStore`]) and adds **one
+//! builder call** ([`HarvestBuilder::payload_store`]). No workflow or activity
+//! function signature changes.
 //!
 //! ## The problem
 //!
 //! A legitimately large payload — a scraped HTML document, an ML feature vector,
-//! a generated PDF — cannot durably flow through a workflow: the #252 size cap
-//! *rejects* anything over the limit (to keep `harvest_events` small and replay
-//! fast), and `PayloadCodec` is a synchronous in-place transform that can't do
+//! a generated PDF — cannot durably flow through a workflow. The #252 size cap
+//! *rejects* anything over the limit, to keep `harvest_events` small and replay
+//! fast. `PayloadCodec` is a synchronous in-place transform that cannot do
 //! async I/O against external storage.
 //!
 //! ## The solution

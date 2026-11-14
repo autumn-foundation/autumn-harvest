@@ -9,7 +9,7 @@
 //! coverage is not protection*. HVG002 lists `Uuid::new_v4` explicitly and
 //! DET003 lists `Uuid::new_v4(` and `uuid::Uuid::new_v4` explicitly — both
 //! know this exact call. HVG only visits the annotated body, which has no
-//! `Uuid` token; det_check resolves one hop to a **same-file, same-module**
+//! `Uuid` token. `det_check` resolves one hop to a **same-file, same-module**
 //! helper, and `idem_key` is in another crate. One crate boundary turns a
 //! fully-covered rule into a false negative.
 //!

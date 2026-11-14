@@ -228,9 +228,8 @@ fn check_line_rules(path: &str, pieces: &[&Piece]) -> Vec<Finding> {
         // this" is a commitment with a bullet in front of it, and only a
         // fence exempts. The text is blanked first. A marker inside an
         // inline code span is the syntax under description, not a
-        // commitment. CH005 and CH006 read the raw text on purpose, as the
-        // known limitations say. But those are ratcheted, and this rule
-        // fails the build outright.
+        // commitment. CH005 and CH006 are absolute too, so they read the
+        // same blanked text.
         //
         // The reference is read from the blanked text too, not the raw line.
         // "The `#123` syntax" documents the shape of a marker. It does not
@@ -246,11 +245,11 @@ fn check_line_rules(path: &str, pieces: &[&Piece]) -> Vec<Finding> {
             findings.push(Finding::new("CH002", path, line.line, stripped));
         }
 
-        if ARCHAEOLOGY_RE.is_match(stripped) {
+        if ARCHAEOLOGY_RE.is_match(spanless_body) {
             findings.push(Finding::new("CH005", path, line.line, stripped));
         }
 
-        if CONTRACTION_RE.is_match(stripped) {
+        if CONTRACTION_RE.is_match(spanless_body) {
             findings.push(Finding::new("CH006", path, line.line, stripped));
         }
     }
@@ -359,8 +358,6 @@ fn check_prose_rules(path: &str, pieces: &[&Piece]) -> Vec<Finding> {
             // Both are absolute. A comment that documents a contraction
             // token documents a literal. To fail the build on it stops the
             // documentation.
-            // CH006 still reads the raw text. It is ratcheted, and the known
-            // limitations record that choice.
             let mut spanless = blank_code_spans(sentence);
             if unit.doc {
                 spanless = blank_inline_code(&spanless);

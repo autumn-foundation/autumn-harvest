@@ -171,9 +171,9 @@ async fn non_terminal_counts_return_bounded_execution_id_samples() {
 #[tokio::test]
 async fn non_terminal_counts_samples_are_oldest_first() {
     // AC2 ordering: the per-shard sample is `started_at ASC, id ASC` — the
-    // oldest (most likely stuck) runs, in order. Seed 6 non-terminal runs whose
-    // `started_at` order is the REVERSE of insertion order, so a sample ordered
-    // by insertion/id (rather than `started_at`) would fail this assertion.
+    // oldest (most likely stuck) runs, in order. Seed 6 non-terminal runs in the
+    // REVERSE of `started_at` order. A sample ordered by insertion or id then
+    // fails this assertion.
     let (url, _container) = setup_db().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
 

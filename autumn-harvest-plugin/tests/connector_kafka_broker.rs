@@ -360,18 +360,16 @@ async fn a_committed_offset_is_not_re_read_and_a_redelivery_dedupes() {
 }
 
 /// Lag must be measured from the DURABLE committed group offset, not the local
-/// next-fetch position (Codex review of a872555).
+/// next-fetch position.
 ///
-/// `position()` advances the instant a record is fetched, regardless of
-/// whether it has been dispatched, is being retried, or is stuck behind a
-/// blocked commit prefix. A consumer wedged with a large uncommitted backlog —
-/// exactly the condition the `harvest.connector.lag` gauge exists to expose —
-/// would therefore report its lag collapsing to zero while a restart replayed
-/// everything from the last commit.
+/// `position()` advances as soon as a record is fetched, even when it is still
+/// in retry or stuck behind a blocked commit prefix. The `harvest.connector.lag`
+/// gauge exists to expose a consumer wedged with a large uncommitted backlog.
+/// Measured from `position()`, that lag would fall to zero while a restart
+/// replayed everything from the last commit.
 ///
-/// This drives the source directly rather than through `ConnectorRuntime`, so
-/// the records are *fetched but never acked*: the honest reproduction of a
-/// blocked prefix.
+/// This drives the source directly, not through `ConnectorRuntime`, so the
+/// records are *fetched but never acked*. That reproduces a blocked prefix.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn lag_reflects_the_committed_offset_not_the_fetch_position() {
@@ -417,17 +415,17 @@ async fn lag_reflects_the_committed_offset_not_the_fetch_position() {
     );
 }
 
-/// Both replicas of a consumer group report the SAME lag, and it is the whole
-/// group's backlog rather than the share of partitions each one happens to own.
+/// Both replicas of a consumer group report the SAME lag. It is the whole
+/// group's backlog, not the share of partitions each replica owns.
 ///
-/// This is the property the dashboard depends on. It aggregates the gauge with
-/// `max by (source)` — correct for SQS, where every replica reads the same
-/// whole-queue depth — so an assignment-scoped Kafka sample would surface the
-/// largest replica's subtotal (roughly `1/replicas` of the truth) and hide a
-/// partition stalled on any of the others.
+/// The dashboard depends on this property. It aggregates the gauge with
+/// `max by (source)`, which is correct for SQS, where every replica reads the
+/// whole-queue depth. An assignment-scoped Kafka sample would show only the
+/// largest replica's subtotal, roughly `1/replicas` of the truth. It would
+/// also hide a partition stalled on any other replica.
 ///
 /// It needs a real broker because the bug is in *which* partitions the sample
-/// asks about: the unit tests take the partition list as a parameter, so they
+/// asks about. The unit tests take the partition list as a parameter, so they
 /// cannot distinguish `fetch_metadata` from `assignment()`. Only a genuine
 /// group with a genuine split assignment can.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

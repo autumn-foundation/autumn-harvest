@@ -1,12 +1,12 @@
 //! Built-in synthetic liveness canary registration (issue #796).
 //!
-//! Registers a throwaway workflow (one per configured probe queue) plus its
-//! reserved activity, and schedules the workflow on an aggressive interval, so
+//! Registers a throwaway workflow (one per configured probe queue) and its
+//! reserved activity. It schedules the workflow on an aggressive interval. So
 //! the *live* `start → dispatch → activity → durable-timer → complete`
-//! execution path is exercised continuously. A wedged pipeline (workers polling
-//! but never completing, a stalled scheduler tick, a write-blocked shard) then
-//! surfaces within one probe interval — before any customer workflow misses its
-//! SLA — with zero operator-authored workflow code.
+//! execution path runs continuously. A wedged pipeline then surfaces within
+//! one probe interval, before any customer workflow misses its SLA. Examples
+//! are workers that poll but never complete, a stalled scheduler tick and a
+//! write-blocked shard. No operator-authored workflow code is needed.
 //!
 //! **Distinct from the #512 replay canary.** The replay canary validates *code
 //! changes* by replaying in-flight histories against new workflow code. This
@@ -15,9 +15,10 @@
 //! "canary".
 //!
 //! The reserved names and predicates live in the core crate
-//! ([`autumn_harvest::canary`]); this plugin module owns the *registration*
-//! (workflow/activity `Info` construction, per-writable-shard schedule,
-//! aggressive self-cleaning retention) and the opt-in [`CanaryConfig`].
+//! ([`autumn_harvest::canary`]). This plugin module owns the *registration*
+//! and the opt-in [`CanaryConfig`]. Registration builds the workflow/activity
+//! `Info`, the per-writable-shard schedule and the aggressive self-cleaning
+//! retention.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -36,9 +37,10 @@ use serde::Serialize;
 use crate::api::HarvestApiState;
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation, UnavailableShard};
 
-/// Upper bound on any derived (or user-supplied) retention age, kept safely
-/// below the core `RetentionConfig` validator's 10-year ceiling so a
-/// pathologically large probe interval can never fail `try_build()`
+/// Upper bound on any derived (or user-supplied) retention age.
+///
+/// It stays safely below the core `RetentionConfig` validator's 10-year
+/// ceiling. So a pathologically large probe interval never fails `try_build()`
 /// (issue #796, AC9). Realistic canary intervals are seconds-to-minutes; this
 /// clamp is purely defensive.
 const MAX_DERIVED_RETENTION: Duration = Duration::from_hours(87600);
@@ -49,25 +51,26 @@ const MAX_DERIVED_RETENTION: Duration = Duration::from_hours(87600);
 /// `GET /admin/canary` read can always see the last recorded success.
 const RETENTION_FLOOR: Duration = Duration::from_hours(1);
 
-/// Minimum wall-clock a *healthy* probe needs to reach terminal completion:
-/// one dispatched activity, a full `ctx.timer("probe", 1)` (a whole-second
-/// durable timer armed **after** the activity completes), plus two workflow-task
-/// wakeups and the activity dispatch. That floor is strictly greater than 1s, so
-/// a `per_probe_timeout` at or below it would deterministically time out a
-/// perfectly healthy pipeline and report a permanent `harvest.canary.failure`
-/// (issue #796, AC6). `PROBE_MIN_RUNTIME` is a safe floor above that cost, so
-/// `per_probe_timeout` is never allowed below it.
+/// Minimum wall-clock a *healthy* probe needs to reach terminal completion.
+///
+/// The probe runs one dispatched activity and a full `ctx.timer("probe", 1)`.
+/// That whole-second durable timer arms **after** the activity completes. Two
+/// workflow-task wakeups and the activity dispatch add to it. So the cost is
+/// strictly greater than 1s. A `per_probe_timeout` at or below it would
+/// deterministically time out a healthy pipeline. It would then report a
+/// permanent `harvest.canary.failure` (issue #796, AC6). `PROBE_MIN_RUNTIME`
+/// is a safe floor above that cost. `per_probe_timeout` never goes below it.
 const PROBE_MIN_RUNTIME: Duration = Duration::from_secs(5);
 
 /// Minimum probe interval (issue #796, AC6).
 ///
 /// A valid probe needs `per_probe_timeout` in
-/// `[PROBE_MIN_RUNTIME, interval - 1s]` — strictly below the interval so a
-/// wedged probe times out before the next tick (AC6, non-blocking), yet at least
-/// `PROBE_MIN_RUNTIME` so a healthy probe never false-fails. That band is only
+/// `[PROBE_MIN_RUNTIME, interval - 1s]`. The upper bound makes a wedged probe
+/// time out before the next tick (AC6, non-blocking). The lower bound keeps a
+/// healthy probe from false-failing. That band is only
 /// non-empty when `interval >= PROBE_MIN_RUNTIME + 1s`; this adds a little margin
-/// above that hard minimum. Intervals below this are clamped up (with a warning)
-/// rather than silently producing a false-failing probe.
+/// above that hard minimum. Intervals below this are clamped up with a warning.
+/// They do not silently produce a false-failing probe.
 const MIN_CANARY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Opt-in configuration for the built-in synthetic liveness canary (issue #796).
@@ -83,16 +86,16 @@ pub struct CanaryConfig {
     /// [`MIN_CANARY_INTERVAL`] (intervals below it are clamped up with a
     /// warning); **30s is recommended**. See [`Self::new`].
     interval: Duration,
-    /// Probe queues. Defaults to `["default"]`; one canary workflow +
-    /// schedule is registered per queue so a single wedged worker pool is
-    /// distinguishable from "some queue is draining" (AC3).
+    /// Probe queues. Defaults to `["default"]`.
+    ///
+    /// Each queue gets one canary workflow and schedule. So a single wedged
+    /// worker pool is distinguishable from "some queue is draining" (AC3).
     queues: Vec<String>,
     /// Per-probe execution timeout (`execution_timeout` → `deadline_at`). A
     /// wedged probe times out before the next tick, so probes never block
-    /// (AC6). Always kept in `[PROBE_MIN_RUNTIME, interval - 1s]` — above the
-    /// probe's own minimum runtime so a healthy probe never false-fails, and
-    /// strictly below `interval` so a wedged probe times out before the next
-    /// tick. Defaults to ~half the interval, clamped into that band.
+    /// (AC6). Always kept in `[PROBE_MIN_RUNTIME, interval - 1s]`. The lower
+    /// bound keeps a healthy probe from false-failing. Defaults to ~half the
+    /// interval, clamped into that band.
     per_probe_timeout: Duration,
     /// Window after which a missing success is considered stale (AC7). `None`
     /// resolves to `2 × interval` via [`Self::effective_staleness_window`].
@@ -110,10 +113,10 @@ impl CanaryConfig {
     /// `[PROBE_MIN_RUNTIME, interval - 1s]`, and `None` (auto)
     /// staleness/retention.
     ///
-    /// `interval` below [`MIN_CANARY_INTERVAL`] is **clamped up** (with a
-    /// warning) rather than accepted — a too-small interval would derive a
-    /// `per_probe_timeout` at or below the probe's own minimum runtime and
-    /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
+    /// `interval` below [`MIN_CANARY_INTERVAL`] is **clamped up** with a
+    /// warning. A too-small interval would derive a `per_probe_timeout` at or
+    /// below the probe's own minimum runtime. That would false-fail a healthy
+    /// pipeline (issue #796, AC6). **30s is recommended.**
     /// A fractional `interval` rounds up to the next whole second (issue #1967).
     /// An `interval` above [`MAX_INTERVAL_PERIOD`] is **clamped down** (with a
     /// warning), so the interval schedule validates (issue #2048).
@@ -158,9 +161,11 @@ impl CanaryConfig {
     }
 
     /// Clamp a per-probe timeout into the valid band `[PROBE_MIN_RUNTIME,
-    /// interval - 1s]`: strictly below `interval` so a wedged probe times out
-    /// before the next tick (AC6), yet at least `PROBE_MIN_RUNTIME` so a healthy
-    /// probe never false-fails. `interval` is always `>= MIN_CANARY_INTERVAL`
+    /// interval - 1s]`.
+    ///
+    /// The upper bound makes a wedged probe time out before the next tick
+    /// (AC6). The lower bound keeps a healthy probe from false-failing.
+    /// `interval` is always `>= MIN_CANARY_INTERVAL`
     /// (clamped in [`Self::new`]), so `interval - 1s >= PROBE_MIN_RUNTIME` and
     /// the band is never empty.
     fn clamp_per_probe_timeout(interval: Duration, timeout: Duration) -> Duration {
@@ -192,11 +197,10 @@ impl CanaryConfig {
 
     /// Override the per-probe execution timeout (AC6).
     ///
-    /// Clamped into `[PROBE_MIN_RUNTIME, interval - 1s]` (with a warning when
-    /// out of range) so an operator cannot accidentally set a value that
-    /// false-fails a healthy probe (`< PROBE_MIN_RUNTIME`, e.g. `0`) or that is
-    /// at/above the interval (which would let a wedged probe block the next
-    /// tick — AC6).
+    /// Clamped into `[PROBE_MIN_RUNTIME, interval - 1s]`, with a warning when
+    /// out of range. A value `< PROBE_MIN_RUNTIME` (e.g. `0`) would false-fail
+    /// a healthy probe. A value at or above the interval would let a wedged
+    /// probe block the next tick (AC6).
     #[must_use]
     pub fn with_per_probe_timeout(mut self, timeout: Duration) -> Self {
         let clamped = Self::clamp_per_probe_timeout(self.interval, timeout);
@@ -256,16 +260,16 @@ impl CanaryConfig {
 
     /// The effective canary-history retention window (AC9).
     ///
-    /// **Floored at `max(2 × staleness_window, 1h)` in every config path** —
-    /// including an explicit [`Self::with_retention`] override — so a
+    /// **Floored at `max(2 × staleness_window, 1h)` in every config path**,
+    /// an explicit [`Self::with_retention`] override included. So a
     /// `GET /admin/canary` read can always still see the last recorded success.
-    /// A retention window at or below the staleness window would let the janitor
-    /// prune each success row before the staleness check reads it, producing a
-    /// **false-positive stale alert on a perfectly healthy pipeline** (the worst
-    /// failure mode for a liveness tool). An explicit override below the floor is
-    /// raised (with a warning) rather than honoured verbatim. The result is
-    /// clamped to `[1s, MAX_DERIVED_RETENTION]` so it is always within the core
-    /// `RetentionConfig` validator's bounds and can never fail `try_build()`.
+    /// At or below the staleness window, the janitor could prune each success
+    /// row before the staleness check reads it. That gives a **false-positive
+    /// stale alert on a perfectly healthy pipeline**, the worst failure mode for
+    /// a liveness tool. An explicit override below the floor is raised with a
+    /// warning, not honoured verbatim. The result is clamped to
+    /// `[1s, MAX_DERIVED_RETENTION]`. So it always stays within the core
+    /// `RetentionConfig` validator's bounds and never fails `try_build()`.
     #[must_use]
     pub fn effective_retention(&self) -> Duration {
         let staleness = self.effective_staleness_window();
@@ -293,13 +297,13 @@ impl CanaryConfig {
 
 /// Handler for the built-in synthetic liveness canary workflow (issue #796).
 ///
-/// Exercises the full live execution path: dispatch one **non-local** activity
-/// on the probe's target queue (proving the claim/dispatch/complete path), then
-/// wait on a short **durable** timer (proving the scheduler/timer path), then
-/// complete. Matches [`autumn_harvest::WorkflowHandlerFn`] exactly so it can be
-/// stored directly in a hand-built [`WorkflowInfo`] whose `name` is the
-/// per-queue probe name (which the `#[workflow]` macro cannot express, since it
-/// derives the name from the function identifier).
+/// Exercises the full live execution path. It dispatches one **non-local**
+/// activity on the probe's target queue (the claim/dispatch/complete path).
+/// It then waits on a short **durable** timer (the scheduler/timer path), then
+/// completes. It matches [`autumn_harvest::WorkflowHandlerFn`] exactly. So a
+/// hand-built [`WorkflowInfo`] stores it directly, with the per-queue probe
+/// name as `name`. The `#[workflow]` macro cannot express that name, because
+/// it derives the name from the function identifier.
 fn canary_workflow_handler(
     ctx: &WorkflowContext,
     input: serde_json::Value,
@@ -343,8 +347,8 @@ fn canary_activity_handler(
 /// Build the [`WorkflowInfo`] for a per-queue synthetic liveness canary
 /// workflow (issue #796).
 ///
-/// The name is dynamic (`{PREFIX}__{queue}`), so — unlike a `#[workflow]`
-/// macro — the `Info` is hand-built and the runtime `String` name is
+/// The name is dynamic (`{PREFIX}__{queue}`), unlike a `#[workflow]` macro
+/// name. So the `Info` is hand-built, and the runtime `String` name is
 /// `Box::leak`ed into the required `&'static str` field. The number of canary
 /// workflows is bounded (one per configured probe queue, registered once at
 /// startup), so this bounded leak mirrors the MCP tool-route precedent.
@@ -370,9 +374,9 @@ pub fn canary_workflow_info(workflow_name: String, per_probe_timeout: Duration) 
         throttle: None,
         // The canary is a reserved, non-user-facing probe workflow -- not
         // registered via `#[workflow(quota(...))]` -- so it carries no
-        // per-tenant quota (issue #946). It also isn't resolved through any
-        // `#[workflow(concurrency(...))]`-style tenant key, so there is
-        // nothing for a quota to key off of even if one were desired.
+        // per-tenant quota (issue #946). It also is not resolved through any
+        // `#[workflow(concurrency(...))]`-style tenant key. So a quota has
+        // nothing to key off, even if one were desired.
         quota: None,
         max_input_bytes: None,
         owner: None,
@@ -430,28 +434,27 @@ pub fn canary_activity_info() -> ActivityInfo {
 /// - registers the reserved canary activity (once, for all queues);
 /// - registers a per-queue probe workflow named `{PREFIX}__{queue}`;
 /// - schedules the probe on `cfg.interval()` across **every writable shard**
-///   (AC4), with [`OverlapPolicy::Skip`] so probes never pile up (AC6) and a
-///   per-run `execution_timeout` so a wedged probe times out (AC6); and
+///   (AC4). [`OverlapPolicy::Skip`] keeps probes from piling up (AC6). A
+///   per-run `execution_timeout` times out a wedged probe (AC6).
 /// - registers an aggressive self-cleaning retention override for the probe
-///   workflow (AC9), which — since an overrides-only [`RetentionConfig`] still
-///   runs the janitor and resolves the override age via `effective_max_age` —
-///   causes the canary's own history to be purged shortly after each run even
-///   when no global retention `max_age` is configured.
+///   workflow (AC9). An overrides-only [`RetentionConfig`] still runs the
+///   janitor and resolves the override age via `effective_max_age`. So the
+///   canary's own history is purged shortly after each run, even with no
+///   global retention `max_age`.
 ///
-/// **The probed queue MUST be polled by some worker in the fleet built from this
-/// builder** — that is the fleet whose liveness the canary is testing. The
-/// canary deliberately does **not** force the local worker to poll the probe
-/// queue: a probe queue served only by a dedicated remote fleet (e.g.
-/// `gpu-heavy`) must be measured on *that* fleet, and auto-adding it to the
-/// local worker's queue set would make the local worker claim that fleet's real
-/// customer tasks and could report a false-"healthy" (the probe would prove the
-/// *local* worker drains the queue, not the intended fleet). If no worker in the
-/// fleet polls the probe queue, the probe simply times out — correctly flagging
-/// "this queue has no live pollers", a real liveness failure. The default
-/// `"default"` queue is already polled by the builder's default worker, so the
-/// out-of-the-box config works with no extra wiring; probing any other queue
-/// requires that a worker (local via [`WorkerConfig::with_queues`], or a
-/// separate process) is configured to drain it.
+/// **Some worker in the fleet built from this builder MUST poll the probed
+/// queue.** The canary tests the liveness of that fleet. It deliberately does
+/// **not** force the local worker to poll the probe queue. A probe queue that
+/// only a dedicated remote fleet serves (e.g. `gpu-heavy`) must be measured on
+/// *that* fleet. Auto-adding it to the local worker's queue set would make the
+/// local worker claim that fleet's real customer tasks. It could then report a
+/// false "healthy": the probe would prove that the *local* worker drains the
+/// queue, not the intended fleet. If no worker in the fleet polls the probe
+/// queue, the probe simply times out. That correctly flags "this queue has no
+/// live pollers", a real liveness failure. The builder's default worker
+/// already polls the `"default"` queue, so the default config needs no extra
+/// wiring. Any other probe queue needs a worker configured to drain it, local
+/// via [`WorkerConfig::with_queues`] or a separate process.
 #[must_use]
 pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> HarvestBuilder {
     use autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX;
@@ -474,16 +477,14 @@ pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> Harve
 
         let wf_name = format!("{CANARY_WORKFLOW_NAME_PREFIX}__{queue}");
 
-        // Register the per-queue probe workflow.
         builder = builder.workflows(vec![canary_workflow_info(
             wf_name.clone(),
             per_probe_timeout,
         )]);
 
-        // Deliberately do NOT force the local worker to poll `queue`: the probe
-        // must be run by whatever worker in the fleet-under-test legitimately
-        // drains that queue (see the fn-level doc). If none does, the probe
-        // times out — correctly flagging "this queue has no live pollers".
+        // Deliberately do NOT force the local worker to poll `queue`. The
+        // worker in the fleet under test that drains that queue must run the
+        // probe (see the fn-level doc).
 
         // Schedule the probe across every writable shard (AC4), never piling
         // up (AC6), with a per-run deadline (AC6). The input carries the queue
@@ -511,12 +512,12 @@ pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> Harve
 
 // ── `GET /admin/canary` read model (issue #796) ─────────────────────────────
 //
-// This is the OBSERVE side of the synthetic liveness canary: it reconstructs,
-// per `(queue, shard)`, the freshness of the built-in probe by reading the
-// canary executions the scheduler has been firing. It never starts a probe and
-// never mutates anything — the schedule + workflow (registered above) do the
-// probing; this endpoint only reports the last-success age so an operator (or a
-// staleness alert) can tell "the pipeline is live" from "queue X on shard Y has
+// This is the OBSERVE side of the synthetic liveness canary. Per `(queue,
+// shard)`, it reconstructs the freshness of the built-in probe from the canary
+// executions that the scheduler fires. It never starts a probe and never
+// mutates anything. The schedule and workflow registered above do the probing.
+// This endpoint only reports the last-success age. An operator or a staleness
+// alert reads it. It tells "the pipeline is live" from "queue X on shard Y has
 // not completed a probe in far too long".
 //
 // Distinct from the #512 replay canary, whose `/admin/workflows/replay-canary`
@@ -557,9 +558,11 @@ pub struct CanaryProbeStatus {
     pub queue: String,
     /// The shard this probe ran on.
     pub shard: i32,
-    /// `completed_at` of the most recent COMPLETED probe run, or `None` if this
-    /// `(queue, shard)` has never had a probe complete (AC4/AC7 — an empty or
-    /// write-blocked shard reports `None` here and `stale: true`).
+    /// `completed_at` of the most recent COMPLETED probe run.
+    ///
+    /// It is `None` if no probe on this `(queue, shard)` ever completed. An
+    /// empty or write-blocked shard reports `None` here and `stale: true`
+    /// (AC4/AC7).
     pub last_success_at: Option<DateTime<Utc>>,
     /// Seconds since [`Self::last_success_at`] as of the snapshot, or `None`
     /// when there has been no success.
@@ -611,23 +614,23 @@ impl CanaryReport {
 /// Merge per-shard canary observations into the freshness report (pure, no DB).
 ///
 /// The probe grid is `expected` (the configured queues × the router's writable
-/// shards) **unioned** with any `(queue, shard)` pairs actually found in the
-/// data — so a queue recently removed from config still surfaces its stale
-/// leftover rows, and a configured `(queue, shard)` with zero rows still
-/// surfaces as a probe with `last_success_at: None, stale: true` (AC4).
+/// shards) **unioned** with the `(queue, shard)` pairs found in the data. So a
+/// queue recently removed from config still surfaces its stale leftover rows.
+/// A configured `(queue, shard)` with zero rows still surfaces as a probe with
+/// `last_success_at: None, stale: true` (AC4).
 ///
-/// For a reachable shard, each probe's freshness is derived from that shard's
-/// rows filtered to the probe's queue: `last_success` is the newest COMPLETED
-/// row (`last_success_at`/`last_roundtrip_ms`/`age`), `success_count` counts
-/// COMPLETED, `failure_count` counts terminal-non-completed. `stale` is true
-/// when there has been no success or the last success is older than
-/// `staleness_window`. Because canary history is retention-bounded (AC9),
-/// counting all present rows *is* the rolling window.
+/// For a reachable shard, each probe reads that shard's rows for its queue.
+/// `last_success` is the newest COMPLETED row (`last_success_at`,
+/// `last_roundtrip_ms`, `age`). `success_count` counts COMPLETED rows, and
+/// `failure_count` counts terminal rows that did not complete.
+/// `stale` is true when there is no success or the last success is older than
+/// `staleness_window`. Canary history is retention-bounded (AC9). So counting
+/// all present rows *is* the rolling window.
 ///
-/// For an unreachable shard, every expected probe on it is reported stale with
-/// `last_success_at: None`, and the shard is named in `unavailable_shards`, so
-/// a write-blocked shard is never mistaken for healthy (AC7) and `status` drops
-/// to `partial`/`unavailable` — the call never fails wholesale.
+/// For an unreachable shard, every expected probe on it is stale with
+/// `last_success_at: None`. The shard is named in `unavailable_shards`. So a
+/// write-blocked shard is never mistaken for healthy (AC7). `status` drops to
+/// `partial`/`unavailable`, and the call never fails wholesale.
 #[must_use]
 pub fn build_canary_report(
     expected: &[(String, i32)],
@@ -639,8 +642,8 @@ pub fn build_canary_report(
 
     // Rows from every reachable shard (a shard with `error: None` was inspected,
     // even if it returned zero rows). A shard with an error is absent from this
-    // map, so an expected probe on it falls through to `stale_probe` below —
-    // this map is the authoritative "was this shard inspected" signal.
+    // map. So an expected probe on it falls through to `stale_probe` below.
+    // This map is the authoritative "was this shard inspected" signal.
     let mut rows_by_shard: BTreeMap<i32, &Vec<CanaryRow>> = BTreeMap::new();
     for observation in observations {
         if observation.error.is_none() {
@@ -662,9 +665,9 @@ pub fn build_canary_report(
     let mut probes: Vec<CanaryProbeStatus> = grid
         .into_iter()
         .map(|(queue, shard)| {
-            // Unreachable (error observation), or a shard that was never
-            // inspected at all (e.g. a writable shard with no pool wired up
-            // yet): absent from `rows_by_shard` ⇒ no data ⇒ stale.
+            // An unreachable shard, or one never inspected (e.g. a writable
+            // shard with no pool wired up yet), is absent from `rows_by_shard`.
+            // No data means stale.
             let Some(rows) = rows_by_shard.get(&shard) else {
                 return stale_probe(queue, shard);
             };
@@ -757,19 +760,20 @@ struct CanaryRowDb {
 
 /// Bounded upper limit on canary rows read per shard.
 ///
-/// Canary history is aggressively retention-bounded (AC9), so a healthy shard
-/// holds only a handful of recent probe runs; this cap is a defensive ceiling
-/// so a mis-configured (never-cleaned) shard can never return an unbounded row
+/// Canary history is aggressively retention-bounded (AC9). So a healthy shard
+/// holds only a handful of recent probe runs. This cap is a defensive ceiling.
+/// A mis-configured (never-cleaned) shard then never returns an unbounded row
 /// set to the freshness merge. Ordered newest-first so the most recent success
 /// is always within the window.
 const CANARY_ROW_CAP: i64 = 500;
 
 /// Load this shard's canary execution rows (issue #796).
 ///
-/// Selects only rows whose `workflow_name` carries the reserved canary prefix
-/// (`starts_with`, matching the fleet-count exclusion seam byte-for-byte — a
-/// prefix predicate, not a `LIKE` whose `_` wildcards would over-match the
-/// underscore-laden prefix).
+/// Selects only rows whose `workflow_name` carries the reserved canary prefix.
+///
+/// The predicate is `starts_with`, which matches the fleet-count exclusion
+/// seam byte-for-byte. A `LIKE` would not do: its `_` wildcards would
+/// over-match the underscore-laden prefix.
 async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>, String> {
     let rows: Vec<CanaryRowDb> = diesel::sql_query(autumn_harvest::canary::CANARY_ROWS_SQL)
         .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
@@ -790,8 +794,8 @@ async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>
 
 /// Query one shard for its canary rows (issue #796).
 ///
-/// Returns a [`ShardObservation`] rather than propagating errors so a single
-/// unreachable shard never fails the whole fan-out — the merge folds it into
+/// Returns a [`ShardObservation`] rather than propagating errors. So a single
+/// unreachable shard never fails the whole fan-out. The merge folds it into
 /// `unavailable_shards` and a `partial`/`unavailable` status instead.
 async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObservation<CanaryRow> {
     let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
@@ -816,17 +820,17 @@ async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObser
 /// (issue #796).
 ///
 /// The probe grid is the configured queues × the router's **writable** shards
-/// (AC4): every writable shard must run its own probe loop, so a write-blocked
-/// shard with zero completed rows surfaces as a stale probe rather than being
-/// silently absent. The fan-out set unions that writable-shard grid with
-/// [`shard_fanout::expected_shards`] (pools + readable + default) so a shard
-/// mid-rollout, or one holding stale leftover probes for a de-configured queue,
-/// is still inspected. All shards are queried concurrently (`join_all`).
+/// (AC4). Every writable shard must run its own probe loop. So a write-blocked
+/// shard with zero completed rows surfaces as a stale probe, not silently
+/// absent. The fan-out set unions that writable-shard grid with
+/// [`shard_fanout::expected_shards`] (pools + readable + default). So it still
+/// inspects a shard mid-rollout, or one with stale leftover probes for a
+/// de-configured queue. All shards are queried concurrently (`join_all`).
 ///
 /// Never fails outright: an unreachable shard surfaces as `status:
-/// partial`/`unavailable` with a named `unavailable_shards` entry. When the
-/// canary is disabled (no config mirrored onto the runtime) an empty `complete`
-/// report is returned — the endpoint still works, it just reports nothing (AC1).
+/// partial`/`unavailable` with a named `unavailable_shards` entry. A disabled
+/// canary (no config mirrored onto the runtime) returns an empty `complete`
+/// report. The endpoint still works; it just reports nothing (AC1).
 pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> CanaryReport {
     let now = Utc::now();
 
@@ -854,7 +858,6 @@ pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> Can
         },
     );
 
-    // Expected grid = queues × writable shards.
     let mut expected: Vec<(String, i32)> = Vec::new();
     for queue in cfg.queues() {
         for shard in &writable {
@@ -862,9 +865,9 @@ pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> Can
         }
     }
 
-    // Fan-out set = expected_shards (pools + readable + default) ∪ writable, so
-    // every writable shard is inspected even when it has no pool wired up yet
-    // (reported unavailable), and any leftover-probe shard is included too.
+    // Fan-out set = expected_shards (pools + readable + default) ∪ writable.
+    // So every writable shard is inspected even with no pool wired up yet
+    // (reported unavailable). Any leftover-probe shard is included too.
     let pools = shard_fanout::pools_by_shard(api_state);
     let mut fanout: BTreeSet<i32> = shard_fanout::expected_shards(api_state, &pools);
     fanout.extend(writable.iter().copied());
@@ -924,8 +927,8 @@ mod tests {
     fn tiny_interval_is_clamped_up_and_yields_a_healthy_per_probe_timeout() {
         // A 2s interval is below MIN_CANARY_INTERVAL, so it is clamped up. The
         // derived per-probe timeout then lands in [PROBE_MIN_RUNTIME,
-        // interval - 1s] — never at/below the probe's own minimum runtime,
-        // which would false-fail a healthy pipeline (AC6).
+        // interval - 1s]. At or below the probe's own minimum runtime, it would
+        // false-fail a healthy pipeline (AC6).
         let cfg = CanaryConfig::new(Duration::from_secs(2));
         assert_eq!(cfg.interval(), MIN_CANARY_INTERVAL);
         assert!(cfg.per_probe_timeout() >= PROBE_MIN_RUNTIME);
@@ -996,10 +999,10 @@ mod tests {
 
     #[test]
     fn explicit_retention_below_staleness_is_floored_above_staleness() {
-        // AC9: an explicit retention below the staleness window would let the
-        // janitor prune the last success before the freshness check reads it,
-        // producing a false-positive stale alert on a healthy pipeline. It must
-        // be floored above the staleness window in the explicit-override path.
+        // AC9: with an explicit retention below the staleness window, the
+        // janitor could prune the last success before the freshness check reads
+        // it. That gives a false-positive stale alert on a healthy pipeline. The
+        // explicit-override path must floor it above the staleness window.
         let cfg = CanaryConfig::new(Duration::from_secs(30))
             .with_staleness_window(Duration::from_secs(3600))
             .with_retention(Duration::from_secs(60));
@@ -1128,16 +1131,14 @@ mod tests {
         assert!(canary_scheds.iter().all(|s| s.all_writable_shards));
 
         // register_canary does NOT auto-add a non-default probe queue to the
-        // local worker: probing "email" is a statement about whichever fleet
-        // drains "email", not the local worker. The default worker set is left
-        // untouched, so "email" is absent unless the operator wired a worker for
-        // it themselves.
+        // local worker. A probe of "email" tests whichever fleet drains "email",
+        // not the local worker. The default worker set stays untouched. So
+        // "email" is absent unless the operator wired a worker for it.
         assert!(
             !builder.worker_config().queues.iter().any(|q| q == "email"),
             "register_canary must not force the local worker to poll a probe queue"
         );
 
-        // Retention overrides for both.
         let overrides = builder.retention_config().workflow_overrides();
         assert!(overrides.contains_key("__harvest_canary_probe__default"));
         assert!(overrides.contains_key("__harvest_canary_probe__email"));
@@ -1168,10 +1169,10 @@ mod tests {
 
     #[test]
     fn register_canary_output_passes_try_build() {
-        // The registered canary must produce a buildable configuration —
-        // schedule references a registered workflow, retention override names a
-        // registered workflow, and the retention age is within validator
-        // bounds (AC9 self-clean mechanism confirmed end to end).
+        // The registered canary must produce a buildable configuration. The
+        // schedule and the retention override each name a registered workflow.
+        // The retention age is within validator bounds. This confirms the AC9
+        // self-clean mechanism end to end.
         let cfg = CanaryConfig::new(Duration::from_secs(30))
             .with_queues(vec!["default".to_string(), "email".to_string()]);
         let builder = register_canary(HarvestBuilder::default(), &cfg);
@@ -1288,9 +1289,9 @@ mod tests {
 
     #[test]
     fn expected_shard_with_zero_rows_is_present_and_stale() {
-        // AC4: a configured (queue, shard) with NO rows at all (e.g. a
-        // write-blocked shard that never completed a probe) must still appear as
-        // a stale probe, not vanish.
+        // AC4: a configured (queue, shard) with NO rows at all must still appear
+        // as a stale probe, not vanish. An example is a write-blocked shard that
+        // never completed a probe.
         let now = at(1000);
         let report = build_canary_report(
             &[("default".to_string(), 0)],
@@ -1385,7 +1386,6 @@ mod tests {
         let legacy = probe(&report, "legacy", 0);
         assert!(legacy.stale, "leftover is old (age 499 > 60s window)");
         assert_eq!(legacy.success_count, 1);
-        // Probes are sorted by (queue, shard).
         let order: Vec<(&str, i32)> = report
             .probes
             .iter()

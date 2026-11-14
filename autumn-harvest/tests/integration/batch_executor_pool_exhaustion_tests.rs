@@ -245,14 +245,12 @@ async fn run_executor_once_does_not_self_deadlock_a_capacity_one_shard_pool() {
 
 #[tokio::test]
 async fn run_executor_once_does_not_self_deadlock_a_capacity_two_shard_pool() {
-    // This is the exact shape of the originally reported hang. Both root
-    // causes together permanently retain two connections (the listing
-    // connection, then `owning_conn`) before the dispatch loop asks for a
-    // third. That already fills a pool of two, so the dispatch loop's own
-    // checkout never succeeds. A single retained connection always leaves
-    // this pool's second slot free for the dispatch loop. So this test
-    // guards the combined regression. The capacity-one test above catches
-    // either cause alone.
+    // The shape of the reported hang. The two root causes together retain
+    // two connections for good (the listing connection, then `owning_conn`)
+    // before the dispatch loop asks for a third. That fills a pool of two, so
+    // the checkout of the dispatch loop never succeeds. One retained
+    // connection leaves a slot free, so this test guards the combined
+    // regression. The capacity-one test catches either cause alone.
     let fixture = build_fixture(2).await;
 
     let result = tokio::time::timeout(

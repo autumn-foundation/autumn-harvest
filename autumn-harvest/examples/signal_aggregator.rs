@@ -5,17 +5,17 @@
 //! ## The problem
 //!
 //! The canonical aggregator collects N events delivered as signals, batch-
-//! processes them, and `continue_as_new`s to keep its history bounded. Written
-//! with the only tool available before this feature — `receive_signal`, which
-//! blocks for exactly one signal per call — collecting a batch of N signals
-//! costs O(N) workflow tasks and O(N²) cumulative replay work, because each of
-//! the N tasks replays the whole growing history.
+//! processes them, and `continue_as_new`s to keep its history bounded. Before
+//! this feature, the only tool was `receive_signal`, which blocks for exactly
+//! one signal per call. A batch of N signals then costs O(N) workflow tasks.
+//! It also costs O(N²) cumulative replay work, because each of the N tasks
+//! replays the whole growing history.
 //!
 //! ## The solution: non-blocking drain
 //!
-//! Block once for the first event, then drain every already-buffered signal of
-//! the same name in the *same* task execution — no extra tasks, no per-signal
-//! replay amplification:
+//! Block once for the first event. Then drain every already-buffered signal of
+//! the same name in the *same* task execution. There are no extra tasks and no
+//! per-signal replay amplification:
 //!
 //! ```rust
 //! use autumn_harvest::prelude::*;
@@ -42,15 +42,15 @@
 //! | `try_wait_for_signal(name)`      | `Option<Value>` (oldest)      | never |
 //! | `drain_signals_raw(name)`        | `Vec<Value>` (all)            | never |
 //!
-//! `drain_signals` is fail-fast (a single undeserializable payload aborts the
-//! whole batch, discarding its good siblings); `drain_signals_collect` returns
-//! a per-slot `Result` so a poison payload never loses the good ones — mirroring
-//! the fan-out fail-fast/collect pair.
+//! `drain_signals` is fail-fast. One undeserializable payload aborts the whole
+//! batch and discards its good siblings. `drain_signals_collect` returns a
+//! per-slot `Result`, so a poison payload never loses the good ones. The pair
+//! mirrors the fan-out fail-fast/collect pair.
 //!
 //! All consume already-recorded `SignalReceived` events in FIFO
 //! recorded-history order and NEVER suspend. They never double-deliver an event
-//! already consumed by `receive_signal`/`wait_for_signal` or a push handler, and
-//! they never resolve a signal reserved for an open `receive_signal_timeout`
+//! already consumed by `receive_signal`/`wait_for_signal` or a push handler.
+//! They never resolve a signal reserved for an open `receive_signal_timeout`
 //! race (issue #476).
 
 use autumn_harvest::prelude::*;
@@ -66,20 +66,19 @@ struct LineItem {
 ///
 /// This runnable version is deliberately **single-shot**: it collects one batch
 /// and returns, so the embedded `WorkflowTestEnv` tests terminate. A real
-/// long-lived aggregator would loop — after processing `batch`, call
-/// `ctx.continue_as_new(...)` (where the `Ok(total_qty)` return is below) to
-/// fork a fresh execution with bounded history and go back to blocking on the
-/// next `receive_signal("line_item")`.
+/// long-lived aggregator loops. After it processes `batch`, it calls
+/// `ctx.continue_as_new(...)` in place of the `Ok(total_qty)` return below.
+/// That forks a fresh execution with bounded history, which blocks on the next
+/// `receive_signal("line_item")`.
 ///
-/// Aggregator race caveat: a `line_item` signal delivered *after* this drain
-/// but *before* a `continue_as_new` commit belongs to the **old** execution's
-/// signal stream — `continue_as_new` mints a new `exec_id`, and a new exec_id is
-/// a new signal stream. Such a straggler is still visible to a final drain on
-/// the current execution (drain again right before continuing), but is not
-/// carried forward into the successor.
+/// Aggregator race caveat: a `line_item` signal may arrive *after* this drain
+/// but *before* a `continue_as_new` commit. It belongs to the **old**
+/// execution's signal stream. `continue_as_new` mints a new `exec_id`, and a new
+/// exec_id is a new signal stream. A final drain on the current execution, right
+/// before continuing, still sees such a straggler. It is not carried forward
+/// into the successor.
 #[workflow]
 async fn aggregate_order(ctx: &WorkflowContext, _input: ()) -> Result<u32, String> {
-    // Block until the first line item arrives.
     let first: LineItem = ctx
         .receive_signal("line_item")
         .await
@@ -110,10 +109,10 @@ fn main() {
     println!("    -H 'Content-Type: application/json' -d '{{\"sku\":\"A\",\"qty\":2}}'");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must
-// keep building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for an external consumer only when the
+// `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;

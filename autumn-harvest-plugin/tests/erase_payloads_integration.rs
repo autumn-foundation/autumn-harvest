@@ -494,12 +494,11 @@ async fn erase_tombstones_pii_in_events_row_and_signals() {
     );
 }
 
-/// Issue #605 / PR #921 review (Codex P1): a completion-callback delivery's
-/// frozen `payload` carries the workflow's own result/error, so it must be
-/// scrubbed by erasure exactly like events/execution row/signals -- and the
-/// delivery row itself (`state`/`attempt`/`next_attempt_at`) must be left alone
-/// so a still-pending delivery keeps its retry schedule (it will now just
-/// post the tombstone marker instead of the real data).
+/// Issue #605 / PR #921: a completion-callback delivery's frozen `payload`
+/// carries the workflow's own result or error. Erasure must scrub it like
+/// events, the execution row and signals. It must leave the delivery's
+/// `state`/`attempt`/`next_attempt_at` alone. A pending delivery then keeps its
+/// retry schedule and posts the tombstone marker instead of the real data.
 #[tokio::test]
 async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_its_schedule() {
     use autumn_harvest::schema::harvest_completion_deliveries;
@@ -570,14 +569,12 @@ async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_
     );
 }
 
-/// Issue #921 review (Codex P1, follow-up): a completion-callback delivery
-/// that exhausted retries writes a *second*, independent copy of the frozen
-/// envelope into `harvest_dead_letters.input`. Scrubbing
-/// `harvest_completion_deliveries.payload` alone (the prior fix, tested
-/// above) leaves that DLQ copy carrying the erased PII, so this test seeds
-/// a `task_type = "CALLBACK"` dead-letter row directly (mirroring what
-/// `apply_outcome`'s `OutcomeAction::DeadLetter` branch would insert) and
-/// asserts erasure scrubs it too.
+/// Issue #921: a completion-callback delivery that exhausted retries writes a
+/// *second* copy of the frozen envelope into `harvest_dead_letters.input`.
+/// A scrub of `harvest_completion_deliveries.payload` alone leaves the erased
+/// PII in that DLQ copy. This test seeds a `task_type = "CALLBACK"`
+/// dead-letter row, as `apply_outcome`'s `OutcomeAction::DeadLetter` branch
+/// would. It asserts that erasure scrubs it too.
 #[tokio::test]
 async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
     use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
@@ -720,7 +717,6 @@ async fn erase_is_idempotent() {
     let exec_id = seed_execution_with_pii(&mut conn, "erase-idempotent-wf", pii).await;
     mark_completed(&mut conn, exec_id).await;
 
-    // First erase.
     let (status1, body1) = post_json(
         &app,
         &format!("/workflows/{exec_id}/erase-payloads"),

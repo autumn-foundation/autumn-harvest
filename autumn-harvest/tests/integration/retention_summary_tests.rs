@@ -15,15 +15,15 @@
 //!   the blob reference (#524).
 //! - AC5: the summary GC pass deletes summaries past the summary horizon and
 //!   emits `record_summary_deleted`; `Unbounded` keeps them forever.
-//! - AC6: #495 PII erase scrubs a matching summary — both when the erase runs
-//!   before GC (the summary captures the already-tombstoned output) and after
-//!   GC (a summary-only erase succeeds and tombstones the row).
+//! - AC6: #495 PII erase scrubs a matching summary, before or after GC. An
+//!   erase before GC leaves the summary to capture the already-tombstoned
+//!   output. After GC, a summary-only erase succeeds and tombstones the row.
 //! - AC7: a legal-held execution is neither deleted nor summarized until the
 //!   hold is released.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded, each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle
+//! against it directly (single-threaded, each test scrubs first). Otherwise a
+//! fresh testcontainers Postgres boots with the full migration bundle
 //! (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
@@ -1303,11 +1303,11 @@ async fn load_callback_dlq_input(
     .input
 }
 
-// AC6 (Codex P1): a summary-ONLY erase (execution row already GC'd) must ALSO
-// scrub the lingering completion-callback PII — the frozen `payload` envelope
-// in `harvest_completion_deliveries` and the CALLBACK `harvest_dead_letters
-// .input` copy — both of which retention deliberately leaves behind and both of
-// which are still retryable/redrivable. Before the fix the summary-only path
+// AC6 (issue #752): a summary-ONLY erase (execution row already collected)
+// must ALSO scrub the lingering completion-callback PII. That is the frozen
+// `payload` envelope in `harvest_completion_deliveries` and the CALLBACK
+// `harvest_dead_letters.input` copy. Retention deliberately leaves both behind,
+// and both are still retryable/redrivable. Before the fix the summary-only path
 // hardcoded these counters to 0 and left the PII in place while returning 200.
 #[tokio::test]
 async fn erase_summary_only_scrubs_lingering_completion_callback_pii() {
@@ -1372,7 +1372,7 @@ async fn erase_summary_only_scrubs_lingering_completion_callback_pii() {
     assert_eq!(after.result, Some(tombstone));
 }
 
-// Regression guard for the shared-helper extraction (issue #752 Codex P1): the
+// Regression guard for the shared-helper extraction (issue #752): the
 // execution-EXISTS path must still scrub both callback-PII tables exactly as
 // before.
 #[tokio::test]
@@ -1522,12 +1522,12 @@ async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
     assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
 }
 
-// AC6 (child-summary erase cascade, issue #752 review): a TERMINAL child is
-// independently retention-eligible, so it is demoted into a summary (with its
-// PII captured) and its execution row deleted BEFORE the parent is erased.
+// AC6 (child-summary erase cascade, issue #752): a TERMINAL child is
+// independently retention-eligible. It is demoted into a summary (with its PII
+// captured) and its execution row deleted BEFORE the parent is erased.
 // Erasing the parent must reach the child summary via `parent_id`, or the
-// child's captured PII survives undiscoverably. Also proves the `parent_id`
-// link is preserved through deletion regardless of retention processing order.
+// child's captured PII survives undiscoverably. Also proves that the
+// `parent_id` link survives deletion in any retention processing order.
 #[tokio::test]
 async fn erase_parent_scrubs_a_demoted_child_summary() {
     let (url, _c) = setup_db().await;

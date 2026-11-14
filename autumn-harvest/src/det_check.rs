@@ -19,14 +19,13 @@
 //! | DET010 | Error*   | `HashMap`/`HashSet` iteration order (issue #785) |
 //! | DET011 | Error    | `select!` / futures select combinators (issue #799) |
 //!
-//! DET011 is the det_check twin of guardrail HVG010 (SelectMacro, issue #600):
-//! `tokio::select!` / `futures::select!` / `select_biased!` and the
-//! `futures::future::{select, select_all, select_ok, try_select}` combinators
-//! (in both the fully-qualified `futures::future::…` and the short `future::…`
-//! forms) race ctx-managed awaitables non-deterministically (the winning branch
-//! differs between the live run and a replay). HVG010 is the compile-time /
-//! catalog id; det_check surfaces the same hazard as DET011 (DET010 was the
-//! prior det_check maximum).
+//! DET011 is the det_check twin of guardrail HVG010 (SelectMacro, issue #600).
+//! It flags `tokio::select!`, `futures::select!`, `select_biased!` and the
+//! `futures::future::{select, select_all, select_ok, try_select}` combinators,
+//! in both the `futures::future::…` and the short `future::…` forms. These race
+//! ctx-managed awaitables, so the winning branch can differ between the live
+//! run and a replay. HVG010 is the compile-time / catalog id. det_check reports
+//! the same hazard as DET011, because DET010 was the prior det_check maximum.
 //!
 //! \* DET010 is command-aware: a flagged loop whose body schedules commands
 //! (`.execute_activity*`, `.spawn_child_workflow*`, `.execute_local_activity*`,
@@ -36,16 +35,16 @@
 //!
 //! # Heuristic pre-check vs. authoritative guardrail
 //!
-//! `det_check` is a best-effort **text** scanner: a fast, CLI-friendly
-//! pre-check that mirrors the compile-time guardrails so problems surface early
-//! (in review or CI) without waiting for a build. Being text-based, it can lag
-//! the guardrails on exotic syntax (turbofish, unusual spacing, multi-line
-//! calls). The **authoritative** determinism gate is the syn-based proc-macro
-//! guardrail that runs during compilation (e.g. HVG010 for DET011): it operates
-//! on the parsed AST, so it always hard-blocks these forms even where the text
-//! scanner would miss them. When the two disagree, trust the compile-time
-//! guardrail — it is the safety net, and `#[workflow(allow_nondeterministic_apis)]`
-//! (or a `// harvest-suppress:` comment for det_check) is the escape hatch.
+//! `det_check` is a best-effort **text** scanner. It is a fast, CLI-friendly
+//! pre-check that mirrors the compile-time guardrails, so problems surface in
+//! review or CI without a build. Because it reads text, it can lag the
+//! guardrails on exotic syntax (turbofish, unusual spacing, multi-line calls).
+//! The **authoritative** determinism gate is the syn-based proc-macro guardrail
+//! that runs during compilation (e.g. HVG010 for DET011). It reads the parsed
+//! AST, so it always hard-blocks these forms, even where the text scanner
+//! misses them. When the two disagree, trust the compile-time guardrail: it is
+//! the safety net. The escape hatch is `#[workflow(allow_nondeterministic_apis)]`,
+//! or a `// harvest-suppress:` comment for det_check.
 //!
 //! # Suppression
 //!
@@ -86,9 +85,9 @@ pub struct DetLocation {
     pub line: u32,
     /// 1-indexed column of the matched pattern within the source line.
     ///
-    /// Best-effort: a real column is computed from the matched substring for the
-    /// substring-table rules (DET001–DET009, DET011); the bespoke DET010 pass
-    /// and any site lacking an offset report `1`. Always `> 0`.
+    /// Best-effort. The substring-table rules (DET001–DET009, DET011) compute a
+    /// real column from the matched substring. The bespoke DET010 pass and any
+    /// site without an offset report `1`. Always `> 0`.
     pub col: u32,
 }
 
@@ -109,10 +108,12 @@ pub struct DetFinding {
     pub message: String,
     /// A deterministic Harvest-shaped alternative.
     pub alternative: &'static str,
-    /// For a transitive finding (issue #778, one first-party hop): the name of
-    /// the first-party helper function — reachable via a direct call from the
-    /// `workflow_name` entry point — that contains the offending call. `None`
-    /// for a direct-in-body finding.
+    /// The name of the helper that holds the offending call, for a transitive
+    /// finding.
+    ///
+    /// The scan follows one first-party hop (issue #778). The `workflow_name`
+    /// entry point calls this first-party helper directly. `None` for a
+    /// direct-in-body finding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_helper: Option<String>,
 }
@@ -329,58 +330,57 @@ const RULES: &[Rule] = &[
         id: "DET011",
         severity: DetSeverity::Error,
         patterns: &[
-            // Select MACROS — the trailing `!` makes these unambiguous macro
-            // invocations (no ident/method call contains it) and bounds the
-            // macro NAME on the right, so `select_biasedx!` and a `select!`
-            // match inside `select_biased!` are excluded. The candidate pattern
-            // only LOCATES the macro name; the accept/reject decision is made by
-            // the path-precise `matches_select_macro_pattern` (see
-            // `DET011_MACRO_PATTERNS`), which extracts the FULL qualified macro
-            // path (walking back over the contiguous path run, stripping an
-            // optional leading `::`) and matches it EXACTLY against
-            // `is_allowed_select_macro_path`. That precision is required so a
-            // qualified macro under an UNRELATED root is NOT flagged:
-            // `crate::ui::select! {}`, `my::select_biased! {}`,
+            // Select MACROS. The trailing `!` makes these unambiguous macro
+            // invocations, since no ident or method call contains it. It also
+            // bounds the macro NAME on the right, so `select_biasedx!` and a
+            // `select!` match inside `select_biased!` are excluded. The
+            // candidate pattern only LOCATES the macro name. The path-precise
+            // `matches_select_macro_pattern` makes the accept/reject decision
+            // (see `DET011_MACRO_PATTERNS`). It extracts the FULL qualified
+            // macro path, walking back over the contiguous path run and
+            // stripping an optional leading `::`. It then matches that path
+            // EXACTLY against `is_allowed_select_macro_path`. That precision
+            // keeps a qualified macro under an UNRELATED root unflagged.
+            // `crate::ui::select! {}`, `my::select_biased! {}` and
             // `foo::bar::select! {}` all resolve to paths outside the allowed
-            // set and are rejected — exactly as the compile-time HVG010
-            // guardrail's `visit_macro` rejects them (#980 Codex P2 — the
-            // earlier ident-boundary-only check false-positived on any `::`
-            // prefix). `::tokio::select!` normalizes to `tokio::select` and IS
-            // flagged; `sql_select!` / `my_select!` are absorbed into a
-            // non-matching path by the backward walk and stay unflagged. The
-            // allowed set mirrors `visit_macro` case-for-case: bare `select`,
+            // set and are rejected. The compile-time HVG010 guardrail's
+            // `visit_macro` rejects them the same way (#980). The earlier
+            // ident-boundary-only check false-positived on any `::` prefix.
+            // `::tokio::select!` normalizes to `tokio::select` and IS flagged.
+            // The backward walk absorbs `sql_select!` / `my_select!` into a
+            // non-matching path, so they stay unflagged. The allowed set
+            // mirrors `visit_macro` case for case: bare `select`,
             // `select_biased`, `tokio::select`, `futures::select`,
-            // `futures::select_biased` (note `tokio::select_biased` is absent
-            // there too).
+            // `futures::select_biased`. `tokio::select_biased` is absent there
+            // too.
             "select!",
             "select_biased!",
             // Combinator FUNCTIONS. These candidate patterns are the bare
-            // combinator NAME anchors (no trailing `(`); they cheaply locate a
-            // possible combinator call and the actual decision is made by the
-            // path-precise `matches_futures_combinator_pattern` (see
-            // `DET011_COMBINATOR_FN_PATTERNS`), which (a) confirms the name is a
-            // complete token, (b) requires a call `(` to follow — after an
+            // combinator NAME anchors, with no trailing `(`. They cheaply
+            // locate a possible combinator call. The path-precise
+            // `matches_futures_combinator_pattern` makes the decision (see
+            // `DET011_COMBINATOR_FN_PATTERNS`). It does three checks. (a) The
+            // name is a complete token. (b) A call `(` follows, after an
             // OPTIONAL turbofish `::<…>` and any surrounding whitespace, so a
             // turbofished call `future::select::<_, _>(a, b)` is caught too
-            // (#980 Codex P2) — and (c) extracts the FULL qualified path ending
-            // at the call and matches it exactly against the same allowed-path
-            // set as the compile-time HVG010 guardrail's
-            // `is_select_combinator_path`. That precision is required so a
-            // qualified call by an UNRELATED helper of the same tail name is
-            // NOT flagged: `crate::future::select(`, `my_dsl::select_all(`,
-            // `bar::future::select_ok(`, and `foo::try_select(` all resolve to
-            // paths outside the allowed set and are rejected, exactly as the
-            // macro lint rejects them. The allowed set is: the
-            // `futures`-anchored qualified forms (`futures::future::{select,
-            // select_all, select_ok, try_select}`), their `future::…` short
-            // forms (the idiomatic `use futures::future;` spelling), and the
+            // (#980). (c) The FULL qualified path that ends at the call matches
+            // exactly the allowed-path set of the compile-time HVG010
+            // guardrail's `is_select_combinator_path`. That precision keeps a
+            // qualified call to an UNRELATED helper with the same tail name
+            // unflagged. `crate::future::select(`, `my_dsl::select_all(`,
+            // `bar::future::select_ok(` and `foo::try_select(` all resolve to
+            // paths outside the allowed set. The macro lint rejects them the
+            // same way. The allowed set holds the `futures`-anchored qualified
+            // forms (`futures::future::{select, select_all, select_ok,
+            // try_select}`). It also holds their `future::…` short forms, the
+            // idiomatic `use futures::future;` spelling. Last, it holds the
             // genuinely BARE distinctive names `select_all`/`select_ok`/
-            // `try_select` (a bare free-fn call by any of these three is, in
-            // practice, always the futures combinator via
-            // `use futures::future::select_all;`). Bare `select` is
-            // deliberately NOT in the allowed set (`select` is a common
-            // free-fn / query-builder name), and a preceding `.` (method call,
-            // e.g. `q.select_all()`) is rejected — mirroring the AST macro
+            // `try_select`. In practice, a bare free-fn call by one of these
+            // three is always the futures combinator, via
+            // `use futures::future::select_all;`. Bare `select` is deliberately NOT
+            // in the allowed set, because `select` is a common free-fn and
+            // query-builder name. A preceding `.` (a method call, e.g.
+            // `q.select_all()`) is rejected. That mirrors the AST macro
             // visitor's structural exclusion of method calls.
             "future::select",
             "select_all",
@@ -407,15 +407,16 @@ const RULES: &[Rule] = &[
 /// Check Rust source code text for determinism violations reachable from
 /// `#[workflow]` functions.
 ///
-/// Each `#[workflow]` body is scanned directly, and — one first-party hop
-/// (issue #778) — every plain helper function it calls directly **that is
-/// declared in the workflow's own module** (same file + module path) is scanned
-/// too, attributing any finding to the workflow entry point via
-/// [`DetFinding::via_helper`]. A helper in a different module / file (reached via
-/// a `use` import the line-based scanner cannot see) is NOT resolved — a safe
-/// false-negative (see [`resolve_helper`]). `#[activity]` bodies are never
-/// scanned (activities are allowed to be non-deterministic by design), and
-/// neither are the bodies of helpers a workflow does not reach.
+/// Each `#[workflow]` body is scanned directly. Issue #778 adds one first-party
+/// hop. A plain helper that the workflow calls directly is scanned too, **if
+/// the workflow's own module declares it** (same file + module path). A finding
+/// there is attributed to the workflow entry point through
+/// [`DetFinding::via_helper`]. A helper in a different module or file is NOT
+/// resolved. A `use` import reaches it, and the line-based scanner cannot see
+/// that import. That is a safe false-negative (see [`resolve_helper`]).
+/// `#[activity]` bodies are never scanned, because activities may be
+/// non-deterministic by design. The bodies of helpers that a workflow does not
+/// reach are not scanned either.
 ///
 /// `file` is used only for source-location reporting; no file is read.
 /// The function always returns a report; it never panics on malformed input.
@@ -441,14 +442,14 @@ pub fn check_file(path: &Path) -> std::io::Result<DetCheckReport> {
 
 /// Recursively check all `.rs` files under `dir` for determinism violations.
 ///
-/// One-hop first-party helper reachability (issue #778) is resolved
-/// **same-module only** — a helper in the caller's own module (same file +
-/// module path; see [`resolve_helper`]); a cross-file / cross-module helper is
-/// not resolved.
+/// One-hop first-party helper reachability (issue #778) resolves **same-module
+/// only**. It finds a helper in the caller's own module (same file + module
+/// path; see [`resolve_helper`]). A cross-file / cross-module helper is not
+/// resolved.
 ///
-/// Build-output, hidden, and trybuild-fixture directories are skipped so a scan
-/// of a repository root stays fast, never lints generated code, and never lints
-/// the deliberately-broken `compile_fail/` fixtures (see [`skip_scan_dir`]).
+/// Build-output, hidden and trybuild-fixture directories are skipped (see
+/// [`skip_scan_dir`]). So a scan of a repository root stays fast. It never
+/// lints generated code or the deliberately-broken `compile_fail/` fixtures.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be read or any file read fails.
@@ -461,46 +462,45 @@ pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
 /// Check an explicit set of source paths (files and/or directories) for
 /// determinism violations.
 ///
-/// All paths are collected into a **single shared index** before scanning, so
-/// every file is de-duplicated across arguments (the changed-files CI pattern
-/// `det-check $(git diff --name-only '*.rs')`) and no file is scanned twice.
-/// One-hop first-party helper reachability (issue #778) is nevertheless resolved
-/// **same-module only** (same file + module path; see [`resolve_helper`]): a
-/// cross-file transitive helper is deliberately NOT resolved (a safe
-/// false-negative), because the line-based scanner cannot see the `use` import
-/// that would make such a bare call reach across files — resolving it risks the
-/// Codex round-4/round-5 false-positive family, which for a CI gate is the worse
-/// outcome.
+/// All paths go into a **single shared index** before the scan. So every file
+/// is de-duplicated across arguments, as in the changed-files CI pattern
+/// `det-check $(git diff --name-only '*.rs')`. One-hop first-party helper
+/// reachability (issue #778) is still resolved **same-module only** (same
+/// file + module path; see [`resolve_helper`]). A cross-file transitive helper is
+/// deliberately NOT resolved (a safe false-negative). The line-based scanner
+/// cannot see the `use` import that makes such a bare call reach across files.
+/// Resolving it risks false positives on same-file-different-module,
+/// aliased-import and globally-unique helpers. For a CI gate a false positive
+/// is the worse outcome.
 ///
-/// A file argument is scanned directly; a directory argument is walked
+/// A file argument is scanned directly. A directory argument is walked
 /// recursively with [`skip_scan_dir`] applied. Symlinked files and directories
-/// are **not** followed — neither those discovered during a directory walk nor
-/// one passed directly as a top-level path argument (classified with
-/// `symlink_metadata`, which does not follow, and skipped with a warning). A
-/// self-referential directory symlink cannot explode the scan, and a `../..`
-/// symlink cannot pull out-of-tree files into the report.
-/// Overlapping arguments (a directory and a file inside it, or a repeated path)
-/// are de-duplicated by canonicalized path, so no file is scanned twice. A
-/// single unreadable / non-UTF-8 `.rs` file discovered during a directory walk
-/// is skipped with a warning naming the file rather than aborting the whole
-/// scan.
+/// are **not** followed. That holds for a symlink found during a directory walk
+/// and for one passed directly as a top-level path argument. A top-level
+/// argument is classified with `symlink_metadata`, which does not follow, and
+/// skipped with a warning. A self-referential directory symlink cannot explode
+/// the scan, and a `../..` symlink cannot pull out-of-tree files into the
+/// report. Overlapping arguments (a directory and a file inside it, or a
+/// repeated path) are de-duplicated by canonicalized path, so no file is
+/// scanned twice. A single unreadable / non-UTF-8 `.rs` file found during a
+/// directory walk is skipped with a warning that names the file. It does not
+/// abort the whole scan.
 ///
 /// # Errors
-/// Returns an error if a top-level path does not exist or cannot be classified,
-/// if a directory cannot be read, or if an explicitly-named file argument cannot
-/// be read.
+/// Returns an error if a top-level path does not exist or cannot be classified.
+/// It also returns an error if a directory cannot be read, or if an
+/// explicitly-named file argument cannot be read.
 pub fn check_paths(paths: &[&Path]) -> std::io::Result<DetCheckReport> {
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     for &path in paths {
-        // Classify with `symlink_metadata` (which does NOT follow) so a
-        // top-level symlink argument is skipped rather than followed — mirroring
-        // the nested walker's no-follow behavior (#778, Codex r9). Following a
-        // symlinked file would lint its target, and a symlinked directory would
-        // walk out-of-tree contents into the report; both contradict the
-        // documented no-follow contract. `metadata` (which follows) is still used
-        // for the resolved file-vs-dir decision below, but only after confirming
-        // the argument is not itself a symlink.
+        // Classify with `symlink_metadata`, which does NOT follow. So a
+        // top-level symlink argument is skipped, not followed, like the nested
+        // walker (#778). Following a symlinked file would lint its target.
+        // Following a symlinked directory would walk out-of-tree contents into
+        // the report. Both contradict the documented no-follow contract. The
+        // file-vs-dir decision below still uses `metadata`, which follows, but
+        // only after the argument is known not to be a symlink.
         let link_md = std::fs::symlink_metadata(path)?;
         if link_md.file_type().is_symlink() {
             eprintln!("det-check: skipping symlink {}", path.display());
@@ -518,9 +518,9 @@ pub fn check_paths(paths: &[&Path]) -> std::io::Result<DetCheckReport> {
 }
 
 /// Builds a single first-party function index across every collected file and
-/// scans it once. The shared index de-duplicates and orders the files, but bare
-/// helper calls resolve **same-module only** ([`resolve_helper`]): a workflow in
-/// one file never resolves a helper defined in another.
+/// scans it once. The shared index de-duplicates and orders the files. Bare
+/// helper calls still resolve **same-module only** ([`resolve_helper`]). A
+/// workflow in one file never resolves a helper defined in another.
 fn scan_sources(sources: &[(String, String)]) -> DetCheckReport {
     let mut all_fns: Vec<FnDef> = Vec::new();
     for (label, content) in sources {
@@ -534,12 +534,13 @@ fn scan_sources(sources: &[(String, String)]) -> DetCheckReport {
     scan_functions(&all_fns)
 }
 
-/// Whether a directory should be skipped during a recursive scan: build
-/// artifacts (`target`), hidden directories (any name starting with `.`, e.g.
-/// `.git`), and trybuild compile-fail fixtures (`compile_fail`, which hold
-/// deliberately-broken sources with committed `.stderr` snapshots — true
-/// positives that exist to be rejected by the compile-time guardrail and must
-/// never be linted or edited by the text pre-check).
+/// Whether a directory should be skipped during a recursive scan.
+///
+/// It skips build artifacts (`target`) and hidden directories (any name that
+/// starts with `.`, e.g. `.git`). It also skips trybuild compile-fail fixtures
+/// (`compile_fail`). These hold deliberately-broken sources with committed
+/// `.stderr` snapshots. They are true positives that the compile-time guardrail
+/// must reject, so the text pre-check must never lint or edit them.
 fn skip_scan_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -563,9 +564,11 @@ fn collect_rs_sources(dir: &Path, sources: &mut Vec<(String, String)>) -> std::i
 }
 
 /// Symlink-safe, de-duplicating recursive `.rs` collector used by
-/// [`check_paths`]. Symlinked entries are skipped (no cycles, no out-of-tree
-/// escapes); `skip_scan_dir` directories are pruned; a per-file read/UTF-8 error
-/// is warned-and-skipped rather than aborting the walk; each file is added at
+/// [`check_paths`].
+///
+/// It skips symlinked entries, so there are no cycles and no out-of-tree
+/// escapes. It prunes `skip_scan_dir` directories. A per-file read/UTF-8 error
+/// is warned and skipped; it does not abort the walk. Each file is added at
 /// most once, keyed by its canonicalized path.
 fn collect_rs_sources_robust(
     dir: &Path,
@@ -632,7 +635,6 @@ fn add_source_strict(
 /// A top-level function definition captured from one source file. Bodies are
 /// owned so a cross-file index can outlive the per-file line buffers.
 struct FnDef {
-    /// Function name.
     name: String,
     /// Identifiers bound by the parameter list (over-collected; see
     /// [`extract_fn_params`]). Used to shadow-suppress a call to a same-named
@@ -648,9 +650,9 @@ struct FnDef {
     /// File label the function was extracted from (set by the caller).
     file: String,
     /// `mod`-nesting path the function is declared in, joined by `::` (empty at
-    /// file root). Used for Rust-accurate scope-aware resolution of a bare call
-    /// to a same-named free helper (#778, Codex P1): the caller's own module
-    /// sibling wins over an unrelated same-named helper elsewhere.
+    /// file root). It gives Rust-accurate, scope-aware resolution of a bare
+    /// call to a same-named free helper (#778). The caller's own module sibling
+    /// wins over an unrelated same-named helper elsewhere.
     module_path: String,
 }
 
@@ -665,8 +667,8 @@ struct BodyScope<'a> {
 }
 
 /// A brace scope the extractor is currently nested inside. A `Module` brace is
-/// transparent — its items are module scope and are scanned; every other brace
-/// (`impl`/`trait`/`struct`/`fn` body / bare block) is `Opaque` and its contents
+/// transparent: its items are module scope and are scanned. Every other brace
+/// (`impl`/`trait`/`struct`/`fn` body / bare block) is `Opaque`. Its contents
 /// are skipped for item extraction (the #386 method-exclusion boundary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeKind {
@@ -674,37 +676,39 @@ enum ScopeKind {
     Opaque,
 }
 
-/// Returns every **module-scope** function definition (top level and inside
-/// `mod NAME { … }` blocks, at any nesting), with a flag for whether it carries
-/// `#[workflow]` / `#[activity]`. Methods inside `impl`/`trait` blocks are
-/// deliberately not captured, so they can never be mistaken for free-function
-/// helper callees (#386 boundary). Module-nested `#[workflow]` entry points and
-/// their module-scope helpers are scanned (issue #778, Codex P1).
+/// Returns every **module-scope** function definition, with a flag for whether
+/// it carries `#[workflow]` / `#[activity]`. That covers the top level and
+/// `mod NAME { … }` blocks at any nesting. Methods inside `impl`/`trait`
+/// blocks are deliberately not captured, so they can never be mistaken for
+/// free-function helper callees (#386 boundary). Module-nested `#[workflow]`
+/// entry points and their module-scope helpers are scanned (issue #778).
 fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
     let mut result = Vec::new();
-    // Brace scopes we are currently inside, innermost last. Once an `Opaque`
-    // scope is entered it forms a contiguous suffix (an `impl`/`trait`/`fn`/block
-    // never contains a module), so the innermost scope decides whether we are
-    // item-scanning (`Module`/empty) or skipping (`Opaque`). `fn` bodies are
-    // consumed wholesale by [`extract_fn_body`] and never pushed here.
+    // Brace scopes the line is currently inside, innermost last. An entered
+    // `Opaque` scope forms a contiguous suffix, because an
+    // `impl`/`trait`/`fn`/block never contains a module. So the innermost scope
+    // decides between item scanning (`Module`/empty) and skipping (`Opaque`).
+    // [`extract_fn_body`] consumes `fn` bodies wholesale, so they are never
+    // pushed here.
     let mut scopes: Vec<ScopeKind> = Vec::new();
-    // Names of the `mod NAME` blocks we are currently nested inside, maintained
-    // in lockstep with the `Module` entries of `scopes` (#778, Codex P1).
+    // Names of the enclosing `mod NAME` blocks, kept in lockstep with the
+    // `Module` entries of `scopes` (#778).
     let mut mod_stack: Vec<String> = Vec::new();
     let mut pending_wf = false;
     let mut pending_act = false;
-    // A `mod NAME` declaration whose opening `{` is on a later line — the next
-    // `{` we open should be a transparent `Module` scope, not an `Opaque` one.
+    // A `mod NAME` declaration whose opening `{` is on a later line. The next
+    // `{` opens a transparent `Module` scope, not an `Opaque` one.
     let mut pending_mod = false;
     // The name of a `pending_mod` block, carried until its `{` is seen.
     let mut pending_mod_name: Option<String> = None;
     let mut i = 0;
 
     while i < lines.len() {
-        // Inside an opaque scope: skip the line, only tracking brace balance so
-        // we know when the opaque (and any nested) scope closes and item
-        // scanning resumes. A closing `}` may pop past the opaque suffix into an
-        // enclosing module on the same line, so `mod_stack` is maintained here too.
+        // Inside an opaque scope: skip the line and track only brace balance.
+        // That shows when the opaque scope (and any nested one) closes and item
+        // scanning resumes. A closing `}` may pop past the opaque suffix into
+        // an enclosing module on the same line. So `mod_stack` is maintained
+        // here too.
         if matches!(scopes.last(), Some(ScopeKind::Opaque)) {
             apply_line_braces_scoped(
                 &strip_unparseable_content(lines[i]),
@@ -757,12 +761,12 @@ fn extract_all_functions(lines: &[&str]) -> Vec<FnDef> {
             continue;
         }
 
-        // A module-scope line that is not a fn declaration — reset pending
-        // attributes and classify its braces. The first `{` opened on a
-        // `mod NAME { … }` line (or continuing a `pending_mod` from a prior line)
-        // pushes a transparent `Module` scope so items inside keep being scanned;
-        // every other `{` (`impl … {`, `struct … {`, a bare block) pushes an
-        // `Opaque` scope whose contents are skipped.
+        // A module-scope line that is not a fn declaration: reset pending
+        // attributes and classify its braces. The first `{` on a
+        // `mod NAME { … }` line pushes a transparent `Module` scope, so items
+        // inside are still scanned. So does the first `{` that continues a `pending_mod`
+        // from a prior line. Every other `{` (`impl … {`, `struct … {`, a bare
+        // block) pushes an `Opaque` scope whose contents are skipped.
         pending_wf = false;
         pending_act = false;
         let stripped = strip_unparseable_content(lines[i]);
@@ -861,11 +865,12 @@ fn extract_fn_body(lines: &[&str], fn_idx: usize) -> Option<(Vec<(u32, String)>,
 /// Pushes/pops the scope stack for each brace on an already-literal-stripped
 /// line, maintaining `mod_stack` in lockstep with the `Module` entries of
 /// `scopes` (#778). The **first** `{` on the line opens a transparent
-/// [`ScopeKind::Module`] scope (pushing `mod_name`) when `mod_first` is true (a
-/// `mod NAME { … }` opener); every other `{` opens an [`ScopeKind::Opaque`]
-/// scope. Each `}` pops the innermost scope, popping `mod_stack` only when the
-/// popped scope was a `Module`. A `}` with no matching open (a stray close, or
-/// the strip-caveat of a multi-line block comment) is a harmless no-op.
+/// [`ScopeKind::Module`] scope when `mod_first` is true (a `mod NAME { … }`
+/// opener). That `{` also pushes `mod_name` onto `mod_stack`. Every other
+/// `{` opens an [`ScopeKind::Opaque`] scope. Each `}` pops the innermost
+/// scope, and pops `mod_stack` only when the popped scope was a `Module`. A
+/// `}` with no matching open (a stray close, or the strip-caveat of a
+/// multi-line block comment) is a harmless no-op.
 fn apply_line_braces_scoped(
     stripped: &str,
     scopes: &mut Vec<ScopeKind>,
@@ -894,11 +899,12 @@ fn apply_line_braces_scoped(
     }
 }
 
-/// Whether `trimmed` (a module-scope line, already whitespace-trimmed) begins an
-/// **inline** module declaration `mod NAME { … }` (which opens a transparent
-/// scope) as opposed to an external module `mod NAME;` (no inline body) or a
-/// non-module item. Only an optional leading visibility (`pub`, `pub(crate)`,
-/// `pub(in …)`) is accepted before `mod`; the presence of a `;` before any body
+/// Whether `trimmed` begins an **inline** module declaration `mod NAME { … }`.
+///
+/// `trimmed` is a module-scope line, already whitespace-trimmed. An inline
+/// module opens a transparent scope. An external module `mod NAME;` (no inline
+/// body) or a non-module item does not. Only an optional leading visibility
+/// (`pub`, `pub(crate)`, `pub(in …)`) may precede `mod`. A `;` before any body
 /// brace marks an external module and returns `false`.
 fn is_mod_block_decl(trimmed: &str) -> bool {
     let s = strip_leading_visibility(trimmed);
@@ -941,19 +947,19 @@ fn strip_leading_visibility(trimmed: &str) -> &str {
 }
 
 /// Scans every extracted `#[workflow]` body directly, then follows one hop of
-/// direct first-party helper calls into plain (non-workflow, non-activity)
-/// helpers and scans those too, attributing findings to the workflow entry
+/// direct first-party helper calls. It scans those plain (non-workflow,
+/// non-activity) helpers too and attributes findings to the workflow entry
 /// point. Findings are deduped by `(rule_id, entry-workflow, file, line)`.
 fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
     use std::collections::HashMap;
 
-    // Candidate helper index: only plain helpers are eligible callees. A name may
-    // map to more than one plain helper (same name in different modules/files);
-    // resolution of a bare call is deferred to [`resolve_helper`], which resolves
-    // ONLY a candidate in the caller's own module (same file + same module path)
-    // and treats every cross-module / cross-file / imported / aliased case as
-    // ambiguous — so a resolution can never introduce a false positive (#778,
-    // Codex r4/r5).
+    // Candidate helper index: only plain helpers are eligible callees. A name
+    // may map to more than one plain helper (same name in different
+    // modules/files). [`resolve_helper`] resolves a bare call later. It
+    // resolves ONLY a candidate in the caller's own module (same file + same
+    // module path). It treats every cross-module, cross-file, imported or
+    // aliased case as ambiguous. So a resolution can never introduce a false
+    // positive (#778).
     let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, f) in fns.iter().enumerate() {
         if f.is_workflow || f.is_activity {
@@ -972,27 +978,26 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
         };
         report.merge(check_body(&scope, &view));
 
-        // Names locally bound in the workflow — parameters (fn-pointer /
-        // closure params), body `let` bindings (closures, shadows), and
-        // body-local `use` imports (incl. an unnameable glob) — are
-        // shadow-suppressed so a call to one is never resolved to a same-named
-        // free helper (#778 review, zero-FP; #386 excludes fn pointers/closures).
+        // Names that the workflow binds locally are shadow-suppressed. These
+        // are parameters (fn-pointer / closure params), body `let` bindings
+        // (closures, shadows) and body-local `use` imports (incl. an unnameable
+        // glob). A call to one is never resolved to a same-named free helper
+        // (#778 review, zero-FP; #386 excludes fn pointers/closures).
         // Suppression differs by binding kind, matching Rust scoping:
         //   * params bind for the whole body and always suppress;
-        //   * a `let` shadow is **source-order + column-aware** — it suppresses a
-        //     call on a strictly-later source line, or a same-line call past the
-        //     binding's statement-terminating `;` (a call before the binding is
-        //     in scope resolves to the free helper);
-        //   * a body-local `use` import (and glob) shadows the name for the
-        //     **whole body** — a Rust block `use` item is in scope for the
-        //     entire enclosing block regardless of textual position, so a call
-        //     may precede the `use` and still resolve to the import (#778,
-        //     Codex r7). Only module/file-level `use` (outside the body) is
-        //     never a body shadow.
+        //   * a `let` shadow is **source-order + column-aware**. It suppresses a call
+        //     on a strictly-later source line, or a same-line call past the binding's
+        //     statement-terminating `;`. A call before the binding is in scope
+        //     resolves to the free helper;
+        //   * a body-local `use` import (and glob) shadows the name for the **whole
+        //     body**. A Rust block `use` item is in scope for the entire enclosing
+        //     block, whatever its textual position. So a call may precede the `use`
+        //     and still resolve to the import (#778). Only module/file-level `use`
+        //     (outside the body) is never a body shadow.
         //   * a body-local `fn NAME(...)` item likewise shadows the name for the
-        //     **whole body** — a Rust block `fn` item is in scope for the entire
-        //     enclosing block, so a call `NAME()` resolves to the nested fn, not
-        //     a same-module `fn NAME` (#778, Codex r10).
+        //     **whole body**. A Rust block `fn` item is in scope for the entire
+        //     enclosing block. So a call `NAME()` resolves to the nested fn, not a
+        //     same-module `fn NAME` (#778).
         let params: std::collections::HashSet<String> = wf.params.iter().cloned().collect();
         let let_binding_lines = collect_body_let_binding_lines(&view);
         let (mut use_bindings, has_glob_use) = collect_body_use_bindings(&view);
@@ -1024,33 +1029,36 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
     report
 }
 
-/// Resolves a bare call to a first-party free helper from `caller`'s scope,
-/// restricted to **same-module candidates only** (#778, Codex r4/r5 — ends the
-/// cross-module false-positive family structurally):
+/// Resolves a bare call to a first-party free helper from `caller`'s scope.
 ///
-/// - a candidate in the caller's **own module** (same `file` + same `module_path`)
-///   resolves — the one case a bare call `name()` provably reaches without an
-///   import the line-based scanner cannot see;
-/// - **everything else** (cross-module, cross-file, `use`-imported, aliased via
-///   `use ... as name`, and even a *globally-unique* helper that is not in the
-///   caller's own module) is treated as ambiguous and NOT resolved — a safe
-///   false-negative, never a false-positive.
+/// Only **same-module candidates** resolve (#778). That ends the cross-module
+/// false-positive family structurally:
 ///
-/// This is a deliberate scope decision: the line-based front-door cannot resolve
-/// `use` imports/aliases, so ANY cross-module resolution keeps producing the
-/// Codex round-4 (same-file-different-module) and round-5 (aliased-import,
-/// globally-unique) false-positive family. For a CI GATE a false positive
+/// - a candidate in the caller's **own module** (same `file` + same
+///   `module_path`) resolves. It is the one case that a bare call `name()`
+///   provably reaches without an import the line-based scanner cannot see;
+/// - **everything else** is ambiguous and NOT resolved: a safe false-negative,
+///   never a false-positive. That covers cross-module, cross-file,
+///   `use`-imported and `use ... as name` aliased helpers. It even covers a
+///   *globally-unique* helper outside the caller's own module.
+///
+/// This is a deliberate scope decision. The line-based front-door cannot
+/// resolve `use` imports/aliases. So ANY cross-module resolution keeps
+/// producing false positives: same-file-different-module calls, and
+/// aliased-import or globally-unique helpers. For a CI GATE a false positive
 /// (failing CI on innocent code) is the worst outcome and outranks marginal
-/// recall, so the earlier globally-unique (`[only]`) and same-file-different-module
-/// fallbacks are removed. What is skipped here is a false-negative that the
-/// body-only compile-time `#[workflow]` guardrail (#386) also misses; the backstop
-/// for it is runtime determinism detection (`WorkflowReplayer` and the live
-/// `HistoryMatcher`) plus manual review, not #386.
+/// recall. So the earlier globally-unique (`[only]`) and
+/// same-file-different-module fallbacks are removed. What is skipped here is a
+/// false-negative that the body-only compile-time `#[workflow]` guardrail
+/// (#386) also misses. The backstop for it is runtime determinism detection
+/// (`WorkflowReplayer` and the live `HistoryMatcher`) plus manual review, not
+/// #386.
 fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
-    // Same module only (same file + same module path). Exactly one such candidate
-    // resolves; two same-named helpers in one module is not valid Rust, and none
-    // means the target is out of the caller's own module scope (cross-module,
-    // cross-file, `use`-imported, or aliased) — treat as ambiguous and skip.
+    // Same module only (same file + same module path). Exactly one such
+    // candidate resolves. Two same-named helpers in one module is not valid
+    // Rust. None means the target is outside the caller's own module scope
+    // (cross-module, cross-file, `use`-imported or aliased). Treat that as
+    // ambiguous and skip it.
     let same_module: Vec<usize> = candidates
         .iter()
         .copied()
@@ -1067,43 +1075,46 @@ fn body_view(body: &[(u32, String)]) -> Vec<(u32, &str)> {
     body.iter().map(|(n, s)| (*n, s.as_str())).collect()
 }
 
-/// Collects the names of first-party helpers a body calls via a **direct
-/// free-function call** (`helper(`), excluding method calls (`x.helper(`),
-/// path-qualified calls (`m::helper(`), and identifier-continuation. Only names
-/// present in `candidates` and **not shadowed in scope at the call site** are
-/// returned: a call to a name the caller binds itself (a fn-pointer/closure
-/// parameter, a local closure, or a shadowing `let`) is never resolved to a
-/// same-named free helper (#778 review, zero-FP; #386 excludes fn
-/// pointers/closures).
+/// Collects the names of first-party helpers that a body calls via a **direct
+/// free-function call** (`helper(`).
 ///
-/// Shadow suppression matches Rust scoping by binding kind (#778, Codex P2/r7/r9):
-/// `params` bind for the whole body and always suppress; a `let` shadow (in
-/// `let_binding_lines`, name → earliest [`LetBinding`] scope-entry point) is
-/// **source-order + column-aware** — it suppresses a call on a strictly-later
-/// source line, or on the SAME line only when the call's column is past the
-/// binding's statement-terminating `;` (the point the binding enters scope). A
-/// call that runs before the binding is in scope resolves to the free helper,
-/// matching Rust — correct for `let helper = ...; helper();` (the same-line call
-/// after the `;` is suppressed), for the RHS of `let bad = bad();` (before the
-/// `;`, so flagged), and for a pre-shadow `bad(); let bad = ...;` (before the
-/// binding, so flagged).
+/// It excludes method calls (`x.helper(`), path-qualified calls (`m::helper(`)
+/// and identifier-continuation. It returns only names that are in `candidates`
+/// and **not shadowed in scope at the call site**. A call to a name that the
+/// caller binds itself is never resolved to a same-named free helper (#778
+/// review, zero-FP; #386 excludes fn pointers/closures). Such a binding is a
+/// fn-pointer/closure parameter, a local closure or a shadowing `let`.
 ///
-/// A **block-local `use` import** rebinds a name for the **whole body**, not
-/// source-order: a Rust block `use` item is in scope for the entire enclosing
-/// block regardless of textual position, so a bare call may PRECEDE the `use`
-/// and still resolve to the import. Any name in `use_bindings` (from an explicit
-/// / aliased / grouped body-local `use`) is therefore suppressed on every line,
-/// and `has_glob_use` (an unnameable glob `use ...::*;` anywhere in the body)
-/// conservatively suppresses every same-module call in the body — a call to such
-/// a name is never resolved to a same-module free helper (#778, Codex r6/r7; the
-/// module/file-level `use` is not a body line, so the common top-of-file prelude
-/// case is unaffected).
+/// Shadow suppression matches Rust scoping by binding kind (#778). `params`
+/// bind for the whole body and always suppress. A `let` shadow is
+/// **source-order + column-aware**. `let_binding_lines` maps its name to the
+/// earliest [`LetBinding`] scope-entry point. It suppresses a call on a
+/// strictly-later source line. On the SAME line, it suppresses a call only when
+/// the call's column is past the binding's statement-terminating `;`. That `;`
+/// is where the binding enters scope. A call that runs before the binding is in
+/// scope resolves to the free helper, matching Rust. That is correct for
+/// `let helper = ...; helper();`, where the same-line call after the `;` is
+/// suppressed. It is correct for the RHS of `let bad = bad();`, which is before
+/// the `;` and so flagged. It is also correct for a pre-shadow
+/// `bad(); let bad = ...;`, which is before the binding and so flagged.
 ///
-/// The suppression is safe-direction: it only ever suppresses (never adds a
-/// call), so it introduces no new false-positive. A `let` shadow bound in an
-/// inner block that has already closed before an outer call is still treated as
-/// in scope (source-order, not full brace-scope tracking); that over-suppresses
-/// the outer call, an accepted false-negative — never a false-positive.
+/// A **block-local `use` import** rebinds a name for the **whole body**, not in
+/// source order. A Rust block `use` item is in scope for the entire enclosing
+/// block, whatever its textual position. So a bare call may PRECEDE the `use`
+/// and still resolve to the import. Any name in `use_bindings` (from an
+/// explicit, aliased or grouped body-local `use`) is therefore suppressed on
+/// every line. `has_glob_use` marks an unnameable glob `use ...::*;` anywhere
+/// in the body. It conservatively suppresses every same-module call in the
+/// body. So a call to such a name is never resolved to a same-module free
+/// helper (#778). The module/file-level `use` is not a body line, so the common
+/// top-of-file prelude case is unaffected.
+///
+/// The suppression is safe-direction: it only ever suppresses and never adds a
+/// call, so it introduces no new false-positive. A `let` shadow bound in an
+/// inner block that closed before an outer call is still treated as in scope.
+/// That is source-order tracking, not full brace-scope tracking. It
+/// over-suppresses the outer call: an accepted false-negative, never a
+/// false-positive.
 fn collect_direct_free_fn_calls(
     body: &[(u32, &str)],
     candidates: &std::collections::HashMap<&str, Vec<usize>>,
@@ -1126,14 +1137,14 @@ fn collect_direct_free_fn_calls(
             while i < bytes.len() && is_ident_byte(bytes[i]) {
                 i += 1;
             }
-            // Raw-identifier call: `r#gen(` tokenizes as `r`/`#`/`gen` under the
-            // ident-byte scan (`#` is not an ident byte), so re-attach the `r#`
-            // prefix and the following ident run — a call `r#gen(` then keys on
-            // `r#gen`, matching a `fn r#gen` def (indexed under `r#gen`, Codex r4)
-            // and completing raw-ident support on the CALL side (#778, Codex r6).
-            // `start` still points at `r`, so the `.`/`:` before-guard below keeps
-            // excluding `x.r#m()` / `Type::r#a()`, and the turbofish skip still
-            // applies (`r#gen::<T>()`).
+            // Raw-identifier call: `r#gen(` tokenizes as `r`/`#`/`gen` under
+            // the ident-byte scan, because `#` is not an ident byte. So
+            // re-attach the `r#` prefix and the following ident run. A call
+            // `r#gen(` then keys on `r#gen` and matches a `fn r#gen` def, which
+            // is indexed under `r#gen`. That completes raw-ident support on the
+            // CALL side (#778). `start` still points at `r`, so the `.`/`:`
+            // before-guard below keeps excluding `x.r#m()` / `Type::r#a()`. The
+            // turbofish skip still applies (`r#gen::<T>()`).
             if &code[start..i] == "r"
                 && i + 1 < bytes.len()
                 && bytes[i] == b'#'
@@ -1156,36 +1167,37 @@ fn collect_direct_free_fn_calls(
                 let b = bytes[start - 1];
                 !is_ident_byte(b) && b != b'.' && b != b':'
             };
-            // Immediate call paren, allowing an optional turbofish `::<…>` between
-            // the ident and the `(` — e.g. `bad::<u64>()` / `bad::<Vec<u8>>()`
-            // (#778, Codex P2). The `.`/`:` before-guard above already excludes
-            // method (`x.m::<T>()`) and associated (`Type::a::<T>()`) turbofish.
+            // Immediate call paren. An optional turbofish `::<…>` may sit
+            // between the ident and the `(`, e.g. `bad::<u64>()` /
+            // `bad::<Vec<u8>>()` (#778). The `.`/`:` before-guard above already
+            // excludes method (`x.m::<T>()`) and associated (`Type::a::<T>()`)
+            // turbofish.
             let call_at = if code[i..].starts_with("::<") {
                 skip_balanced_angles(bytes, i + 2)
             } else {
                 Some(i)
             };
             let after_ok = matches!(call_at, Some(p) if p < bytes.len() && bytes[p] == b'(');
-            // A `fn NAME(` is a function DECLARATION (the ident is preceded,
-            // ignoring whitespace, by the `fn` keyword), not a call. Skip it so a
-            // nested `fn helper() {}` in the body is never mis-collected as a call
-            // to a same-module `fn helper` (#778, Codex r10 FP). The declaration's
-            // name is separately added to the whole-body shadow set (see
-            // `collect_body_fn_bindings`), so a *genuine* call to it resolves to
-            // the nested fn rather than the module helper.
+            // A `fn NAME(` is a function DECLARATION, not a call: the `fn`
+            // keyword precedes the ident, ignoring whitespace. Skip it, so a
+            // nested `fn helper() {}` is never collected as a call to a
+            // same-module `fn helper` (#778). `collect_body_fn_bindings` adds
+            // the declaration's name to the whole-body shadow set. So a
+            // *genuine* call to it resolves to the nested fn, not the module
+            // helper.
             let is_fn_decl = is_ident_preceded_by_fn(bytes, start);
-            // Shadowed in scope at this call site? A param shadows everywhere; a
-            // `let` binding shadows a call on a strictly-later source line, or —
-            // on the SAME line — a call whose column is past the binding's
-            // statement-terminating `;` (the point the binding enters scope), so
-            // `let helper = ...; helper();` suppresses the call while the RHS of
-            // `let bad = bad();` and a pre-shadow `bad(); let bad = ...;` call
-            // stay flagged (source-order + column-aware, #778 Codex P2/r9). A
-            // block-local `use` import, a block-local glob `use ...::*;`, and a
-            // block-local `fn NAME(...)` item shadow the name across the WHOLE
-            // body — a Rust block `use`/`fn` item is in scope for the entire
-            // block regardless of position, so a call may precede the item and
-            // still resolve to it (#778, Codex r7/r10).
+            // Shadowed in scope at this call site? A param shadows everywhere.
+            // A `let` binding shadows a call on a strictly-later source line.
+            // On the SAME line, it shadows a call whose column is past the
+            // binding's statement-terminating `;`, where the binding enters
+            // scope. So `let helper = ...; helper();` suppresses the call. The
+            // RHS of `let bad = bad();` and a pre-shadow
+            // `bad(); let bad = ...;` call stay flagged (source-order +
+            // column-aware, #778). A block-local `use` import, a block-local
+            // glob `use ...::*;` and a block-local `fn NAME(...)` item shadow
+            // the name across the WHOLE body. A Rust block `use`/`fn` item is
+            // in scope for the entire block, whatever its position. So a call
+            // may precede the item and still resolve to it (#778).
             let shadowed_here = params.contains(token)
                 || let_binding_lines.get(token).is_some_and(|b| {
                     b.line < src_line || (b.line == src_line && start > b.in_scope_col)
@@ -1206,13 +1218,14 @@ fn collect_direct_free_fn_calls(
     called
 }
 
-/// True when the identifier starting at byte `start` is immediately preceded
-/// (ignoring intervening whitespace) by the `fn` keyword — i.e. it is a function
-/// DECLARATION name (`fn helper(`, `async fn helper(`), not a call. Used to skip
-/// a nested `fn` item's own name in the call collector so a body-local
-/// `fn helper() {}` is never mis-resolved to a same-module `fn helper` (#778,
-/// Codex r10). The `fn` must itself be word-bounded (so `myfn helper` is not a
-/// declaration).
+/// True when the `fn` keyword immediately precedes the identifier at byte
+/// `start`, ignoring whitespace.
+///
+/// Such an ident is a function DECLARATION name (`fn helper(`,
+/// `async fn helper(`), not a call. The call collector uses this to skip a nested `fn`
+/// item's own name. So a body-local `fn helper() {}` is never mis-resolved to a
+/// same-module `fn helper` (#778). The `fn` must itself be word-bounded, so
+/// `myfn helper` is not a declaration.
 fn is_ident_preceded_by_fn(bytes: &[u8], start: usize) -> bool {
     let mut j = start;
     while j > 0 && bytes[j - 1].is_ascii_whitespace() {
@@ -1222,10 +1235,10 @@ fn is_ident_preceded_by_fn(bytes: &[u8], start: usize) -> bool {
     j >= 2 && &bytes[j - 2..j] == b"fn" && (j == 2 || !is_ident_byte(bytes[j - 3]))
 }
 
-/// Given `open_lt` pointing at the `<` opening a turbofish (or generic) segment,
-/// returns the byte index just past the matching balanced `>` (accounting for
-/// nested generics like `::<Vec<u8>>`), or `None` if unbalanced. Used to skip an
-/// optional turbofish between an ident and its call `(` (#778, Codex P2).
+/// Given `open_lt` at the `<` that opens a turbofish (or generic) segment,
+/// returns the byte index just past the matching balanced `>`. It accounts for
+/// nested generics like `::<Vec<u8>>` and returns `None` if unbalanced. Used to
+/// skip an optional turbofish between an ident and its call `(` (#778).
 const fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut k = open_lt;
@@ -1245,14 +1258,16 @@ const fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
     None
 }
 
-/// Collects the identifiers bound by a function's parameter list, so a call to
-/// a same-named local (a fn-pointer / closure parameter) is never resolved to a
-/// same-named free helper (#778 review, zero-FP). The param list is the first
-/// balanced `(...)` after the `fn` keyword (string/comment content is stripped
-/// first); every lowercase-/underscore-initial ident inside it is collected via
-/// [`det010_pattern_mask_idents`]. Over-collection (picking up a lowercase TYPE
-/// ident like `fn`/`i64`) is safe: an extra shadow only ever suppresses a
-/// resolution (a false-negative), never introduces a false-positive.
+/// Collects the identifiers bound by a function's parameter list.
+///
+/// A call to a same-named local (a fn-pointer / closure parameter) is then
+/// never resolved to a same-named free helper (#778 review, zero-FP). The param
+/// list is the first balanced `(...)` after the `fn` keyword, after
+/// string/comment content is stripped. [`det010_pattern_mask_idents`] collects
+/// every lowercase- or underscore-initial ident inside it. Over-collection (a
+/// lowercase TYPE ident like `fn`/`i64`) is safe. An extra shadow only ever
+/// suppresses a resolution (a false-negative), never introduces a
+/// false-positive.
 fn extract_fn_params(lines: &[&str], fn_idx: usize) -> Vec<String> {
     // Join signature lines (from the `fn` line) up to the body `{`.
     let mut sig = String::new();
@@ -1292,11 +1307,13 @@ fn extract_fn_params(lines: &[&str], fn_idx: usize) -> Vec<String> {
     det010_pattern_mask_idents(&sig[open + 1..close])
 }
 
-/// The scope-entry point of a `let` binding: the source line it is bound on and,
-/// for that line, the byte column (in stripped-code coordinates) of the
-/// statement-terminating `;` at which the binding comes into scope. `in_scope_col`
+/// The scope-entry point of a `let` binding.
+///
+/// It holds the source line the binding is on, and the column on that line
+/// where the binding comes into scope. That column is the byte column (in
+/// stripped-code coordinates) of the statement-terminating `;`. `in_scope_col`
 /// is [`usize::MAX`] when the `let` statement has no depth-0 `;` on its keyword
-/// line (a multi-line `let`), so no same-line call is ever suppressed by it.
+/// line (a multi-line `let`). Then it never suppresses a same-line call.
 #[derive(Clone, Copy)]
 struct LetBinding {
     /// Source line the `let` keyword is on.
@@ -1306,16 +1323,17 @@ struct LetBinding {
     in_scope_col: usize,
 }
 
-/// Collects the identifiers bound by `let` statements in a function body,
-/// mapping each to the **earliest** point at which it enters scope (earliest
-/// source line, and on that line the earliest statement-terminating `;`), so a
+/// Collects the identifiers bound by `let` statements in a function body.
+///
+/// Each maps to the **earliest** point where it enters scope: the earliest
+/// source line, and on that line the earliest statement-terminating `;`. So a
 /// call to a same-named local (a closure binding, a shadowing `let`) is never
-/// resolved to a same-named free helper (#778 review, zero-FP) — but only for
-/// calls that come after the binding is in scope (source-order suppression, #778
-/// Codex P2; column-aware within a line, #778 Codex r9). Reuses
-/// [`det010_parse_let`] for robust pattern handling (simple, `mut`, annotated,
-/// and destructuring / enum-variant patterns). Single-line handling only; a
-/// multi-line `let` is a safe-direction under-collection.
+/// resolved to a same-named free helper (#778 review, zero-FP). That holds only
+/// for calls after the binding is in scope (source-order suppression,
+/// column-aware within a line, #778). It reuses [`det010_parse_let`] for robust
+/// pattern handling: simple, `mut`, annotated, and destructuring / enum-variant
+/// patterns. Single-line handling only; a multi-line `let` is a safe-direction
+/// under-collection.
 fn collect_body_let_binding_lines(
     body: &[(u32, &str)],
 ) -> std::collections::HashMap<String, LetBinding> {
@@ -1352,15 +1370,17 @@ fn collect_body_let_binding_lines(
     lines
 }
 
-/// Returns the byte column of the depth-0 `;` that terminates the `let` statement
-/// beginning at `let_pos` in already-stripped `code` (strings/comments removed by
-/// [`strip_unparseable_content`], so a `;` inside a string cannot mislead it), or
-/// [`usize::MAX`] if the statement is not terminated on this line (a multi-line
-/// `let`). Depth tracks `()`/`[]`/`{}` so a `;` inside a closure block (e.g.
-/// `let f = || { a(); b() };`) or a nested expression is skipped — the terminator
-/// is the point at which the binding enters scope, so a same-line call before it
-/// (the `let`'s own RHS, incl. a self-referencing `let x = x();`) is not
-/// suppressed, while a same-line call after it is.
+/// Returns the byte column of the depth-0 `;` that ends the `let` statement at
+/// `let_pos`.
+///
+/// Returns [`usize::MAX`] when the statement does not end on this line (a
+/// multi-line `let`). `code` is already stripped: [`strip_unparseable_content`]
+/// removed strings and comments, so a `;` inside a string cannot mislead it.
+/// Depth tracks `()`/`[]`/`{}`, so a `;` inside a closure block (e.g.
+/// `let f = || { a(); b() };`) or a nested expression is skipped. The terminator is the
+/// point where the binding enters scope. So a same-line call before it is not
+/// suppressed, while a same-line call after it is. The `let`'s own RHS, incl. a
+/// self-referencing `let x = x();`, is such an earlier call.
 const fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
     let bytes = code.as_bytes();
     let mut depth: i32 = 0;
@@ -1377,27 +1397,29 @@ const fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
     usize::MAX
 }
 
-/// Collects the set of names bound by **block-local `use` imports** anywhere in
-/// a workflow body, plus whether the body contains any **glob** `use ...::*;`.
-/// Unlike the `let` collector, this is presence-based (no source line): a Rust
-/// block `use` item is in scope for the entire enclosing block regardless of
-/// textual position, so a bare call may PRECEDE the `use` and still resolve to
-/// the import — the shadow must apply to the WHOLE body, not just later lines
-/// (#778, Codex r7). A glob names no specific binding, so `has_glob_use`
-/// conservatively suppresses every same-module call in the body (safe-direction
-/// over-suppression, never a false positive; block-local globs are rare).
+/// Collects the names bound by **block-local `use` imports** in a workflow
+/// body, and whether it has a **glob** `use ...::*;`.
 ///
-/// A body-local `use crate::x::helper;` rebinds `helper` to a clean import, so
-/// Rust resolves a bare `helper()` call to the import, not a same-module sibling
-/// `fn helper` — the same-module resolver must not walk the sibling (#778,
-/// Codex r6/r7). Only `use` statements INSIDE the body are seen (`extract_fn_body`
-/// captures body lines only), so a module/file-level `use` — including the
-/// common top-of-file prelude glob — is never a body shadow by construction.
+/// Unlike the `let` collector, this is presence-based, with no source line. A
+/// Rust block `use` item is in scope for the entire enclosing block, whatever
+/// its textual position. So a bare call may PRECEDE the `use` and still resolve
+/// to the import. The shadow must apply to the WHOLE body, not just later lines
+/// (#778). A glob names no specific binding, so `has_glob_use` conservatively
+/// suppresses every same-module call in the body. That is safe-direction
+/// over-suppression, never a false positive, and block-local globs are rare.
+///
+/// A body-local `use crate::x::helper;` rebinds `helper` to a clean import. So
+/// Rust resolves a bare `helper()` call to the import, not to a same-module
+/// sibling `fn helper`. The same-module resolver must not walk the sibling
+/// (#778). Only `use` statements INSIDE the body are seen, because
+/// `extract_fn_body` captures body lines only. So a module/file-level `use`,
+/// including the common top-of-file prelude glob, is never a body shadow by
+/// construction.
 ///
 /// Single-line handling only; a multi-line `use` is a safe-direction
 /// under-collection (matching the `let` collector). A `use<'a>` precise-capture
-/// clause (edition 2024 RPIT) is ignored — an import always has whitespace after
-/// the `use` keyword.
+/// clause (edition 2024 RPIT) is ignored, because an import always has
+/// whitespace after the `use` keyword.
 fn collect_body_use_bindings(body: &[(u32, &str)]) -> (std::collections::HashSet<String>, bool) {
     let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut has_glob = false;
@@ -1422,19 +1444,21 @@ fn collect_body_use_bindings(body: &[(u32, &str)]) -> (std::collections::HashSet
 }
 
 /// Collects the names of block-local `fn NAME(...)` items declared inside the
-/// workflow body. Like a block-local `use` import, a nested `fn` item shadows a
-/// same-named module helper for the WHOLE enclosing block, so a call `NAME()` in
-/// the body resolves to the nested fn — not a same-module `fn NAME` — and must
-/// be shadow-suppressed to avoid a false positive (#778, Codex r10).
+/// workflow body.
 ///
-/// Single-line `fn NAME(` detection only (a signature always opens with its name
-/// on the `fn` keyword's line, whatever qualifiers precede it). A `fn(..)`
+/// Like a block-local `use` import, a nested `fn` item shadows a same-named
+/// module helper for the WHOLE enclosing block. So a call `NAME()` in the body
+/// resolves to the nested fn, not a same-module `fn NAME`. It must be
+/// shadow-suppressed to avoid a false positive (#778).
+///
+/// Single-line `fn NAME(` detection only (a signature always opens with its
+/// name on the `fn` keyword's line, whatever qualifiers precede it). A `fn(..)`
 /// pointer TYPE has `(` immediately after `fn`, so it yields no following
 /// identifier and binds nothing. A raw-identifier item (`fn r#gen`) keeps its
-/// `r#` so it keys on the same string as the CALL tokenizer and the def index
-/// (#778, Codex r6). Anything not confidently parsed simply binds nothing
-/// (safe-direction under-collection — the call would then resolve to the module
-/// helper, never a false positive).
+/// `r#`, so it keys on the same string as the CALL tokenizer and the def index
+/// (#778). Anything not confidently parsed binds nothing. That is a
+/// safe-direction under-collection: the call then resolves to the module
+/// helper, never a false positive.
 fn collect_body_fn_bindings(body: &[(u32, &str)]) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for &(_src_line, line) in body {
@@ -1451,15 +1475,16 @@ fn collect_body_fn_bindings(body: &[(u32, &str)]) -> std::collections::HashSet<S
     names
 }
 
-/// Parses the text of a single `use` statement (everything after `use`, up to
-/// but not including the `;`) into `(bound_names, is_glob)`. Handles the common
-/// forms: `path::name` → binds `name`; `path as alias` / `path::orig as alias`
-/// → binds `alias`; grouped `path::{a, b as c}` → binds `a` and `c`; glob
-/// `path::*` → `is_glob = true` (no nameable binding). A raw-identifier segment
-/// (`r#gen`) keeps its `r#` so it keys on the same string as a `fn r#gen` def
-/// (#778, Codex r6). Conservative on anything it cannot confidently parse
-/// (nested group, unnameable item) → `is_glob = true`, i.e. over-suppress
-/// (safe-direction, never a false positive).
+/// Parses the text of a single `use` statement into `(bound_names, is_glob)`.
+///
+/// The text is everything after `use`, up to but not including the `;`.
+/// `path::name` binds `name`. `path as alias` / `path::orig as alias` binds
+/// `alias`. Grouped `path::{a, b as c}` binds `a` and `c`. Glob `path::*` sets
+/// `is_glob = true` (no nameable binding). A raw-identifier segment (`r#gen`)
+/// keeps its `r#`, so it keys on the same string as a `fn r#gen` def (#778).
+/// Anything it cannot confidently parse (nested group, unnameable item) sets
+/// `is_glob = true`. That over-suppresses, which is safe-direction and never a
+/// false positive.
 fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
     let s = use_body.trim();
     if s.is_empty() {
@@ -1490,7 +1515,7 @@ fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
             }
             match parse_use_single(item) {
                 Some(name) => names.push(name),
-                None => glob = true, // couldn't name it → conservative
+                None => glob = true, // could not name it → conservative
             }
         }
         return (names, glob);
@@ -1505,7 +1530,7 @@ fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
 
 /// Extracts the bound name of a single (non-grouped, non-glob) `use` item: the
 /// alias after `as`, else the last `::`-separated path segment. Retains an `r#`
-/// raw-identifier prefix (#778, Codex r6). Returns `None` if no valid identifier
+/// raw-identifier prefix (#778). Returns `None` if no valid identifier
 /// is found (e.g. an `as _` throwaway).
 fn parse_use_single(item: &str) -> Option<String> {
     let item = item.trim();
@@ -1517,9 +1542,9 @@ fn parse_use_single(item: &str) -> Option<String> {
 }
 
 /// Reads a leading (optionally raw `r#`-prefixed) identifier from a `use`
-/// segment, retaining the `r#` so it keys on the same string as a `fn r#name`
-/// def (#778, Codex r6). Returns `None` for an empty ident or the `_` wildcard
-/// binding (`use path as _;` binds no nameable local).
+/// segment. It keeps the `r#`, so it keys on the same string as a `fn r#name`
+/// def (#778). Returns `None` for an empty ident or the `_` wildcard binding
+/// (`use path as _;` binds no nameable local).
 fn extract_use_ident(seg: &str) -> Option<String> {
     let seg = seg.trim();
     let raw = seg.starts_with("r#");
@@ -1601,10 +1626,10 @@ fn fn_decl_name(trimmed: &str) -> Option<String> {
         return None;
     }
     let after = after.trim_start();
-    // Optional raw-identifier prefix (`r#gen`, `r#type`, …) — a valid Rust fn name
-    // whose identifier may itself be a reserved keyword (`gen` is reserved in
-    // edition 2024). Keep the `r#` on the extracted name so a def and any
-    // `r#name(` call site key on the same string (#778, Codex r4).
+    // Optional raw-identifier prefix (`r#gen`, `r#type`, …). It lets a valid
+    // Rust fn name be a reserved keyword (`gen` is reserved in edition 2024).
+    // Keep the `r#` on the extracted name, so a def and any `r#name(` call site
+    // key on the same string (#778).
     let raw_prefix_len = if after.starts_with("r#") { 2 } else { 0 };
     let ident: String = after[raw_prefix_len..]
         .chars()
@@ -1648,10 +1673,8 @@ fn check_body(scope: &BodyScope, body_lines: &[(u32, &str)]) -> DetCheckReport {
                     continue;
                 }
 
-                // Best-effort 1-based column of the matched pattern in the raw line.
                 let col = det_col(line, pattern);
 
-                // Pattern matched — check for a suppression comment.
                 if let Some(reason) = find_suppression(rule.id, line, prev_line) {
                     report.suppressions.push(DetSuppression {
                         rule_id: rule.id.to_string(),
@@ -1686,17 +1709,17 @@ fn check_body(scope: &BodyScope, body_lines: &[(u32, &str)]) -> DetCheckReport {
     }
 
     // NOTE: DET010 findings are appended AFTER the substring-table findings
-    // above, so a report's findings are grouped by pass, not strictly sorted
-    // by source line across rules. Consumers needing line order should sort
-    // on `location.line`.
+    // above. So a report groups findings by pass, not strictly by source line
+    // across rules. Consumers that need line order should sort on
+    // `location.line`.
     report.merge(check_hash_iteration(scope, body_lines));
 
     report
 }
 
 /// Best-effort 1-based **column** of `pattern` within the raw source `line`.
-/// The pattern is located in the raw line (not the stripped form) so the column
-/// aligns with what an operator sees; a byte offset is converted to a 1-based
+/// The pattern is located in the raw line, not the stripped form, so the column
+/// aligns with what an operator sees. A byte offset converts to a 1-based
 /// character column. Falls back to `1` when the pattern is not found in the raw
 /// line (e.g. it only survives in the stripped form). Always `> 0`.
 fn det_col(line: &str, pattern: &str) -> u32 {
@@ -1707,24 +1730,25 @@ fn det_col(line: &str, pattern: &str) -> u32 {
 
 // ── DET010: HashMap/HashSet iteration order (issue #785) ─────────────────────
 //
-// The substring-table `Rule` engine above cannot express this rule (it needs
-// binding tracking plus loop-body extent), so DET010 is a bespoke pass over
-// the same extracted workflow bodies. It shares `DetFinding`/`DetSeverity`/
-// `DetSuppression`, `find_suppression`, and `strip_unparseable_content`, and
-// fires from the same `check_source`/`check_file`/`check_dir` front doors.
+// The substring-table `Rule` engine above cannot express this rule, because it
+// needs binding tracking plus loop-body extent. So DET010 is a bespoke pass
+// over the same extracted workflow bodies. It shares
+// `DetFinding`/`DetSeverity`/`DetSuppression`, `find_suppression`, and
+// `strip_unparseable_content`, and fires from the same
+// `check_source`/`check_file`/`check_dir` front doors.
 //
-// Rule-ID note: issue #785's text proposed "DET/HVG010", but HVG010 was
-// already permanently assigned to SelectMacro (issue #600) and DET009 was the
-// previous det_check maximum — this rule ships as DET010 here and HVG011 in
-// the guardrail catalog / `#[workflow]` macro lint.
+// Rule-ID note: issue #785's text proposed "DET/HVG010". But HVG010 was already
+// permanently assigned to SelectMacro (issue #600), and DET009 was the previous
+// det_check maximum. So this rule ships as DET010 here and as HVG011 in the
+// guardrail catalog / `#[workflow]` macro lint.
 
 const DET010_ID: &str = "DET010";
 
 /// Iteration methods on `HashMap`/`HashSet` whose order is hash-randomized.
 /// Only a SINGLE argument-free call from this set on a tracked ident is
-/// flagged — longer chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`)
-/// are never flagged, which is how "already-sorted iterators are never
-/// flagged" holds.
+/// flagged. Longer chains (`map.keys().sorted()`, `.collect::<Vec<_>>()`) are
+/// never flagged. That is how "already-sorted iterators are never flagged"
+/// holds.
 const DET010_ITER_METHODS: &[&str] = &[
     "iter",
     "iter_mut",
@@ -1737,9 +1761,9 @@ const DET010_ITER_METHODS: &[&str] = &[
     "into_values",
 ];
 
-/// Command markers for the severity decision: a loop body containing any of
-/// these schedules history-ordered durable commands, so hash-order iteration
-/// is an Error; a command-free loop is a Warning.
+/// Command markers for the severity decision. A loop body that contains any of
+/// these schedules history-ordered durable commands, so hash-order iteration is
+/// an Error. A command-free loop is a Warning.
 const DET010_COMMAND_MARKERS: &[&str] = &[
     ".execute_activity",
     ".spawn_child_workflow",
@@ -1760,10 +1784,11 @@ const DET010_ALTERNATIVE: &str = "Use a BTreeMap/BTreeSet for any collection the
      into a Vec and sort() it before iterating: `let mut keys: Vec<_> = \
      map.keys().cloned().collect(); keys.sort();`.";
 
-/// The guardrail-catalog spelling of this rule. Honored as a suppression
-/// alias (AC5, issue #785): `// harvest-suppress: HVG011 "reason"` suppresses
-/// a DET010 finding exactly like the DET010 spelling, and is echoed into
-/// [`DetCheckReport::suppressions`] with the id the author actually wrote.
+/// The guardrail-catalog spelling of this rule. It is a suppression alias (AC5,
+/// issue #785). A `// harvest-suppress: HVG011 "reason"` comment suppresses a
+/// DET010 finding exactly like the DET010 spelling.
+/// [`DetCheckReport::suppressions`] echoes it with the id the author actually
+/// wrote.
 const DET010_HVG_ALIAS: &str = "HVG011";
 
 /// Bound on how many continuation lines a multi-line `let` statement is
@@ -1783,25 +1808,27 @@ enum Det010Event {
 enum Det010LetBinding {
     /// A single plain ident binding — tracked (`is_hash`) or masked (`!is_hash`).
     Simple { ident: String, is_hash: bool },
-    /// A pattern binding (destructuring, enum variant, let-else): every
-    /// plausibly-bound ident is masked (never tracked — unknown shapes
-    /// default to NOT flagging, false positives are the top risk).
+    /// A pattern binding (destructuring, enum variant, let-else). Every
+    /// plausibly-bound ident is masked and never tracked. Unknown shapes
+    /// default to NOT flagging, because false positives are the top risk.
     PatternMask(Vec<String>),
 }
 
-/// Single ordered pass over a workflow body: track hash-typed `let` bindings
-/// in a lexical scope stack (brace depth opens/closes scopes; a non-hash
-/// binding MASKS an outer tracked binding rather than deleting it, so scope
-/// exit restores the outer state — PR #970 review, P1-C), then flag
-/// `for … in` loops over a tracked binding, with command-aware severity and
-/// `harvest-suppress` support (DET010 or its HVG011 catalog alias).
+/// Single ordered pass over a workflow body that flags `for … in` loops over a
+/// tracked hash binding.
 ///
-/// LEXER CAVEAT (shared with DET001–DET009, pre-existing): the line-based
-/// lexer does not track multi-line string literals — the continuation lines
-/// of a string opened on an earlier line are lexed as code, so string content
-/// that *looks like* a `let`/`for`/brace can perturb binding tracking. Keep
-/// multi-line strings out of workflow bodies (they are almost always test
-/// fixtures) or suppress the resulting finding.
+/// It tracks hash-typed `let` bindings in a lexical scope stack, where brace
+/// depth opens and closes scopes. A non-hash binding MASKS an outer tracked
+/// binding instead of deleting it, so scope exit restores the outer state
+/// (PR #970). Severity is command-aware, and `harvest-suppress` works with DET010
+/// or its HVG011 catalog alias.
+///
+/// LEXER CAVEAT (shared with DET001–DET009, pre-existing): the line-based lexer
+/// does not track multi-line string literals. It lexes the continuation lines
+/// of a string opened on an earlier line as code. So string content that *looks
+/// like* a `let`/`for`/brace can perturb binding tracking. Keep multi-line
+/// strings out of workflow bodies (they are almost always test fixtures), or
+/// suppress the resulting finding.
 fn check_hash_iteration(scope_ctx: &BodyScope, body_lines: &[(u32, &str)]) -> DetCheckReport {
     use std::collections::HashMap;
 
@@ -1810,10 +1837,10 @@ fn check_hash_iteration(scope_ctx: &BodyScope, body_lines: &[(u32, &str)]) -> De
         .iter()
         .map(|&(_, line)| strip_unparseable_content(line))
         .collect();
-    // Per-line brace/marker metadata, computed once (single pass) so the
-    // per-finding loop-body severity scan is O(1) per interior line —
-    // adversarial unbalanced-brace input can no longer make it quadratic
-    // (PR #970 review, P2-A).
+    // Per-line brace/marker metadata, computed once in a single pass. So the
+    // per-finding loop-body severity scan is O(1) per interior line.
+    // Adversarial unbalanced-brace input can no longer make it quadratic
+    // (PR #970).
     let meta: Vec<Det010LineMeta> = stripped.iter().map(|l| det010_line_meta(l)).collect();
 
     // Lexical scope stack: ident → is-hash. Lookup walks innermost-out.
@@ -1914,9 +1941,9 @@ fn det010_line_events(code: &str) -> Vec<(usize, Det010Event)> {
     events
 }
 
-/// Records a DET010 finding — or, when a `harvest-suppress` comment for
-/// DET010 (or its HVG011 catalog alias, AC5) is present, the suppression,
-/// echoed with the exact id the author wrote.
+/// Records a DET010 finding, or the suppression when a `harvest-suppress`
+/// comment is present. The comment may name DET010 or its HVG011 catalog alias
+/// (AC5). The suppression echoes the exact id the author wrote.
 fn det010_emit_for_finding(
     report: &mut DetCheckReport,
     scope: &BodyScope,
@@ -1966,15 +1993,14 @@ const fn is_ident_byte(b: u8) -> bool {
 }
 
 /// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is the
-/// bare combinator NAME (no trailing `(`) — a cheap substring locator; the
-/// accept/reject decision is made by the path-precise
-/// [`matches_futures_combinator_pattern`], which confirms the name is a complete
-/// token, requires a call `(` (skipping an optional turbofish and whitespace),
-/// and extracts the full qualified path ending at the call to match it exactly
-/// against the allowed set. This keeps `det_check` in lock-step with the
-/// compile-time HVG010 guardrail's `is_select_combinator_path`, which matches
-/// whole paths exactly after `syn` has already stripped any turbofish
-/// (#980 Codex P2 review).
+/// bare combinator NAME (no trailing `(`), a cheap substring locator. The
+/// path-precise [`matches_futures_combinator_pattern`] makes the accept/reject
+/// decision. It confirms that the name is a complete token. It requires a call
+/// `(`, after an optional turbofish and whitespace. It extracts the full
+/// qualified path that ends at the call, and matches it exactly against the
+/// allowed set. This keeps `det_check` in lock-step with the compile-time
+/// HVG010 guardrail's `is_select_combinator_path` (#980). That function
+/// matches whole paths exactly after `syn` has stripped any turbofish.
 const DET011_COMBINATOR_FN_PATTERNS: &[&str] =
     &["future::select", "select_all", "select_ok", "try_select"];
 
@@ -1984,9 +2010,10 @@ const DET011_COMBINATOR_FN_PATTERNS: &[&str] =
 /// crate's `determinism_lint.rs`: the `futures`-anchored qualified forms, their
 /// `future::…` short forms, and the genuinely bare distinctive names
 /// `select_all`/`select_ok`/`try_select`. A qualified path with any OTHER root
-/// (`crate::future::select`, `my_dsl::select_all`, `bar::future::select_ok`,
-/// `foo::try_select`) is deliberately absent, and bare `select` is deliberately
-/// absent (too ambiguous a free-fn / query-builder name to hard-block).
+/// is deliberately absent: `crate::future::select`, `my_dsl::select_all`,
+/// `bar::future::select_ok`, `foo::try_select`. Bare `select` is deliberately
+/// absent too, because it is too ambiguous a free-fn / query-builder name to
+/// hard-block.
 fn is_allowed_combinator_path(path: &str) -> bool {
     matches!(
         path,
@@ -2008,27 +2035,27 @@ fn is_allowed_combinator_path(path: &str) -> bool {
 /// `future::select` or `select_all`) occurs in `code` as a genuine futures
 /// combinator call. For each occurrence of `pattern` the check is:
 ///
-/// 1. The name must be a complete token — the byte immediately after it must
-///    not be an identifier byte, so `future::select` inside `future::selected`
-///    / `future::select_all`, or `select_all` inside `select_all_flag`, is not
-///    a false hit (the longer name is caught by its own anchor).
+/// 1. The name must be a complete token. The byte right after it must not be an
+///    identifier byte. So `future::select` inside `future::selected` /
+///    `future::select_all`, or `select_all` inside `select_all_flag`, is not a
+///    false hit. The longer name is caught by its own anchor.
 /// 2. A call `(` must follow once an OPTIONAL turbofish `::<…>` and any
-///    surrounding whitespace are skipped (see [`call_paren_follows`]). This is
-///    what makes `future::select::<_, _>(a, b)` and `select_all::<Vec<_>>(v)`
-///    match — the syn-based HVG010 macro lint strips such path arguments before
-///    matching, so `det_check` must tolerate them too (#980 Codex P2).
-/// 3. The full qualified path ending at the name is extracted by walking
-///    backward over the contiguous run of path bytes (identifier bytes and
-///    `:`), then matched exactly against [`is_allowed_combinator_path`] after a
-///    single optional leading `::` is stripped (so an absolute path like
-///    `::futures::future::select` matches, mirroring the macro lint's
-///    `path_to_string`, which ignores `leading_colon`). A path run immediately
-///    preceded by `.` is a method call and is rejected.
+///    surrounding whitespace are skipped (see [`call_paren_follows`]). So
+///    `future::select::<_, _>(a, b)` and `select_all::<Vec<_>>(v)` match. The
+///    syn-based HVG010 macro lint strips such path arguments before matching,
+///    so `det_check` must tolerate them too (#980).
+/// 3. A backward walk over the contiguous run of path bytes (identifier bytes
+///    and `:`) extracts the full qualified path that ends at the name. A single
+///    optional leading `::` is stripped. The path must then match
+///    [`is_allowed_combinator_path`] exactly. So an absolute path like
+///    `::futures::future::select` matches. That mirrors the macro lint's
+///    `path_to_string`, which ignores `leading_colon`. A path run right after a
+///    `.` is a method call and is rejected.
 ///
-/// This is path-precise, so an unrelated helper of the same tail name under a
-/// different root (`crate::future::select`, `my_dsl::select_all`,
-/// `::my_dsl::select_all`) is never flagged — mirroring the macro lint's
-/// exact-path matching — with or without a leading `::` or a turbofish.
+/// This is path-precise, like the macro lint's exact-path matching. An
+/// unrelated helper with the same tail name under a different root is never
+/// flagged, with or without a leading `::` or a turbofish. Examples are
+/// `crate::future::select`, `my_dsl::select_all` and `::my_dsl::select_all`.
 fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
     let bytes = code.as_bytes();
     let name_len = pattern.len();
@@ -2043,28 +2070,30 @@ fn matches_futures_combinator_pattern(code: &str, pattern: &str) -> bool {
         if !call_paren_follows(bytes, name_end) {
             return false;
         }
-        // (3) Extract the full qualified path ending at the name (walking back
-        // over the contiguous path run and stripping an optional leading `::`),
-        // and match it exactly against the allowed set. A `.`-preceded run is a
-        // method call → `None` → rejected.
+        // (3) Extract the full qualified path that ends at the name. Walk back
+        // over the contiguous path run and strip an optional leading `::`. Then
+        // match the path exactly against the allowed set. A `.`-preceded run is
+        // a method call → `None` → rejected.
         extract_qualified_path(code, pos, name_end).is_some_and(is_allowed_combinator_path)
     })
 }
 
-/// Walk backward from `name_start` over the contiguous path run (identifier
-/// bytes and `:`) and return the full qualified path from the run start through
-/// `name_end`, with a single optional leading `::` stripped (so an absolute
-/// path like `::tokio::select` normalizes to `tokio::select`, mirroring the
-/// syn-based HVG010 macro lint's `path_to_string`, which ignores
-/// `leading_colon`). Returns `None` when the run is immediately preceded by a
-/// `.` — a method call, which is never a qualified path/macro invocation.
+/// Walk backward from `name_start` over the contiguous path run and return the
+/// full qualified path through `name_end`.
+///
+/// The path run holds identifier bytes and `:`. A single optional leading `::`
+/// is stripped, so an absolute path like `::tokio::select` normalizes to
+/// `tokio::select`. That mirrors the syn-based HVG010 macro lint's
+/// `path_to_string`, which ignores `leading_colon`. Returns `None` when a `.`
+/// immediately precedes the run. That is a method call, which is never a
+/// qualified path/macro invocation.
 ///
 /// Shared by the DET011 combinator-FUNCTION matcher
 /// ([`matches_futures_combinator_pattern`]) and the DET011 select-MACRO matcher
 /// ([`matches_select_macro_pattern`]) so both extract the path identically. The
-/// caller supplies `name_start`/`name_end` — for a function the whole pattern
-/// (`future::select`) is the tail run; for a macro the `!` is excluded from
-/// `name_end` so only the macro PATH (`tokio::select`) is returned.
+/// caller supplies `name_start`/`name_end`. For a function, the whole pattern
+/// (`future::select`) is the tail run. For a macro, `name_end` excludes the
+/// `!`, so only the macro PATH (`tokio::select`) is returned.
 fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Option<&str> {
     let bytes = code.as_bytes();
     let mut run_start = name_start;
@@ -2084,12 +2113,12 @@ fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Opt
     Some(path.strip_prefix("::").unwrap_or(path))
 }
 
-/// From byte index `after_name` (just past a combinator name token), returns
-/// `true` if a call `(` follows once an OPTIONAL turbofish `::<…>` and any
-/// surrounding whitespace are skipped. The turbofish's angle brackets are
-/// matched with a balanced-depth scan (their contents may contain nested `<>`,
-/// commas, paths, and `_`); the scan is bounded by `bytes.len()`, so it cannot
-/// run away, and an unbalanced group is rejected rather than treated as a call.
+/// From byte index `after_name`, just past a combinator name token, returns
+/// `true` if a call `(` follows. An OPTIONAL turbofish `::<…>` and any
+/// surrounding whitespace are skipped first. A balanced-depth scan matches the
+/// turbofish's angle brackets. Their contents may hold nested `<>`, commas,
+/// paths and `_`. The scan is bounded by `bytes.len()`, so it cannot run away.
+/// An unbalanced group is rejected, not treated as a call.
 ///
 /// Recognized shapes (all → `true`):
 /// `name(`, `name (`, `name::<T>(`, `name::<_, _> (`, `name::<Vec<Box<T>>>(`.
@@ -2125,13 +2154,13 @@ const fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
 }
 
 /// DET011 candidate patterns for the select MACROS. Each carries a trailing
-/// `!` (so the macro NAME is a complete token bounded on the right by the bang,
-/// which keeps `select_biasedx!` and a `select` prefix inside `select_biased!`
-/// from matching); the accept/reject decision is made by the path-precise
-/// [`matches_select_macro_pattern`], which extracts the full qualified macro
-/// path and matches it EXACTLY against [`is_allowed_select_macro_path`]. This
-/// keeps `det_check` in lock-step with the compile-time HVG010 guardrail's
-/// `visit_macro`, which matches macro paths exactly (#799 / #980 Codex P2).
+/// `!`, so the macro NAME is a complete token bounded on the right by the bang.
+/// That keeps `select_biasedx!` and a `select` prefix inside `select_biased!`
+/// from matching. The path-precise [`matches_select_macro_pattern`] makes the
+/// accept/reject decision. It extracts the full qualified macro path and
+/// matches it EXACTLY against [`is_allowed_select_macro_path`]. This keeps
+/// `det_check` in lock-step with the compile-time HVG010 guardrail's
+/// `visit_macro`, which matches macro paths exactly (#799 / #980).
 const DET011_MACRO_PATTERNS: &[&str] = &["select!", "select_biased!"];
 
 /// The exact set of paths that name a select MACRO flagged by HVG010.
@@ -2139,11 +2168,11 @@ const DET011_MACRO_PATTERNS: &[&str] = &["select!", "select_biased!"];
 /// This mirrors, case-for-case, the allowed-path set in the macro crate's
 /// `determinism_lint.rs::visit_macro`: bare `select`/`select_biased`,
 /// `tokio::select`, `futures::select`, and `futures::select_biased`. Note that
-/// `tokio::select_biased` is deliberately ABSENT — it is not in `visit_macro`'s
-/// set either. A qualified path with any OTHER root (`crate::ui::select`,
-/// `my::select_biased`, `foo::bar::select`) is absent, so those are never
-/// flagged, exactly as the compile-time guardrail leaves them un-flagged
-/// (#980 Codex P2 — the qualified-macro-path false-positive fix).
+/// `tokio::select_biased` is deliberately ABSENT, because it is not in
+/// `visit_macro`'s set either. A qualified path with any OTHER root
+/// (`crate::ui::select`, `my::select_biased`, `foo::bar::select`) is absent. So
+/// those are never flagged, exactly as the compile-time guardrail leaves them
+/// unflagged. This is the qualified-macro-path false-positive fix of #980.
 fn is_allowed_select_macro_path(path: &str) -> bool {
     matches!(
         path,
@@ -2151,26 +2180,27 @@ fn is_allowed_select_macro_path(path: &str) -> bool {
     )
 }
 
-/// True if a select-macro `pattern` (`select!` or `select_biased!`, trailing
-/// `!` included) occurs in `code` as an invocation whose FULL qualified macro
-/// path is in the allowed set. For each occurrence the check is:
+/// True if a select-macro `pattern` occurs in `code` as an invocation whose FULL
+/// qualified macro path is in the allowed set.
 ///
-/// 1. The trailing `!` in `pattern` guarantees the macro name is a complete
-///    token on the right (`select_biasedx!` and a `select!` match inside
-///    `select_biased!` are excluded by `match_indices` itself).
-/// 2. The full qualified path ending at the macro name (the `!` excluded) is
-///    extracted by [`extract_qualified_path`] — walking backward over the
-///    contiguous path run and stripping an optional leading `::` — then matched
-///    exactly against [`is_allowed_select_macro_path`]. A `.`-preceded run
+/// `pattern` is `select!` or `select_biased!`, with the trailing `!`. For each
+/// occurrence the check is:
+///
+/// 1. The trailing `!` in `pattern` makes the macro name a complete token on
+///    the right. So `match_indices` itself excludes `select_biasedx!` and a
+///    `select!` match inside `select_biased!`.
+/// 2. [`extract_qualified_path`] extracts the full qualified path that ends at
+///    the macro name, with the `!` excluded. It walks backward over the
+///    contiguous path run and strips an optional leading `::`. The path must
+///    then match [`is_allowed_select_macro_path`] exactly. A `.`-preceded run
 ///    (`None`) is rejected.
 ///
-/// This is path-precise, so an unrelated macro of the same tail name under a
-/// different root (`crate::ui::select!`, `my::select_biased!`,
-/// `foo::bar::select!`) is never flagged — mirroring `visit_macro`'s
-/// exact-path matching — while `::tokio::select!` normalizes to `tokio::select`
-/// and IS flagged. `sql_select!` / `my_select!` are absorbed into a
-/// non-matching path (`sql_select` / `my_select`) by the backward walk and stay
-/// unflagged.
+/// This is path-precise, like `visit_macro`'s exact-path matching. An
+/// unrelated macro with the same tail name under a different root is never
+/// flagged: `crate::ui::select!`, `my::select_biased!`, `foo::bar::select!`.
+/// `::tokio::select!` normalizes to `tokio::select` and IS flagged. The
+/// backward walk absorbs `sql_select!` / `my_select!` into a non-matching path
+/// (`sql_select` / `my_select`), so they stay unflagged.
 fn matches_select_macro_pattern(code: &str, pattern: &str) -> bool {
     // `pattern` ends with `!`; exclude it so only the macro PATH is extracted.
     let name_end_offset = pattern.len() - 1;
@@ -2198,9 +2228,9 @@ const fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Text of one `let` statement (everything after the `let` keyword, up to but
-/// not including the terminating `;`), joining continuation lines when the
-/// statement spans multiple source lines (PR #970 review, P2-D).
+/// Text of one `let` statement, from after the `let` keyword up to but not
+/// including the terminating `;`. It joins continuation lines when the
+/// statement spans multiple source lines (PR #970).
 ///
 /// Join rules (conservative — a failed join defaults to not-tracked):
 /// - the same-line remainder ends the join at the first `;` or brace;
@@ -2263,13 +2293,14 @@ fn det010_pattern_mask_idents(pattern: &str) -> Vec<String> {
 }
 
 /// Parses one `let` statement (text after the `let` keyword) into a DET010
-/// binding decision. Positional, not word-containment: a statement that
-/// merely *mentions* `HashMap` somewhere (`Vec<HashMap<..>>` annotation,
-/// `load_ids::<HashMap<..>>()` call turbofish) is NOT tracked — only a type
-/// annotation that *starts with* `HashMap`/`HashSet` (path prefix stripped),
-/// a `HashMap::new()`-family constructor call, or a
-/// `.collect::<HashMap<..>>()` turbofish (incl. `Result`/`Option`-wrapped)
-/// tracks the binding (PR #970 review, P1-B).
+/// binding decision. The match is positional, not word-containment. A statement
+/// that merely *mentions* `HashMap` somewhere is NOT tracked, e.g. a
+/// `Vec<HashMap<..>>` annotation or a `load_ids::<HashMap<..>>()` call
+/// turbofish. Only three shapes track the binding (PR #970). The first is a
+/// type annotation that *starts with* `HashMap`/`HashSet` (path prefix
+/// stripped). The second is a `HashMap::new()`-family constructor call. The
+/// third is a `.collect::<HashMap<..>>()` turbofish (incl.
+/// `Result`/`Option`-wrapped).
 fn det010_parse_let(stmt: &str) -> Det010LetBinding {
     let s = stmt.trim_start();
     let s = s.strip_prefix("mut ").map_or(s, str::trim_start);
@@ -2296,11 +2327,10 @@ fn det010_parse_let(stmt: &str) -> Det010LetBinding {
 }
 
 /// Splits `": Type = init"` content (text after the annotation colon) into
-/// the type text and the optional initializer. The initializer `=` is the
-/// first `=` at angle-bracket depth <= 0 that does not begin `==` (an
-/// associated-type binding `Item = X` inside `<..>` is at depth > 0; the `>`
-/// of a fn-pointer `->` return arrow can push the running depth negative,
-/// hence `<=`).
+/// the type text and the optional initializer. The initializer `=` is the first
+/// `=` at angle-bracket depth <= 0 that does not begin `==`. An associated-type
+/// binding `Item = X` inside `<..>` is at depth > 0. The `>` of a fn-pointer
+/// `->` return arrow can push the running depth negative, hence `<=`.
 fn det010_split_type_and_init(after_colon: &str) -> (&str, Option<&str>) {
     let bytes = after_colon.as_bytes();
     let mut depth: i32 = 0;
@@ -2319,10 +2349,10 @@ fn det010_split_type_and_init(after_colon: &str) -> (&str, Option<&str>) {
     (after_colon, None)
 }
 
-/// `true` when a type annotation text names a hash collection at its ROOT:
-/// optional leading path segments (`std::collections::`), then
+/// `true` when a type annotation text names a hash collection at its ROOT. That
+/// is optional leading path segments (`std::collections::`), then
 /// `HashMap`/`HashSet` followed by `<`, whitespace, or end. `Vec<HashMap<..>>`
-/// and `Option<HashMap<..>>` do not match — the hash type is nested, not the
+/// and `Option<HashMap<..>>` do not match: the hash type is nested, not the
 /// binding's own type.
 fn det010_type_is_hash(type_text: &str) -> bool {
     let mut t = type_text.trim();
@@ -2406,11 +2436,11 @@ fn det010_init_has_hash_ctor(init: &str) -> bool {
     false
 }
 
-/// `true` when a `.collect::<..>()` turbofish in the initializer targets a
-/// hash collection, including the `Result<HashMap<..>, E>` /
-/// `Option<HashMap<..>>` wrapped forms (the wrapper's first generic argument
-/// is what `?`/unwrap yields). `.collect::<Vec<HashMap<..>>>()` does not
-/// match — the produced collection is the Vec.
+/// `true` when a `.collect::<..>()` turbofish in the initializer targets a hash
+/// collection. That includes the `Result<HashMap<..>, E>` /
+/// `Option<HashMap<..>>` wrapped forms, because `?`/unwrap yields the wrapper's
+/// first generic argument. `.collect::<Vec<HashMap<..>>>()` does not match: the
+/// produced collection is the Vec.
 fn det010_collect_targets_hash(init: &str) -> bool {
     const NEEDLE: &str = ".collect::<";
     let mut search = init;
@@ -2468,10 +2498,10 @@ fn det010_scope_lookup(scopes: &[std::collections::HashMap<String, bool>], ident
     false
 }
 
-/// If a `for` loop header's iterated expression (`expr` is the text after
-/// ` in `) is a tracked hash-typed binding — a bare ident, `&ident` /
-/// `&mut ident`, or exactly one argument-free [`DET010_ITER_METHODS`] call on
-/// the ident — returns the binding ident.
+/// Returns the binding ident if a `for` loop header iterates a tracked
+/// hash-typed binding. `expr` is the text after ` in `. It matches a bare
+/// ident, `&ident` / `&mut ident`, or exactly one argument-free
+/// [`DET010_ITER_METHODS`] call on the ident.
 fn det010_for_target(
     expr: &str,
     scopes: &[std::collections::HashMap<String, bool>],
@@ -2480,7 +2510,6 @@ fn det010_for_target(
     let expr = expr.strip_prefix("&mut ").unwrap_or(expr);
     let expr = expr.strip_prefix('&').unwrap_or(expr).trim();
 
-    // Bare tracked ident.
     if !expr.is_empty() && expr.chars().all(is_ident_char) {
         return det010_scope_lookup(scopes, expr).then(|| expr.to_string());
     }
@@ -2504,7 +2533,6 @@ struct Det010LineMeta {
     /// Minimum running brace delta within the line (detects a close that
     /// dips the depth to zero even when the net delta does not).
     min_delta: i32,
-    /// Whether the line contains any `{`.
     has_open: bool,
     /// Whether the line contains any [`DET010_COMMAND_MARKERS`] substring.
     has_marker: bool,
@@ -2568,12 +2596,12 @@ fn det010_scan_segment(segment: &str, depth: &mut i64, entered: &mut bool) -> Op
 /// Scans the loop body for command markers to decide DET010 severity.
 ///
 /// The scan starts at the `for` token's byte offset on the `for` line
-/// (`for_pos`) — a command or an enclosing `{` BEFORE the `for` on the same
-/// line can neither inflate the severity nor drag the depth accounting past
-/// the loop's own close (PR #970 review, P3.2). Interior lines use the
-/// precomputed per-line [`Det010LineMeta`] so each is O(1) unless it is the
-/// line the body actually closes on — unbalanced-brace input therefore costs
-/// O(lines) per finding instead of an O(bytes-to-EOF) rescan (P2-A).
+/// (`for_pos`). So a command or an enclosing `{` BEFORE the `for` on the same
+/// line cannot inflate the severity. Nor can it drag the depth accounting past
+/// the loop's own close (PR #970). Interior lines use the precomputed per-line
+/// [`Det010LineMeta`]. So each is O(1), unless it is the line where the body
+/// actually closes. Unbalanced-brace input therefore costs O(lines) per
+/// finding, not an O(bytes-to-EOF) rescan.
 fn det010_loop_body_has_command(
     stripped: &[String],
     meta: &[Det010LineMeta],
@@ -2840,28 +2868,28 @@ fn raw_string_end(line: &str, start: usize) -> Option<usize> {
 /// and everything from the first `//` comment stripped.
 /// This prevents pattern matches inside string data or comments.
 ///
-/// Fused single pass: this used to be `strip_line_comment(line)` (which itself
-/// scans the whole line via `line_comment_start`, skipping over string/char/
-/// raw-string/block-comment regions to find the first bare `//`) followed by a
-/// *second*, separate character-by-character walk over that already-truncated
-/// text to strip string/char-literal content and block comments. Both walks
-/// classify every character with the exact same skip-region logic
-/// (`raw_string_end` / `normal_string_end` / `char_literal_end` /
-/// `block_comment_end`), so scanning twice was pure duplicated work -- and
-/// this function is the innermost per-line hot path of `extract_all_functions`
-/// (called on essentially every module-scaffolding line of a scanned source
-/// tree). Equivalence: `line_comment_start`'s skip-region decisions for a
-/// prefix `line[..p]` are identical to this loop's decisions over that same
-/// prefix (both start scanning at position 0 and use the same classifiers), so
-/// stopping this loop the instant a bare `//` is found reproduces exactly what
-/// two-pass `strip_line_comment(line)` then re-scan would have produced. See
+/// Fused single pass. This used to be two walks. The first was
+/// `strip_line_comment(line)`, which scans the whole line via
+/// `line_comment_start` to find the first bare `//`. It skips
+/// string/char/raw-string/block-comment regions. The second was a separate
+/// character-by-character walk over that truncated text. It stripped
+/// string/char-literal content and block comments. Both walks classify every
+/// character with the same skip-region logic (`raw_string_end` /
+/// `normal_string_end` / `char_literal_end` / `block_comment_end`). So scanning
+/// twice was pure duplicated work. This function is the innermost per-line hot
+/// path of `extract_all_functions`, called on almost every module-scaffolding
+/// line of a scanned source tree.
+///
+/// Equivalence: for a prefix `line[..p]`, `line_comment_start` makes the same
+/// skip-region decisions as this loop. Both start at position 0 and use the
+/// same classifiers. So this loop stops the instant it finds a bare `//`, and
+/// that reproduces exactly the two-pass result. See
 /// `docs/performance-det-check.md`.
 fn strip_unparseable_content(line: &str) -> String {
-    // `result.len()` can never exceed `line.len()` (every push consumes one
-    // char of `line`; every skip region only removes bytes), so this is a
-    // tight-enough upper bound that guarantees zero reallocation during the
-    // loop below, without re-deriving the (now-removed) comment-truncated
-    // length via a second scan.
+    // `result.len()` can never exceed `line.len()`: every push consumes one
+    // char of `line`, and every skip region only removes bytes. So this upper
+    // bound guarantees zero reallocation in the loop below, with no second scan
+    // for the comment-truncated length.
     let mut result = String::with_capacity(line.len());
     let mut pos = 0;
 
@@ -2878,10 +2906,10 @@ fn strip_unparseable_content(line: &str) -> String {
         match ch {
             '"' => pos = normal_string_end(line, pos),
             '\'' => pos = char_literal_end(line, pos).unwrap_or(next_pos),
-            // A bare `//` (not inside a string/char/raw-string literal, which
-            // are all handled above before this match is even reached) ends
-            // the line -- nothing after it is ever part of the result, so stop
-            // rather than keep scanning content that would be discarded anyway.
+            // A bare `//` ends the line. String, char and raw-string literals
+            // are all handled above, before this match. Nothing after the `//`
+            // is ever part of the result, so stop instead of scanning content
+            // that would be discarded.
             '/' if line[next_pos..].starts_with('/') => break,
             '/' if line[next_pos..].starts_with('*') => {
                 pos = block_comment_end(line, next_pos + 1);
@@ -2976,8 +3004,7 @@ mod tests {
             fn_decl_name("fn plain<T>(x: T) {"),
             Some("plain".to_string())
         );
-        // Raw identifiers — the `r#` prefix is retained on the extracted name
-        // (#778, Codex r4).
+        // Raw identifiers keep the `r#` prefix on the extracted name (#778).
         assert_eq!(fn_decl_name("async fn r#gen("), Some("r#gen".to_string()));
         assert_eq!(
             fn_decl_name("pub fn r#type() -> i64 {"),
@@ -3020,7 +3047,6 @@ mod tests {
         assert_eq!(strip_leading_visibility("pub mod m"), "mod m");
         assert_eq!(strip_leading_visibility("pub(crate) fn f()"), "fn f()");
         assert_eq!(strip_leading_visibility("pub(in crate::x) mod m"), "mod m");
-        // No visibility modifier — unchanged.
         assert_eq!(strip_leading_visibility("mod m"), "mod m");
         // `public`/`pubfoo` are not visibility modifiers.
         assert_eq!(strip_leading_visibility("public_fn()"), "public_fn()");
@@ -3048,7 +3074,6 @@ mod tests {
         apply_line_braces_scoped("}", &mut scopes, &mut mods, false, None);
         assert_eq!(scopes, vec![ScopeKind::Module]);
         assert_eq!(mods, vec!["workflows".to_string()]);
-        // Closing the module empties both stacks.
         apply_line_braces_scoped("}", &mut scopes, &mut mods, false, None);
         assert_eq!(scopes, [] as [crate::det_check::ScopeKind; 0]);
         assert_eq!(mods, [] as [std::string::String; 0]);
@@ -3056,8 +3081,8 @@ mod tests {
 
     #[test]
     fn apply_line_braces_scoped_pops_module_when_impl_and_mod_close_on_one_line() {
-        // `} }` closing an impl (opaque) then the enclosing module on one line —
-        // the mod stack must pop exactly once (for the Module), not for the impl.
+        // `} }` closes an impl (opaque), then the enclosing module, on one line.
+        // The mod stack must pop exactly once, for the Module, not for the impl.
         let mut scopes = vec![ScopeKind::Module, ScopeKind::Opaque];
         let mut mods = vec!["outer".to_string()];
         apply_line_braces_scoped("} }", &mut scopes, &mut mods, false, None);

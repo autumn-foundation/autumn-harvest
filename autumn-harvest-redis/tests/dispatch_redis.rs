@@ -479,8 +479,7 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
 }
 
 /// One lease's delay overflowing `chrono::Duration` must not skip its
-/// siblings' release in the same batch (Codex review, issue #1429
-/// follow-up).
+/// siblings' release in the same batch (issue #1429 follow-up).
 ///
 /// `release_many_inner` used to build every entry's due time with a `?` on
 /// the `chrono::Duration::from_std` conversion. One out-of-range delay
@@ -586,7 +585,7 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
 }
 
 /// Acking a stale lease must not delete a marker a fresher entry now owns
-/// (Codex review, issue #1429).
+/// (issue #1429).
 ///
 /// A batched worker defers a lease's ack until after its task has already
 /// been spawned. A fast-completing task can re-pend and republish the same
@@ -653,7 +652,7 @@ async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
 }
 
 /// Recovering a stale, unacked lease must not clobber a fresher entry's
-/// marker (Codex review, issue #1429).
+/// marker (issue #1429).
 ///
 /// Same republish-before-settling setup as
 /// `acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact`, but the
@@ -912,13 +911,13 @@ async fn a_blocking_read_returns_early_when_an_entry_arrives() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_multi_queue_blocking_read_still_delivers_an_arrival_on_either_queue() {
-    // Issue #1429, Codex review: a multi-queue read no longer combines every
-    // queue's stream into one blocking `XREADGROUP` (that crossed Redis
-    // Cluster slots). It blocks on only the queue this call's own rotation
-    // leads with, and reads every other queue non-blocking. A caller's own
-    // poll loop calls `next` repeatedly. It still picks up an arrival on any
-    // queue within a small bounded number of calls, regardless of which
-    // queue led this call's rotation.
+    // Issue #1429: a multi-queue read no longer combines every queue's stream
+    // into one blocking `XREADGROUP` (that crossed Redis Cluster slots). It
+    // blocks on only the queue this call's own rotation leads with, and reads
+    // every other queue non-blocking. A caller's own poll loop calls `next`
+    // repeatedly. It still picks up an arrival on any queue within a small
+    // bounded number of calls, regardless of which queue led this call's
+    // rotation.
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {
         return;
     };
@@ -1032,8 +1031,7 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
 }
 
 /// A single busy queue's read is sized from the full remaining batch
-/// capacity, not an equal `max / queue_count` split (Codex review, issue
-/// #1429).
+/// capacity, not an equal `max / queue_count` split (issue #1429).
 ///
 /// Before this fix, `per_stream_count` divided the cap evenly across every
 /// configured queue, regardless of which ones actually had work. A worker
@@ -1083,8 +1081,8 @@ async fn a_busy_queue_gets_the_full_budget_among_idle_peers() {
 }
 
 /// A persistently broken queue must surface as an error, not a quiet
-/// success, even while a healthy sibling queue keeps delivering (Codex
-/// review, issue #1429).
+/// success, even while a healthy sibling queue keeps delivering (issue
+/// #1429).
 ///
 /// `read_across_queues` used to swallow a failing queue's error whenever
 /// any other queue in the same pass returned an entry. Consider a queue
@@ -1130,8 +1128,7 @@ async fn a_persistently_broken_queue_is_not_masked_by_a_healthy_sibling() {
 }
 
 /// Every configured queue erroring immediately must end the blocking wait
-/// early, not spin for the whole budget (Codex review, issue #1429
-/// follow-up).
+/// early, not spin for the whole budget (issue #1429 follow-up).
 ///
 /// An immediate error -- `WRONGTYPE`, an ACL rejection -- returns at once.
 /// It consumes none of a blocking read's own wait slice, unlike a real
@@ -1202,7 +1199,7 @@ async fn every_queue_is_served_when_the_read_cap_is_one() {
 }
 
 /// An entry published on a non-leader queue must not wait out the leader's
-/// full blocking timeout (Codex review, issue #1429).
+/// full blocking timeout (issue #1429).
 ///
 /// `read_across_queues` blocks each queue's stream on its own single-key
 /// call. A multi-key `XREADGROUP` across several queues' hash-tagged
@@ -1259,8 +1256,8 @@ async fn a_non_leader_queue_is_not_starved_behind_the_leaders_full_wait() {
 }
 
 /// A queue near the tail of a long rotation must still get a blocking
-/// look within the same `wait` (Codex review, issue #1429). That must
-/// hold however many queues are configured.
+/// look within the same `wait` (issue #1429). That must hold however many
+/// queues are configured.
 ///
 /// A fixed per-queue blocking slice does not fit a lap with more queues
 /// than `wait / QUEUE_BLOCK_SLICE`. The deadline passes before the
@@ -1406,7 +1403,7 @@ async fn a_malformed_entry_leaves_the_pending_list() {
 }
 
 /// Malformed entries spanning two queues in one multi-queue read must both
-/// get cleaned up (Codex review, issue #1429).
+/// get cleaned up (issue #1429).
 ///
 /// `discard_entries` used to build one atomic `MULTI`/`EXEC` pipe over
 /// every malformed entry a read collected, across every queue involved.

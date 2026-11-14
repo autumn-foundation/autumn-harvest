@@ -1,23 +1,22 @@
 //! The persist-site **class invariant** (corrections 3 & 4).
 //!
-//! Every persist site in the backend appends its event(s) and mutates its durable
-//! rows inside ONE `conn.transaction()`, so a crash (modelled by dropping the
-//! runtime and re-opening the file) can never leave the event history and the
-//! durable rows observably out of sync. Rather than only per-site tests, this
-//! sweep drives a single workflow through EVERY site type — start, deterministic
-//! side effect, activity dispatch + drain, timer arm + fire, signal delivery, and
-//! terminal — reopening the database at each stage and asserting history ⟷ rows
-//! consistency after each reopen. It also proves the activity body runs exactly
-//! once across all the reopens (deterministic replay).
+//! Every persist site in the backend appends its events and mutates its durable
+//! rows inside ONE `conn.transaction()`. A crash, modelled by dropping the runtime
+//! and re-opening the file, can never leave history and rows observably out of
+//! sync. This sweep adds to the per-site tests. It drives one workflow through
+//! EVERY site type: start, deterministic side effect, activity dispatch + drain,
+//! timer arm + fire, signal delivery, and terminal. It reopens the database at each
+//! stage and asserts history ⟷ rows consistency. It also proves the activity body
+//! runs exactly once across all the reopens (deterministic replay).
 //!
 //! **What "crash" means here:** each stage boundary is a clean `drop(rt)` of a
-//! *quiesced* runtime, so this sweep proves **logical atomicity** — the committed
-//! state is internally consistent (history ⟷ rows) at every reopen. It does NOT
-//! model a mid-transaction interruption or fsync/power-loss durability: true
-//! crash-between-append-and-mutate is covered by the inline `*_within_tx`
-//! drop-uncommitted unit tests in `src/{runtime,worker}.rs`, and a genuine
-//! stranded-`RUNNING` reopen is covered by
-//! `durability::orphaned_running_task_is_reclaimed_and_body_reruns`.
+//! *quiesced* runtime. So this sweep proves **logical atomicity**: the committed
+//! state is consistent (history ⟷ rows) at every reopen. It does NOT model a
+//! mid-transaction interruption or fsync/power-loss durability. The inline
+//! `*_within_tx` drop-uncommitted unit tests in `src/{runtime,worker}.rs` cover a
+//! crash between append and mutate.
+//! `durability::orphaned_running_task_is_reclaimed_and_body_reruns` covers a real
+//! stranded-`RUNNING` reopen.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -188,7 +187,7 @@ async fn reopen_consistency_across_every_persist_site() {
     };
     assert_reopen_consistent(&build_rt(&path, &calls), &path, exec);
 
-    // Stage 2 — drive through the side effect + activity dispatch/drain; the timer
+    // Stage 2 — drive through the side effect + activity dispatch/drain. The timer
     // arms and the run blocks WaitingTimer (deadline t0+5 is not due at t0).
     {
         let mut rt = build_rt(&path, &calls);

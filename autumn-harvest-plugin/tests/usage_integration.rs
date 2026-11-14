@@ -1,12 +1,13 @@
 //! Integration tests for `GET /admin/usage` (issue #596).
 //!
 //! Seeds workflow executions and hand-inserted `harvest_events` rows with
-//! explicit timestamps, and asserts the endpoint aggregates workflow starts,
-//! terminal outcomes, activity executions/failures, and activity
-//! compute-seconds correctly, honors both `group_by` modes (including the
-//! `"(unattributed)"` bucket), enforces the window ceiling, merges across
-//! shards, and degrades gracefully (never a 500) when a shard is
-//! unreachable.
+//! explicit timestamps. The tests assert that the endpoint:
+//!
+//! - aggregates workflow starts, terminal outcomes, activity
+//!   executions/failures and activity compute-seconds correctly;
+//! - honors both `group_by` modes, including the `"(unattributed)"` bucket;
+//! - enforces the window ceiling and merges across shards;
+//! - degrades gracefully (never a 500) when a shard is unreachable.
 
 use std::collections::BTreeMap;
 
@@ -427,12 +428,12 @@ async fn terminal_outcomes_counted_by_durable_terminal_events() {
 
 #[tokio::test]
 async fn redriven_failure_still_counted_in_the_window_it_occurred() {
-    // Locks in the PR #895 review fix: usage-report terminal outcomes are
+    // Locks in the PR #895 fix: usage-report terminal outcomes are
     // immutable historical facts derived from durable events, not mutable
     // row-state snapshots. A DLQ redrive (reactivate_failed_execution)
-    // clears a FAILED row's state/completed_at but never rewrites or
-    // removes the original WorkflowFailed event, so a report re-run for
-    // the window the failure actually occurred in must still show it.
+    // clears a FAILED row's state/completed_at. It never rewrites or removes
+    // the original WorkflowFailed event. So a report re-run over the window of
+    // the failure must still show it.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let now = Utc::now();
@@ -441,9 +442,9 @@ async fn redriven_failure_still_counted_in_the_window_it_occurred() {
     let exec_id = seed_execution(&url, 0, "onboarding", "FAILED", started, Some(now), None).await;
     seed_terminal_event(&url, exec_id, 1, "WorkflowFailed", now).await;
 
-    // Simulate a redrive: the row flips back to RUNNING and completed_at is
-    // cleared, mirroring exactly what reactivate_failed_execution does to
-    // the row, without touching the already-recorded WorkflowFailed event.
+    // Simulate a redrive as reactivate_failed_execution does it: the row flips
+    // back to RUNNING and completed_at is cleared. The recorded WorkflowFailed
+    // event stays untouched.
     {
         use autumn_harvest::schema::harvest_workflow_executions::dsl;
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
@@ -518,13 +519,12 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
 
 #[tokio::test]
 async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
-    // PR #895 review (chatgpt-codex-connector): a DAG retry/reset with
-    // allow_terminal_source can seal a CANCELLED source execution to
-    // TERMINATED (reset.rs's sealable_states). Because that reset also
-    // appends WorkflowResetTerminated on the source execution -- unlike a
-    // genuine terminate, which never does -- the cancelled counter must
-    // keep counting the original WorkflowCancelled event instead of losing
-    // it once the row moves off CANCELLED.
+    // PR #895: a DAG retry/reset with allow_terminal_source can seal a
+    // CANCELLED source execution to TERMINATED (reset.rs's sealable_states).
+    // That reset also appends WorkflowResetTerminated on the source execution.
+    // A genuine terminate never does. So the cancelled counter must keep
+    // counting the original WorkflowCancelled event after the row leaves
+    // CANCELLED.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let now = Utc::now();
@@ -570,11 +570,11 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
 
 #[tokio::test]
 async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
-    // PR #895 review (chatgpt-codex-connector): enforce_external_task_timeouts
-    // appends ActivityTimedOut for external activities that never emit
-    // ActivityStarted (they're dispatched via ActivityAwaitingExternal, never
-    // claimed by a worker). activity_executions_failed must require a
-    // matching start, same as activity_compute_seconds already does.
+    // PR #895: enforce_external_task_timeouts appends ActivityTimedOut for
+    // external activities that never emit ActivityStarted. They are dispatched
+    // via ActivityAwaitingExternal, and no worker claims them.
+    // activity_executions_failed must require a matching start, as
+    // activity_compute_seconds already does.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let now = Utc::now();
@@ -841,11 +841,10 @@ async fn one_shard_down_is_partial_not_500() {
 
 #[tokio::test]
 async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
-    // Locks in the documented limitation (issue #596 F1): an execution whose
-    // search_attrs value for the requested key literally equals the
-    // "(unattributed)" sentinel is indistinguishable from an execution that
-    // lacks the key entirely — both merge into the same group. This is an
-    // accepted, documented limitation, not a defect (see the module doc in
+    // Locks in the documented limitation (issue #596). A search_attrs value
+    // that literally equals the "(unattributed)" sentinel looks the same as a
+    // missing key. Both merge into the same group. This is an accepted,
+    // documented limitation, not a defect (see the module doc in
     // autumn-harvest/src/usage.rs).
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
@@ -916,12 +915,11 @@ async fn group_count_over_cap_is_413_naming_the_cap() {
 
 #[tokio::test]
 async fn group_count_far_over_cap_is_still_413_via_bounded_shard_query() {
-    // PR #895 review (chatgpt-codex-connector): the 413 cap must bound the
-    // shard query itself (a LIMIT), not just the merged response -- a
-    // single shard with far more distinct groups than the cap must not
-    // materialize them all before the check runs. Seeds well more than
-    // cap+1 groups on one shard and confirms the report still fails loudly
-    // rather than silently succeeding or hanging.
+    // PR #895: the 413 cap must bound the shard query itself with a LIMIT,
+    // not just the merged response. A shard with far more distinct groups
+    // than the cap must not materialize them all before the check runs.
+    // Seeds well over cap+1 groups on one shard. The report must still fail
+    // loudly, not succeed silently or hang.
     let (url, _c) = setup_single_shard().await;
     let now = Utc::now();
 

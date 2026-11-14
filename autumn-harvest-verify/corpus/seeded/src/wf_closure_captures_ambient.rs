@@ -9,9 +9,9 @@
 //! **Launder.** The closure body is a **separate MIR item**
 //! (`wf_closure_captures_ambient::{closure#0}`) reached only through
 //! `<{closure@…} as Fn<(u32,)>>::call` from a *different crate*. No syntactic
-//! walker can follow that edge: HVG only ever visits the annotated item, and
-//! det_check's one-hop resolver matches a bare call to a same-module free
-//! function by name — a closure has no name to match. `FACTOR.load` is
+//! walker can follow that edge. HVG only ever visits the annotated item. The
+//! one-hop resolver of `det_check` matches a bare call to a same-module free
+//! function by name, and a closure has no name. `FACTOR.load` is
 //! unmodeled by both layers regardless.
 //!
 //! **Expected trace hops.** `wf_closure_captures_ambient` ⇒

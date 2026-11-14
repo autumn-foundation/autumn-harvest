@@ -252,10 +252,9 @@ struct CountValue {
 // ── Evidence capture (not a CI assertion) ───────────────────────────────────
 
 async fn capture_dlq_bulk_discard_evidence() {
-    // MATCHING is the endpoint's own `dlq::MAX_BULK_LIMIT` -- the real
-    // production ceiling on how many rows one bulk-discard request can act
-    // on. It is not an arbitrary round number. NOISE models a lived-in DLQ
-    // with 25 other activities' failures still sitting in it.
+    // MATCHING is the endpoint's own `dlq::MAX_BULK_LIMIT`: the production
+    // ceiling on the rows that one bulk-discard request can act on. NOISE
+    // models a lived-in DLQ with the failures of 25 other activities.
     const MATCHING: i64 = 1000;
     const NOISE: i64 = 4000;
 
@@ -287,9 +286,8 @@ async fn capture_dlq_bulk_discard_evidence() {
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
-    // The one, real, public entry point: the exact request an operator's
-    // "purge every dead letter for this broken activity" action issues. It
-    // runs at the endpoint's own row cap.
+    // The public entry point: the request that an operator's "purge every
+    // dead letter for this broken activity" action issues, at the row cap.
     let (status, body) = post_json(
         &app,
         "/dead-letters/discard",

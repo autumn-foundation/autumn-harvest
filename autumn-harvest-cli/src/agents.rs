@@ -389,7 +389,6 @@ pub fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// The by-id route of the agent `agent_id`.
 fn by_id(agent_id: &str) -> String {
     format!(
         "/workflows/by-id/{AGENT_WORKFLOW}/{}",
@@ -611,12 +610,10 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
     }
 }
 
-/// The failure count of an agent state.
 fn failures(state: &Value) -> u64 {
     state.get("failures").and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// The state query of the agent `agent_id`.
 fn state_query(agent_id: &str) -> ApiRequest {
     ApiRequest::get(format!("{}/query/{ENTITY_STATE_QUERY}", by_id(agent_id)))
 }

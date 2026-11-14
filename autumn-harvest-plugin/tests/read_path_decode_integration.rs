@@ -1,7 +1,7 @@
 //! Integration tests for operator read-path decoding of codec-encrypted
 //! payloads (issue #608).
 //!
-//! Tests run against a real Postgres instance (testcontainers) and exercise
+//! Tests run against a real Postgres instance (testcontainers). They exercise
 //! the management-API read surfaces end-to-end: `/result`, history export
 //! (single + batch), describe, `/history`, `/stack`, `/dead-letters`, and the
 //! SSE event stream.
@@ -13,9 +13,8 @@
 //! the engine write AES-256-GCM envelopes into the codec columns (issue
 //! #1979).
 //!
-//! **Sandbox note:** no Docker is available in the authoring sandbox, so this
-//! file is compile-checked only (`cargo test --no-run`), matching the
-//! #543/#544/#601 precedent.
+//! **Sandbox note:** a sandbox without Docker only compile-checks this file
+//! (`cargo test --no-run`), matching the #543/#544/#601 precedent.
 
 #![allow(clippy::too_many_lines)]
 
@@ -478,13 +477,13 @@ async fn seed_pending_activity(
     activity_id
 }
 
-/// Seed a pending activity in the real BACKING-OFF state (issue #773): a
-/// `PENDING` task-queue row whose `error` column carries the last retryable
-/// failure message, a bumped `attempt`, and a future `scheduled_at`. This is
-/// what `queue::requeue_for_retry` actually writes — a retryable regular
-/// failure appends NO `ActivityFailed` event, so the stack handler must source
-/// `last_failure` from this column. `error` is written verbatim (pass an
-/// envelope to exercise the #608 decode path).
+/// Seed a pending activity in the real BACKING-OFF state (issue #773). The
+/// `PENDING` task-queue row has the last retryable failure in `error`, a bumped
+/// `attempt` and a future `scheduled_at`. That is what
+/// `queue::requeue_for_retry` writes. A retryable regular failure appends NO
+/// `ActivityFailed` event, so the stack handler reads `last_failure` from this
+/// column. `error` is written verbatim; pass an envelope to exercise the #608
+/// decode path.
 async fn seed_backing_off_activity(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -530,9 +529,9 @@ async fn decode_audit_rows(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// AC1: with the flag off, responses are byte-for-byte identical to today —
-/// even when a codec registry is mirrored onto the api state — and the stored
-/// ciphertext is what callers see.
+/// AC1: with the flag off, responses are byte-for-byte identical to today,
+/// even with a codec registry on the api state. Callers see the stored
+/// ciphertext.
 #[tokio::test]
 async fn responses_byte_identical_when_flag_off() {
     let (url, _container) = setup_database().await;
@@ -582,9 +581,9 @@ async fn responses_byte_identical_when_flag_off() {
     }
 
     // /stack is the one surface whose response schema changed (the new
-    // optional PendingActivity.input field): with the flag off the field must
-    // be omitted entirely — no `input` key, no ciphertext, no plaintext — so
-    // the JSON stays byte-identical to a pre-#608 build.
+    // optional PendingActivity.input field). With the flag off, the field must
+    // be omitted entirely. The JSON then stays byte-identical to a pre-#608
+    // build.
     let stack_exec = seed_running(&mut conn, "flag-off-stack", json!({})).await;
     seed_pending_activity(
         &mut conn,
@@ -802,13 +801,11 @@ async fn history_export_skips_decode_under_redacted_policy() {
     );
 }
 
-/// PR #936 review: export size enforcement runs on the *decoded* document.
-/// An export whose encoded envelope pushes it over `max_bytes` but whose
-/// decoded form fits must succeed when decoding is enabled, and the reported
-/// `size_limit.actual_bytes` must be the serialized size of the exact
-/// response body (one source of truth). Flag-off keeps the pre-existing
-/// behavior byte-identical: the stored (encoded) document is measured and
-/// rejected with 413.
+/// PR #936: export size enforcement runs on the *decoded* document. An
+/// export over `max_bytes` only in encoded form must succeed with decoding on.
+/// The reported `size_limit.actual_bytes` must be the serialized size of the
+/// exact response body. Flag-off behavior stays byte-identical: the stored
+/// (encoded) document is measured and rejected with 413.
 #[tokio::test]
 async fn history_export_size_limit_is_enforced_on_the_decoded_document() {
     let (url, _container) = setup_database().await;
@@ -816,7 +813,7 @@ async fn history_export_size_limit_is_enforced_on_the_decoded_document() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let exec_id = seed_running(&mut conn, "export-size", json!({})).await;
-    // Decoded payload ~3 KB; its base64 envelope is ~4/3 larger, so a 4000
+    // Decoded payload ~3 KB; its base64 envelope is ~4/3 larger. So a 4000
     // byte limit sits between the decoded (~3.4 KB) and encoded (~4.5 KB)
     // document sizes.
     append_events(
@@ -1009,8 +1006,8 @@ async fn stack_pending_activity_input_is_decoded() {
         "stack must not leak envelopes: {stack_str}"
     );
     // A decode-active response carries the input-budget signaling fields
-    // (PR #936 review): the small seeded input is within its per-activity cap
-    // and the cumulative per-response budget, so it passes through unclipped.
+    // (PR #936). The small seeded input fits its per-activity cap and the
+    // per-response budget, so it passes through unclipped.
     let pending = &stack["pending_activities"][0];
     assert_eq!(
         pending["input_truncated"],
@@ -1034,14 +1031,12 @@ async fn stack_pending_activity_input_is_decoded() {
     );
 }
 
-/// #773 (P1): a retrying (backing-off) REGULAR pending activity surfaces
-/// `last_failure` sourced from the task-row `harvest_task_queue.error` column —
-/// NOT from an `ActivityFailed` event, which a retryable failure never appends.
-/// The regular-path shape is: `error`/`attempt` from the task row,
-/// `error_type="Error"`, `non_retryable=false`, and `failed_at`/`details`
-/// omitted. A never-failed pending activity omits the field entirely
-/// (AC3/AC7). No decoding needed — plaintext here — so this runs on the plain
-/// app.
+/// #773: a backing-off REGULAR pending activity surfaces `last_failure` from
+/// the `harvest_task_queue.error` column. A retryable failure never appends an
+/// `ActivityFailed` event. The regular-path shape is: `error`/`attempt` from
+/// the task row, `error_type="Error"`, `non_retryable=false`, and
+/// `failed_at`/`details` omitted. A never-failed pending activity omits the
+/// field (AC3/AC7). The data is plaintext, so this runs on the plain app.
 #[tokio::test]
 async fn stack_pending_activity_surfaces_last_failure() {
     let (url, _container) = setup_database().await;
@@ -1049,9 +1044,9 @@ async fn stack_pending_activity_surfaces_last_failure() {
     let app = build_plain_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    // Scenario 1: a backing-off regular activity — the REAL engine state after
-    // a retryable failure: PENDING task, error column set, attempt bumped,
-    // scheduled_at in the future, and NO ActivityFailed event in history.
+    // Scenario 1: a backing-off regular activity in the REAL engine state after
+    // a retryable failure. The task is PENDING with `error` set, `attempt`
+    // bumped and a future `scheduled_at`. History has NO ActivityFailed event.
     let exec_id = seed_running(&mut conn, "stack-last-failure", json!({})).await;
     seed_backing_off_activity(
         &mut conn,
@@ -1120,9 +1115,9 @@ async fn stack_pending_local_activity_surfaces_last_failure() {
 
     let exec_id = seed_running(&mut conn, "stack-local-last-failure", json!({})).await;
     let activity_id = ActivityExecId::new();
-    // LocalActivityScheduled (still pending — no LocalActivityCompleted) plus a
-    // LocalActivityFailed for the same activity_id, so the local panel surfaces
-    // it as a pending local activity with its recorded failure (AC4).
+    // LocalActivityScheduled with no LocalActivityCompleted, plus a
+    // LocalActivityFailed for the same activity_id. The local panel shows it
+    // as pending, with its recorded failure (AC4).
     append_events(
         &mut conn,
         exec_id,
@@ -1170,8 +1165,8 @@ async fn stack_pending_local_activity_surfaces_last_failure() {
 /// A local activity whose retry budget is exhausted closes with a terminal
 /// `LocalActivityExhausted` event. If the workflow catches that failure and
 /// keeps running, `/stack` must NOT report the exhausted activity as pending
-/// (Codex review, PR #1022; issue #773). Before the fix the fold never
-/// consumed `LocalActivityExhausted`, so the entry stayed pending forever.
+/// (PR #1022; issue #773). Before the fix the fold never consumed
+/// `LocalActivityExhausted`, so the entry stayed pending forever.
 #[tokio::test]
 async fn stack_exhausted_local_activity_is_not_pending() {
     let (url, _container) = setup_database().await;
@@ -1221,14 +1216,13 @@ async fn stack_exhausted_local_activity_is_not_pending() {
     );
 }
 
-/// #608 audit fidelity (Codex P2, PR #1022): a local activity that failed with
-/// a stringified codec envelope and then EXHAUSTED (terminal) is removed from
-/// the pending panel. Its `last_failure` must therefore NOT be decoded — and
-/// so must never touch `decode_outcome` and never write a spurious
-/// `payload.decode_read` audit row for data that never left the handler. Before
-/// the fix the fold decoded `last_failure` inside the `LocalActivityScheduled`
-/// arm, before the terminal `LocalActivityExhausted` arm removed the entry, so
-/// the removed entry's envelope was decoded and audited.
+/// #608 audit fidelity (PR #1022): a local activity that failed with a
+/// stringified codec envelope and then EXHAUSTED is removed from the pending
+/// panel. So its `last_failure` must NOT be decoded. It must never touch
+/// `decode_outcome` or write a spurious `payload.decode_read` audit row. The
+/// fold once decoded `last_failure` in the `LocalActivityScheduled` arm. The
+/// `LocalActivityExhausted` arm removed the entry only later, so the removed
+/// envelope was decoded and audited.
 #[tokio::test]
 async fn stack_removed_local_activity_failure_is_not_decoded_or_audited() {
     let (url, _container) = setup_database().await;
@@ -1239,9 +1233,9 @@ async fn stack_removed_local_activity_failure_is_not_decoded_or_audited() {
 
     let exec_id = seed_running(&mut conn, "stack-local-removed-no-audit", json!({})).await;
     let activity_id = ActivityExecId::new();
-    // The failure error is a codec envelope that WOULD decode if surfaced, but
-    // the following terminal `LocalActivityExhausted` removes the pending entry
-    // (catch-and-continue; the workflow is still RUNNING).
+    // The failure error is a codec envelope that WOULD decode if surfaced. The
+    // next terminal `LocalActivityExhausted` removes the pending entry. The
+    // workflow catches it and stays RUNNING.
     append_events(
         &mut conn,
         exec_id,
@@ -1285,9 +1279,9 @@ async fn stack_removed_local_activity_failure_is_not_decoded_or_audited() {
         !stack_str.contains("pii-alpha") && !stack_str.contains("_harvest_codec_envelope"),
         "the removed entry's failure must neither be surfaced nor decoded: {stack_str}"
     );
-    // … and, crucially, NO payload.decode_read audit row for a request that
-    // surfaced nothing decodable (audit_decoded_read no-ops on an untouched
-    // outcome, so a row means the removed entry's failure was decoded).
+    // … and NO payload.decode_read audit row, because nothing decodable
+    // surfaced. `audit_decoded_read` no-ops on an untouched outcome. So a row
+    // means the removed entry's failure was decoded.
     let audit = decode_audit_rows(&mut conn).await;
     assert!(
         audit.is_empty(),
@@ -1341,9 +1335,9 @@ async fn dead_letters_list_decodes_input_and_error() {
     );
 }
 
-/// AC4 (SSE): the live event stream emits decoded frames, and one
-/// `payload.decode_read` audit row is written at stream open when decode mode
-/// is active (mirrors the `OP_EXECUTION_STREAM_OPEN` one-row-per-stream shape).
+/// AC4 (SSE): the live event stream emits decoded frames. With decode mode
+/// on, stream open writes one `payload.decode_read` audit row, like the
+/// `OP_EXECUTION_STREAM_OPEN` one-row-per-stream shape.
 #[tokio::test]
 async fn sse_stream_emits_decoded_frames_and_writes_decode_audit_at_open() {
     let (url, _container) = setup_database().await;
@@ -1837,11 +1831,11 @@ async fn read_with_decode_leaves_stored_rows_untouched() {
     );
 }
 
-/// PR #936 review (P1): the export path must load history *raw* so an
-/// encrypted deployment can still export with the flag off — the stored
-/// envelopes ride along verbatim (the same ciphertext describe/history/SSE
-/// already surface) instead of the whole export failing `UnknownPayloadCodec`
-/// before any policy runs. No decode happened, so no decode-audit row either.
+/// PR #936: the export path must load history *raw*, so an encrypted
+/// deployment can still export with the flag off. The stored envelopes go out
+/// verbatim, as describe/history/SSE show them. The export must not fail with
+/// `UnknownPayloadCodec` before any policy runs. No decode ran, so no
+/// decode-audit row is written.
 #[tokio::test]
 async fn history_export_flag_off_returns_stored_envelopes_verbatim() {
     let (url, _container) = setup_database().await;
@@ -1902,11 +1896,10 @@ async fn history_export_flag_off_returns_stored_envelopes_verbatim() {
     );
 }
 
-/// PR #936 review (P2): the decode audit row is written through the caller's
-/// already-held connection. With a pool sized to exactly one connection, a
-/// decoded read that acquired a *second* connection for the audit would stall
-/// until the pool timeout and silently skip the row — so this pins both the
-/// prompt 200 and the audit row's presence under a size-1 pool.
+/// PR #936: the decode audit row is written through the caller's held
+/// connection. With a one-connection pool, a *second* connection for the audit
+/// would stall until the pool timeout and skip the row. So this pins the
+/// prompt 200 and the audit row under a size-1 pool.
 #[tokio::test]
 async fn decode_audit_reuses_callers_connection_under_single_connection_pool() {
     let (url, _container) = setup_database().await;

@@ -7,16 +7,15 @@
 //! happens synchronously inside `Plugin::build` -- only the `on_startup`
 //! hook that installs the live Harvest runtime needs Postgres.
 //!
-//! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here for the same
-//! reason `mcp_tools_http_tests.rs` cannot use it -- `TestApp` replays
-//! plugin startup hooks and `start_harvest_runtime` requires a live
-//! Postgres. This suite reproduces exactly the metrics-source-registration
-//! half of `HarvestPlugin::build` through a tiny local `Plugin`, so the real
-//! autumn-web rendering pipeline (HELP/TYPE lines, label sorting/escaping,
-//! dedup-by-family-name) is exercised end to end without a database. The
-//! full plugin-wired flow (a live workflow run driving the same recorder
-//! through `HarvestBuilder::telemetry`) is covered by the runnable example
-//! `examples/metrics_scrape_quickstart.rs`.
+//! NOTE: `TestApp::plugin(HarvestPlugin)` does not work here, as in
+//! `mcp_tools_http_tests.rs`. `TestApp` replays plugin startup hooks, and
+//! `start_harvest_runtime` requires a live Postgres. This suite reproduces
+//! the metrics-source-registration half of `HarvestPlugin::build` through a
+//! tiny local `Plugin`. So the real autumn-web rendering pipeline (HELP/TYPE
+//! lines, label sorting/escaping, dedup-by-family-name) runs end to end
+//! without a database. The runnable example `examples/metrics_scrape_quickstart.rs`
+//! covers the full plugin-wired flow, where a live workflow run drives the
+//! same recorder through `HarvestBuilder::telemetry`.
 
 #![cfg(feature = "metrics")]
 
@@ -68,8 +67,8 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     recorder.record_retention_deleted("onboarding", 42);
     // These four back the engine's own is_enabled()-gated background
     // samplers (queue depth/DLQ depth samplers' oldest-age query, the
-    // stranded-work scanner, the worker-slot sampler) -- implemented so
-    // that already-paid-for sampler work isn't silently discarded once
+    // stranded-work scanner, the worker-slot sampler). They exist so that
+    // already-paid-for sampler work is not silently discarded once
     // .with_metrics_scrape() flips is_enabled() to true.
     recorder.record_queue_oldest_pending_age("default", 12.5);
     recorder.record_worker_slots(SlotType::Workflow, 3, 7);
@@ -124,17 +123,16 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
         assert!(body.contains(expected), "missing `{expected}` in:\n{body}");
     }
 
-    // Cardinality rule (issue #355 AC2): no execution.id label ever appears
-    // -- the `MetricsRecorder` methods this recorder implements never
-    // accept one, so this also guards against a future accidental addition.
+    // Cardinality rule (issue #355 AC2): no execution.id label ever appears.
+    // The `MetricsRecorder` methods never accept one, so this also guards
+    // against a future accidental addition.
     assert!(
         !body.contains("execution.id") && !body.contains("execution_id"),
         "execution.id leaked into scrape:\n{body}"
     );
 
     // Harvest's samples coexist with the app's own built-in families on the
-    // one shared endpoint (issue #355: "one endpoint for autumn web apps
-    // and its plugins like harvest").
+    // one shared endpoint (issue #355).
     assert!(body.contains("autumn_http_requests_total"));
 }
 
@@ -142,9 +140,9 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
 async fn scrape_endpoint_omits_harvest_families_when_metrics_source_not_registered() {
     // No plugin, no `metrics_source` registration -- mirrors an app that
     // never calls `HarvestPlugin::with_metrics_scrape()`. `/actuator/prometheus`
-    // still exists (it's the app's own endpoint, always mounted by
-    // default) but carries no `harvest_*` family, and there is zero runtime
-    // cost paid for the unused aggregator (issue #355 AC3/AC8).
+    // still exists (it is the app's own endpoint, always mounted by
+    // default) but carries no `harvest_*` family. The unused aggregator
+    // costs nothing at runtime (issue #355 AC3/AC8).
     let client = TestApp::new().build();
     let body = scrape(&client).await;
     assert!(
@@ -156,7 +154,7 @@ async fn scrape_endpoint_omits_harvest_families_when_metrics_source_not_register
 
 #[tokio::test]
 async fn no_family_emitted_for_a_metric_that_was_never_recorded() {
-    // A cold aggregator contributes zero families -- there's no way to
+    // A cold aggregator contributes zero families. There is no way to
     // synthesize a meaningful zero-value default for a labeled series
     // before its label values are known (see `metrics_scrape.rs` module
     // docs).

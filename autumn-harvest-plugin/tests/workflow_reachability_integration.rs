@@ -1,8 +1,8 @@
 //! Integration tests for `GET /admin/workflow-types/reachability` (issue #520).
 //!
-//! Verifies the three verdicts (`safe_to_remove` / `in_use` / `orphaned`), the
-//! `?workflow_type=` filter, cross-shard aggregation with an unreachable shard
-//! reported as `partial`, and the admin auth boundary.
+//! Verifies the three verdicts (`safe_to_remove` / `in_use` / `orphaned`) and
+//! the `?workflow_type=` filter. Also covers the admin auth boundary and
+//! cross-shard aggregation, with an unreachable shard reported as `partial`.
 
 use std::collections::BTreeSet;
 use std::pin::Pin;
@@ -546,32 +546,32 @@ async fn reachability_requires_admin_auth() {
 // Boot-time orphaned-workflow reachability gate (issue #700 AC4).
 // ---------------------------------------------------------------------------
 //
-// `start_harvest_runtime` is a private, config-file/migration/pool-coupled
-// `async fn` that spawns background tasks — it is not integration-callable, and
-// on the abort path it tears those tasks down and returns `Err` *before*
-// autumn-web reacts to a failed `on_startup` hook. What that abort decision
-// depends on is a two-step composition of PUBLIC building blocks:
+// `start_harvest_runtime` is a private `async fn` that spawns background tasks.
+// It depends on the config file, migrations and pools, so a test cannot call
+// it. On the abort path it tears those tasks down and returns `Err`. That
+// happens *before* autumn-web reacts to a failed `on_startup` hook. The abort
+// decision composes two PUBLIC building blocks:
 //
 //   1. `build_workflow_reachability_report(api_state, ..)` — the cross-shard DB
 //      fan-out (the riskiest new code), and
 //   2. `startup_orphan_decision(action, report.orphaned, report.status)` — the
 //      pure gate rule.
 //
-// These tests drive that exact decision path against a seeded database, so they
+// These tests drive that exact decision path against a seeded database. They
 // exercise the real report builder end-to-end and confirm the Abort / Warn /
-// Continue verdict the boot gate would produce. They deliberately do NOT boot a
-// full autumn-web app (the only way to invoke the private `start_harvest_runtime`
-// shell), which is thin task-teardown glue over this decision.
+// Continue verdict of the boot gate. They deliberately do NOT boot a full
+// autumn-web app. That is the only way to call `start_harvest_runtime`, which
+// is thin task-teardown glue over this decision.
 //
-// Each test filters the report to a UNIQUE workflow-type name, which narrows
-// `report.orphaned` / `total_orphaned_executions` to just that type — isolating
-// it from leftover or concurrently-seeded rows on a shared database with no
-// global scrub (so the tests are re-runnable and race-free).
+// Each test filters the report to a UNIQUE workflow-type name. That narrows
+// `report.orphaned` / `total_orphaned_executions` to that type only. Leftover
+// or concurrent rows on a shared, unscrubbed database then do not interfere.
+// So the tests are re-runnable and race-free.
 
 /// Env-URL (local Postgres, no Docker) when `HARVEST_TEST_DATABASE_URL` is set,
-/// otherwise a fresh testcontainer. Mirrors the core-crate DB-test precedent
-/// (e.g. `retention_summary_tests`): the env URL is assumed to point at an
-/// already-migrated database, so no migrations are run on that path.
+/// otherwise a fresh testcontainer. As in core-crate DB tests (e.g.
+/// `retention_summary_tests`), the env URL must point at a migrated database.
+/// That path runs no migrations.
 async fn setup_db_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
@@ -667,8 +667,8 @@ async fn boot_gate_warn_action_allows_boot_with_orphan() {
 
 #[tokio::test]
 async fn boot_gate_fail_action_allows_clean_boot() {
-    // `fail` with NO orphan (only a registered type with a live run -> in_use)
-    // -> the gate continues, so a clean fleet boots even under the strict action.
+    // `fail` with NO orphan: only a registered type with a live run (in_use).
+    // The gate continues, so a clean fleet boots even under the strict action.
     let (database_url, _container) = setup_db_env_or_container().await;
     let registered_type = "boot_gate_clean_registered";
     insert_execution(
@@ -708,22 +708,24 @@ async fn boot_gate_fail_action_allows_clean_boot() {
 }
 
 // -------------------------------------------------------------------------
-// Issue #700 AC4 (P1 fix): the boot-time orphan gate runs BEFORE workers spawn.
+// Issue #700 AC4: the boot-time orphan gate runs BEFORE workers spawn.
 //
-// The production race (a worker claiming/failing an orphaned run in the boot
-// window before an after-the-fact abort) cannot be booted from a test — the
-// only entry point, the private `start_harvest_runtime`, is pool/migration/
-// full-app coupled. These two tests prove the fix structurally and behaviorally:
-// (1) the gate core needs NO started runtime (so it can precede the runner),
-// and (2) running the core + decision is side-effect-free (a seeded orphan's
-// claimable task row and execution are untouched, and no `WorkflowFailed` event
-// is appended) — the deterministic analogue of "no worker touched the task."
+// The production race is a worker that claims or fails an orphaned run in the
+// boot window, before a late abort. A test cannot boot it: the only entry
+// point, the private `start_harvest_runtime`, needs pools, migrations and the
+// full app. These two tests prove the fix structurally and behaviorally:
+//
+// 1. The gate core needs NO started runtime, so it can precede the runner.
+// 2. The core + decision has no side effects. A seeded orphan's claimable task
+//    row and execution stay untouched, and no `WorkflowFailed` event is
+//    appended. That is the deterministic analogue of "no worker touched the
+//    task."
 // -------------------------------------------------------------------------
 
 /// The boot-gate core resolves the abort decision from just a `registered` set
 /// and a shard pool — with NO `HarvestApiState`/runtime constructed. That is
 /// the compile-time + runtime evidence that the gate can run before
-/// `HarvestRunner::start` spawns any worker (the whole point of the P1 fix).
+/// `HarvestRunner::start` spawns any worker (the whole point of the issue #700 fix).
 #[tokio::test]
 async fn gate_report_core_needs_no_runtime() {
     let (database_url, _container) = setup_db_env_or_container().await;
@@ -759,10 +761,10 @@ async fn gate_report_core_needs_no_runtime() {
 }
 
 /// Running the pre-runner gate core + decision does NOT mutate the seeded
-/// orphan: its claimable pending task-queue row stays `PENDING`, its execution
-/// stays `RUNNING`, and no `WorkflowFailed` event is appended. This is the
-/// deterministic analogue of the production guarantee "no worker claimed or
-/// failed the orphaned run" — the gate is a pure read that precedes any worker.
+/// orphan. Its pending task-queue row stays `PENDING`, and its execution stays
+/// `RUNNING`. No `WorkflowFailed` event is appended. The gate is a pure read that
+/// precedes any worker. That is the deterministic analogue of "no worker claimed
+/// or failed the orphaned run".
 #[tokio::test]
 async fn gate_is_side_effect_free_orphan_task_untouched() {
     use autumn_harvest::schema::{harvest_events, harvest_task_queue};

@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// The mesh guide.
 const MESH: &str = "docs/agent-mesh.md";
 
 /// The durable-agents guide.

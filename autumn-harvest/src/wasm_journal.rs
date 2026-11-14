@@ -156,7 +156,6 @@ impl HostCallGrants {
         self.handlers.is_empty()
     }
 
-    /// The handler for `name`, if granted.
     fn handler(&self, name: &str) -> Option<HostCallHandler> {
         self.handlers.get(name).cloned()
     }

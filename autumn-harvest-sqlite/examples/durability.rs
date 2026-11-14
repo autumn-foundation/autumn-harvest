@@ -19,9 +19,9 @@
 //! 4. **Reopen the same file**, re-register the handlers, deliver the signal,
 //!    and drive to completion.
 //!
-//! Two in-process side-effect counters prove the outcome: the reserve body runs
-//! **once** (session 1 only — session 2 replays it from history without
-//! re-executing it), and the ship body runs **once** (session 2 only). The run
+//! Two in-process side-effect counters prove the outcome. The reserve body runs
+//! **once**, in session 1 only. Session 2 replays it from history and does not
+//! re-execute it. The ship body runs **once**, in session 2 only. The run
 //! resumed exactly where it left off.
 
 // This example registers counting closures with `register_activity_with_body`,

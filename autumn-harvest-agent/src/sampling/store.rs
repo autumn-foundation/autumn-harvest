@@ -213,7 +213,6 @@ pub trait SamplingPolicyStore: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, Result<Vec<PolicyAudit>, PolicyStoreError>>;
 }
 
-/// Refuse a kind that is not a valid agent kind.
 fn check_kind(kind: &str) -> Result<(), PolicyStoreError> {
     if valid_name(kind) {
         Ok(())

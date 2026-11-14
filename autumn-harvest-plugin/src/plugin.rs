@@ -38,12 +38,11 @@ const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/app"
 /// Plugin migrations that belong to the **harvest** database.
 ///
 /// Split from [`OUTBOX_MIGRATIONS`] because the two are different databases
-/// under `HarvestMode::Split`/`External`. The connector dead-letter table
-/// (issue #944) is written by `PostgresDeadLetterSink`, which is built from
-/// the *harvest* pool — applying it only to the app database left the table
-/// missing where the sink actually writes, so every dead-letter write failed,
-/// `settle` downgraded the poison message to a retry, and it was redelivered
-/// forever: exactly the partition wedge the feature exists to prevent.
+/// under `HarvestMode::Split`/`External`. `PostgresDeadLetterSink` writes the
+/// connector dead-letter table (issue #944) through the *harvest* pool. When
+/// the table went only to the app database, every dead-letter write failed.
+/// `settle` then downgraded the poison message to a retry, and it was
+/// redelivered forever. That is the partition wedge the feature prevents.
 const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/harvest");
 
 /// Hand Harvest's embedded migration sets to Autumn, which owns applying them
@@ -51,12 +50,11 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 ///
 /// Autumn applies every registered set inside `setup_database`, i.e. *before*
 /// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
-/// already-migrated database. It also keeps the same dev/prod policy the plugin
-/// applied by hand before: auto-apply under the `dev` profile, warn-only
-/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas —
-/// and, for the dedicated Harvest database under `Split`/`External` that
-/// `autumn migrate` cannot reach, `harvest migrate run`; see
-/// [`ensure_runtime_migrations_blocking`]).
+/// already-migrated database. The dev/prod policy stays the same. The `dev`
+/// profile auto-applies, and other profiles only warn. Run a one-shot
+/// `autumn migrate` before you roll prod replicas. `autumn migrate` cannot
+/// reach the dedicated Harvest database under `Split`/`External`, so run
+/// `harvest migrate run` for it (see [`ensure_runtime_migrations_blocking`]).
 ///
 /// Registering here rather than migrating ourselves is what lets Autumn resolve
 /// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
@@ -70,19 +68,19 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// `plugin_migrations` can only target the application's primary database.
 /// Under [`HarvestMode::Embedded`] (the default) that *is* the Harvest
 /// database, so Autumn can own all three sets. Under [`HarvestMode::Split`] /
-/// [`HarvestMode::External`], Harvest storage is a **separate** database that
-/// Autumn has no handle on — those two sets stay on the plugin's own apply path
-/// in [`ensure_runtime_migrations`], which connects to `harvest.database.url`
-/// directly.
+/// [`HarvestMode::External`], Harvest storage is a **separate** database.
+/// Autumn has no handle on it. So those two sets stay on the plugin's own
+/// apply path in [`ensure_runtime_migrations`], which connects to
+/// `harvest.database.url` directly.
 ///
 /// On a Postgres app, the outbox set goes to the application database in every
 /// mode. An embedder writes to its table in their own business transaction. A
 /// SQLite build registers no outbox set (see [`app_outbox_set_applies`]).
 ///
-/// If the Harvest config cannot be loaded here, registration fails immediately
-/// rather than guessing: applying the sets to the app database for an unknown
-/// mode could create Harvest tables in the wrong place, while registering only
-/// the outbox would let migration-only commands report false success.
+/// If the Harvest config cannot be loaded here, registration fails at once.
+/// It does not guess. For an unknown mode, the app database could get Harvest
+/// tables in the wrong place. Registering only the outbox would let
+/// migration-only commands report false success.
 /// `require_embedded` is set only by the dev runtime (issue #1291): when
 /// true, a resolved mode other than `Embedded` panics rather than silently
 /// registering split/external migrations. The dev runtime's own startup gate
@@ -122,17 +120,16 @@ const fn app_outbox_set_applies() -> bool {
 
 /// Whether the dev runtime's embedded-only backstop (issue #1291) should
 /// refuse. True only when the caller requires embedded storage and the
-/// resolved mode is not `Embedded`. Pure so both call sites --
-/// [`register_plugin_migrations`] and `start_harvest_runtime` -- share one
-/// unit-testable decision instead of duplicating the boolean logic.
+/// resolved mode is not `Embedded`. [`register_plugin_migrations`] and
+/// `start_harvest_runtime` share this one unit-testable decision.
 const fn embedded_harvest_mode_violated(require_embedded: bool, mode: HarvestMode) -> bool {
     require_embedded && !matches!(mode, HarvestMode::Embedded)
 }
 
-/// Resolve the topology before migration registration. This must be fail-fast:
-/// `autumn migrate` builds plugins but does not execute their startup hooks, so
-/// deferring a configuration error would let that command report success after
-/// registering only the application outbox migrations.
+/// Resolve the topology before migration registration, and fail fast.
+/// `autumn migrate` builds plugins but does not execute their startup hooks.
+/// A deferred configuration error would let that command report success after
+/// it registers only the application outbox migrations.
 fn migration_registration_mode(
     config: Result<HarvestRuntimeConfig, autumn_web::config::ConfigError>,
 ) -> HarvestMode {
@@ -189,10 +186,10 @@ pub(crate) type ApiMiddlewareFn = Box<
 /// The MCP tool routes are registered via `AppBuilder::routes(...)`, not
 /// `nest()`, so they never pass through the `ApiMiddlewareFn` above (which
 /// only wraps the nested management-API router). Without this, a caller
-/// could hit a mutating tool route's own HTTP path directly and bypass both
-/// the configured admin auth and autumn-web's `secure_mcp` (which only gates
-/// the `/mcp` JSON-RPC envelope, not a typed route's direct path). `Fn` (not
-/// `FnOnce`) so it can be cloned onto every generated route.
+/// could call a mutating tool route's own HTTP path directly. That bypasses
+/// the configured admin auth and autumn-web's `secure_mcp`. `secure_mcp` gates
+/// only the `/mcp` JSON-RPC envelope, not a typed route's direct path. `Fn`
+/// (not `FnOnce`) lets it clone onto every generated route.
 pub(crate) type McpToolMiddlewareFn = std::sync::Arc<
     dyn Fn(
             autumn_web::reexports::axum::routing::MethodRouter<autumn_web::AppState>,
@@ -221,10 +218,9 @@ pub(crate) type McpToolMiddlewareFn = std::sync::Arc<
 ///     .await;
 /// # }
 /// ```
-// Each bool is an independent, orthogonal opt-in mirrored onto HarvestApiState
-// (mcp tools, read-path decode, read-only role, metrics scrape); they are not a
-// state machine that a bitfield/enum would model better. The count crosses the
-// clippy threshold only under the `metrics` feature.
+// Each bool is an independent opt-in mirrored onto `HarvestApiState`.
+// They are not a state machine that a bitfield or enum would model better.
+// The count crosses the clippy threshold only under the `metrics` feature.
 #[allow(clippy::struct_excessive_bools)]
 pub struct HarvestPlugin {
     builder: HarvestBuilder,
@@ -346,17 +342,15 @@ pub(crate) struct ConnectorRuntimeHandle {
 /// Stop every connector consumer loop, cancelling *all* of them before
 /// awaiting *any*.
 ///
-/// Cancelling and awaiting one at a time would serialize the drains:
-/// connector *N* keeps consuming — and therefore keeps accruing more in-flight
-/// work of its own to drain — for as long as connectors *1..N* take to finish.
-/// Each drain is individually bounded
-/// ([`ConnectorRuntime::drain_in_flight`](crate::connector::ConnectorRuntime)),
-/// but serialized those bounds *sum*, so a fleet of bindings turns a
-/// per-connector deadline into an N-times-longer shutdown — and the messages
-/// the late connectors consumed in the meantime are the ones most likely to be
-/// hard-stopped when their own turn finally comes. Cancelling first starts
-/// every drain deadline at the same instant, so the total is the slowest
-/// connector rather than their sum.
+/// Cancelling and awaiting one at a time would serialize the drains.
+/// Connector *N* keeps consuming while connectors *1..N* finish, so it keeps
+/// accruing more in-flight work to drain. Each drain has its own bound
+/// ([`ConnectorRuntime::drain_in_flight`](crate::connector::ConnectorRuntime)).
+/// Serialized, those bounds *sum*, so N bindings make an N-times-longer
+/// shutdown. The messages that late connectors consume meanwhile are the most
+/// likely to be hard-stopped at their turn. Cancelling first starts every
+/// drain deadline at the same instant. The total is then the slowest
+/// connector, not their sum.
 #[cfg(feature = "connectors")]
 pub(crate) async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
     let draining: Vec<JoinHandle<()>> = connectors
@@ -448,11 +442,11 @@ pub(crate) fn validate_connectors(connectors: &[ConnectorRegistration], builder:
                 connectors[i].binding.name, connectors[j].binding.name,
             );
         }
-        // The same clash reached a different way: two *separately
+        // The same clash reached a different way. Two *separately
         // constructed* sources over one physical subscription have
-        // distinct pointers, so the identity check above cannot see them,
-        // but they still compete for the same messages. An adapter that
-        // declares no identity keeps the pointer check only.
+        // distinct pointers, so the pointer check cannot see them. They
+        // still compete for the same messages. An adapter that declares no
+        // identity keeps the pointer check only.
         let subscriptions: Vec<Option<String>> = connectors
             .iter()
             .map(|r| r.source.subscription_identity())
@@ -471,13 +465,12 @@ pub(crate) fn validate_connectors(connectors: &[ConnectorRegistration], builder:
                 subscriptions[i].as_deref().unwrap_or("<unknown>"),
             );
         }
-        // Two bindings on DISTINCT subscriptions consuming the same
-        // logical stream into the same target is legitimate fan-in across
-        // independent brokers, so it is not rejected -- but on one broker
-        // it double-dispatches every message (each binding derives its own
-        // idempotency key, since the name namespaces it), so say it once.
-        // Reached only when the identity check above passed, i.e. the two
-        // are genuinely different subscriptions.
+        // Two bindings on DISTINCT subscriptions can feed one logical
+        // stream into one target. That is legitimate fan-in across
+        // independent brokers, so it is not rejected. On one broker it
+        // double-dispatches every message, because the binding name
+        // namespaces each idempotency key. So warn once. This runs only
+        // after the identity check passed.
         let pairs: Vec<(&str, &str, Option<&str>)> = connectors
             .iter()
             .map(|r| {
@@ -751,15 +744,14 @@ impl HarvestPlugin {
     /// How long a keyed workflow start's idempotency claim is retained
     /// (issue #808; default 24 h).
     ///
-    /// Load-bearing for broker connectors (issue #944): a `BrokerCoordinates`
-    /// binding dedupes through this claim, so the "one execution per message"
-    /// guarantee lasts exactly as long as the window. Brokers replay much
-    /// older than a day — a Kafka consumer-group reset or topic replay, an SQS
-    /// message redelivered across many receives — and a redelivery arriving
-    /// after the claim is purged reserves the key as *fresh*, starting a
-    /// second execution. Size this to how far back your broker can replay;
-    /// harvest warns at startup if a coordinate-dedupe binding is registered
-    /// while this is left at its default.
+    /// Broker connectors (issue #944) rely on it. A `BrokerCoordinates`
+    /// binding dedupes through this claim. So "one execution per message"
+    /// lasts exactly as long as the window. Brokers can replay much older than
+    /// a day: a Kafka consumer-group reset or topic replay, or an SQS message
+    /// redelivered across many receives. A redelivery after the claim is
+    /// purged reserves the key as *fresh* and starts a second execution.
+    /// Size this to how far back your broker can replay. Harvest warns at
+    /// startup when a coordinate-dedupe binding keeps the default.
     #[must_use]
     pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
         self.builder = self.builder.start_idempotency_window(window);
@@ -848,12 +840,11 @@ impl HarvestPlugin {
     /// Enable the **opt-in durable per-execution workflow log sink** (issue
     /// #790).
     ///
-    /// With it, lines emitted through the existing
+    /// With it, Harvest also persists per execution each line from the
     /// `ctx.logger()` / `ctx.log_info` / `ctx.log_warn` / `ctx.log_error`
-    /// entry points (issue #379) are additionally persisted per execution and
-    /// readable in one call via `GET /api/harvest/workflows/{id}/logs`, the
-    /// `harvest workflow logs` CLI command, or the Vantage execution-detail
-    /// **Logs** panel — no external log-aggregation correlation.
+    /// entry points (issue #379). One call reads them back, with no external
+    /// log aggregation. Use `GET /api/harvest/workflows/{id}/logs`, the
+    /// `harvest workflow logs` CLI command, or the Vantage **Logs** panel.
     ///
     /// **Off by default, and additive.** Without this call `ctx.logger()`
     /// behaves exactly as before (`tracing`-only), and the workflow body does
@@ -938,13 +929,12 @@ impl HarvestPlugin {
     /// Mount the Harvest management API under `path`, protected by the given
     /// tower middleware layer.
     ///
-    /// The same layer is also applied to every generated MCP tool route
-    /// (issue #597 hardening) when [`Self::mcp_tools`] /
-    /// [`Self::mcp_tools_at`] is used — those routes are registered via
-    /// `AppBuilder::routes(...)`, not `nest()`, so without this they would
-    /// never pass through this middleware and would be reachable
-    /// unauthenticated at their own HTTP path even when the rest of the
-    /// Harvest API requires a credential.
+    /// With [`Self::mcp_tools`] / [`Self::mcp_tools_at`], the same layer also
+    /// wraps every generated MCP tool route (issue #597 hardening). Those
+    /// routes go through `AppBuilder::routes(...)`, not `nest()`. Without
+    /// this, they would skip this middleware. They would then be reachable
+    /// unauthenticated at their own HTTP path, while the rest of the Harvest
+    /// API requires a credential.
     #[must_use]
     pub fn api_with_auth<M>(mut self, path: impl Into<String>, middleware: M) -> Self
     where
@@ -984,30 +974,32 @@ impl HarvestPlugin {
     /// tower middleware layer, **with the read-only operator role enabled**
     /// (issue #776).
     ///
-    /// This behaves exactly like [`Self::api_with_auth`] — `middleware` is the
-    /// embedder's authentication layer, applied to the whole management router
-    /// (and to every generated MCP tool route) — and additionally installs a
-    /// class-aware enforcement layer that gives a **least-privilege read-only
-    /// tier** in one call.
+    /// This behaves exactly like [`Self::api_with_auth`]. `middleware` is the
+    /// embedder's authentication layer. It wraps the whole management router
+    /// and every generated MCP tool route. This call also installs a
+    /// class-aware enforcement layer, which gives a **least-privilege
+    /// read-only tier**.
     ///
     /// # The read-only principal contract
     ///
-    /// The restriction applies **only** to a principal the embedder's
-    /// `middleware` explicitly marks read-only on the autumn-web `Session`:
-    /// either `role` set to one of `harvest_readonly` / `harvest_operator` /
-    /// `operator` / `readonly` / `read_only`, or a truthy
+    /// The restriction applies **only** to a principal that the embedder's
+    /// `middleware` explicitly marks read-only on the autumn-web `Session`.
+    /// One marker is a `role` of `harvest_readonly` / `harvest_operator` /
+    /// `operator` / `readonly` / `read_only`. The other is a truthy
     /// `is_harvest_readonly` / `is_harvest_operator` session value. Such a
     /// principal may reach every [`RouteClass::ReadOnly`](autumn_harvest::audit::RouteClass)
-    /// route (100% of the read surface) but receives **403 Forbidden** on every
-    /// mutating route. A principal carrying an admin marker (`role` ∈
-    /// {`admin`,`harvest_admin`} or a truthy `is_harvest_admin`/`is_admin`), or
-    /// a principal your middleware lets through with no marker at all, keeps
-    /// full access — exactly as under [`Self::api_with_auth`] today.
+    /// route (100% of the read surface). It receives **403 Forbidden** on
+    /// every mutating route.
     ///
-    /// Enforcement is driven by
-    /// [`autumn_harvest::audit::CLASSIFIED_ROUTES`] as the single source of
-    /// truth and **fails closed**: a route with no classification entry is
-    /// treated as a mutation and denied to read-only principals.
+    /// Some principals keep full access, exactly as under
+    /// [`Self::api_with_auth`]. One kind carries an admin marker: a `role` in
+    /// {`admin`,`harvest_admin`}, or a truthy `is_harvest_admin`/`is_admin`.
+    /// The other kind has no marker at all.
+    ///
+    /// [`autumn_harvest::audit::CLASSIFIED_ROUTES`] is the single source of
+    /// truth for enforcement. Enforcement **fails closed**. A route with no
+    /// classification entry counts as a mutation, so read-only principals
+    /// get a deny.
     ///
     /// Read-only principals get admin-level **reads** (payload decode, the SSE
     /// event stream) by design — this slice restricts *verbs* (read vs mutate),
@@ -1042,13 +1034,14 @@ impl HarvestPlugin {
     ///
     /// Installs the token verification + scope-enforcement layer
     /// ([`crate::api_token::enforce_token_scope`]) on the nested
-    /// `harvest_api_router`. A bearer that begins with `hvst_` is verified
-    /// against the `harvest_api_tokens` table (rejecting an unknown/expired/
-    /// revoked token 401, a `read`-scoped token attempting a mutating route
-    /// 403), and its stable identity is threaded into the audit trail as
-    /// `token:{id}`. A bearer that does **not** begin with `hvst_` (or an absent
-    /// bearer) is passed through untouched, so token auth **composes with** — it
-    /// never replaces — an embedder's own `api_with_auth` middleware (AC7).
+    /// `harvest_api_router`. The layer verifies a bearer that begins with
+    /// `hvst_` against the `harvest_api_tokens` table. An unknown, expired or
+    /// revoked token gets 401. A `read`-scoped token on a mutating route gets
+    /// 403. The audit trail records its stable identity as `token:{id}`.
+    ///
+    /// A bearer that does **not** begin with `hvst_`, or no bearer, passes
+    /// through untouched. So token auth **composes with** an embedder's own
+    /// `api_with_auth` middleware and never replaces it (AC7).
     ///
     /// Default off: an embedder that never calls this sees byte-for-byte
     /// unchanged behavior (no layer installed).
@@ -1154,19 +1147,19 @@ impl HarvestPlugin {
     /// follow-up).
     ///
     /// Generates typed `start_{wf}` / `{wf}_status` / `signal_{wf}` /
-    /// `{wf}_watch` routes (plus one `{wf}_update_{name}` per
-    /// `#[update(workflow = "…", mcp)]` handler) under `{api_path}/mcp`
-    /// (default `/api/harvest/mcp`) and registers them as app-level routes so
+    /// `{wf}_watch` routes under `{api_path}/mcp` (default
+    /// `/api/harvest/mcp`). Each `#[update(workflow = "…", mcp)]` handler adds
+    /// one `{wf}_update_{name}` route. They register as app-level routes, so
     /// autumn-web's `AppBuilder::mount_mcp("/mcp")` projects them into the MCP
-    /// tool catalog. The app author still mounts (and secures, via
-    /// `secure_mcp`) the MCP endpoint itself.
+    /// tool catalog. The app author still mounts the MCP endpoint and secures
+    /// it with `secure_mcp`.
     ///
-    /// A `#[dag(mcp)]` DAG gets a reduced three-tool set instead --
-    /// `start_{dag}` / `{dag}_status` / `{dag}_watch`, no `signal_{dag}` and
-    /// no update tools (a DAG never consumes signals and has no update
-    /// handlers) -- and its `start_{dag}` tool routes through the DAG trigger
-    /// contract (admission gates, `max_active_runs`/paused enforcement)
-    /// rather than the generic workflow-start path.
+    /// A `#[dag(mcp)]` DAG gets a reduced three-tool set instead:
+    /// `start_{dag}` / `{dag}_status` / `{dag}_watch`. A DAG never consumes
+    /// signals and has no update handlers, so it gets no `signal_{dag}` and no
+    /// update tools. Its `start_{dag}` tool goes through the DAG trigger
+    /// contract, not the generic workflow-start path. That contract enforces
+    /// the admission gates, `max_active_runs` and the paused state.
     ///
     /// Opt-in only: workflows and DAGs without the `mcp` attribute never
     /// surface, and the mutating tools are never part of autumn-web's
@@ -1212,23 +1205,25 @@ impl HarvestPlugin {
 
     /// Decode codec-encrypted payloads on the operator read path (issue #608).
     ///
-    /// Explicit opt-in, default **off** — without this call, responses are
-    /// byte-for-byte identical to today and no handler ever consults the
-    /// codec registry. With it enabled, the management API read surfaces
-    /// (`/result`, history export under `payload_policy=full`, describe,
-    /// `/history`, `/stack`, `GET /dead-letters`, the SSE event stream) and
-    /// the Vantage UI decode stored codec envelopes **only** for requests
-    /// that pass the same harvest-admin predicate the `require_admin` layer
-    /// uses — a non-admin caller on an ungated route still sees the stored
-    /// bytes. Every request that actually decodes (or degrades) at least one
-    /// envelope writes a best-effort `payload.decode_read` audit record, so
-    /// plaintext reads are accountable. A per-field decode failure (bad key,
-    /// rotated-away codec id) degrades to an `_harvest_undecodable` marker —
+    /// Explicit opt-in, default **off**. Without this call, responses are
+    /// byte-for-byte identical and no handler consults the codec registry.
+    ///
+    /// With it, the Vantage UI and the management API read surfaces decode
+    /// stored codec envelopes. The surfaces are `/result`, history export
+    /// under `payload_policy=full`, describe, `/history`, `/stack`,
+    /// `GET /dead-letters` and the SSE event stream. They decode **only** for
+    /// a request that passes the harvest-admin predicate of the
+    /// `require_admin` layer. A non-admin caller on an ungated route still sees
+    /// the stored bytes.
+    ///
+    /// Each request that decodes or degrades at least one envelope writes a
+    /// best-effort `payload.decode_read` audit record. So plaintext reads are
+    /// accountable. A per-field decode failure, such as a bad key or a
+    /// rotated-away codec id, degrades to an `_harvest_undecodable` marker,
     /// never a 500. Stored rows are never mutated.
     ///
-    /// Note: with [`Self::api_with_auth`], the embedder boundary makes every
-    /// request that reaches the API an admin — decode then applies to all of
-    /// them, which is exactly the boundary's contract.
+    /// With [`Self::api_with_auth`], each request that reaches the API is an
+    /// admin. Decode then applies to all of them, as the boundary intends.
     ///
     /// See `docs/operations/read-path-decode.md` for the full operator guide,
     /// including the provenance caveat (decoded values are not authenticated)
@@ -1255,11 +1250,11 @@ impl HarvestPlugin {
 
     /// Enable the built-in synthetic liveness canary (issue #796).
     ///
-    /// Registers a throwaway probe workflow + activity per configured queue and
-    /// schedules them on `config`'s interval across every writable shard, so the
-    /// live `start → dispatch → activity → durable-timer → complete` path is
-    /// exercised continuously and a wedged pipeline surfaces within one probe
-    /// interval — with zero operator-authored workflow code.
+    /// Registers a throwaway probe workflow and activity for each configured
+    /// queue. It schedules them on `config`'s interval across every writable
+    /// shard. So the live `start → dispatch → activity → durable-timer →
+    /// complete` path runs continuously, with no operator-authored workflow
+    /// code. A wedged pipeline shows within one probe interval.
     ///
     /// Off by default: without this call the canary is entirely absent and the
     /// runtime is byte-for-byte unchanged (AC1). Distinct from the #512 replay
@@ -1288,18 +1283,17 @@ impl HarvestPlugin {
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
-    /// Each `#[webhook]`-annotated function is mounted as an app-level route
-    /// at its declared `path`, verified by autumn-web's `[security.webhooks]`
-    /// signed-webhook layer (`SignedWebhook`) before this crate's dispatch
-    /// code ever runs. Call `.workflows(...)` with every trigger's target
-    /// workflow *before* calling this method -- `HarvestPlugin::build` fails
-    /// fast (panics) if a trigger targets an unregistered workflow, or if two
+    /// Each `#[webhook]`-annotated function mounts as an app-level route at
+    /// its declared `path`. Autumn-web's `[security.webhooks]` signed-webhook
+    /// layer (`SignedWebhook`) verifies each request before this crate's
+    /// dispatch code runs. Call `.workflows(...)` with every trigger's target
+    /// workflow *before* this method. `HarvestPlugin::build` panics when a
+    /// trigger targets an unregistered workflow. It also panics when two
     /// triggers declare the same binding path.
     ///
-    /// Accumulates across repeated calls (mirrors `.workflows`/`.activities`/
-    /// `.queries`/`.updates`), so registering webhook bindings from separate
-    /// modules via multiple `.webhooks(...)` calls keeps every prior
-    /// registration instead of the last call silently discarding them.
+    /// Repeated calls accumulate, as `.workflows` / `.activities` /
+    /// `.queries` / `.updates` do. So separate modules can each call
+    /// `.webhooks(...)`, and no call discards an earlier registration.
     ///
     /// See `docs/getting-started/12-webhooks.md`.
     #[cfg(feature = "webhooks")]
@@ -1318,13 +1312,12 @@ impl HarvestPlugin {
     /// Installs a `HarvestMetricsRecorder` as both the engine's
     /// `MetricsRecorder` (via `HarvestBuilder::telemetry`) and an
     /// `autumn_web::actuator::MetricsSource` registered under the name
-    /// `"harvest"`. There is exactly **one** metrics scrape endpoint for the
-    /// whole app — Harvest's samples appear alongside the app's own
-    /// `autumn_http_*` families and any other plugin's `MetricsSource`, not on
-    /// a second, Harvest-owned route. Auth posture is therefore governed
-    /// entirely by the app's own `[actuator]` config (`actuator.prometheus`,
-    /// profile-aware sensitive-endpoint gating) rather than a
-    /// Harvest-specific toggle.
+    /// `"harvest"`. The whole app has exactly **one** metrics scrape endpoint.
+    /// Harvest's samples appear beside the app's own `autumn_http_*` families
+    /// and any other plugin's `MetricsSource`. No Harvest-owned route exists.
+    /// So the app's own `[actuator]` config governs the auth posture
+    /// (`actuator.prometheus`, profile-aware sensitive-endpoint gating). No
+    /// Harvest-specific toggle exists.
     ///
     /// Opt-in and additive: without this call, telemetry stays wired to the
     /// zero-cost `NoOpMetrics` default exactly as before. Calling it a second
@@ -1333,18 +1326,19 @@ impl HarvestPlugin {
     /// the first).
     ///
     /// This does **not** back the full starter alert pack
-    /// (`docs/alerts/starter-pack-v0.1.0.json`) — it covers the metrics
-    /// named in issue #355 plus a few more that the engine's own
-    /// background samplers already compute for free once enabled (queue
-    /// backlog age, worker slot occupancy, stranded-work demand), but not
-    /// the wider catalogue (e.g. `harvest.workflow.terminal`,
-    /// `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`).
-    /// For OTLP export, a custom `MetricsRecorder`, the full metric surface,
-    /// or a full bucketed histogram (this endpoint renders
-    /// `harvest.workflow.duration` / `harvest.activity.duration` as
-    /// `_count`/`_sum` counter pairs, since `MetricsSource`'s `MetricKind`
-    /// has no histogram variant), use the `metrics-rs` adapter escape hatch
-    /// documented in `docs/telemetry.md` instead.
+    /// (`docs/alerts/starter-pack-v0.1.0.json`). It covers the metrics named
+    /// in issue #355. It also covers a few that the engine's background
+    /// samplers compute for free once enabled: queue backlog age, worker slot
+    /// occupancy and stranded-work demand. It omits the wider catalogue, for
+    /// example `harvest.workflow.terminal`,
+    /// `harvest.activity.attempts`/`.retries` and `harvest.schedule.fire_attempts`.
+    ///
+    /// `MetricsSource`'s `MetricKind` has no histogram variant. So this
+    /// endpoint renders `harvest.workflow.duration` /
+    /// `harvest.activity.duration` as `_count`/`_sum` counter pairs. For a
+    /// full bucketed histogram, OTLP export, a custom `MetricsRecorder` or the
+    /// full metric surface, use the `metrics-rs` adapter escape hatch in
+    /// `docs/telemetry.md`.
     #[cfg(feature = "metrics")]
     #[must_use]
     pub const fn with_metrics_scrape(mut self) -> Self {
@@ -1360,11 +1354,11 @@ impl HarvestPlugin {
     /// startup and cancelled on shutdown.
     ///
     /// Call `.workflows(...)` with every binding's target workflow **before**
-    /// this — `HarvestPlugin::build` fails fast (panics) on an unregistered
-    /// target, a DAG target, a duplicate binding name, a missing mapping
-    /// function, or a `BrokerCoordinates` dedupe mode explicitly requested on a
-    /// workflow whose admission is deferred by a throttle/debounce/batch
-    /// policy (the start route rejects that combination with `400`).
+    /// this. `HarvestPlugin::build` panics on an unregistered target, a DAG
+    /// target, a duplicate binding name or a missing mapping function. It
+    /// also panics on an explicit `BrokerCoordinates` dedupe mode for a
+    /// workflow whose throttle, debounce or batch policy defers admission.
+    /// The start route rejects that combination with `400`.
     ///
     /// Accumulates across repeated calls, mirroring `.workflows` / `.webhooks`.
     ///
@@ -1386,9 +1380,10 @@ impl HarvestPlugin {
 
     /// [`Self::connector`] with explicit polling knobs.
     ///
-    /// `None` uses [`ConnectorRuntimeConfig::default`][c], which is tuned for
-    /// a cheap idle binding (a ≥ 1s poll so SQS *long*-polls rather than
-    /// short-polls, an idle backoff, and a throttled consumer-lag sample).
+    /// `None` uses [`ConnectorRuntimeConfig::default`][c], tuned for a cheap
+    /// idle binding. It has a ≥ 1s poll, so SQS *long*-polls rather than
+    /// short-polls. It also has an idle backoff and a throttled consumer-lag
+    /// sample.
     /// Override it to trade idle API cost against pickup latency, or to raise
     /// `max_batch` for a high-throughput topic.
     ///
@@ -1428,18 +1423,8 @@ impl HarvestPlugin {
     }
 }
 
-/// Validate every registered binding, then spawn one consumer loop per binding.
-///
-/// Split out of `start_harvest_runtime` so the wiring stays readable, and so
-/// the validation half is reachable from `build()` for fail-fast.
-///
-/// # Panics
-///
-/// Panics when a binding is invalid or when its adapter's `stream()` does not
-/// match the binding's declared `stream` — both are startup misconfigurations
-/// that would otherwise surface as a silently idle consumer.
-/// What actually bounds a binding's dedupe guarantee, when that bound is left
-/// somewhere the operator has probably not weighed (issue #944, Codex review).
+/// What bounds a binding's dedupe guarantee, when the operator has probably
+/// not weighed that bound (issue #944).
 ///
 /// A binding's dedupe rests on one of two records with *different lifetimes*,
 /// so one knob cannot cover both.
@@ -1450,10 +1435,11 @@ enum UntunedDedupeBound {
     /// `harvest_start_idempotency` row (#808), purged after
     /// `HarvestBuilder::start_idempotency_window` (default 24 h).
     StartIdempotencyWindow,
-    /// The dedupe record lives on — or cascades from — the **execution row**,
-    /// so retention deleting the run deletes the only evidence a redelivery was
-    /// already handled. `start_idempotency_window` governs a claim table this
-    /// path never touches, so it does nothing here. Two bindings land here:
+    /// The dedupe record lives on, or cascades from, the **execution row**.
+    /// When retention deletes the run, it deletes the only evidence that a
+    /// redelivery was already handled. `start_idempotency_window` governs a
+    /// claim table this path never touches, so it does nothing here. Two
+    /// bindings land here:
     ///
     /// * `SignalsWithStart`, which persists its key *only* on
     ///   `harvest_signals` (`ON DELETE CASCADE` on its execution) and never
@@ -1473,23 +1459,22 @@ enum UntunedDedupeBound {
 /// Resolve which bound — if any — is worth naming at startup for one binding.
 ///
 /// Exactly one shape rides the start-idempotency claim table: a
-/// **coordinate-keyed `Starts`** binding. Everything else — `SignalsWithStart`,
-/// and any `WorkflowId` binding, which passes no idempotency key at all — rests
-/// on the execution row and is bounded by retention.
+/// **coordinate-keyed `Starts`** binding. Every other binding rests on the
+/// execution row, and retention bounds it. That covers `SignalsWithStart` and
+/// any `WorkflowId` binding, which passes no idempotency key at all.
 ///
 /// Returns `None` when the guarantee needs no caveat:
 ///
 /// * A coordinate-keyed `Starts` binding with an explicitly configured window:
 ///   an explicit value is a considered one.
-/// * An execution-row-bound binding with retention **off** (harvest's default):
-///   the row — and with it the claim — is never deleted, so the dedupe is
-///   *unbounded*, which is stronger than the claim-table case rather than
-///   weaker.
+/// * An execution-row-bound binding with retention **off** (harvest's
+///   default). The row and its claim are never deleted. So the dedupe is
+///   *unbounded*, which is stronger than the claim-table case.
 ///
 /// An execution-row-bound binding under active retention always reports its
-/// bound, deliberately: tuning `start_idempotency_window` must not silence it,
-/// because that knob does not govern this path at all. Naming the wrong remedy
-/// is the failure mode this exists to prevent.
+/// bound. Tuning `start_idempotency_window` must not silence it, because that
+/// knob does not govern this path. This exists to stop a warning that names
+/// the wrong remedy.
 ///
 /// Pure so the decision is unit-testable without capturing `tracing` output.
 #[cfg(feature = "connectors")]
@@ -1512,21 +1497,22 @@ fn untuned_dedupe_bound(
 }
 
 /// The first pair of registrations that share one event source, if any
-/// (issue #944, Codex review).
+/// (issue #944).
 ///
-/// Each registration gets its own [`ConnectorRuntime`][r] and therefore its own
-/// `OffsetTracker`, so handing the same `Arc<dyn EventSource>` to two of them
-/// starts two receive loops over **one client** with two independent views of
-/// what is durable. On Kafka that is a message-loss hazard: the loops split the
-/// stream nondeterministically, so one tracker can commit a contiguous mark
-/// covering offsets the *other* loop is still dispatching, and a crash then
-/// skips them permanently. On SQS it is a silent fan-out failure: each message
-/// goes to exactly one of the two bindings, so neither target sees the whole
-/// queue.
+/// Each registration gets its own [`ConnectorRuntime`][r] and its own
+/// `OffsetTracker`. Give the same `Arc<dyn EventSource>` to two of them, and
+/// two receive loops run over **one client**. Each has its own view of what is
+/// durable.
 ///
-/// Callers pass source identities (`Arc::as_ptr` addresses); taking plain
-/// integers keeps the decision unit-testable without constructing sources,
-/// mirroring [`binding_stream_matches_adapter`].
+/// On Kafka that is a message-loss hazard. The loops split the stream
+/// nondeterministically. One tracker can commit a contiguous mark over offsets
+/// that the *other* loop still dispatches. A crash then skips them
+/// permanently. On SQS it is a silent fan-out failure. Each message goes to
+/// one of the two bindings, so neither target sees the whole queue.
+///
+/// Callers pass source identities (`Arc::as_ptr` addresses). Plain integers
+/// keep the decision unit-testable without sources, as in
+/// [`binding_stream_matches_adapter`].
 ///
 /// [r]: crate::connector::ConnectorRuntime
 #[cfg(feature = "connectors")]
@@ -1541,15 +1527,14 @@ fn first_shared_source(identities: &[usize]) -> Option<(usize, usize)> {
 
 /// Index pair of the first two entries that declare the same identity.
 ///
-/// The sibling of [`first_shared_source`] for a *declared* identity rather
-/// than an object pointer: two separately constructed sources over one
-/// physical subscription have distinct pointers, so the pointer check cannot
-/// see them, but they still compete for the same messages.
+/// The sibling of [`first_shared_source`] for a *declared* identity, not an
+/// object pointer. Two separately constructed sources over one physical
+/// subscription have distinct pointers, so the pointer check cannot see them.
+/// They still compete for the same messages.
 ///
-/// A `None` entry declares no identity and never matches — not even another
-/// `None`. An adapter that cannot name its subscription is not evidence of a
-/// clash, and treating absence as a match would reject every pair of custom
-/// adapters on sight.
+/// A `None` entry declares no identity and never matches, not even another
+/// `None`. An adapter that cannot name its subscription is no evidence of a
+/// clash. A match on absence would reject every pair of custom adapters.
 #[cfg(feature = "connectors")]
 fn first_shared_identity<T: PartialEq>(identities: &[Option<T>]) -> Option<(usize, usize)> {
     for (i, id) in identities.iter().enumerate() {
@@ -1567,16 +1552,15 @@ fn first_shared_identity<T: PartialEq>(identities: &[Option<T>]) -> Option<(usiz
 /// Index pair of the first two bindings that consume the same logical
 /// `(stream, target)` pair (issue #944).
 ///
-/// Not an error, unlike a shared *physical* subscription: two independent
-/// brokers can expose the same stream name and legitimately feed one workflow
-/// (active/active, or a cluster migration), and only the operator knows which
-/// they meant. But on ONE broker it double-dispatches every message — each
-/// binding derives its own idempotency key, because the binding name
-/// namespaces it — so it is worth saying out loud once at startup.
+/// Not an error, unlike a shared *physical* subscription. Two independent
+/// brokers can expose the same stream name and legitimately feed one workflow,
+/// as in active/active or a cluster migration. Only the operator knows which
+/// they meant. On ONE broker it double-dispatches every message. Each binding
+/// derives its own idempotency key, because the binding name namespaces it.
+/// So startup warns once.
 ///
-/// Callers pass `(stream, workflow, signal_name)` triples; taking plain tuples
-/// keeps the decision unit-testable without constructing bindings, mirroring
-/// [`first_shared_source`].
+/// Callers pass `(stream, workflow, signal_name)` triples. Plain tuples keep
+/// the decision unit-testable without bindings, as in [`first_shared_source`].
 #[cfg(feature = "connectors")]
 fn first_duplicate_stream_target<'a>(
     pairs: &[(&'a str, &'a str, Option<&'a str>)],
@@ -1594,12 +1578,12 @@ fn first_duplicate_stream_target<'a>(
 ///
 /// `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
 /// `HashMap`, so a name registered twice executes under the *last* definition.
-/// A `.find()` would be first-wins, which is not a cosmetic difference here:
-/// the target's info decides the effective [`IdempotencyMode`][im], so a first
-/// throttled definition followed by a plain one makes the runtime dedupe on
-/// broker coordinates while a first-wins lookup describes a definition that
-/// will never run — suppressing the 24-hour claim-lifetime warning and leaving
-/// the operator unaware that a late replay can start a second execution.
+/// A `.find()` would be first-wins, and the difference matters. The target's
+/// info decides the effective [`IdempotencyMode`][im]. Take a throttled
+/// definition followed by a plain one. The runtime dedupes on broker
+/// coordinates. A first-wins lookup describes the definition that never runs.
+/// It suppresses the 24-hour claim-lifetime warning. The operator then does not
+/// know that a late replay can start a second execution.
 ///
 /// One helper so every connector path that reads a target's info agrees by
 /// construction rather than by comment.
@@ -1963,14 +1947,12 @@ impl HarvestPlugin {
         // -- can also refuse a non-embedded ambient mode.
         api_state.set_require_embedded_harvest_mode(require_embedded_harvest_mode);
 
-        // Issue #355: one shared `HarvestMetricsRecorder` instance backs both
-        // the engine-side `MetricsRecorder` (installed on `builder` before it
-        // is stashed in the runtime slot -- `HarvestBuilder::telemetry(..)`
-        // must be applied before `try_build()` runs inside
-        // `start_harvest_runtime`) and the app-level `MetricsSource`
-        // registration, so the shared `/actuator/prometheus` endpoint always
-        // renders the exact samples the engine recorded. There is
-        // deliberately no separate Harvest-owned scrape route.
+        // Issue #355: one shared `HarvestMetricsRecorder` backs the engine-side
+        // `MetricsRecorder` and the app-level `MetricsSource`. So the shared
+        // `/actuator/prometheus` endpoint renders the exact samples that the
+        // engine recorded. No Harvest-owned scrape route exists, by design.
+        // `HarvestBuilder::telemetry(..)` must apply before `try_build()` runs
+        // in `start_harvest_runtime`, so it goes on `builder` before the stash.
         #[cfg(feature = "metrics")]
         let metrics_recorder =
             metrics_scrape_enabled.then(crate::metrics_scrape::HarvestMetricsRecorder::new);
@@ -1992,10 +1974,10 @@ impl HarvestPlugin {
         };
 
         // Issue #344: generate the inbound webhook receiver routes before the
-        // builder is stashed in the runtime slot (same ordering constraint as
-        // the MCP tool routes below -- `builder.workflow_infos()` is only
-        // available pre-build). Fails fast (panics) on a duplicate/malformed
-        // binding path or a trigger targeting an unregistered workflow.
+        // builder goes into the runtime slot. `builder.workflow_infos()`
+        // exists only pre-build, as for the MCP tool routes. It panics on a
+        // duplicate or malformed binding path. It also panics on a trigger
+        // that targets an unregistered workflow.
         #[cfg(feature = "webhooks")]
         let webhook_routes = if webhook_triggers.is_empty() {
             Vec::new()
@@ -2008,18 +1990,18 @@ impl HarvestPlugin {
             )
         };
 
-        // Issue #944: validate broker bindings before the builder is stashed
-        // in the runtime slot (`builder.workflow_infos()` is only available
-        // pre-build), so a misconfigured binding is a startup panic rather
-        // than a consumer that silently never dispatches anything.
+        // Issue #944: validate broker bindings before the builder goes into
+        // the runtime slot, because `builder.workflow_infos()` exists only
+        // pre-build. A misconfigured binding is then a startup panic, not a
+        // consumer that silently dispatches nothing.
         #[cfg(feature = "connectors")]
         validate_connectors(&connectors, &builder);
 
         // Issue #597: generate the MCP tool routes before the builder is
-        // stashed in the runtime slot. These are app-level typed routes
-        // (registered via `AppBuilder::routes`, not `nest`) so autumn-web's
-        // `mount_mcp` can project them into the tool catalog; handlers fail
-        // closed until `on_startup` installs the runtime.
+        // stashed in the runtime slot. They are app-level typed routes from
+        // `AppBuilder::routes`, not `nest`. So autumn-web's `mount_mcp` can
+        // project them into the tool catalog. Handlers fail closed until
+        // `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
         let mcp_routes = build_mcp_routes(
             McpMount {
@@ -2038,22 +2020,22 @@ impl HarvestPlugin {
             &api_state,
         );
 
-        // Issue #608: deployment-level opt-in for read-path payload decoding,
-        // co-located with the codec-registry mirror so both are in place
-        // before the HTTP server binds — no boot window where a
-        // decode-eligible request sees a default identity-only registry
-        // (`try_build` clones the registry verbatim, so this pre-build view
-        // is identical to the post-build one). Mirroring is unconditional
-        // and cheap; behavior is controlled by the flag + per-request admin
-        // gate. Must run before `builder` is moved into the runtime slot.
+        // Issue #608: the read-path payload decoding opt-in sits beside the
+        // codec-registry mirror. Both are in place before the HTTP server
+        // binds. So no decode-eligible request sees a default identity-only
+        // registry during boot. `try_build` clones the registry verbatim, so
+        // this pre-build view equals the post-build one. Mirroring is
+        // unconditional and cheap. The flag and the per-request admin gate
+        // control behavior. This must run before `builder` moves into the
+        // runtime slot.
         api_state.set_payload_codecs(builder.payload_codecs().clone());
         api_state.set_decode_payloads_on_read(decode_payloads_on_read);
         // Issue #679: mirror the rolled-up status thresholds into the API state.
         api_state.set_status_thresholds(status_thresholds);
-        // Issue #796: mirror the synthetic liveness canary config so
-        // `start_harvest_runtime` can register the probe workflow/activity/
-        // schedule, and the (follow-up) `GET /admin/canary` read model can
-        // resolve the interval/staleness window. `None` leaves the canary off.
+        // Issue #796: `start_harvest_runtime` reads this canary config to
+        // register the probe workflow, activity and schedule. The follow-up
+        // `GET /admin/canary` read model reads its interval and staleness
+        // window. `None` leaves the canary off.
         api_state.set_canary_config(canary_config);
         // Issue #2374: the store of the agent profile overlay routes.
         api_state.set_agent_overlay_store(agent_overlay_store);
@@ -2225,11 +2207,10 @@ pub(crate) fn build_mcp_routes(
     if !(mcp_tools_enabled || mcp_tasks_enabled) {
         return None;
     }
-    // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
-    // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
-    // the outer app builder, after this `Plugin::build` call returns
-    // -- so there is no way to *guarantee* these routes are
-    // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
+    // PR #908: `HarvestPlugin` cannot detect or intercept
+    // `AppBuilder::secure_mcp(...)`. That is configured on the outer app
+    // builder, after this `Plugin::build` call returns. So there is no
+    // way to *guarantee* these routes are protected. `secure_mcp` only gates the `/mcp` JSON-RPC
     // envelope, not a generated tool route's own direct HTTP path
     // (these are registered via `AppBuilder::routes`, not `nest`).
     // Surface the gap loudly at startup instead of leaving it silent.
@@ -2263,12 +2244,11 @@ pub(crate) fn build_mcp_routes(
         );
     }
     let prefix = crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
-    // A unified DAG's shadow `WorkflowInfo` (auto-registered by
-    // `.dags(...)`) lives in `builder.workflow_infos()` alongside
-    // ordinary workflows; `collect_descriptors` cross-references
-    // `builder.dag_infos()` to tell them apart, routing a DAG's start
-    // tool through the DAG trigger contract and omitting its signal
-    // tool (issue #601 follow-up).
+    // `.dags(...)` registers a unified DAG's shadow `WorkflowInfo` in
+    // `builder.workflow_infos()`, beside ordinary workflows.
+    // `collect_descriptors` reads `builder.dag_infos()` to tell them apart.
+    // A DAG's start tool then goes through the DAG trigger contract, and
+    // it gets no signal tool (issue #601 follow-up).
     let descriptors = crate::mcp_tools::collect_descriptors(
         builder.workflow_infos(),
         builder.update_handlers(),
@@ -2281,7 +2261,7 @@ pub(crate) fn build_mcp_routes(
             &descriptors,
             api_state,
             mcp_tool_middleware.as_ref(),
-            // Issue #776 (F1): gate mutating MCP tools for read-only
+            // Issue #776: gate mutating MCP tools for read-only
             // principals. These routes are app-level (outside the
             // `enforce_read_only_class` layer on the nested management
             // router), so the read-only class boundary is applied here too.
@@ -2355,62 +2335,61 @@ fn oidc_mcp_tool_gate(
 /// The application configuration this startup hook should read.
 ///
 /// `state.config()` first, **not** `AutumnConfig::load()`. Re-loading reads
-/// `autumn.toml` + `AUTUMN_*` from scratch and so silently ignores any
-/// `ConfigLoader` the embedder installed via `AppBuilder::with_config_loader` —
-/// the seam autumn-web documents for exactly this. Autumn had already resolved
-/// the database URL through that loader, applied the migrations with it and
-/// built the pool from it; this function then looked at a *different* config
-/// and refused to start with "requires database.url when harvest.mode is
-/// embedded".
+/// `autumn.toml` + `AUTUMN_*` from scratch. It silently ignores any
+/// `ConfigLoader` from `AppBuilder::with_config_loader`, the seam autumn-web
+/// documents for exactly this. Autumn resolved the database URL through that
+/// loader, applied the migrations and built the pool with it. This function
+/// then read a *different* config. It refused to start with "requires
+/// database.url when harvest.mode is embedded".
 ///
 /// But `state.config()` is not always populated. `autumn_web::test::TestApp`
-/// starts from `AutumnConfig::default()`, and `AppState::config_arc` falls back
-/// to a default when no config extension is present — so a harness that
-/// supplies its database another way leaves `database.url` empty while the
-/// process environment still carries it. Reading only `state.config()` broke
-/// exactly those suites.
+/// starts from `AutumnConfig::default()`. `AppState::config_arc` falls back to
+/// a default when no config extension is present. A harness that supplies its
+/// database another way then has an empty `database.url`, while the process
+/// environment still carries it. Reading only `state.config()` broke exactly
+/// those suites.
 ///
-/// So: prefer the config the app is actually running on, and fall back to the
-/// ambient one **only when the app's own config names no database at all**. The
-/// fallback can add a URL where there was none; it can never override one the
-/// embedder resolved, which is what the `ConfigLoader` fix depends on.
+/// So prefer the config that the app runs on. Fall back to the ambient one
+/// **only when the app's own config names no database at all**. The fallback
+/// can add a URL where there was none. It can never override one that the
+/// embedder resolved, and the `ConfigLoader` fix depends on that.
 fn resolve_app_config(state: &AppState) -> AutumnConfig {
     preferred_app_config(state.config(), AutumnConfig::load().ok())
 }
 
 /// The choice [`resolve_app_config`] makes, as a pure function of both configs.
 ///
-/// Split out so the rule is unit-testable: the bug it fixes only reproduced
-/// inside a live `TestApp` against a Docker-backed database, which is the
-/// slowest possible place to notice a one-line policy change.
+/// Split out so the rule is unit-testable. The bug it fixes reproduced only
+/// inside a live `TestApp` against a Docker-backed database. That is the
+/// slowest place to notice a one-line policy change.
 fn preferred_app_config(from_state: AutumnConfig, ambient: Option<AutumnConfig>) -> AutumnConfig {
     if from_state.database.url.is_some() {
         return from_state;
     }
     match ambient {
         Some(ambient) if ambient.database.url.is_some() => ambient,
-        // Neither names a database. Return the app's own config so the caller
-        // reports the invariant it actually cares about ("requires
-        // database.url when harvest.mode is embedded") rather than a difference
-        // between two empty configs.
+        // Neither names a database. Return the app's own config. The caller
+        // then reports the invariant it cares about, not a difference between
+        // two empty configs. That invariant is "requires database.url when
+        // harvest.mode is embedded".
         _ => from_state,
     }
 }
 
 /// Announce an unauthenticated management API at startup (issue #1284).
 ///
-/// In the `dev` profile with no declared auth boundary, a caller that presents
-/// no session cookie reaches every admin route — that is what makes the
-/// quickstart's documented `harvest preflight` step work without a manual
-/// credential setup, and it is the posture `set_deployment_profile` has always
-/// documented. Deliberate, but never silent: an operator who left a `dev`-profile
-/// process bound to a shared interface should learn it from the log, not from an
-/// incident. The two ways out are named in the message.
+/// In the `dev` profile with no declared auth boundary, a caller with no
+/// session cookie reaches every admin route. That lets the quickstart's
+/// documented `harvest preflight` step work with no manual credential setup.
+/// `set_deployment_profile` has always documented this posture. It is
+/// deliberate, but never silent. An operator who left a `dev`-profile process
+/// on a shared interface should learn it from the log, not from an incident.
+/// The message names the two ways out.
 ///
-/// Split out as a free function so the exact predicate is unit-testable without
-/// booting an `AppState` — the failure mode that matters is this warning firing
-/// for a profile that is *not* open (noise operators learn to ignore) or staying
-/// quiet for one that is.
+/// A free function makes the exact predicate unit-testable without an
+/// `AppState`. Two failures matter. The warning can fire for a profile that is
+/// *not* open, which is noise that operators learn to ignore. Or it can stay
+/// quiet for one that is open.
 fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
     if dev_admin_api_is_open(profile, auth_boundary_present) {
         tracing::warn!(
@@ -2569,37 +2548,38 @@ async fn start_harvest_runtime(
     // Copy the builder limits into the API state. `HarvestEmbedding` runs the
     // same step, so the two boot paths serve the same limits (issue #1613).
     crate::boot::mirror_built_config(api_state, &mut built);
-    // The read-path decode codec registry (issue #608) is mirrored in
-    // `Plugin::build`, together with the opt-in flag, so it is in place
-    // before the HTTP server binds — not here.
+    // `Plugin::build` mirrors the read-path decode codec registry (issue
+    // #608) with its opt-in flag, not here. So it is in place before the
+    // HTTP server binds.
 
-    // The resolved effective runtime configuration (issue #695) served by
-    // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
-    // (in `HarvestRunner::start` below) and rides on the resulting
-    // `HarvestApiRuntime`, so it is populated on any deployment that installs
-    // that runtime — the plugin web-app path here and the standalone runner
-    // alike — without a separate `set_effective_config` call to remember.
+    // `PreparedHarvestRuntime::build`, inside `HarvestRunner::start`,
+    // captures the effective runtime configuration of `GET /admin/config`
+    // (issue #695). It rides on the resulting `HarvestApiRuntime`. So each
+    // deployment that installs that runtime has it, the plugin web-app path
+    // and the standalone runner alike. No `set_effective_config` call is
+    // needed.
 
     state.insert_extension(harvest_config.outbox.clone());
     state.insert_extension(router.clone());
 
-    // issue #618 (F1 re-review): populate the gate-cache snapshot with the
-    // persisted active gates BEFORE the cache Arc is published to the global
-    // static and BEFORE `HarvestRunner::start` spawns the worker poll loops and
-    // the timeout scanner (which fire completion-trigger / debounce / throttle /
-    // event-batch starts). Otherwise a scanner tick or a completion trigger
-    // firing in the boot window would run `check_cached()` against an EMPTY
-    // snapshot and PROCEED, bypassing persisted Fleet/queue/name gates uncounted
-    // at startup. This runs on `harvest_pool` because it must complete before
-    // that pool is moved into `runner_resources` on the next line. The runner's
-    // own storage pool (`harvest_db_pool` below) wraps the very same underlying
-    // pool, so the snapshot loaded here is the one workers see.
+    // Issue #618: load the persisted active gates into the gate-cache
+    // snapshot first. This runs BEFORE the cache Arc goes to the global
+    // static. It also runs BEFORE `HarvestRunner::start` spawns the worker
+    // poll loops and the timeout scanner. Those fire completion-trigger,
+    // debounce, throttle and event-batch starts. Otherwise a scanner tick or a
+    // completion trigger in the boot window would run `check_cached()` against
+    // an EMPTY snapshot and PROCEED. It would then bypass the persisted
+    // Fleet, queue and name gates, uncounted. This runs on `harvest_pool`,
+    // because that pool moves into `runner_resources` on the next line. The
+    // runner's storage pool (`harvest_db_pool`) wraps the same underlying
+    // pool. So the workers see the snapshot loaded here.
     //
-    // Boot-load-FAILS case (a genuine gate-DB outage at boot): the snapshot
-    // stays empty and `check_cached()` proceeds — the same documented bounded
-    // caveat as a mid-run fail-closed with no cached match. We deliberately do
-    // NOT block-drop on boot-load failure (that reintroduces the permanent-drop
-    // fixed in F3); the direct HTTP start path still fails closed via `check()`.
+    // If the boot load FAILS (a real gate-DB outage at boot), the snapshot
+    // stays empty and `check_cached()` proceeds. That is the same documented,
+    // bounded caveat as a mid-run fail-closed with no cached match. Boot-load
+    // failure deliberately does NOT block-drop, because that brings back an
+    // earlier permanent-drop bug. The direct HTTP start path still fails
+    // closed through `check()`.
     crate::boot::load_boot_admission_gates(api_state, &harvest_pool).await;
 
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
@@ -2619,12 +2599,11 @@ async fn start_harvest_runtime(
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
     let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
-    // Issue #763 review (Codex finding): the transactional-start idempotency
-    // dedup window must honor the operator's configured
-    // `HarvestBuilder::start_idempotency_window`, the same value the HTTP
-    // start route and the purge scanner already use (see `api_state.set_start_idempotency_window`
-    // and `start_idempotency::set_purge_window_secs` above) -- not a hardcoded
-    // default.
+    // Issue #763: the transactional-start dedup window honors the operator's
+    // `HarvestBuilder::start_idempotency_window`, not a hardcoded default.
+    // The HTTP start route and the purge scanner use the same value. See
+    // `api_state.set_start_idempotency_window` and
+    // `start_idempotency::set_purge_window_secs`.
     let start_idempotency_window = built.start_idempotency_window;
     // Pre-flight: reject a multi-shard WorkerConfig before spawning any background
     // tasks.  The plugin configures WorkflowHandleClient with only shard-0's
@@ -2645,27 +2624,28 @@ async fn start_harvest_runtime(
         }
     }
 
-    // Issue #700 AC4 (P1 fix): boot-time orphaned-workflow-type reachability gate.
-    // Run it HERE — BEFORE `HarvestRunner::start` spawns the worker poll loop and
-    // the scanners, and before any admission global is published — not after.
+    // Issue #700 AC4: boot-time orphaned-workflow-type reachability gate.
+    // Run it HERE — BEFORE `HarvestRunner::start` spawns the worker poll loop
+    // and the scanners, and before any admission global is published.
     // Under `orphaned_workflows = fail` + `worker_enabled`, a worker spawned by
-    // `HarvestRunner::start` could CLAIM and terminally FAIL an orphaned-type
-    // execution (no registered handler -> WorkflowFailed + FAILED state) during
-    // the boot window before an after-the-fact abort tore the runner down —
-    // defeating the gate's protective purpose. Placing the gate before any task
-    // can be claimed closes that window; on Abort we `return Err` with nothing to
-    // tear down (no runner / gate-refresh / outbox spawned yet, no admission
-    // globals published).
+    // `HarvestRunner::start` can CLAIM and terminally FAIL an orphaned-type
+    // execution (no registered handler -> WorkflowFailed + FAILED state). It can
+    // do so in the boot window, before an after-the-fact abort tears the runner
+    // down. That defeats the protective purpose of the gate. Placing the gate
+    // before any task can be claimed closes that window. On Abort the function
+    // returns `Err` with nothing to tear down. No runner, gate refresh or
+    // outbox is spawned yet, and no admission global is published.
     //
-    // The gate itself lives in `runner::run_startup_orphan_gate` (issue #1128),
-    // which `HarvestRunner::start` also calls so the STANDALONE embedder path
-    // gets the identical fail-fast. One implementation, so the registered-set
-    // union, the pool precedence, the decision table and the operator-facing
-    // messages cannot drift between the two boot paths. Everything it needs is
-    // available before the runner starts: `built` (workflow names UNION
-    // unified-DAG names) and `runner_resources` (the pool the runner will
-    // resolve, plus the router). It is READ-ONLY and installs no process global,
-    // so an aborting gate is side-effect-free (issue #700 P4).
+    // The gate lives in `runner::run_startup_orphan_gate` (issue #1128).
+    // `HarvestRunner::start` also calls it, so the STANDALONE embedder path
+    // gets the identical fail-fast. With one implementation, the two boot
+    // paths cannot drift. That covers the registered-set union, the pool
+    // precedence, the decision table and the operator-facing messages.
+    // Everything it needs exists before the runner starts. `built` gives the
+    // workflow names UNION the unified-DAG names. `runner_resources` gives the
+    // pool the runner will resolve, plus the router. The gate is READ-ONLY
+    // and installs no process global. So an aborting gate is side-effect-free
+    // (issue #700).
     //
     // `runner_resources` is marked below with `with_startup_orphan_gate_already_run()`
     // so `HarvestRunner::start` does not repeat the scan for this boot.
@@ -2676,34 +2656,32 @@ async fn start_harvest_runtime(
     )
     .await?;
 
-    // issue #618 (F11 + F1 re-review): publish the SAME gate-cache Arc the
-    // management API uses into the process-global static BEFORE
-    // HarvestRunner::start spawns the worker poll loops and the timeout scanner
-    // (which fire completion-trigger / debounce / throttle / event-batch starts).
-    // The snapshot was already populated with persisted gates just above (before
-    // `harvest_pool` was moved), so the Arc published here — and mutated in place
-    // by the background refresh loop — already carries the boot-time gates. A
-    // single publish is sufficient; no re-publish per refresh.
-    // issue #618 (F-round7): publish via an RAII guard so any early-return error
-    // AFTER this point clears the globals rather than leaving them pointing at a
-    // failed startup's stale cache/recorder. Defused with `.commit()` on success.
+    // Issue #618: publish the SAME gate-cache Arc as the management API into
+    // the process-global static. Do it BEFORE `HarvestRunner::start` spawns
+    // the worker poll loops and the timeout scanner. Those fire
+    // completion-trigger, debounce, throttle and event-batch starts. The
+    // snapshot already holds the persisted gates, loaded before `harvest_pool`
+    // moved. The background refresh loop mutates this Arc in place. So it
+    // already carries the boot-time gates, and one publish is enough.
+    // An RAII guard publishes it. Any early-return error after this point
+    // clears the globals. They never point at a failed startup's stale cache
+    // or recorder. `.commit()` defuses the guard on success.
     let mut admission_guard = AdmissionGlobalsGuard::publish_gate_cache(api_state.gate_cache());
-    // issue #618 (F-round5, F-round14): publish the SAME metrics recorder the
-    // workers/scanners use so the completion-trigger block path counts a block even
-    // when its caller passes `metrics: None` (the cancel / terminate /
-    // parent-close-cascade paths, which rely on the process-global recorder). Publish
-    // it BEFORE `HarvestRunner::start` spawns the worker poll loops and the timeout
-    // scanner — symmetric with the gate cache above (F-round14). Otherwise, in the
-    // boot window between the runner spawning those background tasks and a later
-    // metrics publish, a completion-trigger block on one of those paths would find
-    // `global_admission_metrics() == None` and silently drop the
-    // `harvest.admission.blocked` count. `built.telemetry().metrics` is the very same
-    // `Arc<dyn MetricsRecorder>` the registry hands the workers — both come from
-    // `built.telemetry` via `into_worker_parts_with_extra_state` — so this counts
-    // through the identical sink the runner-derived accessor would have, while
-    // `built` is still owned here (consumed by `HarvestRunner::start` on the next
-    // line). The RAII guard keeps clearing BOTH globals on any early-return error and
-    // keeping both only on `.commit()`.
+    // Issue #618: publish the SAME metrics recorder as the workers and
+    // scanners. Then the completion-trigger block path counts a block even when
+    // its caller passes `metrics: None`. The cancel, terminate and
+    // parent-close-cascade paths do that, and rely on the process-global
+    // recorder. Publish it BEFORE `HarvestRunner::start` spawns the worker
+    // poll loops and the timeout scanner, as for the gate cache. Otherwise a
+    // block on one of those paths in the boot window would find
+    // `global_admission_metrics() == None`. It would then silently drop the
+    // `harvest.admission.blocked` count. `built.telemetry().metrics` is the
+    // same `Arc<dyn MetricsRecorder>` that the registry hands the workers.
+    // Both come from `built.telemetry` via `into_worker_parts_with_extra_state`.
+    // So this counts through the same sink as the runner-derived accessor.
+    // `built` is still owned here, and `HarvestRunner::start` consumes it next.
+    // The RAII guard clears BOTH globals on any early-return error. It keeps
+    // both only on `.commit()`.
     admission_guard.publish_metrics(std::sync::Arc::clone(&built.telemetry().metrics));
 
     let runner = HarvestRunner::start(
@@ -2740,24 +2718,22 @@ async fn start_harvest_runtime(
     .with_codecs(payload_codecs)
     .with_shared_state(runner.api_runtime().registry().shared_state())
     .with_handlers(query_handlers, update_handlers)
-    // Issue #763: registered `WorkflowInfo`s so the in-process transactional
-    // start API can resolve defaults (execution_timeout, sla, concurrency key)
-    // and published input-schema validation, the same way the HTTP start
-    // route does.
+    // Issue #763: the in-process transactional start API reads the registered
+    // `WorkflowInfo`s, as the HTTP start route does. It resolves defaults
+    // (execution_timeout, sla, concurrency key) and the published input-schema
+    // validation.
     //
-    // Issue #763 review ("Exclude registered DAGs from transactional workflow
-    // starts"): unified DAGs are filtered out by `transactional_client_workflows`
-    // below — see its doc comment for the full rationale.
+    // Issue #763: `transactional_client_workflows` filters out unified DAGs.
+    // Its doc comment gives the full rationale.
     .with_workflows(transactional_client_workflows(
         runner.api_runtime().registry().workflows.values(),
         runner.api_runtime().registered_dag_names(),
     ))
-    // Issue #763 review ("Carry the default queue on the handle client"): the
-    // SAME runtime-carried queue list `POST /workflows/{name}/start` resolves
-    // its own default queue from, so a start with no explicit
-    // `TransactionalStartOptions::queue_name` lands on a queue this fleet's
-    // workers actually poll instead of the (possibly unset or stale)
-    // process-global default.
+    // Issue #763: `POST /workflows/{name}/start` resolves its default queue
+    // from this SAME runtime-carried queue list. So a start with no explicit
+    // `TransactionalStartOptions::queue_name` lands on a queue that this
+    // fleet's workers poll. It does not use the process-global default, which
+    // can be unset or stale.
     .with_queues(runner.api_runtime().queues().iter().map(String::as_str))
     // Issue #2387: the registry's run-default overrides apply here too.
     .with_run_defaults(Arc::clone(runner.api_runtime().registry().run_defaults()))
@@ -2770,7 +2746,7 @@ async fn start_harvest_runtime(
     .with_history_policy(runner.api_runtime().registry().history_policy())
     .with_default_debounce_max_wait(default_debounce_max_wait)
     .with_max_workflow_attempts(max_workflow_attempts)
-    // Issue #763 review: use the operator-configured idempotency window for
+    // Issue #763: use the operator-configured idempotency window for
     // transactional-start dedup, matching the HTTP start route.
     .with_start_idempotency_window(start_idempotency_window)
     // Issue #684: wire the engine recorder so the in-process typed-update path
@@ -2795,9 +2771,9 @@ async fn start_harvest_runtime(
 
                 let registry =
                     state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
-                // Metrics recorder for the admission-gate block counter (issue #618,
-                // Finding A). Best-effort: absent only in a degenerate boot window
-                // where the registry extension isn't installed yet.
+                // Metrics recorder for the admission-gate block counter (issue #618).
+                // Best-effort: absent only in a degenerate boot window where the
+                // registry extension is not installed yet.
                 let metrics = registry
                     .as_ref()
                     .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
@@ -2854,27 +2830,27 @@ async fn start_harvest_runtime(
                             autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
                         })?;
 
-                    // Issue #618, Finding A (round 9 → round 12): the OUTBOUND
-                    // webhook-delivery producer is gated as a FRESH in-process start —
-                    // but an idempotent RETRY for the same webhook log (deterministic
-                    // workflow id `webhook-delivery-{log.id}`, `AllowDuplicate` reuse)
-                    // does NOT admit a fresh run: `start_or_load` just LOADS the existing
-                    // execution, so gating that retry would wrongly block a non-admission
-                    // and inflate the block counter.
+                    // Issue #618: the OUTBOUND webhook-delivery producer is
+                    // gated as a FRESH in-process start. An idempotent RETRY for the same
+                    // webhook log (deterministic workflow id `webhook-delivery-{log.id}`,
+                    // `AllowDuplicate` reuse) does NOT admit a fresh run. `start_or_load`
+                    // just LOADS the existing execution. Gating that retry would wrongly
+                    // block a non-admission and inflate the block counter.
                     //
-                    // Round 9 decided this with an UNLOCKED `try_load_by_key`, which had a
-                    // TOCTOU: if the existing run sealed (CONTINUED_AS_NEW / TERMINATED)
-                    // between the read-only check and `start_or_load`, the core start path
-                    // (default `AllowDuplicate`) admitted a FRESH replacement — and because
-                    // the unlocked check had already decided to skip the gate, that fresh
-                    // start slipped an active gate uncounted. Round 12 closes the window by
-                    // making the gate-skip decision CONSISTENT with `start_or_load`'s own
-                    // create-vs-attach decision: `gate_checked_start_or_load` locks the
-                    // existing active run (`FOR UPDATE`) so it cannot seal underneath us,
-                    // decides the gate on that LOCKED state, and runs `start_or_load` in the
-                    // SAME transaction — so a live run is attached (gate skipped) and a
-                    // sealed/absent run's fresh create is gated (matching gate → block+count;
-                    // fail-closed sentinel → block a fresh start, per round 5).
+                    // An UNLOCKED `try_load_by_key` check is not enough: it has a TOCTOU.
+                    // The existing run can seal (CONTINUED_AS_NEW / TERMINATED) between
+                    // the read-only check and `start_or_load`. The core start path (default
+                    // `AllowDuplicate`) then admits a FRESH replacement. The unlocked check
+                    // has already decided to skip the gate, so that fresh start slips an
+                    // active gate uncounted.
+                    //
+                    // The gate-skip decision therefore follows the create-vs-attach
+                    // decision of `start_or_load`. `gate_checked_start_or_load` locks the
+                    // existing active run (`FOR UPDATE`), so it cannot seal underneath. It
+                    // decides the gate on that LOCKED state and runs `start_or_load` in the
+                    // SAME transaction. A live run is attached and skips the gate. A fresh
+                    // create for a sealed or absent run is gated: a matching gate blocks
+                    // and counts, and the fail-closed sentinel blocks a fresh start.
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
                         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
                         concurrency_on_conflict:
@@ -2905,26 +2881,24 @@ async fn start_harvest_runtime(
                         )
                     };
 
-                    // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the
-                    // `+ Send + Sync` reference the core start path expects (the trait
-                    // requires both supertraits), mirroring how the outbox relay passes it.
+                    // The core start path expects a `+ Send + Sync` reference, so
+                    // coerce the recorder. The outbox relay passes it the same way.
                     let metrics_ref = metrics.as_ref().map(|m| {
                         m.as_ref()
                             as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
                     });
 
-                    // Issue #618, PR #1014: the gate is now enforced AUTHORITATIVELY
-                    // inside the core start primitive. `Some(GateMode::CheckCached)`
-                    // makes `_collect` apply the gate iff it will CREATE a new
-                    // execution — an idempotent `AllowDuplicate` retry that attaches
-                    // to (or reloads) an existing run admits nothing and is never
-                    // gated, while a genuinely fresh admission (incl. a seal-race
-                    // replacement, now caught under the primitive's `FOR UPDATE` lock)
-                    // is blocked + counted by the primitive itself. `CheckCached`
-                    // (not the fail-closed `Check`) is used because the outbound
-                    // webhook delivery is in-flight continuation of already-committed
-                    // work and must not be permanently dropped by a boot/DB blip it
-                    // cannot retry past.
+                    // Issue #618, PR #1014: the core start primitive enforces the
+                    // gate AUTHORITATIVELY. With `Some(GateMode::CheckCached)`,
+                    // `_collect` applies the gate iff it will CREATE a new execution.
+                    // An idempotent `AllowDuplicate` retry that attaches to or reloads
+                    // an existing run admits nothing, so it is never gated. The
+                    // primitive blocks and counts a genuinely fresh admission. That
+                    // includes a seal-race replacement, caught under its `FOR UPDATE`
+                    // lock. This uses `CheckCached`, not the fail-closed `Check`. The
+                    // outbound webhook delivery continues already-committed work. A
+                    // boot or DB blip that it cannot retry past must not drop it
+                    // permanently.
                     match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                         &mut conn,
                         start_params,
@@ -2962,12 +2936,6 @@ async fn start_harvest_runtime(
 
     api_state.install_storage_pool(harvest_db_pool.clone());
 
-    // issue #618 (F11 + F1 re-review): the process-global gate cache was
-    // published above with its snapshot already populated from persisted gates,
-    // BEFORE HarvestRunner::start spawned the workers/scanners — so a
-    // completion trigger firing in the boot window sees the real gates rather
-    // than an empty snapshot.
-
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
     // The load-shed sampler takes its registry data from the runtime here, not
     // from `api_state.install(...)` below, so its first tick cannot race the
@@ -2990,15 +2958,13 @@ async fn start_harvest_runtime(
     });
     api_state.install(runner.api_runtime());
 
-    // The boot-time orphaned-workflow-type reachability gate (issue #700 AC4,
-    // shared with the standalone runner path by issue #1128) runs earlier —
-    // BEFORE `HarvestRunner::start` spawns any worker — so a `fail` action
-    // cannot let a worker claim and terminally fail an orphaned run before the
-    // abort. See the gate call above the runner start.
+    // The orphaned-workflow-type gate (issues #700 AC4, #1128) runs before
+    // `HarvestRunner::start` spawns any worker. So with a `fail` action, no
+    // worker can claim and terminally fail an orphaned run before the abort.
 
-    // Issue #944: spawn one consumer loop per registered broker binding, after
-    // `api_state.install(...)` above so the very first message a connector
-    // pulls can already reach the dispatch path.
+    // Issue #944: spawn the connector loops after `api_state.install(...)`.
+    // Then the first message that a connector pulls can reach the dispatch
+    // path.
     #[cfg(feature = "connectors")]
     let connectors = if connector_registrations.is_empty() {
         Vec::new()
@@ -3026,31 +2992,29 @@ async fn start_harvest_runtime(
         });
     }
 
-    // Startup succeeded — keep the published admission globals (issue #618,
-    // F-round7); `stop_harvest_runtime` clears them (ptr-eq guarded) on shutdown.
+    // Startup succeeded, so keep the published admission globals (issue #618).
+    // `stop_harvest_runtime` clears them, ptr-eq guarded, on shutdown.
     admission_guard.commit();
     Ok(())
 }
 
-/// Workflows to expose on the in-process transactional-start client (issue
-/// #763), with unified DAGs excluded (issue #763 review, "Exclude registered
-/// DAGs from transactional workflow starts").
+/// Workflows to expose on the in-process transactional-start client, with
+/// unified DAGs excluded (issue #763).
 ///
 /// A unified DAG's shadow `WorkflowInfo` (issue #256) lives in
-/// `registry.workflows` right alongside ordinary workflows, but
-/// `POST /workflows/{name}/start` rejects a DAG name outright and points
-/// callers at `POST /dags/{name}/trigger` instead — the only path that runs
-/// `trigger_unified_dag`'s pause / `max_active_runs` admission checks and
-/// schedule bookkeeping. Passing every registry workflow straight through
-/// would let `start_workflow_transactional` start a paused or
-/// capacity-saturated DAG as an ordinary workflow execution, silently
-/// bypassing those checks. Filtering here — against the exact same
-/// `registered_dag_names()` set `HarvestApiRuntime::is_registered_dag` checks
-/// against for the HTTP route — means the transactional client never
-/// registers a DAG name at all; a caller naming one is rejected the same way
-/// any other unregistered workflow name is. Extracted as a pure function
-/// (rather than an inline closure in the builder chain) so the exclusion is
-/// directly unit-testable without booting a plugin/database.
+/// `registry.workflows` beside ordinary workflows. But
+/// `POST /workflows/{name}/start` rejects a DAG name and points callers at
+/// `POST /dags/{name}/trigger`. Only that path runs `trigger_unified_dag`'s
+/// pause and `max_active_runs` admission checks and schedule bookkeeping.
+/// If every registry workflow passed through, `start_workflow_transactional`
+/// could start a paused or capacity-saturated DAG as an ordinary execution.
+/// It would silently bypass those checks.
+///
+/// This filters on the same `registered_dag_names()` set that
+/// `HarvestApiRuntime::is_registered_dag` checks for the HTTP route. So the
+/// transactional client never registers a DAG name. A caller that names one
+/// is rejected like any other unregistered workflow name. A pure function
+/// makes the exclusion unit-testable without a plugin or a database.
 fn transactional_client_workflows<'a>(
     workflows: impl Iterator<Item = &'a WorkflowInfo>,
     registered_dag_names: &HashSet<String>,
@@ -3137,18 +3101,17 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     let Some(runtime) = runtime else {
         // No runtime to stop (never started, or already stopped by a prior call).
         // No worker/scanner can be evaluating a completion trigger, so clearing the
-        // global gate cache now is safe. Ptr-eq guarded (F5) so tearing down this
-        // plugin never clobbers a concurrently-live sibling's cache. The metrics
-        // recorder is not cleared here: without a runtime we have no recorder Arc to
-        // ptr-eq against (it was either never published by us or already cleared).
+        // global gate cache now is safe. The clear is ptr-eq guarded, so tearing
+        // down this plugin never clobbers a concurrently-live sibling's cache. The
+        // metrics recorder stays. Without a runtime, no recorder Arc exists to
+        // ptr-eq against. This plugin never published one, or it is already cleared.
         crate::boot::clear_admission_globals(&api_state, None);
         api_state.clear();
         return;
     };
 
-    // Capture this runtime's metrics recorder Arc BEFORE `HarvestRunner::stop(self)`
-    // consumes the runner, so we can ptr-eq against it when clearing the global
-    // recorder after the runner has stopped.
+    // Capture the recorder Arc BEFORE `HarvestRunner::stop(self)` consumes the
+    // runner. The global recorder clear after the stop ptr-eqs against it.
     let stopped_metrics = runtime
         .runner
         .api_runtime()
@@ -3176,21 +3139,22 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         }
     }
 
-    // issue #618 (F-round9): stop the runner — all worker + timeout-scanner tasks —
-    // BEFORE clearing the process-global admission gate cache / metrics recorder. A
-    // worker or timeout scanner evaluating a completion trigger reads
-    // `global_admission_gate_cache()` in that window; clearing the globals while those
-    // tasks are still alive would let a trigger start its target unblocked +
-    // uncounted under an active gate during shutdown/restart. Once `stop()` returns,
-    // no task can evaluate a trigger, so it is safe to clear the globals.
+    // Issue #618: stop the runner (all worker and timeout-scanner tasks) BEFORE
+    // clearing the process-global admission gate cache and metrics recorder.
+    // A worker or timeout scanner that evaluates a completion trigger reads
+    // `global_admission_gate_cache()` in that window. If the globals cleared
+    // while those tasks live, a trigger could start its target under an active
+    // gate during shutdown or restart. That start would be unblocked and
+    // uncounted. Once `stop()` returns, no task can evaluate a trigger, so the
+    // clear is safe.
     runtime.runner.stop().await;
 
-    // issue #618 (F5, reordered by F-round9): clear the process-global gate cache and
-    // metrics recorder so a stopped plugin's cache (whose refresh loop is now
-    // cancelled and would go stale) never leaks into a sibling plugin's
-    // completion-trigger gate check. Each clear is ptr-eq guarded so tearing down one
-    // plugin never clobbers a concurrently-live sibling's cache/recorder. Mirrors
-    // #921's teardown of GLOBAL_CALLBACK_CONFIG.
+    // Issue #618: clear the process-global gate cache and metrics recorder.
+    // The refresh loop of a stopped plugin is cancelled, so its cache goes
+    // stale. It must never leak into a sibling plugin's completion-trigger gate
+    // check. Each clear is ptr-eq guarded, so tearing down one plugin never
+    // clobbers a concurrently-live sibling's cache or recorder. This mirrors
+    // the #921 teardown of GLOBAL_CALLBACK_CONFIG.
     crate::boot::clear_admission_globals(&api_state, Some(&stopped_metrics));
     api_state.clear();
 }
@@ -3209,14 +3173,14 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 /// Historical note (issue #1232): under autumn-web 0.6 this wrapper was also
 /// required for *correctness*, not just for scheduling hygiene. A
 /// TLS-requiring `sslmode` (`require`/`verify-ca`/`verify-full`) used to reuse
-/// the *current* Tokio runtime handle and call `Handle::block_on` on it --
-/// which Tokio forbids (and panics on) from a thread already driving that
-/// runtime's tasks, exactly what an `on_startup` hook is. autumn-web 0.7 fixed
-/// that upstream by moving the whole operation onto a thread that has never
-/// entered a runtime, so the TLS path is now safe from any caller context.
-/// `migration_body_is_safe_to_call_directly_from_an_async_context` below pins
-/// that upstream guarantee, so a regression in it is caught here rather than
-/// resurfacing as a production startup panic.
+/// the *current* Tokio runtime handle and call `Handle::block_on` on it.
+/// Tokio forbids that, and panics, on a thread that already drives that
+/// runtime's tasks. An `on_startup` hook is exactly such a thread. autumn-web
+/// 0.7 fixed that upstream. It moved the whole operation onto a thread that has
+/// never entered a runtime. So the TLS path is now safe from any caller.
+/// `migration_body_is_safe_to_call_directly_from_an_async_context` pins that
+/// upstream guarantee. A regression in it then fails here, not as a production
+/// startup panic.
 async fn ensure_runtime_migrations(
     profile: &str,
     app_config: &AutumnConfig,
@@ -3238,9 +3202,9 @@ async fn ensure_runtime_migrations(
     }
 }
 
-/// The synchronous migration-check body. **Must never be called from a thread
-/// that is currently driving a Tokio runtime's async tasks** -- against a
-/// TLS-requiring database URL it panics (see [`ensure_runtime_migrations`]).
+/// The synchronous migration-check body. **Never call it from a thread that
+/// drives a Tokio runtime's async tasks.** Against a TLS-requiring database
+/// URL, it panics there (see [`ensure_runtime_migrations`]).
 /// Sync contexts (the CLI) and `spawn_blocking` tasks are both fine; call
 /// [`ensure_runtime_migrations`] from an async context instead.
 fn ensure_runtime_migrations_blocking(
@@ -3248,17 +3212,17 @@ fn ensure_runtime_migrations_blocking(
     app_config: &AutumnConfig,
     harvest_config: &HarvestRuntimeConfig,
 ) -> autumn_web::AutumnResult<()> {
-    // Autumn owns every set that lives in the APPLICATION database -- the
-    // outbox always, plus the two Harvest sets under `Embedded`, where the
-    // application database *is* the Harvest database. They are registered in
-    // `register_plugin_migrations` and applied during `setup_database`, before
-    // this startup hook runs. Under `Embedded` there is therefore nothing left
-    // for the plugin to migrate.
+    // Autumn owns every set that lives in the APPLICATION database. That is
+    // always the outbox. Under `Embedded`, the application database *is* the
+    // Harvest database, so it also covers the two Harvest sets. They register
+    // in `register_plugin_migrations` and apply during `setup_database`,
+    // before this startup hook runs. So under `Embedded`, the plugin has
+    // nothing left to migrate.
     let harvest_database_url = match harvest_config.mode {
         HarvestMode::Embedded => {
-            // Still validate the invariant Autumn cannot check for us: with no
-            // `database.url` there is no Harvest storage at all, and failing
-            // here is far clearer than a missing-table error later.
+            // Still validate the invariant that Autumn cannot check. With no
+            // `database.url`, no Harvest storage exists. Failing here is far
+            // clearer than a missing-table error later.
             if app_config.database.url.is_none() {
                 return Err(AutumnError::service_unavailable_msg(
                     "autumn-harvest requires database.url when harvest.mode is embedded",
@@ -3266,9 +3230,9 @@ fn ensure_runtime_migrations_blocking(
             }
             return Ok(());
         }
-        // A dedicated Harvest database Autumn has no handle on: `plugin_migrations`
-        // only ever targets the application's primary database, so these two sets
-        // are applied here, against `harvest.database.url`.
+        // Autumn has no handle on a dedicated Harvest database.
+        // `plugin_migrations` targets only the application's primary database.
+        // So these two sets apply here, against `harvest.database.url`.
         HarvestMode::Split | HarvestMode::External => {
             harvest_config.database.url.as_deref().ok_or_else(|| {
                 AutumnError::service_unavailable_msg(
@@ -3286,10 +3250,10 @@ fn ensure_runtime_migrations_blocking(
         HARVEST_MIGRATE_REMEDY,
     )?;
 
-    // Plugin-owned tables that live in the harvest database (issue #944's
-    // connector dead-letter table). Applied to the same dedicated URL as the
-    // core migrations above so `Split`/`External` deployments get them where
-    // the code that writes them actually connects.
+    // Plugin-owned tables in the harvest database, such as the connector
+    // dead-letter table (issue #944). They go to the same dedicated URL as the
+    // core migrations. So `Split`/`External` deployments get them where their
+    // writer connects.
     apply_migrations_for_profile(
         profile,
         harvest_database_url,
@@ -3302,16 +3266,15 @@ fn ensure_runtime_migrations_blocking(
 /// The command that applies [`HARVEST_MIGRATIONS`] to a dedicated Harvest
 /// database.
 ///
-/// `autumn migrate` is deliberately NOT named: this path only ever runs for a
-/// dedicated Harvest database (`ensure_runtime_migrations_blocking` returns
-/// early under `Embedded`), which that command cannot reach — it applies the
-/// application database's sets and exits 0 having changed nothing (issue
-/// #1240).
+/// `autumn migrate` is deliberately NOT named. This path runs only for a
+/// dedicated Harvest database, because `ensure_runtime_migrations_blocking`
+/// returns early under `Embedded`. That command cannot reach it. It applies
+/// the application database's sets and exits 0 with no change (issue #1240).
 const HARVEST_MIGRATE_REMEDY: &str = concat!(
     "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run` ",
-    // The DSN usually carries a password, and a command line is readable by
-    // every process on the host (`ps`, /proc) for as long as the migration
-    // runs. `--database-url` still works and is right for a passwordless DSN.
+    // The DSN usually carries a password. Every process on the host can read
+    // a command line (`ps`, /proc) while the migration runs. `--database-url`
+    // still works and is right for a passwordless DSN.
     "to apply them. Prefer the environment variable over `--database-url`: a ",
     "command line is visible host-wide, and this DSN usually carries a password."
 );
@@ -3320,20 +3283,20 @@ const HARVEST_MIGRATE_REMEDY: &str = concat!(
 ///
 /// **Not the same command.** The `harvest` binary embeds Harvest's own
 /// migrations, not the plugin's, so this set only applies when its directory is
-/// named explicitly. An operator given [`HARVEST_MIGRATE_REMEDY`] for *this*
-/// warning would see a successful exit and roll replicas with
-/// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
-/// added the table to prevent, since the first poison message then fails its
-/// dead-letter write and redelivers forever.
+/// named explicitly. An operator who got [`HARVEST_MIGRATE_REMEDY`] for *this*
+/// warning would see a successful exit. They would then roll replicas while
+/// `harvest_connector_dead_letters` is still absent. The first poison message
+/// then fails its dead-letter write and redelivers forever. Issue #944 added
+/// the table to prevent exactly that wedge.
 const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
     "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run ",
     "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
     "Prefer the environment variable over `--database-url`: a command line is ",
     "visible host-wide, and this DSN usually carries a password. ",
-    // Said out loud because the process logging this is usually a container
-    // with installed binaries and no checkout: unlike Harvest's own set, this
-    // one is NOT embedded in the `harvest` binary, so a workspace-relative
-    // path would send an operator at a directory that does not exist there.
+    // The process that logs this is usually a container with installed
+    // binaries and no checkout. Unlike Harvest's own set, this one is NOT
+    // embedded in the `harvest` binary. A workspace-relative path would send
+    // an operator to a directory that does not exist there.
     "That directory ships in the autumn-harvest-plugin crate source, not in the ",
     "`harvest` binary, so make it available wherever you run the command."
 );
@@ -3537,11 +3500,10 @@ mod migration_remedy_tests {
 
     #[test]
     fn neither_remedy_puts_the_dsn_in_a_command_line() {
-        // These strings are copied verbatim by an operator mid-incident, and
-        // the DSN they substitute usually carries a password. A command line
-        // is readable by every process on the host (`ps`, /proc) for as long
-        // as the migration runs, so the remedy must demonstrate the
-        // environment form.
+        // An operator copies these strings verbatim mid-incident, and the DSN
+        // they substitute usually carries a password. Every process on the
+        // host can read a command line (`ps`, /proc) while the migration
+        // runs. So the remedy must show the environment form.
         for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
             assert!(
                 remedy.contains("HARVEST_DATABASE_URL="),
@@ -3557,8 +3519,8 @@ mod migration_remedy_tests {
     #[test]
     fn only_the_plugin_remedy_names_the_plugin_migration_directory() {
         // The `harvest` binary embeds Harvest's own migrations, not the
-        // plugin's: without `--include-dir` the plugin set is silently not
-        // applied, and the operator rolls replicas with
+        // plugin's. Without `--include-dir`, the plugin set silently does not
+        // apply. The operator then rolls replicas with
         // `harvest_connector_dead_letters` absent.
         assert!(
             PLUGIN_HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
@@ -3569,9 +3531,9 @@ mod migration_remedy_tests {
             PLUGIN_HARVEST_MIGRATE_REMEDY.contains("migrations/harvest"),
             "{PLUGIN_HARVEST_MIGRATE_REMEDY}"
         );
-        // The process logging this is usually a container with no checkout, so
-        // the warning must say where that directory comes from rather than
-        // implying a path relative to the working directory.
+        // The process that logs this is usually a container with no checkout.
+        // So the warning must say where that directory comes from. It must not
+        // imply a path relative to the working directory.
         assert!(
             PLUGIN_HARVEST_MIGRATE_REMEDY.contains("crate source"),
             "the warning must say where the directory comes from: \
@@ -3673,12 +3635,11 @@ mod tests {
         assert!(api_state.is_draining());
     }
 
-    /// **Issue #1284.** The startup warning's predicate must be exact: it fires
-    /// for, and only for, the one configuration under which
-    /// `has_harvest_admin_access` admits a caller that presented no credential.
-    /// A warning that fires for closed deployments is noise operators learn to
-    /// scroll past; one that stays quiet for an open deployment is the incident
-    /// it was added to prevent.
+    /// **Issue #1284.** The startup warning's predicate must be exact. It fires
+    /// for exactly one configuration: the one where `has_harvest_admin_access`
+    /// admits a caller with no credential. A warning for closed deployments is noise
+    /// that operators learn to scroll past. Silence for an open deployment is
+    /// the incident the warning prevents.
     #[test]
     fn dev_admin_api_is_open_only_without_a_boundary_in_the_dev_profile() {
         assert!(
@@ -3812,12 +3773,12 @@ mod tests {
     #[test]
     fn the_ambient_config_fills_in_when_the_app_names_no_database() {
         // Regression: `autumn_web::test::TestApp` starts from
-        // `AutumnConfig::default()`, and `AppState::config_arc` falls back to a
-        // default when no config extension is present — so a harness that
-        // supplies its database another way leaves `database.url` empty while
-        // the process environment still carries it. Reading only
-        // `state.config()` broke those suites with "requires database.url when
-        // harvest.mode is embedded".
+        // `AutumnConfig::default()`. `AppState::config_arc` falls back to a
+        // default when no config extension is present. A harness that supplies
+        // its database another way then has an empty `database.url`, while the
+        // process environment still carries it. Reading only `state.config()`
+        // broke those suites with "requires database.url when harvest.mode is
+        // embedded".
         let chosen = preferred_app_config(
             config_naming(None),
             Some(config_naming(Some("postgres://ambient/db"))),
@@ -3842,13 +3803,12 @@ mod tests {
 
     /// Shutting a fleet of connectors down must not serialize their drains.
     ///
-    /// Deliberately *not* a wall-clock threshold: the first connector's drain
-    /// is made to genuinely depend on the second having been cancelled. Under
-    /// a cancel-then-await-one-at-a-time shutdown that dependency can never be
-    /// satisfied — the second connector's cancellation is still queued behind
-    /// the first connector's `await` — so the shutdown deadlocks and the
-    /// timeout below fires. It is exactly the deadlock a real fleet risks in
-    /// slow motion, and it either happens or it does not.
+    /// Deliberately *not* a wall-clock threshold. The first connector's drain
+    /// depends on the cancellation of the second. A cancel-then-await-one-at-a-time
+    /// shutdown can never satisfy that dependency. The second cancellation
+    /// still waits behind the first connector's `await`. So the shutdown
+    /// deadlocks and the timeout fires. A real fleet risks this deadlock in
+    /// slow motion, and here it either happens or it does not.
     #[cfg(feature = "connectors")]
     #[tokio::test]
     async fn every_connector_is_cancelled_before_any_drain_is_awaited() {
@@ -3860,8 +3820,8 @@ mod tests {
             handle: tokio::spawn(async move {
                 first_shutdown.cancelled().await;
                 // Stand-in for "this drain outlives the next connector's
-                // cancellation" — true of any real drain that is still
-                // finishing when the next connector is asked to stop.
+                // cancellation". That is true of any real drain that still
+                // runs when the next connector gets its stop.
                 let _ = second_cancelled_rx.await;
             }),
         };
@@ -3967,11 +3927,10 @@ mod tests {
         }
     }
 
-    /// Issue #763 review, "Exclude registered DAGs from transactional workflow
-    /// starts": `transactional_client_workflows` must drop exactly the names
-    /// present in `registered_dag_names` and keep every other registered
-    /// workflow untouched, mirroring what `HarvestApiRuntime::is_registered_dag`
-    /// checks against for the HTTP start route.
+    /// Issue #763: `transactional_client_workflows` drops exactly the names in
+    /// `registered_dag_names` and keeps every other registered workflow. That
+    /// mirrors the `HarvestApiRuntime::is_registered_dag` check of the HTTP
+    /// start route.
     #[test]
     fn transactional_client_workflows_excludes_registered_dag_names() {
         let plain = fake_workflow_info();
@@ -3996,9 +3955,8 @@ mod tests {
         );
     }
 
-    /// Regression guard for the fix above: with no DAGs registered at all, every
-    /// workflow passes through unchanged -- the filter must not accidentally cut
-    /// out ordinary workflows.
+    /// With no DAGs registered, every workflow passes through unchanged. The
+    /// filter must not cut out ordinary workflows.
     #[test]
     fn transactional_client_workflows_keeps_everything_when_no_dags_registered() {
         let a = fake_workflow_info();
@@ -4041,12 +3999,11 @@ mod tests {
 
     #[test]
     fn workflow_log_persistence_threads_the_policy_into_the_built_harvest() {
-        // Issue #790 (review P1): the durable log sink lives on
-        // `HarvestBuilder`, and `HarvestPlugin` holds its builder privately
-        // behind a hand-picked forwarder set. Without this forwarder the
-        // feature has NO enabling path for a plugin-wired app -- which is the
-        // primary documented deployment shape, and exactly what every doc
-        // snippet shows.
+        // Issue #790: the durable log sink lives on `HarvestBuilder`.
+        // `HarvestPlugin` holds its builder privately behind a hand-picked
+        // forwarder set. Without this forwarder, a plugin-wired app has NO way
+        // to turn the feature on. That is the primary documented deployment
+        // shape, and every doc snippet shows it.
         let built = HarvestPlugin::new()
             .workflow_log_persistence(
                 autumn_harvest::WorkflowLogPolicy::new()
@@ -4078,10 +4035,10 @@ mod tests {
     #[cfg(feature = "webhooks")]
     #[test]
     fn webhooks_accumulates_across_repeated_calls() {
-        // Codex review (PR #918): unlike .workflows/.activities/.queries/
-        // .updates, .webhooks used to *replace* rather than extend, so a
-        // second call from a separate module silently dropped the first
-        // call's bindings.
+        // PR #918: `.webhooks` used to *replace* rather than extend, unlike
+        // `.workflows` / `.activities` / `.queries` / `.updates`. So a second
+        // call from a separate module silently dropped the first call's
+        // bindings.
         let plugin = HarvestPlugin::new()
             .webhooks(vec![fake_webhook_trigger("a", "/hooks/a")])
             .webhooks(vec![fake_webhook_trigger("b", "/hooks/b")]);
@@ -4305,7 +4262,7 @@ mod tests {
         assert!(plugin.api_middleware.is_some());
     }
 
-    /// Regression test (issue #597, PR #908 review): `mcp_tools()` combined
+    /// Regression test (issue #597, PR #908): `mcp_tools()` combined
     /// with no `api_with_auth(..)` must be flagged so the generated tool
     /// routes' unauthenticated-at-their-own-path gap is never silent.
     #[cfg(feature = "mcp")]
@@ -4336,9 +4293,9 @@ mod tests {
         );
     }
 
-    /// The synthetic liveness canary (issue #796) must be off by default so a
-    /// plugin that never calls `synthetic_canary` produces a byte-for-byte
-    /// identical runtime (AC1), and the opt-in must store the config.
+    /// The synthetic liveness canary (issue #796) is off by default. A plugin
+    /// that never calls `synthetic_canary` keeps a byte-for-byte identical
+    /// runtime (AC1). The opt-in stores the config.
     #[test]
     fn synthetic_canary_defaults_off_and_sets_on_builder() {
         let plugin = HarvestPlugin::new();
@@ -4413,9 +4370,9 @@ mod tests {
                 outbox: HarvestOutboxConfig::default(),
                 batch: crate::config::HarvestBatchConfig::default(),
                 readiness: crate::config::HarvestReadinessConfig::default(),
-                // Deliberately the DEFAULT action (`warn`), not `off`: the
-                // classic-DAG rejection is pure configuration validation that
-                // `start` runs BEFORE the issue-#1128 orphan gate, so this
+                // Deliberately the DEFAULT action (`warn`), not `off`. The
+                // classic-DAG rejection is pure configuration validation.
+                // `start` runs it BEFORE the issue-#1128 orphan gate. So this
                 // `--lib` test stays DB-free with the gate fully enabled. If the
                 // rejection ever moved back behind the gate, this test would
                 // start reaching for a database it has no access to.
@@ -4554,24 +4511,22 @@ mod tests {
         assert_eq!(harvest_pool.status().max_size, 10);
     }
 
-    /// Fixture for the two tests below: a `Split`-mode `AutumnConfig`/
-    /// `HarvestRuntimeConfig` pair whose **Harvest** database URL requires
-    /// TLS (`sslmode=require`), pointed at a port nothing is listening on.
+    /// Fixture for the two TLS tests: a `Split`-mode `AutumnConfig` /
+    /// `HarvestRuntimeConfig` pair. Its **Harvest** database URL requires TLS
+    /// (`sslmode=require`) and points at a port with no listener.
     /// `127.0.0.1:1` refuses the connection almost instantly on every
-    /// platform, so these tests are hermetic and fast -- no real
-    /// TLS-enabled Postgres server is needed. Reaching
-    /// `autumn_web::migrate`'s rustls connection path at all is what
-    /// triggers the "`block_on` from within a runtime" hazard, before any
-    /// network I/O happens -- so whether the target is actually reachable
-    /// is irrelevant to what these tests exercise.
+    /// platform. So these tests are hermetic and fast, with no real
+    /// TLS-enabled Postgres server. The "`block_on` from within a runtime"
+    /// hazard fires when `autumn_web::migrate` reaches its rustls connection
+    /// path, before any network I/O. So the reachability of the target does
+    /// not matter here.
     ///
-    /// `Split` (rather than `Embedded`) is load bearing: since Autumn took
-    /// ownership of the application database's migrations via
-    /// `plugin_migrations`, a dedicated Harvest database is the *only* thing
-    /// the plugin still migrates itself, so it is the only mode that reaches
-    /// the connection path this regression is about. Under `Embedded`,
-    /// `ensure_runtime_migrations_blocking` returns before connecting and both
-    /// tests below would pass vacuously.
+    /// `Split` (rather than `Embedded`) is load bearing. Autumn owns the
+    /// application database's migrations through `plugin_migrations`. So the
+    /// plugin itself migrates *only* a dedicated Harvest database. That mode
+    /// alone reaches the connection path of this regression. Under `Embedded`,
+    /// `ensure_runtime_migrations_blocking` returns before connecting, and both
+    /// tests would pass vacuously.
     fn tls_url_fixture() -> (AutumnConfig, HarvestRuntimeConfig) {
         let app_config = AutumnConfig {
             database: DatabaseConfig {
@@ -4620,12 +4575,11 @@ mod tests {
         assert!(embedded_harvest_mode_violated(true, HarvestMode::External));
     }
 
-    /// Pins the ownership split itself: under `Embedded` the plugin migrates
-    /// nothing (Autumn applied the registered sets during `setup_database`,
-    /// before this startup hook ran), so the body returns `Ok` **without**
-    /// dialling the database -- proven here by a URL that would otherwise
-    /// fail to connect. This is what makes `tls_url_fixture`'s use of
-    /// `Split` necessary rather than incidental.
+    /// Pins the ownership split itself. Under `Embedded` the plugin migrates
+    /// nothing, because Autumn applied the registered sets during
+    /// `setup_database`. So the body returns `Ok` **without** dialling the
+    /// database. A URL that would fail to connect proves it. That is why
+    /// `tls_url_fixture` must use `Split`.
     #[test]
     fn embedded_mode_migrates_nothing_and_never_connects() {
         let app_config = AutumnConfig {
@@ -4648,10 +4602,10 @@ mod tests {
         );
     }
 
-    /// The one invariant Autumn cannot check for us: `Embedded` means "Harvest
-    /// lives in the application database", so with no `database.url` there is
-    /// no Harvest storage at all. Failing here beats a missing-table error
-    /// deep in the first workflow start.
+    /// The one invariant that Autumn cannot check. `Embedded` means "Harvest
+    /// lives in the application database". So with no `database.url`, no
+    /// Harvest storage exists. Failing here beats a missing-table error deep
+    /// in the first workflow start.
     #[test]
     fn embedded_mode_without_a_database_url_is_rejected() {
         let harvest_config = HarvestRuntimeConfig {
@@ -4668,14 +4622,13 @@ mod tests {
         );
     }
 
-    /// Pins the autumn-web 0.7 upstream fix that the wrapper's original
-    /// rationale depended on (issue #1232): the synchronous migration body is
-    /// now safe to call *directly* from an async task -- the shape a
-    /// `#[tokio::test]` gives, matching the real `on_startup` hook -- even
-    /// against a TLS-requiring URL. Under 0.6 the rustls branch reused this
-    /// task's own runtime handle and panicked with "Cannot start a runtime
-    /// from within a runtime"; 0.7 runs connect and body on a freshly spawned
-    /// thread that has never entered a runtime.
+    /// Pins the autumn-web 0.7 upstream fix behind the wrapper's original
+    /// rationale (issue #1232). The synchronous migration body is now safe to
+    /// call *directly* from an async task, even against a TLS-requiring URL.
+    /// A `#[tokio::test]` gives that shape, as the real `on_startup` hook does.
+    /// Under 0.6, the rustls branch reused this task's own runtime handle. It
+    /// panicked with "Cannot start a runtime from within a runtime". 0.7 runs
+    /// connect and body on a fresh thread that has never entered a runtime.
     ///
     /// `ensure_runtime_migrations` still wraps this in `spawn_blocking`, now
     /// purely so the blocking `join()` never stalls an async worker thread.
@@ -4694,12 +4647,11 @@ mod tests {
         );
     }
 
-    /// Regression test for `ensure_runtime_migrations` failing on a
-    /// TLS-enabled Postgres: it must be safely callable from within an
-    /// async context (replicating the real `start_harvest_runtime`/
-    /// `on_startup` call site) against a TLS-requiring database URL.
-    /// Before the fix this panicked the calling task instead of returning
-    /// an ordinary connection error.
+    /// Regression test for `ensure_runtime_migrations` on a TLS-enabled
+    /// Postgres. An async context must call it safely against a TLS-requiring
+    /// database URL. That replicates the real `start_harvest_runtime` /
+    /// `on_startup` call site. Before the fix, this panicked the calling task
+    /// instead of returning an ordinary connection error.
     #[tokio::test]
     async fn ensure_runtime_migrations_does_not_panic_on_a_tls_requiring_database_url() {
         let (app_config, harvest_config) = tls_url_fixture();
@@ -4760,13 +4712,13 @@ mod tests {
 
     #[test]
     fn harvest_plugin_forwards_signals_to_builder_and_registry() {
-        // Issue #610 gap-fill: `#[signal(..)]` handlers registered through the
-        // plugin's fluent surface must reach both the builder AND the runtime
-        // `HandlerRegistry` that the `GET /interface` route and the pre-enqueue
-        // payload-validation gates read from. Without the `.signals()`
-        // forwarding method this test fails to compile (the method does not
-        // exist), and even if it did, a registry-level assertion catches a
-        // forwarding method that drops the handler on the floor.
+        // Issue #610 gap-fill: `#[signal(..)]` handlers from the plugin's
+        // fluent surface must reach the builder AND the runtime
+        // `HandlerRegistry`. The `GET /interface` route and the pre-enqueue
+        // payload-validation gates read that registry. Without the
+        // `.signals()` forwarding method, this test does not compile. A
+        // registry-level assertion also catches a forwarder that drops the
+        // handler.
         fn fake_signal() -> autumn_harvest::SignalHandlerInfo {
             autumn_harvest::SignalHandlerInfo {
                 name: "cancel",
@@ -4782,7 +4734,6 @@ mod tests {
             .workflows(vec![fake_workflow_info()])
             .signals(vec![fake_signal()]);
 
-        // Builder level: the forwarding method appended the handler.
         assert_eq!(plugin.builder.signal_handlers().len(), 1);
         assert_eq!(plugin.builder.signal_handlers()[0].name, "cancel");
         assert_eq!(plugin.builder.signal_handlers()[0].workflow, "echo");
@@ -4798,7 +4749,7 @@ mod tests {
 
     #[test]
     fn harvest_plugin_forwards_retention_to_builder() {
-        // Issue #355 review follow-up: `.retention(...)` had no dedicated
+        // Issue #355 follow-up: `.retention(...)` had no dedicated
         // coverage of its own -- only the metrics_scrape_quickstart example
         // (Docker-requiring) exercised it. `try_build()` only validates
         // config in-memory (no DB connection), so this stays a fast unit test.
@@ -4859,9 +4810,9 @@ mod tests {
     //
     // These guard the two inline `assert!`s in `Plugin::build`, which are
     // otherwise only reachable by standing up a whole plugin. Both failures
-    // are SILENT in production if they slip through: a stream mismatch makes
-    // the consumer poll forever and deliver nothing, and an unsupported
-    // broker-native mode re-reads a poison message forever.
+    // are SILENT in production. A stream mismatch makes the consumer poll
+    // forever and deliver nothing. An unsupported broker-native mode re-reads
+    // a poison message forever.
 
     #[cfg(feature = "connectors")]
     #[test]
@@ -4877,11 +4828,11 @@ mod tests {
     #[cfg(feature = "connectors")]
     #[test]
     fn two_registrations_sharing_one_source_are_rejected() {
-        // Two receive loops over ONE client, each with its own OffsetTracker,
-        // is the failure this catches: on Kafka one loop can commit a mark
-        // covering offsets the other has not made durable, permanently
-        // skipping them on a crash; on SQS the stream is split between the
-        // bindings so neither target sees every message.
+        // This catches two receive loops over ONE client, each with its own
+        // OffsetTracker. On Kafka, one loop can commit a mark over offsets that
+        // the other has not made durable. A crash then skips them permanently.
+        // On SQS the bindings split the stream, so neither target sees every
+        // message.
         assert_eq!(first_shared_source(&[1, 2, 3]), None);
         assert_eq!(first_shared_source(&[1, 2, 1]), Some((0, 2)));
         assert_eq!(first_shared_source(&[7, 7]), Some((0, 1)));
@@ -4897,9 +4848,9 @@ mod tests {
     fn two_sources_on_one_physical_subscription_are_rejected() {
         // Pointer identity only catches a *shared* `Arc`. Two separately
         // constructed sources over the same physical subscription have
-        // distinct pointers and compete for the same messages, so each target
-        // sees an arbitrary subset -- the same split the shared-`Arc` case
-        // produces, reached a different way.
+        // distinct pointers. They compete for the same messages, so each
+        // target sees an arbitrary subset. That is the shared-`Arc` split,
+        // reached a different way.
         let q = |s: &str| Some(s.to_string());
         assert_eq!(
             first_shared_identity(&[q("sqs:a"), q("sqs:b")]),
@@ -4911,9 +4862,9 @@ mod tests {
             Some((0, 1)),
             "two sources on one queue url must be rejected"
         );
-        // Two Kafka consumers on ONE topic under DISTINCT group ids is the
-        // sanctioned fan-out -- the existing panic message recommends it -- so
-        // the identity must include the group, not just the topic.
+        // Two Kafka consumers on ONE topic under DISTINCT group ids are the
+        // sanctioned fan-out, and the panic message recommends it. So the
+        // identity must include the group, not just the topic.
         assert_eq!(
             first_shared_identity(&[q("kafka:g1/orders"), q("kafka:g2/orders")]),
             None,
@@ -4924,9 +4875,9 @@ mod tests {
             Some((0, 1)),
             "two consumers in one group compete for the same partitions"
         );
-        // An adapter that declares no identity is not evidence of a clash:
-        // two `None`s must never match each other, or every pair of custom
-        // adapters would be rejected on sight.
+        // An adapter that declares no identity is no evidence of a clash.
+        // Two `None`s must never match. Otherwise every pair of custom
+        // adapters would be rejected.
         assert_eq!(first_shared_identity::<String>(&[None, None]), None);
         assert_eq!(first_shared_identity(&[None, q("sqs:a")]), None);
         // Reports the FIRST offending pair, matching `first_shared_source`.
@@ -4940,11 +4891,11 @@ mod tests {
     #[cfg(feature = "connectors")]
     #[test]
     fn a_duplicate_stream_target_pair_is_warned_about_not_rejected() {
-        // Rejecting this would break legitimate fan-in from two independent
-        // brokers exposing the same stream name, which no operator can work
-        // around (a Kafka source's `stream()` IS the topic, and the plugin
-        // requires the binding to match it). It still double-dispatches on one
-        // broker, so it is worth a warning -- which is what this drives.
+        // A rejection would break legitimate fan-in from two independent
+        // brokers with the same stream name. No operator could work around it.
+        // A Kafka source's `stream()` IS the topic, and the binding must match
+        // it. On one broker it still double-dispatches, so this drives a
+        // warning.
         let p = |stream, wf, sig| (stream, wf, sig);
         assert_eq!(
             first_duplicate_stream_target(&[
@@ -4994,14 +4945,13 @@ mod tests {
     #[test]
     fn a_duplicate_workflow_name_resolves_last_wins_everywhere() {
         // `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
-        // `HashMap`, so a name registered twice resolves LAST-wins -- that is
-        // the info the engine actually executes. Every connector path that
-        // reads a target's info must agree, or the startup warning describes a
-        // definition the runtime will never run: a first *throttled* definition
-        // followed by a plain one makes the runtime dedupe on broker
-        // coordinates while a first-wins lookup suppresses the 24h
-        // claim-lifetime warning, leaving the operator unaware that a late
-        // replay can start a second execution.
+        // `HashMap`, so a name registered twice resolves LAST-wins. The engine
+        // executes that info. Every connector path that reads a target's info
+        // must agree. Otherwise the startup warning describes a definition
+        // that never runs. Take a first *throttled* definition and then a plain
+        // one. The runtime dedupes on broker coordinates. A first-wins lookup
+        // suppresses the 24h claim-lifetime warning. The operator then does not
+        // know that a late replay can start a second execution.
         let named = |name| WorkflowInfo {
             name,
             ..fake_workflow_info()
@@ -5074,9 +5024,9 @@ mod tests {
         );
 
         // `SignalsWithStart` persists its key ONLY on `harvest_signals`, which
-        // is ON DELETE CASCADE on its execution. So retention deleting the run
-        // deletes the claim, and the window does nothing for this path -- which
-        // is exactly why tuning it must NOT silence the warning.
+        // is ON DELETE CASCADE on its execution. When retention deletes the
+        // run, it deletes the claim. The window does nothing for this path. So
+        // tuning it must NOT silence the warning.
         assert_eq!(
             untuned_dedupe_bound(
                 IdempotencyMode::BrokerCoordinates,
@@ -5155,12 +5105,11 @@ mod tests {
     #[test]
     fn connector_target_workflow_resolution_is_last_wins_like_the_registry() {
         // `spawn_connectors` resolves a binding's target `WorkflowInfo` from a
-        // last-wins map because that is what `HandlerRegistry` itself does
-        // when it collapses the builder's `Vec` into a `HashMap`. A first-wins
-        // `.find()` would hand the connector a DIFFERENT info than the engine
-        // will actually execute -- e.g. an un-throttled one -- silently
-        // resolving the wrong `IdempotencyMode` and defeating the very
-        // backpressure the operator configured.
+        // last-wins map. `HandlerRegistry` does the same when it collapses the
+        // builder's `Vec` into a `HashMap`. A first-wins `.find()` would give
+        // the connector a DIFFERENT info than the one the engine executes, such
+        // as an un-throttled one. It would silently resolve the wrong
+        // `IdempotencyMode`. That defeats the backpressure the operator set.
         let mut plain = fake_workflow_info();
         plain.name = "dup";
         let mut throttled = fake_workflow_info();

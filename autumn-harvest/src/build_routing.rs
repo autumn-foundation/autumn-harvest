@@ -164,9 +164,10 @@ pub struct BuildPolicy {
     pub ramp_percent: Option<i32>,
 }
 
-/// Domain separator for the ramp-decision hash, so it is decoupled from the
-/// shard-router rendezvous hash and the scheduler jitter hash even though all
-/// three use `seahash` over a fixed byte layout.
+/// Domain separator for the ramp-decision hash.
+///
+/// It decouples this hash from the shard-router rendezvous hash and the
+/// scheduler jitter hash. All three use `seahash` over a fixed byte layout.
 const RAMP_HASH_DOMAIN_SEP: &[u8] = b"harvest_build_ramp:";
 
 /// Deterministic bucket in `0..100` for `exec_id`, used to decide ramp membership.
@@ -205,10 +206,10 @@ impl BuildPolicy {
     ///
     /// Returns `target_build_id` for approximately `ramp_percent`% of
     /// `exec_id` values and `build_id` otherwise. The decision is a pure,
-    /// deterministic function of `exec_id` (via [`ramp_bucket`]) so an
-    /// outbox/start retry for the same execution never flips its build
-    /// (issue #604 AC3), and in-flight executions are never re-routed since
-    /// this is only ever called once, at start time.
+    /// deterministic function of `exec_id` (via [`ramp_bucket`]). So an
+    /// outbox/start retry for the same execution never flips its build (issue
+    /// #604 AC3). In-flight executions are never re-routed, because this runs
+    /// only once, at start time.
     ///
     /// `ramp_percent = None` or `Some(0)`, or `target_build_id = None`, all
     /// resolve to `build_id` — clearing either field alone is enough to stop
@@ -603,9 +604,9 @@ pub async fn list_build_policies(conn: &mut AsyncPgConnection) -> HarvestResult<
 
 /// Set (or update) the percentage ramp for a queue's existing build policy.
 ///
-/// The base policy (`build_id`) must already exist for `queue_name` — a ramp
-/// targets a second build *in addition to* the base, so there must be a base
-/// to ramp away from. `percent` is validated via [`validate_ramp_percent`].
+/// The base policy (`build_id`) must already exist for `queue_name`. A ramp
+/// targets a second build *in addition to* the base, so it needs a base to
+/// ramp away from. [`validate_ramp_percent`] validates `percent`.
 ///
 /// # Errors
 ///
@@ -1074,8 +1075,8 @@ pub async fn revoke_compat(
 /// [`BuildCompatibilitySet`] for in-process use.
 ///
 /// Workers can cache this and refresh it periodically to avoid per-claim DB
-/// round-trips (the claim SQL already enforces the rule server-side; this is
-/// for application-layer checks and logging).
+/// round-trips. The claim SQL already enforces the rule server-side. This copy
+/// serves application-layer checks and logging.
 ///
 /// # Errors
 ///
@@ -1424,10 +1425,9 @@ pub async fn all_build_reachability(
 ///
 /// # Errors
 ///
-/// Returns `HarvestError::Database` on the first shard that fails. Errors from
-/// unreachable shards bubble up rather than being silently skipped so that
-/// callers get an honest picture of fleet state (a failed shard means the
-/// reachability data is incomplete).
+/// Returns `HarvestError::Database` on the first shard that fails. An
+/// unreachable shard's error propagates and is never skipped. A failed shard
+/// means incomplete reachability data, and callers must see that.
 #[cfg(feature = "db")]
 pub async fn all_build_reachability_sharded(
     pool: &crate::shard::ShardedDbPool,
@@ -1435,7 +1435,6 @@ pub async fn all_build_reachability_sharded(
 ) -> HarvestResult<Vec<BuildReachability>> {
     use futures::future::try_join_all;
 
-    // Fan out to all shards concurrently.
     let shard_futures: Vec<_> = pool
         .iter_shards()
         .map(|(_, shard_pool)| {

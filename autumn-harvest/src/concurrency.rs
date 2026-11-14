@@ -13,18 +13,19 @@
 //! assert_eq!(policy.limit, 10);
 //! ```
 //!
-//! At dispatch time the worker resolves the expression against the workflow's
-//! JSON input (via [`resolve_concurrency_key`]) to get the concrete group key
-//! (e.g. `"acme"`), then passes `(key, limit)` to [`crate::queue::EnqueueParams`]
-//! so the `SKIP LOCKED` claim query enforces it across the whole fleet.
+//! At dispatch time, [`resolve_concurrency_key`] resolves the expression
+//! against the workflow's JSON input to a concrete group key (e.g. `"acme"`).
+//! The worker passes `(key, limit)` to [`crate::queue::EnqueueParams`]. The
+//! `SKIP LOCKED` claim query then enforces it across the whole fleet.
 //!
 //! # Overflow strategy (issue #811)
 //!
 //! By default an over-limit start is *deferred*: the task row is enqueued and
-//! simply waits for a slot at claim time. [`crate::concurrency::ConcurrencyOnConflict::CancelRunning`]
-//! flips that to *latest-wins* — the newest admitted run supersedes the oldest
-//! in-flight run(s) for the same key, using the ordinary cooperative
-//! cancellation path (no new event variant, no migration).
+//! simply waits for a slot at claim time.
+//! [`crate::concurrency::ConcurrencyOnConflict::CancelRunning`] changes that to
+//! *latest-wins*. The newest admitted run supersedes the oldest in-flight
+//! run(s) for the same key. It uses the ordinary cooperative cancellation path,
+//! with no new event variant and no migration.
 //!
 //! ```rust
 //! use autumn_harvest::concurrency::{ConcurrencyOnConflict, ConcurrencyPolicy};
@@ -37,8 +38,8 @@
 //! # Sharding note
 //!
 //! Limits are enforced *within a shard*. Cross-shard global limits are out of
-//! scope; embedders wanting a true global cap should route all executions for
-//! a given key to a single shard via a custom [`crate::ShardRouter`].
+//! scope. For a true global cap, route all executions for a key to one shard
+//! with a custom [`crate::ShardRouter`].
 //! See `docs/sharding.md` for details.
 
 /// What to do when admitting a run would exceed the per-key concurrency limit.
@@ -61,10 +62,10 @@ impl ConcurrencyOnConflict {
     /// `rename_all` derive emits (pinned by `on_conflict_serde_round_trip_is_snake_case`).
     ///
     /// Paired with [`Self::parse`] as the string round-trip for any surface that
-    /// carries the strategy as text. Neither is on a production path today: the
-    /// `#[workflow]` macro validates the attribute in the proc-macro crate (which
-    /// cannot depend on this type), and `GET /admin/concurrency` serialises via
-    /// serde. They exist so a future HTTP/CLI surface has one canonical spelling.
+    /// carries the strategy as text. Neither is on a production path today. The
+    /// `#[workflow]` macro validates the attribute in the proc-macro crate, which
+    /// cannot depend on this type. `GET /admin/concurrency` serialises via serde.
+    /// They exist so a future HTTP/CLI surface has one canonical spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -139,8 +140,8 @@ impl ConcurrencyPolicy {
 /// That is `(existing_others + 1) - cap` without the `+ 1`, so it cannot
 /// overflow at `usize::MAX`.
 ///
-/// A `limit` of `0` is clamped to `1`: a literal zero would demand cancelling
-/// every run *including the one we just admitted*, which is never the intent.
+/// A `limit` of `0` is clamped to `1`. A literal zero would cancel every run,
+/// *including the admitted one*, which is never the intent.
 #[must_use]
 pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     let effective = if limit == 0 { 1 } else { limit };
@@ -149,28 +150,28 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     existing_others.saturating_sub(cap - 1)
 }
 
-/// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
+/// Shed decision for one latest-wins supersede pass (issue #811).
 ///
 /// `candidates` are the shed-eligible non-terminal runs on the key; `protected`
 /// are in-flight admissions whose start transaction is still open on this task
-/// (see `ADMITTING`). Protected runs **count toward the population** — they are
-/// real non-terminal runs — but are never selected, so a nested admission can
-/// never cancel the outer admission that spawned it.
+/// (see `ADMITTING`). Protected runs are real non-terminal runs, so they
+/// **count toward the population**. They are never selected, so a nested
+/// admission never cancels the outer admission that spawned it.
 ///
 /// Returns both numbers deliberately:
 /// * `target` — how many runs the key is over its limit (clamped to
 ///   `SUPERSEDE_SCAN_LIMIT`).
-/// * `shed` — how many we may actually cancel (`target`, capped by the number of
-///   shed-eligible candidates).
+/// * `shed` — how many may actually be cancelled (`target`, capped by the
+///   number of shed-eligible candidates).
 ///
 /// `shed < target` means the remaining overflow is entirely protected in-flight
-/// admissions. The key stays transiently over its limit and converges on the next
-/// ordinary admission, which sees those runs unprotected — the same bounded-shed
-/// philosophy as `SUPERSEDE_SCAN_LIMIT`.
+/// admissions. The key stays over its limit for a short time. It converges on
+/// the next ordinary admission, which sees those runs unprotected. This is the
+/// bounded-shed approach of `SUPERSEDE_SCAN_LIMIT`.
 ///
-/// Counting `protected` is what fixes the nested case: excluding it entirely (the
-/// first cut) computed `supersede_count(0, 1) == 0` for a nested admission and
-/// preserved BOTH runs on a `limit = 1` key.
+/// Counting `protected` is what fixes the nested case. Excluding it entirely
+/// computed `supersede_count(0, 1) == 0` for a nested admission and preserved
+/// BOTH runs on a `limit = 1` key.
 #[must_use]
 pub const fn supersede_plan(candidates: usize, protected: usize, limit: u32) -> SupersedePlan {
     let target = {
@@ -198,7 +199,7 @@ pub struct SupersedePlan {
     pub shed: usize,
 }
 
-/// How many `credited_ids` are absent from `shed_ids` (issue #1228 review, P2).
+/// How many `credited_ids` are absent from `shed_ids` (issue #1228).
 ///
 /// A quota admission credits an execution's slot on the assumption that a
 /// later, real supersede pass will cancel it. `shed_ids` is the population
@@ -228,9 +229,8 @@ pub fn credited_but_not_shed_count(credited_ids: &[uuid::Uuid], shed_ids: &[uuid
 /// - Any segment along the path is missing.
 /// - The resolved value is JSON `null`.
 ///
-/// Non-string values are converted to their JSON string representation
-/// (`123` → `"123"`, `true` → `"true"`) so the caller always gets a
-/// plain `String` usable as a concurrency group key.
+/// Non-string values become their JSON string form (`123` → `"123"`,
+/// `true` → `"true"`), so the caller always gets a plain `String` key.
 ///
 /// # Examples
 ///
@@ -251,7 +251,6 @@ pub fn credited_but_not_shed_count(credited_ids: &[uuid::Uuid], shed_ids: &[uuid
 /// ```
 #[must_use]
 pub fn resolve_concurrency_key(expr: &str, input: &serde_json::Value) -> Option<String> {
-    // Strip the "input." prefix so "input.tenant_id" == "tenant_id".
     let path = expr.strip_prefix("input.").unwrap_or(expr);
 
     let mut current = input;
@@ -270,12 +269,11 @@ pub fn resolve_concurrency_key(expr: &str, input: &serde_json::Value) -> Option<
 
 /// Hard cap on how many in-flight runs one admission may supersede.
 ///
-/// Latest-wins is a per-key *fair-share* control, not a bulk-cancel tool: a
-/// single start should never open an unbounded transaction cancelling hundreds
-/// of executions (each cancel appends events, fails task rows, and runs the
-/// parent-close cascade). If a key is over the cap by more than this, the
-/// excess is shed by the *next* admission for the same key, so the population
-/// still converges without one start paying an unbounded cost.
+/// Latest-wins is a per-key *fair-share* control, not a bulk-cancel tool. One
+/// start never opens an unbounded transaction that cancels hundreds of runs.
+/// Each cancel appends events, fails task rows, and runs the parent-close
+/// cascade. The *next* admission for the key sheds any excess over this cap.
+/// So the population converges without one start paying an unbounded cost.
 pub const SUPERSEDE_SCAN_LIMIT: usize = 32;
 
 /// One run that a latest-wins admission superseded.
@@ -315,17 +313,18 @@ pub struct SupersedeOutcome {
 /// # Lock-ordering scope (what is and is NOT guaranteed)
 ///
 /// **Against `queue::claim_task`: deadlock-free by construction.** The claim side
-/// uses the NON-blocking `pg_try_advisory_xact_lock` and simply skips the row when
-/// it cannot take the lock, so it never waits on us while holding row locks we need.
+/// uses the NON-blocking `pg_try_advisory_xact_lock`. It skips the row when it
+/// cannot take the lock. So it never waits on this lock while it holds row locks
+/// that this pass needs.
 ///
 /// **Against the durable-mutex lock (issue #691): a lock-ordering inversion is
 /// possible.** Postgres's one-argument advisory locks share a single 64-bit space,
 /// and `mutex::lock_mutex_key` takes a *blocking* `pg_advisory_xact_lock(hashtext(..))`
 /// in that same space. Two orders exist and they are inverted:
 ///
-/// * *mutex-key then concurrency-key* — a mutex holder reaching a terminal state
-///   runs `mutex::sweep_terminal_holder_and_wake` (holding the mutex lock to commit)
-///   and its completion trigger then starts a `cancel_running` workflow.
+/// * *mutex-key then concurrency-key* — a mutex holder reaches a terminal state.
+///   It runs `mutex::sweep_terminal_holder_and_wake`, which holds the mutex lock
+///   to commit. Its completion trigger then starts a `cancel_running` workflow.
 /// * *concurrency-key then mutex-key* — this function, holding the concurrency lock
 ///   while cancelling an incumbent that itself holds a mutex.
 ///
@@ -354,12 +353,12 @@ async fn lock_concurrency_key(
 
 /// Non-terminal runs sharing `(workflow_name, concurrency_key)`, oldest first.
 ///
-/// Scoped to the workflow TYPE as well as the key so a latest-wins policy can
-/// never cancel a *different* workflow type that merely resolved the same key
-/// string and did not opt in. That scoping is also what makes this migration-free:
-/// the resolved key lives on `harvest_task_queue`, and the join is served by the
-/// existing `(workflow_name, workflow_id, shard_id)` and task-queue indexes
-/// rather than a new column on `harvest_workflow_executions`.
+/// Scoped to the workflow TYPE as well as the key. So a latest-wins policy never
+/// cancels a *different* workflow type that resolved the same key string and did
+/// not opt in. That scoping also makes this migration-free. The resolved key
+/// lives on `harvest_task_queue`. The existing `(workflow_name, workflow_id,
+/// shard_id)` and task-queue indexes serve the join, with no new column on
+/// `harvest_workflow_executions`.
 ///
 /// `SUSPENDED` is deliberately absent: it is not a persisted state (the state
 /// CHECK constraint forbids it), so `RUNNING`/`PAUSED` is the complete active set.
@@ -368,25 +367,24 @@ async fn lock_concurrency_key(
 ///
 /// This counts non-terminal *execution rows*; the #247 claim gate
 /// (`queue::claim_task`) counts *task rows* that are `RUNNING` with a non-null
-/// `worker_id`. So a `PAUSED` run — or one whose workflow task is still deferred
-/// at the claim gate — occupies no claim-time slot yet still counts here, and can
-/// therefore be superseded. That is deliberate: latest-wins enforces "at most N
-/// **non-terminal runs** per key, newest wins", which is the operator-visible
-/// population, not the momentary dispatch occupancy.
+/// `worker_id`. A `PAUSED` run occupies no claim-time slot, nor does a run whose
+/// workflow task waits at the claim gate. Both still count here, so both can be
+/// superseded. That is deliberate. Latest-wins enforces "at most N **non-terminal
+/// runs** per key, newest wins". That is the operator-visible population, not the
+/// momentary dispatch occupancy.
 ///
 /// # Protected in-flight admissions
 ///
-/// Only `self_exec_id` is excluded. An outer admission whose start transaction is
-/// still open on this task (see `ADMITTING`) IS returned, so the caller can count
-/// it toward the population while filtering it out of the shed set (issue #811,
-/// Codex round 2).
+/// Only `self_exec_id` is excluded. This returns an outer admission whose start
+/// transaction is still open on this task (see `ADMITTING`). The caller counts it
+/// toward the population and filters it out of the shed set (issue #811).
 ///
 /// # Bounded fetch
 ///
-/// `fetch_cap` bounds the result set. The caller only needs enough rows to compute
-/// `supersede_count(len, limit).min(SUPERSEDE_SCAN_LIMIT)`, which saturates once
-/// `len >= limit + SUPERSEDE_SCAN_LIMIT` — so a key with a large backlog never
-/// materialises the whole backlog while holding the advisory lock.
+/// `fetch_cap` bounds the result set. The caller computes
+/// `supersede_count(len, limit).min(SUPERSEDE_SCAN_LIMIT)`. That value saturates
+/// once `len >= limit + SUPERSEDE_SCAN_LIMIT`. So a key with a large backlog never
+/// loads the whole backlog while it holds the advisory lock.
 #[cfg(feature = "db")]
 async fn active_runs_for_key(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -407,11 +405,11 @@ async fn active_runs_for_key(
         queue_name: String,
     }
 
-    // Only the admitted run itself is excluded from the scan. A protected
-    // in-flight admission (issue #811, Codex round 2) is deliberately RETURNED
-    // here so it still counts toward the key's population; the caller filters it
-    // out of the shed set. Excluding it from the query too would under-count the
-    // group and let a nested admission preserve an over-limit population.
+    // Only the admitted run is excluded. A protected in-flight admission
+    // (issue #811) is deliberately RETURNED, so it counts toward the population.
+    // The caller filters it out of the shed set. Excluding it here would
+    // under-count the group and let a nested admission keep an over-limit
+    // population.
     let excluded: Vec<uuid::Uuid> = vec![self_exec_id.as_uuid()];
 
     let rows: Vec<Row> = diesel::sql_query(
@@ -450,15 +448,16 @@ async fn active_runs_for_key(
 /// Cancellation reason recorded on a superseded run.
 pub const SUPERSEDE_CANCEL_REASON: &str = "superseded by a newer run for the same concurrency key";
 
-/// `true` when a [`crate::error::HarvestError::Config`] raised by a cancel is the
-/// benign "candidate reached a terminal state between the scan and the cancel"
-/// race, rather than a genuine fault.
+/// `true` when a cancel's [`crate::error::HarvestError::Config`] is the benign race.
 ///
-/// `Config` is a general-purpose variant, so matching it wholesale would also
-/// swallow real faults reachable from inside `cancel_workflow_execution_collect`
-/// (a malformed `parent_close_policy` column, a completion-trigger start rejected
-/// by an admission gate). Those must stay visible — silently skipping one leaves
-/// the key over its declared limit with no diagnostic.
+/// In that race the candidate reached a terminal state between the scan and the
+/// cancel. Any other `Config` error is a genuine fault.
+///
+/// `Config` is a general-purpose variant. Matching it wholesale would swallow
+/// real faults from inside `cancel_workflow_execution_collect`. Examples are a
+/// malformed `parent_close_policy` column, or a completion-trigger start that an
+/// admission gate rejects. Those must stay visible. A silent skip leaves the key
+/// over its declared limit with no diagnostic.
 #[must_use]
 pub fn is_already_terminal_cancel_race(message: &str) -> bool {
     message.contains("is already terminal (") || message.contains("is no longer running")
@@ -468,13 +467,13 @@ pub fn is_already_terminal_cancel_race(message: &str) -> bool {
 tokio::task_local! {
     /// Execution ids whose start transaction is still open on this task.
     ///
-    /// A cancellation performed by [`supersede_running_for_key`] runs the superseded
-    /// run's terminal chokepoint, which can start a completion-trigger target
-    /// **in the same transaction** — and that nested start may itself supersede.
-    /// Because the outer admission's row is already inserted (uncommitted but
-    /// visible within the transaction) and carries the same concurrency key, a
-    /// nested pass with a different `self_exec_id` would otherwise treat it as a
-    /// candidate and cancel the very run the outer start is reporting as created.
+    /// A cancellation by [`supersede_running_for_key`] runs the superseded run's
+    /// terminal chokepoint. That can start a completion-trigger target **in the
+    /// same transaction**, and that nested start may itself supersede. The outer
+    /// admission's row is already inserted, uncommitted but visible in the
+    /// transaction. It carries the same concurrency key. Without this set, a
+    /// nested pass with a different `self_exec_id` would treat it as a candidate.
+    /// It would cancel the very run that the outer start reports as created.
     ///
     /// Each pass scopes its own id (plus everything it inherited) for the duration
     /// of its cancellations, and every nested scan excludes the whole set.
@@ -523,7 +522,7 @@ pub struct SupersedeCredit {
 /// stay AFTER the admitted row's own `WorkflowStarted` event and task are
 /// durable — see [`supersede_running_for_key`]'s own doc comment for why.
 ///
-/// # Scoping (Codex review, PR #1484)
+/// # Scoping (PR #1484)
 ///
 /// `concurrency_key` and `quota_key` are resolved by two independent
 /// expressions. They can differ. A shed candidate without a matching
@@ -658,9 +657,9 @@ pub async fn dry_run_supersede_credit(
 /// Latest-wins: cancel the OLDEST in-flight runs for `(workflow_name, key)` until
 /// the post-admission population respects `limit` (issue #811).
 ///
-/// Must be called from INSIDE the start transaction, AFTER the admitted run's own
-/// row is inserted and ONLY when that insert actually created a fresh execution.
-/// Both are load-bearing:
+/// Call it from INSIDE the start transaction, AFTER the admitted run's own row is
+/// inserted. Call it ONLY when that insert created a fresh execution. Both rules
+/// are load-bearing:
 ///
 /// * Superseding *before* the insert would cancel the incumbent and then let the
 ///   reuse policy attach to the very run it just cancelled.
@@ -674,11 +673,10 @@ pub async fn dry_run_supersede_credit(
 /// its `ParentClosePolicy` cascade runs normally. No new `WorkflowEvent` variant
 /// and no migration (AC5).
 ///
-/// `quota_lock_held` (issue #1228 review, P1 on the prior round's own
-/// fix). `true` only when THIS transaction's `enforce_quota_admission`
-/// call actually acquired `lock_quota_key`, for the admission being
-/// checked. That happens exactly when its `quota_policy` had a cap and
-/// its `quota_key` resolved. Only then can waiting on a candidate's row
+/// `quota_lock_held` (issue #1228) is `true` only when THIS transaction's
+/// `enforce_quota_admission` call actually acquired `lock_quota_key`, for the
+/// admission being checked. That happens exactly when its `quota_policy` had a
+/// cap and its `quota_key` resolved. Only then can waiting on a candidate's row
 /// lock complete the ABBA cycle the shed loop's non-blocking probe
 /// avoids (see that comment). A `cancel_running` workflow with no quota
 /// policy never takes that lock, so the cycle cannot form there. This
@@ -692,7 +690,7 @@ pub async fn dry_run_supersede_credit(
 /// cancellation. A candidate that reached a terminal state between the scan and
 /// the cancel is skipped, not an error. So is a candidate whose row lock this
 /// function's own non-blocking probe could not claim, when `quota_lock_held`
-/// applies that probe (issue #1228 review, P1). See the shed loop's own
+/// applies that probe (issue #1228). See the shed loop's own
 /// comment for why waiting there is unsafe only in that case.
 #[cfg(feature = "db")]
 pub async fn supersede_running_for_key(
@@ -726,9 +724,9 @@ pub async fn supersede_running_for_key(
         .await
 }
 
-/// Non-blockingly claims one candidate's row lock, returning its id when
-/// claimed or `None` when it is locked elsewhere right now (issue #1228
-/// review, P1).
+/// Non-blockingly claims one candidate's row lock (issue #1228).
+///
+/// Returns its id when claimed, or `None` when it is locked elsewhere.
 ///
 /// `supersede_inner`'s transaction already holds `lock_quota_key` for the
 /// admission being checked. An incumbent can be completing on its own at
@@ -815,9 +813,9 @@ async fn supersede_inner(
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
     lock_concurrency_key(conn, concurrency_key).await?;
 
-    // Enough rows to compute the (clamped) shed count exactly -- see
-    // `active_runs_for_key`'s "Bounded fetch" note. Saturating so a pathological
-    // `limit` can never overflow the bind.
+    // Enough rows to compute the clamped shed count exactly. See
+    // `active_runs_for_key`'s "Bounded fetch" note. Saturating, so a pathological
+    // `limit` never overflows the bind.
     let fetch_cap =
         i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
     let others = active_runs_for_key(
@@ -830,15 +828,14 @@ async fn supersede_inner(
     .await?;
 
     // Protected in-flight admissions COUNT toward the population but are never
-    // shed (issue #811, Codex round 2).
+    // shed (issue #811).
     //
     // `inherited` holds the outer admission(s) whose start transaction is still
-    // open on this task -- see `ADMITTING`. Excluding them from the population
-    // entirely (as the first cut did) under-counted the group: a nested
-    // admission spawned while cancelling an incumbent would compute
-    // `supersede_count(0, 1) == 0` and preserve BOTH the outer run and itself on
-    // a `limit = 1` key. Counting them here makes the shed target honest, so
-    // every overflow that CAN be shed is shed.
+    // open on this task (see `ADMITTING`). Excluding them from the population
+    // under-counts the group. A nested admission spawned while cancelling an
+    // incumbent would compute `supersede_count(0, 1) == 0`. It would keep BOTH
+    // the outer run and itself on a `limit = 1` key. Counting them makes the shed
+    // target honest, so every overflow that CAN be shed is shed.
     let (candidates, protected): (Vec<SupersededRun>, Vec<SupersededRun>) = others
         .into_iter()
         .partition(|run| !inherited.contains(&run.exec_id));
@@ -849,9 +846,9 @@ async fn supersede_inner(
     } = supersede_plan(candidates.len(), protected.len(), limit);
     if shed_target > shed {
         // The only over-limit runs are protected in-flight admissions. The group
-        // stays transiently over its declared limit and converges on the next
-        // ordinary admission for the key, which sees them unprotected -- the same
-        // bounded-shed philosophy as `SUPERSEDE_SCAN_LIMIT`.
+        // stays over its declared limit for a short time. It converges on the
+        // next ordinary admission for the key, which sees them unprotected. This
+        // is the bounded-shed approach of `SUPERSEDE_SCAN_LIMIT`.
         tracing::warn!(
             workflow = %workflow_name,
             concurrency_key = %concurrency_key,
@@ -863,24 +860,19 @@ async fn supersede_inner(
              remaining runs are protected in-flight admissions; the key stays over its \
              declared limit until the next admission",
         );
-        // issue #1197, item 2: promote the warn above to an alertable counter
-        // so operators can monitor keys that stay transiently over their
-        // declared limit, rather than relying on log scraping.
+        // Issue #1197, item 2: an alertable counter mirrors the warn above, so
+        // operators can monitor keys that stay over their limit without log
+        // scraping.
         //
-        // The ONLY reachable path to this branch is a NESTED admission (a
-        // non-empty `inherited`, i.e. this call is running inside another
-        // admission's `ADMITTING` scope) — see this function's `inherited`
-        // parameter doc. Every such nesting is reached through this module's
-        // own shed loop below calling `cancel_workflow_execution_collect`,
-        // which -- like every other cancel/terminate/parent-close-cascade
-        // path in `execution.rs` -- evaluates completion triggers with
-        // `metrics: None` (no caller-supplied recorder in scope at that
-        // chokepoint). Falling back to the process-global recorder here
-        // mirrors the identical, already-established fallback
-        // `completion_trigger::evaluate_triggers_for_execution_collecting`'s
-        // admission-gate-block branch uses for the same reason: without it,
-        // this counter would be wired up but structurally unreachable with a
-        // real recorder, silently never firing in production.
+        // Only a NESTED admission reaches this branch: a non-empty `inherited`,
+        // inside another admission's `ADMITTING` scope. Each such nesting comes
+        // from the shed loop below calling `cancel_workflow_execution_collect`.
+        // That path, like every cancel, terminate and parent-close cascade in
+        // `execution.rs`, evaluates completion triggers with `metrics: None`.
+        // So the process-global recorder is the fallback here.
+        // `completion_trigger::evaluate_triggers_for_execution_collecting` uses
+        // the same fallback in its admission-gate-block branch. Without it, this
+        // counter could never fire with a real recorder in production.
         let resolved_metrics = crate::admission_gate::resolve_metrics_with_global_fallback(metrics);
         if let Some(m) = resolved_metrics.as_dyn() {
             let gap = u64::try_from(shed_target - shed).unwrap_or(u64::MAX);
@@ -895,10 +887,9 @@ async fn supersede_inner(
     for candidate in candidates.into_iter().take(shed) {
         // Non-blocking probe for the row lock `cancel_workflow_execution_collect`
         // is about to take. Applied ONLY when this transaction holds the
-        // quota lock the ABBA cycle needs (issue #1228 review, P1 on the
-        // probe's own prior-round fix). See `try_claim_candidate_row`'s
-        // and this function's own `quota_lock_held` doc. Skipping there
-        // is unsafe, not just unnecessary, outside that case.
+        // quota lock the ABBA cycle needs (issue #1228). See
+        // `try_claim_candidate_row`'s and this function's own `quota_lock_held`
+        // doc. Skipping there is unsafe, not just unnecessary, outside that case.
         if quota_lock_held
             && !claim_candidate_row_or_warn(conn, candidate.exec_id, workflow_name, concurrency_key)
                 .await?
@@ -927,8 +918,8 @@ async fn supersede_inner(
                     if !is_already_terminal_cancel_race(&msg) {
                         // Not the benign race: a genuine fault inside the cancel.
                         // Skipping keeps one corrupt neighbour from wedging every
-                        // future admission for this key, but it must never be
-                        // silent -- the key stays over its limit until next time.
+                        // future admission for this key. It must never be silent,
+                        // because the key stays over its limit until next time.
                         tracing::warn!(
                             candidate = %candidate.exec_id,
                             workflow = %workflow_name,
@@ -1157,11 +1148,7 @@ mod tests {
         );
     }
 
-    // `supersede_count(existing_others, limit)` is the whole latest-wins
-    // decision: after our own execution is admitted, how many of the OTHER
-    // non-terminal runs for this key must be cancelled so that the post-admit
-    // in-flight count is <= limit.
-    // ── issue #811 Codex round 2: protected in-flight admissions count ────
+    // ── issue #811: protected in-flight admissions count ─────────────────
 
     #[test]
     fn plan_counts_protected_toward_the_population() {
@@ -1192,7 +1179,7 @@ mod tests {
 
     #[test]
     fn plan_shed_is_capped_by_available_candidates() {
-        // Over by 2 but only one shed-eligible run: shed what we can, and report
+        // Over by 2 but only one shed-eligible run: shed that one, and report
         // the gap so the caller can warn.
         let plan = supersede_plan(1, 2, 2);
         assert_eq!(plan.target, 2);
@@ -1252,8 +1239,8 @@ mod tests {
     fn supersede_count_treats_zero_limit_as_one() {
         // A `limit = 0` policy is rejected by the macro and by
         // `HarvestBuilder::try_build`, but a hand-built `StartWorkflowParams`
-        // can still carry it. Clamping to 1 keeps the surviving run alive; a
-        // literal 0 would demand cancelling everything INCLUDING ourselves.
+        // can still carry it. Clamping to 1 keeps the admitted run alive. A
+        // literal 0 would cancel everything, INCLUDING the admitted run.
         assert_eq!(supersede_count(1, 0), 1);
         assert_eq!(supersede_count(0, 0), 0);
     }
@@ -1282,7 +1269,7 @@ mod tests {
         // The real pass shed nothing at all.
         assert_eq!(credited_but_not_shed_count(&[a, b], &[]), 2);
         // The real pass shed one of the two credited ids -- `b`'s own
-        // cancellation was skipped (issue #1228 review, P2).
+        // cancellation was skipped (issue #1228).
         assert_eq!(credited_but_not_shed_count(&[a, b], &[a]), 1);
         // A shed id the credit never counted on is irrelevant to the gap.
         assert_eq!(credited_but_not_shed_count(&[a], &[c]), 1);

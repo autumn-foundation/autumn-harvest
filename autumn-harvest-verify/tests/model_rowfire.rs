@@ -1,22 +1,22 @@
 //! The model-row ratchet (issue #962, follow-up #2 of the feasibility report).
 //!
 //! The `Atomic<T>` incident is the reason this file exists. Between rustc 1.94
-//! and 1.98 the compiler changed how it *spells* a type in MIR; the parser was
-//! unaffected, no `mir-parse` boundary was raised, and five seeded bugs
-//! silently became `proven-deterministic` because the model rows keyed on the
-//! old spelling stopped matching anything. Nothing was red. The rows were still
+//! and 1.98 the compiler changed how it *spells* a type in MIR. The parser was
+//! unaffected, and no `mir-parse` boundary was raised. But five seeded bugs
+//! silently became `proven-deterministic`. The model rows keyed on the old
+//! spelling stopped matching anything. Nothing was red. The rows were still
 //! there, still correct-looking, and dead.
 //!
-//! So: for every row of every keyed model table, this test asks whether the row
-//! matched **at least one real call site** in the corpus MIR plus the checked-in
-//! `.mir` fixtures — and compares the set of rows that did not against
+//! So this test asks one question of every row of every keyed model table. Did
+//! the row match **at least one real call site** in the corpus MIR plus the
+//! checked-in `.mir` fixtures? It compares the set of rows that did not against
 //! `tests/model_unfired_rows.txt`. Two failure directions, both loud:
 //!
 //! * a row is unfired and **not** listed ⇒ rot. Either the corpus lost the case
 //!   that exercised it, or the row's key stopped matching the spelling rustc
 //!   now prints. Re-run the corpus before believing the row is fine.
-//! * a row is listed and **does** fire ⇒ a stale entry. Delete the line; the
-//!   list is a record of what is *not* covered, and an entry that has quietly
+//! * a row is listed and **does** fire ⇒ a stale entry. Delete the line. The
+//!   list is a record of what is *not* covered. An entry that has quietly
 //!   started working makes the rest of the list less believable.
 //!
 //! The list may therefore only shrink on its own. Adding a line is allowed only
@@ -109,9 +109,9 @@ fn key(table: &str, path: &str, receiver: Option<&str>) -> String {
 
 /// Every keyed row of the model, as `(key, human description)`.
 ///
-/// `[[trusted]]` is deliberately absent: a trusted-crate row fires on the crate
-/// *root* of a path, which the corpus reaches only incidentally, and its purpose
-/// is to say "assume clean" rather than to match a specific call.
+/// `[[trusted]]` is deliberately absent. A trusted-crate row fires on the crate
+/// *root* of a path, which the corpus reaches only incidentally. Its purpose is
+/// to say "assume clean", not to match a specific call.
 fn model_rows(model: &Model) -> BTreeMap<String, String> {
     let mut rows = BTreeMap::new();
     for rule in &model.source {
@@ -170,7 +170,7 @@ fn fired_keys(model: &Model, docs: &[mir::MirDoc]) -> BTreeSet<String> {
                     continue;
                 };
                 // The analyzer substitutes generics into the callee text before
-                // classifying; here the printed text is used as-is, so a row
+                // classifying. Here the printed text is used as-is. So a row
                 // that only matches after substitution can read as unfired.
                 // That is a conservative direction: it over-reports, and the
                 // ratchet file records the over-report explicitly.
@@ -198,20 +198,22 @@ fn note_ambient(model: &Model, ty: &str, fired: &mut BTreeSet<String>) {
     }
     let direct = TypeName::parse(ty).name;
     for rule in &model.ambient_type {
-        // `is_ambient_type` peels containers before matching, so a match on the
-        // outer name and a match on any inner argument are both credible; the
+        // `is_ambient_type` peels containers before matching. So a match on the
+        // outer name and a match on any inner argument are both credible. The
         // row is credited when its name appears as a type name anywhere in the
-        // spelling, which is what "this row is why the type is ambient" means.
+        // spelling. That is what "this row is why the type is ambient" means.
         if rule.name == direct || ty.contains(&rule.name) {
             fired.insert(key("ambient_type", &rule.name, None));
         }
     }
 }
 
-/// The ratchet key of one classification, or `None` for the classes that are
-/// not keyed rows (`Trusted`, `UnmodeledCtxMethod`, `Unclassified`, and the
-/// `WorkflowContext` tables, which `model_coverage.rs` already pins exhaustively
-/// against `context.rs`).
+/// The ratchet key of one classification, or `None` for a class that is not a
+/// keyed row.
+///
+/// The classes without a key are `Trusted`, `UnmodeledCtxMethod`, `Unclassified`
+/// and the `WorkflowContext` tables. `model_coverage.rs` already pins those
+/// tables exhaustively against `context.rs`.
 fn class_key(class: &CallClass<'_>) -> Option<String> {
     match class {
         CallClass::Source(rule) => Some(key("source", &rule.path, rule.receiver.as_deref())),
@@ -279,8 +281,8 @@ fn every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired() {
         .cloned()
         .collect();
 
-    // Per-table matrix, always printed: the counts are the number this test
-    // exists to make visible, and a reader should not have to fail it to see them.
+    // Per-table matrix, always printed. This test exists to make these counts
+    // visible, and a reader should not have to fail it to see them.
     let mut per_table: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for row in rows.keys() {
         let table = row.split_once(':').map_or("?", |(t, _)| t);

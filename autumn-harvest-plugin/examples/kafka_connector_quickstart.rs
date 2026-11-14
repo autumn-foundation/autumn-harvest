@@ -24,10 +24,10 @@
 //!   own Kafka coordinates (`topic:partition:offset`), namespaced by the
 //!   binding. A rebalance or an un-acked crash replays the message; harvest
 //!   returns the *same* execution instead of starting a second one.
-//! * **At-least-once ack ordering** — the offset is committed only after the
-//!   start durably committed (or was recognised as a replay), and only once
-//!   every lower in-flight offset has also settled. Kill the process
-//!   mid-dispatch and the message is redelivered, not lost.
+//! * **At-least-once ack ordering** — the offset commits only after the start
+//!   durably committed or was recognised as a replay. Every lower in-flight
+//!   offset must also have settled. Kill the process mid-dispatch and the
+//!   message is redelivered, not lost.
 //! * **Poison isolation** — a message that cannot be decoded, or that the
 //!   mapping function rejects `poison_threshold` times running, goes to
 //!   `harvest_connector_dead_letters` and is acked. One bad message never
@@ -76,10 +76,9 @@ async fn main() {
 
     let binding = SourceBinding::starts("orders", "orders.placed", "fulfil_order")
         .map_json(|_ctx, order: OrderPlaced| {
-            // The mapping function chooses the workflow id. Deriving it from a
-            // business key (rather than the offset) makes the run addressable
-            // and keeps redeliveries collapsing onto one execution even if the
-            // broker replays under a different offset.
+            // The mapping function chooses the workflow id. A business key,
+            // not the offset, makes the run addressable. Redeliveries then
+            // collapse onto one execution, even under a different offset.
             let payload = serde_json::to_value(&order).map_err(|e| e.to_string())?;
             Ok::<_, String>(MappedMessage::new(
                 format!("order-{}", order.order_id),

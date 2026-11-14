@@ -3,20 +3,20 @@
 //! # Who owns what
 //!
 //! Harvest does **not** ship its own signature-verification, replay-protection,
-//! or secret-rotation code. autumn-web 0.5 already has first-class signed
-//! webhook intake (`autumn_web::webhook::SignedWebhook`, configured via
-//! `[security.webhooks.endpoints]`): it verifies the sender's signature and
-//! timestamp, rejects stale/duplicate deliveries, and rotates secrets — all
-//! **before** any handler code runs. Harvest's slice sits entirely downstream
-//! of that verification and answers a narrower question: *which workflow
-//! should this already-verified delivery start or signal, and how do we
-//! dispatch that idempotently?*
+//! or secret-rotation code. autumn-web 0.5 has first-class signed webhook
+//! intake: `autumn_web::webhook::SignedWebhook`, configured via
+//! `[security.webhooks.endpoints]`. It verifies the sender's signature and
+//! timestamp, rejects stale/duplicate deliveries, and rotates secrets. All of
+//! that happens **before** any handler code runs. Harvest's slice sits
+//! entirely downstream of that verification. It answers a narrower question:
+//! *which workflow should this verified delivery start or signal, and how do
+//! we dispatch that idempotently?*
 //!
-//! This mirrors the existing outbound-webhook extension slice
-//! (`autumn-harvest-plugin`'s `webhooks` feature, which durably delivers
-//! outbound webhooks through autumn-web's `webhook_outbound` module) and the
-//! `#[workflow(mcp)]` MCP tool slice (issue #597): Autumn owns the primitive,
-//! Harvest ships a thin binding layer.
+//! The outbound-webhook slice works the same way. The `webhooks` feature of
+//! `autumn-harvest-plugin` delivers outbound webhooks through the
+//! `webhook_outbound` module of autumn-web. So does the `#[workflow(mcp)]` MCP
+//! tool slice (issue #597). Autumn owns the primitive, and Harvest ships a
+//! thin binding layer.
 //!
 //! # The pieces
 //!
@@ -36,11 +36,10 @@ use crate::types::WorkflowId;
 /// Verified webhook request metadata handed to a `#[webhook]` mapping
 /// function.
 ///
-/// Built by the plugin from an already-verified
-/// `autumn_web::webhook::SignedWebhook` — by the time a mapping function
-/// receives a `WebhookCtx`, signature, timestamp, and (if configured) replay
-/// verification have already succeeded. A mapping function never sees an
-/// unverified request.
+/// The plugin builds it from an already-verified
+/// `autumn_web::webhook::SignedWebhook`. Signature, timestamp and (if
+/// configured) replay verification have succeeded before a mapping function
+/// receives it. A mapping function never sees an unverified request.
 #[derive(Debug, Clone)]
 pub struct WebhookCtx {
     /// The exact HTTP path this webhook is bound to (the `#[webhook(path =
@@ -93,10 +92,10 @@ impl WebhookCtx {
 /// Why a `#[webhook]` mapping function's dispatch shim failed to produce a
 /// workflow trigger.
 ///
-/// Both variants are surfaced by the plugin as `400 Bad Request` with a
-/// distinguishable `error_code` (`"parse_failed"` for [`Self::Deserialize`],
-/// `"mapping_rejected"` for [`Self::Rejected`]) — never a `500`, since the
-/// request itself has already passed signature verification by this point.
+/// The plugin surfaces both variants as `400 Bad Request`, never a `500`,
+/// because the request has already passed signature verification. The
+/// `error_code` is `"parse_failed"` for [`Self::Deserialize`] and
+/// `"mapping_rejected"` for [`Self::Rejected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookHandlerError {
     /// The verified body could not be deserialized into the mapping
@@ -119,18 +118,16 @@ impl std::error::Error for WebhookHandlerError {}
 
 /// Type-erased `#[webhook]` mapping shim.
 ///
-/// A plain `fn` pointer — mirrors [`crate::info::WorkflowHandlerFn`]'s design
-/// (design decision #6: fn pointers keep registration `Sync` without needing
-/// `Arc`). The macro emits a monomorphized closure, cast to this type, that
-/// deserializes `payload` into the user's typed parameter and invokes the
-/// (synchronous, by design — see the module docs on why webhook mapping
-/// functions never do I/O) mapping function.
+/// A plain `fn` pointer, like [`crate::info::WorkflowHandlerFn`] (design
+/// decision #6: fn pointers keep registration `Sync` without `Arc`). The macro
+/// casts a monomorphized closure to this type. The closure deserializes
+/// `payload` into the user's typed parameter and calls the mapping function.
+/// The mapping function is synchronous by design: it never does I/O.
 ///
-/// `payload` is borrowed rather than owned: the plugin's dispatch path needs
-/// the same verified body both for this shim's deserialization and, on
-/// dispatch, as the workflow input/signal payload it hands to the delegate
-/// start call -- taking `&Value` here lets the caller keep its own owned
-/// copy without an extra clone per dispatch.
+/// `payload` is borrowed, not owned. The dispatch path uses the same verified
+/// body twice: for this deserialization and as the workflow input or signal
+/// payload of the delegate start call. `&Value` lets the caller keep its own
+/// owned copy without an extra clone per dispatch.
 pub type WebhookHandlerFn =
     fn(&WebhookCtx, &serde_json::Value) -> Result<WorkflowId, WebhookHandlerError>;
 
@@ -192,10 +189,10 @@ pub struct WebhookTriggerInfo {
 /// Pure validation for a set of registered webhook triggers.
 ///
 /// Rejects duplicate binding paths (which would silently shadow each other
-/// at the HTTP router level) and malformed paths. Run at
-/// `HarvestPlugin::build` time so a mount conflict fails fast — at process
-/// startup — rather than manifesting as a confusing 404/wrong-handler on the
-/// first live request.
+/// at the HTTP router level) and malformed paths. It runs at
+/// `HarvestPlugin::build` time, so a mount conflict fails at process startup.
+/// Otherwise it shows as a confusing 404 or wrong handler on the first live
+/// request.
 ///
 /// # Errors
 ///

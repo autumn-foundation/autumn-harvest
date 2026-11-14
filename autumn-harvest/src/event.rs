@@ -25,13 +25,13 @@ fn default_error_type() -> String {
 /// Failure reason recorded on the synthetic terminal event of a dispatch that a
 /// **failing decision cycle abandoned** (issue #952).
 ///
-/// A workflow that dispatches awaited work (a child workflow, an activity) and
-/// then returns `Err` from a sibling branch in the same decision cycle never
-/// suspends, so the dispatch never becomes a queue row or an execution row. The
-/// terminal persist path records what the code actually did — a
-/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission position
-/// — immediately followed by a terminal carrying this reason, so the audit trail
-/// neither drops the dispatch nor claims work that is still in flight.
+/// A workflow can dispatch awaited work (a child workflow, an activity), then
+/// return `Err` from a sibling branch in the same decision cycle. It never
+/// suspends, so the dispatch never becomes a queue row or an execution row.
+/// The terminal persist path records what the code actually did. It writes a
+/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission
+/// position, then a terminal with this reason. So the audit trail neither
+/// drops the dispatch nor claims work that is still in flight.
 ///
 /// Deliberately a plain message on the **existing** `ChildWorkflowFailed` /
 /// `ActivityFailed` variants: issue #952 adds no `WorkflowEvent` variant, no
@@ -42,11 +42,11 @@ pub const ABANDONED_DISPATCH_REASON: &str =
 /// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
 /// event (issue #384).
 ///
-/// This is a **bounded** enum — it has a fixed, small set of variants and is
-/// safe to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each of
-/// the `WorkflowContext` deterministic primitives lowers onto a single
-/// `SideEffectRecorded` event and stamps the originating helper here so replay
-/// diagnostics and metrics can distinguish a clock read from a UUID mint without
+/// This is a **bounded** enum with a fixed, small set of variants. It is safe
+/// to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each
+/// `WorkflowContext` deterministic primitive lowers onto a single
+/// `SideEffectRecorded` event and stamps the originating helper here. So replay
+/// diagnostics and metrics can tell a clock read from a UUID mint without
 /// inspecting the recorded value.
 ///
 /// **Append-only invariant:** never remove or rename a variant. The serialised
@@ -348,8 +348,8 @@ pub enum WorkflowEvent {
 
     // ── Continue-as-new ───────────────────────────────────────────
     /// The workflow signalled `continue_as_new`. This is the terminal event
-    /// for the current execution; a fresh execution sharing the same logical
-    /// `WorkflowId` is started in its place with the recorded `input`.
+    /// for the current execution. A fresh execution with the same logical
+    /// `WorkflowId` starts in its place with the recorded `input`.
     WorkflowContinuedAsNew {
         /// The execution ID of the freshly started run that succeeds this one.
         new_exec_id: ExecutionId,
@@ -358,8 +358,8 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
         /// Registered workflow type the successor runs as (issue #803).
         ///
-        /// `None` — the overwhelmingly common case, and what every event
-        /// written before #803 deserializes to — means **same type**: the
+        /// `None` means **same type**. It is the overwhelmingly common case,
+        /// and every event written before #803 deserializes to it. The
         /// successor inherits the predecessor's `workflow_name` and carries
         /// its lifecycle columns forward verbatim, exactly as before.
         ///
@@ -379,8 +379,8 @@ pub enum WorkflowEvent {
     // ── Local activities (issue #98) ─────────────────────────────────────
     /// A local activity was dispatched for inline execution on the workflow
     /// worker. Unlike regular activities, local activities never write a row to
-    /// `harvest_task_queue`; the worker runs the handler in the same Tokio task
-    /// that drives the workflow loop.
+    /// `harvest_task_queue`. The worker runs the handler in the same Tokio
+    /// task that drives the workflow loop.
     LocalActivityScheduled {
         /// Unique ID for this local activity attempt sequence.
         activity_id: ActivityExecId,
@@ -389,16 +389,17 @@ pub enum WorkflowEvent {
         /// JSON input for the activity.
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
-        /// Disambiguation marker distinguishing a #620+ event whose defaults were
-        /// fully resolved at first schedule from a genuine pre-#620 legacy event
-        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_nanos`
-        /// below serialize as absent when they resolved to "no floor", so an
-        /// absent value alone cannot tell a resolved-to-nothing #620+ event apart
-        /// from a legacy event — the former MUST stay frozen (implicit 1-attempt /
-        /// no STC floor) on recovery, the latter MUST fall back to live
-        /// re-derivation for backward compat. This one marker covers both frozen
-        /// fields: every #620+ schedule writes it `true` at the same first-schedule
-        /// anchor; a pre-#620 event has the field absent → deserializes to `false`.
+        /// Marks a #620+ event whose defaults were fully resolved at first
+        /// schedule, as opposed to a genuine pre-#620 legacy event (issue #620).
+        ///
+        /// BOTH `retry_policy` and `start_to_close_nanos` below serialize as
+        /// absent when they resolved to "no floor". So an absent value alone
+        /// cannot tell a resolved-to-nothing #620+ event from a legacy event.
+        /// The former MUST stay frozen on recovery (implicit 1-attempt / no STC
+        /// floor). The latter MUST fall back to live re-derivation for backward
+        /// compat. This one marker covers both frozen fields. Every #620+
+        /// schedule writes it `true` at the same first-schedule anchor. A
+        /// pre-#620 event has the field absent, which deserializes to `false`.
         #[serde(default)]
         resolved: bool,
         /// The fully-resolved retry policy this local activity was scheduled
@@ -406,33 +407,37 @@ pub enum WorkflowEvent {
         ///
         /// Additive/optional: pre-#620 events deserialize to `None`. On a #620+
         /// event (`resolved == true`), a recorded `None` means "explicitly
-        /// resolved to no retry floor" and MUST stay frozen (implicit 1 attempt);
-        /// a legacy event (`resolved == false`) with `None` falls back to today's
-        /// live re-derivation. Frozen here so a local activity mid-retry across a
-        /// worker crash keeps its ORIGINAL retry budget even if the builder-level
-        /// default (`WorkerConfig::with_default_activity_retry_policy`) is changed
-        /// in the crash-recovery window (AC8: an in-flight execution is unaffected
-        /// by later default changes). Recorded on the live frontier at first
-        /// schedule; read on crash-recovery replay — the established side-effect
-        /// pattern.
+        /// resolved to no retry floor". It MUST stay frozen (implicit 1
+        /// attempt). A legacy event (`resolved == false`) with `None` falls
+        /// back to today's live re-derivation.
+        ///
+        /// It is frozen here so a local activity mid-retry across a worker crash
+        /// keeps its ORIGINAL retry budget. That holds even if the builder-level
+        /// default (`WorkerConfig::with_default_activity_retry_policy`) changes
+        /// in the crash-recovery window. AC8 requires that later default changes
+        /// do not affect an in-flight execution. Recorded on the live frontier
+        /// at first schedule; read on crash-recovery replay. That is the
+        /// established side-effect pattern.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The fully-resolved `start_to_close` this local activity was scheduled
         /// with, in **nanoseconds** (call-site → activity default → builder
-        /// default; issue #620, Codex P2). Nanoseconds — the FULL `Duration`
-        /// precision — so no floor is ever truncated: the local per-attempt
-        /// timeout is `Duration::from_nanos(this).min(cap)`. Truncating at any
-        /// coarser unit is the same footgun one order down (a seconds field
-        /// zeroes a subsecond floor; a millis field zeroes a sub-millisecond
-        /// floor like `Duration::from_micros(500)`), so the full `Duration` is
-        /// carried end-to-end (`u64` nanos ≈ 584 years — never saturates for a
-        /// realistic timeout).
+        /// default; issue #620).
         ///
-        /// Additive/optional, same freeze semantics as `retry_policy`: on a #620+
-        /// event (`resolved == true`) a recorded value — `Some` OR `None` — is
-        /// authoritative on recovery (`None` = "explicitly resolved to no STC
-        /// floor", frozen); a legacy event (`resolved == false`) falls back to
-        /// live re-derivation.
+        /// Nanoseconds are the FULL `Duration` precision, so no floor is ever
+        /// truncated. The local per-attempt timeout is
+        /// `Duration::from_nanos(this).min(cap)`. Any coarser unit is the same
+        /// footgun one order down. A seconds field zeroes a subsecond floor. A
+        /// millis field zeroes a sub-millisecond floor like
+        /// `Duration::from_micros(500)`. So the full `Duration` is carried
+        /// end-to-end. `u64` nanos ≈ 584 years, so it never saturates for a
+        /// realistic timeout.
+        ///
+        /// Additive/optional, with the same freeze semantics as `retry_policy`.
+        /// On a #620+ event (`resolved == true`), a recorded value, `Some` OR
+        /// `None`, is authoritative on recovery. There `None` means "explicitly
+        /// resolved to no STC floor", frozen. A legacy event
+        /// (`resolved == false`) falls back to live re-derivation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_to_close_nanos: Option<u64>,
     },
@@ -446,10 +451,10 @@ pub enum WorkflowEvent {
     },
     /// A local activity attempt returned an error or the handler panicked.
     ///
-    /// Multiple `LocalActivityFailed` events may appear in sequence (one per
-    /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
-    /// succeeded) or before the retry budget is exhausted (followed by a
-    /// `LocalActivityExhausted` event that marks the terminal state).
+    /// Multiple `LocalActivityFailed` events may appear in sequence, one per
+    /// attempt. A terminal `LocalActivityCompleted` follows when a retry
+    /// succeeds. A `LocalActivityExhausted` event follows when the retry
+    /// budget is exhausted, and marks the terminal state.
     LocalActivityFailed {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
         activity_id: ActivityExecId,
@@ -473,7 +478,7 @@ pub enum WorkflowEvent {
         /// JSON input for the activity.
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
-        /// Target worker queue (informational; external activities don't occupy a slot).
+        /// Target worker queue (informational; external activities do not occupy a slot).
         queue: String,
         /// Maximum seconds the external system has to deliver a result.
         schedule_to_close_secs: u64,
@@ -570,10 +575,10 @@ pub enum WorkflowEvent {
     /// immediately after the final `LocalActivityFailed` event so replay can
     /// identify the terminal state without knowing the current retry policy.
     ///
-    /// This makes the terminal-vs-in-progress distinction policy-invariant:
-    /// if this event is present the activity is unambiguously done; if only
-    /// `LocalActivityFailed` events are present (without a following
-    /// `LocalActivityExhausted`) the worker crashed between retries and must
+    /// This makes the terminal-vs-in-progress distinction policy-invariant.
+    /// If this event is present, the activity is unambiguously done. If only
+    /// `LocalActivityFailed` events are present, with no following
+    /// `LocalActivityExhausted`, the worker crashed between retries. It must
     /// continue from the next attempt.
     LocalActivityExhausted {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
@@ -585,10 +590,11 @@ pub enum WorkflowEvent {
     },
 
     // ── External workflow signals (issue #330, by-id targeting #751) ─────────
-    /// A workflow requested delivery of a named signal to another workflow,
-    /// addressed either by a specific `ExecutionId` or by a stable
-    /// `(workflow_name, workflow_id)` business key resolved to the current
-    /// run at delivery time (issue #751).
+    /// A workflow requested delivery of a named signal to another workflow.
+    ///
+    /// The target is a specific `ExecutionId`, or a stable
+    /// `(workflow_name, workflow_id)` business key. The key resolves to the
+    /// current run at delivery time (issue #751).
     ///
     /// The `signal_id` correlates this request with its terminal outcome event
     /// (`ExternalSignalDelivered` or `ExternalSignalFailed`). On replay the
@@ -596,9 +602,9 @@ pub enum WorkflowEvent {
     /// side effect.
     ///
     /// `target`'s type widened from a bare `ExecutionId` to
-    /// [`crate::types::ExternalTarget`] in issue #751 — `#[serde(untagged)]`
-    /// makes every pre-#751 stored event (a bare UUID string) deserialize
-    /// unchanged into the `ExecutionId` variant.
+    /// [`crate::types::ExternalTarget`] in issue #751. With
+    /// `#[serde(untagged)]`, every pre-#751 stored event (a bare UUID string)
+    /// deserializes unchanged into the `ExecutionId` variant.
     ExternalSignalRequested {
         /// Correlation ID linking this event to its terminal outcome.
         signal_id: ExternalSignalId,
@@ -624,9 +630,9 @@ pub enum WorkflowEvent {
     /// - `"target_terminal"` — the target execution is already in a terminal
     ///   state (`ExecutionId`-targeted requests only).
     /// - `"not_running"` — the resolved current run for a `workflow_id`
-    ///   target is definitively terminal (issue #751; no grace window needed,
-    ///   since a continue-as-new always leaves an active successor behind
-    ///   atomically, so this observation can never be a false negative).
+    ///   target is definitively terminal (issue #751). No grace window is
+    ///   needed. A continue-as-new always leaves an active successor behind
+    ///   atomically, so this observation can never be a false negative.
     /// - `"target_unknown"` — no execution with the given ID (or business key)
     ///   was ever found, after the configured grace window.
     ExternalSignalFailed {
@@ -699,14 +705,14 @@ pub enum WorkflowEvent {
     /// A deterministic value was captured during live execution and frozen into
     /// history so subsequent replays return the identical value.
     ///
-    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
-    /// `system_time_now()`, `new_uuid()`, `random_u64()`, `random_f64()`,
-    /// `random_range()`, and `side_effect()` — lower onto this single variant so
-    /// the event-schema cost of the feature is paid exactly once. The `kind`
-    /// discriminator (a bounded enum) records which helper produced the value;
-    /// `name` is `Some` only for `side_effect()` (the author-supplied dedup key)
-    /// and `None` for the built-in unnamed helpers; `value` is the recorded JSON
-    /// result returned on every replay.
+    /// All of the `WorkflowContext` deterministic primitives lower onto this
+    /// single variant: `system_now()`, `system_time_now()`, `new_uuid()`,
+    /// `random_u64()`, `random_f64()`, `random_range()`, and `side_effect()`.
+    /// So the event-schema cost of the feature is paid exactly once. The
+    /// `kind` discriminator (a bounded enum) records which helper produced the
+    /// value. `name` is `Some` only for `side_effect()` (the author-supplied
+    /// dedup key) and `None` for the built-in unnamed helpers. `value` is the
+    /// recorded JSON result returned on every replay.
     ///
     /// This is an **append-only** variant added at the end of the enum. The
     /// `harvest_events` table stores it as opaque JSON, so no migration is
@@ -732,10 +738,10 @@ pub enum WorkflowEvent {
     ///
     /// ## Replay determinism
     ///
-    /// Pause/resume events are no-ops for command dispatch during replay: the
-    /// [`crate::replay::HistoryMatcher`] skips them transparently, so a recorded
-    /// pause/resume pair never alters the command sequence reconstructed from
-    /// history.
+    /// Pause/resume events are no-ops for command dispatch during replay. The
+    /// [`crate::replay::HistoryMatcher`] skips them transparently. So a
+    /// recorded pause/resume pair never alters the command sequence
+    /// reconstructed from history.
     WorkflowExecutionPaused {
         /// Wall-clock time the pause was applied.
         paused_at: DateTime<Utc>,
@@ -749,8 +755,8 @@ pub enum WorkflowEvent {
     },
     /// An operator (or the bounded-pause auto-resume scanner) resumed a paused
     /// execution. The executor re-arms and the workflow advances on its next
-    /// decision attempt; timers whose fire time elapsed while paused fire
-    /// immediately in their original order, and signals queued during the pause
+    /// decision attempt. Timers whose fire time elapsed while paused fire
+    /// immediately in their original order. Signals queued during the pause
     /// are delivered in order.
     WorkflowExecutionResumed {
         /// Wall-clock time the resume was applied.
@@ -761,10 +767,11 @@ pub enum WorkflowEvent {
     },
 
     // ── External workflow cancellation (issue #492, by-id targeting #751) ────
-    /// A workflow requested cancellation of another workflow, addressed
-    /// either by a specific `ExecutionId` or by a stable
-    /// `(workflow_name, workflow_id)` business key resolved to the current
-    /// run at delivery time (issue #751).
+    /// A workflow requested cancellation of another workflow.
+    ///
+    /// The target is a specific `ExecutionId`, or a stable
+    /// `(workflow_name, workflow_id)` business key. The key resolves to the
+    /// current run at delivery time (issue #751).
     ///
     /// The `cancel_id` correlates this request with its terminal outcome event
     /// (`ExternalCancelDelivered` or `ExternalCancelFailed`). On replay the
@@ -800,18 +807,18 @@ pub enum WorkflowEvent {
 
     // ── DLQ redrive reactivation (issue #510) ─────────────────────────────────
     /// An operator redrove a dead-lettered task whose owning execution had been
-    /// sealed `FAILED` at quarantine time. This event reopens the execution: it
-    /// is appended **after** the superseded terminal
-    /// [`WorkflowFailed`](Self::WorkflowFailed) and the execution transitions
-    /// `FAILED` → `RUNNING` so the re-enqueued task resumes from existing
+    /// sealed `FAILED` at quarantine time. This event reopens the execution.
+    /// It is appended **after** the superseded terminal
+    /// [`WorkflowFailed`](Self::WorkflowFailed). The execution transitions
+    /// `FAILED` → `RUNNING`, so the re-enqueued task resumes from existing
     /// history (append-only; no prior event is rewritten).
     ///
     /// ## Replay determinism
     ///
     /// `WorkflowRedriven` is a **non-terminal** lifecycle event and is a no-op
-    /// for command dispatch during replay: the
+    /// for command dispatch during replay. The
     /// [`crate::replay::HistoryMatcher`] marks both this event **and** the
-    /// `WorkflowFailed` it supersedes as transparent, so the reconstructed
+    /// `WorkflowFailed` it supersedes as transparent. So the reconstructed
     /// command sequence advances past the reopened terminal instead of
     /// diverging against it. A bare trailing `WorkflowFailed` with no following
     /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
@@ -841,7 +848,7 @@ pub enum WorkflowEvent {
     /// This event lives ONLY in the sealed failed run's history and is appended
     /// **after** the terminal `WorkflowFailed` event. The
     /// [`crate::replay::HistoryMatcher`] stops consuming events after a terminal
-    /// lifecycle event, so this trailing event is transparent to replay: the
+    /// lifecycle event. So this trailing event is transparent to replay. The
     /// failed run is already sealed; its retry is a separate execution.
     WorkflowRetryScheduled {
         /// The execution ID of the newly-created retry run.
@@ -867,9 +874,9 @@ pub enum WorkflowEvent {
     /// A `TimerCancelled { timer_id }` recorded **before** any `TimerFired` with the
     /// same id resolves the timer's observed outcome to
     /// [`crate::context::TimerOutcome::Cancelled`]. It is a command-bearing event
-    /// that may interleave with unrelated activity/timer/child scans, so every
-    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of order
-    /// (mirroring the `TimerFired` / external-cancel skip pattern).
+    /// that may interleave with unrelated activity/timer/child scans. So every
+    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of
+    /// order, like the `TimerFired` / external-cancel skip pattern.
     ///
     /// Appended at the END of the enum; pre-#768 histories that never contain this
     /// variant deserialize unchanged.
@@ -1203,13 +1210,13 @@ impl WorkflowEvent {
                 | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
                 | Self::WorkflowExecutionTimedOut { .. }
-                // Written to the parent history after the parent's own terminal event;
-                // never consumed by the workflow function itself, so must be skipped
-                // during unconsumed-event checks to avoid false non-determinism reports.
+                // Written to the parent history after the parent's own terminal
+                // event. The workflow function never consumes it. Unconsumed-event
+                // checks skip it, or they would report false non-determinism.
                 | Self::ChildWorkflowCascadeApplied { .. }
                 // Appended to the failed run's history after WorkflowFailed as a
-                // durable linkage record; the failed run is sealed and the event is
-                // never consumed by its workflow function on replay.
+                // durable linkage record. The failed run is sealed. Its workflow
+                // function never consumes the event on replay.
                 | Self::WorkflowRetryScheduled { .. }
         )
     }
@@ -1681,7 +1688,7 @@ mod tests {
 
     #[test]
     fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
-        // Issue #620 (Codex P2): a #620+ event carrying the resolution marker
+        // Issue #620: a #620+ event carrying the resolution marker
         // plus frozen retry/STC must round-trip all three fields verbatim.
         let event = WorkflowEvent::LocalActivityScheduled {
             activity_id: ActivityExecId::new(),
@@ -2642,7 +2649,6 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
-        // The three additive optionals skip when None.
         let json = serde_json::to_string(&event)?;
         assert!(
             !json.contains("last_completion_result"),
@@ -2657,7 +2663,6 @@ mod tests {
             "scheduled_time must skip when None, got {json}"
         );
 
-        // Round-trips back to an equivalent value.
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         match back {
             WorkflowEvent::WorkflowStarted {
@@ -2825,9 +2830,9 @@ mod tests {
 
     // ── Cross-type continue-as-new (issue #803) ──────────────────────────
 
-    /// A same-type continue-as-new records `new_workflow_type: None`, and the
-    /// additive field must be **absent** from the serialized JSON so a
-    /// pre-#803 reader (and a byte-comparison against a pre-#803 history) sees
+    /// A same-type continue-as-new records `new_workflow_type: None`. The
+    /// additive field must be **absent** from the serialized JSON. So a
+    /// pre-#803 reader, and a byte-comparison against a pre-#803 history, sees
     /// exactly today's shape.
     #[test]
     fn continued_as_new_same_type_omits_the_additive_field() -> Result<(), serde_json::Error> {
@@ -2879,8 +2884,8 @@ mod tests {
     }
 
     /// **Append-only invariant (AC3).** A history written by a pre-#803 build
-    /// carries no `new_workflow_type` key at all; it must deserialize to
-    /// `None` (same-type) rather than failing, so in-flight executions replay
+    /// carries no `new_workflow_type` key at all. It must deserialize to
+    /// `None` (same-type) rather than fail. So in-flight executions replay
     /// identically across the upgrade.
     #[test]
     fn pre_803_continued_as_new_json_deserializes_to_none() -> Result<(), serde_json::Error> {

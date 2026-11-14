@@ -1,15 +1,16 @@
 //! Registration-time rejection of unsupported `WorkflowInfo`-level features
-//! (Codex #1069 P2). Issue #2029 honors `execution_timeout` and `retry_policy`.
+//! (#1069). Issue #2029 honors `execution_timeout` and `retry_policy`.
 //!
-//! [`SqliteRuntime::register_workflow`] retains ONLY `name` + `handler`, so every
-//! other execution- or admission-affecting `WorkflowInfo` field would otherwise be
-//! silently dropped — diverging from the declared `#[workflow(...)]` contract. This
-//! backend rejects such a workflow LOUDLY at registration (a setup-time panic,
-//! mirroring the Postgres `HarvestPlugin::build()` panic on misconfiguration),
-//! naming the specific feature. Pure metadata / observability-only fields
-//! (`description`, `sla`, schemas, owner/runbook/severity, `mcp`) are accepted and
-//! inert. These tests drive the PUBLIC API (`register_workflow`) rather than the
-//! private audit fn, which has its own in-crate unit coverage.
+//! [`SqliteRuntime::register_workflow`] retains ONLY `name` + `handler`. Every
+//! other execution- or admission-affecting `WorkflowInfo` field would be
+//! silently dropped, which diverges from the declared `#[workflow(...)]`
+//! contract. This backend rejects such a workflow LOUDLY at registration and
+//! names the feature. The setup-time panic mirrors the Postgres
+//! `HarvestPlugin::build()` panic on misconfiguration. Pure metadata /
+//! observability-only fields (`description`, `sla`, schemas,
+//! owner/runbook/severity, `mcp`) are accepted and inert. These tests drive the
+//! PUBLIC API (`register_workflow`) rather than the private audit fn, which has
+//! its own in-crate unit coverage.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -76,9 +77,9 @@ async fn documented_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 #[tokio::test]
 async fn a_metadata_only_workflow_registers_and_runs() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // `description` is pure metadata (surfaced by GET /workflows/registered on the
-    // Postgres HTTP edge, which this backend has no analog for): accepted, inert,
-    // never blocks registration or execution.
+    // `description` is pure metadata: accepted, inert, never blocks registration
+    // or execution. GET /workflows/registered surfaces it on the Postgres HTTP
+    // edge, which this backend has no analog for.
     rt.register_workflow(&documented_wf_info());
     let exec = rt.start_workflow("documented_wf", json!(41)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();

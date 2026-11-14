@@ -3,11 +3,10 @@
 //! Shared harness for the issue #958 retention-reclamation measurement.
 //!
 //! Lives under `tests/` so the manifest-driven CI runner
-//! (`.github/ci/integration-suites.txt`) can execute the gate that uses it; the
-//! benchmark (`benches/retention_reclaim_bench.rs`) reaches across to the same
-//! code rather than duplicating it, so the numbers published in
-//! `docs/perf-artifacts/` and the number CI gates on can never be produced by
-//! two different implementations.
+//! (`.github/ci/integration-suites.txt`) can execute the gate that uses it. The
+//! benchmark (`benches/retention_reclaim_bench.rs`) reuses the same code. So
+//! the numbers published in `docs/perf-artifacts/` and the number CI gates on
+//! always come from one implementation.
 //!
 //! # What it measures
 //!
@@ -23,14 +22,13 @@
 //!
 //! The pass is timed **end to end**, which means it includes the per-execution
 //! candidate loop (archive hook, legal-hold re-check, summary demotion,
-//! auxiliary-row cleanup, execution-row delete). That loop is *unchanged* by
-//! issue #958 and is required by the `HistoryArchiver` contract — it must see
-//! each execution individually, before its rows become unreachable. So the
-//! report separates the two costs rather than blending them: `events_secs` is
-//! the reclamation this issue changes, `executions_secs` is the pre-existing
-//! per-execution collection. Reporting only the total would let a genuine O(1)
-//! event reclamation hide behind an O(n) loop nobody asked us to touch — or,
-//! worse, let that loop's cost be read as evidence that partitioning did not
+//! auxiliary-row cleanup, execution-row delete). Issue #958 does not change that
+//! loop. The `HistoryArchiver` contract requires it: it must see each execution
+//! individually, before its rows become unreachable. So the report separates
+//! the two costs. `events_secs` is the reclamation this issue changes.
+//! `executions_secs` is the pre-existing per-execution collection. A total
+//! alone lets a genuine O(1) event reclamation hide behind an untouched O(n)
+//! loop. Worse, that loop's cost can read as evidence that partitioning did not
 //! help.
 
 use std::sync::Arc;
@@ -70,9 +68,10 @@ impl Scale {
         }
     }
 
-    /// A laptop/CI-sized corpus with the same *shape* — same events per
-    /// execution, same cohort count, same expired fraction — so the per-unit
-    /// costs it reports extrapolate honestly.
+    /// A laptop/CI-sized corpus with the same *shape* as the full one.
+    ///
+    /// It keeps the events per execution, cohort count and expired fraction. So
+    /// the per-unit costs it reports extrapolate honestly.
     #[must_use]
     pub const fn small() -> Self {
         Self {
@@ -180,10 +179,9 @@ pub fn p99_ms(samples: &mut [Duration]) -> f64 {
         return 0.0;
     }
     samples.sort_unstable();
-    // Integer arithmetic rather than a float multiply: sample counts here are
-    // in the thousands, and `ceil(len * 0.99)` on a float is one rounding
-    // surprise away from picking the wrong rank. `(len * 99).div_ceil(100)` is
-    // the same nearest-rank definition with no float in it at all.
+    // Integer arithmetic, not a float multiply. Sample counts are in the
+    // thousands, and a float `ceil(len * 0.99)` can round to the wrong rank.
+    // `(len * 99).div_ceil(100)` is the same nearest-rank definition, no float.
     let rank = (samples.len().saturating_mul(99)).div_ceil(100);
     let idx = rank.saturating_sub(1).min(samples.len() - 1);
     samples[idx].as_secs_f64() * 1000.0
@@ -220,17 +218,17 @@ async fn scalar(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
 /// Seed the corpus with bulk `INSERT … SELECT generate_series(…)` rather than
 /// row-by-row appends.
 ///
-/// Seeding is setup, not measurement, so it is allowed to be fast in ways the
-/// engine's own append path is not: one statement per table, and the
-/// partitioned layout's integrity trigger disabled for the duration (it would
-/// otherwise do a primary-key probe per seeded row, turning a ten-second setup
-/// into a ten-minute one without changing a single measured number).
+/// Seeding is setup, not measurement, so it may take shortcuts the engine's
+/// append path does not. It uses one statement per table. It disables the
+/// partitioned layout's integrity trigger for the duration. Otherwise that
+/// trigger does a primary-key probe per seeded row. That turns a ten-second
+/// setup into a ten-minute one and changes no measured number.
 ///
 /// Executions are spread evenly across `cohorts` daily buckets, oldest first,
 /// and the oldest `expired_fraction` of them are given a `completed_at` well
-/// past the retention horizon. Because the corpus is laid out oldest-first,
-/// the expired set occupies whole cohorts — which is the steady state issue
-/// #958 describes, and the only state in which a partition is droppable at all.
+/// past the retention horizon. The corpus is laid out oldest-first, so the
+/// expired set occupies whole cohorts. That is the steady state issue #958
+/// describes, and the only state in which a partition is droppable at all.
 pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool) {
     let cohorts = i64::try_from(scale.cohorts).unwrap_or(1).max(1);
     let executions = i64::try_from(scale.executions).unwrap_or(0);
@@ -258,13 +256,12 @@ pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool)
     //
     // The corpus is laid out strictly OLDEST-FIRST — cohort index rises
     // monotonically with `g` — so the expired prefix occupies whole cohorts.
-    // That is load-bearing, not cosmetic: with `g % cohorts` (interleaving
-    // expired and retained executions through every cohort) not one partition
-    // would ever be fully free, so the partitioned arm would measure a sweep
-    // that correctly drops nothing and the benchmark would report the wrong
-    // thing while looking healthy. Whole-cohort expiry IS the steady state
-    // issue #958 describes, and the only state in which a partition is
-    // droppable at all.
+    // That is load-bearing. With `g % cohorts`, expired and retained executions
+    // interleave through every cohort, so no partition is ever fully free.
+    // The partitioned arm would then measure a sweep that correctly drops
+    // nothing. The benchmark would report the wrong thing and look healthy.
+    // Whole-cohort expiry IS the steady state issue #958 describes, and the
+    // only state in which a partition is droppable at all.
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions
              (workflow_name, workflow_id, shard_id, state, input, created_at, started_at, completed_at)
@@ -332,9 +329,9 @@ pub async fn dead_tuple_ratio(conn: &mut AsyncPgConnection) -> f64 {
     )
     .get_result::<RatioRow>(conn)
     .await
-    // NOT `unwrap_or(0.0)`: a failed stats query returning "no bloat" would
-    // make the Success-Metric assertion pass for the wrong reason, which is
-    // worse than no assertion at all.
+    // NOT `unwrap_or(0.0)`: a failed stats query that returns "no bloat"
+    // passes the Success-Metric assertion for the wrong reason. That is worse
+    // than no assertion at all.
     .expect("read dead-tuple ratio")
     .v
 }
@@ -359,10 +356,9 @@ pub async fn event_count(conn: &mut AsyncPgConnection) -> i64 {
 /// Flush this backend's pending statistics so a counter read immediately after
 /// is not stale.
 ///
-/// A backend buffers statistics locally and flushes them lazily, so without
-/// this a read can miss the work it is supposed to be measuring — and a
-/// `pg_stat_reset()` can be followed by the pre-reset numbers landing on top of
-/// the zeroed values.
+/// A backend buffers statistics locally and flushes them lazily. Without this,
+/// a read can miss the work it measures. Also, the pre-reset numbers can land
+/// on top of the values that `pg_stat_reset()` zeroed.
 pub async fn flush_stats(conn: &mut AsyncPgConnection) {
     conn.batch_execute("SELECT pg_stat_force_next_flush()")
         .await
@@ -371,9 +367,9 @@ pub async fn flush_stats(conn: &mut AsyncPgConnection) {
 
 /// Count of surviving event rows belonging to the SEEDED corpus.
 ///
-/// Excludes the concurrent load's own execution: the load appends throughout
-/// the measured window, and netting its appends against the reclamation would
-/// understate what the pass freed (and, at small scale, report it as negative).
+/// Excludes the concurrent load's own execution. The load appends throughout
+/// the measured window. Netting its appends against the reclamation
+/// understates what the pass freed, and at small scale reports it as negative.
 pub async fn seeded_event_count(conn: &mut AsyncPgConnection) -> i64 {
     scalar(
         conn,
@@ -409,20 +405,20 @@ pub struct LoadSamples {
 /// Drive appends and claims against a live execution until `stop` is set,
 /// recording per-operation latency.
 ///
-/// This is the load whose p99 the Success Metric budgets. It deliberately uses
-/// the engine's own `store::append_events` and `queue::claim_task_on_shard`
-/// rather than hand-written SQL, so what is measured is the hot path operators
-/// actually run — including, on the partitioned layout, tuple routing, the
-/// `DEFAULT` cohort expression and the integrity trigger.
+/// This is the load whose p99 the Success Metric budgets. It uses the engine's
+/// own `store::append_events` and `queue::claim_task_on_shard`, not hand-written
+/// SQL. So it measures the hot path operators actually run. On the partitioned
+/// layout that includes tuple routing, the `DEFAULT` cohort expression and the
+/// integrity trigger.
 pub async fn drive_load(url: &str, stop: Arc<AtomicBool>, ops: Arc<AtomicU64>) -> LoadSamples {
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .expect("load connection");
     let mut samples = LoadSamples::default();
 
-    // A dedicated live execution, created now, so its appends land in the
-    // currently-open cohort and are never a retention candidate — the load must
-    // measure contention with the pass, not participate in it.
+    // A dedicated live execution, created now. Its appends land in the
+    // currently-open cohort and are never a retention candidate. The load
+    // measures contention with the pass. It must not participate in it.
     let exec: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
              (workflow_name, workflow_id, shard_id, state, input)
@@ -450,8 +446,8 @@ pub async fn drive_load(url: &str, stop: Arc<AtomicBool>, ops: Arc<AtomicU64>) -
             next_event_id += 1;
         }
 
-        // An empty queue still exercises the whole claim predicate — the scan,
-        // the ordering and every accreted gate — which is what competes with a
+        // An empty queue still exercises the whole claim predicate: the scan,
+        // the ordering and every accreted gate. That competes with a
         // maintenance pass for locks and buffers.
         let t1 = Instant::now();
         let claimed = autumn_harvest::queue::claim_task_on_shard(
@@ -494,9 +490,9 @@ pub async fn measure_baseline(url: &str, window: Duration) -> (f64, f64) {
 /// Run one retention pass against `url` while the concurrent load runs, and
 /// report every quantity the Success Metric names.
 ///
-/// `partitioned` describes the layout already applied to `url`; the harness
-/// does not convert it, so the caller decides (and so the same code measures
-/// both arms of the comparison).
+/// `partitioned` describes the layout already applied to `url`. The harness
+/// does not convert it. The caller decides, so the same code measures both
+/// arms of the comparison.
 // A single measured scenario: baseline window, seeded-state snapshot, the
 // timed pass, then the timed reclamation. Splitting it would separate the
 // measurement from the state it is measured against.
@@ -522,14 +518,13 @@ pub async fn measure_pass(
         measure_baseline(url_static, baseline_window).await;
 
     // Counted over the SEEDED corpus only. The concurrent load appends to its
-    // own live execution throughout the pass, so a bare `COUNT(*)` before/after
-    // would net the load's appends against the reclamation and could even
-    // report a negative figure.
+    // own live execution throughout the pass. A bare `COUNT(*)` before/after
+    // nets the load's appends against the reclamation, and can go negative.
     let events_before = seeded_event_count(&mut conn).await;
     let executions_before = execution_count(&mut conn).await;
 
-    // Reset AFTER seeding (and after flushing the seed's own pending stats),
-    // so the delete counter and dead-tuple ratio below describe THE PASS and
+    // Reset AFTER seeding and after flushing the seed's own pending stats.
+    // Then the delete counter and dead-tuple ratio below describe THE PASS,
     // not the bulk insert that set it up.
     flush_stats(&mut conn).await;
     conn.batch_execute("SELECT pg_stat_reset()")
@@ -551,17 +546,17 @@ pub async fn measure_pass(
         .expect("pool");
 
     let mut config = RetentionConfig::with_max_age(Duration::from_secs(3_600));
-    // One batch big enough to take the whole expired set, so the measurement is
-    // of a single pass rather than of the batch loop's tick cadence.
+    // One batch takes the whole expired set. So this measures a single pass,
+    // not the batch loop's tick cadence.
     config.batch_size = scale.executions.max(1);
     // Phase 1 times the candidate loop ALONE. Partition maintenance is timed
-    // separately below, because it is the only part of the pass issue #958
-    // changes and blending the two would let an O(1) partition drop hide inside
-    // a pre-existing O(n) per-execution loop — or, worse, let that loop's cost
-    // read as evidence that partitioning did not help. On the unpartitioned
-    // layout there is nothing to separate: the cascade fires inside the
-    // candidate loop, so its event reclamation is part of `pass` by
-    // construction, and `events_reclaim` stays zero.
+    // separately below. It is the only part of the pass that issue #958 changes.
+    // Blended, an O(1) partition drop hides inside a pre-existing O(n)
+    // per-execution loop. Worse, that loop's cost can read as evidence that
+    // partitioning did not help. The unpartitioned layout has nothing to
+    // separate. The cascade fires inside the candidate loop. So its event
+    // reclamation is part of `pass` by construction, and `events_reclaim`
+    // stays zero.
     config.partitions.enabled = false;
 
     let started = Instant::now();
@@ -593,10 +588,10 @@ pub async fn measure_pass(
     runtime.shutdown();
 
     // Read BEFORE the sweep. `DROP TABLE` removes the partition's row from
-    // `pg_stat_all_tables` entirely, so a post-drop read cannot tell "no row
-    // deletes occurred" from "row deletes occurred in a table that was then
-    // dropped" — and the headline "zero row DELETEs" assertion would be
-    // vacuous in exactly the arm it is supposed to prove.
+    // `pg_stat_all_tables` entirely. A post-drop read cannot tell "no row
+    // deletes occurred" from "row deletes occurred in a dropped table". The
+    // headline "zero row DELETEs" assertion is then vacuous in the arm it
+    // must prove.
     let event_rows_deleted_before_sweep = event_rows_deleted(&mut conn).await;
 
     // Phase 2: the event-storage reclamation on its own. On the partitioned
@@ -625,11 +620,10 @@ pub async fn measure_pass(
     stop.store(true, Ordering::Relaxed);
     let mut samples = load.await.expect("load task");
     // Truncate both arms to the SAME window before taking a percentile. The
-    // under-load window is as long as the pass, and the whole point of the
-    // change is that one arm's pass is shorter — so an untruncated comparison
-    // would give the slower arm strictly more chances to catch a checkpoint,
-    // WAL switch or autovacuum wake-up, biasing the numbers in exactly the
-    // direction this benchmark wants to demonstrate.
+    // under-load window is as long as the pass, and one arm's pass is shorter.
+    // An untruncated comparison gives the slower arm more chances to catch a
+    // checkpoint, WAL switch or autovacuum wake-up. That biases the numbers in
+    // the direction this benchmark wants to demonstrate.
     let window_ops = sample_window_ops(&samples, load_started.elapsed(), baseline_window);
     samples
         .appends

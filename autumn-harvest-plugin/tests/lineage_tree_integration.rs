@@ -2,13 +2,13 @@
 //!
 //! The recursive, cross-shard lineage tree. The pure walk (bounds, cycle
 //! safety, nesting, summarisation) is unit-tested in
-//! `autumn-harvest-plugin/src/lineage.rs`; these tests verify the HTTP wiring
-//! plus the thing no unit test can prove — that a child which landed on a
-//! **different shard** than its parent still appears in the tree.
+//! `autumn-harvest-plugin/src/lineage.rs`. These tests verify the HTTP wiring.
+//! They also prove what no unit test can: a child on a **different shard**
+//! than its parent still appears in the tree.
 //!
-//! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres **admin** URL (a
-//! per-test database is created off it) to run without Docker; otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle.
+//! Execution: to run without Docker, set `HARVEST_TEST_DATABASE_URL` to a
+//! Postgres **admin** URL. Each test creates its own database there. Otherwise
+//! a testcontainers Postgres boots with the full migration bundle.
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
@@ -430,9 +430,9 @@ async fn a_detached_child_reports_its_parent_close_policy() {
         Spec::child(root, "detached", 2).detached("terminate"),
     )
     .await;
-    // `await_mode` is derived as "detached iff the stored policy parses", so
-    // every accepted spelling must be exercised — an unparsed one would
-    // silently report a detached child as awaited.
+    // `await_mode` is "detached iff the stored policy parses". So the test
+    // covers every accepted spelling. An unparsed one would report a detached
+    // child as awaited.
     insert(
         &mut conn,
         Spec::child(root, "detached-abandon", 3).detached("abandon"),
@@ -713,9 +713,9 @@ async fn max_nodes_truncation_flags_the_reason_and_names_the_dropped_parent() {
 }
 
 /// `max_nodes=1` spends the entire budget on the root, so the walk breaks
-/// before querying a single shard. That must still be reported as a
-/// truncation — a root with children is otherwise indistinguishable from a
-/// leaf, which is exactly the silent cap AC4 forbids.
+/// before it queries a shard. That must still count as a truncation.
+/// Otherwise a root with children looks like a leaf, the silent cap AC4
+/// forbids.
 #[tokio::test]
 async fn a_budget_that_only_fits_the_root_is_still_reported_as_truncated() {
     let (admin, _guard) = setup_server().await;
@@ -783,9 +783,9 @@ async fn an_exactly_spent_budget_reports_max_nodes_not_max_depth() {
     );
 }
 
-/// An unrecognised `summary` value must be rejected, not silently treated as
-/// `false` — a caller asking for a roll-up and receiving a full tree with a
-/// 200 has no way to notice the typo.
+/// An unrecognised `summary` value must be rejected, not treated as `false`.
+/// A caller who asks for a roll-up and gets a full tree with a 200 cannot
+/// notice the typo.
 #[tokio::test]
 async fn an_unrecognised_summary_value_is_rejected() {
     let (admin, _guard) = setup_server().await;
@@ -875,9 +875,9 @@ async fn demote_child_to_summary(
 }
 
 /// A terminal child demoted into a retention summary is invisible to a walk of
-/// `harvest_workflow_executions`. The tree must not then claim completeness —
-/// otherwise a FAILED child yields `truncated: false` and `counts.failed == 0`,
-/// the exact silent omission the bounds machinery exists to prevent.
+/// `harvest_workflow_executions`. The tree must not then claim completeness.
+/// Otherwise a FAILED child yields `truncated: false` and `counts.failed == 0`.
+/// The bounds machinery exists to prevent that silent omission.
 #[tokio::test]
 async fn a_child_demoted_into_a_retention_summary_is_reported_not_silently_dropped() {
     let (admin, _guard) = setup_server().await;
@@ -1027,21 +1027,20 @@ async fn summary_mode_also_reports_retained_summary_parents() {
 /// The root lookup must not silently fall back to the default shard.
 ///
 /// `ShardedDbPool::pool_for` falls back to the default shard when the requested
-/// shard has no entry, so routing the root off its encoded shard through the
-/// lenient `pool_for_execution` would query the **wrong database**, find
-/// nothing, and answer a confident `404` — for an execution that may well exist
-/// on its own shard. That is the exact false-negative the sibling business-id
-/// resolver (#805) fails closed against, and it would contradict this very
-/// endpoint's own fan-out, which reports a router-known-but-poolless shard as
-/// `unavailable` rather than pretending it is empty.
+/// shard has no entry. So the lenient `pool_for_execution` would query the
+/// **wrong database** for the root and answer a confident `404`. The execution
+/// may well exist on its own shard. The business-id resolver (#805) fails
+/// closed against that false negative. It would also contradict this
+/// endpoint's own fan-out, which reports a router-known shard with no pool as
+/// `unavailable`, not empty.
 #[tokio::test]
 async fn a_root_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() {
     let (admin, _guard) = setup_server().await;
     let shard0 = create_shard_db(&admin, &unique("lineage_s0")).await;
 
-    // The router knows shards 0 and 1, but this process only has a pool for 0
-    // — the documented mid-shard-add-rollout state (readable_shards widened
-    // before the pool is configured).
+    // The router knows shards 0 and 1, but this process only has a pool for 0.
+    // That is the documented mid-rollout state of a shard add: readable_shards
+    // widens before the pool is configured.
     let pools = BTreeMap::from([(ShardId::new(0), build_pool(&shard0))]);
     let app = build_app(
         HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0))),
@@ -1065,9 +1064,9 @@ async fn a_root_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() {
     );
 }
 
-/// ...but the fix must not over-reach into a confusing `503` for an id no shard
-/// in this deployment could ever host (an operator pasting a wrong UUID decodes
-/// to an arbitrary shard number). Unknown-to-the-router stays a clean `404`.
+/// ...but the fix must not give a confusing `503` for an id that no shard in
+/// this deployment could host. A wrong pasted UUID decodes to an arbitrary
+/// shard number. A shard unknown to the router stays a clean `404`.
 #[tokio::test]
 async fn a_root_on_a_shard_this_deployment_does_not_know_is_still_404() {
     let (admin, _guard) = setup_server().await;
@@ -1199,9 +1198,9 @@ async fn success_metric_depth_six_two_hundred_nodes_returns_in_one_call() {
         total as u64,
         "the COMPLETE tree is returned in one call"
     );
-    // Generous vs. the 500 ms p95 target: this is a debug build on shared CI
-    // hardware, so the assertion guards against an O(nodes × shards) regression
-    // rather than pinning the production budget.
+    // Generous vs. the 500 ms p95 target, because this is a debug build on
+    // shared CI hardware. It guards against an O(nodes × shards) regression,
+    // not the production budget.
     assert!(
         elapsed.as_secs() < 5,
         "one call took {elapsed:?}; a per-parent walk regression is the usual cause"

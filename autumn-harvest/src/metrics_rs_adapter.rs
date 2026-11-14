@@ -889,12 +889,12 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_scanner_registered(&self, scanner: &str, shard: &str) {
-        // Same counter and the same label set, incremented by zero: this exists
-        // purely to bring the series into existence at registration, so a loop
-        // that wedges before its first tick still reads `rate(...) == 0`
-        // instead of exporting no series at all (issue #797). The labels must
-        // match `record_scanner_tick` exactly or it would initialize a
-        // different series than the one the ticks increment.
+        // Same counter and label set, incremented by zero. It creates the
+        // series at registration, so a loop that wedges before its first tick
+        // still reads `rate(...) == 0` (issue #797). Without it the loop
+        // exports no series at all. The labels must match `record_scanner_tick`
+        // exactly, or this initializes a different series than the one the
+        // ticks increment.
         counter!(
             METRIC_SCANNER_TICK,
             METRIC_LABEL_SCANNER => scanner.to_owned(),
@@ -1181,10 +1181,10 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_rate_limit_throttled(&self, activity: &str) {
-        // Labelled by the bounded activity name, never the raw bucket key:
-        // a dynamic per-key key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds
-        // unbounded tenant input and must never become a metric label
-        // (ADR-0001 §7).
+        // Labelled by the bounded activity name, never the raw bucket key. A
+        // dynamic per-key key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds
+        // unbounded tenant input. It must never become a metric label (ADR-0001
+        // §7).
         counter!(
             METRIC_RATE_LIMIT_THROTTLED,
             METRIC_LABEL_ACTIVITY => activity.to_owned(),
@@ -1683,8 +1683,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_signal_received(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — signal names come from the
-        // free-form send route and have no declared registry to bound them.
+        // Issue #684: no `name` label. Signal names come from the free-form
+        // send route and have no declared registry to bound them.
         counter!(
             METRIC_SIGNAL_RECEIVED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
@@ -1694,7 +1694,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — see record_signal_received.
+        // Issue #684: no `name` label. See `record_signal_received`.
         counter!(
             METRIC_SIGNAL_UNHANDLED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
@@ -1704,10 +1704,11 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — admission is at the free-form
-        // update route boundary where the name is not yet resolved against a
-        // registered handler (declarative OR imperative), so it cannot be bounded
-        // by construction. Per-name visibility lives on completed/failed/rejected.
+        // Issue #684: no `name` label. Admission happens at the free-form
+        // update route boundary. There the name is not yet resolved against a
+        // registered handler (declarative OR imperative), so it cannot be
+        // bounded by construction. Per-name visibility lives on
+        // completed/failed/rejected.
         counter!(
             METRIC_UPDATE_ADMITTED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
@@ -1812,10 +1813,6 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1898,8 +1895,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // RED-phase tests: record_workflow_terminal bridge (issue #519)
-    // These tests fail until MetricsRsRecorder implements record_workflow_terminal.
+    // `record_workflow_terminal` bridge (issue #519)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1929,10 +1925,10 @@ mod tests {
     // Background control-loop liveness heartbeat bridge (issue #797)
     // -----------------------------------------------------------------------
 
-    // Real label-content assertion support: a local `metrics::Recorder` that
-    // captures every registered counter key, so a wrong metric name, a dropped
-    // label, or a mis-named label constant is caught here rather than surfacing
-    // as a silently-missing series in production.
+    // A local `metrics::Recorder` that captures every registered counter key.
+    // It catches a wrong metric name, a dropped label, or a mis-named label
+    // constant here. In production those would surface only as a
+    // silently-missing series.
     type CounterKey = (String, Vec<(String, String)>);
 
     #[derive(Default)]
@@ -2140,10 +2136,10 @@ mod tests {
     #[test]
     fn bridges_scanner_registered_by_initializing_the_same_tick_series() {
         // A loop that panics or hangs on its *first* iteration never reaches a
-        // tick, so without an explicit registration sample the process exports
-        // no series at all -- and the shipped alert
+        // tick. Without an explicit registration sample, the process then
+        // exports no series at all. The shipped alert
         // `rate(harvest_scanner_tick_total{...}[5m]) == 0` only evaluates
-        // series that exist, so the page would stay silent forever.
+        // series that exist. So the page would stay silent forever.
         //
         // Registration must therefore pre-create the *same* counter key the
         // tick uses: same metric name, same bounded `scanner` label. A separate
@@ -2246,13 +2242,11 @@ mod tests {
 
     #[test]
     fn bridges_quota_rejected_with_workflow_and_resource_labels() {
-        // Real label-content assertion (issue #946): a local
-        // `metrics::Recorder` captures the registered counter key, so a
-        // swapped or dropped label value in the bridge is caught here, not
-        // just a bare no-panic smoke test. Both a `db`-only resource
-        // (`dead_letters`) and a plain-core resource (`active_executions`)
-        // are exercised so the workflow/resource pairing is provably
-        // un-swapped either way.
+        // Issue #946: a local `metrics::Recorder` captures the registered
+        // counter key, so a swapped or dropped label value in the bridge is
+        // caught here. The test exercises a `db`-only resource (`dead_letters`)
+        // and a plain-core resource (`active_executions`). That proves the
+        // workflow/resource pairing is un-swapped either way.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -2350,11 +2344,10 @@ mod tests {
 
     #[test]
     fn bridges_saga_counters_with_workflow_and_queue_labels() {
-        // Real label-content assertion (issue #801 post-review): a local
-        // `metrics::Recorder` captures the registered counter keys, so a
-        // swapped or dropped label value in the bridge is caught here —
-        // unlike the file's older no-panic smoke idiom, which predates
-        // `metrics::with_local_recorder` (0.24).
+        // Issue #801: a local `metrics::Recorder` captures the registered
+        // counter keys, so a swapped or dropped label value in the bridge is
+        // caught here. The file's older no-panic smoke tests cannot catch that.
+        // Their idiom predates `metrics::with_local_recorder` (0.24).
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -2442,11 +2435,11 @@ mod tests {
 
     #[test]
     fn bridges_workflow_history_bloat_with_workflow_label_only() {
-        // Real label-content assertion: a local `metrics::Recorder` captures
-        // the registered counter key, so a swapped label, a dropped label, or
-        // an accidentally-added `queue` label (unlike its sibling
-        // `sla_breached`/`nd_blocked` counters, this one is deliberately
-        // `workflow`-only, per the constant's doc comment) is caught here.
+        // A local `metrics::Recorder` captures the registered counter key, so a
+        // swapped or dropped label is caught here. So is an accidentally-added
+        // `queue` label. Unlike its sibling `sla_breached`/`nd_blocked`
+        // counters, this one is deliberately `workflow`-only, per the
+        // constant's doc comment.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -2529,11 +2522,11 @@ mod tests {
 
     #[test]
     fn bridges_concurrency_superseded_with_workflow_label_only() {
-        // Real label-content assertion: a local `metrics::Recorder` captures
-        // the registered counter key, so a swapped label, a dropped label, or
-        // an accidentally-added `key` label (the concurrency key is resolved
-        // from workflow input and is unbounded — ADR-0001 §7 forbids it) is
-        // caught here rather than as a cardinality incident in production.
+        // A local `metrics::Recorder` captures the registered counter key, so a
+        // swapped or dropped label is caught here. So is an accidentally-added
+        // `key` label, which would otherwise surface as a cardinality incident
+        // in production. The concurrency key is resolved from workflow input and
+        // is unbounded, and ADR-0001 §7 forbids it.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -2616,14 +2609,15 @@ mod tests {
 
     #[test]
     fn bridges_concurrency_residual_over_limit_with_workflow_and_gap_labels() {
-        // Codex review (PR #1367, P1): the documented full-surface
-        // `MetricsRsRecorder` did not override `record_concurrency_residual_over_limit`
-        // at all, so it silently resolved to the trait's no-op default —
-        // the new counter would never be exported for any deployment using
-        // this adapter. Mirrors `bridges_concurrency_superseded_with_workflow_label_only`
-        // exactly: a real `metrics::Recorder` captures the registered counter
-        // key so a dropped/swapped label (or an accidentally-added
-        // concurrency-key label — forbidden by ADR-0001 §7) is caught here.
+        // Pins the gap fixed in PR #1367. The documented full-surface
+        // `MetricsRsRecorder` once did not override
+        // `record_concurrency_residual_over_limit`. It silently resolved to the
+        // trait's no-op default, so no deployment using this adapter exported
+        // the new counter. This test mirrors
+        // `bridges_concurrency_superseded_with_workflow_label_only`. A real
+        // `metrics::Recorder` captures the registered counter key. So a dropped
+        // or swapped label is caught here, and so is an accidentally-added
+        // concurrency-key label (ADR-0001 §7 forbids it).
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -2704,7 +2698,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Supersede-credit-not-shed bridge (issue #1228 review, P2)
+    // Supersede-credit-not-shed bridge (issue #1228)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2801,10 +2795,10 @@ mod tests {
 
     #[test]
     fn bridges_workflow_active_gauge_with_workflow_and_state_labels_and_value() {
-        // Real gauge-VALUE assertion: a local `metrics::Recorder` returns a
-        // custom `Gauge` whose `set(f64)` calls are captured alongside the
-        // registered key name + labels, so a swapped label or dropped value in
-        // the bridge is caught here (the #754/#801 hardened bar).
+        // A local `metrics::Recorder` returns a custom `Gauge` that captures
+        // each `set(f64)` call with the registered key name and labels. So a
+        // swapped label or a dropped value in the bridge is caught here (the
+        // #754/#801 hardened bar).
         type GaugeSample = (String, Vec<(String, String)>, f64);
 
         struct RecordingGauge {
@@ -3089,8 +3083,8 @@ mod tests {
     #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
     fn bridges_signal_update_lifecycle_counters_with_bounded_labels() {
         // Issue #684: a local `metrics::Recorder` captures the registered
-        // counter keys, so a swapped or dropped label value in any of the six
-        // signal/update lifecycle bridges is caught here (not just no-panic).
+        // counter keys. A swapped or dropped label value in any of the six
+        // signal/update lifecycle bridges is caught here.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -3160,8 +3154,8 @@ mod tests {
             rec.record_update_failed("wf", "set_priority", "q");
         });
 
-        // Signals carry no `name` label (issue #684, Codex P2): free-form send
-        // route, no declared registry to bound it.
+        // Signals carry no `name` label (issue #684): free-form send route, no
+        // declared registry to bound it.
         let wf_q = |q: &str| {
             vec![
                 (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
@@ -3208,9 +3202,9 @@ mod tests {
     #[test]
     fn bridges_update_duration_histogram_with_bounded_labels() {
         // Issue #781: a local `metrics::Recorder` captures the registered
-        // histogram key, so a swapped or dropped label value in the
-        // admit→terminal latency bridge is caught here (not just no-panic). The
-        // histogram must register `harvest.update.duration` with exactly the
+        // histogram key. A swapped or dropped label value in the admit→terminal
+        // latency bridge is caught here. The histogram must register
+        // `harvest.update.duration` with exactly the
         // workflow/name/queue/outcome constants, values un-swapped.
         type HistKey = (String, Vec<(String, String)>);
 
@@ -3307,10 +3301,10 @@ mod tests {
     #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
     fn bridges_capability_miss_counter_with_bounded_labels() {
         // Issue #804 (AC5): a local `metrics::Recorder` captures the registered
-        // counter key, so a swapped or dropped label value in the capability-miss
-        // bridge is caught here (not just no-panic). Both bounded `outcome`
-        // values are exercised so an operator alert keyed on
-        // `outcome="escalated"` is provably expressible.
+        // counter key. A swapped or dropped label value in the capability-miss
+        // bridge is caught here. Both bounded `outcome` values run, so an
+        // operator alert keyed on `outcome="escalated"` is provably
+        // expressible.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -3415,9 +3409,9 @@ mod tests {
     #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
     fn bridges_shard_dispatched_counter_with_bounded_shard_label() {
         // AC5 (issue #961): a local `metrics::Recorder` captures the registered
-        // counter key, so a swapped/dropped `shard` label in the bridge is
-        // caught here rather than only surfacing as a silently-missing series
-        // on the per-shard fairness dashboard.
+        // counter key. A swapped or dropped `shard` label in the bridge is
+        // caught here. Otherwise it would surface only as a silently-missing
+        // series on the per-shard fairness dashboard.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]
@@ -3505,11 +3499,10 @@ mod tests {
     #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
     fn bridges_activity_pause_actions_counter_with_bounded_labels() {
         // Issue #807: a local `metrics::Recorder` captures the registered
-        // counter key, so a swapped or dropped label value in the pause-action
-        // bridge is caught here (not just no-panic). Both bounded `action`
-        // values are exercised, because an operator dashboard that cannot
-        // separate a hold from a release is useless during exactly the outage
-        // this lever exists for.
+        // counter key. A swapped or dropped label value in the pause-action
+        // bridge is caught here. Both bounded `action` values run. A dashboard
+        // that cannot separate a hold from a release is useless during exactly
+        // the outage this lever exists for.
         type CounterKey = (String, Vec<(String, String)>);
 
         #[derive(Default)]

@@ -1,7 +1,7 @@
 //! Integration tests for the `harvest schema` subcommand (issue #794).
 //!
-//! Black-box tests over the crate's public schema-gate surface: they write
-//! contract files to a tempdir and drive the pure format/gate helpers and
+//! Black-box tests over the public schema-gate surface. They write contract
+//! files to a tempdir. They drive the format and gate helpers, and
 //! `run_schema_check` / `run_schema_update` end to end. No database, no network.
 
 use autumn_harvest_cli::{
@@ -318,10 +318,10 @@ fn current_may_be_a_raw_registered_workflows_response() {
 /// End-to-end through the **real binary**: parse the flag, run the gate, print
 /// the diff, exit non-zero.
 ///
-/// The in-process helpers cannot see `println!`, so a `--format json` that
-/// silently rendered text — or a flag that never reached the renderer — would
-/// pass every in-process test. Spawning the binary is the only way to assert
-/// what CI actually consumes.
+/// The in-process helpers cannot see `println!`. A `--format json` that
+/// silently rendered text would pass every in-process test. So would a flag
+/// that never reached the renderer. Only the spawned binary shows what CI
+/// consumes.
 #[test]
 fn the_real_binary_emits_json_and_exits_one_on_a_breaking_change() {
     let (_d, b, c) = tree(BASELINE, CURRENT_BREAKING);
@@ -428,9 +428,9 @@ fn the_json_diff_carries_the_documented_fields() {
 /// A truncated report cannot certify that nothing is breaking, so the gate must
 /// fail closed rather than exit 0 on a partial answer.
 ///
-/// The fixture produces **only compatible** deltas past the cap: with breaking
-/// ones the ordinary `has_breaking()` check would fail it anyway, and the
-/// truncation guard would never be the reason.
+/// The fixture produces **only compatible** deltas past the cap. With breaking
+/// ones, the ordinary `has_breaking()` check would fail it anyway. The
+/// truncation guard would then never be the reason.
 #[test]
 fn a_truncated_but_entirely_compatible_diff_still_fails_closed() {
     let n = autumn_harvest::MAX_DELTAS + 10;
@@ -479,14 +479,14 @@ fn a_truncated_but_entirely_compatible_diff_still_fails_closed() {
 /// `update` replaces the baseline via a sibling temp file + `rename`, so a
 /// reader never observes a half-written contract.
 ///
-/// What this asserts is the observable half: after a successful update the
-/// baseline parses **and** no `.tmp-*` sibling is left behind — which fails if
-/// the rename is dropped or the temp file leaks.
+/// This asserts the observable half. After a successful update, the baseline
+/// parses **and** no `.tmp-*` sibling remains. It fails if the rename is
+/// dropped or the temp file leaks.
 ///
-/// Crash-atomicity itself (dying mid-write) is deliberately not asserted: it
-/// needs the process to be killed between the write and the rename, which an
-/// in-process test cannot arrange. A test shaped like one would pass whatever
-/// the implementation did, so it is not written.
+/// Crash-atomicity itself (dying mid-write) is deliberately not asserted. It
+/// needs a kill between the write and the rename, which an in-process test
+/// cannot arrange. A test shaped like one would pass whatever the
+/// implementation did, so it is not written.
 #[test]
 fn update_leaves_a_parseable_baseline_and_no_temp_files() {
     let (dir, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
@@ -522,7 +522,7 @@ fn a_refused_update_does_not_modify_the_baseline() {
     );
 }
 
-// ── review round: an empty `--current` is a broken producer, not a deletion ──
+// ── An empty `--current` is a broken producer, not a deletion ──────────────
 
 const EMPTY_CONTRACT: &str = r#"{
   "version": "0.0.0-test",
@@ -532,10 +532,10 @@ const EMPTY_CONTRACT: &str = r#"{
 
 /// A dump that published nothing must be diagnosed, not diffed.
 ///
-/// Diffed literally it is "every workflow removed" — technically true, but it
-/// buries the real cause (a producer that registered no workflows) under N
-/// breaking deltas and invites `--acknowledge`, which would overwrite the
-/// baseline with nothing and disarm the gate permanently.
+/// Diffed literally it is "every workflow removed", which is technically true.
+/// But it buries the real cause (a producer that registered no workflows)
+/// under N breaking deltas. It also invites `--acknowledge`, which would
+/// overwrite the baseline with nothing and disarm the gate permanently.
 #[test]
 fn an_empty_current_is_diagnosed_rather_than_read_as_a_mass_deletion() {
     let (_d, b, c) = tree(BASELINE, EMPTY_CONTRACT);
@@ -597,7 +597,7 @@ fn growing_from_an_empty_baseline_is_compatible() {
 // ── The baseline must be CURRENT, not merely non-breaking ───────────────────
 
 /// A compatible delta left unabsorbed makes the artifact a record of what was
-/// deployed *some time ago*, and the gate reads it as the record of what was
+/// deployed *some time ago*. The gate reads it as the record of what was
 /// deployed *last*. That gap is round-trippable:
 ///
 /// 1. add an enum variant — compatible, so the gate passes and nobody
@@ -629,8 +629,10 @@ fn an_unabsorbed_compatible_delta_fails_the_currency_check() {
     );
 }
 
-/// The A→B→A round trip the currency check exists to prevent, end to end: with
-/// the baseline advanced at step 1, removing the variant is caught as breaking.
+/// The A→B→A round trip that the currency check prevents, end to end.
+///
+/// With the baseline advanced at step 1, the check catches the removal of the
+/// variant as breaking.
 #[test]
 fn advancing_the_baseline_makes_the_later_removal_visible() {
     let dir = tempfile::tempdir().unwrap();
@@ -667,9 +669,9 @@ fn a_current_baseline_passes_the_currency_check() {
 
 /// `BASELINE` with one regenerated-metadata field edited, serialised back.
 ///
-/// Built through the real parse/serialise round trip rather than by string
-/// surgery, so the fixture is always a VALID artifact — a malformed one would
-/// fail at parse and prove nothing about the currency check.
+/// The real parse/serialise round trip builds it, not string surgery. So the
+/// fixture is always a VALID artifact. A malformed one would fail at parse and
+/// prove nothing about the currency check.
 fn doctor(edit: impl FnOnce(&mut autumn_harvest::WorkflowSchemaContract)) -> String {
     let mut c = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).expect("fixture parses");
     let before = c.clone();
@@ -728,9 +730,10 @@ fn a_hand_edited_description_fails_the_currency_check() {
     );
 }
 
-/// The over-firing guard for the metadata check: the crate version records WHICH
-/// BUILD generated the artifact, not what the gate checks, so it must not tie
-/// currency to every release bump.
+/// The over-firing guard for the metadata check.
+///
+/// The crate version records WHICH BUILD generated the artifact, not what the
+/// gate checks. So it must not tie currency to every release bump.
 #[test]
 fn a_differing_crate_version_does_not_fail_the_currency_check() {
     let bumped = doctor(|c| c.version = "9.9.9-test".to_string());
@@ -830,11 +833,10 @@ fn an_acknowledged_baseline_passes_the_escape_hatch_check() {
 
 /// A rubber stamp must not buy coverage — and must say so.
 ///
-/// `schema update --acknowledge ""` is refused at the authoring path, and the
-/// ordinary check reports a blank reason in the artifact it diffs. Neither
-/// covers THIS mode run on its own: the head artifact is loaded separately from
-/// the two contracts being diffed, so nothing had inspected its reasons before
-/// counting them as coverage.
+/// The authoring path refuses `schema update --acknowledge ""`. The ordinary
+/// check reports a blank reason in the artifact it diffs. Neither covers THIS
+/// mode run on its own. The head artifact loads apart from the two diffed
+/// contracts. So nothing inspected its reasons before they counted as coverage.
 #[test]
 fn a_blank_reason_record_fails_the_escape_hatch_check() {
     let dir = tempfile::tempdir().unwrap();
@@ -899,8 +901,8 @@ fn a_compatible_change_passes_the_escape_hatch_check() {
 
 /// Retargeting an existing record rather than appending is caught.
 ///
-/// The coverage check alone cannot see it: the retargeted record names this
-/// PR's break and is absent from the base multiset, so it looks like fresh
+/// The coverage check alone cannot see it. The retargeted record names this
+/// PR's break and is absent from the base multiset. So it looks like fresh
 /// coverage. Its one signature is that the record the base carried is gone.
 #[test]
 fn a_retargeted_acknowledgement_record_fails_the_escape_hatch_check() {
@@ -1027,15 +1029,15 @@ fn the_escape_hatch_check_is_opt_in() {
 /// gives every process by default.
 ///
 /// A debug build of a CLI this size overflows that inside clap's own
-/// argument-tree construction — before any subcommand is dispatched, so even
-/// `--help` aborts with `STATUS_STACK_OVERFLOW`. Linux's 8 MiB default hides it,
-/// which is why it stayed latent until this suite became the first thing in the
-/// repo to spawn `harvest` as a process.
+/// argument-tree construction. That happens before any subcommand dispatch, so
+/// even `--help` aborts with `STATUS_STACK_OVERFLOW`. Linux's 8 MiB default
+/// hides it. It stayed latent until this suite first spawned `harvest` as a
+/// process.
 ///
-/// `ulimit -s` bounds the **main** thread only; a thread's stack is sized at
-/// spawn, so this passes exactly when `main` does its work on one it sized
-/// itself. Unix-only because that is where `ulimit` exists — Windows CI covers
-/// the same guarantee natively by running the three tests above.
+/// `ulimit -s` bounds the **main** thread only. A thread's stack is sized at
+/// spawn. So this passes exactly when `main` does its work on a thread it sized
+/// itself. It is Unix-only because `ulimit` exists there. Windows CI covers the
+/// same guarantee natively by running the three tests above.
 #[cfg(unix)]
 #[test]
 fn the_real_binary_survives_a_one_mebibyte_main_thread_stack() {

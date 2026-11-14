@@ -2,15 +2,14 @@
 //!
 //! These tests are the **correctness oracle** for the hand-reconstructed SQL in
 //! `mutex.rs` and the worker park/grant/release + lease-renewal/reclaim wiring.
-//! They drive the real [`Worker`] poll loop against a live Postgres and use a
-//! **mutual-exclusion witness**: a `critical_section` activity that is dispatched
-//! *only while a workflow holds the guard*, tracking per-key in-flight count and
-//! max-seen. If the mutex is correct, the max concurrent critical sections per
-//! key is exactly **1**.
+//! They drive the real [`Worker`] poll loop against a live Postgres. They use a
+//! **mutual-exclusion witness**: a `critical_section` activity that runs *only
+//! while a workflow holds the guard*. It tracks the per-key in-flight count and
+//! the maximum seen. If the mutex is correct, that maximum is exactly **1**.
 //!
-//! DB source of truth: `test_init_sql()` (the paved-path bundle) applied
-//! to a fresh per-test database (when `HARVEST_TEST_DATABASE_URL` points at an
-//! admin server) or a throwaway testcontainer (CI default). Run with
+//! DB source of truth: `test_init_sql()` (the paved-path bundle). It goes to a
+//! fresh per-test database when `HARVEST_TEST_DATABASE_URL` points at an admin
+//! server, else to a throwaway testcontainer (CI default). Run with
 //! `--test-threads=1` — several tests set the process-global mutex lease TTL.
 #![cfg(feature = "db")]
 #![allow(
@@ -65,10 +64,11 @@ struct Witness {
     order: std::sync::Mutex<Vec<String>>,
     /// total critical sections entered (any key)
     entered: AtomicI64,
-    /// #1126 barrier: the losing race branch has begun executing (its
-    /// `ActivityStarted` is already durably recorded before the handler body
-    /// runs), so the fast winner may complete while the loser is still
-    /// in-flight — reproducing the "loser in-flight at resolution" condition.
+    /// #1126 barrier: the losing race branch has begun executing.
+    ///
+    /// Its `ActivityStarted` is durable before the handler body runs. So the
+    /// fast winner can complete while the loser is in-flight. That reproduces
+    /// the "loser in-flight at resolution" condition.
     race_loser_started: AtomicBool,
 }
 
@@ -110,11 +110,12 @@ fn shared_state(witness: Arc<Witness>) -> SharedState {
     Arc::new(map)
 }
 
-/// Records the `harvest.workflow.nondeterministic_block` counter (issue #603 /
-/// #1126). The counter fires monotonically on every nd-block *entry* and is NOT
-/// un-fired when the run later recovers and `nd_blocked_at` is cleared — so it
-/// is the reliable, timing-independent signal that a TRANSIENT nd-block ever
-/// occurred, which a post-hoc `nd_blocked_at IS NULL` check cannot see.
+/// Records the `harvest.workflow.nondeterministic_block` counter (issues #603
+/// and #1126).
+///
+/// The counter fires on every nd-block *entry*. It does NOT go back when the
+/// run recovers and `nd_blocked_at` is cleared. So it reliably shows that a
+/// TRANSIENT nd-block occurred. A later `nd_blocked_at IS NULL` check cannot.
 #[derive(Default)]
 struct RecordingMetrics {
     nd_blocks: std::sync::Mutex<Vec<(String, String)>>,
@@ -394,10 +395,12 @@ fn act(
 
 // ─────────────────────── #1126 race regression pieces ─────────────────────
 
-/// The FAST (winning) race branch. Spins until the slow loser branch has begun
-/// executing, then returns immediately — so the winner completes while the
-/// loser is genuinely in-flight (its `ActivityStarted` recorded, no terminal),
-/// reproducing issue #1126. Bounded so a bug can never hang the test.
+/// The FAST (winning) race branch.
+///
+/// It spins until the slow loser has begun, then returns. So the winner
+/// completes while the loser is in-flight (its `ActivityStarted` recorded, no
+/// terminal), as in issue #1126. The spin is bounded, so a bug cannot hang the
+/// test.
 fn race_fast_activity<'a>(
     ctx: &'a ActivityContext,
     _input: Value,
@@ -418,10 +421,11 @@ fn race_fast_activity<'a>(
     })
 }
 
-/// The SLOW (losing) race branch. Signals that it has started (its
-/// `ActivityStarted` is already durable by the time the handler body runs),
-/// then sleeps long enough to remain in-flight at race resolution — it is
-/// cancelled by the winner's `CancelRaceLosers` before it would finish.
+/// The SLOW (losing) race branch.
+///
+/// It signals its start (its `ActivityStarted` is already durable), then
+/// sleeps through race resolution. The `CancelRaceLosers` of the winner
+/// cancels it before it would finish.
 fn race_slow_activity<'a>(
     ctx: &'a ActivityContext,
     _input: Value,
@@ -432,11 +436,9 @@ fn race_slow_activity<'a>(
             .expect("witness state must be registered")
             .clone();
         witness.mark_race_loser_started();
-        // Long enough that the loser is durably still-in-flight (its
-        // `ActivityStarted` recorded, no terminal) for the entire window in
-        // which the winner completes and the follow-on decision cycle runs, so
-        // the #1126 in-flight-loser condition is reliably reproduced rather than
-        // racing the loser's own completion.
+        // The loser stays in-flight (no terminal) while the winner completes
+        // and the follow-on decision cycle runs. So the #1126 in-flight-loser
+        // condition reproduces reliably and does not race the loser.
         tokio::time::sleep(Duration::from_secs(15)).await;
         Ok(json!({"provider": "slow"}))
     })
@@ -584,10 +586,9 @@ fn with_db_name(url: &str, db: &str) -> String {
 
 /// Create an isolated, migrated database and return its URL.
 ///
-/// When `HARVEST_TEST_DATABASE_URL` is set it is treated as an *admin* URL: a
-/// fresh per-test database is created on that server (full isolation, no leaked
-/// rows between tests). Otherwise a throwaway testcontainer is started. Either
-/// way the returned URL points at a freshly migrated database.
+/// When `HARVEST_TEST_DATABASE_URL` is set, it is an *admin* URL. A fresh
+/// per-test database is created on that server, so no rows leak between
+/// tests. Otherwise a throwaway testcontainer is started.
 async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let mut admin = AsyncPgConnection::establish(&admin_url)
@@ -886,9 +887,11 @@ where
     out
 }
 
-/// Run a worker wired with a `RecordingMetrics` recorder for the duration of
-/// `body`; returns `(body_output, metrics)` so a test can assert on engine
-/// metrics (issue #1126: the nd-block counter).
+/// Run a worker with a `RecordingMetrics` recorder for the duration of
+/// `body`.
+///
+/// The returned metrics let a test assert on the nd-block counter (issue
+/// #1126).
 async fn with_worker_metrics<F, Fut, T>(
     url: &str,
     witness: Arc<Witness>,
@@ -1592,9 +1595,8 @@ async fn early_release_before_terminal_grants_contender() {
         // wake the contender.
         send_signal(&url, holder, "go").await;
 
-        // The contender must proceed to COMPLETED while the holder is still
-        // RUNNING (not terminal) — proving the release happened at the early
-        // point, not via a terminal sweep.
+        // The contender completes while the holder is still RUNNING. That
+        // proves the early release, not a terminal sweep.
         wait_for_state(&url, contender, "COMPLETED", Duration::from_secs(30)).await;
         assert_ne!(
             exec_state(&url, holder).await,
@@ -1734,17 +1736,18 @@ async fn reset_after_release_succeeds() {
 
 // ─────────────────────────── #1126 regression tests ───────────────────────
 
-/// Issue #1126: a plain durable activity issued in the SAME decision cycle
-/// immediately after `ctx.race()` resolves — with a losing branch still
-/// in-flight — must NOT nd-block.
+/// Issue #1126: a plain durable activity issued right after `ctx.race()`
+/// resolves, in the SAME decision cycle, must NOT nd-block.
+///
+/// A losing branch is still in-flight at that point.
 ///
 /// The deterministic oracle is the `harvest.workflow.nondeterministic_block`
 /// counter (issue #603), captured by a `RecordingMetrics` recorder. Pre-fix,
-/// the follow-on `match_activity` diverges on the loser's leftover
-/// `ActivityStarted`, so the run enters an nd-block (counter fires ≥ 1) that
-/// only clears once the loser eventually finishes — a `nd_blocked_at IS NULL`
-/// check at COMPLETED time cannot see that transient block, but the monotonic
-/// counter can. Post-fix the follow-on lands cleanly and the counter stays 0.
+/// the follow-on `match_activity` diverges on the leftover `ActivityStarted`
+/// of the loser. The run enters an nd-block (counter ≥ 1). It clears only
+/// when the loser finishes. A `nd_blocked_at IS NULL` check at COMPLETED time
+/// cannot see that transient block, but the monotonic counter can. Post-fix,
+/// the follow-on lands cleanly and the counter stays 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn race_followon_activity_does_not_nd_block() {
     let (url, _c) = setup().await;

@@ -8,10 +8,10 @@
 //! is an acceptable RED — the GREEN implementation lands these symbols.
 //!
 //! A DAG node may declare a **compensator** activity. On terminal DAG failure
-//! (`Err("one or more DAG tasks failed")`) the engine unwinds: for every node
-//! that **succeeded** and declares a compensator, the compensator is dispatched
+//! (`Err("one or more DAG tasks failed")`) the engine unwinds. It dispatches the
+//! compensator of every node that **succeeded** and declares one. Dispatch runs
 //! in **reverse topological / LIFO order** through the existing `Saga`
-//! machinery, using the ordinary activity lowering
+//! machinery. It uses the ordinary activity lowering
 //! (`execute_activity_raw_with_opts`) on the node's own queue.
 //!
 //! Contract pinned by these tests:
@@ -211,9 +211,9 @@ fn diamond_comp_dag(dag: &mut DagBuilder) {
 }
 
 /// T8 — on terminal failure, compensators for the succeeded nodes run in
-/// **reverse topological order**: push order is levels-forward / ascending
-/// index (`a`, `b`, `c`), so the LIFO unwind dispatches `comp_c`, `comp_b`,
-/// `comp_a` — exactly, and in that order.
+/// **reverse topological order**. Push order is levels-forward / ascending
+/// index (`a`, `b`, `c`). So the LIFO unwind dispatches exactly `comp_c`,
+/// `comp_b`, `comp_a`, in that order.
 #[tokio::test]
 async fn terminal_failure_compensates_succeeded_nodes_in_reverse_topological_order() {
     let outcome = WorkflowTestEnv::new()
@@ -336,9 +336,9 @@ fn bound_comp_dag(dag: &mut DagBuilder) {
     let _fail = dag.activity(bind_fail).upstream(&mid);
 }
 
-/// T10 — for a node with an `input_from` binding (issue #702) the envelope's
-/// `input` is the node's RESOLVED forward input, i.e. the raw upstream output —
-/// never the `conf`/`dag_task` wrapper.
+/// T10 — for a node with an `input_from` binding (issue #702), the envelope's
+/// `input` is the node's RESOLVED forward input. That is the raw upstream
+/// output, never the `conf`/`dag_task` wrapper.
 #[tokio::test]
 async fn compensator_of_a_bound_node_receives_the_bound_input() {
     let outcome = WorkflowTestEnv::new()
@@ -662,9 +662,9 @@ async fn a_non_array_mapped_input_still_unwinds_the_succeeded_upstream() {
     );
 }
 
-/// T13 — mapped-node compensation is **node**-granular: a `CollectAll` mapped
+/// T13 — mapped-node compensation is **node**-granular. A `CollectAll` mapped
 /// node that reaches `Succeeded` (despite failed cells) is compensated exactly
-/// ONCE with the whole cells array as its recorded output; a `FailFast` mapped
+/// ONCE, with the whole cells array as its recorded output. A `FailFast` mapped
 /// node that a failed cell drove to `Failed` is NOT compensated at all.
 #[tokio::test]
 async fn mapped_node_compensation_is_node_granular_not_cell_granular() {
@@ -774,19 +774,19 @@ async fn mapped_node_compensation_is_node_granular_not_cell_granular() {
 }
 
 // ===========================================================================
-// T13b — post-review P1-B: a FailFast mapped node whose failing cell is NOT
-//        the last one polled must still unwind cleanly
+// T13b — a FailFast mapped node whose failing cell is NOT the last one
+//        polled must still unwind cleanly
 // ===========================================================================
 
 /// Drive `history` to completion on a fresh replay context and report the
 /// terminal result together with the engine's non-determinism slot.
 ///
 /// Issue #603 gates the permanent nd-block on `WorkflowContext::take_nd_details`
-/// (the executor reads it on the `Ok(Err(..))` arm), NOT on
-/// `take_deferred_nd_error` — which only the infallible issue #384 primitives
-/// ever write. A test that asserts the deferred slot would pass even while the
-/// run wedges forever, so every "must never nd-block" assertion in this suite
-/// reads `nd_details`.
+/// (the executor reads it on the `Ok(Err(..))` arm). It does NOT gate on
+/// `take_deferred_nd_error`, which only the infallible issue #384 primitives
+/// write. A test of the deferred slot would pass even while the run wedges
+/// forever. So every "must never nd-block" assertion in this suite reads
+/// `nd_details`.
 async fn drive_replay_for_nd_details(
     handler: autumn_harvest::WorkflowHandlerFn,
     history: Vec<WorkflowEvent>,
@@ -807,11 +807,11 @@ async fn drive_replay_for_nd_details(
 
 /// Drive `handler` against a hand-built history **tolerating a suspension**.
 ///
-/// A `for_replay` context has no driver, so any dispatch that is not already in
-/// the recorded history parks forever on its oneshot. That is the expected
-/// shape for a test that inspects a *partial* unwind: the `ScheduleActivity`
-/// command is pushed BEFORE the await, so `ctx.drain_commands()` still observes
-/// it. Returns `None` when the handler suspended.
+/// A `for_replay` context has no driver. So any dispatch that is not already in
+/// the recorded history parks forever on its oneshot. A test that inspects a
+/// *partial* unwind expects that. The `ScheduleActivity` command is pushed
+/// BEFORE the await, so `ctx.drain_commands()` still observes it. Returns
+/// `None` when the handler suspended.
 async fn drive_replay_tolerating_suspension(
     ctx: &WorkflowContext,
     handler: autumn_harvest::WorkflowHandlerFn,
@@ -824,14 +824,14 @@ async fn drive_replay_tolerating_suspension(
     .ok()
 }
 
-/// T13b — **post-review P1-B (blocker).** A `FailFast` mapped node aborts its
-/// instance stream on the FIRST failing cell. When that cell is not the last one
-/// the stream yields, the remaining instances are never polled, so their
-/// recorded `ActivityScheduled` events stay unconsumed and the replay cursor is
-/// left parked on one of them. Issue #780's unwind is the first thing to consume
-/// history after the level loop, so it dispatched the first compensator straight
-/// into that stale cursor: `match_activity` diverged, the divergence poisoned
-/// `nd_details`, and the run both (a) skipped compensation entirely and (b)
+/// T13b — **blocker.** A `FailFast` mapped node aborts its instance stream on
+/// the FIRST failing cell. When that cell is not the last one the stream
+/// yields, the remaining instances are never polled. Their recorded
+/// `ActivityScheduled` events stay unconsumed, and the replay cursor stays
+/// parked on one of them. The issue #780 unwind is the first thing to consume
+/// history after the level loop. So it dispatched the first compensator straight
+/// into that stale cursor. `match_activity` diverged, and the divergence
+/// poisoned `nd_details`. The run then (a) skipped compensation entirely and (b)
 /// wedged in a permanent, non-self-healing nd-block (issue #603).
 ///
 /// The failure position is the whole point: T13's `[1, -1]` fixture fails at the
@@ -893,11 +893,11 @@ async fn failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks(
 
     // (d) …and the produced history replays deterministically.
     //
-    // This history ends in a terminal `WorkflowFailed`, so since issue #952 the
-    // verdict is `ReplaySucceeded` carrying the reproduced error rather than
+    // This history ends in a terminal `WorkflowFailed`. Since issue #952 the
+    // verdict is `ReplaySucceeded` carrying the reproduced error, not
     // `ReplayStatus::WorkflowFailed`. Assert on `failure_message()`, which
-    // reads the reproduced error under either verdict, and pin the ND case
-    // separately — that is the property this test actually guards (#603 would
+    // reads the reproduced error under either verdict. Pin the ND case
+    // separately. That is the property this test guards (#603 would
     // nd-block the run permanently).
     let report = outcome.replay_check(handler).await;
     assert!(
@@ -913,7 +913,7 @@ async fn failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks(
 
 /// T13c — the randomized sibling of T13b: sweep the failing cell across EVERY
 /// position of a `FailFast` mapped node. Only the last position was covered
-/// before (T13), which is exactly the one position that masked P1-B.
+/// before (T13), which is exactly the one position that masked the T13b bug.
 #[tokio::test]
 async fn failfast_mapped_node_compensates_for_every_failing_cell_position() {
     const CELLS: usize = 5;
@@ -1039,11 +1039,11 @@ fn cancel_forward_history() -> Vec<WorkflowEvent> {
 /// run whose node failed must dispatch ZERO compensators, record no
 /// `saga_compensated:` marker, and return the original DAG error unchanged.
 ///
-/// Driven over a hand-built history on a `for_replay` context rather than
-/// `WorkflowTestEnv::with_cancellation`: that helper injects `WorkflowCancelled`
+/// Driven over a hand-built history on a `for_replay` context, not
+/// `WorkflowTestEnv::with_cancellation`. That helper injects `WorkflowCancelled`
 /// as event #1, which diverges the DAG's very FIRST activity dispatch
-/// (`expected ActivityScheduled(c_ok), got WorkflowCancelled`) so the run never
-/// reaches the terminal-failure check under test. Mirrors the mechanics of
+/// (`expected ActivityScheduled(c_ok), got WorkflowCancelled`). The run then
+/// never reaches the terminal-failure check under test. Mirrors the mechanics of
 /// `saga_tests.rs::known_limitation_durable_compensation_after_recorded_cancel_fails_and_is_counted`.
 #[tokio::test]
 async fn cancellation_does_not_auto_compensate() {
@@ -1107,10 +1107,10 @@ async fn cancellation_does_not_auto_compensate() {
 /// T15 — a cancel landing MID-unwind terminates and never nd-blocks.
 ///
 /// History carries a partially-recorded unwind (`saga_compensated:1` marker plus
-/// one dispatched compensator) followed by `WorkflowCancelled`. Whatever the
-/// engine decides to do with the remaining compensations, the run must
-/// TERMINATE with an error and must not record a non-determinism divergence
-/// (which issue #603 would turn into a permanent nd-block).
+/// one dispatched compensator) followed by `WorkflowCancelled`. The engine may
+/// do anything with the remaining compensations. But the run must TERMINATE
+/// with an error and must not record a non-determinism divergence. Issue #603
+/// would turn that divergence into a permanent nd-block.
 #[tokio::test]
 async fn cancel_landing_mid_unwind_terminates_and_never_nd_blocks() {
     let undo = ActivityExecId::new();
@@ -1149,9 +1149,9 @@ async fn cancel_landing_mid_unwind_terminates_and_never_nd_blocks() {
         "a run whose DAG failed must terminate with an error, got {result:?}"
     );
     // Issue #603 gates the permanent nd-block on `nd_details` (read by the
-    // executor's `Ok(Err(..))` arm), NOT on the deferred slot — which only the
-    // infallible issue #384 primitives ever write. Asserting the deferred slot
-    // would pass even while the run wedged forever.
+    // executor's `Ok(Err(..))` arm), NOT on the deferred slot. Only the
+    // infallible issue #384 primitives write that slot. Asserting the deferred
+    // slot would pass even while the run wedged forever.
     assert_eq!(
         ctx.take_nd_details(),
         None,
@@ -1207,10 +1207,10 @@ fn failing_comp_dag(dag: &mut DagBuilder) {
     let _bad = dag.activity(f_bad).upstream(&b);
 }
 
-/// T16 — when a compensator itself fails the unwind still attempts EVERY
-/// remaining compensation (continue-not-abort), then surfaces
-/// `SagaCompensationFailed` carrying both the original DAG error and the
-/// compensation error, records the `saga_compensation_failed:1` dedup marker,
+/// T16 — when a compensator itself fails, the unwind still attempts EVERY
+/// remaining compensation (continue-not-abort). It then surfaces
+/// `SagaCompensationFailed` with both the original DAG error and the
+/// compensation error. It records the `saga_compensation_failed:1` dedup marker
 /// and fires the page-severity `harvest.saga.compensation_failed` counter.
 #[tokio::test]
 async fn compensator_failure_surfaces_saga_compensation_failed() {
@@ -1266,7 +1266,7 @@ async fn compensator_failure_surfaces_saga_compensation_failed() {
         1,
         "the dangling-state page must fire exactly once"
     );
-    // Post-review P2-2: the counters must carry the run's own labels.
+    // The counters must carry the run's own labels.
     assert_eq!(
         recorder.labels(METRIC_SAGA_COMPENSATION_FAILED),
         vec![("failing_comp_dag".to_string(), "default".to_string())],
@@ -1280,10 +1280,10 @@ async fn compensator_failure_surfaces_saga_compensation_failed() {
     );
 }
 
-/// T16d (post-review P3-T4a) — when SEVERAL compensators fail, every one is
-/// still attempted, every error is collected into the single
-/// `SagaCompensationFailed`, and the page-severity counter still fires exactly
-/// ONCE (it is per-unwind, not per-failed-compensation).
+/// T16d — when SEVERAL compensators fail, every one is still attempted. Every
+/// error is collected into the single `SagaCompensationFailed`. The
+/// page-severity counter still fires exactly ONCE: it is per-unwind, not
+/// per-failed-compensation.
 #[tokio::test]
 async fn two_failing_compensators_collect_both_errors_and_page_once() {
     let recorder = Arc::new(CompRecordingMetrics::default());
@@ -1324,13 +1324,13 @@ async fn two_failing_compensators_collect_both_errors_and_page_once() {
 }
 
 // ===========================================================================
-// T16b — post-review P2-2: the SUCCESSFUL unwind fires exactly one
+// T16b — the SUCCESSFUL unwind fires exactly one
 //        `harvest.saga.compensated` with the run's (workflow, queue) labels
 // ===========================================================================
 
-/// T16b — the positive metric assertion the suite lacked: a terminal DAG
-/// failure with at least one compensator must fire `harvest.saga.compensated`
-/// EXACTLY once, labelled with the run's own workflow name and queue, and must
+/// T16b — the positive metric assertion. A terminal DAG failure with at least
+/// one compensator must fire `harvest.saga.compensated` EXACTLY once. The
+/// metric carries the run's own workflow name and queue as labels. The run must
 /// NOT fire the page-severity `compensation_failed` counter.
 #[tokio::test]
 async fn a_successful_unwind_fires_the_compensated_counter_once_with_labels() {
@@ -1368,7 +1368,7 @@ async fn a_successful_unwind_fires_the_compensated_counter_once_with_labels() {
 }
 
 // ===========================================================================
-// T16c — post-review P3-B2: a FAILING DAG with NO compensators is byte-clean
+// T16c — a FAILING DAG with NO compensators is byte-clean
 // ===========================================================================
 
 #[activity]
@@ -1388,13 +1388,13 @@ fn no_compensator_failing_dag(dag: &mut DagBuilder) {
 }
 
 /// T16c — the FAILURE path of a DAG that declares no compensators must be
-/// byte-identical to what it was before issue #780 existed: no saga marker, no
+/// byte-identical to the path before issue #780. It has no saga marker, no
 /// saga metric, no extra dispatch, and the unchanged original error.
 ///
-/// T19 pins the same property for the SUCCESS path; this is its failure-path
-/// complement, and it is the one that actually exercises `unwind_dag_compensations`
-/// (which is reached, finds an empty compensation stack, and must allocate no
-/// seq, record no marker, and emit no metric).
+/// T19 pins the same property for the SUCCESS path. This is its failure-path
+/// complement, and it actually exercises `unwind_dag_compensations`. That
+/// function finds an empty compensation stack. It must allocate no seq, record
+/// no marker, and emit no metric.
 #[tokio::test]
 async fn failing_dag_without_compensators_emits_no_saga_commands_or_metrics() {
     let recorder = Arc::new(CompRecordingMetrics::default());
@@ -1574,8 +1574,8 @@ async fn compensator_dispatches_on_the_nodes_queue() {
 }
 
 // ===========================================================================
-// T21 — post-review P2-D: unwind order follows EXECUTION LEVELS, not the
-//       builder's declaration index
+// T21 — unwind order follows EXECUTION LEVELS, not the builder's
+//       declaration index
 // ===========================================================================
 
 #[activity]
@@ -1601,8 +1601,8 @@ async fn ord_undo_child(_ctx: &ActivityContext, e: Value) -> Result<Value, Strin
     Ok(Value::Null)
 }
 
-/// The CHILD is declared FIRST (index 0) and its parent second (index 1) — the
-/// builder permits it, and it makes declaration index the exact REVERSE of
+/// The CHILD is declared FIRST (index 0) and its parent second (index 1). The
+/// builder permits it. It makes declaration index the exact REVERSE of
 /// topological order.
 #[dag]
 fn out_of_order_comp_dag(dag: &mut DagBuilder) {
@@ -1619,8 +1619,8 @@ fn out_of_order_comp_dag(dag: &mut DagBuilder) {
 ///
 /// Every other fixture in this suite declares nodes in topological order, so a
 /// flat `for i in 0..tasks.len()` push would satisfy them all. Here the child is
-/// declared first, so an index-order push would compensate the parent BEFORE the
-/// child — undoing a step whose dependant is still undone.
+/// declared first. An index-order push would compensate the parent BEFORE the
+/// child, undoing a step whose dependant is still undone.
 #[tokio::test]
 async fn unwind_order_is_reverse_topological_not_reverse_declaration_index() {
     let handler = __autumn_workflow_info_out_of_order_comp_dag().handler;
@@ -1651,7 +1651,7 @@ async fn unwind_order_is_reverse_topological_not_reverse_declaration_index() {
 }
 
 // ===========================================================================
-// T22 — post-review P2-E: node-level retry (AC2 "not recovered by retry")
+// T22 — node-level retry (AC2 "not recovered by retry")
 // ===========================================================================
 
 #[activity]
@@ -1722,9 +1722,9 @@ async fn a_node_recovered_by_retry_compensates_nothing() {
     );
 }
 
-/// T22b — once a node EXHAUSTS its retries it is a terminal node failure: the
-/// succeeded prefix is unwound and the exhausted node itself is never
-/// compensated (it has no successful effect to undo).
+/// T22b — once a node EXHAUSTS its retries, it is a terminal node failure. The
+/// succeeded prefix is unwound. The exhausted node itself is never
+/// compensated, because it has no successful effect to undo.
 #[tokio::test]
 async fn a_node_that_exhausts_its_retries_unwinds_the_prefix_but_not_itself() {
     // The failing node is DOWNSTREAM so there is a succeeded prefix to unwind.
@@ -1758,11 +1758,11 @@ async fn a_node_that_exhausts_its_retries_unwinds_the_prefix_but_not_itself() {
     );
 }
 
-/// T22c (post-review P3-T4c) — a compensator inherits NEITHER the compensated
-/// node's `.retry(…)` NOR its `.start_to_close(…)`: those describe the FORWARD
-/// step's failure budget, so the compensator activity's own `#[activity(…)]`
-/// attributes apply. Pinned on the emitted command, which is where the
-/// overrides would ride if they were inherited.
+/// T22c — a compensator inherits NEITHER the compensated node's `.retry(…)` NOR
+/// its `.start_to_close(…)`. Those describe the FORWARD step's failure budget.
+/// So the compensator activity's own `#[activity(…)]` attributes apply. Pinned
+/// on the emitted command, which is where the overrides would ride if they were
+/// inherited.
 #[tokio::test]
 async fn a_compensator_inherits_no_retry_or_timeout_override_from_its_node() {
     // `rt_flaky` declares `retry(fixed(3, 1ms))`; its compensator must not.
@@ -1834,18 +1834,9 @@ async fn a_compensator_inherits_no_retry_or_timeout_override_from_its_node() {
 }
 
 // ===========================================================================
-// T23 — post-review P2-F: an unwind RESUMED mid-flight (crash recovery)
+// T23 — an unwind RESUMED mid-flight (crash recovery)
 // ===========================================================================
 
-/// T23 — a worker crash mid-unwind must resume from the recorded prefix: the
-/// already-dispatched compensator is replayed (never re-dispatched) and only the
-/// REMAINING compensations are issued, with no non-determinism.
-///
-/// Uses `failing_comp_dag` (T16's fixture: `f_a` -> `f_b` -> `f_bad`), whose
-/// unwind is `f_undo_b` then `f_undo_a`. The hand-built history carries the
-/// forward pass, the `saga_compensated:1` marker, and `f_undo_b` already
-/// scheduled AND completed — i.e. exactly the state a crash right after the
-/// first compensation would leave behind.
 /// The recorded history of a `failing_comp_dag` run whose unwind was
 /// interrupted right after its FIRST compensation (`f_undo_b`) completed.
 fn interrupted_unwind_history() -> Vec<WorkflowEvent> {
@@ -1919,6 +1910,15 @@ fn interrupted_unwind_history() -> Vec<WorkflowEvent> {
     ]
 }
 
+/// T23 — a worker crash mid-unwind must resume from the recorded prefix. The
+/// already-dispatched compensator is replayed, never re-dispatched. Only the
+/// REMAINING compensations are issued, with no non-determinism.
+///
+/// Uses `failing_comp_dag` (T16's fixture: `f_a` -> `f_b` -> `f_bad`), whose
+/// unwind is `f_undo_b` then `f_undo_a`. The hand-built history carries the
+/// forward pass, the `saga_compensated:1` marker, and `f_undo_b` already
+/// scheduled AND completed. That is the state a crash right after the first
+/// compensation leaves behind.
 #[tokio::test]
 async fn an_unwind_resumed_mid_flight_dispatches_only_the_remaining_compensations() {
     let history = interrupted_unwind_history();
@@ -2010,10 +2010,11 @@ fn all_success_comp_dag(dag: &mut DagBuilder) {
 /// T19 — a DAG that declares compensators but SUCCEEDS never constructs a saga:
 /// zero compensator dispatches, zero saga markers, zero saga metrics.
 ///
-/// This asserts the observable surface (dispatches / markers / metrics), which
-/// is what "unchanged from a pre-#780 build" means for the success path — it is
-/// not a literal byte-diff of the event log. `failing_dag_without_compensators_emits_no_saga_commands_or_metrics`
-/// is the complementary FAILURE-path assertion, and it is the one that actually
+/// This asserts the observable surface (dispatches / markers / metrics). For
+/// the success path, that is what "unchanged from a pre-#780 build" means. It
+/// is not a literal byte-diff of the event log.
+/// `failing_dag_without_compensators_emits_no_saga_commands_or_metrics` is the
+/// complementary FAILURE-path assertion, and it is the one that actually
 /// reaches the (empty) unwind.
 #[tokio::test]
 async fn success_path_emits_no_new_commands_and_no_saga_metrics() {
@@ -2179,8 +2180,8 @@ const LINEAR_UPSTREAMS: [&[usize]; 5] = [&[], &[0], &[1], &[2], &[3]];
 const DIAMOND_UPSTREAMS: [&[usize]; 5] = [&[], &[0], &[0], &[1, 2], &[3]];
 
 /// Independently model which nodes succeed given the failing node index.
-/// Indices are in topological order, so a single forward pass suffices: a node
-/// succeeds iff every upstream succeeded and it is not itself the failing node.
+/// Indices are in topological order, so a single forward pass suffices. A node
+/// succeeds iff every upstream succeeded and it is not the failing node.
 fn succeeded_mask(upstreams: &[&[usize]; 5], fail_idx: usize) -> [bool; 5] {
     let mut succeeded = [false; 5];
     for i in 0..5 {
@@ -2225,9 +2226,9 @@ fn bump(ledger: &Ledger, resource: &str, delta: i64) {
 
 /// T20 — **SUCCESS METRIC.** Across 1000 deterministically-seeded fulfillment
 /// runs (two topologies × every failure position), a compensating DAG leaves
-/// **zero uncompensated side effects**: every ledger resource nets to 0, the
+/// **zero uncompensated side effects**. Every ledger resource nets to 0. The
 /// compensator dispatch order is exactly the reverse of the compensable
-/// succeeded prefix, and every produced history replays deterministically.
+/// succeeded prefix. Every produced history replays deterministically.
 #[tokio::test]
 async fn fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs() {
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -2317,12 +2318,12 @@ async fn fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs
         //
         // A failing DAG's handler returns `Err("one or more DAG tasks failed")`,
         // and the recorded history ends in a terminal `WorkflowFailed`. Since
-        // issue #952 that shape replays to `ReplayStatus::ReplaySucceeded`
-        // carrying the reproduced error in `reproduced_failure` — "the current
-        // code failed the same way, with zero divergence", which is exactly what
-        // this assertion has always meant. `failure_message()` reads that error
-        // under either verdict, so the assertion states the property rather than
-        // the enum variant that currently expresses it.
+        // issue #952 that shape replays to `ReplayStatus::ReplaySucceeded`,
+        // with the reproduced error in `reproduced_failure`. That means "the
+        // current code failed the same way, with zero divergence", as this
+        // assertion always meant. `failure_message()` reads that error under
+        // either verdict. So the assertion states the property, not the enum
+        // variant that currently expresses it.
         let report = outcome.replay_check(handler).await;
         assert!(
             !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
@@ -2349,10 +2350,10 @@ const CI_SUITE_MANIFEST: &str = include_str!("../../../.github/ci/integration-su
 /// compile-checked and its guarantees never actually execute.
 ///
 /// Required row shape: osclass `linux`, crate `autumn-harvest`, target
-/// `integration`, features containing `testing` (the file is
-/// `#![cfg(all(feature = "unified-dag-execution", feature = "testing"))]`, and
-/// `linux` rows keep the crate defaults which already supply
-/// `unified-dag-execution`), and a filter that selects this module.
+/// `integration`, features containing `testing`, and a filter that selects
+/// this module. The file is
+/// `#![cfg(all(feature = "unified-dag-execution", feature = "testing"))]`.
+/// `linux` rows keep the crate defaults, which supply `unified-dag-execution`.
 #[test]
 fn dag_compensation_suite_is_wired_into_ci() {
     let wired = CI_SUITE_MANIFEST.lines().any(|line| {
@@ -2372,10 +2373,9 @@ fn dag_compensation_suite_is_wired_into_ci() {
             && krate == "autumn-harvest"
             && target == "integration"
             && features.split(',').any(|f| f.trim() == "testing")
-            // The filter must select THIS module and nothing narrower: a prefix
-            // of the module name credits the whole module, while a
-            // `module::one_test` filter (or an unrelated short filter like `dag`)
-            // must not.
+            // The filter must select THIS module and nothing narrower. A prefix
+            // of the module name credits the whole module. A `module::one_test`
+            // filter (or an unrelated short filter like `dag`) must not.
             && filter.starts_with("dag_compensation")
             && "dag_compensation_tests".starts_with(filter)
     });
@@ -2389,8 +2389,8 @@ fn dag_compensation_suite_is_wired_into_ci() {
 }
 
 // ===========================================================================
-// Post-PR review (Codex on PR #1153) — P1: a deterministic PRE-DISPATCH
-// rejection must route through the unwind, not escape past it.
+// PR #1153: a deterministic PRE-DISPATCH rejection must route through the
+// unwind, not escape past it.
 // ===========================================================================
 
 #[activity]
@@ -2412,15 +2412,15 @@ async fn pc_undo_root(_ctx: &ActivityContext, e: Value) -> Result<Value, String>
 }
 
 /// `process` draws its input straight from `big`'s recorded output (issue
-/// #702), so an oversized upstream output makes `process`'s input exceed the
-/// configured activity-input cap — rejected by `execute_activity_raw_with_opts`
+/// #702). So an oversized upstream output pushes `process`'s input over the
+/// configured activity-input cap. `execute_activity_raw_with_opts` rejects it
 /// BEFORE it allocates an activity id or pushes a `ScheduleActivity` command.
 ///
 /// The oversized value deliberately lives on `big`, which declares **no**
-/// compensator: the compensation envelope embeds the compensated node's whole
-/// input *and* output, so hanging the payload off `root` would push `root`'s own
-/// envelope over the same cap and the unwind would report
-/// `SagaCompensationFailed` instead of dispatching.
+/// compensator. The compensation envelope embeds the compensated node's whole
+/// input *and* output. A payload on `root` would push `root`'s own envelope
+/// over the same cap. The unwind would then report `SagaCompensationFailed`
+/// instead of dispatching.
 #[dag]
 fn payload_cap_comp_dag(dag: &mut DagBuilder) {
     let root = dag.activity(pc_root).compensate(pc_undo_root);
@@ -2428,10 +2428,10 @@ fn payload_cap_comp_dag(dag: &mut DagBuilder) {
     let _process = dag.activity(pc_process).input_from(&big);
 }
 
-/// A `PayloadTooLarge` rejection is deterministic, permanent, and leaves **no**
-/// history footprint and **no** side effect — exactly the class the non-array
-/// mapped-input fix already routes through the unwind. Before the fix it was
-/// returned as `Err` and `activity_result?` propagated it out of the level loop
+/// A `PayloadTooLarge` rejection is deterministic and permanent. It leaves
+/// **no** history footprint and **no** side effect. The non-array mapped-input
+/// fix already routes that class through the unwind. Before the fix, it was
+/// returned as `Err`. `activity_result?` propagated it out of the level loop
 /// *past* the terminal-failure check, so `root`'s side effect was left dangling.
 #[tokio::test]
 async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
@@ -2476,9 +2476,9 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
         .with_payload_caps(512, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024);
 
     let handler = __autumn_workflow_info_payload_cap_comp_dag().handler;
-    // `pc_root` and `pc_big` replay from history; `pc_process` is rejected by
-    // the cap; the unwind then dispatches `pc_undo_root`, which is genuinely new
-    // durable work and therefore parks on its oneshot. Parking is correct here.
+    // `pc_root` and `pc_big` replay from history. The cap rejects `pc_process`.
+    // The unwind then dispatches `pc_undo_root`. That is genuinely new durable
+    // work, so it parks on its oneshot. Parking is correct here.
     let result = drive_replay_tolerating_suspension(&ctx, handler).await;
 
     if let Some(result) = result.as_ref() {
@@ -2511,48 +2511,48 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
 }
 
 /// KNOWN LIMITATION (documented, not fixed): a `PayloadTooLarge` rejection is a
-/// pure function of already-recorded state *plus live configuration*, and leaves
-/// **no history footprint**. So if the activity-input cap is RAISED while a
-/// compensating DAG is mid-unwind, replay re-evaluates the rejection against the
-/// new cap, the previously-rejected node now dispatches, and its
-/// `ScheduleActivity` lands where history records the compensator's — a
+/// pure function of already-recorded state *plus live configuration*. It leaves
+/// **no history footprint**. Suppose the activity-input cap is RAISED while a
+/// compensating DAG is mid-unwind. Replay re-evaluates the rejection against the
+/// new cap, and the previously-rejected node now dispatches. Its
+/// `ScheduleActivity` lands where history records the compensator's, which is a
 /// divergence.
 ///
 /// This is the same class as any config-dependent decision that leaves no
-/// history footprint. Issue #952 closed the sibling case where such a failure is
-/// *uncaught* and seals the run (a trailing terminal `WorkflowFailed` is now
-/// transparent to in-progress matches —
-/// `replayer_tests::early_config_dependent_failure_replays_cleanly`), but a
-/// rejection the unwind catches and routes around records nothing at all, so it
+/// history footprint. Issue #952 closed the sibling case, where such a failure
+/// is *uncaught* and seals the run. A trailing terminal `WorkflowFailed` is now
+/// transparent to in-progress matches
+/// (`replayer_tests::early_config_dependent_failure_replays_cleanly`). But a
+/// rejection that the unwind catches and routes around records nothing. So it
 /// stays re-decided on every replay.
-/// Issue #780 **enlarges** the surface rather than creating it: before the
+/// Issue #780 **enlarges** the surface rather than creating it. Before the
 /// unwind existed, a rejection `?`-escaped and sealed the run FAILED with no
-/// compensation events, so there was nothing for a later dispatch to collide
+/// compensation events. So nothing was there for a later dispatch to collide
 /// with.
 ///
-/// Requires a four-way conjunction — `PayloadTooLarge` + a compensating DAG + a
-/// cap change + that change landing inside the unwind's decision-cycle window —
-/// and the consequence is a #603 **nd-block**: the run stays `RUNNING` and
-/// retries, recovering when the cap is reverted. It is never a silent partial
+/// It requires a four-way conjunction: `PayloadTooLarge`, a compensating DAG, a
+/// cap change, and that change landing inside the unwind's decision-cycle
+/// window. The consequence is a #603 **nd-block**. The run stays `RUNNING` and
+/// retries, and recovers when the cap is reverted. It is never a silent partial
 /// rollback, which is why this is pinned rather than papered over.
 ///
-/// A durable fix means persisting the rejection so replay reads it back instead
-/// of re-deciding it. That cannot be done locally here: the level dispatches
-/// concurrently through `join_all`, so a marker pushed from inside a task future
-/// has no deterministic position, and a marker pushed after the join is read too
-/// late to gate the dispatch. Doing it properly means giving the *engine's*
+/// A durable fix persists the rejection, so replay reads it back instead of
+/// re-deciding it. That cannot be done locally here. The level dispatches
+/// concurrently through `join_all`. A marker pushed from inside a task future
+/// has no deterministic position. A marker pushed after the join is read too
+/// late to gate the dispatch. A proper fix gives the *engine's*
 /// activity-dispatch path a history footprint for deterministic pre-dispatch
-/// rejections — an engine-wide change affecting every workflow, well outside
-/// this slice.
+/// rejections. That is an engine-wide change affecting every workflow, well
+/// outside this slice.
 #[tokio::test]
 async fn known_limitation_raising_the_cap_mid_unwind_diverges() {
     let oversized = Value::String("x".repeat(2048));
     let root_id = ActivityExecId::new();
     let big_id = ActivityExecId::new();
     let undo_id = ActivityExecId::new();
-    // The history the FIRST cycle persisted: `pc_process` was rejected before
-    // dispatch (so it has no events at all) and the unwind scheduled
-    // `pc_undo_root` in its place.
+    // The history the FIRST cycle persisted. `pc_process` was rejected before
+    // dispatch, so it has no events at all. The unwind scheduled `pc_undo_root`
+    // in its place.
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,

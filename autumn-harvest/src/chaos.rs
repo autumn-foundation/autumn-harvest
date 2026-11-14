@@ -1,19 +1,19 @@
 //! Deterministic chaos / fault-injection test harness (issue #940).
 //!
-//! This module lets tests inject faults — a killed worker task, an injected
-//! Diesel/connection error, a dropped `LISTEN`/`NOTIFY` wake, an expired lease —
-//! at *named* points in the production code path, deterministically and
-//! reproducibly, to prove that the engine's convergence guarantees hold under
-//! adversarial timing.
+//! Tests inject faults at *named* points in the production code path. A fault
+//! is a killed worker task, a Diesel/connection error, a dropped
+//! `LISTEN`/`NOTIFY` wake or an expired lease. Injection is deterministic and
+//! reproducible. It proves that the convergence guarantees of the engine hold
+//! under adversarial timing.
 //!
 //! ## Two halves
 //!
 //! - [`points`] is **unconditional** (compiled into every build). It is a
-//!   const catalogue of named injection points; a [`points::ChaosPoint`] value
-//!   can only ever be a catalogue const, so a typo is a *compile error*, never
-//!   a silent runtime no-op (issue #940 AC2). In a non-`chaos` build the
+//!   const catalogue of named injection points. A [`points::ChaosPoint`] value
+//!   is always a catalogue const, so a typo is a *compile error*, never a
+//!   silent runtime no-op (issue #940 AC2). In a non-`chaos` build the
 //!   `chaos_point!` / `chaos_fallible!` macros expand to a compile-time const
-//!   check that emits **zero** runtime code — the hot path is untouched.
+//!   check. It emits **zero** runtime code, so the hot path is untouched.
 //! - The controller ([`arm`], [`hit`], [`ChaosPlan`], [`ChaosGuard`], ...) is
 //!   `#[cfg(feature = "chaos")]`. It exists only in a build with the `chaos`
 //!   feature enabled — a test-only build. It is never part of a production
@@ -22,11 +22,11 @@
 //! ## Zero production impact (AC6)
 //!
 //! The `chaos` feature is off by default and never in `default`. When it is
-//! off, an injection point is a `const _: ChaosPoint = ...;` item that the
-//! compiler discards, so there is no branch, no atomic load, no code at all at
-//! the call site. When the feature is *on* but the harness is disarmed, [`hit`]
-//! is a single `SeqCst` atomic load followed by an early return with no lock
-//! and no `.await` yield.
+//! off, an injection point is a `const _: ChaosPoint = ...;` item. The compiler
+//! discards it, so the call site has no branch, no atomic load and no code.
+//! When the feature is *on* but the harness is disarmed, [`hit`] is one
+//! `SeqCst` atomic load and an early return. It takes no lock and never yields
+//! at an `.await`.
 //!
 //! ## Determinism (AC3)
 //!
@@ -39,10 +39,10 @@
 #![cfg_attr(
     feature = "chaos",
     allow(
-        // The `Chaos*` prefix is the harness's deliberate public vocabulary
-        // (`chaos::ChaosPlan`, `chaos::ChaosGuard`, ...); renaming to bare
-        // `Plan`/`Guard`/`Error` would collide with the crate's own `Error`
-        // and read worse at the call site.
+        // The `Chaos*` prefix is the deliberate public vocabulary of the
+        // harness (`chaos::ChaosPlan`, `chaos::ChaosGuard`, ...). A bare
+        // `Plan`/`Guard`/`Error` collides with the crate's own `Error` and
+        // reads worse at the call site.
         clippy::module_name_repetitions,
         // `ChaosGuard` deliberately holds the process-wide serialization guard
         // for its whole lifetime (RAII); that is the point, not a mistake.
@@ -58,11 +58,10 @@ pub mod points {
     /// Primitive classes a [`ChaosPoint`] supports.
     ///
     /// A *seeded* plan picks an action for a point only from its declared caps.
-    /// A *scripted* plan (`kill_at`/`error_at`/`hold_at`/...) is likewise
-    /// validated against them at plan-build time: a directive whose action a
-    /// point's caps do not allow panics inside the `*_at` builder, right next to
-    /// the mistake — never a silent caps/site mismatch that only surfaces far
-    /// away at the entry point when the point is first hit.
+    /// A *scripted* plan (`kill_at`/`error_at`/`hold_at`/...) is validated
+    /// against them at plan-build time. A directive whose action the caps do
+    /// not allow panics inside the `*_at` builder, next to the mistake. So a
+    /// caps/site mismatch never stays silent until the point is first hit.
     type Caps = u8;
 
     /// The point runs inside a spawned task, so a panic there simulates a task
@@ -78,10 +77,10 @@ pub mod points {
 
     /// A named chaos injection point.
     ///
-    /// A newtype over `&'static str` with a **private** name field: a value can
-    /// only be constructed inside this module, so downstream code can only ever
-    /// reference a real catalogue const. A misspelled point name is therefore a
-    /// compile error (issue #940 AC2), never a silent runtime miss.
+    /// A newtype over `&'static str` with a **private** name field. Only this
+    /// module constructs a value, so downstream code always references a real
+    /// catalogue const. A misspelled point name is a compile error (issue #940
+    /// AC2), never a silent runtime miss.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ChaosPoint {
         name: &'static str,
@@ -116,8 +115,8 @@ pub mod points {
 
     // ---- catalogue ----------------------------------------------------------
     //
-    // Add a point here, wire exactly one `chaos_point!`/`chaos_fallible!` call
-    // site for it, add it to `ALL`, and (when it earns its keep) document it in
+    // A new point goes here, with exactly one `chaos_point!`/`chaos_fallible!`
+    // call site. Add it to `ALL`. When it earns its keep, document it in
     // docs/testing/chaos.md. `CHAOS_POINTS_MAX` is a ratchet: bump it
     // deliberately, never silently.
 
@@ -179,8 +178,8 @@ pub mod points {
 
     /// Top of `poison_pill::reclaim_orphaned_tasks`, before the orphan SELECT.
     ///
-    /// A `chaos_fallible!` site: an injected Diesel/connection error surfaces
-    /// here (AC1(b)) exactly like a real DB failure and is returned to the poll
+    /// A `chaos_fallible!` site. An injected Diesel/connection error surfaces
+    /// here (AC1(b)) exactly like a real DB failure. It returns to the poll
     /// loop, which retries on its next tick. The reclaim is idempotent, so the
     /// retry converges (no orphan is left stranded by the transient error).
     pub const POISON_RECLAIM_BEFORE_LOAD: ChaosPoint = ChaosPoint {
@@ -193,7 +192,7 @@ pub mod points {
     /// A dropped wake (AC1(c)) means a listening worker never receives the
     /// `LISTEN`/`NOTIFY` and must fall back to its poll loop to claim the task.
     /// The invariant it stresses: dispatch converges even when every wake is
-    /// lost, because the poll loop is the source of truth and NOTIFY is only a
+    /// lost. The poll loop is the source of truth, and NOTIFY is only a
     /// latency optimization.
     pub const NOTIFY_TASK_ENQUEUED: ChaosPoint = ChaosPoint {
         name: "notify.task_enqueued",
@@ -305,17 +304,16 @@ mod controller {
     /// never-armed sentinel (see [`ARMED_GEN`]).
     static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
     /// The generation of the currently-armed plan, or `0` when disarmed. This
-    /// is the *sole* armed/disarmed signal — see [`entry_snapshot`] for why an
+    /// is the *sole* armed/disarmed signal. See [`entry_snapshot`] for why an
     /// earlier revision's separate `ARMED: AtomicBool` was removed. A resolved
     /// action only fires when the state it was resolved from still carries
-    /// this generation — so a fault resolved by a spawned task that outlived
-    /// its plan can never leak into a later test (issue #940, Codex review
-    /// round 1).
+    /// this generation. So a fault resolved by a spawned task that outlived
+    /// its plan can never leak into a later test (issue #940).
     static ARMED_GEN: AtomicU64 = AtomicU64::new(0);
 
-    /// An injected fault error. Surfaces at a [`chaos_fallible!`] site as
-    /// whatever error type the enclosing function returns, via `From`, so the
-    /// production error path handles it exactly like a real failure.
+    /// An injected fault error. At a [`chaos_fallible!`] site, `From` converts
+    /// it into the error type of the enclosing function. So the production
+    /// error path handles it exactly like a real failure.
     #[derive(Debug, Clone)]
     pub enum ChaosError {
         /// A generic injected connection/query failure.
@@ -397,8 +395,8 @@ mod controller {
     /// Assert `point`'s declared caps allow a scripted `action`, panicking at
     /// plan-build time otherwise.
     ///
-    /// Scripted plans used to ignore caps, so a `kill_at` on a DROP_NOTIFY-only
-    /// point was accepted silently and only blew up far away at the entry point
+    /// Scripted plans used to ignore caps. A `kill_at` on a DROP_NOTIFY-only
+    /// point was then accepted silently and failed far away at the entry point
     /// (the caps/site-mismatch `panic!` in [`hit`]/[`should_drop_notify`]). This
     /// surfaces the mistake next to the offending `*_at` call instead.
     fn assert_scripted_cap(point: ChaosPoint, action: &Action) {
@@ -410,9 +408,9 @@ mod controller {
             Action::Delay(_) => caps & CAP_DELAY != 0,
             // A `Hold` rendezvous parks the point on an `.await`, so it needs a
             // site that can pause: any of KILL/ERROR/DELAY marks an async point.
-            // A DROP_NOTIFY-only site is synchronous and cannot host a Hold (its
-            // `should_drop_notify` is not `async` — a scripted Hold there would
-            // hang the test's `reached().await` forever).
+            // A DROP_NOTIFY-only site is synchronous and cannot host a Hold. Its
+            // `should_drop_notify` is not `async`, so a scripted Hold there
+            // hangs the test's `reached().await` forever.
             Action::Hold => caps & (CAP_KILL | CAP_ERROR | CAP_DELAY) != 0,
         };
         assert!(
@@ -457,8 +455,6 @@ mod controller {
             if self.released.load(Ordering::Acquire) {
                 return;
             }
-            // Bounded so a buggy test can never hang the harness; a correct
-            // test releases well inside this.
             let _ = tokio::time::timeout(HOLD_MAX, self.release.notified()).await;
         }
 
@@ -527,16 +523,15 @@ mod controller {
         /// A deterministic randomised plan derived from `seed`.
         ///
         /// Each catalogue point gets an independent `splitmix64(seed ^
-        /// fnv1a(name))` stream; roughly half the points are activated, each
-        /// with an action drawn from its declared caps and a fire-on-hit
-        /// ordinal. `Hold` is never selected (it needs a test to release it);
-        /// this plan is for the unattended convergence sweep.
+        /// fnv1a(name))` stream. About half the points are activated. Each one
+        /// gets an action drawn from its declared caps and a fire-on-hit
+        /// ordinal. `Hold` is never selected, because it needs a test to
+        /// release it. This plan is for the unattended convergence sweep.
         #[must_use]
         pub fn seeded(seed: u64) -> Self {
             let mut directives = BTreeMap::new();
             for &p in ALL {
                 let stream = splitmix64(seed ^ fnv1a(p.name()));
-                // Activate ~half the eligible points.
                 if stream & 1 == 0 {
                     continue;
                 }
@@ -554,10 +549,9 @@ mod controller {
         }
 
         /// Whether this plan has a directive armed at `point` (regardless of its
-        /// trigger ordinal). Lets a test compute a non-vacuous seed set against
-        /// the points its workload actually reaches, rather than hardcoding
-        /// magic seeds that could silently go vacuous if the seeded logic or the
-        /// catalogue changes.
+        /// trigger ordinal). A test uses it to compute a non-vacuous seed set
+        /// from the points its workload reaches. Hardcoded magic seeds can go
+        /// vacuous silently when the seeded logic or the catalogue changes.
         #[must_use]
         pub fn activates(&self, point: ChaosPoint) -> bool {
             self.directives.contains_key(point.name())
@@ -565,10 +559,10 @@ mod controller {
 
         /// Whether this plan arms a [`Kill`](Action::Kill) at `point`. Unlike
         /// [`activates`](Self::activates), this ignores convergence-benign
-        /// actions (a `Delay`, or a `DropNotify`): the seeded convergence sweep
-        /// uses it so its non-vacuity guard demands a *disruptive* fault — a
-        /// pre-commit crash that actually strands an orphan — rather than being
-        /// satisfiable by a 5&nbsp;ms sleep that leaves the run healthy.
+        /// actions (a `Delay` or a `DropNotify`). The seeded convergence sweep
+        /// uses it, so its non-vacuity guard demands a *disruptive* fault. That
+        /// fault is a pre-commit crash that strands an orphan, not a 5&nbsp;ms
+        /// sleep that leaves the run healthy.
         #[must_use]
         pub fn kills_at(&self, point: ChaosPoint) -> bool {
             self.directives
@@ -779,14 +773,14 @@ mod controller {
             if !fire {
                 return Resolved::Continue;
             }
-            // NB: `actions_fired` is NOT bumped here. It is bumped via
-            // `fire_if_current` at the entry point (`hit`/`hit_fallible`/
-            // `should_drop_notify`) only when that site can actually *honor* the
-            // resolved action AND this state's generation is still armed — so a
+            // NB: `actions_fired` is NOT bumped here. The entry point
+            // (`hit`/`hit_fallible`/`should_drop_notify`) bumps it via
+            // `fire_if_current`. It does so only when that site can *honor* the
+            // resolved action AND this state's generation is still armed. A
             // caps/site mismatch (e.g. an `Error` scripted at an infallible
-            // `chaos_point!` site) hard-`panic!`s there, and a stale action
-            // resolved after the plan was disarmed fires nothing. Neither
-            // silently inflates the anti-vacuity counter.
+            // `chaos_point!` site) hard-`panic!`s there. A stale action resolved
+            // after the plan was disarmed fires nothing. Neither one silently
+            // inflates the anti-vacuity counter.
             match &directive.action {
                 Action::Kill => Resolved::Kill,
                 Action::Hold => self
@@ -804,9 +798,9 @@ mod controller {
         /// [`ChaosState::fire_if_current`], so the counter and the side effect
         /// are gated by the same generation check.
         ///
-        /// `Relaxed` is sufficient: the counter is a per-plan monotonic tally
-        /// read only after the armed plan is dropped (the `SERIAL` mutex is
-        /// released, establishing a happens-before edge). No test observes it
+        /// `Relaxed` is sufficient. The counter is a per-plan monotonic tally.
+        /// It is read only after the armed plan is dropped, and the `SERIAL`
+        /// mutex release establishes a happens-before edge. No test observes it
         /// concurrently with a firing to order it against other memory, so no
         /// acquire/release fence is needed.
         fn mark_fired(&self) {
@@ -818,36 +812,35 @@ mod controller {
         ///
         /// Returns `true` (and bumps [`mark_fired`](Self::mark_fired)) only when
         /// this state's [`generation`](Self::generation) is still the armed one
-        /// ([`ARMED_GEN`]). A stale state — its plan disarmed by a guard drop,
-        /// possibly with a newer plan armed since — returns `false` and fires
-        /// nothing: an action a spawned task resolved while armed can no longer
-        /// leak a fault into a later test after its plan is gone. `SeqCst`
-        /// pairs with the store in [`arm`]/`Drop` so the fence orders against
-        /// the disarm.
+        /// ([`ARMED_GEN`]). A stale state is one whose plan a guard drop
+        /// disarmed, possibly with a newer plan armed since. It returns `false`
+        /// and fires nothing. So an action that a spawned task resolved while armed
+        /// cannot leak a fault into a later test after its plan is gone.
+        /// `SeqCst` pairs with the store in [`arm`]/`Drop`, so the fence orders
+        /// against the disarm.
         ///
         /// This gate is intentionally *not* one serialized commit with the side
         /// effect that follows it (the panic/sleep/rendezvous/error a caller runs
         /// after a `true`). Two things make a serialized commit both unnecessary
         /// and, as literally suggested, unimplementable:
         ///
-        /// - *No stateful bleed.* Which plan a resolved action belongs to is
-        ///   settled by the entry snapshot ([`entry_snapshot`]) plus this
-        ///   generation fence, both *before* any side effect runs. A side effect
-        ///   that executes in the tiny gap after a `true` runs on the *spawned
-        ///   task* and touches no global chaos state and no later test's
-        ///   workload, so it cannot make a later test non-deterministic — the
-        ///   overlap is temporal only.
-        /// - *A lock across the fire would deadlock.* Holding a lock from this
-        ///   check through the side effect would have to span `Hold`'s
-        ///   `gate.rendezvous().await` and `Delay`'s `sleep().await`; the guard's
-        ///   `Drop` needs that same lock to disarm and `release_all_holds`, so the
-        ///   rendezvous could never complete.
+        /// - *No stateful bleed.* The entry snapshot ([`entry_snapshot`]) and
+        ///   this generation fence settle which plan a resolved action belongs
+        ///   to, both *before* any side effect runs. A side effect in the tiny
+        ///   gap after a `true` runs on the *spawned task*. It touches no
+        ///   global chaos state and no workload of a later test. So it cannot
+        ///   make a later test non-deterministic: the overlap is temporal only.
+        /// - *A lock across the fire would deadlock.* A lock held from this
+        ///   check through the side effect would span `Hold`'s
+        ///   `gate.rendezvous().await` and `Delay`'s `sleep().await`. The
+        ///   guard's `Drop` needs that same lock to disarm and
+        ///   `release_all_holds`. So the rendezvous could never complete.
         ///
         /// The practical guarantee against a fault outliving its test is
-        /// *await-discipline*: a reproducer drives the faulted work in a
-        /// `tokio::spawn`ed task and awaits its `JoinHandle` before dropping the
-        /// guard (see `worker::chaos_drive_one_workflow_task`), so no side effect
-        /// executes past disarm in correct usage.
+        /// *await-discipline*. A reproducer drives the faulted work in a
+        /// `tokio::spawn`ed task and awaits its `JoinHandle` before it drops the
+        /// guard (see `worker::chaos_drive_one_workflow_task`). So in correct
+        /// usage no side effect executes past disarm.
         fn fire_if_current(&self) -> bool {
             if self.generation != ARMED_GEN.load(Ordering::SeqCst) {
                 return false;
@@ -897,66 +890,65 @@ mod controller {
 
     /// Atomically snapshot the armed state *and* the generation it belongs to.
     ///
-    /// The disarmed fast path is a single `SeqCst` load of [`ARMED_GEN`] and
-    /// early return — no lock, no clone — so the zero-cost-when-disarmed
-    /// property the entry points ([`hit`]/[`hit_fallible`]/[`should_drop_notify`])
-    /// document still holds. `ARMED_GEN` is the *sole* armed/disarmed sentinel
-    /// (`0` == disarmed, see its own doc comment) as well as the generation to
-    /// fence the subsequent `STATE` read against — there is deliberately no
+    /// The disarmed fast path is a single `SeqCst` load of [`ARMED_GEN`] and an
+    /// early return, with no lock and no clone. So the entry points
+    /// ([`hit`]/[`hit_fallible`]/[`should_drop_notify`]) stay zero-cost when
+    /// disarmed, as they document. `ARMED_GEN` is the *sole* armed/disarmed
+    /// sentinel (`0` == disarmed, see its own doc comment). It is also the
+    /// generation that fences the next `STATE` read. There is deliberately no
     /// separate flag.
     ///
     /// An earlier revision of this function read a standalone `ARMED: AtomicBool`
-    /// (with `Relaxed` ordering) *and* `ARMED_GEN` as two separate atomics. A
-    /// task that read `ARMED` while true, was then preempted across a full
-    /// guard drop + re-arm to a *different* plan, and resumed reading
-    /// `ARMED_GEN`/`STATE` would observe the *incoming* plan's pair — which is
-    /// trivially self-consistent (both belong to the same, newer generation) —
-    /// and wrongly resolve (firing) a directive belonging to a plan it was
-    /// never entered under. The two-flag design also had a false-negative
-    /// mirror image: `arm` published `STATE` and `ARMED_GEN` before flipping
-    /// `ARMED` true, so a reader observing exactly that window would see a
-    /// stale `ARMED == false` and silently skip fault injection under a plan
-    /// that was, by every other measure, already live. Deleting the
-    /// standalone flag and using `ARMED_GEN` alone eliminates both of *these*
-    /// directions by construction: there is no longer a second,
-    /// independently-ordered *read* left to go stale relative to it.
+    /// (with `Relaxed` ordering) *and* `ARMED_GEN` as two separate atomics.
+    /// Take a task that read `ARMED` while true and was then preempted across
+    /// a full guard drop + re-arm to a *different* plan. On resume it read
+    /// `ARMED_GEN`/`STATE` and would observe the pair of the *incoming* plan.
+    /// That pair is trivially self-consistent, because both belong to the same,
+    /// newer generation. So the task would wrongly resolve (and fire) a
+    /// directive of a plan that it never entered under. The two-flag design
+    /// also had a false-negative mirror image. `arm` published `STATE` and
+    /// `ARMED_GEN` before it flipped `ARMED` true. A reader in exactly that
+    /// window would see a stale `ARMED == false`. It would then silently skip
+    /// fault injection under a plan that was, by every other measure, already
+    /// live. With the standalone flag deleted, `ARMED_GEN` alone eliminates
+    /// both of *these* directions by construction. No second,
+    /// independently-ordered *read* is left to go stale relative to it.
     ///
-    /// A narrower, structurally different window remains in [`arm`] itself:
-    /// `STATE` and `ARMED_GEN` are still two separate atomics, so a
-    /// concurrent reader can observe `ARMED_GEN == 0` for an instant after
-    /// `STATE` has already been overwritten with the new plan — a real-time
-    /// interleaving, not a stale cached read. This is inherent to publishing
-    /// two atomics rather than one (closing it fully would need something
-    /// like a single `ArcSwap` carrying both the state and its generation in
-    /// one atomic swap) and is benign: unlike the deleted `ARMED` bool, it
-    /// can only ever produce a transient, self-detecting *false negative* — a
-    /// request momentarily sees "disarmed" and skips injection, which the
-    /// reproducer's own `actions_fired() >= 1` anti-vacuity assert would
-    /// catch — never the false-positive misfire the two-flag design risked.
-    /// It is also no wider than the window that already existed pre-fix.
+    /// A narrower, structurally different window remains in [`arm`] itself.
+    /// `STATE` and `ARMED_GEN` are still two separate atomics. So a concurrent
+    /// reader can observe `ARMED_GEN == 0` for an instant after `STATE` already
+    /// holds the new plan. That is a real-time interleaving, not a stale cached
+    /// read. It is inherent to publishing two atomics rather than one. Closing
+    /// it fully needs something like a single `ArcSwap` that carries both the
+    /// state and its generation in one atomic swap. The window is benign.
+    /// Unlike the deleted `ARMED` bool, it can only produce a transient,
+    /// self-detecting *false negative*. A request momentarily sees "disarmed"
+    /// and skips injection, and the `actions_fired() >= 1` anti-vacuity assert
+    /// of the reproducer catches that. It never produces the false-positive
+    /// misfire that the two-flag design risked. It is also no wider than the
+    /// window that already existed pre-fix.
     ///
-    /// The state read that remains — `ARMED_GEN` then `STATE` — is fenced by
-    /// the generation-mismatch check exactly as before: [`arm`] publishes
-    /// `STATE` before `ARMED_GEN`, so observing a generation implies its state
-    /// is already visible; the only rejected pairs are genuinely torn (entry
-    /// generation from an outgoing plan, `STATE` already the incoming one's).
-    /// The generation is fenced *again* at fire time via
-    /// [`ChaosState::fire_if_current`], so a disarm landing after this snapshot
-    /// still fires nothing.
+    /// The generation-mismatch check fences the state read that remains
+    /// (`ARMED_GEN`, then `STATE`), exactly as before. [`arm`] publishes `STATE`
+    /// before `ARMED_GEN`, so an observed generation implies that its state is
+    /// already visible. The only rejected pairs are genuinely torn: the entry
+    /// generation is from an outgoing plan, and `STATE` already holds the
+    /// incoming one. [`ChaosState::fire_if_current`] fences the generation
+    /// *again* at fire time. So a disarm that lands after this snapshot still
+    /// fires nothing.
     ///
     /// A `#[cfg(test)]`-only rendezvous (see [`maybe_pause_entry_snapshot`])
-    /// sits between the two reads below -- absent from every non-test build,
-    /// including a real `--features chaos` binary, so it costs nothing
-    /// outside `cargo test`. `entry_snapshot_rejects_a_straddled_read_of_the_real_production_path`
+    /// sits between the two reads below. No non-test build has it, a real
+    /// `--features chaos` binary included, so it costs nothing outside
+    /// `cargo test`. `entry_snapshot_rejects_a_straddled_read_of_the_real_production_path`
     /// uses it to pause THIS function on a real OS thread and drive a
-    /// genuine concurrent disarm+rearm across the pause, proving this exact
-    /// function -- not a hand-reconstructed stand-in -- rejects a straddled
-    /// read (Codex review round 3, issue #1202: the sibling
+    /// genuine concurrent disarm+rearm across the pause. That proves this exact
+    /// function, not a hand-reconstructed stand-in, rejects a straddled read
+    /// (issue #1202). The sibling
     /// `entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled`
     /// test below only replays the REMOVED shape's bug against a clone,
-    /// `vulnerable_two_read_shape`, and so cannot detect a regression that
-    /// reintroduces an equivalent stale-decision defect into this real
-    /// function).
+    /// `vulnerable_two_read_shape`. So it cannot detect a regression that puts
+    /// an equivalent stale-decision defect back into this real function.
     fn entry_snapshot() -> Option<Arc<ChaosState>> {
         let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
         if entry_gen == 0 {
@@ -972,9 +964,9 @@ mod controller {
     }
 
     /// Test-only rendezvous consulted by [`entry_snapshot`] between its two
-    /// reads (see [`maybe_pause_entry_snapshot`]). `None` -- the default, and
+    /// reads (see [`maybe_pause_entry_snapshot`]). `None` is the default and
     /// the only state outside an explicit [`install_entry_snapshot_test_pause`]
-    /// call -- costs a single mutex lock with nothing to do; only a test that
+    /// call. It costs a single mutex lock with nothing to do. Only a test that
     /// has armed the pause pays for the rendezvous itself.
     #[cfg(test)]
     static ENTRY_SNAPSHOT_TEST_PAUSE: Mutex<
@@ -985,11 +977,12 @@ mod controller {
     > = Mutex::new(None);
 
     /// Arm a one-shot pause for the *next* call to [`entry_snapshot`] that
-    /// observes the harness armed (an already-disarmed call returns before
-    /// ever reaching the rendezvous, so it never blocks on this). Returns a
-    /// `(reached, release)` pair: `reached.recv()` blocks the caller until
-    /// the paused call is parked at the rendezvous; sending on (or dropping)
-    /// `release` lets the paused call proceed to its second read.
+    /// observes the harness armed.
+    ///
+    /// A disarmed call returns before the rendezvous, so it never blocks on
+    /// this. Returns a `(reached, release)` pair. `reached.recv()` blocks the
+    /// caller until the paused call is parked at the rendezvous. Sending on (or
+    /// dropping) `release` lets the paused call proceed to its second read.
     #[cfg(test)]
     fn install_entry_snapshot_test_pause() -> (
         std::sync::mpsc::Receiver<()>,
@@ -1003,13 +996,13 @@ mod controller {
         (reached_rx, release_tx)
     }
 
-    /// Consumed at most once per [`install_entry_snapshot_test_pause`] call
-    /// -- `take()`, not a peek -- so an unrelated concurrent `entry_snapshot`
-    /// call could never also consume this test's rendezvous. In practice
-    /// this is moot: `arm`'s process-wide `SERIAL` lock means only one test
-    /// can be armed at a time, so no other call can reach an armed
-    /// `entry_snapshot` while this rendezvous is installed -- but `take`
-    /// keeps that true by construction rather than by relying on it.
+    /// Consumed at most once per [`install_entry_snapshot_test_pause`] call,
+    /// by `take()`, not a peek. So an unrelated concurrent `entry_snapshot`
+    /// call can never also consume the rendezvous of this test. In practice
+    /// this is moot. The process-wide `SERIAL` lock of `arm` lets only one
+    /// test be armed at a time. So no other call can reach an armed
+    /// `entry_snapshot` while this rendezvous is installed. But `take` keeps
+    /// that true by construction rather than by relying on it.
     #[cfg(test)]
     fn maybe_pause_entry_snapshot() {
         let taken = ENTRY_SNAPSHOT_TEST_PAUSE
@@ -1022,10 +1015,11 @@ mod controller {
         }
     }
 
-    /// Install a chaining panic hook (once, idempotently) that prints a compact
-    /// one-line note for an expected chaos kill and delegates every other panic
-    /// to the hook captured at install time. Transparent for non-chaos panics,
-    /// so parallel non-chaos tests are unaffected.
+    /// Install a chaining panic hook once, idempotently.
+    ///
+    /// The hook prints a compact one-line note for an expected chaos kill. It
+    /// delegates every other panic to the hook captured at install time, so
+    /// parallel non-chaos tests are unaffected.
     fn install_quiet_hook_once() {
         HOOK_INSTALLED.call_once(|| {
             let prev = std::panic::take_hook();
@@ -1044,9 +1038,9 @@ mod controller {
     }
 
     fn panic_message(info: &PanicHookInfo<'_>) -> String {
-        // Mirrors the shared `crate::error::panic_message` idiom, but for the
-        // borrowed `&(dyn Any + Send)` a panic hook exposes (that helper takes an
-        // owned `Box<dyn Any>` from `catch_unwind`, so it cannot be reused here).
+        // Mirrors the shared `crate::error::panic_message` idiom for the
+        // borrowed `&(dyn Any + Send)` of a panic hook. That helper takes an
+        // owned `Box<dyn Any>` from `catch_unwind`, so it cannot be reused here.
         let payload = info.payload();
         payload
             .downcast_ref::<&str>()
@@ -1072,9 +1066,9 @@ mod controller {
     }
 
     /// Publish `plan` as the armed state under a fresh generation. Callers
-    /// must already hold [`SERIAL`]; this is the arming half of that lock's
-    /// critical section, factored out so [`ChaosGuard::rearm_in_place`] runs
-    /// the identical sequence rather than a test-local copy of it.
+    /// must already hold [`SERIAL`]. This is the arming half of the critical
+    /// section of that lock. [`ChaosGuard::rearm_in_place`] runs this same
+    /// sequence, not a test-local copy of it.
     fn install_armed_state(plan: ChaosPlan) -> Arc<ChaosState> {
         let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(ChaosState::from_plan(plan, generation));
@@ -1145,15 +1139,16 @@ mod controller {
             self.state.seed
         }
 
-        /// A compact description of the plan and what has fired — embed it in a
-        /// reproducer's assert message so a failure prints the seed for
-        /// one-command local replay (issue #940 AC3).
+        /// A compact description of the plan and what has fired.
+        ///
+        /// Embed it in the assert message of a reproducer. A failure then
+        /// prints the seed for one-command local replay (issue #940 AC3).
         ///
         /// The *plan* (seed → directives) is fully deterministic and is what
         /// makes a failure reproducible. The observed `hits`/`trace` reflect the
-        /// actual runtime hit *order*, which under concurrent workers can vary
-        /// run-to-run; they are a diagnostic of what happened this run, not a
-        /// replay key. Replay off the seed, not the trace.
+        /// actual runtime hit *order*, which can vary run-to-run under
+        /// concurrent workers. They diagnose this run and are not a replay key.
+        /// Replay off the seed, not the trace.
         #[must_use]
         pub fn diagnostics(&self) -> String {
             self.state.describe()
@@ -1162,9 +1157,9 @@ mod controller {
 
     impl Drop for ChaosGuard {
         fn drop(&mut self) {
-            // Clear armed state here, in the body, so it completes *before*
-            // `_serial` drops (fields drop after the body runs) and no other
-            // `arm()` can observe a half-torn-down state.
+            // Clear armed state here, in the body. Fields drop after the body
+            // runs, so this completes *before* `_serial` drops. No other
+            // `arm()` can then observe a half-torn-down state.
             clear_armed_state(&self.state);
         }
     }
@@ -1175,14 +1170,13 @@ mod controller {
         /// in its place — all **without** releasing the process-wide
         /// [`SERIAL`] lock this guard owns.
         ///
-        /// A test that wants to observe the fully-disarmed window between two
-        /// armed plans cannot get there by dropping its guard: the guard owns
-        /// `SERIAL`, so dropping it hands the lock to whichever sibling test
-        /// is blocked in [`arm`], and that sibling can publish its own
-        /// `ARMED_GEN` before the observation runs. That is a race in the
-        /// test, not in the harness, and it is why this steps through the same
-        /// [`clear_armed_state`] / [`install_armed_state`] sequence the real
-        /// `Drop` and `arm` use while the lock stays put.
+        /// A test cannot observe the fully-disarmed window between two armed
+        /// plans by dropping its guard. The guard owns `SERIAL`. Dropping it
+        /// hands the lock to whichever sibling test is blocked in [`arm`]. That
+        /// sibling can publish its own `ARMED_GEN` before the observation runs.
+        /// That is a race in the test, not in the harness. So this steps
+        /// through the same [`clear_armed_state`] / [`install_armed_state`]
+        /// sequence as the real `Drop` and `arm`, while the lock stays put.
         fn rearm_in_place(&mut self, plan: ChaosPlan, observe_disarmed: impl FnOnce()) {
             clear_armed_state(&self.state);
             observe_disarmed();
@@ -1203,18 +1197,18 @@ mod controller {
     /// simulates a task crash and must be triggered inside a spawned task.
     pub async fn hit(point: ChaosPoint) {
         // One consistent (state, generation) snapshot — see `entry_snapshot`:
-        // rejects a task that straddled a disarm+rearm so it can't fire a
-        // newer plan's directive.
+        // rejects a task that straddled a disarm+rearm, so that it cannot fire
+        // a newer plan's directive.
         let Some(state) = entry_snapshot() else {
             return;
         };
         match state.resolve(point) {
             Resolved::Continue => {}
             Resolved::Kill => {
-                // A simulated task crash: panic with the chaos-kill marker the
-                // quiet panic hook recognizes — but only while this state's
-                // generation is still armed (`fire_if_current`), so a stale
-                // resolved Kill can never crash a later test.
+                // A simulated task crash: panic with the chaos-kill marker that
+                // the quiet panic hook recognizes. Panic only while this
+                // state's generation is still armed (`fire_if_current`). So a
+                // stale resolved Kill can never crash a later test.
                 assert!(
                     !state.fire_if_current(),
                     "harvest-chaos-kill: {}",
@@ -1233,9 +1227,9 @@ mod controller {
             }
             // An infallible `chaos_point!` site cannot honor Error (needs a
             // `chaos_fallible!` site) or DropNotify (needs `chaos_drop_notify!`).
-            // Panic loudly (in debug AND release test builds) instead of
-            // silently swallowing it and inflating the anti-vacuity counter —
-            // a mis-scripted directive is an author bug, not a fault to hide.
+            // Panic loudly, in debug AND release test builds. Silently
+            // swallowing it would inflate the anti-vacuity counter. A
+            // mis-scripted directive is an author bug, not a fault to hide.
             other @ (Resolved::Error(_) | Resolved::DropNotify) => {
                 panic!(
                     "chaos: a {} directive is armed at `{}`, an infallible chaos_point!() site \
@@ -1250,8 +1244,8 @@ mod controller {
     /// A named injection point at a `?`-returning site.
     ///
     /// Like [`hit`], but an armed [`Error`](Action::Error) directive returns the
-    /// injected [`ChaosError`], which the `?` at the call site converts (via
-    /// `From`) into whatever error the enclosing function returns.
+    /// injected [`ChaosError`]. The `?` at the call site converts it (via
+    /// `From`) into the error type of the enclosing function.
     ///
     /// # Errors
     ///
@@ -1324,15 +1318,16 @@ mod controller {
         };
         match state.resolve(point) {
             // `fire_if_current` returns `true` (drop the wake, counted) only
-            // while this state's generation is still armed; a stale state
+            // while this state's generation is still armed. A stale state
             // returns `false`, so no wake is dropped after disarm.
             Resolved::DropNotify => state.fire_if_current(),
             Resolved::Continue => false,
-            // A synchronous drop-notify site can only honor DropNotify; it cannot
-            // await a Hold rendezvous, panic a Kill, sleep a Delay, or return an
-            // Error. Panic loudly on the caps/site mismatch (a scripted Hold here
-            // would otherwise hang the test's `reached().await` forever), in
-            // release test builds too — not just under `debug_assertions`.
+            // A synchronous drop-notify site can only honor DropNotify. It
+            // cannot await a Hold rendezvous, panic a Kill, sleep a Delay, or
+            // return an Error. Panic loudly on the caps/site mismatch, in
+            // release test builds too, not just under `debug_assertions`.
+            // Otherwise a scripted Hold here hangs the test's `reached().await`
+            // forever.
             other => {
                 panic!(
                     "chaos: a {} directive is armed at `{}`, a synchronous chaos_drop_notify!() \
@@ -1602,15 +1597,15 @@ mod controller {
             assert_eq!(state.actions_fired.load(Ordering::Relaxed), 0);
         }
 
-        /// The P2 fix (`mark_fired` is bumped by the entry point only when it can
-        /// honor the resolved action) locked in at the real entry points: a
-        /// honored directive bumps the anti-vacuity counter, a resolve that does
-        /// not fire (wrong ordinal) does not, and each honoring site increments
+        /// The entry point bumps `mark_fired` only when it can honor the resolved
+        /// action. This test locks that rule in at the real entry points. A
+        /// honored directive bumps the anti-vacuity counter. A resolve that does
+        /// not fire (wrong ordinal) does not. Each honoring site increments
         /// exactly once per honored hit.
         #[tokio::test]
         async fn honored_entry_points_bump_actions_fired_but_resolve_alone_does_not() {
-            // DropNotify at a synchronous drop-notify site: `OnHit(1)`, so the
-            // first call is honored (returns true, bumps to 1) and the second
+            // DropNotify at a synchronous drop-notify site, with `OnHit(1)`.
+            // The first call is honored (returns true, bumps to 1). The second
             // resolves `Continue` (returns false, no bump).
             {
                 let guard = arm(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED)).await;
@@ -1642,7 +1637,7 @@ mod controller {
             }
         }
 
-        // ---- Fix 2 (Codex review round 1): scripted directives are validated
+        // ---- Fix 2: scripted directives are validated
         //      against the point's declared caps at plan-build time -----------
 
         #[test]
@@ -1684,15 +1679,15 @@ mod controller {
             let _ = ChaosPlan::scripted().hold_at(QUEUE_PARK_BEFORE_UPDATE);
         }
 
-        // ---- Fix 1 (Codex review round 1): a resolved action is fenced by the
+        // ---- Fix 1: a resolved action is fenced by the
         //      armed generation, so a stale state cannot fire into a later plan -
 
         #[tokio::test]
         async fn a_stale_state_is_fenced_after_its_plan_is_disarmed() {
-            // Capture a live state's Arc and resolve a directive while armed (as
-            // a slow spawned task would), then drop the guard and arm a *newer*
-            // plan. The stale state must refuse to fire and must not bump its
-            // anti-vacuity counter.
+            // Capture the Arc of a live state and resolve a directive while
+            // armed, as a slow spawned task would. Then drop the guard and arm a
+            // *newer* plan. The stale state must refuse to fire and must not
+            // bump its anti-vacuity counter.
             let stale: Arc<ChaosState> = {
                 let _guard = arm(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED)).await;
                 let s = current_state().expect("armed state present");
@@ -1722,15 +1717,15 @@ mod controller {
             drop(newer);
         }
 
-        // ---- Fix 3 (Codex review round 2): the entry snapshot rejects a state
-        //      whose generation != the armed generation, so a task that
-        //      straddled a disarm+rearm between the `ARMED_GEN` read and the
-        //      `STATE` read cannot adopt a *newer* plan's directive. Unlike
-        //      Fix 1 (a *captured* Arc fenced at fire time), this rejects the
-        //      torn read at the entry point, before `resolve` even bumps the
-        //      hit counter. (Fix 4, below, later removed a separate `ARMED`
-        //      bool this window used to sit behind; this generation-mismatch
-        //      fence is unchanged and still the mechanism this test exercises.) --
+        // ---- Fix 3: the entry snapshot rejects a state whose generation !=
+        //      the armed generation. So a task that straddled a disarm+rearm
+        //      between the `ARMED_GEN` read and the `STATE` read cannot adopt
+        //      a *newer* plan's directive. Fix 1 fences a *captured* Arc at
+        //      fire time. This test instead rejects the torn read at the entry
+        //      point, before `resolve` even bumps the hit counter. Fix 4,
+        //      below, later removed a separate `ARMED` bool that guarded this
+        //      window. This generation-mismatch fence is unchanged, and this
+        //      test still exercises it. --
 
         #[tokio::test]
         async fn entry_snapshot_rejects_a_torn_state_from_a_different_generation() {
@@ -1739,11 +1734,11 @@ mod controller {
             let _guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let armed_gen = ARMED_GEN.load(Ordering::SeqCst);
 
-            // The torn read a straddling task would observe: STATE holds a state
-            // whose generation is NOT the currently-armed ARMED_GEN, as if a
-            // disarm+rearm slipped between the entry generation read and the
-            // STATE read. `entry_snapshot` must reject it (return `None`) so the
-            // task resolves nothing against the mismatched plan.
+            // Build the torn read that a straddling task would observe. STATE
+            // holds a state whose generation is NOT the armed ARMED_GEN. It is
+            // as if a disarm+rearm slipped between the entry generation read and
+            // the STATE read. `entry_snapshot` must reject it (return `None`),
+            // so the task resolves nothing against the mismatched plan.
             let mismatched = Arc::new(ChaosState::from_plan(
                 ChaosPlan::scripted(),
                 armed_gen.wrapping_add(1),
@@ -1764,52 +1759,52 @@ mod controller {
             // `_guard` drop restores STATE=None / disarmed for the next test.
         }
 
-        // ---- Fix 4 (Codex review round 4, issue #1202 / #940 follow-up): the
-        //      entry point used to read `ARMED` (a bare bool) and `ARMED_GEN`
-        //      (the generation) as two SEPARATE atomics. A task preempted
-        //      between those two reads could observe `ARMED == true` under an
-        //      outgoing plan, resume after a *full* disarm + re-arm to a
-        //      different plan, and then read the *incoming* plan's
-        //      `ARMED_GEN`/`STATE` pair -- which is trivially self-consistent
-        //      (both belong to the same, newer generation) -- so the mismatch
-        //      fence (Fix 3, above) never fires and the straggling task
-        //      wrongly adopts the newer plan's directive.
+        // ---- Fix 4 (issue #1202 / #940 follow-up): the entry point used to
+        //      read `ARMED` (a bare bool) and `ARMED_GEN` (the generation)
+        //      separately. A task preempted between those two reads
+        //      could observe `ARMED == true` under an outgoing plan. It could
+        //      then resume after a *full* disarm + re-arm to a different plan,
+        //      and read the *incoming* plan's `ARMED_GEN`/`STATE` pair. That
+        //      pair is trivially self-consistent: both belong to the same,
+        //      newer generation. So the mismatch fence (Fix 3, above) never
+        //      fires, and the straggling task wrongly adopts the newer plan's
+        //      directive.
         //
         //      `vulnerable_two_read_shape` below is a byte-for-byte copy of
-        //      the *removed* algorithm (what `entry_snapshot` used to be),
-        //      resurrected here only so this test can prove the straddle was
-        //      real: it takes a caller-supplied `observed_armed` bool --
-        //      standing in for the stale `ARMED` read a preempted task would
-        //      have captured before the transition -- then reads whatever
-        //      `ARMED_GEN`/`STATE` are CURRENT. Driving it through a real
-        //      arm -> disarm -> re-arm sequence, with the captured boolean
-        //      held stale across that transition, shows it wrongly returns
-        //      `Some` for the newer generation.
+        //      the *removed* algorithm (what `entry_snapshot` used to be). It
+        //      exists here only so this test can prove the straddle was real.
+        //      It takes a caller-supplied `observed_armed` bool. That bool
+        //      stands in for the stale `ARMED` read that a preempted task
+        //      would have captured before the transition. It then reads
+        //      whatever `ARMED_GEN`/`STATE` are CURRENT. The test drives it
+        //      through a real arm -> disarm -> re-arm sequence, with the
+        //      captured boolean held stale across that transition. It then
+        //      wrongly returns `Some` for the newer generation.
         //
-        //      The fix deletes the standalone boolean entirely: `ARMED_GEN`
-        //      alone is now both the armed/disarmed sentinel (`0` = disarmed)
-        //      and the generation to fence against (see `entry_snapshot`), so
-        //      there is no separate first read left for a task to straddle --
-        //      the vulnerable shape can no longer be constructed from
-        //      `entry_snapshot`'s actual (single-read) sequence. A task can
-        //      still be preempted *between* the `ARMED_GEN` read and the
-        //      `STATE` read, but that is exactly the pre-existing Fix-3 window
-        //      (a mismatched generation), already covered above.
+        //      The fix deletes the standalone boolean entirely. `ARMED_GEN`
+        //      alone is now the armed/disarmed sentinel (`0` = disarmed). It
+        //      is also the generation to fence against (see `entry_snapshot`).
+        //      So no separate first read is left for a task to straddle. The
+        //      actual (single-read) sequence of `entry_snapshot` cannot build
+        //      the vulnerable shape. A task can still be preempted *between*
+        //      the `ARMED_GEN` read and the `STATE` read. That is exactly the
+        //      pre-existing Fix-3 window (a mismatched generation), already
+        //      covered above.
         //
-        //      The straddle also has a *false-negative* mirror image, verified
-        //      directly against the real (pre-fix) `entry_snapshot` during
-        //      development of this fix: `arm` publishes `STATE` and
-        //      `ARMED_GEN` *before* flipping `ARMED` true, so a reader
-        //      observing exactly that window -- `ARMED_GEN`/`STATE` already a
-        //      valid, self-consistent pair, `ARMED` still stale-`false` --
-        //      would incorrectly see the harness as disarmed and silently
-        //      skip fault injection the plan believes is live. Poking
-        //      `ARMED.store(false, ..)` on a freshly-armed guard and asserting
-        //      `entry_snapshot().is_some()` failed against the pre-fix code
-        //      and passes once `ARMED` no longer exists to read; that
-        //      transient check is not kept here (it referenced a static this
-        //      fix deletes) but is recorded in this comment for anyone
-        //      re-deriving the fix's justification.
+        //      The straddle also has a *false-negative* mirror image. It was
+        //      verified directly against the real (pre-fix) `entry_snapshot`
+        //      during development of this fix. `arm` publishes `STATE` and
+        //      `ARMED_GEN` *before* it flips `ARMED` true. Take a reader in
+        //      exactly that window. `ARMED_GEN`/`STATE` are already a valid,
+        //      self-consistent pair, but `ARMED` is still stale-`false`. That
+        //      reader would wrongly see the harness as disarmed. It would
+        //      silently skip fault injection that the plan believes is live.
+        //      A check poked `ARMED.store(false, ..)` on a freshly-armed guard
+        //      and asserted `entry_snapshot().is_some()`. It failed against
+        //      the pre-fix code and passes once `ARMED` no longer exists. That
+        //      transient check is not kept here, because it referenced a
+        //      static that this fix deletes. This comment records it for
+        //      anyone who re-derives the justification of the fix.
 
         /// The exact two-read shape `entry_snapshot` used before this fix,
         /// resurrected here only to prove the straddle it permitted. Not
@@ -1838,16 +1833,16 @@ mod controller {
             );
 
             // "Step 1" of the removed shape: a task observes the harness armed
-            // under gen1 and captures that bare boolean, intending to read the
+            // under gen1 and captures that bare boolean. It reads the
             // generation and state next.
             let observed_armed_under_gen1 = true;
 
-            // The task is preempted here: a *full* disarm happens before it
-            // resumes, then a re-arm to a *different* plan completes, still
-            // before the preempted task resumes. `rearm_in_place` walks that
-            // disarm/re-arm without ever releasing `SERIAL` — dropping the
-            // guard to disarm would hand the lock to a sibling test, which
-            // could arm into the window the assertion below is about.
+            // The task is preempted here. A *full* disarm happens, then a
+            // re-arm to a *different* plan completes, both before the task
+            // resumes. `rearm_in_place` walks that disarm/re-arm without ever
+            // releasing `SERIAL`. A guard drop to disarm would hand the lock to
+            // a sibling test. That test could arm into the window that the
+            // assertion below checks.
             guard.rearm_in_place(ChaosPlan::scripted(), || {
                 // The real entry point, called fresh in this fully-disarmed
                 // window, correctly observes nothing armed.
@@ -1865,8 +1860,8 @@ mod controller {
 
             // Resumed: "step 2" of the removed shape reads whatever is CURRENT
             // now (gen2's), using the stale boolean captured under gen1. This
-            // is the bug: the removed shape treats a stale "yes, something was
-            // armed" as license to adopt whatever is armed NOW, regardless of
+            // is the bug. The removed shape treats a stale "yes, something was
+            // armed" as license to adopt whatever is armed NOW. It ignores
             // which plan that stale observation actually belonged to.
             let vulnerable_result = vulnerable_two_read_shape(observed_armed_under_gen1);
             assert!(
@@ -1878,27 +1873,26 @@ mod controller {
             drop(guard);
         }
 
-        // ---- Codex review round 3 (issue #1202): the test above only proves
-        //      the REMOVED two-read shape was buggy by calling a
-        //      hand-reconstructed clone (`vulnerable_two_read_shape`) -- it
-        //      never exercises the REAL `entry_snapshot` under an actual
-        //      straddle, so it would not catch a regression that
-        //      reintroduces an equivalent stale-decision defect (a separate
-        //      flag or otherwise) into the real function. This test closes
-        //      that gap: it pauses the REAL `entry_snapshot` (via the
-        //      `#[cfg(test)]`-only rendezvous installed next to it) on a
-        //      genuine OS thread, between its own two reads, and drives a
-        //      real concurrent disarm+rearm across the pause. ----
+        // ---- Issue #1202: the test above only proves that the REMOVED
+        //      two-read shape was buggy. It calls a hand-reconstructed clone
+        //      (`vulnerable_two_read_shape`). It never exercises the REAL
+        //      `entry_snapshot` under an actual straddle. So it would not
+        //      catch a regression that puts an equivalent stale-decision
+        //      defect (a separate flag or otherwise) back into the real
+        //      function. This test closes that gap. It pauses the REAL
+        //      `entry_snapshot` (via the `#[cfg(test)]`-only rendezvous
+        //      installed next to it) on a genuine OS thread, between its own
+        //      two reads. It then drives a real concurrent disarm+rearm across
+        //      the pause. ----
 
         #[tokio::test]
         async fn entry_snapshot_rejects_a_straddled_read_of_the_real_production_path() {
-            // `entry_snapshot` itself is synchronous; it is run here on a
-            // real `std::thread` (not a tokio task) because the pause hook
-            // below blocks with `std::sync::mpsc`, not a tokio channel. The
-            // blocking `reached_rx.recv()` a few lines down runs on this
-            // test's own (current-thread) tokio executor, which is fine: the
-            // only thing it is waiting on is the separately-spawned
-            // `std::thread`, not any other tokio task on this runtime.
+            // `entry_snapshot` itself is synchronous. It runs here on a real
+            // `std::thread` (not a tokio task), because the pause hook below
+            // blocks with `std::sync::mpsc`, not a tokio channel. The blocking
+            // `reached_rx.recv()` below runs on the current-thread tokio
+            // executor of this test. That is safe: it waits only on the
+            // separately-spawned `std::thread`, not on another tokio task.
             let mut guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let gen1 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, 0, "gen1 must be armed here");
@@ -1909,14 +1903,13 @@ mod controller {
                 .recv()
                 .expect("the real entry_snapshot must reach the rendezvous while armed");
 
-            // While the spawned call is parked between its own two reads
-            // (having already captured entry_gen == gen1), perform a REAL
-            // disarm + rearm to a different plan -- genuine concurrency, not
-            // a simulated STATE poke like the Fix-3 test above.
-            // `rearm_in_place`, not drop-then-`arm`: dropping the guard would
-            // release `SERIAL` while this test still has a paused
-            // `entry_snapshot` in flight, letting a sibling test arm on top of
-            // the straddle this test is constructing.
+            // The spawned call is parked between its own two reads, and it
+            // already captured entry_gen == gen1. Now perform a REAL disarm +
+            // rearm to a different plan. That is genuine concurrency, not a
+            // simulated STATE poke like the Fix-3 test above. Use
+            // `rearm_in_place`, not drop-then-`arm`. A guard drop would release
+            // `SERIAL` while a paused `entry_snapshot` is still in flight. A
+            // sibling test could then arm on top of the straddle.
             guard.rearm_in_place(ChaosPlan::scripted(), || {});
             let gen2 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, gen2, "gen2 must be a genuinely different generation");

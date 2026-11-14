@@ -1,25 +1,24 @@
 //! Control dependence: which command emissions a tainted branch decides (D5).
 //!
-//! A sink that is *reached only when a non-deterministic condition holds* is a
-//! determinism bug even when every argument it receives is a constant — the
-//! recorded history has a different length, or a different order, on a replay.
-//! The corpus pins three cases on this: `wf_atomic_shard_pick` (which of three
-//! activities), `wf_order_dependence_which_first` (the same two activities in
-//! the other order) and `wf_conditional_command_emission` (one activity, or
-//! none).
+//! A sink *reached only when a non-deterministic condition holds* is a
+//! determinism bug, even when every argument is a constant. On a replay the
+//! recorded history has a different length or a different order. The corpus
+//! pins three cases: `wf_atomic_shard_pick` (which of three activities),
+//! `wf_order_dependence_which_first` (the same two activities in the other
+//! order) and `wf_conditional_command_emission` (one activity, or none).
 //!
-//! The rule is the textbook one and *not* "every sink after the branch":
-//! block `B` is control-dependent on branch `S` when some successor of `S`
+//! The rule is the textbook one, *not* "every sink after the branch". Block
+//! `B` is control-dependent on branch `S` when some successor of `S`
 //! post-dominates `B`, and `B` does **not** post-dominate `S`. That second
-//! clause is what keeps the unconditional `primary` activity in
-//! `wf_conditional_command_emission` out of the finding, and what stops every
+//! clause keeps the unconditional `primary` activity in
+//! `wf_conditional_command_emission` out of the finding. It also stops every
 //! `?` from making the rest of a workflow control-dependent.
 //!
-//! Two MIR-specific rules keep the false-positive rate survivable, both
-//! enforced by the *taint* of the switch operand rather than here:
-//! `switchInt(discriminant(P))` reads `P` exactly (never through an extension),
-//! so an `async` coroutine's own resume-state switch and rustc's drop flags are
-//! clean by construction. Unwind edges are excluded from the CFG entirely:
+//! Two MIR-specific rules keep the false-positive rate survivable. The *taint*
+//! of the switch operand enforces both, not this module.
+//! `switchInt(discriminant(P))` reads `P` exactly, never through an extension.
+//! So the resume-state switch of an `async` coroutine and the drop flags of
+//! rustc are clean by construction. Unwind edges are not in the CFG at all:
 //! every call can unwind, and a panic path is not a decision the workflow made.
 
 use crate::mir::ast::Body;
@@ -146,10 +145,10 @@ impl ControlGraph {
 
 /// Iterative post-dominance over the reverse CFG with one virtual exit.
 ///
-/// A block that cannot reach the exit at all (an unconditional loop, or a chain
-/// that only ends in `unreachable`) post-dominates nothing but itself — the
-/// conservative direction, since "does not post-dominate" is what *adds* a
-/// finding and a missed one is a false negative, not a false positive.
+/// A block that cannot reach the exit post-dominates nothing but itself. An
+/// unconditional loop and a chain that ends only in `unreachable` are such
+/// blocks. That is the conservative direction: "does not post-dominate" *adds*
+/// a finding, and a missed one is a false negative, not a false positive.
 fn post_dominance(successors: &[Vec<usize>], reachable: &[bool]) -> Vec<Vec<bool>> {
     let count = successors.len();
     let mut can_exit = vec![false; count];
@@ -404,11 +403,12 @@ mod tests {
     ///
     /// Every `async` body opens with `_n = discriminant((*_m)); switchInt(_n)`,
     /// and the workflow's own locals live in the *fields* of `(*_m)` across the
-    /// suspend points. If a `discriminant` read saw through to those fields,
-    /// one tainted local would make the resume switch tainted, every sink in
-    /// the body control-dependent on it, and every async workflow in the repo a
-    /// finding. `tests/fixtures/async_multi_await.mir` is a three-suspend-point
-    /// coroutine that holds a struct across all of them.
+    /// suspend points. Suppose a `discriminant` read saw through to those
+    /// fields. One tainted local would then taint the resume switch. Every sink
+    /// in the body would be control-dependent on it, and every async workflow
+    /// in the repo would be a finding. `tests/fixtures/async_multi_await.mir`
+    /// is a three-suspend-point coroutine that holds a struct across all of
+    /// them.
     #[test]
     fn the_coroutine_resume_switch_does_not_see_its_own_suspended_locals() {
         use super::super::taint::{Fact, TaintSet, TaintState};

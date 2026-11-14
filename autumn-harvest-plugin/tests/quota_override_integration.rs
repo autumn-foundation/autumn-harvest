@@ -322,7 +322,6 @@ async fn quotas(app: &axum::Router) -> Value {
     body
 }
 
-/// The usage entry of one `(workflow_name, quota_key)` pair.
 fn usage_entry<'a>(body: &'a Value, workflow_name: &str, key: &str) -> &'a Value {
     body["quotas"]
         .as_array()
@@ -332,7 +331,6 @@ fn usage_entry<'a>(body: &'a Value, workflow_name: &str, key: &str) -> &'a Value
         .unwrap_or_else(|| panic!("no entry for {workflow_name}/{key}: {body}"))
 }
 
-/// The `workflow_types` entry of one type.
 fn type_entry<'a>(body: &'a Value, workflow_name: &str) -> &'a Value {
     body["workflow_types"]
         .as_array()

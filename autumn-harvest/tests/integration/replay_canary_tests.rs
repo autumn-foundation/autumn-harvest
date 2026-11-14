@@ -110,7 +110,6 @@ async fn test_replay_canary_simple_pass() {
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("hello", hello_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -174,7 +173,6 @@ async fn test_replay_canary_suspended_workflow() {
         .await
         .unwrap();
 
-    // Event 1: WorkflowStarted
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
         timestamp: Utc::now(),
@@ -196,7 +194,6 @@ async fn test_replay_canary_suspended_workflow() {
         .await
         .unwrap();
 
-    // Event 2: ActivityScheduled
     let act_event = WorkflowEvent::ActivityScheduled {
         activity_id: ActivityExecId::new(),
         name: "my_activity".to_string(),
@@ -217,7 +214,6 @@ async fn test_replay_canary_suspended_workflow() {
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("activity_wf", activity_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -228,7 +224,7 @@ async fn test_replay_canary_suspended_workflow() {
         .await
         .expect("canary run");
 
-    // This should PASS because suspending at the end of history for a RUNNING workflow is expected.
+    // A RUNNING workflow may suspend at the end of history, so the canary passes.
     assert_eq!(report.verdict, CanaryVerdict::Pass);
     assert_eq!(report.sampled, 1);
     assert_eq!(report.replay_succeeded, 1);
@@ -269,7 +265,6 @@ async fn test_replay_canary_divergent_workflow() {
         .await
         .unwrap();
 
-    // Event 1: WorkflowStarted
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
         timestamp: Utc::now(),
@@ -291,7 +286,7 @@ async fn test_replay_canary_divergent_workflow() {
         .await
         .unwrap();
 
-    // Event 2: ActivityScheduled with a mismatching activity name "different_activity"
+    // A mismatching activity name, "different_activity".
     let act_event = WorkflowEvent::ActivityScheduled {
         activity_id: ActivityExecId::new(),
         name: "different_activity".to_string(),
@@ -312,7 +307,6 @@ async fn test_replay_canary_divergent_workflow() {
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("activity_wf", activity_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -323,7 +317,7 @@ async fn test_replay_canary_divergent_workflow() {
         .await
         .expect("canary run");
 
-    // This should FAIL because code scheduled "my_activity" but history expected "different_activity".
+    // The code schedules "my_activity", but history holds "different_activity".
     assert_eq!(report.verdict, CanaryVerdict::Fail);
     assert_eq!(report.sampled, 1);
     assert_eq!(report.replay_succeeded, 0);

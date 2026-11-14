@@ -63,8 +63,6 @@ const SIZES: [u64; 3] = [250, 1_000, 2_000];
 /// The run size of the structural test. Small, because it runs in CI.
 const STRUCTURAL_TIMERS: u64 = 5;
 
-// ── workflow ─────────────────────────────────────────────────────────────────
-
 type BoxFut<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 /// Fires `n` zero-second timers in a row. Each timer is one decision.
@@ -121,8 +119,6 @@ fn worker(worker_id: &str) -> Arc<Worker> {
     config.worker_heartbeat_interval = Duration::from_secs(600);
     Arc::new(Worker::new(config, registry).expect("the worker builds"))
 }
-
-// ── database ─────────────────────────────────────────────────────────────────
 
 async fn setup_server() -> (String, Option<ContainerAsync<Postgres>>) {
     use testcontainers::ImageExt;

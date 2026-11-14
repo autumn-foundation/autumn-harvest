@@ -59,10 +59,9 @@ fn child_fan_out_fail_fast<'a>(
     })
 }
 
-// Two failing children among three slots -- used to demonstrate the known,
-// pre-existing (shared with activity fan-out) limitation that a fail-fast
-// replay selects the failure at the lowest input-slot index, not necessarily
-// the one whose terminal event was recorded earliest in history. See
+// Two failing children among three slots. It shows a known limitation, shared
+// with activity fan-out. A fail-fast replay selects the failure at the lowest
+// input-slot index. That is not always the terminal recorded earliest. See
 // `child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_recorded_order`.
 fn child_fan_out_two_failures<'a>(
     ctx: &'a WorkflowContext,
@@ -84,11 +83,10 @@ fn child_fan_out_two_failures<'a>(
 
 // Two children: slot 0 is still ChildInProgress (no terminal recorded), slot
 // 1 has a recorded failure. Catches the fail-fast error and continues by
-// scheduling an activity -- used to demonstrate the known limitation where
-// try_join_all re-emits slot 0's StartChildWorkflow re-park command before
-// the fail-fast error is even returned, leaving it in the *same* commands
-// batch as whatever the workflow does next. See
-// `child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next_suspension`.
+// scheduling an activity. `try_join_all` re-emits the StartChildWorkflow
+// re-park command of slot 0 before it returns the fail-fast error. That
+// command lands in the *same* batch as whatever the workflow does next. See
+// `child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch`.
 fn child_fan_out_catch_and_continue<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -313,38 +311,35 @@ async fn child_fan_out_raw_fail_fast_on_first_failure() {
     }
 }
 
-/// **Known limitation** (PR #901 review, shared with the pre-existing activity
-/// fan-out from issue #359 -- not introduced by child fan-out): when two or
-/// more children fail and their terminals are all already recorded (a full
-/// replay, e.g. crash recovery or `WorkflowReplayer`), the fail-fast fan-out
-/// selects the failure at the **lowest input-slot index**, not necessarily the
-/// one whose `ChildWorkflowFailed` event was recorded earliest in history.
+/// **Known limitation** (PR #901), shared with the activity fan-out of issue
+/// #359.
+///
+/// Child fan-out did not introduce it. Two or more children can fail with all
+/// their terminals already recorded. That is a full replay, e.g. crash
+/// recovery or `WorkflowReplayer`. The fail-fast fan-out then selects the
+/// failure at the **lowest input-slot index**. That is not always the
+/// `ChildWorkflowFailed` event recorded earliest in history.
 ///
 /// `try_join_all` resolves every slot's future synchronously on its first poll
-/// once a terminal is already in history (`match_child_workflow` is a pure,
-/// synchronous history scan with no actual suspension for an already-recorded
-/// `Matched`/`Failed` result), so a single poll pass finds whichever slot's
-/// future is ready-with-`Err` first while iterating in **slot order** --
-/// this is *usually* the same as recorded order (each terminal typically
-/// arrives in its own wake/replay cycle), but diverges when two terminals
-/// land in history before the same decision cycle observes either of them.
+/// once a terminal is in history. `match_child_workflow` is a pure, synchronous
+/// history scan, with no suspension for a recorded `Matched`/`Failed` result.
+/// So one poll pass finds the first slot ready with `Err`, in **slot order**.
+/// That *usually* matches recorded order, because each terminal typically
+/// arrives in its own wake/replay cycle. It diverges when two terminals land in
+/// history before one decision cycle observes either of them.
 ///
-/// This test locks in the *current* behavior for two reasons: (1) it proves
-/// the divergence is real, and (2) it guards against a silent, undetected
-/// behavior change (e.g. from a future refactor of the fan-out or the
-/// underlying `try_join_all` usage) going unnoticed. A workflow that branches
-/// on the *content* of the returned fail-fast error (rather than treating any
-/// fan-out failure identically) should be aware this selection is
-/// **not** guaranteed to reproduce the live run's chronological "first
-/// failure" on replay.
+/// This test locks in the *current* behavior. It proves the divergence is
+/// real. It also catches a silent behavior change, e.g. from a refactor of the
+/// fan-out or its `try_join_all` use. A workflow can branch on the *content*
+/// of the fail-fast error, not treat every fan-out failure the same. Replay
+/// does **not** guarantee that such a workflow sees the live run's
+/// chronological "first failure".
 ///
-/// Fixing this properly requires threading the recorded terminal event's
-/// index through `HistoryMatch::Failed` and selecting by that index rather
-/// than by `try_join_all`'s poll order -- a change that would need to apply
-/// equally to `execute_activity_fan_out_raw` to stay consistent between the
-/// two fan-out primitives, and is out of scope for issue #601 (which mirrors
-/// the pre-existing activity fan-out mechanism deliberately, defects
-/// included).
+/// A proper fix threads the recorded terminal event's index through
+/// `HistoryMatch::Failed` and selects by that index, not by poll order. The
+/// same change must apply to `execute_activity_fan_out_raw`, to keep the two
+/// fan-out primitives consistent. It is out of scope for issue #601. That
+/// issue mirrors the activity fan-out mechanism on purpose, defects included.
 #[tokio::test]
 async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_recorded_order() {
     let exec_id = ExecutionId::new();
@@ -364,9 +359,9 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
         child_started(id_fail_low_slot, "child_fail_low_slot", Value::Null),
         child_started(id_fail_high_slot, "child_fail_high_slot", Value::Null),
         child_completed(id_ok, json!("success")),
-        // The HIGH-slot child (index 2) is recorded as having failed FIRST --
-        // i.e. on the original live run, this is the failure that actually
-        // won the real chronological race and was surfaced to the workflow.
+        // The HIGH-slot child (index 2) is recorded as failing FIRST. On the
+        // live run, this failure won the chronological race and reached the
+        // workflow.
         child_failed(id_fail_high_slot, "high_slot_failed_first_chronologically"),
         // The LOW-slot child (index 1) failed second, chronologically.
         child_failed(id_fail_low_slot, "low_slot_failed_second_chronologically"),
@@ -377,11 +372,10 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
     match outcome {
         WorkflowOutcome::Failed { error, .. } => {
             // Known-limitation assertion: replay returns the LOW-slot error
-            // (index order) even though the HIGH-slot error was recorded
-            // first (and is what the live run actually returned). If this
-            // assertion ever starts failing, the underlying selection
-            // mechanism has changed -- update this test and the doc comment
-            // above rather than treating it as a regression.
+            // (index order), though the HIGH-slot error was recorded first
+            // and the live run returned it. If this assertion fails, the
+            // selection mechanism has changed. Then update this test and its
+            // doc comment. Do not treat it as a regression.
             assert!(
                 error.contains("low_slot_failed_second_chronologically"),
                 "replay is expected to select the lowest-slot-index failure \
@@ -392,41 +386,42 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
     }
 }
 
-/// **Resolved by issue #950** (previously a documented known limitation from PR
-/// #901, shared with the pre-existing activity fan-out of issue #359): when an
-/// earlier-slot child is still `ChildInProgress` (started, no terminal
-/// recorded yet) while a later-slot child has a recorded failure,
-/// `try_join_all` polls the earlier slot first during the same sweep that
-/// discovers the fail-fast error. `spawn_child_workflow_raw`'s
-/// `ChildInProgress` branch synchronously pushes a re-park
-/// `StartChildWorkflow` command (carrying the existing `child_id`) *before*
-/// suspending on its own oneshot -- and that push is not undone when
-/// `try_join_all` subsequently short-circuits on the later slot's `Err` and
-/// drops the still-pending future. If the workflow catches the fail-fast
-/// error and pushes a different command (e.g. schedules an activity), both
-/// commands land in the *same* suspension batch: a stale re-park alongside
-/// an unrelated new command.
+/// **Resolved by issue #950**: a stale re-park shares a batch with the next
+/// command.
 ///
-/// That batch is still emitted (the combinator semantics are unchanged), but it
-/// is no longer fatal: the worker's suspension-persistence layer now persists
-/// an arbitrary MIXED command batch in one transaction
-/// (`extract_mixed_suspension_batch` / `persist_mixed_suspension_batch`), so a
-/// `StartChildWorkflow` re-park sharing a batch with a `ScheduleActivity` is a
-/// benign re-park: the still-running child is recognised as already-started (no
-/// second row, no second `ChildWorkflowStarted`), the new activity is enqueued,
-/// and the workflow is parked to be woken by whichever resolves first. The
-/// pre-#950 outcome -- "workflow task suspended with unsupported commands ...;
-/// this command set is not implemented yet", terminally failing a workflow that
-/// merely caught a fan-out error and continued -- is gone.
+/// This was a documented known limitation from PR #901, shared with the
+/// activity fan-out of issue #359. An earlier-slot child can still be
+/// `ChildInProgress` (started, no terminal yet) while a later-slot child has a
+/// recorded failure. `try_join_all` then polls the earlier slot first, in the
+/// sweep that discovers the fail-fast error. The `ChildInProgress` branch of
+/// `spawn_child_workflow_raw` synchronously pushes a re-park
+/// `StartChildWorkflow` command with the existing `child_id`. It does so
+/// *before* it suspends on its own oneshot. `try_join_all` then
+/// short-circuits on the later slot's `Err` and drops the pending future. That
+/// does not undo the push. The workflow can catch the fail-fast error and push
+/// a different command, e.g. schedule an activity. Both commands then land in
+/// the *same* suspension batch: a stale re-park beside an unrelated command.
+///
+/// The batch is still emitted, because the combinator semantics are unchanged.
+/// But it is no longer fatal. The worker now persists an arbitrary MIXED
+/// command batch in one transaction (`extract_mixed_suspension_batch` /
+/// `persist_mixed_suspension_batch`). So a `StartChildWorkflow` re-park beside
+/// a `ScheduleActivity` is a benign re-park. The running child is recognised
+/// as already started: no second row, no second `ChildWorkflowStarted`. The
+/// new activity is enqueued. The workflow parks until either one resolves.
+/// Before #950 the worker failed with "workflow task suspended with
+/// unsupported commands ...; this command set is not implemented yet". That
+/// terminally failed a workflow that only caught a fan-out error and went on.
+/// That outcome is gone.
 ///
 /// `execute_activity_fan_out_raw` (issue #359) has the identical structure
 /// (`ActivityInProgress` also pushes `WaitForActivity` then suspends before
 /// returning), so the same fix covers it.
 ///
-/// This test asserts the batch's shape at the `WorkflowOutcome` level (a full
-/// worker-level end-to-end proof lives in the DB-backed
-/// `mixed_suspension_tests.rs`, since the dispatch decision lives in
-/// `worker.rs`, not the pure `executor::run_workflow` used here).
+/// This test asserts the batch's shape at the `WorkflowOutcome` level. The
+/// dispatch decision lives in `worker.rs`, not in the pure
+/// `executor::run_workflow` used here. So the full worker-level proof lives in
+/// the DB-backed `mixed_suspension_tests.rs`.
 #[tokio::test]
 async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
     let exec_id = ExecutionId::new();
@@ -493,11 +488,11 @@ async fn child_fan_out_raw_stale_repark_shares_a_persistable_mixed_batch() {
             // accepts. Before #950 it matched NO extractor and the worker
             // terminally failed the workflow with "unsupported commands".
             //
-            // `autumn_harvest::worker` is gated behind the `db` feature, while
-            // this file is not, so the assertion is gated to match — CI runs the
-            // integration target under `--no-default-features --features testing`
-            // for the docs guards, where the module does not exist. The
-            // assertions above (which pin the emitted batch shape) still run
+            // `autumn_harvest::worker` is gated behind the `db` feature, and
+            // this file is not. So this assertion has the same gate. CI runs
+            // the integration target for the docs guards under
+            // `--no-default-features --features testing`, without that module.
+            // The assertions above pin the emitted batch shape and still run
             // under every feature set.
             #[cfg(feature = "db")]
             assert!(
@@ -959,15 +954,15 @@ async fn child_fan_out_typed_collect_all_returns_per_slot_results() {
 }
 
 // ---------------------------------------------------------------------------
-// Post-review hardening: all-or-nothing dispatch on payload-cap overflow
+// All-or-nothing dispatch on payload-cap overflow
 // ---------------------------------------------------------------------------
 
 /// A fresh fan-out where one child's input exceeds the payload cap must fail
-/// with `PayloadTooLarge` *before dispatching any child* -- not leave earlier
-/// siblings' `StartChildWorkflow` commands sitting in the drained command
-/// list while the batch as a whole fails. Proves the dispatch is genuinely
-/// all-or-nothing: zero `StartChildWorkflow` commands are ever pushed, not a
-/// partial N-of-M count that would depend on `try_join_all`'s poll order.
+/// with `PayloadTooLarge` *before dispatching any child*. It must not leave
+/// earlier siblings' `StartChildWorkflow` commands in the drained list while
+/// the batch fails. Proves the dispatch is all-or-nothing. Zero
+/// `StartChildWorkflow` commands are pushed, not a partial N-of-M count that
+/// depends on `try_join_all`'s poll order.
 #[tokio::test]
 async fn child_fan_out_raw_oversized_child_rejects_before_dispatching_any_sibling() {
     let exec_id = ExecutionId::new();
@@ -999,12 +994,12 @@ async fn child_fan_out_raw_oversized_child_rejects_before_dispatching_any_siblin
         other => panic!("expected PayloadTooLarge, got {other:?}"),
     }
 
-    // Zero commands of ANY kind -- not even the `fan_out:{n}` marker --
-    // must be pushed. If the marker were recorded but no children were, a
-    // later replay of this exact terminal history would match the marker
-    // (fresh_dispatch == false), skip the cap re-check, and then diverge
-    // looking for `ChildWorkflowStarted` events that were never recorded
-    // (see `replayer_...` coverage in tests/replayer_tests.rs).
+    // Zero commands of ANY kind may be pushed, not even the `fan_out:{n}`
+    // marker. Suppose the marker were recorded but no children were. A later
+    // replay of this terminal history would match the marker
+    // (fresh_dispatch == false) and skip the cap re-check. It would then
+    // diverge, looking for `ChildWorkflowStarted` events that were never
+    // recorded (see `replayer_...` coverage in tests/replayer_tests.rs).
     let commands = ctx.drain_commands();
     assert!(
         commands.is_empty(),
@@ -1013,12 +1008,11 @@ async fn child_fan_out_raw_oversized_child_rejects_before_dispatching_any_siblin
     );
 }
 
-/// A fan-out group already fully recorded in history (both children
-/// `Matched`) must replay successfully even if `payload_max_workflow_input`
-/// has since been lowered below what one child's original input required --
-/// the payload pre-check must never re-run on replay, only on a fresh
-/// (first-time) dispatch, or a config change alone could make an
-/// already-completed execution fail non-deterministically on replay.
+/// A fan-out group fully recorded in history (both children `Matched`) must
+/// replay successfully. That holds even if `payload_max_workflow_input` has
+/// since dropped below one child's original input. The payload pre-check runs
+/// only on a fresh (first-time) dispatch, never on replay. Otherwise a config
+/// change alone could make a completed execution fail on replay.
 #[tokio::test]
 async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_recorded_children() {
     let exec_id = ExecutionId::new();
@@ -1061,27 +1055,27 @@ async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_record
     assert_eq!(results, vec![json!("result_a"), json!("result_b")]);
 }
 
-/// A workflow that catches a fan-out's `PayloadTooLarge` (a normal,
-/// supported "degrade gracefully" pattern -- the caller can `match`/`map_err`
-/// on the returned `HarvestResult` instead of propagating with `?`) and then
-/// runs a *second*, successful fan-out must have the second call's marker
-/// number stay one past the first, even though the first call recorded no
-/// marker at all.
+/// A workflow can catch a fan-out's `PayloadTooLarge` and then run a
+/// *second*, successful fan-out. The second call's marker number must stay
+/// one past the first, though the first call recorded no marker.
 ///
-/// This looks unintuitive but is deliberate: an earlier revision tried
-/// *releasing* the failed call's number so the second call could reuse it.
-/// That is a **worse** bug -- it lets an unrelated fan-out call site inherit
-/// another call's number, so a later replay of the *first* call could match
-/// against the *second* call's marker/count (or, in the collect-all-error
-/// case, its recorded children), silently misattributing unrelated data
-/// instead of cleanly diverging. Burning the number instead produces an
-/// honest "expected `fan_out:1`, got `fan_out:2`" divergence on replay -- which
-/// still doesn't gracefully reproduce the CAUGHT error (a failure the workflow
-/// catches and continues past leaves no history footprint at all, so replay
-/// re-decides it against live configuration — explicitly deferred by issue
-/// #952, which fixed the uncaught half: see
-/// `replayer_tests::early_config_dependent_failure_replays_cleanly`), but it is
-/// never silently wrong.
+/// Catching is a normal, supported "degrade gracefully" pattern. The caller
+/// can `match`/`map_err` on the returned `HarvestResult` instead of `?`.
+///
+/// This looks unintuitive but is deliberate. An earlier revision *released*
+/// the failed call's number so the second call could reuse it. That is a
+/// **worse** bug. It lets an unrelated fan-out call site inherit another
+/// call's number. A later replay of the *first* call could then match the
+/// *second* call's marker/count. In the collect-all-error case it could match
+/// its recorded children. That silently misattributes unrelated data instead
+/// of diverging cleanly. Burning the number instead produces an
+/// honest "expected `fan_out:1`, got `fan_out:2`" divergence on replay. That
+/// still does not gracefully reproduce the CAUGHT error, but it is never
+/// silently wrong. A failure the workflow catches and continues past leaves no
+/// history footprint at all, so replay re-decides it against live
+/// configuration. Issue #952 explicitly defers that case and fixes the
+/// uncaught half: see
+/// `replayer_tests::early_config_dependent_failure_replays_cleanly`.
 #[tokio::test]
 async fn child_fan_out_raw_burns_seq_on_validation_failure_so_next_fan_out_never_reuses_it() {
     let exec_id = ExecutionId::new();
@@ -1108,9 +1102,9 @@ async fn child_fan_out_raw_burns_seq_on_validation_failure_so_next_fan_out_never
     // Second fan-out: a small, valid input. Nothing in this no-worker unit
     // test resolves the child's oneshot, so the call suspends forever
     // waiting on it -- confirmed via a short outer timeout. What matters is
-    // the SYNCHRONOUS prefix (peek/validate/record) that runs before that
-    // await point: the marker it records must be "fan_out:2" (seq 1 was
-    // burned by the failed first call, never reused).
+    // the SYNCHRONOUS prefix (peek/validate/record) before that await point.
+    // The marker it records must be "fan_out:2". The failed first call
+    // burned seq 1, and it is never reused.
     let second = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.spawn_child_workflow_fan_out_raw(vec![("child_small".to_string(), json!("small"))]),

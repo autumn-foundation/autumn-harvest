@@ -1,9 +1,9 @@
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc, clippy::unused_async)]
 //! Deterministic side-effect primitives example (issue #384).
 //!
-//! Demonstrates the first-class, replay-safe alternatives to the unsafe APIs the
-//! determinism guardrails (HVG001 / HVG002) warn about — no local activity, no
-//! magic strings, one `WorkflowContext` method call per value:
+//! Demonstrates replay-safe alternatives to the APIs that the determinism
+//! guardrails (HVG001 / HVG002) warn about. Each needs no local activity and no
+//! magic strings, only one `WorkflowContext` method call per value:
 //!
 //! - `ctx.system_now()`  — wall-clock instant captured once and replayed verbatim
 //! - `ctx.new_uuid()`    — UUIDv7 idempotency key captured once

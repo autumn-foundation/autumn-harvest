@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 /// Record a scheduler fire/skip decision to the database.
 ///
-/// Under any database execution error, this logs a warning and increments the
-/// failure metric but proceeds normally to guarantee scheduler robustness.
+/// A database error logs a warning and increments the failure metric. The
+/// call still returns normally, so a failed write never stops the scheduler.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_decision_graceful(
     conn: &mut AsyncPgConnection,
@@ -53,7 +53,7 @@ pub async fn record_decision_graceful(
 ///
 /// # Errors
 ///
-/// Returns a [`database_error`] if the database query execution fails.
+/// Returns a [`database_error`] if the query fails.
 pub async fn purge_old_schedule_decisions(
     conn: &mut AsyncPgConnection,
     retention_days: i64,

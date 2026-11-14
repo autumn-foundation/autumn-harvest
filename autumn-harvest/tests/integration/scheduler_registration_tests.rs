@@ -4,9 +4,9 @@
 //! A `harvest_schedules` row holding a registered DAG's `workflow_name` while
 //! carrying a *different* non-NULL `dag_name` was invisible to the reconciler's
 //! resolver. The reconciler then tried to move that `workflow_name` onto a
-//! different row once per second, forever, failing
-//! `harvest_schedules_workflow_name_unique` every time — with no backoff, no
-//! memory of the previous failure, and the first failing DAG aborting the rest
+//! different row once per second, forever. It failed
+//! `harvest_schedules_workflow_name_unique` every time. It had no backoff and
+//! no memory of the previous failure. The first failing DAG aborted the rest
 //! of that tick's registration.
 //!
 //! These tests drive the shipped registration entry points against a real
@@ -20,8 +20,8 @@
 //! * **Defect 4** — every process reconciling, with no leader election.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! these against a shared local cluster (Docker-free); otherwise a fresh
-//! testcontainers Postgres 16 is started per test. On a shared DB each test
+//! these against a shared local cluster (Docker-free). Otherwise a fresh
+//! testcontainers Postgres 16 starts per test. On a shared DB each test
 //! `scrub()`s first for isolation.
 
 use std::sync::Arc;
@@ -100,8 +100,10 @@ async fn scrub(conn: &mut AsyncPgConnection) {
 }
 
 /// Insert a raw `harvest_schedules` row with an arbitrary
-/// (`dag_name`, `workflow_name`) pair — including the internally inconsistent
-/// pair the incident report reproduces, which no registration path can produce.
+/// (`dag_name`, `workflow_name`) pair.
+///
+/// That includes the inconsistent pair from the incident report, which no
+/// registration path can produce.
 async fn insert_raw_row(
     conn: &mut AsyncPgConnection,
     dag_name: Option<&str>,
@@ -262,11 +264,10 @@ async fn a_squatting_row_no_longer_wedges_the_reconciler() {
 async fn a_squatted_name_with_no_dag_row_no_longer_fails_the_insert() {
     let (mut conn, _db) = setup_db().await;
 
-    // No `dag_name = 'my_dag'` row at all — the resolver returns (None, None)
-    // and falls through to an INSERT carrying BOTH dag_name and workflow_name
-    // under `ON CONFLICT (dag_name) DO NOTHING`, whose arbiter offers no
-    // protection against the workflow_name unique index. Single session, no
-    // race.
+    // No `dag_name = 'my_dag'` row at all. The resolver returns (None, None)
+    // and falls through to an INSERT carrying BOTH dag_name and workflow_name.
+    // Its `ON CONFLICT (dag_name) DO NOTHING` arbiter offers no protection
+    // against the workflow_name unique index. Single session, no race.
     let squatter = insert_raw_row(
         &mut conn,
         Some("some_other_dag"),
@@ -308,11 +309,11 @@ async fn a_consistent_peer_row_is_a_conflict_not_a_steal() {
 
     let result = register_workflow_schedules(&mut conn, &[colliding]).await;
 
-    // Asserting only `is_err()` would prove nothing: pre-fix this ALSO errored,
-    // just opaquely — the resolver missed the peer, fell through to the insert,
-    // and the unique index raised `HarvestError::Database("duplicate key ...")`.
-    // The distinguishing property is that the refusal is now a *deliberate,
-    // typed* decision naming both sides, so an operator can act on it.
+    // `is_err()` alone proves nothing: pre-fix this ALSO errored, opaquely.
+    // The resolver missed the peer and fell through to the insert. The unique
+    // index raised `HarvestError::Database("duplicate key ...")`. Now the
+    // refusal is a *deliberate, typed* decision naming both sides, so an
+    // operator can act on it.
     match result {
         Err(autumn_harvest::HarvestError::Config(message)) => {
             assert!(
@@ -341,11 +342,11 @@ async fn a_consistent_peer_row_is_a_conflict_not_a_steal() {
 // ── Defect 1 — a decoupled schedule keeps working, and never steals ─────────
 
 /// `WorkflowSchedule` exposes `dag_name`/`workflow_name` as independent public
-/// fields and `validate_workflow_schedules` has never required them to agree,
-/// so a deployment upgrading into this fix can legitimately hold rows where
-/// they differ. Such a row must keep reconciling its own cadence — otherwise
-/// the fix strands it, and a row parked by the squatter repair could never
-/// re-stamp its own name.
+/// fields. `validate_workflow_schedules` has never required them to agree. So
+/// a deployment upgrading into this fix can legitimately hold rows where they
+/// differ. Such a row must keep reconciling its own cadence. Otherwise the fix
+/// strands it, and a row parked by the squatter repair never re-stamps its own
+/// name.
 #[tokio::test]
 async fn a_decoupled_registration_still_reconciles_its_own_row() {
     let (mut conn, _db) = setup_db().await;
@@ -391,10 +392,12 @@ async fn a_decoupled_registration_still_reconciles_its_own_row() {
 }
 
 /// The mirror image: a registrant whose `dag_name` differs from the
-/// `workflow_name` it wants has no claim on that name *by right of its own DAG
-/// name*, so it must report a foreign holder as a named collision rather than
-/// stripping it. Only a registrant that owns the name by right (issue #1157's
-/// repro) may release a squatter.
+/// `workflow_name` it wants.
+///
+/// It has no claim on that name *by right of its own DAG name*. So it must
+/// report a foreign holder as a named collision, not strip it. Only a
+/// registrant that owns the name by right (issue #1157's repro) may release a
+/// squatter.
 #[tokio::test]
 async fn a_decoupled_registration_never_steals_a_foreign_name() {
     let (mut conn, _db) = setup_db().await;
@@ -464,10 +467,10 @@ async fn one_unconvergeable_schedule_does_not_starve_the_rest() {
     let mut broken = WorkflowSchedule::new("shared", Schedule::Cron("0 4 * * *".to_string()));
     broken.dag_name = Some("broken_dag".to_string());
 
-    // `broken` is FIRST in registration order. Pre-fix the `?` short-circuit in
-    // `register_workflow_schedules_for_shard` aborts the whole pass, so every
-    // schedule after it is never registered at all — a tick raises exactly one
-    // error however many schedules are broken.
+    // `broken` is FIRST in registration order. Pre-fix, the `?` short-circuit
+    // in `register_workflow_schedules_for_shard` aborts the whole pass. No
+    // schedule after it is registered. A tick raises exactly one error however
+    // many schedules are broken.
     let schedules = vec![
         broken,
         dag_schedule("healthy_one"),
@@ -512,9 +515,8 @@ async fn a_converged_registration_pass_performs_no_writes() {
     let first = updated_at_of(&mut conn, id).await;
 
     // On a healthy twelve-DAG deployment the pre-fix reconciler issues ~2
-    // million UPDATEs a day against a twelve-row table, none of which change
-    // anything — and it is the amplifier that turns any single failure into a
-    // sustained log storm.
+    // million no-op UPDATEs a day against a twelve-row table. That amplifies
+    // any single failure into a sustained log storm.
     for _ in 0..3 {
         register_workflow_schedules(&mut conn, &schedules)
             .await
@@ -629,12 +631,12 @@ async fn a_peer_holding_the_registration_lock_makes_the_pass_skip() {
 // ── Defect 1 — proven through the path production actually runs ─────────────
 
 /// The other squatter tests drive `register_workflow_schedules`, which is the
-/// management-API entry point — *not* the 1 Hz reconciler. The tick path
-/// differs materially: it runs a convergence probe first, writes under the
-/// registration advisory lock, and — critically — **swallows registration
-/// errors into the backoff**. So a regression there would leave `tick_once`
-/// returning `Ok` with only a WARN log, and a test that checked the return
-/// value would be vacuous. This one asserts final row state instead.
+/// management-API entry point, *not* the 1 Hz reconciler. The tick path
+/// differs materially. It runs a convergence probe first. It writes under the
+/// registration advisory lock. Critically, it **swallows registration errors
+/// into the backoff**. A regression there leaves `tick_once` returning `Ok`
+/// with only a WARN log. A test of the return value is vacuous, so this one
+/// asserts final row state.
 #[tokio::test]
 async fn the_tick_path_also_repairs_a_squatting_row() {
     let (mut conn, db) = setup_db().await;
@@ -675,10 +677,10 @@ async fn the_tick_path_also_repairs_a_squatting_row() {
 // ── Defect 1 — releasing a name must preserve everything else ───────────────
 
 /// `release_squatted_workflow_name` nulls one column. That is deliberately
-/// non-destructive: the row keeps its identity, operator pause state and
-/// counters, so its rightful owner re-stamps it and an operator's pause is not
-/// silently undone. Asserting only `(dag_name, workflow_name)` would let a
-/// refactor to delete-and-reinsert pass while destroying all of that.
+/// non-destructive. The row keeps its identity, operator pause state and
+/// counters. Its rightful owner re-stamps it, and an operator's pause is not
+/// silently undone. A check of only `(dag_name, workflow_name)` lets a
+/// delete-and-reinsert refactor pass while it destroys all of that.
 #[tokio::test]
 async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -744,10 +746,10 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
 
 /// The pure tests exercise `ScheduleRegistrationBackoff` in isolation; they
 /// prove the data structure, not that the reconciler consults it. Deleting the
-/// `should_attempt` guard would leave every one of them passing. This drives
-/// two consecutive ticks over one unconvergeable schedule with a caller-owned
-/// registry and asserts the second tick was **suppressed** — the failure count
-/// stays at 1 rather than escalating to 2.
+/// `should_attempt` guard leaves every one of them passing. This drives two
+/// consecutive ticks over one unconvergeable schedule with a caller-owned
+/// registry. It asserts the second tick was **suppressed**: the failure count
+/// stays at 1, not 2.
 #[tokio::test]
 async fn a_failing_schedule_is_suppressed_on_the_very_next_tick() {
     use autumn_harvest::scheduler::{
@@ -795,10 +797,9 @@ async fn a_failing_schedule_is_suppressed_on_the_very_next_tick() {
 // `register_workflow_schedules_for_shard` has two branches. Every test above
 // drives the owning-shard branch (`register_one_workflow_schedule_locked`).
 // The other branch — a DAG-backed schedule that does *not* target this shard —
-// deletes any stale row this shard still holds. It is only reachable in a
-// genuinely multi-shard deployment (`schedule_targets_shard` is unconditionally
-// true single-shard), so these tests call the primitive directly rather than
-// through `tick_once`, which would never take that branch.
+// deletes any stale row this shard still holds. Only a multi-shard deployment
+// reaches it: single-shard, `schedule_targets_shard` is always true. So these
+// tests call the primitive directly. `tick_once` never takes that branch.
 
 #[tokio::test]
 async fn a_converged_shard_issues_no_delete_at_all() {

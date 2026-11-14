@@ -8,13 +8,10 @@ use std::path::{Path, PathBuf};
 /// The guide that holds the section.
 const GUIDE: &str = "docs/agent-adapter.md";
 
-/// The heading of the section.
 const SECTION: &str = "## 28. Inference strategies";
 
-/// The ADR of the strategies.
 const ADR: &str = "docs/adr/0017-inference-strategies.md";
 
-/// The command that runs the example.
 const RUN_EXAMPLE: &str = "cargo run -p agent-strategies";
 
 /// The strategies that the section table lists, by policy name.

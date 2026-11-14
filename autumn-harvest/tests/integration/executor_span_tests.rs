@@ -255,7 +255,6 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             autumn_harvest::executor::ReplayDeclarativeHandlers::default(),
         ));
 
-    // 1. Span must be named correctly.
     let span_fields = fields.fields_for("harvest.workflow.execute");
     assert!(
         !span_fields.is_empty(),
@@ -269,7 +268,6 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             .collect::<Vec<_>>()
     );
 
-    // 2. harvest.replay must be `true`.
     let any_has_replay_true = span_fields.iter().any(|field_set| {
         field_set
             .iter()

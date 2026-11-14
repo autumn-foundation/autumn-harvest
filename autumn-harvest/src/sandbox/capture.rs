@@ -57,7 +57,6 @@ impl StreamCapture {
         if self.tail_cap == 0 {
             return;
         }
-        // Keep only the last `tail_cap` bytes of the rest.
         let rest = &rest[rest.len().saturating_sub(self.tail_cap)..];
         let overflow = (self.tail.len() + rest.len()).saturating_sub(self.tail_cap);
         self.tail.drain(..overflow);

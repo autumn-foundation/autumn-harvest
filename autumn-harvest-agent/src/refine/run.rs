@@ -849,7 +849,6 @@ struct Refine<'a> {
     probes: Vec<Option<ProbedCandidate>>,
     selections: Vec<SelectionRecord>,
     exhausted: bool,
-    /// Whether the worker has a selector.
     selector: bool,
     /// The lesson library that each proposer stage reads.
     lessons: Option<&'a MemorySnapshot>,

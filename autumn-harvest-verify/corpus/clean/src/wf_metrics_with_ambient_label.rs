@@ -8,9 +8,9 @@
 //! classify `metrics()` as a **non-sink**, and taint reaching a non-sink is not
 //! a finding.
 //!
-//! The second-sharpest AC4 test after `side_effect`: an analyzer that treats
-//! every `ctx` method as a sink flags this, and observability calls are
-//! everywhere in real workflows. Verdict: `proven-deterministic`.
+//! The second-sharpest AC4 test after `side_effect`. An analyzer that treats
+//! every `ctx` method as a sink flags this. Observability calls are everywhere
+//! in real workflows. Verdict: `proven-deterministic`.
 
 use autumn_harvest::prelude::*;
 use harvest_verify_corpus_helpers as helpers;

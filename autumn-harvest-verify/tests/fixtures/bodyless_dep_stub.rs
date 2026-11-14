@@ -1,8 +1,8 @@
 //! Companion crate for `bodyless_dependency.rs`: compiled to an rlib WITHOUT
 //! `--emit=mir`, so its bodies never reach the analyzed set.
 //!
-//! This is how a real `--package`-scoped run sees any dependency it did not ask
-//! for MIR from: the call site prints a trimmed path (`now_ish`) with a
+//! This is how a real `--package`-scoped run sees a dependency it did not ask
+//! MIR for. The call site prints a trimmed path (`now_ish`) with a
 //! `std::string::String` destination and no crate root anywhere.
 pub fn now_ish() -> String {
     std::time::SystemTime::now()

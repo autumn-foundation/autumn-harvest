@@ -753,10 +753,9 @@ const BURST: Duration = Duration::from_millis(1500);
 ///
 /// The worker runs one claim loop, no listener and a 30 s poll interval. A
 /// trigger makes each decision commit take 3 s, so no decision wakes the
-/// loop for 3 s. The loop
-/// claims all 8 tasks inside 1.5 s, each after a miss on shard 0. A loop
-/// that waited after a miss could claim only one task in that time. So each
-/// miss moved the claim to shard 1 in the same pass.
+/// loop for 3 s. The loop claims all 8 tasks inside 1.5 s, each after a miss
+/// on shard 0. A loop that waited after a miss could claim only one task in
+/// that time. So each miss moved the claim to shard 1 in the same pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slot_miss_moves_the_claim_to_the_next_shard() {
     let mut db = TestDb::new().await;

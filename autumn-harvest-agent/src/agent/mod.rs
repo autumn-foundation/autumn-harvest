@@ -1081,7 +1081,6 @@ enum Mode<'a> {
 }
 
 impl Mode<'_> {
-    /// The delivery source of the segment.
     const fn source(self) -> ReportSource {
         match self {
             Self::Attended => ReportSource::Run,
@@ -1679,7 +1678,6 @@ impl AgentRun<'_> {
         }
     }
 
-    /// Apply one control op.
     async fn control(&self, mut state: AgentState, control: Control) -> AgentState {
         match control {
             Control::Pause { reason } => state.status = AgentStatus::Paused { reason },
@@ -2607,7 +2605,6 @@ impl AgentRun<'_> {
         }
     }
 
-    /// Send the answer of one segment to the delivery.
     async fn deliver(&self, state: &mut AgentState, task: &AgentTask, sent: Sent<'_>) {
         let Some(text) = report_text(sent.source, sent.stop, sent.answer) else {
             return;

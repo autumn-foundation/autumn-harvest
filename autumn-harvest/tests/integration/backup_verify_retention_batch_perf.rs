@@ -2,31 +2,25 @@
 //! Ledger performance fix: `backup_verify::probes::adjudicate_refs`'s
 //! per-reference retention-summary lookup N+1 (issue #1704 follow-up).
 //!
-//! `backup_verify_refs_batch_perf.rs` (issue #1704) already batched this
-//! same function's execution-STATE lookup: `= ANY($1)` per chunk, instead
-//! of one `WHERE id = $1` round trip per reference. That fix's own fixture
-//! deliberately isolated the state lookup. Every reference there resolves
-//! against a live, `RUNNING` target. So no reference reached the
-//! retention-summary branch a few lines below it in the same function.
-//! See that file's `REF_COUNT` doc comment: "no `retention_summary_exists`
-//! ... calls to muddy the count."
+//! `backup_verify_refs_batch_perf.rs` (issue #1704) already batched the
+//! execution-STATE lookup of this function: one `= ANY($1)` per chunk, not
+//! one `WHERE id = $1` round trip per reference. Its fixture isolates the
+//! state lookup. Every reference there resolves against a live, `RUNNING`
+//! target, so none reaches the retention-summary branch.
 //!
-//! This file exercises exactly that branch. Consider a restore drill
-//! against a backup old enough for retention to have already collected a
-//! completed child. That is the ordinary, expected case for a
-//! `ChildTerminalRecorded` reference, not an edge case. The parent recorded
-//! the child's terminal. The child's execution row is long gone.
-//! `harvest_execution_summaries` is what proves the absence is retention,
-//! not data loss. Before this fix, `adjudicate_refs` issued one
-//! `SELECT EXISTS (... WHERE execution_id = $1)` round trip per such
-//! reference. The fix batches it the same way its state-lookup sibling was
-//! batched: `matching_retention_summaries`, one `= ANY($1)` call per chunk.
+//! This file covers that branch. Take a restore drill against a backup old
+//! enough that retention collected a completed child. That is the ordinary
+//! case for a `ChildTerminalRecorded` reference. The parent recorded the
+//! terminal of the child, and the execution row of the child is gone.
+//! `harvest_execution_summaries` proves that retention, not data loss,
+//! removed it. Before this fix, `adjudicate_refs` sent one `SELECT EXISTS
+//! (... WHERE execution_id = $1)` round trip per such reference. The fix
+//! batches it as the state lookup is batched: `matching_retention_summaries`
+//! makes one `= ANY($1)` call per chunk.
 //!
-//! Evidence is `pg_stat_statements` call counts, driven end-to-end through
-//! the public `verify_restore` entry point. This mirrors
-//! `backup_verify_refs_batch_perf.rs`'s harness shape exactly: same DB
-//! bootstrap, same fresh-database-per-test pattern, same reset/snapshot
-//! discipline.
+//! The evidence is `pg_stat_statements` call counts, through the public
+//! `verify_restore` entry point. The harness has the shape of
+//! `backup_verify_refs_batch_perf.rs`.
 
 use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};
 use autumn_harvest::testing::WorkflowReplayer;
@@ -199,22 +193,22 @@ async fn seed_retention_summary(conn: &mut AsyncPgConnection, exec_id: Execution
     .expect("seed retention summary");
 }
 
-/// How many `ChildTerminalRecorded` references the fixture seeds, each
-/// against a target row that does not exist. This count stays comfortably
-/// under `VerifyOptions::default().probe_limit` (1,000) and
-/// `WORKFLOW_KEY_LOOKUP_CHUNK` (1,000). The whole fixture lands in one
-/// chunk. This measures the per-reference round-trip count, not chunking
-/// behavior, mirroring `backup_verify_refs_batch_perf.rs`'s own `REF_COUNT`.
+/// The `ChildTerminalRecorded` references that the fixture seeds, each
+/// against a target row that does not exist.
+///
+/// The count stays under `VerifyOptions::default().probe_limit` (1,000) and
+/// `WORKFLOW_KEY_LOOKUP_CHUNK` (1,000). The fixture lands in one chunk, so
+/// the test measures round trips per reference, not chunking.
 const REF_COUNT: i64 = 500;
 
-/// End-to-end: `N` parents on shard 0 each recorded a distinct child's
-/// terminal via `ChildWorkflowCompleted`. None of the `N` children ever
-/// existed on shard 1. Retention, or an equally clean restore-drill
-/// fixture, already collected them. Each one instead has a
-/// `harvest_execution_summaries` row proving that. Every reference takes
-/// the `(ChildTerminalRecorded, None)` branch with retention proven. So no
-/// `RetentionUnproven` finding fires, but the harness still exercises
-/// exactly the query class the fix targets.
+/// End-to-end: `N` parents on shard 0 each recorded the terminal of a
+/// distinct child with `ChildWorkflowCompleted`.
+///
+/// No child row exists on shard 1. Each child has a
+/// `harvest_execution_summaries` row instead, as after retention. So each
+/// reference takes the `(ChildTerminalRecorded, None)` branch with retention
+/// proven. No `RetentionUnproven` finding fires, but the query under test
+/// runs.
 #[tokio::test]
 async fn terminal_child_batch_resolves_with_bounded_retention_lookup_calls() {
     let (admin, _guard) = setup_server().await;
@@ -234,13 +228,11 @@ async fn terminal_child_batch_resolves_with_bounded_retention_lookup_calls() {
     for i in 0..REF_COUNT {
         let parent = ExecutionId::new_for_shard(ShardId::new(0));
         let child = ExecutionId::new_for_shard(ShardId::new(1));
-        // The scan only adjudicates a CHILD reference from a NON-TERMINAL
-        // owner. That is `scan_reference_events`'s own
-        // `e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED')` filter. A terminal
-        // parent's recorded child terminal is history, not a live
-        // dependency. A parent can still be `RUNNING` after recording one
-        // child's completion, because it goes on to await further steps.
-        // That is the ordinary shape here, not an edge case.
+        // The scan adjudicates a CHILD reference only from a NON-TERMINAL
+        // owner: the `e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED')` filter
+        // of `scan_reference_events`. For a terminal parent, a recorded
+        // child terminal is history. A parent stays `RUNNING` after one
+        // child completes when it awaits further steps.
         seed_execution(
             &mut a,
             parent,
@@ -267,9 +259,8 @@ async fn terminal_child_batch_resolves_with_bounded_retention_lookup_calls() {
             json!({ "child_id": child.to_string(), "output": {} }),
         )
         .await;
-        // The child never exists on shard 1 -- only its retention-summary
-        // proof does. This is what forces every reference into the
-        // retention-summary branch `adjudicate_refs` adjudicates.
+        // Only the retention summary of the child exists on shard 1. So each
+        // reference takes the retention-summary branch of `adjudicate_refs`.
         seed_retention_summary(&mut b, child, 1).await;
     }
 
@@ -311,12 +302,10 @@ async fn terminal_child_batch_resolves_with_bounded_retention_lookup_calls() {
          batched_calls={batched_calls} all_rows={rows:#?}"
     );
 
-    // GREEN: the fixed shape. The whole REF_COUNT-wide batch resolves in one
-    // `= ANY($1)` round trip. REF_COUNT is well under the 1,000-row chunk
-    // bound. The old per-row `EXISTS` statement is never issued at all.
-    // Measured on this machine: before the fix, `SELECT EXISTS (... WHERE
-    // execution_id = $1)` had calls: 500 (one per reference). After the
-    // fix, it has calls: 0.
+    // GREEN: the whole batch resolves in one `= ANY($1)` round trip, and
+    // the old per-row `EXISTS` never runs. Measured here, `SELECT EXISTS
+    // (... WHERE execution_id = $1)` had 500 calls before the fix (one per
+    // reference) and 0 after it.
     assert_eq!(
         per_row_calls, 0,
         "the per-reference retention-summary `EXISTS` lookup must not be issued once the batch \

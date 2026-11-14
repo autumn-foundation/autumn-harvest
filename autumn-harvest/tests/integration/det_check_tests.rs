@@ -795,10 +795,10 @@ fn regression_det008_direct_io() {
 
 // ── DET010: HashMap/HashSet iteration order (issue #785) ──────────────────
 //
-// NOTE on the rule ID: issue #785's text proposed "DET/HVG010" but HVG010 was
-// already permanently assigned to SelectMacro (issue #600) and DET009 was the
-// current det_check maximum, so this rule ships as DET010 in det_check and
-// HVG011 in the guardrail catalog / macro lint.
+// NOTE on the rule ID: issue #785's text proposed "DET/HVG010". HVG010 was
+// already permanently assigned to SelectMacro (issue #600), and DET009 was the
+// det_check maximum. So this rule ships as DET010 in det_check and as HVG011 in
+// the guardrail catalog / macro lint.
 
 #[test]
 fn det010_flags_hashmap_loop_with_command_as_error() {
@@ -1092,12 +1092,12 @@ fn det010_for_loop_pattern_mask_is_restored_after_the_loop() {
 
 #[test]
 fn det010_match_arm_shadow_residual_over_flag_is_documented() {
-    // RESIDUAL LIMITATION (documented, PR #970 P1-C): the line-based det_check
-    // pass cannot mask match-arm (or closure-param) pattern bindings, so a
-    // tracked ident re-bound by `Some(m) =>` is still over-flagged inside the
-    // arm. The syn-based macro lint is scope-exact for this shape; suppress
-    // with `// harvest-suppress: DET010 "..."` when intended. This test pins
-    // the residual behavior so it is explicit, not accidental.
+    // RESIDUAL LIMITATION (documented, PR #970): the line-based det_check pass
+    // cannot mask match-arm (or closure-param) pattern bindings. So a tracked
+    // ident re-bound by `Some(m) =>` is still over-flagged inside the arm. The
+    // syn-based macro lint is scope-exact for this shape; suppress with
+    // `// harvest-suppress: DET010 "..."` when intended. This test pins the
+    // residual behavior so it is explicit, not accidental.
     let src = wf(
         "let m: HashMap<String, u64> = HashMap::new();\n    match resolve() {\n        Some(m) => {\n            for item in &m {\n                ctx.execute_activity_raw(\"a\", serde_json::json!(item), \"q\").await?;\n            }\n        }\n        None => {}\n    }",
     );
@@ -1169,9 +1169,9 @@ fn det010_multiline_let_annotation_is_tracked() {
 
 #[test]
 fn det010_multiline_for_header_is_a_documented_miss() {
-    // DOCUMENTED LIMITATION (PR #970 P2-D): a `for` header split across lines
-    // (`for (k, v) in` / `&m`) is not detected by the line-based pass — the
-    // syn-based macro lint catches this shape. Pinned so the miss is explicit.
+    // DOCUMENTED LIMITATION (PR #970): the line-based pass misses a `for`
+    // header split across lines (`for (k, v) in` / `&m`). The syn-based macro
+    // lint catches this shape. Pinned so the miss is explicit.
     let src = wf(
         "let m: HashMap<String, u64> = HashMap::new();\n    for (k, v) in\n        &m\n    {\n        ctx.execute_activity_raw(\"a\", serde_json::json!(k), \"q\").await?;\n    }",
     );
@@ -1429,10 +1429,10 @@ fn det011_flags_select_biased_macro() {
 #[test]
 fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
     // A line with a single `tokio::select!` must yield exactly ONE DET011
-    // finding — the `select!` and `select_biased!` macro patterns must not both
-    // fire on the same line (#980 Codex P2). The engine dedupes per-rule-per-line
-    // via `continue 'rules`, so this confirms the boundary guard did not
-    // accidentally introduce a second match.
+    // finding. The `select!` and `select_biased!` macro patterns must not both
+    // fire on the same line (#980). The engine dedupes per-rule-per-line via
+    // `continue 'rules`. This confirms that the boundary guard added no second
+    // match.
     for macro_call in [
         "tokio::select! { _ = a => {} }",
         "futures::select! { _ = a => {} }",
@@ -1456,10 +1456,10 @@ fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
 #[test]
 fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
     // An unrelated macro whose name merely ENDS in `select!` / `select_biased!`
-    // must NOT be flagged — the backward path walk absorbs the leading ident
-    // bytes into a non-matching path (`sql_select` / `my_select`), keeping
-    // det_check in agreement with the compile-time HVG010 guardrail (which
-    // matches macro paths exactly and accepts these) (#980 Codex P2 review).
+    // must NOT be flagged. The backward path walk absorbs the leading ident
+    // bytes into a non-matching path (`sql_select` / `my_select`). That keeps
+    // det_check in agreement with the compile-time HVG010 guardrail, which
+    // matches macro paths exactly and accepts these (#980).
     for call in [
         "sql_select! { columns }",
         "let _ = my_select!();",
@@ -1476,12 +1476,12 @@ fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
 
 #[test]
 fn det011_does_not_flag_qualified_non_select_macros() {
-    // #980 Codex P2 (the qualified-macro-path false positive): a `select!` /
+    // #980 (the qualified-macro-path false positive): a `select!` /
     // `select_biased!` macro under an UNRELATED root path must NOT be flagged.
-    // The earlier ident-boundary-only check false-positived on any `::` prefix
-    // (the byte before `select!` is `:`, which is not an identifier byte);
-    // the full-path match resolves these to paths outside the allowed set —
-    // exactly as the compile-time HVG010 `visit_macro` leaves them un-flagged.
+    // The earlier ident-boundary-only check false-positived on any `::` prefix.
+    // The byte before `select!` is `:`, which is not an identifier byte. The
+    // full-path match resolves these to paths outside the allowed set. The
+    // compile-time HVG010 `visit_macro` leaves them un-flagged the same way.
     for call in [
         "crate::ui::select! { columns }",
         "let _ = my::select_biased! { a };",
@@ -1528,10 +1528,9 @@ fn det011_flags_qualified_future_select_combinator() {
 #[test]
 fn det011_flags_short_form_future_select_combinator() {
     // The `use futures::future; future::select(a, b)` short form must be flagged
-    // too, matching the AST macro visitor which recognizes `future::select`
-    // (#980 Codex P2). Exactly one DET011 finding is emitted for a qualified
-    // call even though the short-form pattern is a suffix of it — the engine
-    // emits at most one finding per rule per line.
+    // too. The AST macro visitor recognizes `future::select` (#980). A qualified
+    // call emits exactly one DET011 finding, even though the short-form pattern
+    // is a suffix of it. The engine emits at most one finding per rule per line.
     let src = wf("let _ = future::select(a, b).await;");
     let report = check_source(&src, "test.rs");
     assert_eq!(
@@ -1560,8 +1559,8 @@ fn det011_flags_short_form_future_select_combinator() {
 #[test]
 fn det011_does_not_flag_method_or_suffix_forms_of_future_select() {
     // A `.select()` method call and a module whose name merely ends in `future`
-    // must NOT be flagged for the `future::select(` pattern — the call-position
-    // boundary guard excludes a preceding `.` or identifier char (#980 Codex P2).
+    // must NOT be flagged for the `future::select(` pattern. The call-position
+    // boundary guard excludes a preceding `.` or identifier char (#980).
     for call in [
         "let _ = x.select();",
         "let _ = builder.select(cols);",
@@ -1591,11 +1590,11 @@ fn det011_flags_bare_distinctive_combinators() {
 #[test]
 fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
     // A qualified call whose full path is outside the futures allowed set must
-    // NOT be flagged — det_check now extracts the FULL path ending at the call
-    // and matches it exactly against the same set as the macro lint's
-    // `is_select_combinator_path`, so a same-tail-name helper under a different
+    // NOT be flagged. det_check now extracts the FULL path ending at the call.
+    // It matches that path exactly against the same set as the macro lint's
+    // `is_select_combinator_path`. So a same-tail-name helper under a different
     // root is rejected exactly as the compile-time HVG010 guardrail rejects it
-    // (#980 Codex P2 review).
+    // (#980).
     for call in [
         "let _ = crate::future::select(a, b).await;",
         "let _ = my_dsl::select_all(v);",
@@ -1614,7 +1613,7 @@ fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
 #[test]
 fn det011_flags_futures_qualified_and_short_form_combinators() {
     // The `futures`-anchored qualified forms and their `future::…` short forms
-    // for every distinctive name must all be flagged (#980 Codex P2). Bare
+    // for every distinctive name must all be flagged (#980). Bare
     // `select(` remains unflagged (deliberately not in the allowed set).
     for call in [
         "let _ = futures::future::select(a, b).await;",
@@ -1650,11 +1649,11 @@ fn det011_flags_futures_qualified_and_short_form_combinators() {
 #[test]
 fn det011_flags_turbofished_combinator_calls() {
     // A turbofish (and defensive whitespace) between the combinator name and the
-    // call `(` must NOT hide the call from det_check: the syn-based HVG010 macro
+    // call `(` must NOT hide the call from det_check. The syn-based HVG010 macro
     // lint strips path arguments before matching and DOES hard-block these
-    // forms, so det_check must too, or the text pre-check green-lights code the
-    // compile-time guardrail rejects (#980 Codex P2). Each is exactly one
-    // DET011 finding.
+    // forms. det_check must too. Otherwise the text pre-check green-lights code
+    // that the compile-time guardrail rejects (#980). Each is exactly one DET011
+    // finding.
     for call in [
         "let _ = futures::future::select::<_, _>(a, b).await;",
         "let _ = future::select_all::<Vec<_>>(v).await;",
@@ -1679,10 +1678,10 @@ fn det011_flags_turbofished_combinator_calls() {
 
 #[test]
 fn det011_does_not_flag_turbofished_non_futures_or_method_forms() {
-    // The turbofish tolerance must NOT loosen path precision: a qualified call
+    // The turbofish tolerance must NOT loosen path precision. A qualified call
     // under a non-futures root, or a method call, stays unflagged even WITH a
-    // turbofish (mirrors the macro lint's exact-path matching). Bare `select`
-    // has no allowed form (turbofished or not) and stays unflagged.
+    // turbofish. This mirrors the macro lint's exact-path matching. Bare
+    // `select` has no allowed form (turbofished or not) and stays unflagged.
     for call in [
         "let _ = crate::future::select::<_,_>(a, b).await;",
         "let _ = my_dsl::select_all::<T>(v);",
@@ -1714,11 +1713,10 @@ fn det011_does_not_flag_turbofished_non_futures_or_method_forms() {
 #[test]
 fn det011_flags_absolute_futures_combinator_paths() {
     // An absolute path (leading `::`) must be flagged exactly like its relative
-    // form: the syn-based HVG010 macro lint's `path_to_string` ignores
+    // form. The syn-based HVG010 macro lint's `path_to_string` ignores
     // `leading_colon`, so `::futures::future::select(a, b)` hard-blocks at
-    // compile time and det_check must match it too (#980 Codex absolute-path
-    // finding). Turbofished absolute forms are covered too. Each is exactly one
-    // DET011 finding.
+    // compile time. det_check must match it too (#980). Turbofished absolute
+    // forms are covered too. Each is exactly one DET011 finding.
     for call in [
         "let _ = ::futures::future::select(a, b).await;",
         "let _ = ::futures::future::select_all::<Vec<_>>(v).await;",
@@ -1740,9 +1738,9 @@ fn det011_flags_absolute_futures_combinator_paths() {
 #[test]
 fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
     // Stripping the leading `::` must NOT make a non-futures absolute path
-    // match: normalizing `::my_dsl::select_all` yields `my_dsl::select_all`,
-    // which is not an allowed combinator path, so it stays unflagged (mirrors
-    // the macro lint's exact-path matching).
+    // match. Normalizing `::my_dsl::select_all` yields `my_dsl::select_all`. It
+    // is not an allowed combinator path, so it stays unflagged. This mirrors the
+    // macro lint's exact-path matching.
     for call in [
         "let _ = ::my_dsl::select_all(v);",
         "let _ = ::crate::future::select(a, b).await;",
@@ -1759,8 +1757,8 @@ fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
 #[test]
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
-    // free-function combinators — they must not be flagged, mirroring the AST
-    // visitor's structural exclusion of method-call receivers (#799 P2 review).
+    // free-function combinators. They must not be flagged. This mirrors the
+    // structural exclusion of method-call receivers in the AST visitor (#799).
     for call in [
         "let _ = x.select_all();",
         "let _ = q.try_select(a, b);",
@@ -1870,10 +1868,10 @@ fn det011_self_scan_of_harvest_src_is_clean() {
 
 // ── Transitive reachability (issue #778, one first-party hop) ──────────────
 //
-// A hard-blocker call located in a first-party helper function that a
-// `#[workflow]` body calls directly must be flagged, naming both the offending
-// site and the workflow entry point. Boundary mirrors #386: activity callees,
-// method calls, and two-hop chains are NOT covered.
+// A `#[workflow]` body may call a first-party helper that holds a hard-blocker
+// call. That call must be flagged, naming both the offending site and the
+// workflow entry point. The boundary mirrors #386: activity callees, method
+// calls, and two-hop chains are NOT covered.
 
 #[test]
 fn transitive_same_file_flags_helper_violation() {
@@ -1989,12 +1987,13 @@ fn pure_helper(x: i64) -> i64 {
 
 #[test]
 fn transitive_cross_file_via_check_dir_is_not_resolved_same_module_only() {
-    // BOUNDARY (issue #778, Codex r4/r5): the workflow lives in file A and calls
-    // a first-party helper defined in file B. Reaching it requires a `use` import
-    // the line-based scanner cannot see, so under same-module-only resolution the
-    // cross-file helper is deliberately NOT resolved — a documented safe
-    // false-negative (never resolving cross-module is what ends the round-4/round-5
-    // false-positive family for a CI gate). #386 is body-only and also misses these
+    // BOUNDARY (issue #778): the workflow lives in file A and calls a
+    // first-party helper defined in file B. Reaching it requires a `use` import
+    // the line-based scanner cannot see. Under same-module-only resolution the
+    // cross-file helper is deliberately NOT resolved. That is a documented safe
+    // false-negative. Cross-module name resolution flagged innocent code under a
+    // same-named helper, and never resolving cross-module ends that family of
+    // false positives for a CI gate. #386 is body-only and also misses these
     // transitive skips; the backstop is runtime replay (`WorkflowReplayer` / live
     // `HistoryMatcher`) plus manual review, not #386.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2225,15 +2224,15 @@ fn bad_time_helper() -> i64 {
 // ── Review hardening (#778): compile_fail exclusion + zero-FP shadowing ─────
 
 /// A minimal `#[workflow]` whose body reads the wall clock (DET001 hard
-/// blocker). Kept as a single-line `\n`-escaped literal so this module-level
-/// const (file brace-depth 0) is fully stripped by the scanner rather than
-/// having its content lexed as code — a bare `det-check .` self-scan must stay
-/// clean (the line-based lexer does not track cross-line string literals).
+/// blocker). It stays a single-line `\n`-escaped literal. The scanner then
+/// fully strips this module-level const (file brace-depth 0) and does not lex
+/// its content as code. A bare `det-check .` self-scan must stay clean. The
+/// line-based lexer does not track cross-line string literals.
 const WF_UTC: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = chrono::Utc::now();\n    Ok(())\n}\n";
 
-// P1 FIX #1 (AC8): a bare repo-root scan must exclude the deliberately-broken
-// `compile_fail/` trybuild fixtures (they are not real workflow source and
-// carry committed `.stderr` snapshots that must not be edited).
+// AC8: a bare repo-root scan must exclude the deliberately-broken
+// `compile_fail/` trybuild fixtures. They are not real workflow source. They
+// carry committed `.stderr` snapshots that must not be edited.
 #[test]
 fn check_dir_excludes_compile_fail_fixtures() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2266,7 +2265,7 @@ fn check_dir_excludes_compile_fail_fixtures() {
     );
 }
 
-// P2 FIX #4: `check_dir` must also skip `target/` and hidden (`.`) directories.
+// `check_dir` must also skip `target/` and hidden (`.`) directories.
 #[test]
 fn check_dir_skips_target_and_hidden_dirs() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2293,9 +2292,9 @@ fn check_dir_skips_target_and_hidden_dirs() {
     assert!(det001[0].location.as_ref().unwrap().file.contains("real"));
 }
 
-// P1 FIX #2 (zero-FP): a call bound to a fn-pointer PARAMETER of the same name
-// must NOT resolve to a same-named first-party free helper (#386 excludes
-// function pointers). Reproducer A.
+// Zero false positives: a call bound to a fn-pointer PARAMETER of the same name
+// must NOT resolve to a same-named first-party free helper. #386 excludes
+// function pointers. Reproducer A.
 #[test]
 fn fn_pointer_param_call_is_not_resolved_to_free_helper() {
     let src = "\
@@ -2316,9 +2315,9 @@ fn transform(n: i64) -> i64 {
     );
 }
 
-// P1 FIX #2 (zero-FP): a call bound to a LOCAL closure of the same name must
-// NOT resolve to a same-named first-party free helper (#386 excludes
-// closures). Reproducer B.
+// Zero false positives: a call bound to a LOCAL closure of the same name must
+// NOT resolve to a same-named first-party free helper. #386 excludes
+// closures. Reproducer B.
 #[test]
 fn local_closure_call_is_not_resolved_to_free_helper() {
     let src = "\
@@ -2341,8 +2340,8 @@ fn compute(n: i64) -> i64 {
 }
 
 // Zero-FP guard: shadowing must NOT suppress a genuinely-reached helper of a
-// DIFFERENT name — a real transitive violation must still be flagged even when
-// the workflow also binds unrelated locals/params.
+// DIFFERENT name. A real transitive violation is still flagged when the
+// workflow also binds unrelated locals/params.
 #[test]
 fn shadowing_does_not_suppress_a_genuinely_reached_helper() {
     let src = "\
@@ -2367,12 +2366,12 @@ fn bad_time() -> i64 {
     assert_eq!(finding.via_helper.as_deref(), Some("bad_time"));
 }
 
-// ── Source-order shadow tracking (issue #778, Codex P2) ─────────────────────
+// ── Source-order shadow tracking (issue #778) ──────────────────────────────
 
-// A call to a free helper that PRECEDES a later same-name `let` binding is
-// resolved by Rust to the FREE helper (the binding is not yet in scope). The
-// whole-body shadow set wrongly suppressed it; source-order tracking restores
-// the (genuine, in-scope) transitive violation. AC4 coverage.
+// Rust resolves a call that PRECEDES a later same-name `let` binding to the
+// FREE helper, because the binding is not yet in scope. The whole-body shadow
+// set wrongly suppressed it. Source-order tracking restores the genuine
+// transitive violation. AC4 coverage.
 #[test]
 fn pre_shadow_call_resolves_to_free_helper_not_the_later_binding() {
     let src = "\
@@ -2399,11 +2398,11 @@ fn bad() -> i64 {
     assert_eq!(finding.via_helper.as_deref(), Some("bad"));
 }
 
-// Documented safe-direction residual FN: source-order tracking (not full
-// scope-awareness) means a shadow bound in an inner/sibling block that has
-// already CLOSED before an outer call still suppresses that call. Rust would
-// resolve the outer call to the free helper, so this is an accepted
-// false-negative (never a false-positive). Pinned so the residual is explicit.
+// Documented safe-direction residual FN. Source-order tracking is not full
+// scope-awareness. A shadow bound in an inner/sibling block that CLOSED before
+// an outer call still suppresses that call. Rust would resolve the outer call
+// to the free helper. So this is an accepted false-negative, never a
+// false-positive. Pinned so the residual is explicit.
 #[test]
 fn block_confined_shadow_before_call_is_a_documented_false_negative() {
     let src = "\
@@ -2426,13 +2425,13 @@ fn bad() -> i64 {
     );
 }
 
-// ── Column-aware same-line `let` shadow (issue #778, Codex r9) ──────────────
+// ── Column-aware same-line `let` shadow (issue #778) ───────────────────────
 
 // A same-line `let helper = ...; helper();` binds the local BEFORE the call, so
-// Rust resolves the call to the local closure. Line-granular source-order
-// tracking wrongly kept flagging this (a same-named free helper with a
-// violation) because the binding and the call share a line; column-awareness
-// (the call comes after the binding's `;`) fixes the FP → NO finding.
+// Rust resolves the call to the local closure. A same-named free helper has a
+// violation. Line-granular source-order tracking kept flagging this, because
+// the binding and the call share a line. Column-awareness fixes the FP: the
+// call comes after the binding's `;` → NO finding.
 #[test]
 fn same_line_let_binding_before_call_is_suppressed() {
     let src = "\
@@ -2454,10 +2453,10 @@ fn helper() -> i64 {
     );
 }
 
-// The inverse: a same-line call that PRECEDES its `let bad` binding is not yet in
-// scope, so Rust resolves it to the free `fn bad` (a genuine violation). Column
+// The inverse: a same-line call that PRECEDES its `let bad` binding is not yet
+// in scope. Rust resolves it to the free `fn bad`, a genuine violation. Column
 // awareness must NOT over-suppress a pre-shadow call on the same line as its
-// later binding — it stays flagged.
+// later binding. It stays flagged.
 #[test]
 fn same_line_call_before_let_binding_is_still_flagged() {
     let src = "\
@@ -2513,16 +2512,17 @@ fn bad() -> i64 {
     assert_eq!(finding.via_helper.as_deref(), Some("bad"));
 }
 
-// ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
+// ── check_paths — cross-path index, dedup, symlinks, non-UTF8 ───────────────
 
-// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern `det-check
+// BOUNDARY (issue #778): the changed-files CI pattern `det-check
 // f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths` still
-// collects them into a single shared index (dedup / symlink / non-UTF-8
-// robustness stand — see the tests below), but bare helper calls resolve
-// same-module ONLY, so a cross-file transitive helper is deliberately NOT
-// resolved (a documented safe false-negative). Never resolving cross-module is
-// what ends the round-4/round-5 false-positive family; for a CI gate a false
-// positive on innocent code is the worse outcome.
+// collects them into a single shared index. The dedup / symlink / non-UTF-8
+// robustness tests below rely on it. But bare helper calls resolve
+// same-module ONLY. So a cross-file transitive helper is NOT resolved, a
+// documented safe false-negative. Cross-module name resolution
+// flagged innocent code under a same-named helper. Never resolving cross-module
+// ends that family of false positives. For a CI gate a false positive on
+// innocent code is the worse outcome.
 #[test]
 fn check_paths_cross_file_helper_is_not_resolved_same_module_only() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2612,7 +2612,7 @@ fn check_paths_does_not_follow_directory_symlinks() {
 
 // A symlink passed as a TOP-LEVEL path argument (a file symlink) must NOT be
 // followed — mirroring the nested no-follow behavior. Following it would lint the
-// target file, which may live outside the requested tree (Codex r9).
+// target file, which may live outside the requested tree (issue #778).
 #[cfg(unix)]
 #[test]
 fn check_paths_does_not_follow_a_top_level_symlink_file() {
@@ -2631,8 +2631,8 @@ fn check_paths_does_not_follow_a_top_level_symlink_file() {
 }
 
 // A symlink to a DIRECTORY passed as a top-level path argument must NOT be
-// walked — following it could pull out-of-tree contents into the report,
-// contradicting the documented no-follow behavior (Codex r9).
+// walked. Following it could pull out-of-tree contents into the report. That
+// contradicts the documented no-follow behavior (issue #778).
 #[cfg(unix)]
 #[test]
 fn check_paths_does_not_follow_a_top_level_symlink_dir() {
@@ -2683,9 +2683,8 @@ fn check_paths_still_scans_real_file_and_dir_args() {
     );
 }
 
-// A non-UTF-8 `.rs` file discovered during a walk must be skipped (with a
-// warning) rather than aborting the whole scan — the clean file is still
-// analyzed.
+// A walk skips a non-UTF-8 `.rs` file with a warning. It must not abort the
+// whole scan, and the clean file is still analyzed.
 #[test]
 fn check_paths_skips_non_utf8_file_and_continues() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2710,11 +2709,11 @@ fn check_paths_errors_on_a_missing_top_level_path() {
     );
 }
 
-// ── P2 FIX #4: additional coverage — transitive structural rule, exacts ─────
+// ── Additional coverage — transitive structural rule, exacts ────────────────
 
 // A STRUCTURAL rule (DET010) reached through a first-party helper must be
-// attributed with `via_helper` — proving the full rule set (not just the
-// substring classes) applies to reachable helper bodies.
+// attributed with `via_helper`. This proves that the full rule set, not just
+// the substring classes, applies to reachable helper bodies.
 #[test]
 fn transitive_helper_det010_is_flagged_via_helper() {
     let src = "\
@@ -2844,9 +2843,9 @@ fn helper() {
     );
 }
 
-// ── module-scoped workflows (issue #778, Codex P1) ──────────────────────────
+// ── module-scoped workflows (issue #778) ───────────────────────────────────
 // A `#[workflow]` declared inside a Rust module (`mod name { … }`, including
-// nested modules) is a valid entry point and MUST be scanned for direct and
+// nested modules) is a valid entry point. It MUST be scanned for direct and
 // one-hop transitive violations, exactly like a top-level workflow. The #386
 // method-exclusion boundary (impl/trait method bodies are not free helpers)
 // must remain intact.
@@ -2927,8 +2926,8 @@ mod acts {
 #[test]
 fn impl_method_callee_is_not_resolved_as_helper() {
     // NEGATIVE guard (#386 boundary): a `#[workflow]` calling an inherent /
-    // associated METHOD whose body reads the clock must NOT be flagged — methods
-    // inside `impl` blocks are not free-function helpers and must never be indexed
+    // associated METHOD whose body reads the clock must NOT be flagged. Methods
+    // inside `impl` blocks are not free-function helpers. They are never indexed
     // or resolved. Covers both `self.foo()` and `Type::foo()` dispatch.
     let src = "\
 #[workflow]
@@ -3003,21 +3002,22 @@ mod workflows {
     );
 }
 
-// ── scope-aware same-name helper resolution (issue #778, Codex P1/r4) ────────
+// ── scope-aware same-name helper resolution (issue #778) ───────────────────
+//
 // When two plain free helpers share an identifier, the caller's own same-module
 // sibling is the Rust-correct resolution target. A same-file-but-different-module
-// definition is NOT preferred (a bare call in a child module does not reach a
-// parent/sibling-module helper without a `use`, which this text-level analysis
-// cannot see), so that case — and any other genuinely-undisambiguable one — is
-// conservatively skipped (safe false-negative, never a false-positive).
+// definition is NOT preferred. A bare call in a child module does not reach a
+// parent/sibling-module helper without a `use`, and this text-level analysis
+// cannot see a `use`. So that case, like any other undisambiguable one, is
+// skipped: a safe false-negative, never a false-positive.
 
 #[test]
 fn same_module_helper_resolves_over_unrelated_same_name() {
     // A workflow in `mod a` calling a bare `stamp()` must resolve to its OWN
-    // module sibling `a::stamp` (which reads the clock) even though an unrelated
-    // `b::stamp` of the same name exists — exactly what Rust resolves the bare
-    // call to. Previously the shared name was marked globally ambiguous and the
-    // reachable hard-blocker in `a::stamp` was skipped (false negative).
+    // module sibling `a::stamp`, which reads the clock. An unrelated `b::stamp`
+    // of the same name exists. Rust resolves the bare call the same way. The old
+    // code marked the shared name globally ambiguous. It skipped the reachable
+    // hard-blocker in `a::stamp` (false negative).
     let src = "\
 mod a {
     use autumn_harvest::prelude::*;
@@ -3056,14 +3056,14 @@ mod b {
 
 #[test]
 fn same_file_different_module_helper_is_not_resolved() {
-    // FALSE-POSITIVE fix (issue #778, Codex r4): a workflow in a child module
-    // does a bare `helper()` whose real target is a `use`-imported helper from
-    // ANOTHER file (`crate::pure::helper`, clean). An UNRELATED `fn helper()` at
-    // the workflow file's root reads the clock. A bare call in `mod inner` does
-    // NOT resolve to a parent-module (file-root) helper without a `use`, which
-    // this text-level analysis cannot see — so this must be treated as ambiguous
-    // and skipped, NOT resolved to the root helper's hard-blocker (a false
-    // positive that could fail CI on innocent code).
+    // FALSE-POSITIVE fix (issue #778): a workflow in a child module does a bare
+    // `helper()`. Its real target is a `use`-imported helper from ANOTHER file
+    // (`crate::pure::helper`, clean). An UNRELATED `fn helper()` at the
+    // workflow file's root reads the clock. A bare call in `mod inner` does NOT
+    // resolve to a parent-module (file-root) helper without a `use`. This
+    // text-level analysis cannot see the `use`. So the call is ambiguous and
+    // skipped. Resolving it to the root helper's hard-blocker would be a false
+    // positive that could fail CI on innocent code.
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("a.rs"),
@@ -3104,17 +3104,17 @@ pub fn helper() -> i64 {
 
 #[test]
 fn aliased_import_bare_call_is_not_resolved_to_root_helper_same_module_only() {
-    // FALSE-POSITIVE fix (issue #778, Codex r5): a workflow in `mod inner` does a
-    // bare `helper()` whose real target is an ALIASED `use`-imported helper from
+    // FALSE-POSITIVE fix (issue #778): a workflow in `mod inner` does a bare
+    // `helper()`. Its real target is an ALIASED `use`-imported helper from
     // ANOTHER file (`use crate::pure_helper as helper;`, clean). An UNRELATED
-    // `fn helper()` at the workflow file's root reads the clock and is the ONLY
-    // definition of the name `helper` in the tree — so the old globally-unique
-    // (`[only]`) resolution branch resolved the bare call cross-module to that root
-    // violation, a false positive that would fail CI on innocent aliased-import
-    // code. Under same-module-only resolution the root `helper` (module "") is NOT
-    // in the caller's own module (`inner`), so it is treated as ambiguous and the
-    // aliased call is NOT resolved. The line-based scanner cannot see the `use ...
-    // as helper;` alias, so no cross-module resolution can be safe here.
+    // `fn helper()` at the workflow file's root reads the clock. It is the ONLY
+    // definition of the name `helper` in the tree. So the old globally-unique
+    // (`[only]`) branch resolved the bare call cross-module to that root
+    // violation. That false positive would fail CI on innocent aliased-import
+    // code. Under same-module-only resolution, the root `helper` (module "") is
+    // NOT in the caller's own module (`inner`). So it is ambiguous, and the
+    // aliased call is NOT resolved. The line-based scanner cannot see the
+    // `use ... as helper;` alias, so no cross-module resolution is safe here.
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("a.rs"),
@@ -3155,10 +3155,10 @@ pub fn pure_helper() -> i64 {
 
 #[test]
 fn genuinely_ambiguous_same_name_helper_is_skipped() {
-    // Rule 4 (safe-FN boundary): two `stamp` helpers in two unrelated modules,
-    // and the workflow lives in a THIRD module with no same-module/same-file
-    // `stamp` to disambiguate its bare call. The call is conservatively skipped
-    // (a safe false-negative), never resolved to an arbitrary candidate.
+    // Rule 4 (safe-FN boundary): two `stamp` helpers live in two unrelated
+    // modules. The workflow lives in a THIRD module with no same-module/same-file
+    // `stamp` to disambiguate its bare call. The call is skipped (a safe
+    // false-negative), never resolved to an arbitrary candidate.
     let src = "\
 mod a {
     fn stamp() -> i64 {
@@ -3190,8 +3190,8 @@ mod c {
 fn same_name_impl_method_is_not_resolved_via_method_call() {
     // NEGATIVE guard: a `stamp` free helper (clean) coexists with an impl method
     // `stamp(&self)` that reads the clock. A workflow calling `obj.stamp()` (a
-    // METHOD call) must never be resolved to either — the method is not indexed
-    // (#386 boundary) and the method-call `.` before-guard excludes it.
+    // METHOD call) must never resolve to either. The method is not indexed (#386
+    // boundary), and the method-call `.` before-guard excludes it.
     let src = "\
 #[workflow]
 async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
@@ -3219,10 +3219,10 @@ impl Clock {
     );
 }
 
-// ── turbofish call form (issue #778, Codex P2) ──────────────────────────────
+// ── turbofish call form (issue #778) ───────────────────────────────────────
 // A generic first-party helper called with a turbofish (`helper::<T>()`) must
-// still have its body scanned; the byte after the ident is `:` (not `(`), so the
-// call-paren matcher must skip an optional `::<…>` segment before requiring `(`.
+// still have its body scanned. The byte after the ident is `:`, not `(`. So the
+// call-paren matcher skips an optional `::<…>` segment before it requires `(`.
 
 #[test]
 fn turbofish_helper_call_is_resolved() {
@@ -3277,10 +3277,10 @@ fn bad<T>() -> i64 {
 #[test]
 fn method_and_assoc_turbofish_are_not_resolved() {
     // NEGATIVE guard: a METHOD turbofish (`x.method::<T>()`) and an ASSOCIATED
-    // turbofish (`Type::assoc::<T>()`) must never be resolved to a free helper —
-    // the `.`/`:` before-guard still excludes both, turbofish or not. `method`
-    // and `assoc` free helpers (which read the clock) exist to prove they are NOT
-    // reached via the qualified/method call forms.
+    // turbofish (`Type::assoc::<T>()`) must never resolve to a free helper. The
+    // `.`/`:` before-guard still excludes both, turbofish or not. The `method`
+    // and `assoc` free helpers read the clock. They prove that the qualified and
+    // method call forms do NOT reach them.
     let src = "\
 #[workflow]
 async fn wf(ctx: &WorkflowContext) -> Result<(), String> {
@@ -3319,11 +3319,12 @@ impl Type {
     );
 }
 
-// ── raw-identifier function names (issue #778, Codex r4) ─────────────────────
+// ── raw-identifier function names (issue #778) ─────────────────────────────
+//
 // A workflow named with a raw identifier (`async fn r#gen(...)` — `gen` is a
-// reserved keyword in edition 2024) must still have its body scanned. Previously
-// the fn-name parser stopped at `r` and the tail sanity check rejected the line,
-// so an `r#`-named workflow's body was never scanned (false negative).
+// reserved keyword in edition 2024) must still have its body scanned. The old
+// fn-name parser stopped at `r`, and the tail sanity check rejected the line.
+// So an `r#`-named workflow's body was never scanned (false negative).
 
 #[test]
 fn raw_ident_workflow_body_is_scanned() {
@@ -3345,15 +3346,16 @@ async fn r#gen(ctx: &WorkflowContext) -> Result<(), String> {
     assert_eq!(finding.workflow_name.as_deref(), Some("r#gen"));
 }
 
-// ── FIX E (issue #778, Codex r6): block-local `use` imports shadow a same-module
-// helper. Even under same-module-only resolution, a `use` INSIDE the workflow
-// body rebinds a name to an import; Rust resolves the bare call to that import,
-// so the same-module resolver must not walk a sibling helper of the same name.
+// ── Block-local `use` imports shadow a same-module helper (issue #778) ──────
+//
+// Even under same-module-only resolution, a `use` INSIDE the workflow body
+// rebinds a name to an import. Rust resolves the bare call to that import. So
+// the same-module resolver must not walk a sibling helper of the same name.
 // The old code false-positived on this innocent (clean) code and exits 1 in CI.
 
 #[test]
 fn block_local_use_import_shadows_same_module_helper() {
-    // Codex's exact repro: a body-local `use crate::pure::helper;` shadows the
+    // The exact repro: a body-local `use crate::pure::helper;` shadows the
     // same-module `fn helper`; `helper()` resolves to the clean import → NO DET001.
     let src = "\
 mod m {
@@ -3427,12 +3429,11 @@ mod m {
 
 #[test]
 fn block_use_shadows_a_call_before_the_use_statement() {
-    // Codex r7: a Rust block `use` item is in scope for the ENTIRE enclosing
-    // block regardless of textual position, so a bare `helper()` call that
-    // PRECEDES the block `use crate::pure::helper;` still resolves to the
-    // import — not the same-module `fn helper`. Source-order suppression (r6)
-    // wrongly kept flagging this; whole-body `use` shadowing fixes the FP → NO
-    // DET001.
+    // A Rust block `use` item is in scope for the ENTIRE enclosing block,
+    // whatever its textual position. So a bare `helper()` call that PRECEDES
+    // the block `use crate::pure::helper;` still resolves to the import, not
+    // the same-module `fn helper`. Source-order suppression wrongly kept
+    // flagging this. Whole-body `use` shadowing fixes the FP → NO DET001.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3458,9 +3459,9 @@ mod m {
 
 #[test]
 fn block_glob_use_shadows_a_call_before_the_glob() {
-    // r7: a body-local glob `use crate::pure::*;` conservatively suppresses
-    // same-module resolution across the WHOLE body — including a call that
-    // precedes the glob (block-item scope, safe-direction) → NO DET001.
+    // A body-local glob `use crate::pure::*;` suppresses same-module resolution
+    // across the WHOLE body. That includes a call that precedes the glob
+    // (block-item scope, safe-direction) → NO DET001.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3485,8 +3486,9 @@ mod m {
 
 #[test]
 fn same_module_call_without_block_local_use_is_still_resolved() {
-    // REGRESSION guard (FIX E must not over-suppress): a genuine same-module call
-    // with NO block-local `use helper` must still resolve and flag (r5 must survive).
+    // REGRESSION guard (block-local `use` shadowing must not over-suppress): a
+    // genuine same-module call with NO block-local `use helper` must still
+    // resolve and flag. Same-module-only resolution must survive.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3551,9 +3553,9 @@ mod m {
 
 #[test]
 fn block_local_glob_use_conservatively_suppresses_later_same_module_calls() {
-    // A body-local glob `use crate::pure::*;` names no specific binding, so it is
-    // conservatively treated as shadowing every same-module call AFTER it in the
-    // body (safe-direction over-suppression, never a false positive).
+    // A body-local glob `use crate::pure::*;` names no specific binding. So it
+    // counts as shadowing every same-module call AFTER it in the body. That is
+    // safe-direction over-suppression, never a false positive.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3576,16 +3578,17 @@ mod m {
     );
 }
 
-// ── FIX (issue #778, Codex r10): nested `fn` declarations are not calls ──────
+// ── Nested `fn` declarations are not calls (issue #778) ────────────────────
+//
 // A nested `fn helper() {}` DECLARATION inside a workflow body must not be
-// mis-collected as a CALL to a same-module `fn helper` — the declaration token
-// `helper(` is preceded by the `fn` keyword, so it is a definition, not a call.
+// mis-collected as a CALL to a same-module `fn helper`. The `fn` keyword
+// precedes the declaration token `helper(`, so it is a definition, not a call.
 
 #[test]
 fn fn_declaration_in_body_is_not_collected_as_a_call() {
     // A nested `fn helper() {}` in the body (a DECLARATION, never called) plus a
-    // same-module `fn helper()` reading the clock. RED before the r10 fix: the
-    // declaration's `helper(` token was treated as a call and resolved to the
+    // same-module `fn helper()` reading the clock. RED before the fix: the
+    // declaration's `helper(` token counted as a call. It resolved to the
     // same-module helper → spurious DET001 that could fail innocent CI.
     let src = "\
 mod m {
@@ -3613,7 +3616,8 @@ fn body_local_fn_shadows_the_module_helper_on_a_real_call() {
     // The body DEFINES a clean nested `fn helper() {}` AND makes a genuine call
     // `helper()`. Rust resolves the call to the body-local nested fn (which
     // shadows the module item), so the same-module `fn helper` reading the clock
-    // must NOT be flagged. RED before r10: the call resolved to the module helper.
+    // must NOT be flagged. RED before the fix: the call resolved to the module
+    // helper.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3639,9 +3643,9 @@ mod m {
 
 #[test]
 fn same_module_call_without_body_local_fn_is_still_flagged() {
-    // REGRESSION guard (the r10 fix must not over-suppress): a genuine same-module
-    // `helper()` call with NO body-local `fn helper` / `use helper` must still
-    // resolve and flag.
+    // REGRESSION guard (the nested-`fn` fix must not over-suppress): a genuine
+    // same-module `helper()` call with NO body-local `fn helper` / `use helper`
+    // must still resolve and flag.
     let src = "\
 mod m {
     use autumn_harvest::prelude::*;
@@ -3670,10 +3674,10 @@ mod m {
     assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
 }
 
-// ── FIX F (issue #778, Codex r6): recognize raw identifiers in the CALL tokenizer.
-// Round 4 indexed a `fn r#gen` def under the key `r#gen`, but the call tokenizer
-// split `r#gen()` into `r`/`gen`, so the call never matched the def → a reachable
-// hard blocker in a raw-ident helper was silently missed (false negative).
+// ── Issue #778: recognize raw identifiers in the CALL tokenizer.
+// The def index stores a `fn r#gen` def under the key `r#gen`. A call tokenizer
+// that splits `r#gen()` into `r`/`gen` never matches the def. A reachable hard
+// blocker in a raw-ident helper is then silently missed (false negative).
 
 #[test]
 fn raw_ident_helper_call_is_resolved_and_flagged() {
@@ -3707,8 +3711,8 @@ mod m {
 
 #[test]
 fn raw_ident_method_call_is_not_resolved() {
-    // NEGATIVE: a raw-identifier METHOD call `x.r#gen()` must NOT be resolved to
-    // the free helper `r#gen` — the `.`/`:` before-guard still applies after the
+    // NEGATIVE: a raw-identifier METHOD call `x.r#gen()` must NOT resolve to
+    // the free helper `r#gen`. The `.`/`:` before-guard still applies after the
     // tokenizer re-attaches the `r#` prefix.
     let src = "\
 mod m {

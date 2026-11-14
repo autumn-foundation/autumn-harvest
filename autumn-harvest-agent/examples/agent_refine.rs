@@ -35,7 +35,6 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 
-/// The agent kind.
 const KIND: &str = "support";
 
 /// The system prompt of the operator. It lacks the rule.
@@ -56,7 +55,6 @@ const PASS: &str = "A manager must approve this refund.";
 /// The answer that misses the rule.
 const MISS: &str = "The refund is done.";
 
-/// The system text of a model request.
 fn system_of(request: &ChatRequest) -> String {
     request
         .messages
@@ -192,7 +190,6 @@ fn walk() -> Result<Walk, Box<dyn Error>> {
     })
 }
 
-/// The active version of the kind.
 async fn active(store: &InMemoryOverlayStore) -> Result<Option<OverlayVersion>, Box<dyn Error>> {
     Ok(store.active(KIND).await?.map(|s| s.version()))
 }

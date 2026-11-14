@@ -2,15 +2,15 @@
 //!
 //! **Mechanism.** `Control`. `helpers::shard_of(3)` is
 //! `ROUND.fetch_add(1, SeqCst) % 3` on a `static AtomicUsize`. Every argument
-//! at every sink in this workflow is a **constant**, so a value-only taint
-//! model reports nothing; only control-dependence — a `switchInt` on a tainted
-//! operand, with sinks in branch regions that do not post-dominate the branch —
-//! finds it.
+//! at every sink in this workflow is a **constant**. So a value-only taint
+//! model reports nothing. Only control-dependence finds it: a `switchInt` on a
+//! tainted operand, with sinks in branch regions that do not post-dominate the
+//! branch.
 //!
 //! **Launder.** Nothing in this body reads anything ambient; the `match`
-//! scrutinee is a plain `usize` local. HVG has no static/atomic rule (HVG007
-//! covers only `.lock()` on an uppercase receiver in the body) and DET has
-//! none; and the read is one crate away regardless.
+//! scrutinee is a plain `usize` local. HVG has no static/atomic rule. HVG007
+//! covers only `.lock()` on an uppercase receiver in the body. DET has no such
+//! rule either, and the read is one crate away regardless.
 //!
 //! **Expected trace hops.** `wf_atomic_shard_pick` ⇒
 //! `harvest_verify_corpus_helpers::shard_of` ⇒ `AtomicUsize::fetch_add` on

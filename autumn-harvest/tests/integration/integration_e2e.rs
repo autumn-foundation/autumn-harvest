@@ -7,9 +7,9 @@
 
 //! End-to-end integration tests using testcontainers for a real Postgres instance.
 //!
-//! These tests spin up a throwaway Postgres container per test, run the harvest
-//! migration SQL via `with_init_sql`, and exercise the full store/queue/DLQ stack
-//! against a real database.
+//! Each test spins up a throwaway Postgres container and runs the harvest
+//! migration SQL via `with_init_sql`. It then exercises the full store/queue/DLQ
+//! stack against a real database.
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
@@ -53,22 +53,26 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
-/// test. Excludes both the workflow-start uniqueness upgrade *and* the
-/// continue-as-new migration so the test can drive the database through the
+/// test.
+///
+/// It excludes both the workflow-start uniqueness upgrade *and* the
+/// continue-as-new migration. The test then drives the database through the
 /// historical upgrade sequence: legacy -> uniqueness fix -> continue-as-new.
 ///
-/// The `concurrency_key` migration is included because `enqueue` (called by
+/// It includes the `concurrency_key` migration because `enqueue` (called by
 /// `start_or_load_workflow_execution`) writes the `concurrency_key` and
-/// `concurrency_cap` columns that it added; without them the INSERT fails.
-/// The `harvest_workers` and `harvest_build_routing` migrations are included
-/// because `start_or_load_workflow_execution` queries `harvest_build_policies`
-/// (created by build routing) and inserts `assigned_build_id` into
-/// `harvest_workflow_executions`; the build routing migration also alters
+/// `concurrency_cap` columns that it added. Without them the INSERT fails.
+///
+/// It includes the `harvest_workers` and `harvest_build_routing` migrations for
+/// these reasons. `start_or_load_workflow_execution` queries `harvest_build_policies`
+/// (created by build routing). It also inserts `assigned_build_id` into
+/// `harvest_workflow_executions`. The build routing migration alters
 /// `harvest_workers`, so that table must exist first.
-/// The parent-close-policy migration is included because the modern start path
-/// inserts/selects the nullable `parent_close_policy` column even for root
-/// workflows; the test still excludes only the uniqueness/continue-as-new
-/// migrations it is explicitly exercising.
+///
+/// It includes the parent-close-policy migration because the modern start
+/// path reads and writes the nullable `parent_close_policy` column, even for
+/// root workflows. The test still excludes only the uniqueness and
+/// continue-as-new migrations that it exercises.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -161,7 +165,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     // harvest_task_queue.*` deserializes into) references capability_misses on
     // every claim, so the legacy start path's enqueue+claim needs it too.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
-    // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
+    // issue #804: `TaskQueueItem` selects the companion distinct-misser
     // set on the same claim, so omitting it fails the legacy path's claim exactly
     // as omitting `capability_misses` would.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
@@ -179,9 +183,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     // policy configured) execution.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n",
     // issue #964: WorkflowExecution::as_select() (the modern start path's
-    // read-back) references the three rebalancing columns even for an
-    // execution that has never been migrated -- which is every execution in
-    // every deployment that never runs a rebalance.
+    // read-back) references the three rebalancing columns. It does so even for
+    // an execution that was never migrated. That is every execution in every
+    // deployment that never runs a rebalance.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
@@ -502,11 +506,11 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
 pub(crate) fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        // Must comfortably exceed the largest `max_concurrent_workflows` any
-        // test in this file passes to `build_runtime_worker` (currently 16,
-        // for the wall-clock fan-out test) -- otherwise genuinely-concurrent
-        // workflow tasks contend for pool checkouts instead of exercising
-        // real in-process parallelism.
+        // Must comfortably exceed the largest `max_concurrent_workflows` that
+        // a test in this file passes to `build_runtime_worker`. That is 16, for
+        // the wall-clock fan-out test. Otherwise concurrent workflow tasks
+        // contend for pool checkouts instead of exercising real in-process
+        // parallelism.
         .max_size(20)
         .build()
         .expect("failed to build test pool")
@@ -698,10 +702,11 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
     exec_id
 }
 
-/// Insert a RUNNING execution pinned to `shard` -- both in the encoded
-/// `ExecutionId` and in the row's `shard_id` column, exactly as the shard-pinned
-/// start path (issue #697) writes it. Used to prove residency is transitive
-/// across the workflow tree.
+/// Insert a RUNNING execution pinned to `shard`.
+///
+/// The pin is in both the encoded `ExecutionId` and the row's `shard_id`
+/// column, exactly as the shard-pinned start path (issue #697) writes it.
+/// Tests use it to prove that residency is transitive across the workflow tree.
 pub(crate) async fn insert_workflow_execution_on_shard(
     conn: &mut AsyncPgConnection,
     shard: autumn_harvest::types::ShardId,
@@ -924,9 +929,9 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         "post-upgrade start should resolve to the same execution as the legacy start",
     );
 
-    // Apply the continue-as-new migration on top to make sure the partial
-    // unique index it installs is compatible with the upgraded schema and
-    // continues to enforce idempotent starts.
+    // Apply the continue-as-new migration on top. Its partial unique index
+    // must be compatible with the upgraded schema and still enforce
+    // idempotent starts.
     let continue_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("migrations/20260427000000_harvest_continue_as_new/up.sql");
     let continue_sql = std::fs::read_to_string(&continue_path).unwrap_or_else(|error| {
@@ -999,18 +1004,19 @@ pub(crate) fn build_runtime_worker(
 /// Same as [`build_runtime_worker`], but with a caller-supplied
 /// `workflow_task_timeout` instead of the default 10s.
 ///
-/// The default 10s per-decision-cycle budget is tight enough that a
-/// genuinely-high-concurrency, DB-heavy test (many workflow tasks racing for
-/// very few CPUs on a constrained CI runner) can trip the poison-pill
-/// mechanism (`WorkerConfig::poison_pill_threshold`, issue #367) purely from
-/// scheduling delay -- a decision cycle whose actual work (e.g. an in-body
-/// `tokio::time::sleep`) is well under budget can still exceed 10s wall-clock
-/// if the runtime starves it for CPU, and three such strikes quarantines the
-/// execution as FAILED with no relation to the workflow's own logic. Tests
-/// that already carry their own generous outer wall-clock bound (e.g. a
-/// `tokio::time::timeout` around the whole assertion) should use this to set
-/// a `workflow_task_timeout` wide enough that only a genuine stall -- not CI
-/// scheduling noise -- can trip it.
+/// The default 10s per-decision-cycle budget is tight. A high-concurrency,
+/// DB-heavy test can trip the poison-pill mechanism
+/// (`WorkerConfig::poison_pill_threshold`, issue #367) purely from scheduling
+/// delay. In such a test, many workflow tasks race for very few CPUs on a
+/// constrained CI runner. A decision cycle whose actual work is well under budget can still
+/// exceed 10s wall-clock if the runtime starves it for CPU. An example is an
+/// in-body `tokio::time::sleep`. Three such strikes quarantine the execution as
+/// FAILED, with no relation to the workflow's own logic.
+///
+/// A test that already has a generous outer wall-clock bound, such as a
+/// `tokio::time::timeout` around the whole assertion, should use this. Set a
+/// `workflow_task_timeout` wide enough that only a genuine stall can trip it,
+/// not CI scheduling noise.
 fn build_runtime_worker_with_task_timeout(
     worker_id: &str,
     max_concurrent_workflows: usize,
@@ -1036,12 +1042,12 @@ fn build_runtime_worker_with_task_timeout(
 /// `capability_miss_max_redeliveries` instead of the default 5.
 ///
 /// The issue #804 release budget is spent against a capped exponential backoff
-/// (`1s * 2^n`, capped at 30s), so the default budget of 5 costs
-/// `1 + 2 + 4 + 8 + 16 = 31s` of dwell before the task escalates -- well past
-/// the 10s default [`wait_for_execution_state`] bound. A test that asserts the
-/// *escalation* (rather than an individual release) should therefore set a
-/// small budget so the terminal verdict lands promptly, instead of widening its
-/// wait and paying the dwell for real.
+/// (`1s * 2^n`, capped at 30s). So the default budget of 5 costs
+/// `1 + 2 + 4 + 8 + 16 = 31s` of dwell before the task escalates. That is well
+/// past the 10s default [`wait_for_execution_state`] bound. A test that asserts
+/// the *escalation*, not an individual release, should set a small budget. The
+/// terminal verdict then lands promptly. A wider wait would pay the dwell for
+/// real.
 pub(crate) fn build_runtime_worker_with_capability_miss_budget(
     worker_id: &str,
     max_concurrent_workflows: usize,
@@ -1061,9 +1067,9 @@ pub(crate) fn build_runtime_worker_with_capability_miss_budget(
 
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
-/// Extracted so tests that need to inspect `Worker::new`'s `Result` (e.g. the
-/// issue #699 worker-startup rate-limit validation tests) can pass a registry
-/// directly without the `.expect(...)` that `build_runtime_worker*` applies.
+/// Some tests inspect the `Result` of `Worker::new`, such as the issue #699
+/// worker-startup rate-limit validation tests. They pass a registry directly,
+/// without the `.expect(...)` that `build_runtime_worker*` applies.
 pub(crate) fn runtime_config(
     worker_id: &str,
     max_concurrent_workflows: usize,
@@ -1132,10 +1138,11 @@ pub(crate) async fn wait_for_execution_state(
     .await
 }
 
-/// Same as [`wait_for_execution_state`] but with a caller-supplied timeout,
-/// for tests whose expected wall-clock (e.g. many genuinely-concurrent
-/// children each sleeping for real time) can exceed the 10s default under
-/// resource-constrained CI runners.
+/// Same as [`wait_for_execution_state`] but with a caller-supplied timeout.
+///
+/// A test's expected wall-clock can exceed the 10s default on
+/// resource-constrained CI runners. An example is many concurrent children,
+/// each sleeping for real time.
 pub(crate) async fn wait_for_execution_state_with_timeout(
     database_url: &str,
     exec_id: ExecutionId,
@@ -1379,8 +1386,10 @@ fn echo_workflow<'a>(
 }
 
 /// Issue #772: returns `ctx.deadline()` (a pure, no-clock accessor) as its
-/// output so a DB e2e test can prove the run's `execution_timeout` was threaded
-/// from the execution row into the `WorkflowContext`.
+/// output.
+///
+/// A DB e2e test then proves that the run's `execution_timeout` flows from the
+/// execution row into the `WorkflowContext`.
 fn deadline_echo_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -1597,8 +1606,9 @@ fn parent_workflow_with_child<'a>(
     })
 }
 
-/// Issue #697 (AC4 + success metric): spawns a child and THEN continues-as-new,
-/// so a single run produces both descendant kinds and one test can assert the
+/// Issue #697 (AC4 + success metric): spawns a child and THEN continues-as-new.
+///
+/// One run produces both descendant kinds. So one test can assert the
 /// metric's "remain on across children/CAN" clause end to end. Branches on
 /// `phase`: `"init"` spawns the child then forks; the continuation returns.
 fn child_then_continue_as_new_workflow<'a>(
@@ -1919,10 +1929,9 @@ async fn full_workflow_lifecycle() {
     ));
     assert_eq!(history.next_event_id, 1);
 
-    // 3. Enqueue an activity task
-    //    Set scheduled_at slightly in the past to avoid clock skew between
-    //    the host (where Utc::now() runs) and the Docker container (where
-    //    Postgres NOW() runs).
+    // 3. Enqueue an activity task. Set scheduled_at slightly in the past to
+    //    absorb clock skew. Utc::now() runs on the host, and Postgres NOW()
+    //    runs in the Docker container.
     let mut params = EnqueueParams::new(
         "default",
         TaskType::Activity,
@@ -2023,15 +2032,17 @@ async fn claim_task_returns_none_on_empty_queue() {
     );
 }
 
-/// Issue #772 (Finding 2): prove the run's `execution_timeout` flows end-to-end
-/// from the execution row (`prepared.execution.execution_timeout`) into the
-/// `WorkflowContext` so `ctx.deadline()` is populated. Deterministic (no timing
-/// flake): the workflow's only job is to return `ctx.deadline()` (a pure,
-/// clock-free accessor), and we assert its output equals the row's `deadline_at`
-/// column exactly — both are `WorkflowStarted.timestamp + execution_timeout`, so
-/// they can only match if the timeout was threaded into the context. Without the
-/// worker→executor→context threading, `ctx.deadline()` would be `None` and the
-/// output would be JSON `null`.
+/// Issue #772: the run's `execution_timeout` flows end to end into
+/// `ctx.deadline()`.
+///
+/// It flows from the execution row (`prepared.execution.execution_timeout`)
+/// into the `WorkflowContext`. The test is deterministic, with no timing flake.
+/// The workflow only returns `ctx.deadline()`, a pure, clock-free accessor. The
+/// test asserts that its output equals the row's `deadline_at` column exactly.
+/// Both are `WorkflowStarted.timestamp + execution_timeout`. So they match only
+/// if the timeout reached the context. Without the worker→executor→context
+/// threading, `ctx.deadline()` would be `None` and the output would be JSON
+/// `null`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_threads_execution_timeout_into_ctx_deadline() {
@@ -2238,23 +2249,26 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     );
 }
 
-/// Issue #772 (P2 split): prove the public `ctx.deadline()` accessor is the
-/// **replay-stable NOMINAL** deadline (`started_at + execution_timeout`) end to
-/// end through the real worker, and is NOT the mutable, resume-shifted
-/// `deadline_at` column.
+/// Issue #772: the public `ctx.deadline()` accessor is the **replay-stable
+/// NOMINAL** deadline (`started_at + execution_timeout`).
 ///
-/// A resumed/redriven run's `deadline_at` is pushed forward past
-/// `started_at + execution_timeout` (pause/resume shifts it by the pause span,
-/// #383; redrive re-anchors it to `now + timeout`). Rather than wiring a full
-/// pause/resume with a backdated `paused_at` (heavy, timing-sensitive), this
-/// test directly `UPDATE`s the row's `deadline_at` to a shifted value — exactly
-/// what resume's SQL does — and asserts the worker still surfaces the NOMINAL
-/// deadline through `ctx.deadline()`. Deterministic: the workflow returns
-/// `ctx.deadline()` as its output, and we assert it equals `started_at +
-/// execution_timeout` and is far from the (shifted) row `deadline_at`. The
-/// live/effective `deadline_at` is consumed only by the internal continue-as-new
-/// budget check, never by this public accessor, so author code depending on
-/// `deadline()` replays deterministically after a pause.
+/// The test proves this end to end through the real worker. The accessor is
+/// NOT the mutable, resume-shifted `deadline_at` column.
+///
+/// A resumed or redriven run's `deadline_at` moves past
+/// `started_at + execution_timeout`. Pause/resume shifts it by the pause span
+/// (#383). Redrive re-anchors it to `now + timeout`. A full pause/resume with a
+/// backdated `paused_at` is heavy and timing-sensitive. So this test directly
+/// `UPDATE`s the row's `deadline_at` to a shifted value, exactly as resume's
+/// SQL does. The worker must still surface the NOMINAL deadline through
+/// `ctx.deadline()`.
+///
+/// The test is deterministic. The workflow returns `ctx.deadline()` as its
+/// output. The test asserts that it equals `started_at + execution_timeout`
+/// and is far from the shifted row `deadline_at`. Only the internal
+/// continue-as-new budget check reads the live `deadline_at`, never this
+/// public accessor. So author code that depends on `deadline()` replays
+/// deterministically after a pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
@@ -3712,11 +3726,13 @@ async fn worker_completes_workflow_with_timer_round_trip() {
 }
 
 /// Issue #697 AC4 (DB, real worker loop): a child spawned by a shard-pinned
-/// parent stays on the parent's shard -- **both** in the encoded `ExecutionId`
-/// (what every id-based lookup routes on) and in the row's `shard_id` column.
-/// The context-level unit tests prove the id is minted correctly; this proves
-/// the whole worker persistence path preserves it end to end, so residency is
-/// transitive across the workflow tree rather than implicitly assumed.
+/// parent stays on the parent's shard.
+///
+/// It stays there **both** in the encoded `ExecutionId` and in the row's
+/// `shard_id` column. Every id-based lookup routes on the `ExecutionId`. The
+/// context-level unit tests prove that the id is minted correctly. This test
+/// proves that the whole worker persistence path preserves it end to end. So
+/// residency is transitive across the workflow tree, not implicitly assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_child_of_a_shard_pinned_parent_inherits_the_parents_shard() {
     use autumn_harvest::types::ShardId;
@@ -3758,9 +3774,9 @@ async fn worker_child_of_a_shard_pinned_parent_inherits_the_parents_shard() {
     assert_eq!(child_execs.len(), 1, "exactly one child should be created");
     let child = &child_execs[0];
 
-    // The encoded shard is the load-bearing half: an `ExecutionId::new()` child
-    // would carry the UNENCODED sentinel and every id-based lookup would route
-    // it to the deployment's *default* shard, breaking residency even though
+    // The encoded shard is the load-bearing half. An `ExecutionId::new()` child
+    // would carry the UNENCODED sentinel. Every id-based lookup would then route
+    // it to the deployment's *default* shard. That breaks residency even though
     // the row itself landed on the parent's shard.
     let child_exec_id: ExecutionId = child
         .id
@@ -3780,14 +3796,16 @@ async fn worker_child_of_a_shard_pinned_parent_inherits_the_parents_shard() {
 }
 
 /// Issue #697 AC4 + the issue's **success metric** (DB, real worker loop):
-/// a shard-pinned run, the child it spawns, AND the continue-as-new successor
-/// it forks all stay on the pinned shard -- the metric's literal
-/// "land on (and remain on across children/CAN) the intended shard" clause,
-/// measured in one run rather than assumed from reading the mint sites.
+/// a shard-pinned run and its descendants stay on the pinned shard.
 ///
-/// Deliberately pinned to a **non-default** shard (5) so a regression that
-/// hardcodes `ShardId::new(0)` / `default_shard` is caught, not just one that
-/// mints the `UNENCODED` sentinel. Each assertion checks BOTH halves: the
+/// The run, the child it spawns, AND the continue-as-new successor it forks
+/// all stay there. This measures the metric's literal "land on (and remain on
+/// across children/CAN) the intended shard" clause in one run. It does not
+/// assume it from reading the mint sites.
+///
+/// The test pins a **non-default** shard (5) on purpose. It then catches a
+/// regression that hardcodes `ShardId::new(0)` / `default_shard`, not only one
+/// that mints the `UNENCODED` sentinel. Each assertion checks BOTH halves: the
 /// encoded `ExecutionId` (what every later id-based lookup routes on) and the
 /// row's `shard_id` column (where the data physically lives).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3947,12 +3965,15 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
     ));
 }
 
-/// Issue #767 success metric (DB, real worker loop): a child that fails with a
-/// *typed* `WorkflowFailure` surfaces its `error_type`/`non_retryable` to the
-/// parent, which branches on the typed class (never the message) across ≥3
-/// categories. Also asserts AC4: the child's `execution.error` column carries
-/// the human message, not the wire envelope; and the child's own history
-/// terminal `WorkflowFailed` event carries the typed fields.
+/// Issue #767 success metric (DB, real worker loop): a typed child failure
+/// reaches the parent.
+///
+/// A child that fails with a *typed* `WorkflowFailure` surfaces its
+/// `error_type`/`non_retryable` to the parent. The parent branches on the
+/// typed class (never the message) across ≥3 categories. The test also
+/// asserts AC4. The child's `execution.error` column carries the human
+/// message, not the wire envelope. The terminal `WorkflowFailed` event in the
+/// child's own history carries the typed fields.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_parent_branches_on_typed_child_failure_across_categories() {
     for (category, expected_branch) in [
@@ -4536,11 +4557,11 @@ fn abandoned_child_dispatch_registry() -> Arc<HandlerRegistry> {
 ///
 /// Before #952, `persist_terminal_outcome_commands` replayed only
 /// `RecordMarker`/`RecordSideEffect`/`SpawnDetachedChildWorkflow` from the
-/// pending-command list, so all three `StartChildWorkflow` commands vanished:
-/// no `ChildWorkflowStarted`, no child rows, an audit trail that lied about what
-/// the code did. Now each dispatch is recorded at its emission position with a
-/// synthetic terminal marking it never-started — and still no child execution
-/// rows, because nothing was ever started.
+/// pending-command list. So all three `StartChildWorkflow` commands vanished.
+/// There was no `ChildWorkflowStarted` and no child row, and the audit trail
+/// lied about what the code did. Now each dispatch is recorded at its emission
+/// position, with a synthetic terminal that marks it never-started. There are
+/// still no child execution rows, because nothing was ever started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_records_every_dispatched_child_when_the_cycle_fails() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4618,9 +4639,10 @@ async fn worker_records_every_dispatched_child_when_the_cycle_fails() {
 }
 
 /// End-to-end proof that the worker persists a `spawn_child_workflow_fan_out_raw`
-/// suspension batch (the `fan_out:{n}` marker + N `StartChildWorkflow` commands)
-/// exactly like the pre-existing hand-rolled `tokio::join!` parallel-children
-/// path, and that all three children complete and merge in input order.
+/// suspension batch exactly like the hand-rolled `tokio::join!` children path.
+///
+/// The batch is the `fan_out:{n}` marker + N `StartChildWorkflow` commands. All
+/// three children complete and merge in input order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_completes_parent_workflow_with_child_fan_out() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4695,9 +4717,10 @@ async fn worker_completes_parent_workflow_with_child_fan_out() {
     }
 }
 
-/// Slow child used by the wall-clock success-metric test: durably waits for
-/// real wall-clock time before returning, so N of these running in parallel
-/// proves genuine concurrent dispatch rather than sequential replay-cycle
+/// Slow child used by the wall-clock success-metric test.
+///
+/// It durably waits for real wall-clock time before it returns. So N of these
+/// in parallel prove concurrent dispatch, not sequential replay-cycle
 /// scheduling.
 ///
 /// **Must use `ctx.timer(...)`, never a raw `tokio::time::sleep` inside the
@@ -4720,20 +4743,20 @@ fn slow_fan_child_workflow<'a>(
 
 /// Number of children fanned out by [`worker_completes_ten_child_fan_out_within_wall_clock_bound`].
 ///
-/// Reduced from 10 to 5 after reproducing this test's CI flakiness locally
-/// (see that test's doc comment for the full investigation): under genuine
-/// CPU contention (verified with `taskset -c 0,1` plus background CPU load,
-/// simulating a busy shared CI runner) all children still completed near-
-/// instantly, but the parent's own reclaim-and-finalize decision cycle --
-/// strictly heavier than any single child's, since it replays the full,
-/// ever-growing history and re-awaits every already-resolved child future
-/// on each reclaim -- occasionally starved for minutes even past the 60s
-/// internal `workflow_task_timeout`, because under severe-enough contention
-/// even tokio's own timer wheel can't service the deadline promptly. Fewer
-/// concurrent decision cycles (6 total instead of 11) directly shrinks both
-/// the contention surface and the parent's per-cycle replay cost, while
-/// still meaningfully proving genuine concurrent dispatch (distinct from
-/// the 3-child correctness test `worker_completes_parent_workflow_with_child_fan_out`).
+/// Reduced from 10 to 5 after a local reproduction of this test's CI
+/// flakiness. That test's doc comment has the full investigation.
+/// `taskset -c 0,1` plus background CPU load simulated a busy shared CI
+/// runner. All children still completed near-instantly. The parent's own
+/// reclaim-and-finalize decision cycle sometimes starved for minutes, even
+/// past the 60s internal `workflow_task_timeout`.
+///
+/// That cycle is heavier than any child's. On each reclaim it replays the
+/// full, growing history and re-awaits every resolved child future. Under
+/// severe contention even tokio's own timer wheel cannot service the deadline
+/// promptly. Fewer concurrent decision cycles (6 instead of 11) shrink both
+/// the contention surface and the parent's per-cycle replay cost. The test
+/// still proves concurrent dispatch, unlike the 3-child correctness test
+/// `worker_completes_parent_workflow_with_child_fan_out`.
 const SLOW_FAN_CHILD_COUNT: usize = 5;
 
 /// Parent that fans out several slow children (count: [`SLOW_FAN_CHILD_COUNT`]).
@@ -4821,18 +4844,19 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
 }
 
 /// Polls for the given execution to reach `COMPLETED`, exactly like
-/// [`wait_for_execution_state_with_timeout`], but on timeout dumps a full
-/// snapshot of the parent's and every child's execution row plus task queue
-/// row(s) into the panic message instead of the bare `Elapsed(())`.
+/// [`wait_for_execution_state_with_timeout`].
 ///
-/// This test (`worker_completes_ten_child_fan_out_within_wall_clock_bound`)
-/// failed on CI several consecutive times across a mix of confirmed,
-/// distinct dropped-wake fixes and one actual test-authoring bug (see that
-/// test's own doc comment for the full history); this snapshot is the
-/// fastest way to tell a genuinely-stuck row (`state=RUNNING`,
-/// `worker_id=NULL`, i.e. parked forever) apart from mere CI slowness
-/// (`state=PENDING`, still waiting for a worker slot) without needing an
-/// interactive debugger against a Docker-less sandbox.
+/// On timeout it panics with a full snapshot, not the bare `Elapsed(())`. The
+/// snapshot holds the execution row and task queue rows of the parent and of
+/// every child.
+///
+/// `worker_completes_ten_child_fan_out_within_wall_clock_bound` failed on CI
+/// several times in a row. That history mixed distinct, confirmed dropped-wake
+/// fixes with one test-authoring bug. Its doc comment has the full history.
+/// This snapshot is the fastest way to tell a stuck row from mere CI slowness,
+/// with no interactive debugger against a Docker-less sandbox. A stuck row has
+/// `state=RUNNING` and `worker_id=NULL`, so it is parked forever. A slow row
+/// has `state=PENDING` and still waits for a worker slot.
 async fn wait_for_completion_with_diagnostics(
     database_url: &str,
     parent_exec_id: ExecutionId,
@@ -4920,65 +4944,58 @@ async fn wait_for_completion_with_diagnostics(
     }
 }
 
-/// Success-metric test (issue #601): 10 children fanned out in parallel
-/// must all complete -- proving the fan-out genuinely dispatches all N
-/// children concurrently (one suspension batch, one worker wave) rather
-/// than one at a time.
+/// Success-metric test (issue #601): [`SLOW_FAN_CHILD_COUNT`] children fanned
+/// out in parallel must all complete.
+///
+/// This proves that the fan-out dispatches all N children concurrently, in
+/// one suspension batch and one worker wave, not one at a time.
 ///
 /// This is deliberately **not** a tight latency assertion. Two rounds of
-/// `ubuntu-latest` CI failures (a 5s bound against a shared 10s timeout,
-/// then a 20s bound against a 30s timeout) showed that GitHub-hosted
-/// runners (2 vCPUs, and this whole suite runs with `--test-threads=1`) do
-/// not give 11 genuinely-concurrent workflow tasks -- each doing several
-/// real DB round trips -- anywhere close to the throughput available in a
-/// typical dev sandbox. The outer bounds below were widened accordingly.
-/// The qualitative claim this test defends -- "N children fanned out
-/// complete together, not one full round trip at a time" -- does not depend
-/// on the exact numbers; only the "all 10 completed" assertion is meant to
-/// be load-bearing on constrained hardware.
+/// `ubuntu-latest` CI failures showed the limits: a 5s bound against a shared
+/// 10s timeout, then a 20s bound against a 30s timeout. GitHub-hosted runners
+/// have 2 vCPUs, and this suite runs with `--test-threads=1`. They give the
+/// parent and its children, all concurrent and DB-heavy workflow tasks, far
+/// less throughput than a typical dev sandbox. So the outer bounds below are wide. The claim under test does not
+/// depend on the exact numbers: N fanned-out children complete together, not
+/// one full round trip at a time. Only the "all children completed" assertion
+/// is load-bearing on constrained hardware.
 ///
-/// **Root cause of five subsequent CI failures, finally found via the
-/// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
-/// review rounds 2-8):** the original version of `slow_fan_child_workflow`
-/// used a raw `tokio::time::sleep` inside the workflow body instead of
-/// `ctx.timer(...)`. That was invalid workflow code for this engine. The
-/// live-execution poll in `drive_workflow` then used a hard 100ms
-/// suspension timer (removed by issue #1797). A raw sleep longer than
-/// that ended the cycle with zero commands emitted. Every attempt hit
-/// "workflow suspended without emitted commands; resumption is not
-/// implemented yet". This was mistaken for a series of
-/// dropped-wake races across several review rounds (each of which found and
-/// fixed a real, independently-confirmed bug in `worker.rs`/`queue.rs` --
-/// none of them were the actual cause of *this test's* failures).
-/// `slow_fan_child_workflow` now uses `ctx.timer("slow_wait", 1)`, the
-/// durable primitive every other wait in this engine uses, which properly
-/// suspends via a real oneshot after pushing `StartTimer` instead of
-/// blocking the poll.
+/// **Root cause of five later CI failures (PR #901):** the diagnostic dump in
+/// [`wait_for_completion_with_diagnostics`] found it. The original
+/// `slow_fan_child_workflow` used a raw `tokio::time::sleep` inside the
+/// workflow body instead of `ctx.timer(...)`. That was invalid workflow code
+/// for this engine. The live-execution poll in `drive_workflow` then used a
+/// hard 100ms suspension timer (removed by issue #1797). A longer raw sleep
+/// ended the cycle with zero commands emitted. Every attempt hit "workflow
+/// suspended without emitted commands; resumption is not implemented yet".
+/// This was mistaken for a series of dropped-wake races. Each fix of that
+/// series fixed a real, independently confirmed bug in `worker.rs`/`queue.rs`.
+/// None of them caused *this test's* failures. `slow_fan_child_workflow` now
+/// uses `ctx.timer("slow_wait", 1)`, the durable primitive of every other wait
+/// in this engine. It pushes `StartTimer` and suspends via a real oneshot,
+/// instead of blocking the poll.
 ///
-/// **Continued flakiness after the above fix (issue #604 PR, unrelated
-/// review round):** even with the timer fix in place, this test still
-/// intermittently failed on `ubuntu-latest` with a single decision cycle
-/// (the parent, or exactly one of the ten children) sitting `RUNNING`
-/// (claimed, `worker_id`/`started_at` populated) for 2+ minutes with zero
-/// progress, while the other 9-10 completed within ~1-2s of dispatch as
-/// expected. Investigated `persist_started_timer`'s park path
-/// (`queue::reschedule_task`) for the same class of dropped-wake bug
-/// documented on the sibling `persist_activity_wait_park`/
-/// `persist_all_started_child_workflows` paths -- ruled out: timer parking
-/// deliberately does not use the `wake_requested` fallback mechanism at
-/// all. It reschedules the row to `PENDING` with `scheduled_at = fires_at`
-/// (a known future instant, unlike an arbitrary external wake), so the
-/// worker's ordinary `WHERE scheduled_at <= NOW()` poll claim picks it up
-/// once due -- there is no wake race to lose. The uneven per-task
-/// completion pattern (most finish almost instantly, one wedges for
-/// minutes) points at pure scheduling-contention on a shared, 2-vCPU CI
-/// runner asked to make progress on 11 genuinely concurrent, DB-heavy
-/// decision cycles at once, not a logic bug in the wake/park mechanics.
-/// `worker_threads` was raised from 4 to 12 (this whole suite runs with
-/// `--test-threads=1`, so this is the only test using this many OS threads
-/// at any given moment) and the outer wait bound from 90s to 180s to give
-/// a legitimately-contended cycle room to finish rather than fail the test
-/// outright; see the wait-bound call site below for the full reasoning.
+/// **Continued flakiness after that fix (found on the issue #604 PR):** this
+/// test still failed intermittently on `ubuntu-latest`. A single decision
+/// cycle (the parent, or one of the ten children) sat `RUNNING` for 2+
+/// minutes with zero progress. It was claimed, with `worker_id`/`started_at`
+/// populated. The other 9-10 completed within ~1-2s of dispatch.
+///
+/// The park path of `persist_started_timer` (`queue::reschedule_task`) was
+/// checked for the dropped-wake bug class documented on
+/// `persist_activity_wait_park`/`persist_all_started_child_workflows`. That
+/// was ruled out. Timer parking does not use the `wake_requested` fallback at
+/// all. It reschedules the row to `PENDING` with `scheduled_at = fires_at`, a
+/// known future instant. The ordinary `WHERE scheduled_at <= NOW()` poll
+/// claim picks it up once due, so there is no wake race to lose.
+///
+/// Most tasks finish almost instantly, and one wedges for minutes. That
+/// pattern points at scheduling contention on a shared 2-vCPU runner with 11
+/// concurrent, DB-heavy decision cycles. It is not a logic bug in the
+/// wake/park mechanics. So `worker_threads` went from 4 to 12. This suite runs
+/// with `--test-threads=1`, so no other test uses these OS threads at the same
+/// time. The outer wait bound went from 90s to 180s, so a contended cycle has
+/// room to finish. The wait-bound call site below has the full reasoning.
 ///
 /// **2026-09-09 CI-health investigation (issue #1459):** this test failed on
 /// `trunk-dev`, run 34282622366, job `Test DB (linux, shard 6)`. The parent
@@ -5008,16 +5025,14 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     // children so every child dispatches in the same wave instead of
     // queueing behind a saturated semaphore.
     //
-    // Uses a wide workflow_task_timeout (not the 10s default) as a safety
-    // margin against pure CI scheduling contention across several
-    // genuinely-concurrent, DB-heavy decision cycles -- this was originally
-    // suspected to be the root cause of this test's flakiness, but the
-    // actual cause (see the doc comment above) was unrelated: a raw
-    // tokio::time::sleep in the workflow body, now fixed. The wider timeout
-    // is left in place as cheap, harmless insurance; the test's own outer
-    // bound is the real backstop against a genuine stall, and
-    // SLOW_FAN_CHILD_COUNT was later reduced from 10 to shrink the
-    // contention surface itself (see that constant's doc comment).
+    // A wide workflow_task_timeout (not the 10s default) is a safety margin
+    // against CI scheduling contention across concurrent, DB-heavy decision
+    // cycles. That contention was first suspected as the cause of this test's
+    // flakiness. The actual cause was a raw tokio::time::sleep in the workflow
+    // body, now fixed (see the doc comment above). The wider timeout stays as
+    // cheap insurance. The test's own outer bound is the real backstop against
+    // a genuine stall. SLOW_FAN_CHILD_COUNT was later reduced from 10 to
+    // shrink the contention surface (see that constant's doc comment).
     let worker = build_runtime_worker_with_task_timeout(
         "worker-e2e-ten-slow-children",
         16,
@@ -5029,15 +5044,13 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let handle = spawn_test_worker(Arc::clone(&worker), pool);
 
     let start = std::time::Instant::now();
-    // Bound widened 90s -> 180s: this specific test has been observed on
-    // busy ubuntu-latest runners to leave a single decision cycle (out of
-    // 11 genuinely concurrent ones) parked/claimed for 2+ minutes with zero
-    // progress before eventually completing -- pure scheduling contention on
-    // a 2-vCPU shared runner, not a hang (the other 9-10 children routinely
-    // finish within ~1-2s of dispatch). Per the doc comment above, only the
-    // "all 10 completed" assertion is meant to be load-bearing on
-    // constrained hardware; this outer bound exists purely to catch a
-    // genuine stall, not to assert throughput.
+    // Bound widened 90s -> 180s. On busy ubuntu-latest runners this test can
+    // leave one of the concurrent decision cycles claimed for 2+ minutes with
+    // zero progress. It then completes. That is scheduling contention on a
+    // 2-vCPU shared runner, not a hang. The other children finish within
+    // ~1-2s of dispatch. Only the "all children completed" assertion is
+    // load-bearing on constrained hardware. This outer bound only catches a
+    // genuine stall. It does not assert throughput.
     let parent_execution = wait_for_completion_with_diagnostics(
         &database_url,
         parent_exec_id,
@@ -5676,7 +5689,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
     .await
     .expect("send_signal should succeed");
 
-    // Wake the parked task immediately so the test doesn't wait for the 1 s
+    // Wake the parked task immediately so the test does not wait for the 1 s
     // requeue delay.
     queue::wake_workflow_task(&mut conn, exec_id)
         .await
@@ -5709,11 +5722,11 @@ async fn worker_completes_workflow_after_signal_delivery() {
 
 /// Signal arrives before the workflow's activity is scheduled.
 ///
-/// `ingest_pending_signals` can append a `SignalReceived` event at the very
-/// start of history (right after `WorkflowStarted`) if the signal arrives
-/// while the workflow task is queued but not yet running.  The replay engine
-/// must skip those early signals when looking for `ActivityScheduled` and
-/// then deliver them when the workflow later calls `wait_for_signal`.
+/// A signal can arrive while the workflow task is queued but not yet running.
+/// `ingest_pending_signals` then appends a `SignalReceived` event right after
+/// `WorkflowStarted`. The replay engine must skip those early signals when it
+/// looks for `ActivityScheduled`. It delivers them when the workflow later
+/// calls `wait_for_signal`.
 #[allow(clippy::too_many_lines)] // issue #802 added declared-dependency fields to the WorkflowInfo literal
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_handles_early_ingested_signal_before_activity() {
@@ -5740,9 +5753,9 @@ async fn worker_handles_early_ingested_signal_before_activity() {
     .await
     .expect("append WorkflowStarted failed");
 
-    // Insert the signal into history BEFORE the workflow runs its activity,
-    // simulating the race where a signal arrives right after the workflow
-    // task is enqueued but before the worker picks it up.
+    // Insert the signal into history BEFORE the workflow runs its activity.
+    // This simulates a signal that arrives after the enqueue of the workflow
+    // task but before the worker picks it up.
     store::append_events(
         &mut conn,
         exec_id,
@@ -6171,10 +6184,10 @@ async fn wake_workflow_task_refreshes_sticky_until() {
     )
     .await
     .expect("claim should succeed");
-    // Use a 5s window so both the park's sticky_until and the wake's refreshed
-    // sticky_until land comfortably in the future even under DB/host clock skew
-    // on CI runners. The test asserts the value was REFRESHED by comparing
-    // before/after timestamps, not by waiting for expiry.
+    // A 5s window puts both the park's sticky_until and the wake's refreshed
+    // sticky_until comfortably in the future, even under DB/host clock skew on
+    // CI runners. The test compares before/after timestamps to prove the
+    // REFRESH. It does not wait for expiry.
     queue::park_workflow_task(
         &mut conn,
         task_id,
@@ -6220,21 +6233,20 @@ async fn wake_workflow_task_refreshes_sticky_until() {
     );
 }
 
-/// Regression test for a PR #901 review finding: `wake_workflow_task`'s
-/// dropped-wake fallback can itself lose the race against `park_workflow_task`.
+/// Regression test (PR #901): `wake_workflow_task`'s dropped-wake fallback can
+/// itself lose the race against `park_workflow_task`.
 ///
-/// If `park_workflow_task`'s `candidate SELECT ... FOR UPDATE` has already
-/// locked the row (but not yet committed) when the fallback `UPDATE ... SET
-/// wake_requested = TRUE` runs, the fallback's initial snapshot still shows
-/// the row as owned (`worker_id IS NOT NULL`) so it attempts to lock and
-/// write -- and blocks on park's row lock. Once park commits, Postgres
-/// re-checks the fallback's WHERE clause against the now-committed row
-/// (`worker_id` is NULL after park), which no longer matches, so the
-/// fallback silently updates zero rows and `wake_requested` is never set --
-/// even though a park this wake raced against just committed a parked row
-/// that is this exact wake's target. `wake_workflow_task` must retry its
-/// primary re-pend query in that case rather than relying solely on
-/// `wake_requested`.
+/// Suppose the `candidate SELECT ... FOR UPDATE` of `park_workflow_task` has
+/// locked the row but not yet committed. The fallback
+/// `UPDATE ... SET wake_requested = TRUE` then runs. Its initial snapshot
+/// still shows the row as owned (`worker_id IS NOT NULL`). So it tries to lock
+/// and write, and blocks on park's row lock. Once park commits, Postgres
+/// re-checks the fallback's WHERE clause against the committed row. After
+/// park `worker_id` is NULL, so the clause no longer matches. The fallback
+/// silently updates zero rows and never sets `wake_requested`. Yet the park
+/// that this wake raced against just committed a parked row that is this
+/// wake's exact target. So `wake_workflow_task` must retry its primary re-pend
+/// query in that case, not rely solely on `wake_requested`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -6265,11 +6277,10 @@ async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
         .expect("claim should succeed")
         .expect("row should be claimable");
 
-    // Manually hold park's row lock open: BEGIN an explicit transaction on
-    // `conn_park`, run the real `park_workflow_task` (which locks and
-    // provisionally updates the row inside this open transaction), but do
-    // NOT commit yet -- reproducing park having locked the row but not yet
-    // released it.
+    // Hold park's row lock open. BEGIN an explicit transaction on `conn_park`
+    // and run the real `park_workflow_task`. It locks and provisionally updates
+    // the row inside this open transaction. Do NOT commit yet. This reproduces
+    // a park that has locked the row but not yet released it.
     conn_park
         .batch_execute("BEGIN")
         .await
@@ -6279,16 +6290,16 @@ async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
         .expect("park should succeed inside the open transaction");
 
     // Wake concurrently on a separate connection while the park above is
-    // still uncommitted. Its primary re-pend UPDATE won't match (the row's
-    // committed snapshot still shows worker_id NOT NULL), so it falls
-    // through to the fallback UPDATE, which blocks on the row lock
-    // `conn_park` is holding.
+    // still uncommitted. The row's committed snapshot still shows worker_id
+    // NOT NULL, so the primary re-pend UPDATE does not match. The wake falls
+    // through to the fallback UPDATE, which blocks on the row lock that
+    // `conn_park` holds.
     let wake_handle =
         tokio::spawn(async move { queue::wake_workflow_task(&mut conn_wake, exec_id).await });
 
-    // Give the spawned wake a moment to reach and block on the fallback
-    // UPDATE before releasing the lock -- otherwise this test could pass
-    // trivially because the wake simply ran entirely after the commit.
+    // Give the spawned wake a moment to block on the fallback UPDATE before
+    // the lock is released. Otherwise the wake could run entirely after the
+    // commit, and this test would pass trivially.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     conn_park
@@ -6371,12 +6382,11 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
     let sealed_execution =
         wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
 
-    // The successor run is identified by the WorkflowContinuedAsNew event
-    // appended to the original run's history. Walking the history is the
-    // public contract operators rely on; loading a fresh row by joining on
-    // the parent_id chain would not work because continue-as-new
-    // intentionally does NOT set parent_id (parent_id is reserved for child
-    // workflows).
+    // The WorkflowContinuedAsNew event in the original run's history
+    // identifies the successor run. Operators rely on that history walk as the
+    // public contract. A join on the parent_id chain would not work.
+    // Continue-as-new intentionally does NOT set parent_id, which is reserved
+    // for child workflows.
     let original_history = load_history_from_url(&database_url, original_exec_id).await;
     let new_exec_id = original_history
         .events
@@ -6417,9 +6427,9 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
         "the new run should observe the input passed to continue_as_new"
     );
 
-    // The successor run starts with an empty history apart from
-    // WorkflowStarted plus its own terminal completion event — this is the
-    // whole point of continue-as-new, bounding history growth.
+    // The successor's history holds only WorkflowStarted and its own terminal
+    // completion event. That bound on history growth is the whole point of
+    // continue-as-new.
     let new_history = load_history_from_url(&database_url, new_exec_id).await;
     assert!(
         matches!(
@@ -6439,11 +6449,13 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 }
 
 /// Issue #740 (AC3): a continue-as-new successor records its OWN `continue_as_new`
-/// source referencing the predecessor — it is NEVER misattributed as a fresh
-/// `api` start, and never inherits the predecessor's source. Driven through the
-/// real worker loop (the only way to exercise `persist_workflow_continue_as_new`,
-/// which is engine-internal). The predecessor is deliberately stamped with a
-/// DISTINCT source (`schedule`) so the assertion falsifies any inheritance.
+/// source, which references the predecessor.
+///
+/// It is NEVER misattributed as a fresh `api` start, and never inherits the
+/// predecessor's source. The test drives the real worker loop. That is the
+/// only way to exercise `persist_workflow_continue_as_new`, which is
+/// engine-internal. The predecessor deliberately has a DISTINCT source
+/// (`schedule`), so the assertion falsifies any inheritance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_continue_as_new_records_own_start_source_referencing_predecessor() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -6705,8 +6717,10 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
 // ── WorkflowIdReusePolicy integration matrix ─────────────────────────────────
 //
 // 4 policies × 5 prior states (none, RUNNING, COMPLETED, FAILED, CANCELLED)
-// = 20 cells, each asserting: (a) which exec_id the second start observes,
-// (b) whether a new exec_id was minted, (c) the error variant when applicable.
+// = 20 cells. Each cell asserts three things:
+// (a) which exec_id the second start observes,
+// (b) whether a new exec_id was minted,
+// (c) the error variant when applicable.
 
 /// Helpers for the reuse-policy matrix tests.
 mod reuse_policy_helpers {
@@ -7191,9 +7205,11 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
     assert_ne!(second.exec_id, first.exec_id);
 }
 
-/// `TerminateIfRunning` is idempotent: if the prior run is CANCELLED (e.g. from
-/// a previous `TerminateIfRunning` that crashed between the two transactions),
-/// the retry starts fresh without requiring manual intervention.
+/// `TerminateIfRunning` is idempotent.
+///
+/// A prior run can be CANCELLED, for example by an earlier `TerminateIfRunning`
+/// that crashed between the two transactions. The retry then starts fresh
+/// with no manual intervention.
 #[tokio::test]
 async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempotent() {
     let (mut conn, _container) = setup_test_db().await;
@@ -7294,18 +7310,19 @@ async fn count_tasks_for_execution(conn: &mut AsyncPgConnection, exec_id: Execut
         .n
 }
 
-/// `UseExisting` attaches to a RUNNING prior regardless of the reuse policy —
-/// returning the existing handle, appending no new `WorkflowStarted` event, and
-/// leaving the prior RUNNING (no cancel).
+/// `UseExisting` attaches to a RUNNING prior regardless of the reuse policy.
+///
+/// It returns the existing handle and appends no new `WorkflowStarted` event.
+/// The prior stays RUNNING, with no cancel.
 #[tokio::test]
 async fn conflict_use_existing_running_attaches_no_new_run() {
     let (mut conn, _container) = setup_test_db().await;
     let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let mut params = reuse_policy_helpers::base_params("cf-use-run", first_id);
-    // Pair with a reuse policy whose NATIVE active behavior differs from Attach
-    // (AllowDuplicateFailedOnly natively attaches, but TerminateIfRunning would
-    // cancel) — here we prove UseExisting overrides regardless. Use
-    // AllowDuplicateFailedOnly to also confirm no interaction with the reuse axis.
+    // Pair with a reuse policy whose NATIVE active behavior differs from
+    // Attach. AllowDuplicateFailedOnly natively attaches, but
+    // TerminateIfRunning would cancel. UseExisting overrides regardless.
+    // AllowDuplicateFailedOnly also confirms no interaction with the reuse axis.
     params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
     let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
         .await
@@ -7384,8 +7401,10 @@ async fn conflict_use_existing_paused_attaches() {
 }
 
 /// AC-3 corner: `TerminateIfRunning` reuse + `UseExisting` conflict on a
-/// COMPLETED (terminal) prior — the conflict axis governs only active priors, so
-/// the terminal prior is decided by the reuse axis (`TerminateIfRunning`) → fresh.
+/// COMPLETED (terminal) prior.
+///
+/// The conflict axis governs only active priors. So the reuse axis
+/// (`TerminateIfRunning`) decides the terminal prior → fresh.
 #[tokio::test]
 async fn conflict_terminate_if_running_reuse_plus_use_existing_completed_starts_fresh() {
     let (mut conn, _container) = setup_test_db().await;
@@ -7412,8 +7431,10 @@ async fn conflict_terminate_if_running_reuse_plus_use_existing_completed_starts_
 }
 
 /// AC-3 corner (the pre-check gate fix): `TerminateIfRunning` reuse +
-/// `UseExisting` conflict on a RUNNING prior — `UseExisting` overrides the active
-/// behavior to Attach, so the prior is NOT cancelled by the pre-check.
+/// `UseExisting` conflict on a RUNNING prior.
+///
+/// `UseExisting` overrides the active behavior to Attach. So the pre-check
+/// does NOT cancel the prior.
 #[tokio::test]
 async fn conflict_terminate_if_running_reuse_plus_use_existing_running_attaches() {
     let (mut conn, _container) = setup_test_db().await;
@@ -7520,12 +7541,14 @@ async fn conflict_terminate_existing_running_cancels_and_starts_fresh() {
     );
 }
 
-/// FIX 2 (AC-2 coverage gap): `TerminateExisting` on a PAUSED prior cancels it and
-/// starts fresh. Unlike the RUNNING case — which the native `TerminateIfRunning`
-/// pre-check can reach — a PAUSED prior is resolved by the IN-TRANSACTION
-/// `inline_cancel` + `replace_execution` under the row lock (the pre-check-based
-/// path never terminates a PAUSED prior). We pair it with `AllowDuplicate` reuse
-/// (which natively attaches) to prove `TerminateExisting` overrides.
+/// AC-2 coverage gap: `TerminateExisting` on a PAUSED prior cancels it and
+/// starts fresh.
+///
+/// The native `TerminateIfRunning` pre-check can reach a RUNNING prior. The
+/// pre-check-based path never terminates a PAUSED prior. The IN-TRANSACTION
+/// `inline_cancel` + `replace_execution` under the row lock resolves it
+/// instead. `AllowDuplicate` reuse natively attaches. The test pairs it with
+/// `TerminateExisting` to prove that `TerminateExisting` overrides.
 #[tokio::test]
 async fn conflict_terminate_existing_paused_cancels_and_starts_fresh() {
     let (mut conn, _container) = setup_test_db().await;
@@ -7624,9 +7647,11 @@ async fn conflict_unspecified_preserves_allow_duplicate_running_attaches() {
     assert_eq!(second.state, "RUNNING");
 }
 
-/// Success-metric proof (scaled to 20 for CI speed; the 100/100 metric is this
-/// test's shape): N concurrent `UseExisting` starts against ONE running prior all
-/// converge on the same `exec_id` — zero `AlreadyExists` errors, zero terminations.
+/// Success-metric proof: N concurrent `UseExisting` starts against ONE running
+/// prior all converge on the same `exec_id`.
+///
+/// There are zero `AlreadyExists` errors and zero terminations. N is 20 for CI
+/// speed. The 100/100 metric has this test's shape.
 #[tokio::test]
 async fn conflict_concurrency_race_use_existing_converges() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -7683,19 +7708,20 @@ async fn conflict_concurrency_race_use_existing_converges() {
     assert_eq!(prior.state, "RUNNING", "no start may terminate the prior");
 }
 
-/// Codex P2 (issue #685 review): N concurrent `terminate_existing` starts against
-/// ONE running prior for a single `(workflow_name, workflow_id)` CONVERGE — every
-/// call returns Ok (no transient `NotFound`, no `AlreadyExists`) and the storm
-/// settles to exactly ONE surviving non-terminal (RUNNING) execution, with all
-/// others sealed.
+/// Issue #685: N concurrent `terminate_existing` starts against ONE running
+/// prior for a single `(workflow_name, workflow_id)` CONVERGE.
 ///
-/// This guards the convergence invariant (0 errors, 1 survivor), NOT a
-/// deterministic reproduction of the pre-fix 404: the seal race is timing
-/// dependent (a loser must reach the post-INSERT load in the window after a
-/// winner sealed the prior it locked but before the loser's own snapshot sees the
-/// replacement). Without the seal-race retry loop around
-/// `load_workflow_execution_by_key_for_update`, a loser that lands in that window
-/// surfaces `NotFound` -> the assertion `Ok` below would fail intermittently.
+/// Every call returns Ok, with no transient `NotFound` and no `AlreadyExists`.
+/// The storm settles to exactly ONE surviving non-terminal (RUNNING) execution,
+/// and all others are sealed.
+///
+/// This guards the convergence invariant (0 errors, 1 survivor). It is NOT a
+/// deterministic reproduction of the pre-fix 404, because the seal race is
+/// timing dependent. A loser must reach the post-INSERT load after a winner
+/// sealed the prior it locked. It must also get there before its own snapshot
+/// sees the replacement. Without the seal-race retry loop around
+/// `load_workflow_execution_by_key_for_update`, a loser in that window surfaces
+/// `NotFound`. The assertion `Ok` below would then fail intermittently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conflict_terminate_existing_concurrent_converges() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -7751,8 +7777,8 @@ async fn conflict_terminate_existing_concurrent_converges() {
     );
 
     // AC: the storm settled to exactly ONE surviving non-terminal (RUNNING) run
-    // for the key; every other row (the seed + the N-1 superseded replacements)
-    // is sealed/cancelled and no longer active.
+    // for the key. Every other row is sealed/cancelled and no longer active:
+    // the seed and the N-1 superseded replacements.
     let mut conn = pool.get().await.expect("pool conn");
     let rows: Vec<String> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq("reuse_policy_wf"))
@@ -7964,9 +7990,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     );
 }
 
-/// (d) Backward compatibility: activities without a `concurrency_key` (NULL in
-/// the queue row) are completely unaffected by a saturated key — they can be
-/// claimed freely even when another key is at its cap.
+/// (d) Backward compatibility: a saturated key does not affect activities
+/// without a `concurrency_key` (NULL in the queue row).
+///
+/// They stay freely claimable even when another key is at its cap.
 #[tokio::test]
 async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     let (mut conn, _container) = setup_test_db().await;
@@ -8010,8 +8037,8 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
             .expect("enqueue uncapped task failed");
     }
 
-    // All 3 uncapped tasks must be claimable even though the saturated key
-    // is at its cap — the NULL check-path must not be constrained by other keys.
+    // All 3 uncapped tasks must be claimable while the saturated key is at its
+    // cap. Other keys must not constrain the NULL check-path.
     let mut claimed = 0usize;
     for _ in 0..3 {
         if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
@@ -9285,19 +9312,19 @@ fn always_retryable_failure_activity<'a>(
     Box::pin(async move { Err("downstream is down".to_string()) })
 }
 
-/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
-/// the activity must fail on attempt 1 (skipping the retry policy entirely),
-/// the `ActivityFailed` event in history must carry the structured
-/// `error_type` and `non_retryable` fields, and the workflow itself must
-/// reach `FAILED` because the workflow function propagates the activity
-/// error.
+/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`.
 ///
-/// We deliberately do **not** assert on a `harvest_dead_letters` row: the
-/// worker no longer auto-inserts DLQ rows for activity failures because
-/// `dlq::replay_dead_letter` cannot meaningfully re-run them (the terminal
-/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject
-/// the replayed task). Workflow-level visibility is preserved via the
-/// `ActivityFailed` + `WorkflowFailed` event pair.
+/// The activity must fail on attempt 1 and skip the retry policy entirely.
+/// The `ActivityFailed` event in history must carry the structured
+/// `error_type` and `non_retryable` fields. The workflow function propagates
+/// the activity error, so the workflow must reach `FAILED`.
+///
+/// The test deliberately does **not** assert on a `harvest_dead_letters` row.
+/// The worker no longer auto-inserts DLQ rows for activity failures.
+/// `dlq::replay_dead_letter` cannot meaningfully re-run them: the terminal
+/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject the
+/// replayed task. The `ActivityFailed` + `WorkflowFailed` event pair keeps
+/// workflow-level visibility.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn non_retryable_activity_fails_fast_on_attempt_one() {
@@ -9454,13 +9481,13 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 /// `CircuitBreakerPolicy` (threshold 1) against a downstream that is hard-down.
 ///
 /// Attempt 1 dispatches normally (breaker closed) and fails with a retryable
-/// error, which trips the breaker. Attempt 2 (the retry) is short-circuited by
-/// the open breaker and recorded as a non-retryable `ActivityFailed` with
-/// `error_type = "CircuitOpen"`, terminating the workflow without burning the
-/// rest of the retry curve. The `CircuitOpen` failure lives in the workflow's
-/// own event history exactly like any other activity failure, so replay
-/// reproduces the same outcome regardless of breaker state at replay time
-/// (no new `WorkflowEvent` variant is introduced).
+/// error, which trips the breaker. The open breaker short-circuits attempt 2
+/// (the retry). It records a non-retryable `ActivityFailed` with
+/// `error_type = "CircuitOpen"`. That terminates the workflow without burning
+/// the rest of the retry curve. The `CircuitOpen` failure lives in the
+/// workflow's own event history like any other activity failure. So replay
+/// reproduces the same outcome whatever the breaker state at replay time. No
+/// new `WorkflowEvent` variant is introduced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn circuit_breaker_short_circuits_after_tripping() {
@@ -9586,9 +9613,9 @@ async fn circuit_breaker_short_circuits_after_tripping() {
         "CircuitOpen failures must be non-retryable terminal for the in-flight attempt"
     );
 
-    // The breaker prevented the full retry curve from running: far fewer than
-    // the 5 configured attempts were dispatched (attempt 1 ran, the rest were
-    // short-circuited terminally).
+    // The breaker stopped the full retry curve. Far fewer than the 5
+    // configured attempts were dispatched. Attempt 1 ran, and the breaker
+    // short-circuited the rest terminally.
     let activity_started = history
         .events
         .iter()
@@ -10236,11 +10263,13 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
 }
 
 /// Seed a RUNNING execution that simulates a cross-type continue-as-new
-/// successor (issue #1160): it carries `schedule_id` from a real schedule but
-/// a `workflow_name` that is NOT that schedule's registered type -- exactly
-/// what `ctx.continue_as_new_as(...)` (#803) leaves behind mid-chain --
-/// `origin = ORIGIN_SCHEDULED` (a manual-trigger row is deliberately excluded
-/// from overlap cleanup, so this must not look like one).
+/// successor (issue #1160).
+///
+/// It carries `schedule_id` from a real schedule, but a `workflow_name` that is
+/// NOT that schedule's registered type. `ctx.continue_as_new_as(...)` (#803)
+/// leaves exactly that behind mid-chain. It has `origin = ORIGIN_SCHEDULED`.
+/// Overlap cleanup deliberately excludes a manual-trigger row, so this row
+/// must not look like one.
 async fn insert_cross_type_scheduled_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -10295,11 +10324,12 @@ async fn insert_cross_type_scheduled_execution(
 }
 
 /// Seed a RUNNING execution that simulates an operator-triggered manual run of
-/// a schedule's OWN type (issue #1160 AC3 regression guard): `schedule_id`
-/// NULL, `origin = ORIGIN_MANUAL_TRIGGER`. Used to prove the #1160 fix is
-/// additive -- it must not stop a manual run of an existing single-type
-/// schedule from counting toward `max_active_runs`, which is the behaviour
-/// the issue explicitly calls out as out of scope to change.
+/// a schedule's OWN type (issue #1160 AC3 regression guard).
+///
+/// It has `schedule_id` NULL and `origin = ORIGIN_MANUAL_TRIGGER`. Tests use it
+/// to prove that the #1160 fix is additive. A manual run of an existing single-type
+/// schedule must still count toward `max_active_runs`. The issue explicitly
+/// calls that behaviour out of scope to change.
 async fn insert_manual_trigger_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -10353,12 +10383,15 @@ async fn insert_manual_trigger_execution(
 }
 
 /// Count `harvest_schedule_decisions` rows recording a `max_active_runs_reached`
-/// skip for `schedule_id` (`decision = "skipped"`, `reason_code =
-/// "max_active_runs_reached"` -- see `schedule_decision::record_decision_graceful`
-/// and the `OverlapAction::Drop` branch in `tick_one_workflow_schedule`). A
-/// positive control: proves the tick actually ran and took the capacity-gated
-/// branch, rather than a test merely observing "nothing happened" for an
-/// unrelated reason (e.g. the schedule never ticked at all).
+/// skip for `schedule_id`.
+///
+/// Such a row has `decision = "skipped"` and
+/// `reason_code = "max_active_runs_reached"`. See
+/// `schedule_decision::record_decision_graceful` and the `OverlapAction::Drop`
+/// branch in `tick_one_workflow_schedule`. This is a positive control. It
+/// proves that the tick ran and took the capacity-gated branch. Otherwise a
+/// test can observe "nothing happened" for an unrelated reason, such as a
+/// schedule that never ticked.
 async fn count_max_active_runs_skip_decisions(database_url: &str, schedule_id: Uuid) -> i64 {
     use autumn_harvest::schema::harvest_schedule_decisions::dsl;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
@@ -10378,9 +10411,9 @@ async fn count_max_active_runs_skip_decisions(database_url: &str, schedule_id: U
 /// `workflow_name`) must still count toward the schedule's `max_active_runs`.
 ///
 /// Before the fix, `schedule_running_basis` (and the tick's own inline copy of
-/// it) counted only same-named executions, so this cross-type row was
-/// invisible to `max_active_runs` and a `Skip`-policy schedule would fire
-/// straight past its configured cap of 1.
+/// it) counted only same-named executions. So `max_active_runs` did not see
+/// this cross-type row. A `Skip`-policy schedule then fired straight past its
+/// configured cap of 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_runs() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -10447,9 +10480,9 @@ async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_run
         Arc::clone(&workflow_schedules),
     );
 
-    // Actively poll for 12 s (several cron cycles at 2 s, generous for Docker
-    // startup latency): fail the instant a new own-type run appears, rather
-    // than a single blind sleep.
+    // Actively poll for 12 s: several cron cycles at 2 s, generous for Docker
+    // startup latency. Fail the instant a new own-type run appears, instead of
+    // one blind sleep.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     loop {
         let running_own_type = count_running_executions(&database_url, wf_name).await;
@@ -10468,9 +10501,9 @@ async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_run
         successor_still_running, 1,
         "the pre-seeded cross-type successor must remain RUNNING under Skip (untouched)"
     );
-    // Positive control: prove the tick actually ran and took the
-    // capacity-gated Skip branch, not merely that nothing happened for some
-    // unrelated reason (e.g. the schedule never ticked at all).
+    // Positive control: prove the tick ran and took the capacity-gated Skip
+    // branch. "Nothing happened" can have an unrelated reason, such as a
+    // schedule that never ticked.
     let skip_decisions = count_max_active_runs_skip_decisions(&database_url, schedule_id).await;
     assert!(
         skip_decisions >= 1,
@@ -10483,11 +10516,13 @@ async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_run
 }
 
 /// (issue #1160, AC3 regression guard) A manual-trigger run of the schedule's
-/// OWN type must still count toward `max_active_runs` after the #1160 fix --
-/// the `schedule_id`-scoped addition to the running-count is additive, not a
-/// replacement of the existing name-based count that also covers manual
-/// (non-scheduled) runs. Without this, a wrong fix that re-scoped counting to
-/// `schedule_id` alone would silently stop enforcing the cap on manual runs.
+/// OWN type must still count toward `max_active_runs` after the #1160 fix.
+///
+/// The `schedule_id`-scoped addition to the running-count is additive. It does
+/// not replace the existing name-based count, which also covers manual
+/// (non-scheduled) runs. A wrong fix could re-scope counting to `schedule_id`
+/// alone. Without this test, it would silently stop enforcing the cap on
+/// manual runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_skip_still_counts_a_manual_trigger_run_of_the_same_type() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -10577,15 +10612,17 @@ async fn overlap_policy_skip_still_counts_a_manual_trigger_run_of_the_same_type(
 }
 
 /// (issue #1160, AC2) `CancelOther` must be able to cancel a cross-type
-/// continue-as-new successor of the same schedule: it carries the right
-/// `schedule_id` but the wrong `workflow_name` (the target type), so a
-/// selection that ALSO filters on `workflow_name` can never reach it.
+/// continue-as-new successor of the same schedule.
 ///
-/// Before the fix, this scenario compounded with AC1's bug: since the
-/// cross-type row was invisible to the running-count too, the tick never even
-/// entered the overlap branch, so the predecessor was neither counted NOR
-/// cancelled -- it just sat RUNNING forever while a fresh run dispatched
-/// alongside it, silently exceeding `max_active_runs`.
+/// The successor carries the right `schedule_id` but the wrong
+/// `workflow_name` (the target type). So a selection that ALSO filters on
+/// `workflow_name` can never reach it.
+///
+/// Before the fix, this scenario compounded with AC1's bug. The running-count
+/// did not see the cross-type row either, so the tick never entered the
+/// overlap branch. The predecessor was neither counted NOR cancelled. It sat
+/// RUNNING forever while a fresh run dispatched alongside it. That silently
+/// exceeded `max_active_runs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -10664,12 +10701,11 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
         "issue #1160: CancelOther timed out waiting to reach the cross-type successor within 12 s",
     );
 
-    // Shut the scheduler down before taking any further counts: with
-    // OverlapPolicy::CancelOther and this cron cadence, every subsequent tick
-    // cancels the current run and dispatches a new one, so wf_name's total
-    // execution count grows monotonically for as long as the scheduler keeps
-    // ticking -- an equality assertion taken while it's still running would
-    // be flaky by construction.
+    // Shut the scheduler down before any further counts. With
+    // OverlapPolicy::CancelOther and this cron cadence, every later tick
+    // cancels the current run and dispatches a new one. So wf_name's total
+    // execution count grows while the scheduler ticks. An equality assertion
+    // taken while it still runs would be flaky by construction.
     scheduler.shutdown();
     let _ = scheduler.join().await;
 
@@ -10693,11 +10729,11 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
 /// (issue #1160, AC2) `TerminateOther` must be able to terminate a cross-type
 /// continue-as-new successor of the same schedule -- the symmetric case of
 /// `overlap_policy_cancel_other_reaches_a_cross_type_successor` above.
-/// `terminate_in_flight_runs` got the identical fix (drop the redundant
-/// `workflow_name` filter, select on `schedule_id` alone) via the shared
-/// `load_overlap_cleanup_targets` helper, but exercised independently since
-/// `TerminateOther` takes a different `OverlapAction` branch in
-/// `tick_one_workflow_schedule`.
+/// `terminate_in_flight_runs` got the identical fix via the shared
+/// `load_overlap_cleanup_targets` helper. It drops the redundant
+/// `workflow_name` filter and selects on `schedule_id` alone. This test
+/// exercises it independently, because `TerminateOther` takes a different
+/// `OverlapAction` branch in `tick_one_workflow_schedule`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_terminate_other_reaches_a_cross_type_successor() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -11308,14 +11344,14 @@ async fn per_key_concurrency_does_not_block_other_keys() {
                 "any task claimed while loud is saturated must be a quiet-key task"
             );
             quiet_claimed += 1;
-            // Immediately complete quiet tasks so they don't hold state.
+            // Immediately complete quiet tasks so they do not hold state.
             let claim = TaskClaim::of(&task).expect("a claimed task");
             queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete quiet task failed");
         } else {
             // No task available right now; the loud cap is blocking the loud
-            // tasks and quiet tasks haven't been claimed yet — should not happen.
+            // tasks and quiet tasks have not been claimed yet — should not happen.
             break;
         }
         attempts += 1;
@@ -11396,10 +11432,9 @@ fn retry_context_activity<'a>(
 /// worker-level retries and that `previous_failure()` carries the last error
 /// string on subsequent attempts.
 ///
-/// AC #8 of issue #381: "at least one end-to-end integration test asserts that
-/// an activity which fails twice and succeeds on attempt 3 observes
-/// `ctx.attempt() == 1, 2, 3` and `ctx.previous_failure() == None,
-/// Some("…"), Some("…")`".
+/// This covers AC #8 of issue #381. An activity fails twice and succeeds on
+/// attempt 3. It observes `ctx.attempt() == 1, 2, 3` and
+/// `ctx.previous_failure() == None, Some("…"), Some("…")`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
@@ -11638,11 +11673,13 @@ static SAGA_CANCEL_FLIGHT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static SAGA_CANCEL_HOTEL_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// Records the two saga counters (with their labels) emitted through the
-/// worker's real telemetry wiring; every other `MetricsRecorder` method stays
-/// a no-op default. Labels are recorded here and asserted after the run —
-/// never asserted inside the callback, which runs on the worker task and
-/// would surface a label regression as a confusing poison-pill FAILED
-/// instead of a clear assertion message (issue #801 post-review).
+/// worker's real telemetry wiring.
+///
+/// Every other `MetricsRecorder` method stays a no-op default. The test
+/// asserts the recorded labels after the run, never inside the callback
+/// (issue #801). The callback runs on the worker task. A label regression
+/// there would surface as a confusing poison-pill FAILED, not a clear
+/// assertion message.
 #[derive(Default)]
 struct SagaE2eRecorder {
     compensated: std::sync::Mutex<Vec<(String, String)>>,
@@ -11697,10 +11734,11 @@ fn saga_cancel_hotel_activity<'a>(
 }
 
 /// Two activity-backed forward steps with activity-backed compensations, then
-/// an in-line step-3 failure that triggers the LIFO unwind. Every activity
-/// boundary forces a full from-scratch replay of the workflow function — the
-/// exact code path a worker crash-resume takes (crash-resume = re-claim +
-/// replay; there is no other resume mechanism).
+/// an in-line step-3 failure that triggers the LIFO unwind.
+///
+/// Every activity boundary forces a full from-scratch replay of the workflow
+/// function. A worker crash-resume takes exactly that code path. Crash-resume
+/// is re-claim + replay, and there is no other resume mechanism.
 fn saga_metrics_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -11783,9 +11821,11 @@ fn saga_activity_info(
     }
 }
 
-/// AC3 e2e — the compensated counter fires exactly once across the many
-/// genuine decision cycles a real worker takes through an activity-backed
-/// unwind, and each compensation activity executes exactly once.
+/// AC3 e2e — the compensated counter fires exactly once through an
+/// activity-backed unwind.
+///
+/// A real worker takes many decision cycles through that unwind. Each
+/// compensation activity also executes exactly once.
 #[allow(clippy::too_many_lines)] // #946: required quota field tips this pre-existing literal-heavy test to 101 lines
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decision_cycles() {
@@ -11868,8 +11908,8 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
     );
 
     // Exactly-once across every decision cycle of the unwind, with the real
-    // worker-threaded labels (asserted here, after the run, so a regression
-    // reads as a clear assertion failure rather than an in-worker panic).
+    // worker-threaded labels. The assertion runs here, after the run, so a
+    // regression reads as a clear assertion failure, not an in-worker panic.
     assert_eq!(
         recorder
             .compensated
@@ -12096,9 +12136,8 @@ pub(crate) async fn insert_named_execution(
 /// Count `harvest_task_queue` rows in `RUNNING`/`PENDING` state that are
 /// activity tasks attributable to a specific workflow execution.
 ///
-/// Takes a caller-owned connection so a polling loop can reuse ONE connection
-/// across all polls rather than establishing (and dropping) a fresh connection
-/// on every sample.
+/// Takes a caller-owned connection, so a polling loop reuses ONE connection
+/// across all polls. It does not open and drop a connection per sample.
 async fn count_active_activity_rows(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
@@ -12111,9 +12150,10 @@ async fn count_active_activity_rows(conn: &mut AsyncPgConnection, exec_id: Execu
 }
 
 /// Success metric (issue #750): a windowed fan-out (N=20, W=5) never has more
-/// than W=5 of its activities in `RUNNING`/`PENDING` at once, completes with
-/// byte-identical results to an unbounded fan-out over the same inputs, and
-/// records exactly N=20 `ActivityScheduled` events.
+/// than W=5 of its activities in `RUNNING`/`PENDING` at once.
+///
+/// Its results are byte-identical to an unbounded fan-out over the same
+/// inputs. It records exactly N=20 `ActivityScheduled` events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn windowed_fan_out_peak_task_rows_bounded_by_window() {

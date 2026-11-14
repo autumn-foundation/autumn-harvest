@@ -482,7 +482,6 @@ impl ApiRateLimiter {
         }
     }
 
-    /// The number of buckets the limiter holds.
     #[cfg(test)]
     fn bucket_count(&self) -> usize {
         let state = self

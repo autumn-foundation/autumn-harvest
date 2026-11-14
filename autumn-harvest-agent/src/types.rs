@@ -1047,7 +1047,6 @@ pub struct AgentReport {
     pub parked_until_ms: Option<i64>,
 }
 
-/// The transcript without system messages.
 pub(crate) fn without_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()

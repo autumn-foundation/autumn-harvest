@@ -346,7 +346,7 @@ pub fn error_of(error: &Value) -> AgentError {
     AgentError::new(kind, format!("the API answered an error: {message}"))
 }
 
-/// The error kind that the words of a code or a type name.
+/// The error kind that the words of an error code or type name signal.
 fn kind_of_words(words: &str) -> ErrorKind {
     if words.contains("rate_limit") {
         ErrorKind::RateLimited

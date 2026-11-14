@@ -2,36 +2,30 @@
 //! Ledger performance fix: the local awaited-child fan-out insert/event/
 //! enqueue N+1 (issue #1589).
 //!
-//! `persist_all_started_child_workflows`'s local-child loop
-//! (`autumn-harvest/src/worker.rs`) used to call, per new local child,
-//! three single-row `INSERT`s. One into `harvest_workflow_executions`.
-//! One into `harvest_events`, for the child's `WorkflowStarted`. One via
-//! `queue::enqueue`, into `harvest_task_queue`. A decision that fanned out
-//! to `n` awaited local children cost `3n` round trips to persist.
+//! The local-child loop of `persist_all_started_child_workflows`
+//! (`autumn-harvest/src/worker.rs`) used to send three single-row `INSERT`s
+//! per new local child. One went into `harvest_workflow_executions`, one
+//! into `harvest_events` for its `WorkflowStarted`, and one into
+//! `harvest_task_queue` through `queue::enqueue`. A fan-out to `n` awaited
+//! local children cost `3n` round trips.
 //!
-//! The fix splits local children by whether their own
-//! `enforce_quota_admission` call would be a no-op. That is true when the
-//! child declares no policy, its policy has no active cap, or no key
-//! resolved. A child in that shape is batched: one multi-row `INSERT` per
-//! table for the whole group. This goes via
+//! The fix splits local children by whether their `enforce_quota_admission`
+//! call is a no-op. It is when the child declares no policy, its policy has
+//! no active cap, or no key resolved. Such children are batched: one
+//! multi-row `INSERT` per table for the group. The batch goes through
 //! [`autumn_harvest::store::append_new_execution_started_events_batch`] and
-//! [`autumn_harvest::queue::enqueue_batch`] (already built for the sibling
-//! `ScheduleActivity` fan-out, PR #1447). A child with an active cap on its
-//! own declared policy keeps the original sequential insert-then-admit
-//! path, unchanged. `enforce_quota_admission`'s graduated "admit first K,
-//! reject the rest" property therefore survives -- proven separately in
-//! `quota_enforcement_tests.rs`.
+//! [`autumn_harvest::queue::enqueue_batch`] (built for the `ScheduleActivity`
+//! fan-out, PR #1447). A child with an active cap on its own policy keeps the
+//! sequential insert-then-admit path. So the graduated "admit first K, reject
+//! the rest" property survives. `quota_enforcement_tests.rs` proves it.
 //!
-//! Evidence here is `pg_stat_statements` call counts, driven end-to-end
-//! through a real `Worker` and a real workflow decision. This is not a
-//! direct call to an internal helper. The row-building logic is inlined in
-//! `persist_all_started_child_workflows`. That matches every other
-//! per-child insert call site in this file, none of which are factored
-//! out either.
-//! This harness follows the same shape as `activity_enqueue_batch_perf.rs`:
-//! a fresh, uniquely-named, fully-migrated database per measurement.
-//! `pg_stat_statements` is reset immediately before the measured decision,
-//! then snapshotted immediately after it.
+//! The evidence is `pg_stat_statements` call counts, through a real `Worker`
+//! and a real workflow decision, not a direct call to an internal helper.
+//! The row-building logic is inlined in `persist_all_started_child_workflows`,
+//! as at every other per-child insert site. As in
+//! `activity_enqueue_batch_perf.rs`, each measurement gets a fresh, migrated
+//! database. `pg_stat_statements` resets just before the measured decision
+//! and is read just after it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -64,14 +58,11 @@ async fn setup_server() -> (String, DbGuard) {
     }
     let container = Postgres::default()
         .with_tag("16")
-        // Preload `pg_stat_statements` so the evidence-capture tests below
-        // work on the pure-Docker fallback path (issue #1589 CI failure).
-        // The extension's C hooks only exist once preloaded at postmaster
-        // start. `CREATE EXTENSION` alone (`ensure_pg_stat_statements`
-        // below) cannot retroactively enable them. Mirrors
-        // `claim_bench_support.rs`'s identical fix. `.with_cmd(...)` fully
-        // replaces `Image::cmd()`, so the image's own `fsync=off` default
-        // is repeated here explicitly to avoid re-enabling fsync.
+        // Preload `pg_stat_statements`, as `claim_bench_support.rs` does, so
+        // the capture works on the Docker fallback (the issue #1589 CI
+        // failure). Its C hooks exist only when preloaded at postmaster
+        // start. `CREATE EXTENSION` alone cannot enable them. `.with_cmd`
+        // replaces `Image::cmd()`, so it repeats the `fsync=off` default.
         .with_cmd([
             "-c",
             "shared_preload_libraries=pg_stat_statements",
@@ -348,13 +339,12 @@ fn fan_out_parent<'a>(
     })
 }
 
-/// Never completes: the child's own first decision cycle suspends on a
-/// signal that is never sent. Every child stays parked in `RUNNING` once
-/// spawned. So nothing beyond the parent's ONE fan-out decision touches
-/// `harvest_events`/`harvest_workflow_executions`/`harvest_task_queue`
-/// during the measurement window below. A child completing (or the parent
-/// reacting to that completion) would add its own, unrelated `INSERT`s,
-/// masking the signal this test is isolating.
+/// Never completes: its first decision cycle waits for a signal that never
+/// comes.
+///
+/// So each child stays parked in `RUNNING`. Only the ONE fan-out decision of
+/// the parent writes the three tables in the measured window. A completed
+/// child would add unrelated `INSERT`s and mask the signal.
 fn fan_out_child<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -365,13 +355,12 @@ fn fan_out_child<'a>(
     })
 }
 
-/// End-to-end: a real workflow decision fans out to [`FAN_OUT_N`] awaited
-/// local children, of a workflow type with NO declared quota policy. It
-/// must persist that decision with O(1) `INSERT` calls per table, not
-/// `O(FAN_OUT_N)`. This is the exact shape issue #1589 measured (3 calls
-/// per child, unbatched). It is driven through the real
-/// `persist_all_started_child_workflows` code path, not a direct call to
-/// an internal helper.
+/// End-to-end: a fan-out to [`FAN_OUT_N`] awaited local children persists
+/// with O(1) `INSERT` calls per table, not `O(FAN_OUT_N)`.
+///
+/// The child type declares NO quota policy. This is the shape that issue
+/// #1589 measured (3 calls per child, unbatched). The test drives the real
+/// `persist_all_started_child_workflows` path.
 #[tokio::test]
 async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     let (admin, _guard) = setup_server().await;
@@ -405,12 +394,10 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     let worker = build_runtime_worker("w-1589-fanout-batch-perf", 4, 1, Arc::clone(&reg));
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
-    // The parent's ONE decision cycle spawns all FAN_OUT_N children, then
-    // parks waiting on them. Every child immediately suspends on a signal
-    // that never arrives (see `fan_out_child`). So once the parent's task
-    // is parked, nothing further will touch these three tables. The
-    // snapshot below captures exactly the one spawn decision, not any
-    // later child-completion traffic.
+    // ONE decision cycle of the parent spawns all FAN_OUT_N children and
+    // parks. Each child waits for a signal that never comes (see
+    // `fan_out_child`). So after the park, nothing writes these tables, and
+    // the snapshot holds only the spawn decision.
     wait_for_workflow_task_parked(&mut start_conn, parent_id).await;
     assert_eq!(
         get_state(&mut start_conn, parent_id).await,
@@ -426,9 +413,8 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     worker.shutdown();
     handle.await.expect("worker join");
 
-    // The two tables issue #1589 targets are each covered by exactly ONE
-    // multi-row `INSERT`, for the whole FAN_OUT_N-wide group. Not one per
-    // child, and not merely "fewer than N".
+    // Each of the two tables that issue #1589 targets gets exactly ONE
+    // multi-row `INSERT` for the group, not merely "fewer than N".
     assert_eq!(
         workflow_execution_inserts, 1,
         "harvest_workflow_executions INSERT calls must be exactly 1 for the whole \
@@ -439,17 +425,14 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
         "harvest_task_queue INSERT calls must be exactly 1 for the whole {FAN_OUT_N}-child \
          batch, not one per child"
     );
-    // harvest_events carries both parts of this decision. The batched
-    // insert this issue targets is the children's own WorkflowStarted
-    // rows, 1 call. The PARENT's own per-event append loop is the fan_out
-    // marker plus one ChildWorkflowStarted per child, `FAN_OUT_N + 1`
-    // separate calls. That parent-side loop is deliberately out of scope
-    // for issue #1589. See its own text: scoped to the "Insert rows and
-    // enqueue tasks for new children" section, not the parent's own
-    // history append. That append re-reads `MAX(event_id) FOR UPDATE` per
-    // event, to serialize against concurrent sibling completions. The
-    // bound below is exact given that shape. It proves the children's own
-    // batch adds exactly one call on top of the parent-side loop.
+    // `harvest_events` gets both parts of this decision. The batch of the
+    // children's WorkflowStarted rows is 1 call. The append loop of the
+    // PARENT writes the fan_out marker and one ChildWorkflowStarted per
+    // child: `FAN_OUT_N + 1` calls. Issue #1589 scopes that loop out. It
+    // covers only "Insert rows and enqueue tasks for new children".
+    // The parent append re-reads `MAX(event_id) FOR UPDATE` per event, to
+    // serialize against concurrent sibling completions. So the bound is
+    // exact, and the child batch adds exactly one call.
     let fan_out_n_i64 = i64::try_from(FAN_OUT_N).expect("FAN_OUT_N fits in i64");
     assert_eq!(
         event_inserts,
@@ -459,8 +442,7 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
          all {FAN_OUT_N} children's own WorkflowStarted rows"
     );
 
-    // Functional correctness alongside the call-count evidence: every
-    // child actually exists, actually started, and is durably parked.
+    // Each child exists, started and is durably parked.
     let child_count: CountRow = diesel::sql_query(
         "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
          WHERE workflow_name = $1 AND state = 'RUNNING'",
@@ -482,11 +464,9 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
 ///
 /// `NewHarvestEvent` carries 4 columns, so one unchunked multi-row `INSERT`
 /// hits Postgres's 65,535-bind-parameter ceiling at 16,383 rows
-/// (`65_535 / 4 = 16_383`, floor). This drives `N` past that boundary:
-/// two chunks, not one. Mirrors
-/// `activity_enqueue_batch_perf.rs::enqueue_batch_handles_a_batch_past_the_parameter_ceiling`,
-/// the direct regression test for the same pre-chunking bug class in the
-/// sibling batch-insert path.
+/// (`65_535 / 4 = 16_383`, floor). `N` crosses that boundary: two chunks,
+/// not one. The sibling batch insert has the same test:
+/// `activity_enqueue_batch_perf.rs::enqueue_batch_handles_a_batch_past_the_parameter_ceiling`.
 #[tokio::test]
 async fn append_new_execution_started_events_batch_handles_a_batch_past_the_parameter_ceiling() {
     use autumn_harvest::event::WorkflowEvent;
@@ -503,9 +483,8 @@ async fn append_new_execution_started_events_batch_handles_a_batch_past_the_para
         .await
         .expect("connect to fresh database");
 
-    // Bulk-seed N real harvest_workflow_executions rows in one round trip
-    // (the FK `harvest_events.workflow_exec_id` references), and read back
-    // their ids.
+    // Seed N execution rows in one round trip, as targets of the
+    // `harvest_events.workflow_exec_id` foreign key.
     let wf_name = unique("event_batch_over_ceiling_wf");
     let rows: Vec<CountRowUuid> = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \

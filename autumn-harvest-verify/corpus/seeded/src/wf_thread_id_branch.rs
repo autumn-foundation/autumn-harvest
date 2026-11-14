@@ -6,9 +6,9 @@
 //! branch and records a different command.
 //!
 //! **Launder.** No rule in either layer mentions `thread::current`, `ThreadId`,
-//! or `DefaultHasher`: HVG005/DET007 cover `thread::spawn`, which is a
-//! different thing entirely, and DET005 (process id, a `Warning`) is the closest
-//! relative. Two crate boundaries on top.
+//! or `DefaultHasher`. HVG005/DET007 cover `thread::spawn`, which is a
+//! different thing. DET005 (process id, a `Warning`) is the closest relative.
+//! Two crate boundaries on top.
 //!
 //! **Expected trace hops.** `wf_thread_id_branch` ⇒
 //! `harvest_verify_corpus_helpers::worker_slot_parity` ⇒

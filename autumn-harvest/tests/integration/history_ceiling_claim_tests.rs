@@ -1,38 +1,31 @@
 #![cfg(feature = "db")]
 //! Correctness and buffer-cost evidence for
-//! `timeout::workflow_history_ceiling_query()` (issue #493) -- the scanner
-//! query behind `enforce_workflow_history_ceiling`, run on every timeout-
-//! scanner tick (`enforce_timeouts_once`) whenever an operator configures
-//! `HarvestBuilder::max_workflow_history_events`.
+//! `timeout::workflow_history_ceiling_query()` (issue #493).
+//! `enforce_workflow_history_ceiling` runs it on every timeout-scanner tick
+//! when `HarvestBuilder::max_workflow_history_events` is set.
 //!
-//! The query needs each RUNNING execution's durable `harvest_events` row
-//! count in two places -- the `SELECT` list (to report it) and the `WHERE`
-//! clause (to filter on it, since a `SELECT`-list alias is not visible to the
-//! `WHERE` clause of the same query). The pre-fix query wrote the correlated
-//! `COUNT(*)` subquery out twice to get both; Postgres evaluates each
+//! The query needs each RUNNING execution's `harvest_events` row count in the
+//! `SELECT` list and in the `WHERE` clause. A `SELECT`-list alias is not
+//! visible to the `WHERE` clause of the same query. The pre-fix query wrote
+//! the correlated `COUNT(*)` subquery twice. Postgres evaluates each
 //! occurrence independently, so every RUNNING row paid for the count twice.
-//! The fix wraps it in a `MATERIALIZED` CTE so the count is computed once per
-//! row and read twice. See `docs/performance-history-ceiling.md` for the full
-//! writeup this file's evidence-capture test regenerates.
+//! The fix wraps it in a `MATERIALIZED` CTE, so the count runs once per row.
+//! The evidence test regenerates `docs/performance-history-ceiling.md`.
 //!
 //! Two tests:
 //! - [`enforce_workflow_history_ceiling_terminates_only_oversized_running_rows`]
-//!   -- fast, always-run functional correctness check against the real
-//!   scanner function and the shared test database (state transitions only,
-//!   filtered to this test's own uniquely-named rows -- the scanner is a
-//!   GLOBAL scan, exactly like `enforce_workflow_execution_timeouts` in
-//!   `chain_timeout_tests.rs`).
+//!   -- a fast functional check against the shared test database. The scanner
+//!   is a GLOBAL scan, like `enforce_workflow_execution_timeouts` in
+//!   `chain_timeout_tests.rs`. So the test checks only its own rows.
 //! - [`zz_capture_history_ceiling_claim_evidence`] -- `#[ignore]`d. Seeds a
 //!   production-shaped fixture into a throwaway database
-//!   ([`claim_bench_support::db::setup_bench_db`]), then captures
+//!   ([`claim_bench_support::db::setup_bench_db`]). It captures
 //!   `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)` and a
-//!   `pg_stat_statements` snapshot for both the pre-fix query (hardcoded
-//!   below, byte-for-byte what the previous commit's baseline measured) and
-//!   the current `workflow_history_ceiling_query()`, against the identical
-//!   fixture in the identical run -- and asserts the two produce
-//!   byte-identical result sets (same executions, same reported
-//!   `event_count`), the equivalence proof this rewrite's correctness rests
-//!   on.
+//!   `pg_stat_statements` snapshot for the pre-fix query and the current one.
+//!   Both run against the same fixture in the same run. The pre-fix query
+//!   below is byte-for-byte the previous baseline. The test asserts that both
+//!   queries return byte-identical result sets (same executions, same
+//!   `event_count`). That equivalence is the correctness proof of the rewrite.
 
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
@@ -62,9 +55,10 @@ struct OversizedRow {
     event_count: i64,
 }
 
-/// Bulk-insert `n` events for `exec_id`, bypassing `store::append_single_event`'s
-/// per-row locked round trip -- this file seeds up to hundreds of thousands of
-/// events per fixture, and only the *count* matters, not durable-log realism.
+/// Bulk-insert `n` events for `exec_id`, bypassing `store::append_single_event`.
+///
+/// That path costs a per-row locked round trip. A fixture holds up to hundreds
+/// of thousands of events, and only the count matters.
 async fn seed_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId, n: i64) {
     if n == 0 {
         return;
@@ -83,20 +77,18 @@ async fn seed_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId, n: i64)
 // Fast, always-run correctness check
 // ---------------------------------------------------------------------------
 
-/// Exercises the real `enforce_workflow_history_ceiling` end to end: a RUNNING
-/// row over the ceiling must FAIL with the `history_ceiling_exceeded` message,
-/// a RUNNING row exactly AT the ceiling must also FAIL (`>=`, not `>`), a
-/// RUNNING row one event short must stay RUNNING untouched, and a COMPLETED
-/// row with more events than the ceiling must never be touched at all (the
-/// query filters on `state = 'RUNNING'` before it ever counts events).
+/// Exercises the real `enforce_workflow_history_ceiling` end to end.
 ///
-/// The ceiling (750) and ceiling-straddling event counts are chosen well
-/// above what any other test in this shared-database suite plausibly seeds,
-/// so this test's assertions -- scoped to its own uniquely-named rows, since
-/// the scanner performs a GLOBAL scan exactly like
-/// `enforce_workflow_execution_timeouts` (see `chain_timeout_tests.rs`) --
-/// cannot be tripped by unrelated concurrent tests, and this test cannot trip
-/// theirs.
+/// - A RUNNING row over the ceiling must FAIL with `history_ceiling_exceeded`.
+/// - A RUNNING row exactly AT the ceiling must also FAIL (`>=`, not `>`).
+/// - A RUNNING row one event short must stay RUNNING.
+/// - A COMPLETED row over the ceiling is never touched. The query filters on
+///   `state = 'RUNNING'` before it counts events.
+///
+/// The scanner is a GLOBAL scan, like `enforce_workflow_execution_timeouts`
+/// in `chain_timeout_tests.rs`. The ceiling (750) is well above what other
+/// tests in this shared database seed. The assertions check only this test's
+/// own rows. So concurrent tests cannot trip this test, and it cannot trip them.
 const FUNCTIONAL_TEST_CEILING: i64 = 750;
 
 #[derive(QueryableByName)]
@@ -183,22 +175,21 @@ async fn enforce_workflow_history_ceiling_terminates_only_oversized_running_rows
 // Evidence capture: EXPLAIN + pg_stat_statements baseline
 // ---------------------------------------------------------------------------
 
-/// Seed a production-shaped fixture into `conn`'s (already-migrated,
-/// already-empty) database: 100,000 workflow executions, 3,000 (3%) of them
-/// RUNNING -- a plausible steady-state fraction for a busy fleet where most
-/// work finishes quickly -- and roughly 4,000,000 `harvest_events` rows
-/// spread across them with a skewed, per-state event-count distribution.
+/// Seed a production-shaped fixture into `conn`'s migrated, empty database.
 ///
-/// RUNNING rows get a heavier tail than non-RUNNING ones (10% land in a
-/// 1,000-8,000 event band that straddles the 5,000-event `CEILING` below):
-/// still-running executions over-represent hung/looping workflows -- exactly
-/// the population this scanner exists to catch. Non-RUNNING rows get a much
-/// smaller heavy tail (1%, capped at 3,000) since most of them already
-/// finished normally.
+/// It holds 100,000 workflow executions, of which 3,000 (3%) are RUNNING.
+/// That is a plausible steady state for a busy fleet where most work finishes
+/// quickly. About 4,000,000 `harvest_events` rows are spread across them, with
+/// a skewed per-state count.
 ///
-/// Pure set-based SQL (`generate_series` + `LATERAL`), not a per-row Rust
-/// loop: seeding ~4M events row-by-row from the client would dominate this
-/// test's own wall clock and says nothing about the query under test.
+/// RUNNING rows get a heavier tail: 10% land in a 1,000-8,000 event band
+/// that straddles the 5,000-event `CEILING` below. Still-running executions
+/// over-represent hung or looping workflows, which this scanner exists to
+/// catch. Non-RUNNING rows get a smaller tail (1%, capped at 3,000), because
+/// most of them finished normally.
+///
+/// The seed is set-based SQL (`generate_series` + `LATERAL`). A per-row
+/// client loop over ~4M events would dominate the wall clock of this test.
 const FIXTURE_TOTAL_EXECUTIONS: i64 = 100_000;
 const FIXTURE_RUNNING_EXECUTIONS: i64 = 3_000;
 const CEILING: i64 = 5_000;
@@ -314,10 +305,9 @@ async fn explain_and_result_set(
     (plan_text, rows)
 }
 
-/// Runs `sql` once (`EXPLAIN` + a plain execution), writes its `EXPLAIN`
-/// plan, a `pg_stat_statements` snapshot, and its result set to
-/// `{label}-*` files under `out_dir`, and returns the sorted result rows for
-/// the caller's own equivalence check.
+/// Runs `sql` once (`EXPLAIN` + a plain execution). It writes the plan, a
+/// `pg_stat_statements` snapshot and the result set to `{label}-*` files under
+/// `out_dir`. It returns the sorted rows for the equivalence check.
 async fn capture(
     conn: &mut AsyncPgConnection,
     out_dir: &std::path::Path,

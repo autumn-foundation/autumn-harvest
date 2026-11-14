@@ -22,9 +22,8 @@ fn test_update_validate_deadlock() {
 
     let ctx_clone = ctx.clone();
 
-    // Validator that tries to register another update, causing a deadlock
+    // The validator registers another update. That locks `update_registry` again and can deadlock.
     let validator = move |_: &Value| {
-        // Attempt to register another update, which will try to lock update_registry
         ctx_clone
             .register_update_handler_no_validator("another_update", |input| async { Ok(input) });
         Ok(())
@@ -64,7 +63,7 @@ async fn test_update_handler_deadlock() {
 
     let ctx_clone = ctx.clone();
 
-    // Register update handler that tries to register another update handler in the outer closure
+    // The handler registers a second handler from its outer closure, which can deadlock.
     ctx.register_update_handler_no_validator("my_update", move |input| {
         ctx_clone.register_update_handler_no_validator("another_update", |i| async { Ok(i) });
         async { Ok(input) }

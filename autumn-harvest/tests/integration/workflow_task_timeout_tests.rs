@@ -102,12 +102,11 @@ impl MetricsRecorder for RecordingMetrics {
 // ---------------------------------------------------------------------------
 
 async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
-    // When `TEST_DATABASE_URL` is set (e.g. in environments where Docker image
-    // pulls are blocked), create a fresh per-test database on the local
-    // Postgres instance instead of spinning up a container.
+    // With `TEST_DATABASE_URL` set, create a fresh per-test database on the
+    // local Postgres instead of a container. This serves hosts that cannot
+    // pull Docker images.
     if let Ok(admin_url) = std::env::var("TEST_DATABASE_URL") {
         let db_name = format!("harvest_test_{}", Uuid::new_v4().simple());
-        // Create the fresh test database.
         let mut admin_conn = AsyncPgConnection::establish(&admin_url)
             .await
             .expect("connect to admin DB");
@@ -116,8 +115,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
             .await
             .expect("create test database");
 
-        // Build a URL pointing at the new database.
-        // Strip trailing "/postgres" and replace with the new db name.
+        // Replace the trailing "/postgres" with the new database name.
         let test_url = {
             let base = admin_url.trim_end_matches('/');
             let without_db = base.rfind('/').map_or(base, |i| &base[..i]);
@@ -270,13 +268,13 @@ async fn reset_reverts_running_task_to_pending() {
         "PENDING",
         "reset should move RUNNING → PENDING"
     );
-    // Execution stays RUNNING (timeout below threshold doesn't fail it).
+    // Execution stays RUNNING (timeout below threshold does not fail it).
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
 }
 
-/// `reset_timed_out_workflow_task` is a no-op when the task is already
-/// PENDING or was claimed by a different worker — the optimistic guard prevents
-/// a stale reset from clobbering a fresh claim.
+/// `reset_timed_out_workflow_task` is a no-op on a PENDING task or on a task
+/// that another worker claimed. The optimistic guard keeps a stale reset off
+/// a fresh claim.
 #[tokio::test]
 async fn reset_is_idempotent_on_wrong_state_or_worker() {
     let (mut conn, pool, _container) = setup().await;
@@ -292,7 +290,6 @@ async fn reset_is_idempotent_on_wrong_state_or_worker() {
         "wrong worker_id must not reset the task"
     );
 
-    // Correct worker — transitions.
     reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 
@@ -433,21 +430,18 @@ async fn quarantine_writes_dlq_and_fails_execution() {
     )
     .await;
 
-    // Task row must be FAILED.
     assert_eq!(
         task_state(&mut conn, task_id).await,
         "FAILED",
         "timed-out task must be quarantined (FAILED)"
     );
 
-    // Owning execution must be FAILED.
     assert_eq!(
         execution_state(&mut conn, exec_id).await,
         "FAILED",
         "owning execution must be failed after quarantine"
     );
 
-    // DLQ must have one entry.
     let dlq_count = dead_letter_count(&mut conn).await.expect("dlq count");
     assert_eq!(dlq_count, 1, "exactly one DLQ entry expected");
 
@@ -699,12 +693,12 @@ async fn event_count(conn: &mut AsyncPgConnection, exec_id: Uuid) -> i64 {
         .n
 }
 
-/// Regression (issue #605 code review): a workflow-task timeout can race a
-/// legitimate completion that commits between the timeout firing and this
-/// quarantine's own transaction acquiring its lock. Quarantining must never
-/// clobber (or misreport, via a spurious `WorkflowFailed` event and a
-/// re-triggered completion-callback delivery) an execution that already
-/// reached a different terminal state.
+/// Regression (issue #605): a workflow-task timeout can race a legitimate
+/// completion. The completion can commit after the timeout fires and before
+/// the quarantine transaction takes its lock. The quarantine must never
+/// clobber an execution that already reached another terminal state. It must
+/// not misreport one either, through a spurious `WorkflowFailed` event and a
+/// re-triggered completion-callback delivery.
 #[tokio::test]
 async fn quarantine_does_not_overwrite_an_execution_that_already_completed() {
     let (mut conn, pool, _container) = setup().await;

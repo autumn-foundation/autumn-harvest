@@ -4,8 +4,8 @@
 //! `Verdict::Unknown` is only honest if the reader can see *what* was not
 //! analyzed. The report therefore publishes a boundaries table, and that table
 //! has to stay equal to [`BoundaryKind::ALL`] — the list the tool can actually
-//! emit. A table that drifts is worse than none: it advertises a boundary set
-//! the tool no longer has, so a `proven-deterministic` verdict gets read as
+//! emit. A table that drifts is worse than none. It advertises a boundary set
+//! the tool no longer has. So a `proven-deterministic` verdict reads as
 //! stronger than it is.
 //!
 //! The guard is deliberately split across two crates, because neither can see
@@ -98,8 +98,7 @@ fn every_boundary_kind_is_documented_in_the_report() {
 #[test]
 fn boundary_names_are_stable_kebab_case() {
     // The report, the CLI's `--list-boundaries` output and the JSON format all
-    // print these strings verbatim, so a rename is a breaking change to three
-    // surfaces at once.
+    // print these strings verbatim. So a rename breaks three surfaces at once.
     for kind in BoundaryKind::ALL {
         let name = kind.name();
         assert!(

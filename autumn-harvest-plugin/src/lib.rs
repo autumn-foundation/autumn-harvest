@@ -51,9 +51,9 @@ pub mod dag_retry;
 /// Zero-setup local dev runtime (issue #525).
 ///
 /// Provisions an ephemeral PostgreSQL, applies the ordinary embedded
-/// migrations, runs a worker and serves the management API + Vantage UI — with
-/// no Docker, no `compose.yaml`, no `DATABASE_URL` and no `diesel migration
-/// run`. Development and evaluation only; see the module docs.
+/// migrations, runs a worker and serves the management API + Vantage UI. It
+/// needs no Docker, no `compose.yaml`, no `DATABASE_URL` and no `diesel
+/// migration run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
 /// Durable routes: an Autumn route that runs as a keyed Harvest workflow.

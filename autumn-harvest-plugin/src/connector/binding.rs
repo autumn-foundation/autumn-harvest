@@ -1,9 +1,9 @@
 //! Declarative source→workflow binding descriptors (issue #944).
 //!
 //! A [`SourceBinding`] is the broker-agnostic analogue of
-//! [`autumn_harvest::WebhookTriggerInfo`] (issue #344): it maps one
-//! topic/queue onto one target workflow, with a synchronous mapping function
-//! that turns raw message bytes plus broker metadata into a
+//! [`autumn_harvest::WebhookTriggerInfo`] (issue #344). It maps one
+//! topic/queue onto one target workflow. A synchronous mapping function turns
+//! raw message bytes plus broker metadata into a
 //! [`autumn_harvest::WorkflowId`] and a JSON payload.
 //!
 //! The descriptor is deliberately builder-shaped rather than macro-shaped —
@@ -25,17 +25,16 @@ pub const DEFAULT_POISON_THRESHOLD: u32 = 3;
 
 /// Default bound on messages dispatched concurrently by one binding.
 ///
-/// Bounds the connector's own fan-in so a topic backlog cannot stampede the
-/// admission path (the per-workflow throttle, issue #607, bounds the *start*
-/// rate; this bounds the *dispatch* rate).
+/// Bounds the connector's own fan-in, so a topic backlog cannot stampede the
+/// admission path. The per-workflow throttle (issue #607) bounds the *start*
+/// rate. This bounds the *dispatch* rate.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 16;
 
 /// What a mapping function can fail with.
 ///
 /// Mirrors [`autumn_harvest::WebhookHandlerError`]'s two-way classification
-/// exactly, because the two carry different retry semantics: a decode failure
-/// is deterministic and dead-letters on sight, while a rejection is
-/// strike-counted.
+/// exactly, because the two carry different retry semantics. A decode failure
+/// is deterministic and dead-letters on sight. A rejection is strike-counted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappingError {
     /// The raw bytes could not be decoded into the expected shape.
@@ -63,13 +62,13 @@ pub struct MappedMessage {
     /// it is delivered to the **same execution** — affinity, *not* ordering.
     ///
     /// The connector spawns up to `max_in_flight` dispatches concurrently,
-    /// including two messages for the same key in one batch, so a later broker
-    /// record can persist its signal first and the workflow then observes them
-    /// in database-recorded order rather than broker order. Every message still
-    /// lands in exactly one run; only the sequence is unguaranteed. Set
-    /// `.max_in_flight(1)` on the binding to make dispatch strictly sequential
-    /// — the one knob that does buy you order, at the cost of throughput. See
-    /// the ordering caveat in `docs/getting-started/13-broker-connectors.md`.
+    /// even two messages for the same key in one batch. A later broker record
+    /// can persist its signal first. The workflow then observes database order,
+    /// not broker order. Every message still lands in exactly one run; only the
+    /// sequence is unguaranteed. `.max_in_flight(1)` makes dispatch strictly
+    /// sequential. It is the one knob that buys order, at the cost of
+    /// throughput. See the ordering caveat in
+    /// `docs/getting-started/13-broker-connectors.md`.
     pub workflow_id: WorkflowId,
     /// The JSON payload handed to the workflow as its start input (and, for a
     /// `SignalsWithStart` binding, as the signal payload).
@@ -114,9 +113,9 @@ pub enum ConnectorTarget {
     /// Atomically start-or-attach and deliver a signal — the entity-workflow
     /// pattern, and the per-key *affinity* path for keyed message streams.
     ///
-    /// Affinity, not ordering: every message for a key lands in one execution,
-    /// but concurrent dispatch means the run may observe them out of broker
-    /// order unless the binding sets `.max_in_flight(1)`. See
+    /// Affinity, not ordering: every message for a key lands in one execution.
+    /// With concurrent dispatch, the run may observe them out of broker order,
+    /// unless the binding sets `.max_in_flight(1)`. See
     /// [`MappedMessage::workflow_id`].
     SignalsWithStart {
         /// The registered workflow type name.
@@ -158,24 +157,26 @@ pub enum IdempotencyMode {
     /// computed.
     ///
     /// **Scope: shard-local.** The claim this writes
-    /// (`harvest_start_idempotency`) is per-shard, and the connector always
-    /// dispatches with an explicit `workflow_id`, which issue #808 routes by
-    /// (a keyed start routes by the *key* only when `workflow_id` was
-    /// omitted). So on a **single-shard deployment — the default — dedupe is
-    /// fully independent of the mapper's id**, but on a **multi-shard**
-    /// deployment a redelivery whose mapper produces a *different*
-    /// `workflow_id` routes to a different shard, cannot see the original
-    /// claim, and starts a second execution. Keep the mapping function's id
-    /// deterministic on a multi-shard deployment; the connector logs a warning
-    /// at startup when it detects that combination. This is the same
-    /// shard-local scope every sibling dedupe primitive carries (#808 start
-    /// idempotency, #521 signal idempotency, #247 concurrency, #607 throttle,
-    /// #691 mutex) — cross-shard coordination is out of scope engine-wide.
+    /// (`harvest_start_idempotency`) is per-shard. The connector always
+    /// dispatches with an explicit `workflow_id`, and issue #808 routes by it.
+    /// A keyed start routes by the *key* only when `workflow_id` was omitted.
+    ///
+    /// So on a **single-shard deployment (the default), dedupe is fully
+    /// independent of the mapper's id**. On a **multi-shard** deployment, a
+    /// mapper can produce a *different* `workflow_id` for a redelivery. That
+    /// redelivery routes to a different shard and cannot see the original
+    /// claim. It starts a second execution. Keep the mapping function's id
+    /// deterministic on a multi-shard deployment. The connector logs a warning
+    /// at startup when it detects that combination.
+    ///
+    /// Every sibling dedupe primitive has the same shard-local scope: #808
+    /// start idempotency, #521 signal idempotency, #247 concurrency, #607
+    /// throttle, #691 mutex. Cross-shard coordination is out of scope
+    /// engine-wide.
     ///
     /// **Mutually exclusive** with a target carrying a throttle, debounce or
-    /// batch policy — the start route rejects that combination with `400`,
-    /// because a deferred admission has no synchronous execution to dedupe
-    /// against.
+    /// batch policy. The start route rejects that combination with `400`. A
+    /// deferred admission has no synchronous execution to dedupe against.
     BrokerCoordinates,
     /// Dedupe on the mapping function's deterministic `workflow_id` (the
     /// inbound-webhook model, issue #344). Slightly weaker — it relies on the
@@ -188,14 +189,14 @@ pub enum IdempotencyMode {
 ///
 /// [`IdempotencyMode::BrokerCoordinates`] advertises dedupe independent of the
 /// mapper's `workflow_id`. That holds unconditionally on a single-shard
-/// deployment, but the claim it writes is shard-local while the dispatch is
-/// routed by the explicit `workflow_id` (issue #808), so on a multi-shard
-/// deployment the promise degrades to "holds while the mapper's id is stable"
-/// — i.e. to what [`IdempotencyMode::WorkflowId`] already documents.
+/// deployment. But the claim it writes is shard-local, and the explicit
+/// `workflow_id` routes the dispatch (issue #808). On a multi-shard deployment
+/// the promise degrades to "holds while the mapper's id is stable". That is
+/// what [`IdempotencyMode::WorkflowId`] already documents.
 ///
-/// `true` means the operator should be told; the runtime logs it once at
-/// startup rather than failing, because a stable mapper (the overwhelmingly
-/// common case, and what every example ships) is perfectly safe.
+/// `true` means the operator should be told. The runtime logs it once at
+/// startup and does not fail. A stable mapper is perfectly safe, and it is the
+/// overwhelmingly common case and what every example ships.
 pub(crate) const fn coordinate_dedupe_is_shard_local_only(
     mode: IdempotencyMode,
     readable_shards: usize,
@@ -209,9 +210,9 @@ pub struct SourceBinding {
     /// as the idempotency-key namespace, so it must be unique and is required
     /// to be low-cardinality by construction.
     ///
-    /// Because it is both, renaming it to rotate the dedupe namespace also
-    /// breaks every dashboard built on the label — use
-    /// [`Self::key_incarnation`] to rotate one without the other.
+    /// It is both, so a rename to rotate the dedupe namespace also breaks
+    /// every dashboard built on the label. [`Self::key_incarnation`] rotates
+    /// one without the other.
     pub name: &'static str,
     /// The logical stream (topic or queue) this binding consumes.
     pub stream: String,
@@ -232,11 +233,11 @@ pub struct SourceBinding {
     pub idempotency_mode: Option<IdempotencyMode>,
     /// Rotates the idempotency-key namespace without renaming the binding.
     ///
-    /// Set this when the binding is cut over to a different cluster, or its
-    /// topic is deleted and recreated: broker coordinates are only unique
-    /// within one incarnation of the thing they address, so the old ones come
-    /// back around while their claims are still live. See
-    /// [`SourceBinding::key_incarnation`] for the full rationale.
+    /// Set this when the binding moves to a different cluster, or its topic is
+    /// deleted and recreated. Broker coordinates are unique only within one
+    /// incarnation of what they address. So the old ones come back while their
+    /// claims are still live. See [`SourceBinding::key_incarnation`] for the
+    /// full rationale.
     pub key_incarnation: Option<&'static str>,
     /// Set by `map_raw`/`map_json`. Private so `validate_bindings` can tell
     /// "never configured a mapper" from "configured one that rejects", and so
@@ -316,10 +317,10 @@ impl SourceBinding {
     /// those are only unique within one *incarnation* of the stream they
     /// address. Kafka's `{topic}:{partition}:{offset}` restarts at zero when
     /// a topic is deleted and recreated, and means nothing at all across a
-    /// cutover to a different cluster. Point an existing binding at either
-    /// and the same coordinates come back around while the claims from their
-    /// previous life are still live, so genuinely new records are classified
-    /// as replays and acknowledged **without being dispatched**.
+    /// cutover to a different cluster. Point an existing binding at either,
+    /// and the same coordinates come back while their old claims are still
+    /// live. Genuinely new records are then classified as replays and
+    /// acknowledged **without being dispatched**.
     ///
     /// Nothing detects this for you: Kafka exposes no topic incarnation to a
     /// consumer, and a bootstrap broker list is not a stable cluster
@@ -328,10 +329,10 @@ impl SourceBinding {
     ///
     /// # Why not just rename the binding
     ///
-    /// You can — [`SourceBinding::name`] is already the key namespace. But it
-    /// is also the `source` metric label, so renaming rotates the dedupe
-    /// namespace and breaks every dashboard, alert and runbook built on the
-    /// binding at the same time. This separates the two.
+    /// You can, because [`SourceBinding::name`] is already the key namespace.
+    /// But it is also the `source` metric label. A rename rotates the dedupe
+    /// namespace and also breaks every dashboard, alert and runbook built on
+    /// the binding. This separates the two.
     ///
     /// # Cost of setting it
     ///
@@ -403,21 +404,20 @@ impl SourceBinding {
     /// Use the broker's own dead-letter machinery instead of a harvest-side
     /// record.
     ///
-    /// Only for sources that report a dead-letter destination *abandoning a
-    /// message actually feeds* — in practice an SQS queue carrying a redrive
-    /// policy, or a custom adapter that overrides
-    /// [`EventSource::has_native_dead_letter`][hn]. The pairing is rejected at
-    /// build time on any other source rather than silently re-reading the
-    /// poison message forever.
+    /// Only for a source whose dead-letter destination *an abandoned message
+    /// actually feeds*. In practice that is an SQS queue with a redrive policy,
+    /// or a custom adapter that overrides
+    /// [`EventSource::has_native_dead_letter`][hn]. The build rejects the
+    /// pairing on any other source, so the poison message is not silently
+    /// re-read forever.
     ///
-    /// **Not available on Kafka.** Kafka has no per-message nack, so there is
-    /// nothing for abandoning to hand the message to — routing a DLQ topic is a
-    /// *producer* action the consumer cannot perform. A Kafka binding should
-    /// leave this unset and let poison messages land in
-    /// `harvest_connector_dead_letters` (the default
-    /// [`DeadLetterMode::HarvestSink`]), which is also what keeps the partition
-    /// moving: a dead-lettered message is acked, whereas one left to retry
-    /// blocks its prefix.
+    /// **Not available on Kafka.** Kafka has no per-message nack, so abandoning
+    /// has nothing to hand the message to. Routing a DLQ topic is a *producer*
+    /// action the consumer cannot perform. Leave this unset on a Kafka binding.
+    /// Poison messages then land in `harvest_connector_dead_letters` (the
+    /// default [`DeadLetterMode::HarvestSink`]). That also keeps the partition
+    /// moving: a dead-lettered message is acked, but one left to retry blocks
+    /// its prefix.
     ///
     /// [hn]: super::source::EventSource::has_native_dead_letter
     #[must_use]
@@ -446,11 +446,11 @@ impl SourceBinding {
 /// Resolve the effective dedupe mode for a binding.
 ///
 /// * An explicit [`SourceBinding::idempotency_mode`] always wins.
-/// * Otherwise [`IdempotencyMode::BrokerCoordinates`] is preferred — it is the
-///   strongest guarantee and does not depend on the mapping function's id
-///   choice — **unless** the target workflow carries a throttle, debounce or
-///   batch policy, in which case a keyed start would be rejected `400` by the
-///   start route's mutual-exclusion rule. Then it falls back to
+/// * Otherwise [`IdempotencyMode::BrokerCoordinates`] is preferred. It is the
+///   strongest guarantee and does not depend on the mapping function's id.
+///   The exception is a target workflow with a throttle, debounce or batch
+///   policy. The start route's mutual-exclusion rule rejects a keyed start
+///   there with `400`. Then the mode falls back to
 ///   [`IdempotencyMode::WorkflowId`], which composes with deferred admission.
 ///
 /// `SignalsWithStart` targets always resolve to
@@ -484,19 +484,19 @@ pub const fn has_deferred_admission(info: &WorkflowInfo) -> bool {
 
 /// Validate a binding set at build time.
 ///
-/// Fails fast — like `validate_webhook_triggers` (issue #344) — so a
-/// misconfiguration surfaces at `HarvestPlugin::build` rather than on the
-/// first message, when the message would otherwise be silently retried
-/// forever.
+/// Fails fast, like `validate_webhook_triggers` (issue #344). A
+/// misconfiguration surfaces at `HarvestPlugin::build`, not on the first
+/// message, which would otherwise be silently retried forever.
 ///
 /// # Errors
 ///
-/// Returns a human-readable message when a binding has an empty name, an
-/// empty stream, no mapping function, a duplicate name, a duplicate
-/// `(stream, target)` pair, a target that is not a registered workflow, a
-/// target that is a registered DAG, or an explicit
-/// [`IdempotencyMode::BrokerCoordinates`] on a workflow whose admission is
-/// deferred.
+/// Returns a human-readable message when a binding has one of these defects:
+///
+/// - an empty name, an empty stream, or no mapping function;
+/// - a duplicate name or a duplicate `(stream, target)` pair;
+/// - a target that is not a registered workflow, or is a registered DAG;
+/// - an explicit [`IdempotencyMode::BrokerCoordinates`] on a workflow whose
+///   admission is deferred.
 pub fn validate_bindings(
     bindings: &[SourceBinding],
     registered_workflows: &[WorkflowInfo],
@@ -560,15 +560,16 @@ pub fn validate_bindings_refs(
         // NOTE: a duplicate `(stream, target)` pair is deliberately NOT an
         // error here. Two independent brokers can expose the same stream name
         // and legitimately feed one workflow (active/active, or a cluster
-        // migration), and nothing visible from a binding distinguishes that
-        // from an accidental duplicate: a Kafka source's `stream()` is fixed
-        // to the topic and the plugin separately requires the binding's stream
-        // to match it, so an operator has no way to alias around a rejection.
-        // The real hazard -- two bindings on one *physical* subscription
-        // splitting the stream between them -- is caught in
-        // `HarvestPlugin::build`, which can compare source identities; the
-        // same place warns about a duplicate pair on distinct subscriptions,
-        // since that double-dispatches every message.
+        // migration). Nothing visible from a binding tells that from an
+        // accidental duplicate. A Kafka source's `stream()` is fixed to the
+        // topic, and the plugin requires the binding's stream to match it. So
+        // an operator cannot alias around a rejection.
+        //
+        // The real hazard is two bindings on one *physical* subscription that
+        // split the stream between them. `HarvestPlugin::build` catches it,
+        // because it can compare source identities. It also warns about a
+        // duplicate pair on distinct subscriptions, which double-dispatches
+        // every message.
         let workflow = b.target.workflow();
         if registered_dag_names.iter().any(|d| d == workflow) {
             return Err(format!(
@@ -588,14 +589,14 @@ pub fn validate_bindings_refs(
         validate_target_compatibility(b, info, workflow)?;
 
         // A `broker_native_dead_letter()` binding hands poison quarantine to
-        // the broker's own redrive policy — which only works if the adapter
-        // has a real per-message nack that increments a receive count. Kafka
-        // has none (`abandon` is a no-op; the message simply is not
-        // committed), so a poison message would be re-read forever and never
-        // reach any dead-letter destination: the exact partition wedge the
-        // feature exists to prevent. The binding cannot see its own adapter
-        // here, so this is caught adapter-side in `spawn_connectors`; what we
-        // can check is that the mode was set deliberately.
+        // the broker's own redrive policy. That works only if the adapter has
+        // a real per-message nack that increments a receive count. Kafka has
+        // none: `abandon` is a no-op, and the message is simply not committed.
+        // A poison message would be re-read forever and reach no dead-letter
+        // destination. That is the partition wedge the feature exists to
+        // prevent. The binding cannot see its own adapter here, so
+        // `spawn_connectors` catches this adapter-side. This check can only
+        // confirm that the mode was set deliberately.
     }
     Ok(())
 }
@@ -617,9 +618,9 @@ fn validate_target_compatibility(
     //   reads as "some messages vanish".
     // * **batch** — same shape: no signal-with-start batch admission path
     //   exists, so a fresh start is refused.
-    // * **throttle** — worse, because it *succeeds*: signal-with-start does
-    //   not consult the start throttle at all, so the binding would silently
-    //   bypass the very backpressure the operator configured.
+    // * **throttle** — worse, because it *succeeds*. Signal-with-start does
+    //   not consult the start throttle at all. So the binding would silently
+    //   bypass the backpressure the operator configured.
     if matches!(b.target, ConnectorTarget::SignalsWithStart { .. }) && has_deferred_admission(info)
     {
         return Err(format!(
@@ -637,12 +638,12 @@ fn validate_target_compatibility(
     //
     // `resolve_idempotency_mode` falls back to `WorkflowId` for every
     // deferred-admission target, because a keyed start is a `400` there. That
-    // fallback leans on workflow-id reuse — which only arbitrates when an
+    // fallback leans on workflow-id reuse, which arbitrates only when an
     // execution is *created*. Batch admission mutates a pending aggregate
-    // long before that: `admit_batched_start` upserts with
-    // `buffered_payloads = existing || EXCLUDED`, so a redelivered message is
-    // appended a second time and the collapsed run receives it twice. It also
-    // counts toward `max_size`, so it can flush the batch early.
+    // long before that. `admit_batched_start` upserts with
+    // `buffered_payloads = existing || EXCLUDED`. So a redelivered message is
+    // appended a second time, and the collapsed run receives it twice. It
+    // also counts toward `max_size`, so it can flush the batch early.
     //
     // The other two deferred policies are genuinely safe and stay allowed:
     //
@@ -774,7 +775,6 @@ mod tests {
         let err = (b.mapper)(&ctx(br#"{"id":""}"#)).unwrap_err();
         assert!(matches!(err, MappingError::Rejected(_)), "{err:?}");
 
-        // Happy path.
         let m = (b.mapper)(&ctx(br#"{"id":"7"}"#)).unwrap();
         assert_eq!(m.workflow_id.as_str(), "order-7");
     }
@@ -878,14 +878,14 @@ mod tests {
     fn validate_allows_independent_sources_to_feed_one_stream_target_pair() {
         // Two independent Kafka clusters both exposing `orders` and both
         // feeding `order_flow` is legitimate fan-in (active/active, or a
-        // cluster migration). Nothing in the binding can distinguish them:
-        // `KafkaSource::stream()` is fixed to the topic and the plugin
-        // separately asserts the binding's stream matches it, so an operator
-        // cannot alias either one to get past a logical duplicate check.
+        // cluster migration). Nothing in the binding can distinguish them.
+        // `KafkaSource::stream()` is fixed to the topic, and the plugin
+        // asserts that the binding's stream matches it. So an operator cannot
+        // alias either one past a logical duplicate check.
         //
-        // The genuine hazard -- two consumers on ONE physical subscription
-        // splitting the stream -- is caught by the source-identity check in
-        // `HarvestPlugin::build`, which can see what this cannot.
+        // The genuine hazard is two consumers on ONE physical subscription
+        // that split the stream. The source-identity check in
+        // `HarvestPlugin::build` catches it, because it sees what this cannot.
         let bindings = vec![
             SourceBinding::starts("a", "orders", "order_flow").map_raw(|_| Ok(ok_mapped())),
             SourceBinding::starts("b", "orders", "order_flow").map_raw(|_| Ok(ok_mapped())),
@@ -995,19 +995,19 @@ mod tests {
 
     #[test]
     fn known_limitation_coordinate_dedupe_scope_is_shard_local() {
-        // Issue #944 / Codex P1. `BrokerCoordinates` derives the dedupe key
-        // from stable broker coordinates, but the CLAIM it writes
-        // (`harvest_start_idempotency`) is shard-local, and the connector
-        // always dispatches with an explicit `workflow_id`, so issue #808
-        // routes the start by `workflow_id` rather than by the key. On a
-        // MULTI-SHARD deployment a mapper whose id drifts therefore lands the
-        // redelivery on a different shard, where the original claim is not
-        // visible -- so it starts a second execution.
+        // Issue #944. `BrokerCoordinates` derives the dedupe key from stable
+        // broker coordinates. But the CLAIM it writes
+        // (`harvest_start_idempotency`) is shard-local. The connector always
+        // dispatches with an explicit `workflow_id`, so issue #808 routes the
+        // start by `workflow_id`, not by the key. On a MULTI-SHARD deployment,
+        // a mapper whose id drifts lands the redelivery on a different shard.
+        // The original claim is not visible there, so it starts a second
+        // execution.
         //
-        // This pins the honest scope: the dedupe promise holds
-        // unconditionally on a single-shard deployment (the default), and on a
-        // multi-shard one only while the mapper's id is stable. It is the same
-        // shard-local scope every sibling dedupe primitive carries (#808 start
+        // This pins the honest scope. The dedupe promise holds
+        // unconditionally on a single-shard deployment (the default). On a
+        // multi-shard one it holds only while the mapper's id is stable. Every
+        // sibling dedupe primitive has the same shard-local scope (#808 start
         // idempotency, #521 signal idempotency, #247 concurrency, #607
         // throttle, #691 mutex).
         assert!(
@@ -1061,11 +1061,11 @@ mod tests {
     #[test]
     fn validate_rejects_a_starts_binding_onto_a_batched_workflow() {
         // A batch target is the one deferred-admission policy where a broker
-        // redelivery is *visible to the workflow*: the redelivery appends the
-        // same payload to `buffered_payloads` a second time, so the collapsed
-        // run receives one message twice — and it counts toward `max_size`,
-        // so it can flush the batch early too. Workflow-id reuse cannot save
-        // it, because no execution exists yet when the append happens.
+        // redelivery is *visible to the workflow*. The redelivery appends the
+        // same payload to `buffered_payloads` a second time. So the collapsed
+        // run receives one message twice. It also counts toward `max_size`, so
+        // it can flush the batch early. Workflow-id reuse cannot save it,
+        // because no execution exists yet when the append happens.
         let batched = wf("wf").with_batch(batch_policy());
         let bindings =
             vec![SourceBinding::starts("orders", "orders", "wf").map_raw(|_| Ok(ok_mapped()))];

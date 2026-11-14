@@ -1,19 +1,19 @@
-//! Regression tests for the two Codex #1069 P2 review findings on commit `48d54b2`.
+//! Regression tests for two #1069 fixes on commit `48d54b2`.
 //!
-//! - **FINDING 1** (`queue.rs`) — a deterministic `arm_seq` tie-breaker so several
-//!   timers armed with the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
+//! - **Timer fire order** (`queue.rs`): an `arm_seq` tie-breaker makes timers
+//!   with the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
 //!   ctx.timer("b", 1))`) FIRE in `TimerStarted`-append order. The core
 //!   `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at an
 //!   unconsumed sibling `TimerFired`, so a reversed fire order wedges replay.
-//! - **FINDING 2** (`runtime.rs`) — the typed `ctx.execute_activity(&info, ...)` /
-//!   `execute_activity_with_opts` path carries the activity's declared/per-call
-//!   `RetryPolicy` in `ScheduleActivity::retry_policy_override`; the backend now
-//!   persists its `max_attempts` on the task row and the worker honors it instead
-//!   of always using the registered `ActivitySpec` default.
+//! - **Declared retry policy** (`runtime.rs`): the typed
+//!   `ctx.execute_activity(&info, ...)` and `execute_activity_with_opts` path
+//!   carries the declared or per-call `RetryPolicy` in
+//!   `ScheduleActivity::retry_policy_override`. The backend stores its
+//!   `max_attempts` on the task row, and the worker honors it over the
+//!   registered `ActivitySpec` default.
 
-// The `#[workflow]`/`#[activity]` macros reference the fn's input parameter, so a
-// deliberately-unused param reads as a "used underscore binding" through the
-// expansion.
+// The `#[workflow]`/`#[activity]` macros reference the fn's input parameter, so
+// an unused param reads as a "used underscore binding" through the expansion.
 #![allow(clippy::used_underscore_binding)]
 // The retry-policy activities are `async` because `#[activity]` requires it, but
 // hold no `.await`.
@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FINDING 1 — equal-deadline timers fire in arm (TimerStarted) order.
+// Timer fire order — equal-deadline timers fire in arm (TimerStarted) order.
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[workflow]
@@ -42,11 +42,10 @@ async fn two_timers(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     Ok(1)
 }
 
-/// The money test: a SQLite-driven `join!` of two same-deadline timers produces a
-/// history whose `TimerFired` events land in `TimerStarted` order, and that
-/// history replays cleanly on the core `WorkflowReplayer`. Before the `arm_seq`
-/// tie-break the fire order of equal-`fire_at` rows was SQLite-unspecified, so it
-/// could land reversed and wedge replay.
+/// A SQLite-driven `join!` of two same-deadline timers fires them in
+/// `TimerStarted` order, and the history replays cleanly on the core
+/// `WorkflowReplayer`. Before the `arm_seq` tie-break, `SQLite` left the fire
+/// order of equal-`fire_at` rows unspecified. A reversed order wedged replay.
 #[tokio::test]
 async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -100,21 +99,21 @@ async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
     );
 }
 
-/// Companion to the money test above, updated for issue #1071. Before #1071 the
-/// core `HistoryMatcher::match_timer` scan STOPPED at an unconsumed sibling
-/// `TimerFired`, so a hand-built history identical to the passing one EXCEPT the
-/// two `TimerFired` events reversed WEDGED core replay (`NonDeterminismDetected`)
-/// — and this test asserted exactly that wedge. Issue #1071 made the forward-scan
-/// timer matcher tolerate interleaved sibling terminals: `match_timer_strict` now
-/// crosses a FOREIGN `TimerFired` non-consumingly and each timer's own fire is
-/// still found, so the reversed order now replays CLEANLY on the core (the same
-/// intentional behavior pinned by
-/// `interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded` in the
-/// core `replayer_tests`). The `SQLite` `arm_seq` tie-break remains valuable — it
-/// guarantees a STABLE, arm-order fire sequence rather than a SQLite-unspecified
-/// one (asserted by the money test above) — but it is no longer a
-/// replay-correctness prerequisite. This test now pins that #1071 interaction so a
-/// future core regression that re-wedges reversed sibling fire order is caught.
+/// Companion to the test above, updated for issue #1071. It replays a
+/// history equal to the passing one EXCEPT that the two `TimerFired` events
+/// are reversed.
+///
+/// Before #1071, `HistoryMatcher::match_timer` STOPPED at an unconsumed
+/// sibling `TimerFired`, so that history WEDGED core replay
+/// (`NonDeterminismDetected`). Issue #1071 made the forward-scan matcher
+/// tolerate interleaved sibling terminals. `match_timer_strict` now crosses a
+/// FOREIGN `TimerFired` without consuming it and still finds the own fire. So
+/// the reversed order replays CLEANLY. The core test
+/// `interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded` in
+/// `replayer_tests` pins the same behavior. The `arm_seq` tie-break still
+/// gives a STABLE arm-order fire sequence, as the test above asserts. It is no
+/// longer needed for replay correctness. This test catches a core regression
+/// that wedges reversed sibling fire order again.
 #[tokio::test]
 async fn reversed_timer_fire_order_replays_on_core_after_1071() {
     let reversed = vec![
@@ -149,13 +148,13 @@ async fn reversed_timer_fire_order_replays_on_core_after_1071() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FINDING 2 — the declared/per-call retry policy is honored over the registered
-// ActivitySpec default.
+// Declared retry policy — the declared or per-call policy wins over the
+// registered ActivitySpec default.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Declares a retry policy of 4 attempts via the macro; the runtime registers its
-// BODY with a DIFFERENT (1-attempt) ActivitySpec, so honoring the declared policy
-// vs. the registered spec is observably different.
+// The macro declares a policy of 4 attempts. The runtime registers its BODY
+// with a DIFFERENT (1-attempt) ActivitySpec, so the two give different
+// results.
 #[activity(retry = RetryPolicy::fixed(4, Duration::from_millis(0)))]
 async fn declared_retry_up(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
@@ -170,10 +169,10 @@ async fn calls_declared_up(ctx: &WorkflowContext, n: i64) -> Result<i64, String>
     Ok(out)
 }
 
-/// Registered spec = 1 attempt (no retry); DECLARED policy = 4 attempts. The body
-/// fails its first 3 attempts then succeeds. The workflow completes ONLY if the
-/// declared policy (4) is honored — with the registered spec (1) the activity
-/// would fail after one attempt and the workflow would fail. Falsifiable pre-fix.
+/// The registered spec allows 1 attempt, the DECLARED policy 4. The body fails
+/// its first 3 attempts, then succeeds. The workflow completes ONLY if the
+/// declared policy wins. With the registered spec, the activity fails after
+/// one attempt, and so does the workflow.
 #[tokio::test]
 async fn declared_retry_policy_raises_attempts_over_registered_spec() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -213,8 +212,8 @@ async fn declared_retry_policy_raises_attempts_over_registered_spec() {
     assert_eq!(counter.load(Ordering::SeqCst), 4, "body ran 4 times");
 }
 
-// Declares a retry policy of 1 attempt (retries DISABLED); the runtime registers
-// its body with a 5-attempt ActivitySpec.
+// Declares a policy of 1 attempt (no retries). The runtime registers its body
+// with a 5-attempt ActivitySpec.
 #[activity(retry = RetryPolicy::fixed(1, Duration::from_millis(0)))]
 async fn declared_retry_down(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
@@ -229,10 +228,10 @@ async fn calls_declared_down(ctx: &WorkflowContext, n: i64) -> Result<i64, Strin
     Ok(out)
 }
 
-/// Registered spec = 5 attempts; DECLARED policy = 1 attempt (no retry). The body
-/// always fails. The workflow must fail after EXACTLY ONE attempt — proving a call
-/// that disabled retries cannot be retried up to the registered cap. Falsifiable
-/// pre-fix (the registered spec of 5 would run 5 attempts).
+/// The registered spec allows 5 attempts, the DECLARED policy 1. The body
+/// always fails. The workflow must fail after EXACTLY ONE attempt. So a call
+/// that disabled retries cannot retry up to the registered cap. The bug ran 5
+/// attempts.
 #[tokio::test]
 async fn declared_retry_policy_disables_retries_below_registered_spec() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -265,7 +264,7 @@ async fn declared_retry_policy_disables_retries_below_registered_spec() {
 }
 
 // ── Regression guard: the raw `execute_activity_raw` path (no override) still
-//    falls back to the registered ActivitySpec default, byte-for-byte unchanged.
+//    falls back to the registered ActivitySpec default.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[workflow]
@@ -277,8 +276,8 @@ async fn calls_raw(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(out.as_i64().unwrap_or_default())
 }
 
-/// The raw path carries `retry_policy_override: None`, so the worker must still use
-/// the registered `ActivitySpec` cap (3 here) — the fix must not regress it.
+/// The raw path carries `retry_policy_override: None`, so the worker still uses
+/// the registered `ActivitySpec` cap (3 here).
 #[tokio::test]
 async fn raw_path_without_override_uses_registered_spec_default() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();

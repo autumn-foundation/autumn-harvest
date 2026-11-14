@@ -80,7 +80,6 @@ fn current_details_status_workflow<'a>(
             .execute_activity_raw("send_email", json!({"to": "user@example.com"}), "default")
             .await
             .map_err(|e| e.to_string())?;
-        // Clear the breadcrumb on completion.
         ctx.set_current_details("");
         Ok(json!({"charge": charge, "receipt": receipt}))
     })
@@ -117,12 +116,12 @@ fn cancellable_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 5, issue #768 — FIX 1) Arm `idle` at 300s, then call
+/// Issue #768: arm `idle` at 300s, then call
 /// `start_timer("idle", 600)` again with NO cancel/reset between. The second call
-/// is a duration-preserving idempotent no-op: the returned handle MUST carry the
-/// ORIGINAL 300s, not 600, so the durable row / virtual clock stay consistent with
-/// the single recorded `TimerStarted(idle, 300)`. Emits the armed duration so the
-/// test can assert 300 (before the fix the handle carried 600).
+/// is an idempotent no-op that preserves the duration. The returned handle MUST
+/// carry the ORIGINAL 300s, not 600. The durable row and the virtual clock then
+/// match the single recorded `TimerStarted(idle, 300)`. Emits the armed duration
+/// so the test can assert 300 (before the fix the handle carried 600).
 fn duplicate_active_start_timer_diff_duration_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -163,10 +162,10 @@ fn cancellable_reset_once_workflow<'a>(
     })
 }
 
-/// (Codex P2, issue #768) Arm a cancellable timer, then suspend on an activity
-/// in the SAME cycle. The armed timer must NOT fire before the activity
-/// completes — mirrors the real worker, which records the arm and leaves the
-/// workflow parked on the activity.
+/// (issue #768) Arm a cancellable timer, then suspend on an activity in the
+/// SAME cycle. The armed timer must NOT fire before the activity completes.
+/// This mirrors the real worker, which records the arm and leaves the workflow
+/// parked on the activity.
 fn arm_timer_then_activity_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -181,11 +180,11 @@ fn arm_timer_then_activity_workflow<'a>(
     })
 }
 
-/// (Codex P2, issue #768) Arm a cancellable timer, suspend on an activity in the
-/// SAME cycle, then `await_fire()` the timer AFTER the activity completes. The
-/// timer's `TimerStarted` is recorded in the mixed batch (competing suspension,
-/// so no fire yet); the later bookkeeping-only `await_fire` reschedules the
-/// already-armed row and it fires — never interleaved before `ActivityCompleted`.
+/// (issue #768) Arm a cancellable timer, suspend on an activity in the SAME
+/// cycle, then `await_fire()` the timer AFTER the activity completes. The
+/// mixed batch records the timer's `TimerStarted`. The competing suspension
+/// means no fire yet. The later bookkeeping-only `await_fire` reschedules the
+/// armed row, and it fires. It never interleaves before `ActivityCompleted`.
 fn arm_timer_activity_then_await_fire_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -220,12 +219,12 @@ fn arm_timer_activity_cancel_then_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 4, issue #768 — FIX A primary flow) Arm a cancellable timer,
-/// suspend on an activity, then `reset()` and `await_fire()` AFTER the activity
-/// completes. Under the round-4 model the armed timer's `harvest_timers` row is
-/// inserted only at `await_fire`, so it can NEVER fire while the workflow is
-/// parked on the activity — no spurious `TimerFired` that would break the
-/// subsequent `reset()` (an unconsumed fire → non-determinism) or diverge replay.
+/// Issue #768: arm a cancellable timer, suspend on an activity, then `reset()`
+/// and `await_fire()` AFTER the activity completes. The armed timer's
+/// `harvest_timers` row is inserted only at `await_fire`. So it can NEVER fire
+/// while the workflow is parked on the activity. No spurious `TimerFired` can
+/// break the subsequent `reset()` (an unconsumed fire → non-determinism) or
+/// diverge replay.
 fn arm_timer_activity_reset_then_await_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -242,19 +241,19 @@ fn arm_timer_activity_reset_then_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 15, issue #768) Arm two cancellable timers with DIFFERENT
+/// Issue #768: arm two cancellable timers with DIFFERENT
 /// durations and `await_fire()` both concurrently via `tokio::join!`. Production
-/// reschedules the parked task to the MINIMUM `fires_at` and ingests due timers in
-/// deadline order, so the FAST timer (dur 1) must fire before the SLOW one (dur
-/// 10) regardless of `join!` poll order (which polls `slow` first).
+/// reschedules the parked task to the MINIMUM `fires_at`. It ingests due timers
+/// in deadline order. So the FAST timer (dur 1) must fire before the SLOW one
+/// (dur 10), whatever the `join!` poll order (it polls `slow` first).
 fn concurrent_await_two_timers_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        // Capture the virtual-clock start so the test can assert the elapsed after
-        // both concurrent timers fire is the MAX deadline (10s), not the SUM (11s)
-        // — issue #768, Codex P2 round 16.
+        // Capture the virtual-clock start (issue #768). The test then asserts
+        // that the elapsed time after both concurrent timers fire is the MAX
+        // deadline (10s), not the SUM (11s).
         let start = ctx.now();
         let slow = ctx.start_timer("slow", 10);
         let fast = ctx.start_timer("fast", 1);
@@ -268,22 +267,22 @@ fn concurrent_await_two_timers_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 16, issue #768 — Finding 2) A sibling/handler-style
-/// `cancel_timer("deadline")` targeting an id the main body uses as a CLASSIC
-/// `ctx.timer` must be a NO-OP: it must NOT emit a `CancelTimer` (whose
-/// worker-side `delete_pending_timer` would delete the classic timer's durable
-/// row and hang its waiter). The classic timer therefore still fires and the run
+/// Issue #768: a sibling/handler-style `cancel_timer("deadline")` can target an
+/// id that the main body uses as a CLASSIC `ctx.timer`. It must be a NO-OP and
+/// must NOT emit a `CancelTimer`. That command's worker-side
+/// `delete_pending_timer` would delete the classic timer's durable row and
+/// hang its waiter. The classic timer therefore still fires and the run
 /// replays deterministically.
 fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        // `join!` polls the classic timer FIRST — so `ctx.timer("deadline")` records
-        // "deadline" as a classic id and parks — THEN the sibling branch calls
-        // `cancel_timer("deadline")` on that now-classic id, exactly the Finding-2
-        // "cancel while the classic timer is pending" race. The cancel must be a
-        // no-op (no `CancelTimer`, no row delete), so the classic timer still fires.
+        // `join!` polls the classic timer FIRST. `ctx.timer("deadline")` records
+        // "deadline" as a classic id and parks. THEN the sibling branch calls
+        // `cancel_timer("deadline")` on that classic id. This is the "cancel
+        // while the classic timer is pending" race. The cancel must be a no-op
+        // (no `CancelTimer`, no row delete), so the classic timer still fires.
         let (t, _c) = tokio::join!(ctx.timer("deadline", 5), async {
             ctx.cancel_timer("deadline")
         });
@@ -292,11 +291,11 @@ fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 4, issue #768 — FIX B) Arm a cancellable timer, cancel it, and
+/// Issue #768: arm a cancellable timer, cancel it, and
 /// then start a CLASSIC `ctx.timer` with the SAME id in one task. The classic
-/// timer must arm cleanly and fire — the same-batch `CancelTimer` must not leave
-/// the classic timer rescheduled to a deleted row (no hang), and the run must
-/// replay deterministically.
+/// timer must arm cleanly and fire. The same-batch `CancelTimer` must not leave
+/// it rescheduled to a deleted row (no hang). The run must replay
+/// deterministically.
 fn cancel_then_classic_timer_same_id_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -310,12 +309,12 @@ fn cancel_then_classic_timer_same_id_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 8, issue #768 — FIX A) Arm `idle` at 300s via a handle, then
+/// Issue #768: arm `idle` at 300s via a handle, then
 /// reset it to 600s through `ctx.reset_timer` (NOT the handle), and await the
-/// original handle. `await_fire()` must use the CURRENT armed duration (600) —
-/// read from the logical state map — for the live deadline AND the virtual
-/// clock, NOT the handle's stale cached 300. Before the fix the handle's cached
-/// 300 armed the live deadline / advanced the clock even though the recorded
+/// original handle. `await_fire()` must read the CURRENT armed duration (600)
+/// from the logical state map. It uses that for the live deadline AND the
+/// virtual clock, NOT the stale cached 300 of the handle. Before the fix, the
+/// cached 300 armed the live deadline and advanced the clock. The recorded
 /// `TimerStarted` was 600.
 fn reset_via_ctx_then_await_handle_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -704,9 +703,9 @@ async fn test_cancellable_timer_fires_when_not_cancelled() {
     );
 }
 
-/// (Codex P2 round 15, issue #768) Concurrent awaited cancellable timers fire in
-/// DEADLINE order (min `fires_at` first), matching production's min-deadline
-/// reschedule + deadline-ordered ingest — never in `join!` poll order.
+/// Issue #768: concurrent awaited cancellable timers fire in DEADLINE order
+/// (min `fires_at` first), never in `join!` poll order. That matches
+/// production's min-deadline reschedule + deadline-ordered ingest.
 #[tokio::test]
 async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
     let outcome = WorkflowTestEnv::new()
@@ -729,10 +728,10 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
          slow dur=10), never in join! poll order: {fired_order:?}"
     );
 
-    // Issue #768, Codex P2 round 16: the two timers are armed concurrently (one
-    // `await_fire` batch), so production starts both deadlines at the same instant
-    // and the workflow-observed elapsed after both fire is the MAX deadline (10s),
-    // NOT the sum (11s). The live `ctx.now()` read inside the workflow, and
+    // Issue #768: the two timers are armed concurrently (one `await_fire`
+    // batch), so production starts both deadlines at the same instant. The
+    // workflow-observed elapsed after both fire is the MAX deadline (10s), NOT
+    // the sum (11s). The live `ctx.now()` read inside the workflow, and
     // `final_now()`/`elapsed()` reconstructed from history, must all agree at 10.
     let result = outcome.result.as_ref().expect("run ok");
     assert_eq!(
@@ -755,12 +754,12 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
     );
 }
 
-/// FIX 1 (Codex P2 round 5, issue #768): a duplicate active `start_timer` with a
-/// DIFFERENT duration preserves the RECORDED duration. The handle carries 300
-/// (not the second call's 600), exactly one `TimerStarted(idle, 300)` is
-/// recorded, the timer fires at the 300s deadline (the virtual clock advances by
-/// 300, not 600 — asserted via the armed duration the handle used), and the run
-/// replays cleanly. Before the fix the handle carried 600.
+/// Issue #768: a duplicate active `start_timer` with a
+/// DIFFERENT duration preserves the RECORDED duration. The handle carries 300,
+/// not the 600 of the second call. History holds exactly one
+/// `TimerStarted(idle, 300)`. The timer fires at the 300s deadline, so the
+/// virtual clock advances by 300, not 600. The armed duration of the handle
+/// proves it. The run replays cleanly. Before the fix the handle carried 600.
 #[tokio::test]
 async fn test_duplicate_active_start_timer_preserves_recorded_duration() {
     let outcome = WorkflowTestEnv::new()
@@ -870,11 +869,11 @@ async fn test_reset_then_fire() {
     );
 }
 
-/// (Codex P2 round 8, issue #768 — FIX A) A reset performed through
-/// `ctx.reset_timer` (or another handle) must be honoured by a subsequent
-/// `await_fire()` on the ORIGINAL handle: the live deadline and the virtual
-/// clock must use the CURRENT armed duration (600) from the logical state map,
-/// not the awaiting handle's stale cached 300. Before the fix the clock
+/// Issue #768: a reset performed through `ctx.reset_timer` (or another handle)
+/// must be honoured by a subsequent `await_fire()` on the ORIGINAL handle. The
+/// live deadline and the virtual clock must use the CURRENT armed duration
+/// (600) from the logical state map. They must not use the awaiting handle's
+/// stale cached 300. Before the fix the clock
 /// advanced by 300 and disagreed with the recorded `TimerStarted(idle, 600)`.
 #[tokio::test]
 async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
@@ -901,7 +900,7 @@ async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
     );
 
     // The virtual clock (ctx.now()) advanced by the CURRENT armed 600, not the
-    // stale handle's 300. This is the FIX A behaviour.
+    // stale 300 of the handle.
     let v = outcome.result.as_ref().unwrap();
     let now = v["now"].as_i64().unwrap();
     assert_eq!(
@@ -932,7 +931,7 @@ async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
     );
 }
 
-/// (Codex P2 round 8, issue #768 — FIX B) The harness virtual clock
+/// Issue #768: the harness virtual clock
 /// (`final_now`/`elapsed`) must advance ONLY for timers that actually fired.
 /// A reset records `[TimerStarted(300), TimerCancelled, TimerStarted(300),
 /// TimerFired]`; only the second (fired) 300 counts — NOT the cancelled first
@@ -952,7 +951,7 @@ async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
     assert_eq!(outcome.final_now(), start + chrono::Duration::seconds(300));
 }
 
-/// (Codex P2 round 8, issue #768 — FIX B) A cancelled timer never fired, so the
+/// Issue #768: a cancelled timer never fired, so the
 /// harness virtual clock must not advance for its `TimerStarted` at all. Before
 /// the fix `final_now` counted the cancelled arm's 300.
 #[tokio::test]
@@ -971,10 +970,10 @@ async fn test_final_now_does_not_advance_for_a_cancelled_never_fired_timer() {
 
 #[tokio::test]
 async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
-    // Codex P2 (issue #768): arming a cancellable timer in the same cycle as an
-    // activity suspension must NOT interleave a TimerFired before the activity
-    // completes. The real worker records the arm and parks on the activity;
-    // firing the timer here would synthesise impossible history such as
+    // Issue #768: arming a cancellable timer in the same cycle as an activity
+    // suspension must NOT interleave a TimerFired before the activity
+    // completes. The real worker records the arm and parks on the activity.
+    // A fire here would synthesise impossible history such as
     // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("work", |_| Ok(json!("done")))
@@ -999,8 +998,7 @@ async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
          suspension (impossible history): {events:?}"
     );
 
-    // No TimerFired ever precedes ActivityCompleted — assert the exact ordering
-    // invariant Codex flagged.
+    // No TimerFired ever precedes ActivityCompleted.
     let ts = events
         .iter()
         .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
@@ -1021,11 +1019,11 @@ async fn test_armed_timer_does_not_fire_during_a_mixed_activity_suspension() {
 
 #[tokio::test]
 async fn start_timer_then_activity_then_await_fire_fires() {
-    // Codex P2 (issue #768): an armed timer whose `TimerStarted` was recorded in
-    // an EARLIER mixed (activity) suspension batch must still fire on a later
-    // bookkeeping-only `await_fire` cycle — production reschedules the existing
-    // durable row. Without the fix the harness returns a no-op for the re-arm and
-    // the run stalls ("suspended with no resolvable commands").
+    // Issue #768: an EARLIER mixed (activity) suspension batch records the
+    // `TimerStarted` of an armed timer. The timer must still fire on a later
+    // bookkeeping-only `await_fire` cycle. Production reschedules the existing
+    // durable row. Without the fix, the harness returns a no-op for the re-arm.
+    // The run then stalls ("suspended with no resolvable commands").
     let outcome = WorkflowTestEnv::new()
         .mock_activity("work", |_| Ok(json!("done")))
         .run(arm_timer_activity_then_await_fire_workflow, json!(null))
@@ -1038,7 +1036,6 @@ async fn start_timer_then_activity_then_await_fire_fires() {
     );
 
     let events = outcome.events();
-    // Exactly one arm, one fire, no cancel.
     assert_eq!(
         events
             .iter()
@@ -1091,8 +1088,8 @@ async fn start_timer_then_activity_then_await_fire_fires() {
 #[tokio::test]
 async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
     // Matrix #6 (issue #768): arm → activity → cancel → await must resolve
-    // Cancelled and never fire, even though the arm was recorded in an earlier
-    // mixed-suspension batch.
+    // Cancelled and never fire. This holds even though an earlier
+    // mixed-suspension batch recorded the arm.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("work", |_| Ok(json!("done")))
         .run(arm_timer_activity_cancel_then_await_workflow, json!(null))
@@ -1129,12 +1126,11 @@ async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
 
 #[tokio::test]
 async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
-    // FIX A primary flow (Codex P2 round 4, issue #768): arm → activity →
-    // reset → await. The armed timer must NOT fire while parked on the
-    // activity — under the round-4 model its durable row is inserted only at
-    // `await_fire`, so a `reset()` after the activity is never confronted with an
-    // already-fired timer (which would leave an unconsumed TimerFired → non-
-    // determinism), and the run replays deterministically to a final `Fired`.
+    // Issue #768: arm → activity → reset → await. The armed timer must NOT
+    // fire while parked on the activity. Its durable row is inserted only at
+    // `await_fire`. So a `reset()` after the activity never meets an
+    // already-fired timer, which would leave an unconsumed TimerFired →
+    // non-determinism. The run replays deterministically to a final `Fired`.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("work", |_| Ok(json!("done")))
         .run(arm_timer_activity_reset_then_await_workflow, json!(null))
@@ -1147,8 +1143,8 @@ async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
     );
 
     let events = outcome.events();
-    // No TimerFired may precede ActivityCompleted (the arm-during-activity window
-    // is exactly what round 4 makes non-fire-eligible).
+    // No TimerFired may precede ActivityCompleted. The durable row is inserted
+    // only at `await_fire`, so the arm-during-activity window is not fire-eligible.
     let ac = events
         .iter()
         .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
@@ -1188,10 +1184,10 @@ async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
 
 #[tokio::test]
 async fn cancel_then_classic_timer_same_id_arms_and_fires() {
-    // FIX B (Codex P2 round 4, issue #768): a same-task `start_timer("idle");
-    // cancel(); ctx.timer("idle", n)` must arm the CLASSIC timer cleanly and
-    // fire — the same-batch cancel must not leave the classic timer wedged (no
-    // hang), and the run must replay deterministically.
+    // Issue #768: a same-task `start_timer("idle"); cancel(); ctx.timer("idle", n)`
+    // must arm the CLASSIC timer cleanly and fire. The same-batch cancel must
+    // not leave the classic timer wedged (no hang). The run must replay
+    // deterministically.
     let outcome = WorkflowTestEnv::new()
         .run(cancel_then_classic_timer_same_id_workflow, json!(null))
         .await;
@@ -1228,11 +1224,11 @@ async fn cancel_then_classic_timer_same_id_arms_and_fires() {
 
 #[tokio::test]
 async fn cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer() {
-    // Issue #768, Codex P2 round 16 — Finding 2. A `cancel_timer("deadline")`
-    // targeting the classic timer's id must be a pure no-op: it must NOT record a
-    // `TimerCancelled` (whose worker-side `delete_pending_timer` would delete the
-    // classic timer's durable row), so the classic timer still fires — no hang —
-    // and the run replays deterministically.
+    // Issue #768: a `cancel_timer("deadline")` targeting the classic timer's id
+    // must be a pure no-op. It must NOT record a `TimerCancelled`, whose
+    // worker-side `delete_pending_timer` would delete the classic timer's
+    // durable row. So the classic timer still fires with no hang, and the run
+    // replays deterministically.
     let outcome = WorkflowTestEnv::new()
         .run(
             cancel_timer_does_not_kill_a_classic_timer_workflow,
@@ -1563,7 +1559,6 @@ async fn test_missing_stub_fails_loudly() {
         .run(one_activity_workflow, json!(null))
         .await;
 
-    // The workflow should fail because no mock is registered.
     assert!(
         outcome.result.is_err(),
         "missing stub must cause an error result, not a panic"
@@ -1606,8 +1601,8 @@ async fn test_current_details_set_overwrite_clear_leaves_no_event_footprint() {
     assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
 
     // set_current_details (initial set, overwrite, and a trailing empty-string
-    // clear) must leave zero footprint in harvest_events -- only the two
-    // activities' events are recorded, exactly as if the calls were never made.
+    // clear) must leave zero footprint in harvest_events. History holds only
+    // the events of the two activities, as if the calls never happened.
     let events = outcome.events();
     let scheduled = events
         .iter()
@@ -1830,9 +1825,9 @@ async fn test_mock_activity_retries_history_has_one_scheduled_event() {
 
 #[tokio::test]
 async fn test_mock_activity_retries_history_has_no_intermediate_failures() {
-    // Non-terminal retries do not produce ActivityFailed events in the real
-    // worker (requeue_for_retry is called instead), so the test harness must
-    // match: only the terminal outcome writes ActivityFailed.
+    // The real worker calls requeue_for_retry on a non-terminal retry and
+    // writes no ActivityFailed. The harness must match: only the terminal
+    // outcome writes ActivityFailed.
     let outcome = WorkflowTestEnv::new()
         .mock_activity_retries(
             "resilient_op",
@@ -1847,7 +1842,6 @@ async fn test_mock_activity_retries_history_has_no_intermediate_failures() {
 
     let events = outcome.events();
 
-    // No ActivityFailed at all — the sequence ends in ActivityCompleted.
     let failed_count = events
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
@@ -1857,13 +1851,11 @@ async fn test_mock_activity_retries_history_has_no_intermediate_failures() {
         "intermediate retries must not write ActivityFailed to history"
     );
 
-    // Terminal ActivityCompleted event is present.
     let completed = events
         .iter()
         .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
     assert!(completed, "expected a final ActivityCompleted event");
 
-    // Three ActivityStarted events (one per attempt) are present.
     let started_count = events
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
@@ -1890,10 +1882,10 @@ async fn test_mock_activity_retries_all_fail_terminal_failure_is_non_retryable()
         "exhausted retry sequence must fail"
     );
 
-    // Exactly one ActivityFailed event — the terminal failure — with
-    // non_retryable: false, matching production behaviour for plain
-    // Err(String) payloads (exhaustion is determined by the retry policy,
-    // not the non_retryable flag on the event).
+    // Exactly one ActivityFailed event, the terminal failure, with
+    // non_retryable: false. This matches production for plain Err(String)
+    // payloads. The retry policy decides exhaustion, not the non_retryable
+    // flag on the event.
     let terminal_failure_count = outcome
         .events()
         .iter()
@@ -2615,15 +2607,14 @@ async fn test_race_two_activities_discards_loser_and_replays_deterministically()
         outcome.events()
     );
     // WorkflowTestEnv resolves every mocked ScheduleActivity synchronously
-    // within the same iteration, so by the time the race is evaluated *both*
-    // branches already have a real terminal in history — there is nothing
-    // durably "open" left to cancel, and no synthetic "lost race" terminal is
-    // (or should be) recorded. Both activities' real completions are visible
-    // in history; only the non-winning one's value is discarded. The
-    // still-open-loser-gets-cancelled path (a genuinely durable resource) is
-    // covered by the `race_activity_replays_winner_and_records_marker_plus_cancel_losers`
+    // within the same iteration. When the race is evaluated, *both* branches
+    // already have a real terminal in history. Nothing durable stays "open"
+    // to cancel, so no synthetic "lost race" terminal is recorded. History
+    // shows both real completions; only the value of the loser is discarded.
+    // The cancel path for a still-open loser (a durable resource) is covered by
+    // the `race_activity_replays_winner_and_records_marker_plus_cancel_losers`
     // and `race_activity_winner_is_stable_across_randomized_completion_positions`
-    // unit tests in `context.rs`, which construct that history state directly.
+    // unit tests in `context.rs`. They construct that history state directly.
     assert!(
         !outcome
             .events()
@@ -2717,8 +2708,8 @@ async fn test_race_approval_or_timeout_timer_branch() {
 /// A 3-step pipeline over a worker session: open, run one member activity
 /// through it, then close. Deliberately registers **no** mock for the
 /// reserved `__harvest_session_acquire`/`__harvest_session_release`
-/// activities -- the harness must auto-resolve them so a session-using
-/// workflow needs no special test setup for the happy path.
+/// activities. The harness must auto-resolve them. So a session workflow
+/// needs no special test setup for the happy path.
 fn session_pipeline_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2863,9 +2854,9 @@ async fn a_completed_run_with_a_dropped_session_replays_strictly() {
 
 #[tokio::test]
 async fn test_worker_session_auto_resolved_host_is_stable_across_replay() {
-    // Run once to get recorded history, then replay it directly and confirm
-    // the *same* host worker id comes back both times (proving the harness's
-    // auto-resolution is deterministic, not re-randomized per call).
+    // Run once to record history, then replay it directly. The *same* host
+    // worker id must come back both times. That proves the harness
+    // auto-resolution is deterministic, not re-randomized per call.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("transcode_chunk", |_| Ok(json!("transcoded")))
         .run(session_pipeline_workflow, json!(null))
@@ -2875,9 +2866,9 @@ async fn test_worker_session_auto_resolved_host_is_stable_across_replay() {
     let report = outcome.replay_check(session_pipeline_workflow).await;
     assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
 
-    // Re-run against the exact same recorded history via a fresh env to
-    // confirm the acquire activity's *recorded* output (not a fresh
-    // auto-resolution) is what a real replay would use.
+    // Re-run the same recorded history in a fresh env. A real replay must use
+    // the *recorded* output of the acquire activity, not a fresh
+    // auto-resolution.
     let events = outcome.events().to_vec();
     let acquired_host = events.iter().find_map(|e| match e {
         WorkflowEvent::ActivityCompleted { output, .. } if output.as_str().is_some() => {
@@ -2927,9 +2918,9 @@ impl autumn_harvest::telemetry::MetricsRecorder for SagaLabelRecorder {
     }
 }
 
-/// Issue #801 post-review P3: `with_workflow_name`/`with_queue_name` thread
-/// real metric labels into the harness contexts, and the counter still fires
-/// exactly once across the multiple iterations the env drives.
+/// Issue #801: `with_workflow_name`/`with_queue_name` thread real metric
+/// labels into the harness contexts. The counter still fires exactly once
+/// across the iterations that the env drives.
 #[tokio::test]
 async fn test_env_threads_workflow_and_queue_labels_into_saga_metrics() {
     let recorder = std::sync::Arc::new(SagaLabelRecorder::default());
@@ -2950,13 +2941,13 @@ async fn test_env_threads_workflow_and_queue_labels_into_saga_metrics() {
     );
 }
 
-// ─────────────── Typed workflow failure (issue #767, Codex P2) ────────────────
+// ──────────────────── Typed workflow failure (issue #767) ─────────────────────
 
 /// A root workflow that fails with a typed `WorkflowFailure`. The macro encodes
-/// `Err(WorkflowFailure)` into the `harvest_workflow_failure_v1` envelope on the
-/// engine's `Result<Value, String>` boundary; this handler reproduces that
-/// encoding via `into_workflow_error_payload` so the harness sees exactly what
-/// the worker would.
+/// `Err(WorkflowFailure)` into the `harvest_workflow_failure_v1` envelope at
+/// the `Result<Value, String>` boundary of the engine. This handler reproduces
+/// that encoding via `into_workflow_error_payload`. So the harness sees
+/// exactly what the worker would.
 fn typed_failing_workflow<'a>(
     _ctx: &'a WorkflowContext,
     _input: Value,
@@ -3117,10 +3108,10 @@ fn single_wait_no_drain_workflow<'a>(
 
 #[tokio::test]
 async fn test_single_wait_with_extras_queued_returns_first_signal() {
-    // Regression guard for the `WaitForSignal` batch-promotion change: with
-    // multiple same-name signals queued, a workflow doing a single
-    // `wait_for_signal` (no drain) must still return the FIRST queued signal —
-    // promoting the extras into history must not corrupt the single-wait return.
+    // Regression guard for the `WaitForSignal` batch-promotion change. With
+    // several same-name signals queued, a single `wait_for_signal` (no drain)
+    // must still return the FIRST queued signal. Promoting the extras into
+    // history must not corrupt the single-wait return.
     let outcome = WorkflowTestEnv::new()
         .queue_signal("event", json!({"seq": 1}))
         .queue_signal("event", json!({"seq": 2}))
@@ -3134,12 +3125,12 @@ async fn test_single_wait_with_extras_queued_returns_first_signal() {
     );
 }
 
-/// Drain-first (issue #775, Codex P2): the workflow's FIRST action is a
+/// Drain-first (issue #775): the FIRST action of the workflow is a
 /// non-blocking `drain_signals_raw`, with NO prior blocking `wait_for_signal`.
 /// Production ingests pending signals at task-prep (before the handler runs), so
 /// a drain-first workflow must observe every pre-queued signal. Before the
-/// task-prep ingest fix — when the harness only promoted signals at a
-/// `WaitForSignal` wake — this returned an empty `collected`.
+/// task-prep ingest fix, the harness promoted signals only at a
+/// `WaitForSignal` wake. This then returned an empty `collected`.
 fn drain_first_no_wait_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3166,7 +3157,7 @@ async fn test_drain_first_no_prior_wait_returns_all_queued() {
     );
 }
 
-/// try_receive-first (issue #775, Codex P2): FIRST action is a non-blocking
+/// try_receive-first (issue #775): FIRST action is a non-blocking
 /// `try_receive_signal` with a signal pre-queued and NO prior blocking wait.
 fn try_receive_first_no_wait_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -3194,11 +3185,11 @@ async fn test_try_receive_first_no_prior_wait_returns_oldest() {
 
 // ── Deadline-aware continue-as-new replay_check (issue #772) ───────────────────
 
-/// A deadline-aware workflow: it consults `should_continue_as_new()` (which,
-/// when an `execution_timeout` is configured, records a `SideEffectRecorded{Now}`
-/// deadline probe under the reserved sentinel name — even when the deadline
-/// fraction is nowhere near reached, since the clock is read before the fraction
-/// is compared), then performs one durable step.
+/// A deadline-aware workflow: it consults `should_continue_as_new()`, then
+/// performs one durable step. With an `execution_timeout`, that call records a
+/// `SideEffectRecorded{Now}` deadline probe under the reserved sentinel name.
+/// It records the probe even far from the deadline fraction. The clock is
+/// read before the fraction is compared.
 fn deadline_aware_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3220,11 +3211,11 @@ fn deadline_aware_workflow<'a>(
     })
 }
 
-/// Issue #772 (review finding): `TestRunOutcome::replay_check` must carry the
+/// Issue #772: `TestRunOutcome::replay_check` must carry the
 /// `WorkflowTestEnv::with_execution_timeout` budget into the `WorkflowReplayer`
-/// it builds. Otherwise the deadline branch is disabled during the self-check,
-/// leaving the live run's recorded `SideEffectRecorded{Now}` deadline probe
-/// unconsumed — a FALSE non-determinism report for an otherwise valid
+/// it builds. Otherwise the self-check disables the deadline branch. The
+/// recorded `SideEffectRecorded{Now}` deadline probe of the live run then
+/// stays unconsumed. That is a FALSE non-determinism report for a valid
 /// deadline-aware history.
 #[tokio::test]
 async fn deadline_aware_run_replay_check_carries_execution_timeout() {
@@ -3284,14 +3275,14 @@ fn deadline_trip_workflow<'a>(
     })
 }
 
-/// Issue #772 (Codex P2): in a live `WorkflowTestEnv::with_execution_timeout`
-/// run, the deadline probe must read the context's ADVANCING virtual clock —
-/// not the host `Utc::now()` — so a workflow that consumes its deadline budget
-/// via durable timers actually trips the deadline continue-as-new branch under
-/// test. Before the fix the probe read `Utc::now()` (≈ `start_time`, ~zero
-/// elapsed), so almost none of the budget looked consumed and the branch never
-/// tripped in the harness — making the test-env timeout support unable to
-/// validate the long-lived low-event workflows the feature was added for.
+/// Issue #772: in a live `WorkflowTestEnv::with_execution_timeout` run, the
+/// deadline probe must read the ADVANCING virtual clock of the context, not
+/// the host `Utc::now()`. Then a workflow that spends its deadline budget on
+/// durable timers trips the deadline continue-as-new branch under test.
+/// Before the fix, the probe read `Utc::now()` (≈ `start_time`, ~zero
+/// elapsed). Almost none of the budget looked consumed, and the branch never
+/// tripped in the harness. So the test env could not validate the long-lived
+/// low-event workflows that the feature serves.
 #[tokio::test]
 async fn deadline_probe_reads_advancing_clock_and_trips_in_test_env() {
     let outcome = WorkflowTestEnv::new()
@@ -3319,10 +3310,10 @@ fn deadline_no_trip_workflow<'a>(
     })
 }
 
-/// Control (issue #772 Codex P2): a run that consumes only a small fraction of
-/// its deadline budget must NOT trip — proving the deadline branch reads the
-/// advancing clock rather than being unconditionally true. This case passes
-/// both before and after the fix, so it guards against an over-eager change.
+/// Control (issue #772): a run that consumes a small fraction of its deadline
+/// budget must NOT trip. That proves the deadline branch reads the advancing
+/// clock and is not always true. This case passes before and after the fix.
+/// It guards against an over-eager change.
 #[tokio::test]
 async fn deadline_probe_does_not_trip_below_fraction_in_test_env() {
     let outcome = WorkflowTestEnv::new()
@@ -3414,11 +3405,11 @@ async fn test_info_reports_no_parent_for_top_level_run() {
 }
 
 /// A workflow that records its `ctx.info()` run metadata (`workflow_type`,
-/// `workflow_id`, `parent`) into an **activity input** — the position that is a
-/// matched replay command, so a live-vs-replay mismatch on `ctx.info()` surfaces
-/// as an activity-input divergence. (Contrast `info_echo_workflow`, which only
-/// puts them in the terminal output, where the replayer never compares them —
-/// which is why the pre-fix hardcoded `"__test__"` snapshot name went unnoticed.)
+/// `workflow_id`, `parent`) into an **activity input**. Replay matches that
+/// command, so a live-vs-replay mismatch on `ctx.info()` surfaces as an
+/// activity-input divergence. (`info_echo_workflow` puts them only in the
+/// terminal output, which the replayer never compares. So the pre-fix
+/// hardcoded `"__test__"` snapshot name went unnoticed.)
 fn info_metadata_in_activity_input_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3441,12 +3432,12 @@ fn info_metadata_in_activity_input_workflow<'a>(
     })
 }
 
-/// Codex P2 (issue #698): a `WorkflowTestEnv` configured via `with_workflow_name`
+/// Issue #698: a `WorkflowTestEnv` configured via `with_workflow_name`
 /// / `with_workflow_id` / `with_parent_execution_id` that records `ctx.info()`
-/// metadata into an **activity input** must self-check clean. `replay_check` now
-/// threads the producing env's configured metadata into BOTH the replay snapshot
-/// and the handler-registration key — previously it hardcoded `"__test__"` /
-/// `None`, so the replay context reported `workflow_type == "__test__"` /
+/// metadata into an **activity input** must self-check clean. `replay_check`
+/// threads the configured metadata into BOTH the replay snapshot and the
+/// handler-registration key. It once hardcoded `"__test__"` / `None`. The
+/// replay context then reported `workflow_type == "__test__"` /
 /// `workflow_id == ""` and false-flagged non-determinism on a correct workflow.
 #[tokio::test]
 async fn test_configured_workflow_metadata_in_activity_input_replays_clean() {
@@ -3490,8 +3481,8 @@ async fn test_configured_workflow_metadata_in_activity_input_replays_clean() {
 
 /// Regression guard: a default `WorkflowTestEnv` (NO `with_workflow_name` /
 /// `with_workflow_id`) recording `ctx.info()` metadata into an activity input
-/// still self-checks clean — the default `""` metadata is used consistently on
-/// both the live and replay sides, so they match whatever the value.
+/// still self-checks clean. The live and replay sides both use the default
+/// `""` metadata, so they match whatever the value.
 #[tokio::test]
 async fn test_default_env_metadata_in_activity_input_replays_clean() {
     let outcome = WorkflowTestEnv::new()
@@ -3518,9 +3509,9 @@ async fn test_default_env_metadata_in_activity_input_replays_clean() {
 
 /// Records `ctx.queue_name()` into an activity input.
 ///
-/// `queue_name` is supplied by the live worker from the claimed task row (the
-/// test env supplies it via `span_meta`) and lives in no `WorkflowEvent` — the same
-/// family as `workflow_name` / `workflow_id` above.
+/// The live worker takes `queue_name` from the claimed task row. The test env
+/// supplies it via `span_meta`. It lives in no `WorkflowEvent`, like
+/// `workflow_name` and `workflow_id`.
 fn queue_name_in_activity_input_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3538,10 +3529,10 @@ fn queue_name_in_activity_input_workflow<'a>(
 /// Issue #798: a `WorkflowTestEnv` configured via `with_queue_name` that records
 /// `ctx.queue_name()` into an **activity input** must self-check clean.
 ///
-/// The live run receives the configured queue via `span_meta`, so without
-/// `replay_check` threading it onto the replay snapshot the self-check replays
-/// under `""`, the recorded activity input no longer matches, and the harness
-/// reports a FALSE non-determinism.
+/// The live run receives the configured queue via `span_meta`. Unless
+/// `replay_check` threads it onto the replay snapshot, the self-check replays
+/// under `""`. The recorded activity input then no longer matches, and the
+/// harness reports a FALSE non-determinism.
 #[tokio::test]
 async fn test_configured_queue_name_in_activity_input_replays_clean() {
     let outcome = WorkflowTestEnv::new()
@@ -3570,8 +3561,8 @@ async fn test_configured_queue_name_in_activity_input_replays_clean() {
 }
 
 /// Regression guard: a default `WorkflowTestEnv` (no `with_queue_name`) recording
-/// `ctx.queue_name()` still self-checks clean — the default `""` is used
-/// consistently on both the live and replay sides.
+/// `ctx.queue_name()` still self-checks clean. The live and replay sides both
+/// use the default `""`.
 #[tokio::test]
 async fn test_default_env_queue_name_in_activity_input_replays_clean() {
     let outcome = WorkflowTestEnv::new()
@@ -3714,11 +3705,11 @@ async fn test_await_external_workflow_replays_deterministically() {
     );
 }
 
-/// P2-a (issue #757 review): a non-`COMPLETED` terminal cause is programmatically
-/// branchable via `err.workflow_error_type()` — the reader stamps
-/// `error_type = Some(reason_code)` for `CANCELLED`/`TIMED_OUT`/`TERMINATED`. This runs
-/// the capturing workflow against a fixture that mirrors that reader output and
-/// asserts the coordinator can distinguish the three terminal causes without
+/// Issue #757: a non-`COMPLETED` terminal cause is programmatically
+/// branchable via `err.workflow_error_type()`. The reader stamps
+/// `error_type = Some(reason_code)` for `CANCELLED`/`TIMED_OUT`/`TERMINATED`.
+/// This runs the capturing workflow against a fixture that mirrors that reader
+/// output. The coordinator must tell the three terminal causes apart without
 /// string-matching the message.
 async fn assert_terminal_cause_is_branchable(reason_code: &str) {
     let target = ExecutionId::new();
@@ -3768,8 +3759,8 @@ async fn test_await_external_workflow_terminated_target_is_branchable() {
     assert_terminal_cause_is_branchable("target_terminated").await;
 }
 
-/// Awaits a target with the TYPED API and reports which `HarvestError` variant it
-/// surfaces, so a test can assert an undeserializable output yields
+/// Awaits a target with the TYPED API and reports the `HarvestError` variant it
+/// surfaces. A test can then assert that an undeserializable output yields
 /// `HarvestError::Serialization` (not a panic).
 fn await_typed_deser_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -3794,7 +3785,7 @@ fn await_typed_deser_workflow<'a>(
     })
 }
 
-/// P2-e (issue #757 review): the typed `await_external_workflow::<T>` returns
+/// Issue #757: the typed `await_external_workflow::<T>` returns
 /// `HarvestError::Serialization` (never panics) when the target's output does not
 /// deserialize into `T`.
 #[tokio::test]
@@ -3825,7 +3816,6 @@ fn mutex_acquire_release_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
-        // Trivial critical-section step.
         let out = json!({"held": true});
         guard.release();
         Ok(out)
@@ -3861,9 +3851,9 @@ fn mutex_self_deadlock_workflow<'a>(
     })
 }
 
-/// AC11 (issue #691): the harness auto-grants an uncontended mutex, the workflow
-/// runs its critical section, releases, and completes — with exactly one
-/// `MutexGranted` recorded and no `MutexReleased` event (release is event-less).
+/// AC11 (issue #691): the harness auto-grants an uncontended mutex. The
+/// workflow runs its critical section, releases, and completes. History holds
+/// exactly one `MutexGranted` and no `MutexReleased` (release is event-less).
 #[tokio::test]
 async fn test_mutex_acquire_then_release_completes() {
     let outcome = WorkflowTestEnv::new()
@@ -3886,8 +3876,8 @@ async fn test_mutex_acquire_then_release_completes() {
 }
 
 /// AC11 (issue #691): a mutex key marked contended via `with_mutex_contended`
-/// withholds the grant — the workflow parks (never completes) and no
-/// `MutexGranted` for that key is ever recorded.
+/// withholds the grant. The workflow parks and never completes. History never
+/// records a `MutexGranted` for that key.
 #[tokio::test]
 async fn test_mutex_contended_path_parks() {
     let outcome = WorkflowTestEnv::new()
@@ -3911,8 +3901,8 @@ async fn test_mutex_contended_path_parks() {
 }
 
 /// AC7 (issue #691): re-acquiring a key the workflow already holds returns
-/// `HarvestError::MutexSelfDeadlock` synchronously — the workflow observes the
-/// typed error and exactly one `MutexGranted` (the first acquire) is recorded.
+/// `HarvestError::MutexSelfDeadlock` synchronously. The workflow observes the
+/// typed error. History holds exactly one `MutexGranted`, from the first acquire.
 #[tokio::test]
 async fn test_mutex_self_deadlock_in_test_env() {
     let outcome = WorkflowTestEnv::new()
@@ -4013,10 +4003,10 @@ fn build_id_in_activity_input_workflow<'a>(
 /// `ctx.build_id()` into an **activity input** must self-check clean.
 ///
 /// This locks the live/replay *symmetry* invariant. The env threads the build id
-/// into the live run via `span_meta`; `replay_check` must thread the same value
-/// onto the replayer (it rides the replayer rather than the snapshot, because
-/// `HistorySnapshot` deliberately carries no build id). Wiring only the live half
-/// would reproduce exactly the `queue_name` bug this family already produced once.
+/// into the live run via `span_meta`. `replay_check` must thread the same value
+/// onto the replayer. It rides the replayer, not the snapshot, because
+/// `HistorySnapshot` deliberately carries no build id. Wiring only the live half
+/// would repeat the `queue_name` bug of this family.
 #[tokio::test]
 async fn test_configured_build_id_in_activity_input_replays_clean() {
     let outcome = WorkflowTestEnv::new()
@@ -4045,8 +4035,8 @@ async fn test_configured_build_id_in_activity_input_replays_clean() {
 }
 
 /// Regression guard: a default `WorkflowTestEnv` (no `with_build_id`) recording
-/// `ctx.build_id()` still self-checks clean — `None` is used consistently on both
-/// the live and replay sides, so the default path is unchanged.
+/// `ctx.build_id()` still self-checks clean. The live and replay sides both use
+/// `None`, so the default path is unchanged.
 #[tokio::test]
 async fn test_default_env_build_id_in_activity_input_replays_clean() {
     let outcome = WorkflowTestEnv::new()
@@ -4119,14 +4109,14 @@ async fn test_business_day_timer_fires_without_real_sleeping() {
     );
 }
 
-/// `replay_check` forwards the env's shared state (so this is a *round-trip*
-/// check, not a freeze proof), and separately: replaying the harness-produced
-/// history under a **hostile** calendar that excludes the frozen deadline's own
-/// date still yields the identical deadline.
+/// `replay_check` forwards the shared state of the env, so it is a
+/// *round-trip* check, not a freeze proof. Separately, a replay of the
+/// harness history under a **hostile** calendar still yields the identical
+/// deadline. That calendar excludes the date of the frozen deadline.
 ///
-/// The hostile-calendar half is the falsifiable one — if the deadline were
-/// recomputed on replay instead of read back from the frozen record, the
-/// excluded Monday would push it to Tuesday and the assertion fails.
+/// The hostile-calendar half is the falsifiable one. Suppose replay recomputed
+/// the deadline instead of reading the frozen record. The excluded Monday
+/// would then push it to Tuesday, and the assertion would fail.
 #[tokio::test]
 async fn test_business_day_run_replays_frozen_under_a_hostile_calendar() {
     let outcome = WorkflowTestEnv::new()

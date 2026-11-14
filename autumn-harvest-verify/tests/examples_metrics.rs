@@ -2,20 +2,20 @@
 //! example of `autumn-harvest`, with the checked-in allowlist applied.
 //!
 //! The corpus proves detection; this proves the other half of the success
-//! metric — that the tool is quiet enough to leave switched on. It asserts
-//! `(found + allowed) / analyzed <= 10 %`: a workflow that needs an allowlist
-//! entry counts *against* the budget exactly as a finding does, so the hatch
+//! metric: the tool is quiet enough to leave switched on. It asserts
+//! `(found + allowed) / analyzed <= 10 %`. A workflow that needs an allowlist
+//! entry counts *against* the budget exactly as a finding does. So the hatch
 //! cannot be used to buy the number down.
 //!
 //! `unknown` is free by design. An honest boundary is the tool saying what it
-//! did not see; it costs a reader nothing but a look, whereas a false
+//! did not see. It costs a reader nothing but a look. A false
 //! `nondeterminism-found` costs them the habit of believing the tool at all.
 //!
 //! Env-gated on `HARVEST_VERIFY_EXAMPLES=1` because it builds the examples with
 //! `--emit=mir` into its own target directory, which is minutes on a cold cache.
-//! The gate is an env var rather than `#[ignore]` so that CI runs it as part of
-//! the ordinary suite, and the skip path prints a **loud** line: a metric that
-//! quietly reports success when it measured nothing is worse than no metric.
+//! The gate is an env var rather than `#[ignore]`, so CI runs it as part of the
+//! ordinary suite. The skip path prints a **loud** line. A metric that quietly
+//! reports success when it measured nothing is worse than no metric.
 //! `tests/ci_wiring.rs` asserts that the CI step which sets the variable still
 //! exists, so the measurement cannot lapse unnoticed either.
 
@@ -45,8 +45,8 @@ fn run() -> Report {
         no_default_features: true,
         features: vec!["testing".to_string()],
         // Its own emit directory. `corpus.rs` drives cargo over the same
-        // workspace with a different feature set; sharing one directory makes
-        // each test binary invalidate the other's units for no benefit.
+        // workspace with a different feature set. A shared directory makes each
+        // test binary invalidate the other's units for no benefit.
         target_dir: Some(root.join("target/harvest-verify/examples")),
         ..BuildRequest::default()
     };

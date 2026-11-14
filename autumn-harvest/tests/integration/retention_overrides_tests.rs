@@ -16,7 +16,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded, each test scrubs the executions table
-//! first); otherwise a fresh testcontainers Postgres is booted with the full
+//! first). Otherwise a fresh testcontainers Postgres boots with the full
 //! migration bundle (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
@@ -199,16 +199,16 @@ fn history_only(max_age: Option<Duration>) -> RetentionConfig {
     }
 }
 
-// AC3 + AC4 + AC8: a longer override survives the global age; a shorter
-// override is deleted at its own earlier age; the metric labels the deleted
+// AC3 + AC4 + AC8: a longer override survives the global age. A shorter
+// override is deleted at its own earlier age. The metric labels the deleted
 // type.
 //
-// The distinguishing AC4 case (a shorter override deleting a row that the
-// global would have KEPT) is exercised by the `short_wf`/`control_wf` rows
-// completed ~2 HOURS ago: 2h > the 1-hour override but < the 1-day global.
-// This makes the test falsifiable against a `max(override, global)` mutation
-// of `effective_max_age` — under that mutation `short_wf@2h` would resolve to
-// the 1-day global and survive, so the survivor assertion would fail.
+// The distinguishing AC4 case is a shorter override that deletes a row the
+// global would have KEPT. The `short_wf`/`control_wf` rows completed ~2 HOURS
+// ago cover it: 2h > the 1-hour override but < the 1-day global.
+// This catches a `max(override, global)` mutation of `effective_max_age`.
+// Under that mutation `short_wf@2h` resolves to the 1-day global and survives,
+// so the survivor assertion fails.
 // Comfortable 2h-vs-1h/1day margins avoid `Utc::now()` boundary flakiness.
 #[tokio::test]
 async fn override_longer_survives_shorter_deleted() {
@@ -225,8 +225,8 @@ async fn override_longer_survives_shorter_deleted() {
     // "short_wf": override 1 hour (shorter than the 1-day global). Both the
     // 2-days-ago and the 2-hours-ago rows exceed the 1h override -> deleted.
     insert_completed(&mut conn, "short_wf", "s1", two_days_ago).await;
-    // AC4 crux: 2h exceeds the 1h override but is well under the 1-day global,
-    // so this row is deleted ONLY because the shorter override fires early.
+    // AC4 crux: 2h exceeds the 1h override but is under the 1-day global.
+    // This row is deleted ONLY because the shorter override fires early.
     insert_completed(&mut conn, "short_wf", "s2", two_hours_ago).await;
     // "default_wf": no override, uses the 1-day global -> deleted (2d > 1d).
     insert_completed(&mut conn, "default_wf", "d1", two_days_ago).await;
@@ -379,32 +379,31 @@ async fn overrides_only_never_deletes_types_without_override() {
     );
     assert_eq!(result.deleted_count, 1);
     assert_eq!(metrics.deleted(), vec![("purge_me".to_string(), 1)]);
-    // Scalability optimization (issue #737): in overrides-only mode the SQL
-    // pre-filter is bounded to the overridden type(s), so the never-delete
-    // "keep_forever" row is never even SELECTed as a candidate. Only "purge_me"
-    // is scanned. Before the `workflow_name = ANY(...)` filter, candidate_count
-    // would be 2 (both rows loaded, one skipped).
+    // Issue #737: in overrides-only mode the SQL pre-filter is bounded to the
+    // overridden type(s). The never-delete "keep_forever" row is never SELECTed
+    // as a candidate. Only "purge_me" is scanned. Before the
+    // `workflow_name = ANY(...)` filter, candidate_count was 2 (one skipped).
     assert_eq!(
         result.candidate_count, 1,
         "overrides-only pre-filter must not scan never-delete types"
     );
 }
 
-// Mixed-policy fairness (issue #737, PR #990 review): a global default plus a
-// LONGER per-workflow override — the canonical compliance config (short default,
-// long financial-record retention). The long-retained type's rows are OLDER
-// (smaller `completed_at`), so under the old single-loose-cutoff SELECT
-// (`ORDER BY completed_at ASC`) they were returned FIRST, claimed into the
-// batch, and skipped as not-yet-eligible — consuming the batch budget and
-// starving/delaying deletion of newer already-expired rows of the shorter
-// policy. The fix pushes each row's exact per-type cutoff into the predicate, so
-// only genuinely-eligible rows are ever selected.
+// Mixed-policy fairness (issue #737, PR #990): a global default plus a
+// LONGER per-workflow override. This is the canonical compliance config (short
+// default, long financial-record retention).
+// The long-retained type's rows are OLDER (smaller `completed_at`). The old
+// single-loose-cutoff SELECT (`ORDER BY completed_at ASC`) returned them FIRST.
+// It claimed them into the batch and skipped them as not-yet-eligible.
+// That consumed the batch budget and starved newer expired rows of the shorter
+// policy. The fix pushes each row's exact per-type cutoff into the predicate.
+// So only genuinely-eligible rows are selected.
 //
-// Falsifiable against the old behavior: with `batch_size = 2` and a 3-row
-// not-yet-eligible `archive_wf` backlog that is OLDER than the one eligible
-// `global_wf` row, the old code would load 2 archive_wf rows (oldest first),
-// skip both, exhaust `remaining`, and never reach `global_wf` — deleting nothing
-// and reporting `candidate_count = 2`. The fix selects only the eligible row.
+// Falsifiable: take `batch_size = 2` and a 3-row not-yet-eligible `archive_wf`
+// backlog OLDER than the one eligible `global_wf` row. The old code loads 2
+// archive_wf rows (oldest first), skips both, and exhausts `remaining`.
+// It never reaches `global_wf`, deletes nothing and reports
+// `candidate_count = 2`. The fix selects only the eligible row.
 #[tokio::test]
 async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
     let (url, _container) = setup_db().await;
@@ -489,14 +488,13 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
     assert_eq!(metrics.deleted(), vec![("global_wf".to_string(), 1)]);
 }
 
-// Issue #772 (Codex Finding A): the retention archive writes the LAST cold-storage
-// copy before an execution row is permanently deleted. A completed / continued
-// run can carry a recorded `SideEffectRecorded{Now}` deadline probe (issue #772)
-// before its next command or terminal event, so the archived
-// `HistoryExportDocument` MUST carry `execution_timeout`/`deadline_at` — replaying
-// the archive later with no deadline would leave that probe unconsumed and
-// false-report non-determinism, and after deletion there is no row left from
-// which an operator could recover the missing values.
+// Issue #772: the retention archive writes the LAST cold-storage copy before
+// an execution row is permanently deleted. A completed / continued run can
+// carry a recorded `SideEffectRecorded{Now}` deadline probe before its next
+// command or terminal event. So the archived `HistoryExportDocument` MUST carry
+// `execution_timeout`/`deadline_at`. A replay with no deadline leaves that probe
+// unconsumed and false-reports non-determinism. After deletion, no row is left
+// from which an operator could recover the missing values.
 //
 // Falsifiable: before the fix the retention `HistoryExportRequest` hardcoded
 // `execution_timeout: None, deadline_at: None`, so the captured archive doc's
@@ -576,14 +574,14 @@ async fn retention_archive_carries_deadline_metadata() {
     );
 }
 
-// Issue #698 (Codex P2): the pre-deletion archive — the last surviving copy of
-// a workflow's history — must carry the spawning `parent_execution_id`, sourced
-// from the row's `parent_id` column (present in no `WorkflowEvent`), so a
-// parent-aware child archived to cold storage replays cleanly instead of
-// false-reporting non-determinism on `ctx.info().parent_execution_id`.
+// Issue #698: the pre-deletion archive is the last surviving copy of a
+// workflow's history. It must carry the spawning `parent_execution_id`, sourced
+// from the row's `parent_id` column (present in no `WorkflowEvent`). Then a
+// parent-aware child archived to cold storage replays cleanly. It does not
+// false-report non-determinism on `ctx.info().parent_execution_id`.
 //
 // Falsifiable: before the fix the retention `HistoryExportRequest` had no
-// parent field, so the archived document deserialised parent = None even though
+// parent field. So the archived document deserialised parent = None, though
 // the deleted row carried it.
 #[tokio::test]
 async fn retention_archive_carries_parent_execution_id() {
@@ -594,10 +592,9 @@ async fn retention_archive_carries_parent_execution_id() {
 
     let two_days_ago = Utc::now() - chrono::Duration::days(2);
     // A phantom spawning parent (no FK on `parent_id`, so no parent row is
-    // needed). Using a phantom parent keeps the child the SOLE retention
-    // candidate, so the deleted-parent orphan-nulling path never touches its
-    // `parent_id` and the test isolates the candidate.parent_id ->
-    // doc.parent_execution_id thread.
+    // needed). The child is then the SOLE retention candidate. The
+    // deleted-parent orphan-nulling path never touches its `parent_id`, so the
+    // test isolates the candidate.parent_id -> doc.parent_execution_id thread.
     let parent = ExecutionId::new();
 
     // A completed CHILD row whose `parent_id` points at the phantom parent.
@@ -660,9 +657,8 @@ async fn retention_archive_carries_parent_execution_id() {
     );
 }
 
-/// Capturing archiver — records the `HistoryExportDocument` handed to the
-/// retention janitor so a test can assert what the last cold-storage copy
-/// carried (issue #772 Finding A).
+/// Archiver that records each `HistoryExportDocument` the retention janitor
+/// hands it. A test asserts what the last cold-storage copy carried (#772).
 #[derive(Default)]
 struct CapturingArchiver {
     docs: Mutex<Vec<HistoryExportDocument>>,

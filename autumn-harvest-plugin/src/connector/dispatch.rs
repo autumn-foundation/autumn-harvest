@@ -1,18 +1,17 @@
 //! Dispatch a mapped broker message into harvest (issue #944).
 //!
 //! Like the inbound webhook receiver (issue #344), the connector delegates to
-//! the plugin's own `start_workflow` / `signal_with_start_workflow` handlers
-//! rather than reaching for the `execution.rs` primitives directly. That is
-//! what buys the whole admission stack for free: published-schema validation
-//! (#373/#610), the admission gate (#618), shard placement (#697), start
-//! throttle (#607), debounce (#499), batch (#518), start idempotency (#808),
-//! and the audit row.
+//! the plugin's `start_workflow` / `signal_with_start_workflow` handlers. It
+//! does not call the `execution.rs` primitives directly. So it gets the whole
+//! admission stack: published-schema validation (#373/#610), the admission
+//! gate (#618), shard placement (#697), and start throttle (#607). It also
+//! gets debounce (#499), batch (#518), start idempotency (#808) and the audit
+//! row.
 //!
-//! The cost of that choice — inherited verbatim from the webhook receiver — is
-//! coupling to the delegate's *HTTP response shape*, so status classification
-//! is defensive: a `202` deferred admission is a success, an ordinary `4xx` is
-//! a deterministic refusal, and only genuinely unexpected statuses become
-//! transient errors.
+//! The cost, shared with the webhook receiver, is coupling to the delegate's
+//! *HTTP response shape*. So status classification is defensive. A `202`
+//! deferred admission is a success, and an ordinary `4xx` is a deterministic
+//! refusal. Only unexpected statuses become transient errors.
 
 use autumn_harvest::WorkflowId;
 use autumn_web::reexports::axum;
@@ -30,9 +29,10 @@ pub struct DispatchRequest<'a> {
     pub queue: Option<&'static str>,
     pub idempotency_key: &'a str,
     pub idempotency_mode: IdempotencyMode,
-    /// Rendered broker coordinates (`orders:3:91`), recorded as the start's
-    /// provenance ref (issue #740) so an operator can trace an execution back
-    /// to the exact message that produced it.
+    /// Rendered broker coordinates (`orders:3:91`).
+    ///
+    /// They are the start's provenance ref (issue #740), so an operator can
+    /// trace an execution back to the message that produced it.
     pub coordinates: &'a str,
 }
 
@@ -160,7 +160,6 @@ async fn sqlite_dispatch(
     }
 }
 
-/// Classify the delegate's HTTP response into a [`DispatchOutcome`].
 async fn classify_response(
     response: axum::response::Response,
     workflow_id: String,
@@ -184,12 +183,11 @@ async fn classify_response(
     if status.is_client_error() {
         let detail = truncate(&String::from_utf8_lossy(&body), 1000);
         // Most 4xx from the start/signal-with-start routes ARE deterministic
-        // refusals of this exact message (schema validation, a
-        // mutually-exclusive option) — retrying cannot help, so they poison.
-        // But a handful are transient *engine* states wearing a 4xx, and
-        // quarantining a perfectly good message because harvest happened to be
-        // booting or an operator happened to be pausing a run would be a real
-        // data-loss-shaped bug. Those are retried instead.
+        // refusals of this message (schema validation, a mutually-exclusive
+        // option). A retry cannot help, so they poison. A few are transient
+        // *engine* states with a 4xx status, e.g. a boot or an operator pause.
+        // Quarantining a good message for those is a data-loss-shaped bug, so
+        // they are retried.
         if is_transient_client_error(status.as_u16(), &detail) {
             return DispatchOutcome::Transient(format!("{}: {detail}", status.as_u16()));
         }
@@ -262,16 +260,16 @@ fn classify_success(status: u16, ids: &DispatchIds, workflow_id: String) -> Disp
 /// perfectly good message would be a data-loss-shaped bug:
 ///
 /// * **`400` "harvest runtime is not started"** — the boot window. Every route
-///   fails closed with this until `on_startup` installs the runtime; a message
-///   consumed in that window is fine and will dispatch on the next pass.
+///   fails closed with this until `on_startup` installs the runtime. A message
+///   consumed in that window is fine and dispatches on the next pass.
 /// * **`409` `WorkflowPaused`** — an operator paused the target run (issue
 ///   #383). Resuming it makes the exact same message succeed.
 /// * **`503`** is not a client error at all, so it already falls through to the
 ///   generic transient arm below.
 ///
-/// A `409 AlreadyExists` is deliberately **not** here: it is classified
-/// upstream as an idempotent replay (the run this message wanted already
-/// exists), which is a success, not a retry.
+/// A `409 AlreadyExists` is deliberately **not** here. Upstream classifies it
+/// as an idempotent replay: the run this message wanted already exists. That
+/// is a success, not a retry.
 fn is_transient_client_error(status: u16, detail: &str) -> bool {
     match status {
         400 => detail.contains("harvest runtime is not started"),

@@ -1,13 +1,12 @@
 //! Decision-cycle persistence atomicity at the integration level (AC6).
 //!
-//! The transactional guarantee itself (event append + queue/timer row insert
-//! commit together or roll back together) is proven directly by the inline unit
-//! tests in `src/runtime.rs` and `src/worker.rs`, and the whole *class* of persist
-//! sites is pinned by the reopen-consistency sweep in
-//! `tests/reopen_consistency.rs`. This test asserts the observable consequence
-//! end-to-end: after a real run every `ActivityScheduled` event has a matching
-//! task row (the both-or-neither invariant that the atomic dispatch pair
-//! guarantees can never diverge).
+//! The inline unit tests in `src/runtime.rs` and `src/worker.rs` prove the
+//! transactional guarantee: the event append and the queue/timer row insert commit
+//! or roll back together. The reopen-consistency sweep in
+//! `tests/reopen_consistency.rs` pins the whole *class* of persist sites. This test
+//! asserts the observable consequence end-to-end. After a real run, every
+//! `ActivityScheduled` event has a matching task row. The atomic dispatch pair
+//! keeps that both-or-neither invariant.
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};

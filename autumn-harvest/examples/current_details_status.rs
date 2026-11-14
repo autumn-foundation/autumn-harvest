@@ -6,9 +6,9 @@
 //! `GET /workflows/{id}` reports `RUNNING`. `/stack` reports what event the
 //! run is blocked on. Neither answers the question that actually shortens an
 //! incident: *what is this run trying to do right now, in plain English?*
-//! Reconstructing that today means spelunking `/history/export`, or the
-//! workflow author registering a `#[query]` handler the operator has to know
-//! the name of and call by hand.
+//! Today that means spelunking `/history/export`. Or the workflow author
+//! registers a `#[query]` handler, and the operator must know its name and
+//! call it by hand.
 //!
 //! ## The solution: `ctx.set_current_details(...)`
 //!
@@ -53,7 +53,7 @@
 //! - A static, immutable run summary set once at start time (fast-follow).
 //! - A dedicated query handler or SSE push for the field (SSE already covers
 //!   live updates via #324; this is a pull field on describe).
-//! - Indexing/filtering executions *by* `current_details` (that's the
+//! - Indexing/filtering executions *by* `current_details` (that is the
 //!   search-attributes surface, #506/#159).
 //!
 //! Run with:
@@ -152,10 +152,10 @@ fn main() {
     );
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must
-// keep building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for external consumers only with the
+// `testing` feature.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;

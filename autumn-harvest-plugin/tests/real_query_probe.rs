@@ -13,14 +13,12 @@
 //! that `cargo xtask perf history-bloat` builds.
 //!
 //! **Runs `VACUUM ANALYZE` on both touched tables before measuring.** This
-//! is load-bearing, not decorative: an un-matched Postgres visibility-map
-//! state between a "before" and "after" comparison run against the same
-//! physical data can change each side's `Heap Fetches` count by enough to
-//! reverse the apparent direction of the result, even though
-//! `pg_stat_statements.total_buffers` is itself a deterministic,
-//! caching-order-invariant count of buffer accesses (see the doc section
-//! above for the full story -- this was caught and fixed during this PR's
-//! review, not a hypothetical).
+//! is load-bearing. A "before" and an "after" run on the same data can see
+//! different Postgres visibility-map states. That can change each side's
+//! `Heap Fetches` count enough to reverse the apparent result. It happens even
+//! though `pg_stat_statements.total_buffers` is a deterministic count of
+//! buffer accesses. The doc section above tells the full story; PR #1173 hit
+//! this in practice.
 //!
 //! Run it manually against a persistent, pre-seeded fixture database. Seed
 //! that database with the SQL that `cargo xtask perf history-bloat` uses.
@@ -105,10 +103,9 @@ async fn probe_real_endpoint_query_cost() {
         .execute(&mut conn)
         .await
         .ok();
-    // Match Postgres visibility-map state before measuring -- see the module
-    // doc comment. Without this, a "before" and "after" run against the same
-    // physical data can differ purely by how much time autovacuum has had to
-    // run since the last state change, independent of which query form ran.
+    // Match Postgres visibility-map state before measuring (see the module
+    // doc). Otherwise a "before" and "after" run on the same data can differ
+    // only by how long autovacuum has had to run, whatever query form ran.
     diesel::sql_query("VACUUM ANALYZE harvest_workflow_executions")
         .execute(&mut conn)
         .await

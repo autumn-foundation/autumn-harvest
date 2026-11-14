@@ -759,7 +759,6 @@ struct Parts<'a> {
     delegations: Option<u32>,
 }
 
-/// Run the draws of the strategy of `parts`.
 async fn run_strategy(
     ctx: &WorkflowContext,
     judge: Judge<'_>,
@@ -1673,7 +1672,6 @@ fn no_key() -> String {
     "the answer has no key, so the draw casts no vote".to_owned()
 }
 
-/// The votes of the draws in `scored`.
 fn tally_of(scored: &[Scored]) -> Tally {
     let mut tally = Tally::new();
     for one in scored {

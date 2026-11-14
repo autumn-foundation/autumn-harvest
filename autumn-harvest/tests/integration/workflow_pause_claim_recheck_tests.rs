@@ -1,5 +1,4 @@
 #![cfg(feature = "db")]
-// Test-code style lints (consistent with the other integration test files).
 #![allow(
     clippy::doc_markdown,
     clippy::cast_possible_wrap,
@@ -41,8 +40,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-// ── DB setup ──────────────────────────────────────────────────────────────────
-
 async fn connect(url: &str) -> AsyncPgConnection {
     <AsyncPgConnection as diesel_async::AsyncConnection>::establish(url)
         .await
@@ -68,8 +65,6 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
         .expect("migrations");
     (url, Some(container))
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn unique_queue(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
@@ -165,8 +160,6 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
         started_at: row.started_at,
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// A claim that beat the pause must be released once a fresh statement sees
 /// the pause. Its `attempt` must be restored: no retry budget is consumed.

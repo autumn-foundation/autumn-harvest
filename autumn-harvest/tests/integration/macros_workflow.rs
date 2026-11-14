@@ -158,9 +158,9 @@ fn workflow_concurrency_macro_parses_cancel_running() {
 
 #[test]
 fn workflow_concurrency_macro_parses_explicit_defer() {
-    // Spelling `on_conflict = "defer"` explicitly must resolve to exactly the
-    // same policy as omitting it — the attribute is additive, never a mode
-    // switch that changes the other fields' meaning.
+    // An explicit `on_conflict = "defer"` must resolve to the same policy as
+    // omitting it. The attribute is additive. It never changes the meaning of
+    // the other fields.
     let info = __autumn_workflow_info_explicit_defer_workflow();
     let policy = info
         .concurrency
@@ -343,13 +343,13 @@ fn workflow_custom_enum_failure_stays_untyped() {
 
 // ── Issue #802 — opt-in declared activity/child dependencies ─────────────────
 //
-// The declaration is recorded verbatim as registration metadata; it is the
-// *preflight* check (`check_catalog_consistency`) that resolves each name
-// against the registry. The macro deliberately does NOT resolve the listed
-// identifiers to their companion `_info()` symbols: a bare ident in an
-// attribute is never name-resolved by the compiler, so a typo stays a
-// preflight failure (the exact failure mode AC2 specifies) rather than
-// becoming a compile error, and the author needs no extra `use` in scope.
+// The declaration is recorded verbatim as registration metadata. The
+// *preflight* check (`check_catalog_consistency`) resolves each name against
+// the registry. The macro deliberately does NOT resolve the listed
+// identifiers to their `_info()` symbols. The compiler never resolves a bare
+// ident in an attribute. So a typo stays a preflight failure, the failure
+// mode AC2 specifies, and not a compile error. The author needs no extra
+// `use`.
 
 #[activity]
 #[allow(clippy::unused_async)]
@@ -373,8 +373,8 @@ async fn onboarding_declared(_ctx: &WorkflowContext, _input: String) -> Result<(
 }
 
 // Every path qualifier form must parse. `crate` / `self` / `super` are
-// KEYWORDS, not `Ident`s, so a peek-based guard would reject them before
-// `syn::Path` ever saw the token — each is covered here deliberately.
+// KEYWORDS, not `Ident`s. A peek-based guard would reject them before
+// `syn::Path` saw the token, so each one is covered here.
 #[workflow(activities = [
     crate::billing::charge_card,
     self::sibling_activity,
@@ -412,11 +412,11 @@ fn workflow_declared_dependencies_attribute_parses(/* issue #802 AC1 */) {
 
 #[test]
 fn workflow_declared_dependencies_accept_paths_and_string_literals() {
-    // A path records its LAST segment (the registered name is always the fn
-    // ident — neither macro has a `name = "..."` rename attribute), and a
-    // string literal is accepted verbatim so a raw-dispatched name
+    // A path records its LAST segment. The registered name is always the fn
+    // ident, because neither macro has a `name = "..."` rename attribute.
+    // A string literal is accepted verbatim. So a raw-dispatched name
     // (`ctx.execute_activity_raw("raw_dispatched_name", ..)`) can be declared
-    // even though it is not an identifier in scope.
+    // although it is not an identifier in scope.
     let info = __autumn_workflow_info_path_and_literal_declared();
     assert_eq!(
         info.declared_activities,

@@ -1,10 +1,10 @@
 //! Guards that keep the cross-region DR documentation honest (issue #954).
 //!
 //! No DB, no feature gate. Each assertion below pins a claim that is either
-//! **load-bearing for an operator following the runbook under pressure** or
-//! **dangerous to quietly lose in a later editing pass**. The two we care most
-//! about are the honest limits: fencing does not stop a live, partitioned old
-//! primary, and a promoted *logical* standby needs its sequences advanced.
+//! **load-bearing for an operator under pressure** or **dangerous to lose in
+//! a later edit**. The two most important are the honest limits. Fencing does
+//! not stop a live, partitioned old primary. A promoted *logical* standby
+//! needs its sequences advanced.
 //! Both are the kind of caveat that reads like a nit in review and costs a
 //! forked history in an incident.
 
@@ -81,9 +81,9 @@ fn the_topology_doc_states_the_no_new_event_variant_invariant() {
 /// The most important paragraph in the whole feature.
 ///
 /// A reader who takes "fencing prevents split-brain" unqualified will skip the
-/// step that actually isolates the old primary, and a partitioned old region
-/// will keep writing to its own database while believing it cannot. The doc
-/// must say so *and* must say the isolation step is mandatory.
+/// step that isolates the old primary. A partitioned old region then keeps
+/// writing to its own database while it believes it cannot. The doc must say
+/// so *and* must say the isolation step is mandatory.
 #[test]
 fn the_topology_doc_refuses_to_oversell_the_fence() {
     let doc = topology();
@@ -107,10 +107,10 @@ fn the_topology_doc_refuses_to_oversell_the_fence() {
 
 /// Logical replication does not replicate sequence values.
 ///
-/// Discovered by the drill, not by reading: `harvest_events.id` is a
-/// `BIGSERIAL`, so a promoted logical standby holds every replicated row while
-/// its sequence still sits where it started, and the new primary's first append
-/// dies on a duplicate key. Both docs must carry the step.
+/// The drill found this, not a reading. `harvest_events.id` is a `BIGSERIAL`.
+/// A promoted logical standby holds every replicated row, but its sequence
+/// still sits where it started. The new primary's first append then dies on a
+/// duplicate key. Both docs must carry the step.
 #[test]
 fn both_docs_carry_the_sequence_advance_step_for_logical_standbys() {
     for (name, doc) in [("topology", topology()), ("runbook", runbook())] {
@@ -129,9 +129,9 @@ fn both_docs_carry_the_sequence_advance_step_for_logical_standbys() {
 
 /// Fence → promote → verify → start workers, in that order.
 ///
-/// Starting workers before verification is how a bad restore becomes a
-/// corrupted live region; verifying before fencing is how the old region gets
-/// to keep writing during the verification window. The order is the procedure.
+/// Workers started before verification turn a bad restore into a corrupted
+/// live region. Verification before fencing lets the old region keep writing
+/// during the verification window. The order is the procedure.
 #[test]
 fn the_runbook_orders_fence_before_promote_before_verify_before_workers() {
     let rb = runbook().to_lowercase();
@@ -161,9 +161,9 @@ fn the_runbook_orders_fence_before_promote_before_verify_before_workers() {
 /// fence-then-promote order works only for a **logical** standby (an ordinary
 /// writable database). On the physical topology the command simply fails, and
 /// an operator following the runbook is stuck at step 2 with the clock running.
-/// The runbook has to say so, and the safety argument has to survive the
-/// reordering — it does, because it rests on nothing writing before the fence,
-/// and workers do not start until step 4.
+/// The runbook has to say so. The safety argument survives the reordering. It
+/// rests on nothing writing before the fence, and workers do not start until
+/// step 4.
 #[test]
 fn the_runbook_defers_the_fence_past_promotion_for_physical_standbys() {
     let rb = runbook();

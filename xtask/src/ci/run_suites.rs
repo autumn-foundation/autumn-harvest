@@ -268,7 +268,6 @@ fn read_fields(line: &str) -> [&str; 5] {
     out
 }
 
-/// Turns string literals into owned words.
 fn words(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
 }
@@ -402,7 +401,6 @@ pub fn compile_plan(records: &[&str], shard: Option<Shard>) -> Vec<Invocation> {
             }
         }
     }
-    // Flush the final group.
     if let Some((c, f, targets)) = current {
         plan.push(compile_invocation(c, f, &targets));
     }
@@ -589,7 +587,6 @@ pub fn filterset(records: &[&str], want: &str) -> std::result::Result<String, Ve
     }
 }
 
-/// The message for refused filters.
 fn refused_message(bad: &[String]) -> String {
     let mut message = "run-suites: unsupported manifest filter:".to_string();
     for filter in bad {

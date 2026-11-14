@@ -5,20 +5,21 @@
 //!
 //! A `#[workflow]` has had a hard `execution_timeout` (a runaway/SLA-protection
 //! deadline, issue #243) and a soft `sla` breach signal (issue #487) since Phase
-//! 3.12/3.28. A `#[dag]` had neither: a scheduled nightly ETL DAG that hangs on a
-//! stuck upstream had no engine-level ceiling at all, and there was no way to page
-//! an operator when a DAG run was merely running slower than usual.
+//! 3.12/3.28. A `#[dag]` had neither. A nightly ETL DAG that hung on a stuck
+//! upstream had no engine-level ceiling. Nothing could page an operator when a
+//! DAG run was merely slower than usual.
 //!
 //! ## The solution
 //!
-//! Since Harvest 0.3 (`unified-dag-execution`, on by default), a `#[dag]` is
-//! executed as a `#[workflow]` under the hood — it has a **shadow
-//! `WorkflowInfo`** (see `dag_data_flow.rs` and "Under the hood — unified
-//! execution" in `docs/getting-started/08-dags-and-schedules.md`). This feature
-//! is therefore *pure propagation, zero new machinery*: `execution_timeout`/`sla`
-//! declared on `#[dag]` are copied verbatim onto that shadow `WorkflowInfo` and
-//! enforced by the **exact same scanners** a plain workflow already uses —
-//! `timeout::enforce_workflow_execution_timeouts` (#243) and
+//! Since Harvest 0.3 (`unified-dag-execution`, on by default), a `#[dag]` runs
+//! as a `#[workflow]` with a **shadow `WorkflowInfo`**. See `dag_data_flow.rs`
+//! and "Under the hood — unified execution" in
+//! `docs/getting-started/08-dags-and-schedules.md`.
+//!
+//! So this feature is *pure propagation, zero new machinery*. The
+//! `execution_timeout`/`sla` of a `#[dag]` are copied verbatim onto that shadow
+//! `WorkflowInfo`. The **exact same scanners** as for a plain workflow enforce
+//! them: `timeout::enforce_workflow_execution_timeouts` (#243) and
 //! `timeout::enforce_workflow_sla_breaches` (#487). There is no new
 //! `WorkflowEvent` variant, no new scanner, and no migration.
 //!
@@ -35,10 +36,10 @@
 //!   plain workflow.
 //! - **`sla`** — a *soft* signal. When the run passes its `sla` deadline, Harvest
 //!   emits `harvest.workflow.sla_breached{workflow, queue}` **exactly once** and
-//!   keeps the run going — no lifecycle effect. If `sla` is declared **larger**
-//!   than `execution_timeout`, it is **clamped down** to `execution_timeout` at
-//!   start (the hard timeout would kill the run before the soft signal could ever
-//!   fire — the same clamp `#[workflow(sla = "…")]` already applies).
+//!   keeps the run going — no lifecycle effect. An `sla` **larger** than
+//!   `execution_timeout` is **clamped down** to `execution_timeout` at start.
+//!   Otherwise the hard timeout kills the run before the soft signal can fire.
+//!   `#[workflow(sla = "…")]` applies the same clamp.
 //! - The fleet-wide `HarvestBuilder::max_workflow_execution_timeout(…)` ceiling
 //!   caps a DAG's declared `execution_timeout` **identically** to a plain
 //!   workflow's — no DAG-specific override path exists.
@@ -49,10 +50,10 @@
 //!   fields — `deadline_at`/`sla_deadline_at` stay `NULL`, no scanner
 //!   interaction, byte-identical to a pre-#743 build.
 //!
-//! See `docs/getting-started/07-reliability-knobs.md` ("Soft SLA" / "SLA vs
-//! `execution_timeout`") for the full workflow-level semantics this feature
-//! reuses, and `docs/getting-started/08-dags-and-schedules.md` ("Deadlines for
-//! scheduled DAG runs") for the DAG-specific summary.
+//! `docs/getting-started/07-reliability-knobs.md` ("Soft SLA" / "SLA vs
+//! `execution_timeout`") has the full workflow-level semantics.
+//! `docs/getting-started/08-dags-and-schedules.md` ("Deadlines for scheduled
+//! DAG runs") has the DAG-specific summary.
 //!
 //! Run with:
 //!   cargo run --example dag_execution_timeout --features unified-dag-execution
@@ -72,10 +73,11 @@ async fn reconcile_accounts(_ctx: &ActivityContext) -> Result<Value, String> {
     Ok(json!({ "reconciled": 12_340, "discrepancies": 0 }))
 }
 
-/// A nightly DAG with a hard 4-hour deadline and a soft 3-hour SLA. Both
-/// attributes propagate verbatim onto this DAG's shadow `WorkflowInfo` and are
-/// enforced by the pre-existing #243/#487 scanners -- no bespoke DAG deadline
-/// mechanism was introduced for this.
+/// A nightly DAG with a hard 4-hour deadline and a soft 3-hour SLA.
+///
+/// Both attributes propagate verbatim onto this DAG's shadow `WorkflowInfo`.
+/// The existing #243/#487 scanners enforce them. There is no DAG-specific
+/// deadline mechanism.
 #[dag(
     schedule = "0 6 * * *",
     execution_timeout = "4h",

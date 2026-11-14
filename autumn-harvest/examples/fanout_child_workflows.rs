@@ -1,22 +1,20 @@
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc, clippy::unused_async)]
 //! Fan-out / parallel child-workflow batch example (issue #601).
 //!
-//! Sibling to `examples/fanout_batch.rs` (issue #359, activity fan-out) —
-//! demonstrates the same three shapes, but fanning out **child workflows**
-//! instead of activities. Reach for a child workflow instead of an activity
-//! when each unit of work needs its own durable history, timers, signals, or
-//! retry/compensation logic — see the "Fan-out / Parallel Child Workflows"
-//! section of docs/architecture.md for the full activity-vs-child decision
-//! guidance.
+//! Sibling to `examples/fanout_batch.rs` (issue #359, activity fan-out). It
+//! shows the same three shapes, but fans out **child workflows**. Use a child
+//! workflow when each unit of work needs its own durable history, timers,
+//! signals, or retry/compensation logic. The "Fan-out / Parallel Child
+//! Workflows" section of docs/architecture.md has the full decision guidance.
 //!
 //! Demonstrates:
 //! 1. Fail-fast fan-out: N child workflows run in parallel; returns on first failure.
 //! 2. Collect-all fan-out: N children run in parallel; per-slot success/failure.
 //! 3. Dynamic fan-out derived from a prior activity's output.
 //!
-//! The input collection MUST be derived from already-recorded state (workflow
-//! input, prior activity outputs, signals) — never from non-deterministic
-//! sources such as the wall clock or a random number generator.
+//! The input collection MUST derive from already-recorded state: workflow
+//! input, prior activity outputs, or signals. It must never derive from the
+//! wall clock, a random number generator or another non-deterministic source.
 //!
 //! Run with:
 //!   cargo run --example fanout_child_workflows
@@ -62,11 +60,10 @@ pub async fn fetch_items(_ctx: &ActivityContext, source: String) -> Result<Batch
 
 /// Sub-orchestration that processes a single item.
 ///
-/// Modeled as a child workflow (rather than an activity) because a real
-/// per-item pipeline would typically need its own retries, timers, or
-/// signals — this example keeps the body trivial to focus on the fan-out
-/// primitive. Fails for items starting with "bad_" so the collect-all
-/// example can show partial failure.
+/// A child workflow, not an activity, because a real per-item pipeline
+/// typically needs its own retries, timers, or signals. The body stays trivial to focus on
+/// the fan-out primitive. It fails for items that start with "bad_", so the
+/// collect-all example can show partial failure.
 #[workflow]
 pub async fn process_item_child(
     _ctx: &WorkflowContext,
@@ -139,8 +136,8 @@ pub async fn collect_all_child_batch(
 
 /// Dynamic fan-out: N is derived from a prior activity output.
 ///
-/// The collection is always derived from durable recorded state (the output of
-/// `fetch_items`), never from the wall clock or a random number — this is what
+/// The collection always derives from durable recorded state, the output of
+/// `fetch_items`. It never derives from the wall clock or a random number. That
 /// keeps fan-out deterministic across replays.
 #[workflow]
 pub async fn dynamic_child_fan_out(

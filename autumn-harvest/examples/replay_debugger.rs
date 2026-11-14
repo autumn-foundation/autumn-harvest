@@ -250,12 +250,12 @@ mod tests {
         // The AC6 walkthrough's closing assertion. "Replays cleanly" is a
         // *single-trace* property: no step reports a divergence.
         //
-        // Note it is deliberately NOT `diff_traces(old, fixed).is_none()`. A
-        // step is a replay of `events[0..=k]`, so an intermediate step models an
-        // execution parked at that truncated frontier — and a `ctx.patched`
-        // gate at a frontier is, correctly, *newly* patched. So the gated build
-        // legitimately differs from the ungated one at intermediate steps while
-        // still replaying the full recorded history cleanly. See the
+        // It is deliberately NOT `diff_traces(old, fixed).is_none()`. A step is
+        // a replay of `events[0..=k]`. So an intermediate step models an
+        // execution parked at that truncated frontier. A `ctx.patched` gate at
+        // a frontier is, correctly, *newly* patched. So the gated build differs
+        // from the ungated one at intermediate steps, yet still replays the
+        // full recorded history cleanly. See the
         // "Gates at a truncated frontier" section of `docs/replay-debugger.md`.
         let history = snapshot_json();
         let fixed = trace_with(fixed_build, &history).await;
@@ -265,10 +265,10 @@ mod tests {
             .filter(|s| s.divergence.is_some())
             .map(|s| (s.index, s.divergence.clone()))
             .collect();
-        // `is_clean()` is the verdict, not the divergence scan: it additionally
-        // refuses a trace whose steps timed out, panicked, or were never
-        // replayed — each of which reports no divergence because nothing was
-        // ever compared. The scan above only supplies a readable message.
+        // `is_clean()` is the verdict, not the divergence scan. It also refuses
+        // a trace whose steps timed out, panicked, or never replayed. Such a
+        // step reports no divergence, because nothing was compared. The scan
+        // above only supplies a readable message.
         assert!(
             fixed.is_clean(),
             "a `ctx.patched` gate must keep the pre-change path intact, but this \
@@ -319,9 +319,9 @@ mod tests {
         // each fail:
         //
         //  1. the input history is byte-identical afterwards (nothing mutated);
-        //  2. no *activity* ran — the workflow body reaches
+        //  2. no *activity* ran. The workflow body reaches
         //     `execute_activity_raw`, which in replay resolves from history
-        //     rather than dispatching, so the activity registry is never
+        //     and does not dispatch. So the activity registry is never
         //     consulted and no task row is enqueued.
         let events_before = recorded_history();
         let history = snapshot_json();
@@ -360,9 +360,9 @@ mod tests {
     #[tokio::test]
     async fn a_build_that_completes_early_does_not_replay_cleanly() {
         // The single-trace "does this build replay cleanly?" predicate must
-        // catch a build that *drops* work the history records, not just one
-        // that adds or renames it. Without the early-completion check a build
-        // that returns immediately reports 100% clean against any history.
+        // catch a build that *drops* recorded work, not only one that adds or
+        // renames it. Without the early-completion check, a build that returns
+        // immediately reports 100% clean against any history.
         fn does_nothing<'a>(
             _ctx: &'a WorkflowContext,
             _input: Value,

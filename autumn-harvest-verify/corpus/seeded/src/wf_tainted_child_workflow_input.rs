@@ -1,14 +1,15 @@
 //! **S16** — an ambient value wrapped in a serde struct and sent to a child.
 //!
 //! **Mechanism.** `Value`. `helpers::seed()` is `SEQ.load(Relaxed)` on a
-//! `static AtomicU64`. The value is stored in a field of `ChildRequest`, the
-//! struct is serialized, and the JSON becomes the `StartChildWorkflow`
-//! command's input — so taint must survive a struct aggregate assignment and a
-//! by-value move, not just a scalar rename.
+//! `static AtomicU64`. The value goes into a field of `ChildRequest`. The
+//! struct is serialized, and the JSON becomes the `StartChildWorkflow` input.
+//! So taint must survive a struct aggregate assignment and a by-value move,
+//! not just a scalar rename.
 //!
-//! **Launder.** As in S02: HVG007 (the only ambient rule) needs a literal
-//! `.lock()` on an uppercase receiver **in the body**, `SEQ.load` is neither, and
-//! it is one crate away past det_check's same-module one-hop resolver.
+//! **Launder.** As in S02. HVG007 (the only ambient rule) needs a literal
+//! `.lock()` on an uppercase receiver **in the body**, and `SEQ.load` is
+//! neither. It is also one crate away, past the same-module one-hop resolver
+//! of `det_check`.
 //!
 //! **Expected trace hops.** `wf_tainted_child_workflow_input` ⇒
 //! `harvest_verify_corpus_helpers::seed` ⇒ `AtomicU64::load` on `static SEQ`

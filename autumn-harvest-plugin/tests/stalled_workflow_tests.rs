@@ -1,8 +1,10 @@
 //! Integration tests for the stalled-workflow discovery filter on
-//! `GET /workflows` (issue #486). Seeds workflows in specific states and
-//! verifies that `no_progress_minutes` returns only the expected subset,
-//! that sleeping-on-future-timer workflows are excluded by default (zero false
-//! positives), and that `include_sleeping=true` opts them back in.
+//! `GET /workflows` (issue #486).
+//!
+//! The suite seeds workflows in specific states. `no_progress_minutes` must
+//! return only the expected subset. Workflows asleep on a future timer are
+//! excluded by default (zero false positives). `include_sleeping=true` opts
+//! them back in.
 
 use autumn_harvest::schema::harvest_events;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
@@ -421,9 +423,9 @@ fn test_stall_reason_serializes_as_snake_case() {
     );
 }
 
-/// AC: `no_pending_work` is always surfaced regardless of `include_sleeping` — even
-/// if we pass `include_sleeping=false`, a workflow with no pending work at all
-/// must still be returned (since it cannot be a sleeping-timer case).
+/// AC: `no_pending_work` is always surfaced, whatever `include_sleeping` says.
+/// With `include_sleeping=false`, a workflow with no pending work still returns.
+/// It cannot be a sleeping-timer case.
 #[tokio::test]
 async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let (database_url, _container) = setup_database().await;

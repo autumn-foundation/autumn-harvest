@@ -113,9 +113,9 @@ pub struct BatchStartItemResult {
     /// The workflow instance id this item resolved to — the caller's
     /// explicit `workflow_id`, or the server-generated UUID when omitted.
     ///
-    /// `None` only for a rejection produced during pre-validation, before any
-    /// id is resolved (e.g. an unregistered workflow name) — no id was ever
-    /// generated or used for such an item.
+    /// `None` only for a rejection in pre-validation, before any id is
+    /// resolved (e.g. an unregistered workflow name). No id was generated or
+    /// used for such an item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
 
@@ -144,14 +144,12 @@ pub enum BatchStartItemStatus {
     /// The item was rejected (unknown workflow type, duplicate id, over-size
     /// payload, malformed input, etc.).
     Rejected,
-    /// The item was deferred by a start throttle (issue #607): no token was
-    /// available, so a durable pending-start row was written and the execution
-    /// will be admitted later by the throttle scanner. Not a failure — the item
-    /// is neither dropped nor rejected.
+    /// A start throttle deferred the item (issue #607). No token was
+    /// available, so a durable pending-start row was written. The throttle
+    /// scanner admits the execution later. Not a failure: the item is neither
+    /// dropped nor rejected.
     Deferred,
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

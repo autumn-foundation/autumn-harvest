@@ -2,8 +2,8 @@
 //! & 9).
 //!
 //! `WorkflowEvent` is `#[serde(tag = "type", content = "data")]` and does *not*
-//! derive `PartialEq`, so round-trip fidelity is asserted by comparing the JSON
-//! `Value` of the original against the JSON `Value` of the re-parsed event.
+//! derive `PartialEq`. So the suite compares the JSON `Value` of the original
+//! with the JSON `Value` of the re-parsed event.
 //!
 //! Contract under test:
 //! - every generated variant round-trips (`to_json(ev) == to_json(from_str(to_string(ev)))`);
@@ -54,20 +54,19 @@ fn json_value() -> impl Strategy<Value = Value> {
 
 /// A JSON value that is never top-level `Null`.
 ///
-/// Required for the `Option<serde_json::Value>` fields carrying
+/// Required for the `Option<serde_json::Value>` fields that carry
 /// `#[serde(skip_serializing_if = "Option::is_none")]` (`last_completion_result`,
-/// `details`): `Some(Value::Null)` serializes to `null`, which serde's `Option`
-/// deserializer collapses back to `None` — an inherent `Option<Value>` idiom, not
-/// a round-trip defect — so re-serialization would omit the field. Excluding
-/// top-level `Null` keeps the generator to shapes the round-trip contract
-/// actually covers. (Nested nulls inside an array/object round-trip fine and are
-/// still generated.)
+/// `details`). `Some(Value::Null)` serializes to `null`. The serde `Option`
+/// deserializer collapses that back to `None`, so re-serialization omits the
+/// field. This is an inherent `Option<Value>` idiom, not a round-trip defect.
+/// Excluding top-level `Null` keeps the generator to shapes the contract
+/// covers. Nested nulls inside an array or object round-trip fine and are
+/// still generated.
 ///
-/// Note: the engine CAN legitimately produce `Some(Value::Null)` for
-/// `last_completion_result` (issue #488 — when a prior scheduled run's output is
-/// JSON `null`), which then benignly collapses to `None` on reload. That is a
-/// real but harmless serde-`Option` quirk this property intentionally cannot
-/// cover, by construction of this generator.
+/// Note: the engine CAN produce `Some(Value::Null)` for `last_completion_result`
+/// when the output of a prior scheduled run is JSON `null` (issue #488). It then
+/// collapses to `None` on reload. That serde-`Option` quirk is real but
+/// harmless. This generator cannot cover it, by construction.
 fn json_value_non_null() -> impl Strategy<Value = Value> {
     prop_oneof![
         any::<bool>().prop_map(Value::from),

@@ -34,7 +34,6 @@ const TELEMETRY_PAGE: &str = "docs/telemetry.md";
 const FILTER: &str = "--test integration otel_workflow_semconv_docs::";
 /// The source of the Weaver check.
 const WEAVER_SCRIPT: &str = "xtask/src/check/otel_workflow_semconv.rs";
-/// The command that runs the Weaver check.
 const WEAVER_COMMAND: &str = "cargo xtask check otel-workflow-semconv";
 const WEAVER_WORKFLOW: &str = ".github/workflows/otel-semconv.yml";
 const MODEL_PATHS: &str = "docs/otel-workflow-semconv/**";
@@ -75,7 +74,6 @@ const SCOPE_SECTION: &str = "## 3. Scope and prior art";
 const FACTS_HEADING: &str = "### Facts checked";
 const DECLINE_PREFIX: &str = "If the project decides not to submit";
 
-/// The draft community project proposal.
 const PROPOSAL: &str = "docs/otel-workflow-semconv/project-proposal.md";
 
 /// The upstream issue form for new conventions, its area for a new area and
@@ -608,7 +606,6 @@ fn external_refs(text: &str) -> BTreeSet<String> {
     refs
 }
 
-/// Whether `text` is a date in the form `YYYY-MM-DD`.
 fn is_iso_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == 10
@@ -651,7 +648,6 @@ fn next_heading<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
         .map(str::trim_end)
 }
 
-/// The number of `#` marks that start `heading`.
 fn heading_level(heading: &str) -> usize {
     heading.bytes().take_while(|b| *b == b'#').count()
 }

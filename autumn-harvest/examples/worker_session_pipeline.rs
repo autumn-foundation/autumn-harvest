@@ -2,9 +2,9 @@
 //! Worker session pipeline example (issue #606).
 //!
 //! Demonstrates co-locating a `download -> transcode -> upload` pipeline on a
-//! single physical worker so the three activities can share machine-local
-//! state (here: a scratch-directory path) instead of round-tripping the
-//! artifact through external storage between every hop.
+//! single physical worker. The three activities share machine-local state, here
+//! a scratch-directory path. The artifact need not round-trip through external
+//! storage between hops.
 //!
 //! Adoption cost, per the issue's success metric, is exactly:
 //! 1. One builder call: `WorkerConfig::with_max_concurrent_sessions(n)`.
@@ -16,10 +16,9 @@
 //! `transcode_chunk`, and `upload_chunk` below are ordinary `#[activity]`
 //! functions; only the workflow's dispatch calls change.
 //!
-//! See the "Worker Sessions" decision-matrix section of `docs/architecture.md`
-//! for when
-//! to reach for a session instead of a local activity, a plain activity, or
-//! claim-check payload offloading (issue #524).
+//! The "Worker Sessions" decision-matrix section of `docs/architecture.md` says
+//! when to use a session. The alternatives are a local activity, a plain
+//! activity, or claim-check payload offloading (issue #524).
 //!
 //! Run with:
 //!   cargo run --example worker_session_pipeline
@@ -43,9 +42,9 @@ pub struct MediaResult {
 // ── Activities ───────────────────────────────────────────────────────────────
 //
 // Each activity operates on a *local filesystem path* on the host that ran
-// the previous step — that locality guarantee is exactly what a worker
-// session provides. Without a session, `transcode_chunk` could land on a
-// different worker than `download_chunk` and would find no such file.
+// the previous step. A worker session provides exactly that locality. Without
+// a session, `transcode_chunk` could land on a different worker than
+// `download_chunk` and find no such file.
 
 #[activity(start_to_close = "5m", queue = "gpu-workers")]
 pub async fn download_chunk(_ctx: &ActivityContext, source_url: String) -> Result<String, String> {
@@ -113,10 +112,10 @@ pub async fn transcode_pipeline(
         .map_err(|e| e.to_string())?;
 
     // Release the session's slot on the host worker. If the host died or
-    // drained mid-pipeline, this (like the activity calls above) returns
-    // `HarvestError::SessionBroken` instead of silently retrying elsewhere —
-    // the caller re-establishes a fresh session rather than trusting stale
-    // local state on an unreachable host.
+    // drained mid-pipeline, this returns `HarvestError::SessionBroken`, as the
+    // activity calls above do. It never retries elsewhere silently. The caller
+    // opens a fresh session and does not trust stale state on an unreachable
+    // host.
     session.complete().await.map_err(|e| e.to_string())?;
 
     Ok(result)

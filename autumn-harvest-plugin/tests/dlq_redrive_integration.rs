@@ -1,10 +1,14 @@
 //! HTTP integration tests for `POST /dlq/redrive` — issue #510.
 //!
 //! Drives the redrive endpoint through the real management router against a
-//! Postgres container, covering: dry-run (no mutation), a real redrive that
-//! reactivates a FAILED execution and writes a `dlq.redrive` audit row, the
-//! empty-filter 400, the admin guard, the `max` cap (matched vs redriven), and
-//! a terminal (COMPLETED) owning execution surfacing as a per-row failure.
+//! Postgres container. It covers:
+//!
+//! - dry-run (no mutation);
+//! - a real redrive that reactivates a FAILED execution and writes a
+//!   `dlq.redrive` audit row;
+//! - the empty-filter 400 and the admin guard;
+//! - the `max` cap (matched vs redriven);
+//! - a terminal (COMPLETED) owning execution as a per-row failure.
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::schema::harvest_audit_log;
@@ -289,7 +293,6 @@ async fn redrive_real_reactivates_and_writes_audit() {
     assert_eq!(body["redriven"], 1);
     assert_eq!(body["failed"], 0);
 
-    // Execution reactivated.
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
 
     // Exactly one dlq.redrive audit row.

@@ -1,29 +1,31 @@
 //! Pure token-secret helpers for the management API (issue #942).
 //!
-//! This module is the **single source of truth** for how a harvest-native API
-//! token secret is generated (`mint_secret`), hashed for storage/lookup
-//! (`hash_secret`), and discriminated from an embedder's own bearer credential
-//! (`looks_like_harvest_token`). Both the server-side mint route in
-//! `autumn-harvest-plugin` and the offline `harvest token bootstrap` CLI call
-//! **these exact functions**, so the two paths can never drift: a token seeded
-//! offline hashes to the byte-identical `token_hash` the mint route would store,
-//! and therefore authenticates identically.
+//! This module is the **single source of truth** for a harvest-native API
+//! token secret. It generates one (`mint_secret`), hashes it for storage and
+//! lookup (`hash_secret`), and tells it apart from an embedder's own bearer
+//! credential (`looks_like_harvest_token`).
 //!
-//! These helpers are **pure** (no DB, no `db` feature) and depend only on
-//! `base64`/`sha2`/`rand`, which are non-optional core dependencies — so they
-//! compile and run under `--no-default-features`, which is exactly how the CLI
+//! The server-side mint route in `autumn-harvest-plugin` and the offline
+//! `harvest token bootstrap` CLI call **these exact functions**. So the two
+//! paths can never drift. A token seeded offline hashes to the byte-identical
+//! `token_hash` that the mint route stores, and authenticates identically.
+//!
+//! These helpers are **pure** (no DB, no `db` feature). They depend only on
+//! `base64`/`sha2`/`rand`, which are non-optional core dependencies. So they
+//! compile and run under `--no-default-features`, as the CLI
 //! (`default-features = false`) consumes them.
 //!
 //! # Wire format & secret hygiene (AC2)
 //!
 //! A token secret is `hvst_<base64url(32 random bytes)>` (256 bits of CSPRNG
-//! entropy). Only `token_hash = hex(SHA256(secret))` is ever persisted — the
-//! plaintext is surfaced exactly once at creation and never stored at rest. A
-//! plain (unsalted) SHA-256 is the standard for API keys (the GitHub-PAT model):
-//! the secret is high-entropy random, not a low-entropy human password, so no
-//! salt/argon is needed, and verification is one indexed exact-match lookup with
-//! no in-Rust hash comparison (a 256-bit random hash is not an iterable timing
-//! oracle).
+//! entropy). Only `token_hash = hex(SHA256(secret))` is ever persisted. The
+//! plaintext is surfaced exactly once at creation and never stored at rest.
+//!
+//! A plain (unsalted) SHA-256 is the standard for API keys (the GitHub-PAT
+//! model). The secret is high-entropy random, not a low-entropy human password,
+//! so no salt/argon is needed. Verification is one indexed exact-match lookup
+//! with no in-Rust hash comparison. A 256-bit random hash is not an iterable
+//! timing oracle.
 
 use base64::Engine as _;
 use rand::Rng as _;
@@ -31,9 +33,9 @@ use sha2::{Digest as _, Sha256};
 
 /// The credential-namespace discriminator for a harvest-native token.
 ///
-/// A bearer that does not start with this prefix is the embedder's own
-/// credential and is ignored by the token layer, so token auth **composes
-/// with** — never replaces — an existing auth boundary (issue #942, AC7).
+/// A bearer without this prefix is the embedder's own credential, and the
+/// token layer ignores it. So token auth **composes with** an existing auth
+/// boundary and never replaces it (issue #942, AC7).
 pub const TOKEN_PREFIX: &str = "hvst_";
 
 /// Mint a fresh opaque secret `hvst_<base64url(32 random bytes)>`.
@@ -51,9 +53,9 @@ pub fn mint_secret() -> String {
 /// Hex-encoded SHA-256 of the full presented secret — the indexed lookup key
 /// stored as `harvest_api_tokens.token_hash`.
 ///
-/// This is the one function the server mint path, the verification lookup, and
-/// the offline `harvest token bootstrap` seed all share, so a bootstrap-seeded
-/// row is byte-for-byte accepted by the same verification lookup.
+/// The server mint path, the verification lookup, and the offline
+/// `harvest token bootstrap` seed all share this one function. So the same
+/// verification lookup accepts a bootstrap-seeded row byte for byte.
 #[must_use]
 pub fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());

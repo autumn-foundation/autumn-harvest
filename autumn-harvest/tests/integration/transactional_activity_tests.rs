@@ -1,9 +1,9 @@
 #![cfg(feature = "db")]
 //! Integration tests for transactional activities (issue #352).
 //!
-//! These tests prove that `ctx.run_transactional` atomically commits user
-//! domain writes and the `ActivityCompleted` event in one Postgres
-//! transaction; on error the writes are rolled back and the activity fails.
+//! `ctx.run_transactional` commits user domain writes and the
+//! `ActivityCompleted` event in one Postgres transaction. On error the writes
+//! roll back and the activity fails.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,10 +57,9 @@ const CREATE_USER_RECORDS: &str = "
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Set up a test database. If `TEST_DATABASE_URL` is set in the environment,
-/// use that Postgres instance and apply migrations directly (tests are
-/// responsible for isolation via unique IDs and a fresh `user_records` table).
-/// Otherwise spin up a throwaway testcontainers Postgres container.
+/// Set up a test database. With `TEST_DATABASE_URL` set, apply migrations to
+/// that Postgres directly. Tests then isolate through unique IDs and a fresh
+/// `user_records` table. Otherwise spin up a throwaway testcontainers Postgres.
 async fn setup_db() -> (String, DbHandle) {
     if let Ok(url) = std::env::var("TEST_DATABASE_URL") {
         let mut conn = AsyncPgConnection::establish(&url)

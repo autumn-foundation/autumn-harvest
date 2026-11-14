@@ -1,21 +1,19 @@
-//! Payload-size cap enforcement at the ingress boundaries (issue #252, Codex
-//! #1069 P2: `runtime.rs:264` workflow input, `runtime.rs:346` signal payload,
-//! `worker.rs:340` activity result).
+//! Payload-size cap enforcement at the ingress boundaries (issues #252, #1069): the
+//! workflow input, the signal payload and the activity result.
 //!
-//! The Postgres path enforces payload caps at every boundary; this backend must
-//! mirror it so it never stores an unbounded history row or accepts a payload
+//! The Postgres path enforces payload caps at every boundary. This backend must
+//! mirror it, so it never stores an unbounded history row or accepts a payload that
 //! other backends reject. These tests drive the PUBLIC API:
 //!
 //! - **workflow input (START)** — `start_workflow` rejects an input over
 //!   `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` (2 MiB) with `PayloadTooLarge` BEFORE any
 //!   execution row / `WorkflowStarted` event is written.
 //! - **signal payload (ingress)** — `send_signal` rejects a payload over
-//!   `DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES` (256 KiB) at ingress, AFTER the
-//!   not-found / terminal-target checks, so no oversized `SignalReceived` is
-//!   recorded.
-//! - **activity result** — an oversized SUCCESSFUL activity result is normalized
-//!   into a non-retryable `PayloadTooLarge` `ActivityFailed` (the workflow
-//!   observes the failure) rather than stored as an unbounded `ActivityCompleted`.
+//!   `DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES` (256 KiB) at ingress. It runs AFTER the
+//!   not-found / terminal-target checks. No oversized `SignalReceived` is recorded.
+//! - **activity result** — an oversized SUCCESSFUL activity result becomes a
+//!   non-retryable `PayloadTooLarge` `ActivityFailed`, which the workflow observes.
+//!   It is not stored as an unbounded `ActivityCompleted`.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding".
@@ -74,9 +72,9 @@ async fn oversized_workflow_input_rejected_before_persisting() {
     );
 
     // The runtime is not wedged and nothing was persisted: a VALID start still
-    // works and drives to completion. (The rejection returns BEFORE the insert
-    // transaction is even opened, so no execution row / WorkflowStarted exists —
-    // the in-crate `runtime.rs` unit test asserts the row count is 0 directly.)
+    // drives to completion. The rejection returns BEFORE the insert transaction
+    // opens, so no execution row or WorkflowStarted exists. The `runtime.rs` unit
+    // test asserts the row count of 0 directly.
     let exec = rt.start_workflow("echo_wf", json!(7)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -102,7 +100,6 @@ async fn oversized_signal_payload_rejected_at_ingress() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&wait_then_echo_info());
     let exec = rt.start_workflow("wait_then_echo", json!(0)).unwrap();
-    // Park it on the signal wait.
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::WaitingSignal(ref s) if s == "go"));
 
@@ -136,9 +133,8 @@ async fn oversized_signal_payload_rejected_at_ingress() {
 
 #[tokio::test]
 async fn signal_cap_yields_to_not_found_and_terminal_checks() {
-    // The prompt's chosen order: the target's existence/state is validated FIRST,
-    // so an oversized payload to an unknown or terminal target reports THAT (the
-    // actionable error) rather than a size complaint.
+    // The target's existence and state are validated FIRST. So an oversized payload
+    // to an unknown or terminal target reports THAT actionable error, not its size.
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&echo_wf_info());
 

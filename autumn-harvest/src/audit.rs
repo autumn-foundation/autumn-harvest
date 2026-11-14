@@ -142,11 +142,10 @@ pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
 /// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
 /// declared per-activity rate limit (issue #945).
 ///
-/// Distinct from the legacy [`OP_RATE_LIMIT_OVERRIDE`] (issue #332), which is
-/// a permanent write to a bucket's baseline `refill_rate`/`burst`: this
-/// records a *temporary*, self-expiring layer on top of that baseline that
-/// requires no worker restart to take effect and no operator action to
-/// revert.
+/// Distinct from the legacy [`OP_RATE_LIMIT_OVERRIDE`] (issue #332), which
+/// permanently writes a bucket's baseline `refill_rate`/`burst`. This records
+/// a *temporary*, self-expiring layer on top of that baseline. The layer needs
+/// no worker restart to take effect and no operator action to revert.
 pub const OP_RATE_LIMIT_PACING_OVERRIDE_SET: &str = "rate_limit.pacing_override.set";
 /// Audit operation: Cleared a TTL'd runtime pacing override on a declared
 /// per-activity rate limit before its TTL elapsed (issue #945).
@@ -154,11 +153,10 @@ pub const OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR: &str = "rate_limit.pacing_overrid
 /// Audit operation: Rewound a shard's audit-export cursor so already-delivered
 /// audit records are re-exported to the SIEM sink (issue #953).
 ///
-/// The redrive is itself a privileged action — it causes records to be
-/// re-shipped, and a cursor an operator can move is a control an auditor will
-/// ask about — so it produces an audit record like any other mutation. Note
-/// that a rewind can only ever move a cursor BACKWARDS; the route refuses a
-/// forward request rather than recording one.
+/// The redrive is itself a privileged action, so it produces an audit record.
+/// It re-ships records, and an auditor will ask about a cursor an operator can
+/// move. A rewind only moves a cursor BACKWARDS. The route refuses a forward
+/// request rather than recording one.
 pub const OP_AUDIT_EXPORT_REDRIVE: &str = "audit_export.redrive";
 /// Audit operation: Retired a shard's audit-export cursor, permitting
 /// retention to purge its aged records (issue #953, issue #1273).
@@ -221,8 +219,8 @@ pub const OP_ACTIVITY_FAIL_NOW: &str = "activity.fail_now";
 /// (issue #807).
 ///
 /// Distinct from [`OP_ACTIVITY_RETRY_NOW`] / [`OP_ACTIVITY_FAIL_NOW`], which
-/// act on a single in-flight *task*: this is the type-wide, fleet-wide hold an
-/// operator reaches for when one downstream dependency is in a known outage.
+/// act on a single in-flight *task*. This is the type-wide, fleet-wide hold
+/// for a known outage of one downstream dependency.
 pub const OP_ACTIVITY_PAUSE: &str = "activity.pause";
 /// Audit operation: an operator released a per-activity-type hold (issue #807).
 pub const OP_ACTIVITY_RESUME: &str = "activity.resume";
@@ -243,26 +241,25 @@ pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
 ///
 /// Written only for dispatch *attempts* that pass autumn-web's signature
 /// verification -- an unauthenticated sender cannot generate audit rows by
-/// sending unsigned/badly-signed requests. No
-/// `ALL_MUTATION_ROUTES`/`CLASSIFIED_ROUTES` entry exists for this operation:
-/// webhook binding paths are user-defined and registered as app-level routes
-/// outside `harvest_api_router`, so they are invisible to (and correctly
-/// excluded from) those management-router manifests. See
-/// `docs/getting-started/12-webhooks.md`.
+/// sending unsigned/badly-signed requests.
+///
+/// No `ALL_MUTATION_ROUTES`/`CLASSIFIED_ROUTES` entry exists for this
+/// operation. Webhook binding paths are user-defined app-level routes outside
+/// `harvest_api_router`. So those management-router manifests correctly
+/// exclude them. See `docs/getting-started/12-webhooks.md`.
 pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 /// Audit operation: an operator read decoded codec-encrypted payloads on the
 /// management API / Vantage UI read path (issue #608).
 ///
-/// A **read** audit like [`OP_EXECUTION_STREAM_OPEN`]: written at most once
-/// per request, and only when at least one codec envelope was actually
-/// decoded or degraded to an `_harvest_undecodable` marker (the SSE stream
-/// audits once at stream open whenever decode mode is active for that
-/// stream, since frame counts are unknowable up front). The record names the
-/// actor, route, and target execution — never the payload content. No
+/// A **read** audit like [`OP_EXECUTION_STREAM_OPEN`], written at most once
+/// per request. It is written only when at least one codec envelope is
+/// decoded or degraded to an `_harvest_undecodable` marker. The SSE stream
+/// cannot count frames up front. So it audits once at stream open whenever
+/// decode mode is active for that stream. The record names the actor, route,
+/// and target execution, never the payload content. No
 /// `CLASSIFIED_ROUTES`/`ALL_MUTATION_ROUTES` change: no route mutates and no
 /// new route exists.
 pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
-/// Audit operation: minted a scoped API token (issue #942).
 /// Operation: an operator paused dispatch on a task queue (issue #619).
 pub const OP_QUEUE_PAUSE: &str = "queue.pause";
 /// Operation: an operator resumed dispatch on a task queue (issue #619).
@@ -274,6 +271,7 @@ pub const OP_FAIRNESS_WEIGHT_SET: &str = "fairness.weight.set";
 /// (issue #1976).
 pub const OP_FAIRNESS_WEIGHT_CLEAR: &str = "fairness.weight.clear";
 
+/// Audit operation: minted a scoped API token (issue #942).
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
@@ -398,7 +396,7 @@ pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 ///
 /// Embedders use this to decide which protection level applies to each route
 /// category. The recommended production posture gates all three tiers behind
-/// the host application's authentication middleware; the distinction matters
+/// the host application's authentication middleware. The distinction matters
 /// for graduated roll-out and for documenting intentional exposure choices.
 ///
 /// See `docs/security-posture.md` for the full mounting recipe, CLI/token
@@ -442,15 +440,14 @@ pub enum RouteClass {
 /// one.
 ///
 /// **Fail closed by construction.** The enforcement layer resolves an
-/// unclassified path to [`RouteClass::Mutating`] before calling this function,
-/// so a route a contributor forgot to classify is denied to read-only
-/// principals — never accidentally exposed.
+/// unclassified path to [`RouteClass::Mutating`] before it calls this
+/// function. So a read-only principal is denied a route that a contributor
+/// forgot to classify.
 ///
-/// This is deliberately a pure, `const` function keyed only on
-/// `RouteClass` (the source-of-truth verb classification) so the security
-/// decision is pinned by a truth-table unit test with no session or router
-/// harness. Principal classification (read-only vs admin vs anonymous) is a
-/// separate concern resolved by the enforcement layer and passed in as
+/// This is a pure `const` function keyed only on `RouteClass`, the
+/// source-of-truth verb classification. So a truth-table unit test pins the
+/// security decision with no session or router harness. The enforcement
+/// layer classifies the principal (read-only, admin or anonymous) and passes
 /// `is_readonly_principal`.
 #[must_use]
 pub const fn deny_readonly_mutation(is_readonly_principal: bool, class: RouteClass) -> bool {
@@ -459,11 +456,10 @@ pub const fn deny_readonly_mutation(is_readonly_principal: bool, class: RouteCla
 
 /// Security classification for every route registered in `harvest_api_router`.
 ///
-/// Each entry is `(route_template, RouteClass)`. The exhaustiveness guard test
-/// (`route_classification_covers_all_known_routes`) verifies that this slice
-/// and [`ALL_MUTATION_ROUTES`] contain exactly the same route set, so adding a
-/// new route to `harvest_api_router` without classifying it here causes a
-/// compile-time-visible test failure.
+/// Each entry is `(route_template, RouteClass)`. The guard test
+/// `route_classification_covers_all_known_routes` checks that this slice and
+/// [`ALL_MUTATION_ROUTES`] hold exactly the same route set. So a new
+/// `harvest_api_router` route that is not classified here fails that test.
 ///
 /// **When you add a new route to `harvest_api_router`, you MUST add an entry
 /// here AND in [`ALL_MUTATION_ROUTES`].**
@@ -569,10 +565,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/start-throttle", RouteClass::ReadOnly),
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     ("GET /admin/quotas", RouteClass::ReadOnly),
-    // Payload-codec key rotation progress (issue #948): read-only. Classifying
-    // it matters — an unclassified path defaults to `Mutating`, which would
-    // deny a read-only operator the very screen they watch to decide when an
-    // outgoing key is safe to retire.
+    // Payload-codec key rotation progress (issue #948): read-only. An
+    // unclassified path defaults to `Mutating`. That would deny a read-only
+    // operator the screen that shows when an outgoing key is safe to retire.
     ("GET /admin/codec/rotation", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
@@ -670,8 +665,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Live list signal (issue #1982): read-only, never mutates state.
     ("GET /workflows/changes/stream", RouteClass::ReadOnly),
     // ── Mutating ── modifies workflow execution or system configuration ───────
-    // All of these are covered by the audit trail (harvest_audit_log) or are
-    // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
+    // The audit trail (harvest_audit_log) covers each one. Otherwise
+    // EXCLUDED_ROUTES lists it with an audit disposition note.
     (
         "POST /workflows/{workflow_name}/start",
         RouteClass::Mutating,
@@ -749,8 +744,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     // TTL'd runtime pacing overrides for a declared per-activity rate limit
-    // (issue #945): a temporary layer atop the baseline, not a permanent
-    // write like the legacy route directly above.
+    // (issue #945). They add a temporary layer atop the baseline. The legacy
+    // route directly above writes it permanently.
     (
         "POST /admin/rate-limits/{activity_name}/override",
         RouteClass::Mutating,
@@ -870,11 +865,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // ── Read-only operator role (issue #776) — routes that were mounted in
     // harvest_api_router but had drifted without a classification entry. Under
-    // #776 fail-closed enforcement an unclassified route is treated as
-    // Mutating; these are classified explicitly per verified handler behavior
-    // so the read-only tier reaches every genuine read (AC1) and never a
-    // mutation (AC2). Every "Mutating" handler below was verified to write
-    // state; every "ReadOnly" handler was verified not to.
+    // #776 fail-closed enforcement an unclassified route is Mutating. These
+    // are classified per verified handler behavior. So the read-only tier
+    // reaches every genuine read (AC1) and never a mutation (AC2). Every
+    // "Mutating" handler below writes state. No "ReadOnly" handler does.
     //
     // ReadOnly — discovery / reads (no state mutation):
     ("GET /batches/pending", RouteClass::ReadOnly),
@@ -1096,9 +1090,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_AUTHZ_DENY,
     // Read-only operator role (issue #776): these four constants pre-existed
     // but had never been wired into a route manifest entry. Their handlers
-    // already write audit rows under these ops; classifying the routes (below)
-    // requires an ALL_MUTATION_ROUTES entry, which in turn requires the op be
-    // registered here.
+    // already write audit rows under these ops. A classified route needs an
+    // ALL_MUTATION_ROUTES entry, and that entry needs the op registered here.
     OP_WORKFLOW_UPDATE_WITH_START,
     OP_DAG_RETRY,
     OP_CIRCUIT_FORCE_OPEN,
@@ -1181,10 +1174,9 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/start-throttle",
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     "GET /admin/quotas",
-    // Payload-codec key rotation progress (issue #948): read-only, and it
-    // surfaces only key IDENTIFIERS and row counts — no key material, no
-    // payload content — so there is nothing here to audit that the admin gate
-    // does not already cover.
+    // Payload-codec key rotation progress (issue #948): read-only. It shows
+    // only key IDENTIFIERS and row counts, no key material and no payload
+    // content. So the admin gate already covers all there is to audit.
     "GET /admin/codec/rotation",
     // Read-only pacing-override lookup (issue #945); the SET/DELETE mutations
     // above (OP_START_THROTTLE_PACING_OVERRIDE_SET/CLEAR) are audited.
@@ -1227,10 +1219,10 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Scoped API token list is read-only (issue #942).
     "GET /admin/tokens",
     // Business-id ("latest run") read-only variants (issue #805). Each mirrors
-    // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. Note the
-    // `.../result` variant is deliberately absent — its exec-id counterpart
-    // (`GET /workflows/{id}/result`) is classified ReadOnly and appears in
-    // ALL_MUTATION_ROUTES with `None` (both mean "not audited") but is NOT in
+    // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. The
+    // `.../result` variant is absent on purpose. Its exec-id counterpart
+    // (`GET /workflows/{id}/result`) is ReadOnly with `None` in
+    // ALL_MUTATION_ROUTES (both mean "not audited"). It is NOT in
     // EXCLUDED_ROUTES, so the by-id variant must not be either.
     "GET /workflows/by-id/{workflow_name}/{workflow_id}",
     // Empty-workflow_id guard (issue #1353): always 400, no read, no write.
@@ -1584,9 +1576,9 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Batch reset by semantic point (issue #538)
     ("POST /workflows/batch_reset", Some(OP_BATCH_RESET)),
     // ── Business-id ("latest run") route variants (issue #805) ────────────────
-    // Audit operations mirror the exec-id counterparts (the by-id handlers
-    // delegate to them; the delegated handler writes the audit row under the
-    // exec-id route string with the resolved exec_id as the target).
+    // Audit operations mirror the exec-id counterparts. The by-id handlers
+    // delegate to them. The delegated handler writes the audit row under the
+    // exec-id route string, with the resolved exec_id as the target.
     ("GET /workflows/by-id/{workflow_name}/{workflow_id}", None),
     // Empty-workflow_id guard (issue #1353): always 400, never audited.
     ("GET /workflows/by-id/{workflow_name}/", None),
@@ -1671,9 +1663,9 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workers/{worker_id}/pinned", None),
     ("GET /admin/queues/{queue_name}/eligibility", None),
     ("GET /admin/tasks/{id}/eligibility", None),
-    // Mutating routes — the four with pre-existing op constants audit under
-    // them (their handlers already write the audit row); the calendar +
-    // completion-trigger CRUD have no op and are excluded (None).
+    // Mutating routes. The four with pre-existing op constants audit under
+    // them, because their handlers already write the audit row. The calendar
+    // and completion-trigger CRUD routes have no op, so they map to None.
     (
         "POST /workflows/{workflow_name}/update-with-start",
         Some(OP_WORKFLOW_UPDATE_WITH_START),
@@ -1764,10 +1756,10 @@ impl Default for AuditFilters {
 
 /// Insert a single audit record. Returns the generated audit row id.
 ///
-/// Called after every covered management mutation. For successful mutations,
-/// the caller **must** ensure this returns `Ok` before reporting success to
-/// the HTTP client — the audit record must be durable before the response is
-/// sent.
+/// Called after every covered management mutation. For a successful
+/// mutation, the caller **must** get `Ok` from this before it reports success
+/// to the HTTP client. The audit record must be durable before the response
+/// is sent.
 ///
 /// A read route writes audit rows too, with no fence barrier. So when the
 /// DR fence is on, the insert checks the fence in its own transaction
@@ -1946,27 +1938,26 @@ pub async fn list_audit(
 /// number of rows deleted.
 ///
 /// **Never deletes a record the audit exporter has not shipped** (issue #953).
-/// A retention sweep that removed an unexported row would be a silent
-/// compliance gap — the record would be gone from the database *and* absent
-/// from the SIEM, with nothing anywhere to show it was lost, which is exactly
-/// what "zero silent record loss by construction" rules out.
+/// A sweep that removed an unexported row would be a silent compliance gap.
+/// The record would be gone from the database *and* absent from the SIEM.
+/// Nothing would show that it was lost. "Zero silent record loss by
+/// construction" rules out exactly that.
 ///
 /// ## Deciding whether export is live
 ///
 /// The guard applies when **any** signal says an exporter owes this shard
 /// records:
 ///
-/// - **A live (non-retired) cursor row exists** for the shard. Durable, shared
-///   state, so it works
-///   when retention and export run in **different processes** (issue #953,
-///   Codex review P1): a split web/worker deployment where only the worker
-///   configures the sink would otherwise have the web app's retention sweep
-///   delete rows the worker still owes.
+/// - **A live (non-retired) cursor row exists** for the shard. This is
+///   durable, shared state. So it works when retention and export run in
+///   **different processes** (issue #953). Take a split web/worker deployment
+///   where only the worker configures the sink. Without this signal, the web
+///   app's retention sweep would delete rows the worker still owes.
 /// - **A sink is configured in this process**
-///   ([`crate::audit_export::is_configured`]) — covers the window before the
-///   exporter's first tick on a shard has created the cursor row at all
-///   (freshly enabled, newly added to the fleet, or a shard whose pool has
-///   been failing).
+///   ([`crate::audit_export::is_configured`]). This covers the window before
+///   the exporter's first tick on a shard creates the cursor row. The shard
+///   may be freshly enabled, newly added to the fleet, or one whose pool has
+///   been failing.
 /// - **`protect_unexported_audit` is `true`** (issue #1266). The first two
 ///   signals can both be absent at once. This happens in a split web/worker
 ///   deployment, before the worker's first successful tick on a shard. The
@@ -1998,22 +1989,21 @@ pub async fn list_audit(
 ///   another, still mid-bootstrap on the same sweep.
 ///
 /// Deliberately **not** time-based. An earlier revision expired the guard 24h
-/// after the exporter's last heartbeat, so a long worker outage lifted it; a
+/// after the exporter's last heartbeat, so a long worker outage lifted it. A
 /// timeout cannot distinguish "export was intentionally removed" from "the
-/// worker has been down since Friday", and it resolves that ambiguity by
-/// deleting audit records during exactly the outage where they matter most
-/// (issue #953, Codex review round 3 P1).
+/// worker has been down since Friday". It resolves that ambiguity by deleting
+/// audit records during exactly the outage where they matter most
+/// (issue #953).
 ///
 /// Retiring export is therefore an explicit operator action —
 /// [`crate::audit_export::decommission_cursor`] — not an inferred one. The
 /// cost is that a sink left down indefinitely lets the audit table grow past
-/// its retention window. That is the deliberate trade, and the growth is
-/// bounded by the genuine unexported backlog rather than the whole table:
-/// fully-acknowledged records are purged on the normal schedule. Dropping a
-/// privileged-action log to reclaim disk is not a choice this function gets to
-/// make on an operator's behalf; `harvest.audit.export_lag` and the
-/// `last_error` on `GET /admin/audit-export` are how the condition is
-/// surfaced. See `docs/audit-export.md`.
+/// its retention window. That is the deliberate trade. The genuine unexported
+/// backlog bounds the growth, not the whole table. Fully-acknowledged records
+/// are purged on the normal schedule. This function never drops a
+/// privileged-action log to reclaim disk on an operator's behalf.
+/// `harvest.audit.export_lag` and the `last_error` on
+/// `GET /admin/audit-export` surface the condition. See `docs/audit-export.md`.
 ///
 /// `protect_unexported_audit` has its own "both steps required" trade,
 /// independent of `is_configured`. Decommissioning alone does not resume
@@ -2029,7 +2019,7 @@ pub async fn list_audit(
 /// `colocated_shard_ids` may have no cursor row at all. Or any live
 /// (non-retired) cursor row anywhere in this database may simply not
 /// have acknowledged it yet. This holds whether or not its shard is
-/// named in `colocated_shard_ids` (Codex review, PR #1504). A retired
+/// named in `colocated_shard_ids` (PR #1504). A retired
 /// cursor's own stale ack counts too, but only for a shard in
 /// `colocated_shard_ids`, and only while `protect_unexported_audit` is
 /// itself protecting this pool group. See the note above the SQL for
@@ -2065,7 +2055,7 @@ pub async fn list_audit(
 /// `colocated_shard_ids` -- when that shard has no cursor row yet. That
 /// is the bootstrap window this function's doc already covers.
 ///
-/// This is scoped per shard (Codex review, PR #1504). An unrelated
+/// This is scoped per shard (PR #1504). An unrelated
 /// colocated shard's own lingering row must never stand in for a
 /// different expected shard's still-missing one. Once an expected
 /// shard's own row exists, its `retired_at` decides, full stop.
@@ -2081,12 +2071,12 @@ pub async fn list_audit(
 /// module and `crate::audit_export::decommission_cursor_locked` both state.
 ///
 /// **`audit_export.decommission` and `audit_export.reactivate` records are
-/// never purged, live or retired shard, exported or not** (issue #1273,
-/// Codex review P1). These two rows describe the audit-export system's own
-/// lifecycle controls. A decommission targeting the shard it runs on can
-/// never export its own record. Retiring a cursor is exactly what stops
-/// that shard's exporter from claiming anything, including this row. In a
-/// single-shard deployment that shard is also the only one there is.
+/// never purged, live or retired shard, exported or not** (issue #1273). These
+/// two rows describe the audit-export system's own lifecycle controls. A
+/// decommission targeting the shard it runs on can never export its own record.
+/// Retiring a cursor is exactly what stops that shard's exporter from claiming
+/// anything, including this row. In a single-shard deployment that shard is
+/// also the only one there is.
 ///
 /// A cross-shard best-effort copy (see `audit_export_decommission_handler`
 /// in the plugin) can get such a record to the SIEM when another shard is
@@ -2129,7 +2119,7 @@ pub async fn purge_old_audit_records(
     // the bootstrap window, regardless of what any other colocated
     // shard's cursor looks like. `$7` (raw `is_configured()`) only
     // stands in when some shard named in `$3` has no cursor row of its
-    // own yet (Codex review, PR #1504). That is #1273's own narrow
+    // own yet (PR #1504). That is #1273's own narrow
     // signal, scoped the same way the pending check's own
     // missing-cursor disjunct already is below.
     //
@@ -2162,8 +2152,8 @@ pub async fn purge_old_audit_records(
     // shard-id list; the disjunct is true the moment any of them has no
     // matching row.
     //
-    // The last disjunct's live-cursor arm is unconditional (Codex
-    // review, PR #1504). Any live cursor in this database blocks the
+    // The last disjunct's live-cursor arm is unconditional
+    // (PR #1504). Any live cursor in this database blocks the
     // delete, whether or not its shard is named in `$3`
     // (`colocated_shard_ids`). An earlier revision scoped this arm to
     // `$3` too. A split deployment has two processes, each with its own
@@ -2194,7 +2184,7 @@ pub async fn purge_old_audit_records(
     // signal this pending check trusted to override retirement.
     //
     // `exempted_shard_ids` (`$4`) is no longer read by this predicate
-    // (Codex review, PR #1504). Its own exemption already takes effect
+    // (PR #1504). Its own exemption already takes effect
     // only once `decommission_cursor` actually retires that shard's row,
     // not from the moment the config change lands. While the cursor
     // stays live, it already counts as pending regardless of `$2`. The
@@ -2411,10 +2401,10 @@ mod tests {
     #[test]
     fn legal_hold_routes_are_classified_and_audited() {
         // Per-execution legal hold (issue #747): both routes are admin-only
-        // mutations and must be classified + audited. This dedicated test —
-        // not just the general exhaustiveness guards, which only cross-check
-        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other — is what
-        // catches a route dropped from BOTH lists.
+        // mutations and must be classified + audited. The general
+        // exhaustiveness guards only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other. This test catches a route
+        // dropped from BOTH lists.
         for route in [
             "POST /workflows/{id}/legal-hold",
             "POST /workflows/{id}/legal-hold/release",
@@ -2446,14 +2436,14 @@ mod tests {
 
     #[test]
     fn activity_pause_routes_are_classified_and_audited() {
-        // Per-activity-type pause/resume (issue #807). This dedicated test --
-        // not just the general exhaustiveness guards, which only cross-check
-        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each OTHER -- is
-        // what catches a route dropped from BOTH lists at once.
+        // Per-activity-type pause/resume (issue #807). The general
+        // exhaustiveness guards only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other. This test catches a route
+        // dropped from BOTH lists at once.
         //
         // The mutations are a fleet-wide dispatch kill switch for one activity
-        // type, so they must be classified Mutating (which is what makes the
-        // read-only-operator role, issue #776, deny them) and audited.
+        // type. So they must be audited and classified Mutating. That class
+        // makes the read-only-operator role (issue #776) deny them.
         for (route, op) in [
             ("POST /activities/{activity_name}/pause", OP_ACTIVITY_PAUSE),
             (
@@ -2503,17 +2493,15 @@ mod tests {
 
     #[test]
     fn pacing_override_routes_are_classified_and_audited() {
-        // TTL'd runtime pacing overrides for a declared per-activity rate
-        // limit and a declared workflow-start throttle (issue #945). This
-        // dedicated test -- not just the general exhaustiveness guards, which
-        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against
-        // each OTHER -- is what catches a route dropped from BOTH lists at
-        // once.
+        // TTL'd runtime pacing overrides for a declared per-activity rate limit
+        // and a declared workflow-start throttle (issue #945). The general
+        // exhaustiveness guards only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other. This test catches a route
+        // dropped from BOTH lists at once.
         //
-        // Both the set and the clear are audited under NEW, distinct ops from
-        // the legacy `OP_RATE_LIMIT_OVERRIDE` (a permanent baseline write),
-        // since a TTL'd override is a fundamentally different, self-expiring
-        // operation.
+        // The set and the clear audit under NEW ops, distinct from the legacy
+        // `OP_RATE_LIMIT_OVERRIDE` (a permanent baseline write). A TTL'd
+        // override is a different, self-expiring operation.
         for (route, op) in [
             (
                 "POST /admin/rate-limits/{activity_name}/override",
@@ -2555,10 +2543,9 @@ mod tests {
         }
 
         // Read-only companion to the start-throttle SET/DELETE pair above
-        // (issue #945): resolves an override's live state directly, so it is
-        // ReadOnly (never Mutating -- it writes nothing) and, having no audit
-        // op, must map to `None` in ALL_MUTATION_ROUTES rather than being
-        // silently absent from the manifest entirely.
+        // (issue #945). It reads an override's live state and writes nothing,
+        // so it is ReadOnly. It has no audit op, so it must map to `None` in
+        // ALL_MUTATION_ROUTES, not be silently absent from the manifest.
         let get_route = "GET /admin/start-throttle/{workflow_name}/override";
         assert!(
             CLASSIFIED_ROUTES
@@ -2598,10 +2585,10 @@ mod tests {
     #[test]
     fn rerun_route_is_classified_and_audited() {
         // Operator re-run of a terminal workflow (issue #777): the route is an
-        // admin-only mutation and must be classified + audited. This dedicated
-        // test -- not just the general exhaustiveness guards, which only
-        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
-        // other -- is what catches a route dropped from BOTH lists.
+        // admin-only mutation and must be classified + audited. The general
+        // exhaustiveness guards only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other. This test catches a route
+        // dropped from BOTH lists.
         let route = "POST /workflows/{id}/rerun";
         assert!(
             CLASSIFIED_ROUTES
@@ -2620,11 +2607,10 @@ mod tests {
 
     #[test]
     fn triage_route_is_classified_and_audited() {
-        // Operator-mutable triage tags (issue #759): the route is an
-        // admin-only mutation and must be classified + audited. This
-        // dedicated test -- not just the general exhaustiveness guards,
-        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
-        // against each other -- is what catches a route dropped from BOTH
+        // Operator-mutable triage tags (issue #759): the route is an admin-only
+        // mutation and must be classified + audited. The general exhaustiveness
+        // guards only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other. This test catches a route dropped from BOTH
         // lists.
         let route = "PATCH /workflows/{id}/triage";
         assert!(
@@ -2645,11 +2631,10 @@ mod tests {
     #[test]
     fn token_routes_are_classified_and_audited() {
         // Scoped API tokens (issue #942): create + revoke are admin-only
-        // mutations; list is a read. This dedicated pin — not just the general
-        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
-        // ALL_MUTATION_ROUTES against each other — is what catches a route
-        // dropped from BOTH lists (the recurring gap the codebase pins
-        // per-route).
+        // mutations; list is a read. The general exhaustiveness guards only
+        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other. This pin catches a route dropped from BOTH lists, the
+        // recurring gap the codebase pins per route.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -2688,7 +2673,6 @@ mod tests {
         );
         assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_CREATE));
         assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_REVOKE));
-        // The list read is explicitly excluded from audit.
         assert!(
             EXCLUDED_ROUTES.contains(&"GET /admin/tokens"),
             "GET /admin/tokens must be in EXCLUDED_ROUTES (read, no audit) (issue #942)"
@@ -2750,13 +2734,12 @@ mod tests {
 
     #[test]
     fn workflow_count_route_is_classified_read_only() {
-        // The grouped workflow-count fleet snapshot (issue #544) is a
-        // read-only fan-out projection, no different from the other cross-shard
-        // read models it's modeled after. This test — not just the general
-        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
-        // and ALL_MUTATION_ROUTES against each other rather than against the
-        // live router — is what actually catches a new route shipping with no
-        // classification at all.
+        // The grouped workflow-count fleet snapshot (issue #544) is a read-only
+        // fan-out projection, like the other cross-shard read models. The
+        // general exhaustiveness guards below only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other, not
+        // against the live router. This test catches a new route that ships
+        // with no classification at all.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -2776,11 +2759,10 @@ mod tests {
     #[test]
     fn dag_run_graph_route_is_classified_read_only() {
         // The DAG run graph view (issue #690) is a read-only projection of a
-        // run's node topology + status. This pinned test — not just the general
-        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
-        // and ALL_MUTATION_ROUTES against each other rather than against the
-        // live router — is what actually catches the route being dropped from
-        // BOTH lists at once.
+        // run's node topology + status. The general exhaustiveness guards below
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against
+        // each other, not against the live router. This test catches the route
+        // dropped from BOTH lists at once.
         let route = "GET /dags/{dag_name}/runs/{run_exec_id}";
         assert!(
             CLASSIFIED_ROUTES
@@ -2803,13 +2785,12 @@ mod tests {
     #[test]
     fn queue_coverage_route_is_classified_read_only() {
         // The fleet-wide task-queue coverage read model (issue #774) is a
-        // read-only fan-out projection, no different from the other cross-shard
-        // read models it's modeled after (workflow_reachability, workflow_count,
-        // shard_health). This pinned test — not just the general exhaustiveness
-        // guards below, which only cross-check CLASSIFIED_ROUTES and
-        // ALL_MUTATION_ROUTES against each other rather than against the live
-        // router — is what actually catches the route being dropped from BOTH
-        // lists at once.
+        // read-only fan-out projection. It is no different from the other
+        // cross-shard read models it is modeled after (workflow_reachability,
+        // workflow_count, shard_health). The general exhaustiveness guards
+        // below only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other, not against the live router. This test catches
+        // the route dropped from BOTH lists at once.
         let route = "GET /admin/queue-coverage";
         assert!(
             CLASSIFIED_ROUTES
@@ -2832,11 +2813,11 @@ mod tests {
     #[test]
     fn lineage_tree_route_is_classified_read_only() {
         // The recursive cross-shard lineage tree (issue #621) is a
-        // point-in-time read over the existing `parent_id` edges: it appends no
+        // point-in-time read over the existing `parent_id` edges. It appends no
         // events, performs no writes, and adds no `WorkflowEvent` variant.
-        // Pinned here rather than relying on the general exhaustiveness guards,
-        // which only cross-check CLASSIFIED_ROUTES against ALL_MUTATION_ROUTES
-        // and therefore stay green if the route is dropped from BOTH lists.
+        // The general exhaustiveness guards only cross-check CLASSIFIED_ROUTES
+        // against ALL_MUTATION_ROUTES. They stay green if the route is dropped
+        // from BOTH lists, so this test pins it.
         let route = "GET /workflows/{id}/tree";
         assert!(
             CLASSIFIED_ROUTES
@@ -2861,11 +2842,10 @@ mod tests {
         // The open-awaitables diagnostic (issue #615) replays recorded history
         // to the current suspension point and enumerates every open awaitable.
         // It is read-only (appends no events, performs no writes) and writes no
-        // audit rows. This pinned test — not just the general exhaustiveness
-        // guards below, which only cross-check CLASSIFIED_ROUTES and
-        // ALL_MUTATION_ROUTES against each other rather than against the live
-        // router — is what actually catches the route being dropped from BOTH
-        // lists at once.
+        // audit rows. The general exhaustiveness guards below only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other, not
+        // against the live router. This test catches the route dropped from
+        // BOTH lists at once.
         let route = "GET /workflows/{id}/awaitables";
         assert!(
             CLASSIFIED_ROUTES
@@ -2888,13 +2868,12 @@ mod tests {
     #[test]
     fn diagnose_route_is_classified_read_only() {
         // The per-execution stall diagnosis endpoint (issue #809) resolves the
-        // owning shard from the ExecutionId and reads only that shard: it
+        // owning shard from the ExecutionId and reads only that shard. It
         // appends no WorkflowEvent, performs no task-queue mutation, and adds
-        // no migration, so it is safe to call repeatedly. Pinned here (not only
-        // via the general exhaustiveness guards, which cross-check
-        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
-        // than against the live router) so dropping it from BOTH lists at once
-        // is caught.
+        // no migration. So it is safe to call repeatedly.
+        // The general exhaustiveness guards only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other, not against the live
+        // router. This test catches the route dropped from BOTH lists at once.
         let route = "GET /workflows/{id}/diagnose";
         assert!(
             CLASSIFIED_ROUTES
@@ -2919,11 +2898,11 @@ mod tests {
         // The single-execution replay-diagnosis endpoint (issue #614) loads one
         // execution's recorded history and replays it against the currently
         // registered handler, returning a structured verdict. It is read-only
-        // (appends no events, performs no writes) and writes no audit rows. This
-        // pinned test — not just the general exhaustiveness guards below, which
-        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
-        // other rather than against the live router — is what actually catches
-        // the route being dropped from BOTH lists at once.
+        // (appends no events, performs no writes) and writes no audit rows. The
+        // general exhaustiveness guards below only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other, not
+        // against the live router. This test catches the route dropped from
+        // BOTH lists at once.
         let route = "POST /workflows/{id}/replay-diagnosis";
         assert!(
             CLASSIFIED_ROUTES
@@ -2947,11 +2926,10 @@ mod tests {
     fn progress_stream_route_is_classified_read_only() {
         // The ephemeral workflow progress SSE stream (issue #791) is a
         // read-only, best-effort side channel; it never mutates state and
-        // writes no audit rows. This pinned test — not just the general
-        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
-        // and ALL_MUTATION_ROUTES against each other rather than against the
-        // live router — is what actually catches the route being dropped from
-        // BOTH lists at once.
+        // writes no audit rows. The general exhaustiveness guards below only
+        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other, not against the live router. This test catches the route
+        // dropped from BOTH lists at once.
         let route = "GET /workflows/{id}/stream";
         assert!(
             CLASSIFIED_ROUTES
@@ -2974,9 +2952,9 @@ mod tests {
     #[test]
     fn admin_status_route_is_classified_read_only() {
         // The rolled-up health summary (issue #679) is a read-only fan-out
-        // projection. This pin — not just the general exhaustiveness guards,
-        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
-        // against each other — is what catches the route shipping unclassified.
+        // projection. The general exhaustiveness guards only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other. This
+        // pin catches the route shipping unclassified.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -2996,10 +2974,9 @@ mod tests {
     #[test]
     fn admin_canary_route_is_classified_read_only() {
         // The synthetic liveness canary freshness report (issue #796) is a
-        // read-only cross-shard projection. This pin — not just the general
-        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
-        // ALL_MUTATION_ROUTES against each other — is what catches the route
-        // shipping unclassified.
+        // read-only cross-shard projection. The general exhaustiveness guards
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against
+        // each other. This pin catches the route shipping unclassified.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -3024,11 +3001,10 @@ mod tests {
     #[test]
     fn schedule_update_route_is_classified_mutating() {
         // The in-place schedule update (issue #771) is a mutating, audited
-        // operator route. This pinned test — not just the general
-        // exhaustiveness guards below, which only cross-check
-        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
-        // than against the live router — is what actually catches the route
-        // being dropped from BOTH lists at once.
+        // operator route. The general exhaustiveness guards below only
+        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other, not against the live router. This test catches the route
+        // dropped from BOTH lists at once.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -3054,11 +3030,10 @@ mod tests {
     fn usage_report_route_is_classified_read_only() {
         // The historical per-tenant usage report (issue #596) is a read-only
         // fan-out aggregation, no different from workflow_count / debounce /
-        // concurrency. This test — not just the general exhaustiveness guards
-        // below, which only cross-check CLASSIFIED_ROUTES and
-        // ALL_MUTATION_ROUTES against each other rather than against the live
-        // router — is what actually catches a new route shipping with no
-        // classification at all.
+        // concurrency. The general exhaustiveness guards below only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other, not
+        // against the live router. This test catches a new route that ships
+        // with no classification at all.
         assert!(
             CLASSIFIED_ROUTES
                 .iter()
@@ -3082,15 +3057,14 @@ mod tests {
 
     #[test]
     fn completion_delivery_routes_are_classified() {
-        // Issue #605 code review: the completion-callback delivery list and
-        // redrive routes shipped registered in the router (management_api_routes
-        // in autumn-harvest-plugin/src/api.rs) but absent from
-        // CLASSIFIED_ROUTES/AUDITED_OPERATIONS/ALL_MUTATION_ROUTES entirely —
-        // exactly the gap issues #544/#601 each independently hit and had to
-        // retroactively patch, since the general exhaustiveness guards below
-        // only cross-check these lists against each other, never against the
-        // live router. This test is what actually catches that class of gap
-        // for these two specific routes.
+        // Issue #605: the completion-callback delivery list and redrive routes
+        // shipped registered in the router (management_api_routes in
+        // autumn-harvest-plugin/src/api.rs). They were absent from
+        // CLASSIFIED_ROUTES/AUDITED_OPERATIONS/ALL_MUTATION_ROUTES entirely.
+        // Issues #544/#601 each hit the same gap and had to patch it later. The
+        // general exhaustiveness guards below only cross-check these lists
+        // against each other, never against the live router. This test catches
+        // that class of gap for these two routes.
         assert!(
             CLASSIFIED_ROUTES.iter().any(|(r, c)| {
                 *r == "GET /workflows/{id}/completion-deliveries" && *c == RouteClass::ReadOnly
@@ -3136,11 +3110,11 @@ mod tests {
     fn payload_decode_read_op_is_registered_in_audited_operations() {
         // Issue #608: operator read-path decoding of codec-encrypted payloads
         // writes one best-effort audit row per request that decoded/marked
-        // ≥1 envelope (SSE: one row at stream open when decode mode is
-        // active). It is a *read* audit like OP_EXECUTION_STREAM_OPEN — no
-        // CLASSIFIED_ROUTES/ALL_MUTATION_ROUTES change (no route mutates and
-        // no new route exists), but the operation name itself must be in the
-        // registry so audit consumers can enumerate it.
+        // ≥1 envelope. SSE writes one row at stream open when decode mode is
+        // active. It is a *read* audit like OP_EXECUTION_STREAM_OPEN. No route
+        // mutates and no new route exists, so
+        // CLASSIFIED_ROUTES/ALL_MUTATION_ROUTES do not change. The operation
+        // name must still be in the registry so audit consumers can list it.
         assert_eq!(OP_PAYLOAD_DECODE_READ, "payload.decode_read");
         assert!(
             AUDITED_OPERATIONS.contains(&OP_PAYLOAD_DECODE_READ),
@@ -3239,8 +3213,8 @@ mod tests {
             !deny_readonly_mutation(true, RouteClass::PublicSafe),
             "read-only principal must reach a PublicSafe route"
         );
-        // A non-read-only (admin/anon) principal is never denied by THIS fn —
-        // their access is decided by the existing admin gates, not this layer.
+        // This function never denies an admin or anonymous principal. The
+        // existing admin gates decide their access, not this layer.
         assert!(!deny_readonly_mutation(false, RouteClass::Mutating));
         assert!(!deny_readonly_mutation(false, RouteClass::ReadOnly));
         assert!(!deny_readonly_mutation(false, RouteClass::PublicSafe));
@@ -3248,14 +3222,13 @@ mod tests {
 
     #[test]
     fn newly_classified_mutations_are_mutating_and_covered() {
-        // Privilege-escalation guard (issue #776): every route added to the
-        // classification table as a mutation in this slice MUST be
-        // RouteClass::Mutating — a wrong Mutating→ReadOnly entry would let a
-        // read-only principal force-open a circuit / create a calendar / retry
-        // a DAG / start-via-update. Dedicated pin (like the legal-hold pin):
-        // the general exhaustiveness guards only cross-check the two lists
-        // against each other, so this catches a class regression on these
-        // specific routes.
+        // Privilege-escalation guard (issue #776): every route this slice adds
+        // to the classification table as a mutation MUST be
+        // RouteClass::Mutating. A wrong ReadOnly entry would let a read-only
+        // principal force-open a circuit, create a calendar, retry a DAG, or
+        // start via update. The general exhaustiveness guards only cross-check
+        // the two lists against each other. So, like the legal-hold pin, this
+        // test catches a class regression on these routes.
         let audited: std::collections::HashSet<&str> = ALL_MUTATION_ROUTES
             .iter()
             .filter_map(|(r, op)| op.map(|_| *r))

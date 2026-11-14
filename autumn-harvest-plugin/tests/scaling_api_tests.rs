@@ -317,7 +317,6 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     );
     let app = harvest_api_router(state);
 
-    // 1. JSON scaling API format
     let (status, body) = get_json(&app, "/admin/queues/scaling").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_array());
@@ -351,7 +350,6 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert_eq!(qescape["scheduled"], 0);
     assert_eq!(qescape["active_workers"], 1);
 
-    // 2. Query format=prometheus
     let (status_prom_q, text_prom_q) =
         get_text(&app, "/admin/queues/scaling?format=prometheus").await;
     assert_eq!(status_prom_q, StatusCode::OK);
@@ -366,7 +364,6 @@ async fn single_shard_scaling_signals_endpoint_correctly_categorizes_tasks_and_w
     assert!(text_prom_q.contains("harvest_queue_backlog{queue=\"queue\\\"\\\\\\\\a\"} 1"));
     assert!(text_prom_q.contains("harvest_queue_active_workers{queue=\"queue\\\"\\\\\\\\a\"} 1"));
 
-    // 3. /admin/metrics endpoint
     let (status_metrics, text_metrics) = get_text(&app, "/admin/metrics").await;
     assert_eq!(status_metrics, StatusCode::OK);
     assert!(text_metrics.contains("harvest_queue_backlog{queue=\"queue-a\"} 1"));

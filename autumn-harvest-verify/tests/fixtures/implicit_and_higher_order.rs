@@ -5,9 +5,9 @@
 //!         -o implicit_and_higher_order.mir implicit_and_higher_order.rs
 //!
 //! `WorkflowContext` is a *stand-in* for the real `autumn_harvest::WorkflowContext`,
-//! exactly as in `format_and_outparams.rs`: the model matches sinks and
+//! exactly as in `format_and_outparams.rs`. The model matches sinks and
 //! sanctioned primitives on the receiver's LAST path segment plus the method
-//! name, so a local struct with the same names exercises the same rules.
+//! name. So a local struct with the same names exercises the same rules.
 //!
 //! Every workflow-like fn has an `__autumn_workflow_info_<name>` companion,
 //! which is what `entry::discover` keys on.

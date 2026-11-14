@@ -36,13 +36,12 @@ pub enum WorkflowOutcome {
         output: Value,
         /// Signals delivered into history but never consumed by the workflow
         /// at this terminal outcome, keyed by signal name → occurrence count
-        /// (issue #684). Computed by the executor's terminal arms from the
-        /// driven matcher (the only place the authoritative consumed-set
-        /// exists) and carried out to the worker, which emits
-        /// `harvest.signal.unhandled` **at the same site and under the same
-        /// suppressions as `record_workflow_terminal`** (#519) — downstream of
-        /// the #603 ND-block gate and the fast-path pause discard. Empty for
-        /// every non-terminal-arm construction.
+        /// (issue #684). The executor's terminal arms compute it from the
+        /// driven matcher, the only holder of the authoritative consumed set.
+        /// The worker emits `harvest.signal.unhandled` **at the same site and
+        /// under the same suppressions as `record_workflow_terminal`** (#519).
+        /// That site is downstream of the #603 ND-block gate and the fast-path
+        /// pause discard. Empty for every non-terminal-arm construction.
         unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow function returned an error, or the engine detected
@@ -58,21 +57,20 @@ pub enum WorkflowOutcome {
         non_deterministic_details: Option<crate::error::NonDeterministicDetails>,
         /// `true` only when this failure is a **contained handler panic** the
         /// engine caught at the dispatch boundary (issue #782), as opposed to an
-        /// author-returned `Err`. This drives the worker's non-terminal
-        /// panic-retry gate; it is executor-internal state and is never
-        /// persisted. `error` already carries the typed `HandlerPanic` envelope
-        /// in that case, so the string channel alone is deliberately **not**
-        /// used to gate retry (an author who fabricates a `HandlerPanic`
-        /// error-type string reaches this variant with `handler_panic == false`
-        /// and never triggers the panic-retry loop).
+        /// author-returned `Err`. It drives the worker's non-terminal
+        /// panic-retry gate. It is executor-internal and never persisted.
+        /// `error` also carries the typed `HandlerPanic` envelope, but the
+        /// string alone deliberately does **not** gate retry. An author who
+        /// fabricates a `HandlerPanic` error-type string gets
+        /// `handler_panic == false` and never enters the panic-retry loop.
         handler_panic: bool,
         /// Unconsumed delivered signals at this terminal outcome (issue #684).
-        /// See [`WorkflowOutcome::Completed::unhandled_signals`]. Populated on
-        /// the executor's `Ok(Err)` / deferred-nd-reroute terminal arms; a
-        /// `Failed { non_deterministic_details: Some(_) }` ND-block outcome
-        /// carries it too but is diverted by the worker's #603 gate before the
-        /// emission site, so it is never counted. The skipped-command arm
-        /// (issue #1791) also populates it.
+        /// See [`WorkflowOutcome::Completed::unhandled_signals`]. The
+        /// `Ok(Err)`, deferred-nd-reroute and skipped-command (issue #1791)
+        /// terminal arms populate it. An ND-block outcome
+        /// (`non_deterministic_details: Some(_)`) carries it too. The worker's
+        /// #603 gate diverts that outcome before the emission site, so it is
+        /// never counted.
         unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
@@ -92,9 +90,8 @@ pub enum WorkflowOutcome {
         error: String,
     },
     /// The workflow signalled `continue_as_new`. The current execution is
-    /// terminal and the worker should atomically start a fresh execution
-    /// with the same logical `WorkflowId` but a new `ExecutionId`, passing
-    /// `input` as the initial payload.
+    /// terminal. The worker atomically starts a fresh execution with the same
+    /// `WorkflowId`, a new `ExecutionId`, and `input` as its payload.
     ContinuedAsNew {
         /// JSON payload to pass to the next iteration of the workflow.
         input: Value,
@@ -245,9 +242,9 @@ async fn run_workflow_handler_cycle(
 ) -> HandlerCycleResult {
     use futures::FutureExt as _;
     // Issue #782 (PR #1012 review): contain a panic during future *construction*.
-    // The `catch_unwind` below wraps only the future's poll; a hand-written
-    // handler that does synchronous work before returning its boxed future would
-    // panic here, before the future exists, and escape the poll-time guard.
+    // The `catch_unwind` below wraps only the future's poll. A hand-written
+    // handler can do synchronous work before it returns its boxed future. A
+    // panic there escapes the poll-time guard.
     let handler_fut = match crate::error::catch_construct(|| handler(ctx, input)) {
         Ok(fut) => fut,
         Err(message) => return HandlerCycleResult::Panicked(message),
@@ -367,10 +364,10 @@ fn deadlock_error() -> String {
 /// [`ERROR_TYPE_HANDLER_PANIC`](crate::failure::ERROR_TYPE_HANDLER_PANIC)
 /// class (issue #782).
 ///
-/// The resulting string is what the terminal `WorkflowFailed` event and the
-/// worker's `HarvestError::WorkflowFailed` surface carry, so operators and
-/// result-awaiting callers can classify a panic without parsing the message,
-/// and the worker's #523 exclusion guard can key on the error type.
+/// The terminal `WorkflowFailed` event and the worker's
+/// `HarvestError::WorkflowFailed` carry this string. Operators and
+/// result-awaiting callers can then classify a panic without parsing the
+/// message. The worker's #523 exclusion guard keys on the error type.
 fn encode_workflow_panic(message: String) -> String {
     use crate::failure::{ERROR_TYPE_HANDLER_PANIC, IntoWorkflowErrorString as _, WorkflowFailure};
     WorkflowFailure::new(ERROR_TYPE_HANDLER_PANIC, message)
@@ -401,17 +398,18 @@ pub struct WorkflowExecuteSpanMeta {
     pub link_traceparent: Option<String>,
     /// The worker build ID of the worker executing this workflow.
     pub build_id: Option<String>,
-    /// The effective `execution_timeout` budget for this run (issue #243/#772),
-    /// threaded into the [`WorkflowContext`] as the deadline fallback and as the
+    /// The effective `execution_timeout` budget for this run (issue #243/#772).
+    /// The [`WorkflowContext`] uses it as the deadline fallback and as the
     /// total budget for the deadline-fraction continue-as-new check. `None` when
     /// the workflow has no `execution_timeout`.
     pub execution_timeout: Option<chrono::Duration>,
     /// The authoritative absolute deadline for this run (issue #772), read live
-    /// from the execution row's `deadline_at` column. Threaded into the
-    /// [`WorkflowContext`] so `ctx.deadline()` / `ctx.should_continue_as_new()`
-    /// reason about the **effective** deadline the timeout scanner enforces —
-    /// which pause/resume (#383) and redrive push forward past
-    /// `started_at + execution_timeout`. `None` = fall back to start + timeout.
+    /// from the execution row's `deadline_at` column.
+    ///
+    /// `ctx.deadline()` and `ctx.should_continue_as_new()` then use the
+    /// **effective** deadline that the timeout scanner enforces. Pause/resume
+    /// (#383) and redrive push it past `started_at + execution_timeout`.
+    /// `None` = fall back to start + timeout.
     pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The execution id of the parent workflow that spawned this run, or `None`
     /// for a top-level run (issue #698). The worker populates it from the
@@ -433,9 +431,9 @@ pub struct WorkflowExecuteSpanMeta {
 /// Classification of a bounded, read-only query-replay drive (issue #612).
 ///
 /// A query drives the workflow handler purely in replay against recorded
-/// history — emitting no commands and appending no events — to reconstruct the
-/// context state its registered query handlers read. This enum reports where
-/// that drive stopped so the caller can decide how to respond:
+/// history. It emits no commands and appends no events. The drive rebuilds the
+/// context state that the registered query handlers read. This enum reports
+/// where that drive stopped:
 ///
 /// - [`ReachedTerminal`](Self::ReachedTerminal): the handler ran to `Poll::Ready`
 ///   (`Ok` **or** `Err`), i.e. the full history was drained and the context now
@@ -454,59 +452,60 @@ pub enum QueryReplayOutcome {
     /// The drive exceeded the supplied deadline.
     TimedOut,
     /// The workflow handler **panicked** (unwound) during the replay drive
-    /// (issue #782). The panic is contained here — the process/request survives
-    /// — but the reconstructed context state is untrustworthy, so a query
+    /// (issue #782). The panic is contained, so the process and request
+    /// survive. The reconstructed context state is untrustworthy, so a query
     /// cannot be safely served against it.
     Panicked,
 }
 
-/// Returns `true` when `cmd` is a **replay-significant** workflow command — i.e.
-/// one that reflects genuine workflow progress or a suspension, as opposed to a
-/// pure-metadata command that does not affect replay determinism.
+/// Returns `true` when `cmd` is a **replay-significant** workflow command.
+///
+/// Such a command reflects genuine workflow progress or a suspension. A
+/// pure-metadata command does not affect replay determinism.
 ///
 /// The pure-metadata exclusions are:
 /// - [`UpsertSearchAttributes`](WorkflowCommand::UpsertSearchAttributes) and
 ///   [`SetCurrentDetails`](WorkflowCommand::SetCurrentDetails): operator-facing
 ///   metadata, never part of the deterministic command stream.
 /// - [`PublishProgress`](WorkflowCommand::PublishProgress): an ephemeral,
-///   best-effort live-output side channel (issue #791) that appends nothing to
-///   `harvest_events` and is suppressed during replay — replay-neutral by
-///   construction.
+///   best-effort live-output side channel (issue #791). It appends nothing to
+///   `harvest_events` and is suppressed during replay, so it is replay-neutral
+///   by construction.
 /// - [`RecordLog`](WorkflowCommand::RecordLog): a durable but purely
-///   observational per-execution log line (issue #790). Written to a separate
-///   table, never to `harvest_events`, and suppressed during replay by the same
-///   gate as the `tracing` sink — replay-neutral by construction.
+///   observational per-execution log line (issue #790). It goes to a separate
+///   table, never to `harvest_events`. The same gate as the `tracing` sink
+///   suppresses it during replay, so it is replay-neutral by construction.
 /// - [`CancelRaceLosers`](WorkflowCommand::CancelRaceLosers): for the
-///   timer+signal race shape (issue #600) this is a pure, deterministic function
-///   of already-resolved history (the winner is fixed by recorded order), so it
-///   is re-emitted identically on every replay and carries no new information.
+///   timer+signal race shape (issue #600) it is a pure function of resolved
+///   history. Recorded order fixes the winner. So every replay re-emits it
+///   identically, and it carries no new information.
 /// - [`ReleaseMutex`](WorkflowCommand::ReleaseMutex): a durable mutex release
-///   (issue #691) is event-less bookkeeping — a dropped [`MutexGuard`] always
-///   pushes exactly one release, deterministically, and it appends nothing to
-///   `harvest_events`. Like `CancelRaceLosers` it is re-emitted identically on
-///   every replay (the guard reconstructs from the recorded `MutexGranted`
-///   anchor), so a mutex-holding workflow that completes/continues with the
-///   guard dropped must NOT be flagged as "new commands emitted beyond recorded
-///   history" on the strict replay path. (Issue #1175: canary replay's
-///   completing path doesn't call this function at all any more, so the
-///   question doesn't arise there — every command past the frontier is
-///   tolerated, bookkeeping or not.)
+///   (issue #691) is event-less bookkeeping. A dropped [`MutexGuard`] always
+///   pushes exactly one release and appends nothing to `harvest_events`. Like
+///   `CancelRaceLosers`, every replay re-emits it identically, because the
+///   guard reconstructs from the recorded `MutexGranted` anchor. A
+///   mutex-holding workflow that ends with the guard dropped must NOT be
+///   flagged as "new commands emitted beyond recorded history" on the strict
+///   replay path. (Issue #1175: the completing path of canary replay no
+///   longer calls this function. It tolerates every command past the
+///   frontier.)
 /// - A drop release (issue #2193): the `ScheduleActivity` that a dropped
 ///   `Session` issues. A run that ends first never records it, so a replay of
 ///   that run must not flag it.
 ///
-/// This is the **single source of truth** for two callers that must agree, so
-/// the command classification is never re-enumerated by hand:
+/// This is the **single source of truth** for two callers that must agree:
 /// - the completion-time "new commands emitted beyond recorded history"
 ///   non-determinism check in [`run_workflow_with_state`]/[`run_strict_with_ctx`],
 ///   and
-/// - the query-replay drivers' per-poll **delta** suspension discriminator
-///   ([`drive_query_replay`] / [`drive_query_replay_async`]): a `Poll::Pending`
-///   cycle whose replay-significant command count *increased* is a genuine
-///   [`Suspended`](QueryReplayOutcome::Suspended) (case 1); a zero-delta cycle is
-///   either a `tokio::task::yield_now()` spin the driver keeps driving to the
-///   deadline (case 2 → [`TimedOut`](QueryReplayOutcome::TimedOut)) or a
-///   command-less cold park such as `await_condition` that suspends immediately
+/// - the per-poll **delta** suspension discriminator of the query-replay
+///   drivers ([`drive_query_replay`] / [`drive_query_replay_async`]).
+///
+/// In the drivers, a `Poll::Pending` cycle whose significant command count
+/// *increased* is a genuine [`Suspended`](QueryReplayOutcome::Suspended)
+/// (case 1). A zero-delta cycle is one of two cases:
+/// - a `tokio::task::yield_now()` spin that the driver drives to the deadline
+///   (case 2 → [`TimedOut`](QueryReplayOutcome::TimedOut)), or
+/// - a command-less cold park such as `await_condition` that suspends at once
 ///   (case 3 → [`Suspended`](QueryReplayOutcome::Suspended)).
 pub(crate) fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
     // A run that ends first never records a drop release (issue #2193).
@@ -534,17 +533,17 @@ pub(crate) fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
 /// [`drive_query_replay_async`]) to detect a self-wake — a workflow calling
 /// `tokio::task::yield_now()`.
 ///
-/// **Out of a tokio runtime** (the 16 pure `#[test]` callers of the sync driver)
-/// `yield_now` fires the wake *synchronously* during the poll, so the flag is
-/// readable immediately. **Inside a runtime** (the real HTTP query path)
-/// `yield_now` DEFERS its wake to the scheduler queue, so the flag only flips
-/// after the driver itself cooperatively yields (a single
-/// `tokio::task::yield_now().await` "quiet window" in
-/// [`drive_query_replay_async`]). Either way, the authoritative "genuine
-/// suspension" signal is the per-poll command **delta**
-/// ([`WorkflowContext::count_commands`] over [`is_replay_significant_command`]);
-/// this flag only discriminates the two zero-delta cases (self-wake spin vs.
-/// command-less cold park).
+/// **Out of a tokio runtime** (the pure `#[test]` callers of the sync driver),
+/// `yield_now` fires the wake *synchronously* during the poll. The flag is then
+/// readable at once. **Inside a runtime** (the real HTTP query path),
+/// `yield_now` DEFERS its wake to the scheduler queue. The flag then flips only
+/// after the driver itself yields once, the `tokio::task::yield_now().await`
+/// "quiet window" in [`drive_query_replay_async`].
+///
+/// The authoritative "genuine suspension" signal is the per-poll command
+/// **delta** ([`WorkflowContext::count_commands`] over
+/// [`is_replay_significant_command`]). This flag only separates the two
+/// zero-delta cases: self-wake spin and command-less cold park.
 struct QueryReplayWaker(std::sync::atomic::AtomicBool);
 
 impl futures::task::ArcWake for QueryReplayWaker {
@@ -566,31 +565,30 @@ enum DriveStep {
     /// emitted ≥1 replay-significant command on this poll, i.e. a genuine
     /// workflow suspension (case 1).
     CommandSuspension,
-    /// `Poll::Pending` with a **zero** per-poll command delta: either a
-    /// self-waking `tokio::task::yield_now()` spin (`woken == true`, case 2 —
-    /// keep driving to the deadline) or a command-less cold park such as
-    /// `await_condition` (`woken == false`, case 3 — suspend immediately). In a
-    /// runtime the caller must open a scheduler "quiet window" before trusting
-    /// `woken`, since tokio defers the `yield_now` wake.
+    /// `Poll::Pending` with a **zero** per-poll command delta.
+    ///
+    /// `woken == true` is a self-waking `tokio::task::yield_now()` spin (case
+    /// 2): keep driving to the deadline. `woken == false` is a command-less
+    /// cold park such as `await_condition` (case 3): suspend at once. In a
+    /// runtime, tokio defers the `yield_now` wake. The caller must open a
+    /// scheduler "quiet window" before it trusts `woken`.
     MaybeSpin { woken: bool },
 }
 
 /// Poll the query-replay handler future exactly once and classify the result
 /// (issue #612).
 ///
-/// This helper is **pure and synchronous**: it builds the `!Send`
+/// This helper is **pure and synchronous**. It builds the `!Send`
 /// [`futures::task::waker_ref`] and [`std::task::Context`] internally and drops
-/// them before returning a plain [`DriveStep`]. That is load-bearing for
-/// [`drive_query_replay_async`]: the only values that ever cross its
-/// `yield_now().await` are `Send` (the `Arc<QueryReplayWaker>` flag, the
-/// `Pin<Box<dyn Future + Send>>` handler future, and `&WorkflowContext`), because
-/// the waker/`Context` never escape this function's stack frame.
+/// them before it returns a plain [`DriveStep`]. That is load-bearing for
+/// [`drive_query_replay_async`]. Only `Send` values cross its
+/// `yield_now().await`: the `Arc<QueryReplayWaker>` flag, the
+/// `Pin<Box<dyn Future + Send>>` handler future, and `&WorkflowContext`.
 ///
-/// `before_significant` is the running count of replay-significant commands the
-/// context held *before* this poll; the returned `usize` is the count *after*,
-/// so the caller threads it forward and reads the per-poll delta
-/// (`after > before` ⇒ a command was emitted on this poll ⇒ a genuine
-/// suspension).
+/// `before_significant` is the count of replay-significant commands before
+/// this poll. The returned `usize` is the count *after*. The caller threads it
+/// forward. `after > before` means this poll emitted a command, which is a
+/// genuine suspension.
 fn poll_query_step(
     fut: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<Value, String>> + Send)>,
     flag: &std::sync::Arc<QueryReplayWaker>,
@@ -605,10 +603,10 @@ fn poll_query_step(
     let waker = futures::task::waker_ref(flag);
     let mut poll_cx = std::task::Context::from_waker(&waker);
     // Issue #782: contain a workflow-handler panic during the read-only replay
-    // drive. Without this, a panicking handler unwinds through the caller (the
-    // plugin's query handler / axum request task) — the process survives but the
-    // request 500s ungracefully. Query replays never emit workflow commands or
-    // append events, so there is nothing to roll back.
+    // drive. Without this, the panic unwinds through the plugin's query handler
+    // or axum request task. The process survives, but the request fails with
+    // an ungraceful 500. Query replays emit no commands and append no events,
+    // so there is nothing to roll back.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(&mut poll_cx))) {
         Err(panic_payload) => (
             DriveStep::Panicked(crate::error::panic_message(panic_payload)),
@@ -642,31 +640,33 @@ fn query_drive_deadline(timeout: Duration) -> Option<std::time::Instant> {
 
 /// `true` when the finite `deadline` (if any) has already elapsed.
 ///
-/// Checked BEFORE each poll so an already-elapsed (or zero) deadline classifies
-/// deterministically as `TimedOut` without a hang. This ordering is intentional
-/// and load-bearing: the pure test
-/// `past_deadline_classifies_as_timed_out_deterministically` passes
-/// `Duration::ZERO` and expects `TimedOut`, so switching to poll-first would
-/// break the deterministic-timeout semantics. (The running-path parity nit — a
-/// zero-timeout running query would classify as `TimedOut` rather than serve
-/// partial state — is intentionally not addressed: the default `query_timeout`
-/// is 5s, so this is unreachable in practice.)
+/// Checked BEFORE each poll, so an elapsed (or zero) deadline classifies
+/// deterministically as `TimedOut` without a hang. This order is load-bearing.
+/// The pure test `past_deadline_classifies_as_timed_out_deterministically`
+/// passes `Duration::ZERO` and expects `TimedOut`. Poll-first would break it.
+/// A zero-timeout running query therefore classifies as `TimedOut` and does not
+/// serve partial state. That parity gap is left on purpose: the default
+/// `query_timeout` is 5s, so it is unreachable in practice.
 fn query_deadline_elapsed(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|d| std::time::Instant::now() >= d)
 }
 
-/// The boxed, `Send` handler future a query-replay drive polls. Aliased to keep
-/// the [`construct_query_handler_fut`] signature under clippy's `type_complexity`
-/// bar; identical in shape to [`WorkflowHandlerFn`]'s return type.
+/// The boxed, `Send` handler future a query-replay drive polls.
+///
+/// The alias keeps [`construct_query_handler_fut`] under clippy's
+/// `type_complexity` bar. It has the shape of the return type of
+/// [`WorkflowHandlerFn`].
 type QueryHandlerFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
 
 /// Construct the handler future for a query-replay drive, containing a
-/// construction-phase panic (issue #782 / PR #1012 review). A hand-written
-/// handler doing synchronous work before returning its boxed future can panic
-/// during construction; the poll-time `catch_unwind` in [`poll_query_step`]
-/// cannot reach that, so the construction call is wrapped too. Query replays
-/// emit no commands and append no events, so there is nothing to roll back.
+/// construction-phase panic (issue #782 / PR #1012 review).
+///
+/// A hand-written handler can do synchronous work before it returns its boxed
+/// future, and panic there. The poll-time `catch_unwind` in [`poll_query_step`]
+/// cannot reach that panic, so the construction call is wrapped too. Query
+/// replays emit no commands and append no events, so there is nothing to roll
+/// back.
 fn construct_query_handler_fut(
     ctx: &WorkflowContext,
     handler: WorkflowHandlerFn,
@@ -689,15 +689,15 @@ fn construct_query_handler_fut(
 /// non-spin cases; kept in one place so the sync and async loops agree.
 ///
 /// The `Ready` / `CommandSuspension` / cold-park (`MaybeSpin { woken: false }`)
-/// arms all flush push-based signal handlers before returning (issue #612, Codex
-/// P2 PR #993): a push-based signal handler (issue #546) whose target
-/// `SignalReceived` became claimable but was never picked up by a real
-/// cursor-advancing call this cycle leaves that event stashed. The caller's
+/// arms all flush push-based signal handlers before returning (issue #612, PR
+/// #993). A push-based signal handler (issue #546) can see its target
+/// `SignalReceived` become claimable. If no cursor-advancing call picks it up
+/// this cycle, that event stays stashed. The caller's
 /// `history_has_unconsumed_events()` drift check (`hydrate_ctx_for_query`) runs
-/// *after* the drive returns, so without the flush a truthfully replayed run
-/// would be misclassified as 410. The flush is cursor-bound and
-/// push-handler-only, so it never consumes a signal a genuine pull-based
-/// `wait_for_signal` or an open signal-or-deadline race is still waiting on. A
+/// *after* the drive returns. Without the flush, it would misclassify a
+/// truthfully replayed run as 410. The flush is cursor-bound and
+/// push-handler-only. So it never consumes a signal that a pull-based
+/// `wait_for_signal` or an open signal-or-deadline race still waits on. It is a
 /// no-op when no handlers are registered (the common case).
 fn finish_query_drive(ctx: &WorkflowContext, outcome: QueryReplayOutcome) -> QueryReplayOutcome {
     ctx.flush_pending_signal_handlers();
@@ -710,39 +710,34 @@ fn finish_query_drive(ctx: &WorkflowContext, outcome: QueryReplayOutcome) -> Que
 /// This is **read-only**: it never persists anything. The provided `ctx` must
 /// already be a replay context (built via
 /// [`WorkflowContext::for_replay_with_state_and_history_policy`]) with its query
-/// handlers registered; recorded events resolve synchronously via pre-sent
-/// oneshot channels, so the whole history replays without I/O. The returned
-/// [`QueryReplayOutcome`] tells the caller whether the context now reflects the
-/// workflow's final state ([`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal)),
-/// stopped at a genuine suspension with insufficient history
-/// ([`Suspended`](QueryReplayOutcome::Suspended)), or blew the deadline
-/// ([`TimedOut`](QueryReplayOutcome::TimedOut)).
+/// handlers registered. Recorded events resolve synchronously via pre-sent
+/// oneshot channels, so the whole history replays without I/O.
 ///
 /// The `Ok`/`Err` return value of the workflow function is intentionally
-/// ignored — a `FAILED` run still reconstructs its final internal state, which
-/// is exactly what a post-mortem query wants to read.
+/// ignored. A `FAILED` run still reconstructs its final internal state, which
+/// is what a post-mortem query reads.
 ///
 /// # Sync vs. async
 ///
-/// This synchronous entry point exists for the ~16 pure `#[test]` callers in
+/// This synchronous entry point serves the pure `#[test]` callers in
 /// `query_terminal_tests.rs`, which run **out of a tokio runtime**. There
-/// `tokio::task::yield_now()` fires its wake *synchronously*, so a self-wake spin
-/// (case 2) is observable directly on the [`QueryReplayWaker`] flag with no
-/// scheduler yield. The real production caller uses
-/// [`drive_query_replay_async`], which opens a scheduler "quiet window" to
-/// observe tokio's *deferred* `yield_now` wake inside a runtime.
+/// `tokio::task::yield_now()` fires its wake *synchronously*. The
+/// [`QueryReplayWaker`] flag then shows a self-wake spin (case 2) with no
+/// scheduler yield. The production caller uses [`drive_query_replay_async`].
+/// It opens a scheduler "quiet window" to see tokio's *deferred* `yield_now`
+/// wake inside a runtime.
 ///
 /// Suspension is discriminated by the per-poll **command delta**
 /// ([`poll_query_step`]), not waker timing:
 /// - `CommandSuspension` (≥1 replay-significant command this poll) → `Suspended`.
 /// - `MaybeSpin { woken: true }` (self-wake spin) → keep driving to the deadline
-///   (→ `TimedOut` → 408). Re-polling still makes progress: `yield_now`'s
-///   `Pending` is a one-shot that returns `Ready` on the next poll regardless of
-///   its wake, and the deadline is re-checked at the loop top so we never poll
-///   past `query_timeout`.
+///   (→ `TimedOut` → 408). Re-polling still makes progress. The `Pending` of
+///   `yield_now` is a one-shot that returns `Ready` on the next poll, whatever
+///   its wake. The loop top re-checks the deadline, so no poll runs past
+///   `query_timeout`.
 /// - `MaybeSpin { woken: false }` (command-less cold park, e.g.
-///   `await_condition`) → `Suspended` immediately, so a RUNNING query over such a
-///   park serves fast rather than burning the whole budget.
+///   `await_condition`) → `Suspended` at once. A RUNNING query over such a park
+///   then serves fast and does not burn the whole budget.
 #[must_use]
 pub fn drive_query_replay(
     ctx: &WorkflowContext,
@@ -783,9 +778,8 @@ pub fn drive_query_replay(
             DriveStep::MaybeSpin { woken } => {
                 if woken {
                     // Case 2: out-of-runtime `yield_now` fired synchronously →
-                    // keep driving to the deadline. Yield the OS thread slice so a
-                    // spinning query does not needlessly hard-pin a core for the
-                    // whole budget.
+                    // keep driving to the deadline. Yield the OS thread slice, so
+                    // a spinning query does not pin a core for the whole budget.
                     std::thread::yield_now();
                 } else {
                     // Case 3: command-less cold park (e.g. `await_condition`) →
@@ -801,30 +795,29 @@ pub fn drive_query_replay(
 /// (`hydrate_ctx_for_query`), which awaits inside an axum request task (issue
 /// #612).
 ///
-/// Identical classification to the sync driver except for the zero-command-delta
-/// `MaybeSpin` case: **inside a tokio runtime** `tokio::task::yield_now()` defers
-/// its wake to the scheduler queue rather than firing it synchronously, so this
-/// driver opens a **quiet window** — exactly one `tokio::task::yield_now().await`
-/// — before trusting the [`QueryReplayWaker`] flag. One scheduler tick flushes
-/// the deferred wake queue:
+/// The classification matches the sync driver except in the zero-command-delta
+/// `MaybeSpin` case. **Inside a tokio runtime**, `tokio::task::yield_now()`
+/// defers its wake to the scheduler queue. So this driver opens a **quiet
+/// window**, exactly one `tokio::task::yield_now().await`, before it trusts the
+/// [`QueryReplayWaker`] flag. One scheduler tick flushes the deferred wake queue:
 /// - if the flag then reads set, the workflow is a self-waking spin (case 2) →
 ///   keep driving to the deadline (→ `TimedOut` → 408);
 /// - if it stays cold, the workflow parked command-less on an external re-poll
 ///   that never comes during a query drive (case 3, `await_condition`) →
 ///   `Suspended` immediately.
 ///
-/// A raw `tokio::time::sleep(d)` in workflow code registers a *timer* waker (not
-/// the deferred queue), which one `yield_now().await` does not fire, so it too
-/// classifies case 3 → `Suspended` immediately rather than blocking the query for
-/// `d`. That is correct and desirable (it is a determinism bug regardless).
+/// A raw `tokio::time::sleep(d)` in workflow code registers a *timer* waker,
+/// not the deferred queue. One `yield_now().await` does not fire it. So it also
+/// classifies as case 3 → `Suspended` at once, and does not block the query for
+/// `d`. That is correct, because the sleep is a determinism bug anyway.
 ///
 /// # Send-safety
 ///
 /// The `!Send` waker/`Context` are built and dropped inside the synchronous
-/// [`poll_query_step`], so the only values live across the `yield_now().await`
-/// are `Send`: the `Arc<QueryReplayWaker>` flag, the `Pin<Box<dyn Future + Send>>`
-/// handler future, `&WorkflowContext`, and a couple of `Copy` scalars. This keeps
-/// the returned future `Send`, as the axum handler requires.
+/// [`poll_query_step`]. So only `Send` values live across the
+/// `yield_now().await`: the `Arc<QueryReplayWaker>` flag, the
+/// `Pin<Box<dyn Future + Send>>` handler future, `&WorkflowContext`, and a few
+/// `Copy` scalars. The returned future is therefore `Send`, as axum requires.
 #[must_use]
 pub async fn drive_query_replay_async(
     ctx: &WorkflowContext,
@@ -864,24 +857,23 @@ pub async fn drive_query_replay_async(
             }
             DriveStep::MaybeSpin { woken } => {
                 if !woken {
-                    // Quiet window: one cooperative scheduler tick flushes tokio's
-                    // deferred `yield_now` wake queue so an in-runtime spin's wake
-                    // reaches our flag. Nothing `!Send` is live here — the
-                    // waker/`Context` were built and dropped inside
-                    // `poll_query_step`, and `handler_fut`'s borrow ended when it
-                    // returned.
+                    // Quiet window: one scheduler tick flushes the deferred
+                    // `yield_now` wake queue of tokio. The wake of an in-runtime
+                    // spin then reaches the flag. Nothing `!Send` is live here.
+                    // `poll_query_step` built and dropped the waker/`Context`, and
+                    // the borrow of `handler_fut` ended when it returned.
                     tokio::task::yield_now().await;
                 }
                 if flag.0.load(std::sync::atomic::Ordering::Acquire) {
                     // Case 2: self-waking spin (`tokio::task::yield_now()` in
                     // workflow code) → keep driving to the deadline (→ 408). The
-                    // `yield_now().await` above already yielded the runtime this
-                    // cycle, so a spinning query never starves other tasks.
+                    // `yield_now().await` above yielded the runtime this cycle,
+                    // so a spinning query never starves other tasks.
                     continue;
                 }
                 // Case 3: command-less cold park (e.g. `await_condition`) that
-                // never self-wakes during a query drive → Suspended immediately,
-                // so a RUNNING query serves fast rather than burning the budget.
+                // never self-wakes during a query drive → Suspended at once. A
+                // RUNNING query then serves fast and does not burn the budget.
                 return finish_query_drive(ctx, QueryReplayOutcome::Suspended);
             }
         }
@@ -915,13 +907,12 @@ pub enum TerminalQueryDecision {
 /// also classifies) present in the log.
 ///
 /// The append-only event log always seals with the terminal event, so it sits
-/// at or near the tail; the scan runs **from the end** so a sealed history
-/// short-circuits in O(1) while tolerating any trailing bookkeeping events
-/// (`ChildWorkflowCascadeApplied`, `WorkflowRetryScheduled`) that follow the
-/// seal — those are themselves classified as terminal-lifecycle, so
-/// last-event-only would also work, but `rev().any()` is robust to any future
-/// non-terminal trailing bookkeeping without an O(N) full scan on the common
-/// sealed case.
+/// at or near the tail. The scan runs **from the end**, so a sealed history
+/// short-circuits in O(1). Trailing bookkeeping events
+/// (`ChildWorkflowCascadeApplied`, `WorkflowRetryScheduled`) are themselves
+/// terminal-lifecycle, so a last-event-only check would also work today.
+/// `rev().any()` also tolerates future non-terminal trailing bookkeeping, and
+/// still avoids an O(N) scan in the common sealed case.
 ///
 /// Only meaningful for executions whose DB row is already in a terminal state;
 /// callers gate this behind that check.
@@ -935,49 +926,46 @@ pub fn history_reached_terminal_seal(events: &[WorkflowEvent]) -> bool {
 
 /// Classify how to answer a query on a **terminal** execution (issue #612).
 ///
-/// Takes the replay `outcome`, whether the recorded history reached its terminal
-/// seal (see [`history_reached_terminal_seal`]), and whether — after the drive —
-/// the context still holds **unconsumed non-lifecycle history** (see
+/// The inputs are the replay `outcome`, whether the recorded history reached
+/// its terminal seal (see [`history_reached_terminal_seal`]), and
+/// `has_unconsumed_history`. The last one is `true` when, after the drive, the
+/// context still holds **unconsumed non-lifecycle history** (see
 /// [`WorkflowContext::history_has_unconsumed_events`]).
 ///
-/// `has_unconsumed_history` is the drift guard (Codex P2, PR #986 follow-up).
-/// If the driven handler settled to a servable state (`ReachedTerminal`, or a
-/// `Suspended` run the engine sealed while parked) while genuine recorded
-/// non-lifecycle history remains unmatched, the handler diverged from the
-/// recorded history — the workflow code changed since the run executed — and the
-/// reconstructed state does **not** correspond to what actually happened.
-/// Serving it would be misleading, so gate every `Serve` on this check and
-/// return [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
+/// `has_unconsumed_history` is the drift guard (PR #986 follow-up). Suppose
+/// the handler settled to a servable state (`ReachedTerminal`, or a
+/// `Suspended` run the engine sealed while parked). If recorded non-lifecycle
+/// history still remains unmatched, the handler diverged from the history. The
+/// workflow code changed since the run executed. The reconstructed state then
+/// does **not** match what happened, so every `Serve` is gated on this check
+/// and returns [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
 /// (410) instead. The check comes from
 /// [`HistoryMatcher::has_non_lifecycle_unconsumed`](crate::replay::HistoryMatcher::has_non_lifecycle_unconsumed),
-/// which **excludes trailing terminal-lifecycle events** — so a truthfully
-/// replayed completed / sealed-while-parked run (whose only unconsumed tail is
-/// the terminal seal) reports `false` and still Serves. That exclusion is
-/// exactly why the sealed-mid-flight shapes below are not regressed.
+/// which **excludes trailing terminal-lifecycle events**. A truthfully replayed
+/// completed or sealed-while-parked run has only the terminal seal as its
+/// unconsumed tail. It reports `false` and still Serves. That exclusion keeps
+/// the sealed-mid-flight shapes below working.
 ///
-/// - [`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal): the handler drove
-///   all the way to `Poll::Ready`, so the context holds the workflow's fully
-///   reconstructed final state → [`Serve`](TerminalQueryDecision::Serve) (200),
-///   **unless** `has_unconsumed_history` (code drift) →
+/// - [`ReachedTerminal`](QueryReplayOutcome::ReachedTerminal): the context holds
+///   the fully reconstructed final state → [`Serve`](TerminalQueryDecision::Serve)
+///   (200), **unless** `has_unconsumed_history` (code drift) →
 ///   [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable) (410).
 /// - [`TimedOut`](QueryReplayOutcome::TimedOut) →
 ///   [`TimedOut`](TerminalQueryDecision::TimedOut) (408): a spinning replay.
 /// - [`Suspended`](QueryReplayOutcome::Suspended):
 ///     - if the history reached a terminal seal **and** no non-lifecycle history
 ///       remains unconsumed, the engine sealed the run while its function was
-///       parked mid-command — the canonical shapes are `CONTINUED_AS_NEW`
+///       parked mid-command. The canonical shapes are `CONTINUED_AS_NEW`
 ///       (`continue_as_new` parks forever), `TIMED_OUT` (incomplete trailing
 ///       command + `WorkflowExecutionTimedOut`), and a mid-await external/hard
-///       `CANCELLED`/`FAILED`. This is exactly the running-path behaviour applied
-///       to a run the engine sealed while parked, so serve the reconstructed
+///       `CANCELLED`/`FAILED`. The running-path behaviour applies, so serve the
 ///       partial state at the recorded terminal point
 ///       ([`Serve`](TerminalQueryDecision::Serve), 200).
-///     - otherwise the history has no terminal lifecycle event at all (genuinely
-///       truncated: pruned by retention / released on reset / empty), or the
-///       drifted handler stopped short on a sealed run leaving recorded
-///       non-lifecycle history unconsumed → return
-///       [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable) (410)
-///       rather than a misleading partial/empty answer.
+///     - otherwise the history has no terminal lifecycle event (pruned by
+///       retention, released on reset, or empty). Or the drifted handler
+///       stopped short on a sealed run with non-lifecycle history unconsumed.
+///       Return [`HistoryUnavailable`](TerminalQueryDecision::HistoryUnavailable)
+///       (410), not a misleading partial or empty answer.
 #[must_use]
 pub const fn classify_terminal_query(
     outcome: QueryReplayOutcome,
@@ -1000,22 +988,18 @@ pub const fn classify_terminal_query(
                 TerminalQueryDecision::HistoryUnavailable
             }
         }
-        // Issue #782: a workflow handler that panics during the replay drive
-        // cannot reconstruct trustworthy state, so the reconstructed context
-        // must never be served. Classified as `HistoryUnavailable` (410 Gone,
-        // permanent) rather than `TimedOut` (408, retryable): a deterministic
-        // handler panic recurs on every retry, so retrying is pointless.
+        // Issue #782: a handler that panics during the replay drive leaves
+        // untrustworthy state, so the context is never served. It maps to
+        // `HistoryUnavailable` (410 Gone, permanent), not `TimedOut` (408,
+        // retryable). A deterministic panic recurs on every retry.
         QueryReplayOutcome::Panicked => TerminalQueryDecision::HistoryUnavailable,
     }
 }
 
 /// Run a workflow function through replay and live execution.
 ///
-/// Builds a [`WorkflowContext`] from the provided event history, invokes the
-/// handler, and returns the outcome. If the handler completes within the
-/// timeout, the result is `Completed` or `Failed`. If it blocks (suspended on
-/// a oneshot waiting for activity/timer resolution), the accumulated commands
-/// are returned as `Suspended`.
+/// A handler that blocks on an unresolved activity or timer returns its
+/// accumulated commands as `Suspended`.
 ///
 /// A cycle that completes or suspends with a recorded command left
 /// unconsumed returns `Failed` with `non_deterministic_details` (issue #1791).
@@ -1039,11 +1023,11 @@ pub async fn run_workflow(
 
 /// Run one decision cycle against a **caller-supplied** [`WorkflowContext`].
 ///
-/// [`run_workflow`] builds the context itself from `(exec_id, history)`, which
-/// leaves no way to exercise the context's builder knobs — notably
-/// [`WorkflowContext::with_shard_router`] (issue #956), whose whole point is to
-/// resolve child placement without mutating the process-global router that every
-/// other test in the same binary shares.
+/// [`run_workflow`] builds the context itself from `(exec_id, history)`. That
+/// leaves no way to use the builder knobs of the context. One example is
+/// [`WorkflowContext::with_shard_router`] (issue #956). It resolves child
+/// placement without a change to the process-global router that every test in
+/// the binary shares.
 ///
 /// Identical to [`run_workflow`] in every other respect: same readiness rule,
 /// same panic containment, same outcome mapping.
@@ -1072,33 +1056,32 @@ pub async fn run_workflow_with_context(
 /// registry.update_handlers.iter().filter(|h| h.workflow == wf_name)
 /// ```
 ///
-/// A gate is handed the candidate's *whole* `queries![…]` / `updates![…]`
-/// collection — every workflow's handlers — so registering them unfiltered puts
-/// another workflow's `progress` query on this workflow's context. A workflow
-/// that branches on [`WorkflowContext::list_query_names`] then sees a name the
-/// promoted worker will never show it, and fails in **both** directions:
+/// A gate gets the *whole* `queries![…]` / `updates![…]` collection of the
+/// candidate, with the handlers of every workflow. Unfiltered registration puts
+/// the `progress` query of another workflow on this context. A workflow that
+/// branches on [`WorkflowContext::list_query_names`] then sees a name the
+/// promoted worker never shows it. It fails in **both** directions:
 ///
-/// - false RED — the recorded history came from a worker that *did* filter, so
-///   the unfiltered replay takes the other branch and reports drift on a
-///   workflow nobody changed, blocking a good release;
-/// - false GREEN — a candidate that genuinely **dropped** this workflow's own
-///   handler is masked when a same-named handler survives on another workflow:
-///   replay still sees the name, still matches history, and certifies a build
-///   whose promoted worker will take the other branch.
+/// - false RED — the recorded history came from a worker that *did* filter.
+///   The unfiltered replay takes the other branch and reports drift on a
+///   workflow nobody changed, which blocks a good release;
+/// - false GREEN — a candidate genuinely **dropped** this workflow's own
+///   handler, but a same-named handler survives on another workflow. Replay
+///   still sees the name and matches history. It certifies a build whose
+///   promoted worker takes the other branch.
 ///
-/// Filtering here rather than at each of the three call sites keeps
-/// the mirror at one choke point that cannot be forgotten. The name is read off
-/// the context (every entry point sets it via `.with_workflow_name(…)`) rather
-/// than passed again, so the value filtered on is by construction the same one
-/// `ctx.info().workflow_type` reports to the workflow body.
+/// Filtering here, not at each of the three call sites, keeps the mirror at
+/// one choke point that cannot be forgotten. The name is read off the context,
+/// not passed again. Every entry point sets it via `.with_workflow_name(…)`. So
+/// the filter value is, by construction, what `ctx.info().workflow_type`
+/// reports to the workflow body.
 ///
-/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`: two of its
-/// three callers — `run_workflow_strict` and `run_workflow_canary` — are
-/// ungated `pub` entry points, so gating this helper made the crate fail to
-/// build under a bare `--no-default-features`. It matches the gating of
-/// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
-/// [`ReplayPayloadLimits`] structs, and the ungated
-/// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
+/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`. Two of its
+/// three callers, `run_workflow_strict` and `run_workflow_canary`, are ungated
+/// `pub` entry points. Gating this helper broke the build under a bare
+/// `--no-default-features`. It matches the gating of everything it touches: the
+/// ungated [`ReplayDeclarativeHandlers`] and [`ReplayPayloadLimits`] structs,
+/// and the ungated `WorkflowContext::register_declarative_{query,update}_handler`.
 ///
 /// It also installs the candidate's shard router, when there is one. A fresh
 /// child spawn with a non-default placement needs it (issue #1995).
@@ -1124,21 +1107,21 @@ pub(crate) fn register_declarative_handlers(
 /// into a replay context (issue #798).
 ///
 /// Same class of problem as [`ReplayPayloadLimits`], and the same fix. The live
-/// worker registers a workflow's declarative handlers **before any workflow code
-/// runs**, and [`WorkflowContext::list_query_names`] merges the declarative map
-/// into its result — so a workflow that branches on which handlers exist, or
-/// that dispatches a query, observes them. They live in no `WorkflowEvent`, so a
-/// pure-history replay cannot recover them, and both replay entry points
-/// previously invoked with empty declarative registries.
+/// worker registers the declarative handlers of a workflow **before any
+/// workflow code runs**. [`WorkflowContext::list_query_names`] merges the
+/// declarative map into its result. A workflow that branches on which handlers
+/// exist, or that dispatches a query, therefore observes them. They live in no
+/// `WorkflowEvent`, so a pure-history replay cannot recover them. Both replay
+/// entry points previously ran with empty declarative registries.
 ///
 /// That is wrong in both directions. A candidate that **keeps** a registration
-/// the recorded run had is the false-RED direction: replay takes the other
-/// branch and reports drift on code nobody changed, blocking a good release. A
-/// candidate that **adds or removes** one is the false-GREEN direction: the
-/// branch the promoted worker will take was never exercised.
+/// of the recorded run is the false-RED direction. Replay takes the other
+/// branch and reports drift on code nobody changed, which blocks a good
+/// release. A candidate that **adds or removes** one is the false-GREEN
+/// direction: the branch the promoted worker takes was never exercised.
 ///
-/// Borrowed rather than owned so a caller can pass a registry it already holds,
-/// and `Copy` so threading it through the three entry points costs nothing. The
+/// Borrowed, so a caller can pass a registry it already holds. `Copy`, so
+/// threading it through the three entry points costs nothing. The
 /// [`Default`] is two empty slices, which is byte-for-byte the behavior of every
 /// caller that registers none.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1158,24 +1141,24 @@ pub struct ReplayDeclarativeHandlers<'a> {
 /// The **candidate** worker's payload limits, applied to a replay context.
 ///
 /// These live in no `WorkflowEvent`, so a pure-history replay cannot recover
-/// them from a fixture: the live worker supplies its own configured caps from
+/// them from a fixture. The live worker supplies its own configured caps from
 /// `BuiltHarvest`. Both replay entry points previously left them at the library
-/// defaults, which makes a replay gate answer the wrong question — the caps are
-/// candidate configuration exactly like `build_id` and `history_policy`, and a
-/// build that changes one is precisely what a gate is asked to vet.
+/// defaults. A replay gate then answered the wrong question. The caps are
+/// candidate configuration, exactly like `build_id` and `history_policy`. A
+/// build that changes one is precisely what a gate vets.
 ///
-/// The cap is only consulted where a dispatch is *not* already in recorded
-/// history (`HistoryMatch::NoMatch`), i.e. at the frontier — which is where an
-/// in-flight fixture lands. A candidate that **lowers** a cap is the false-GREEN
+/// The cap is consulted only where a dispatch is *not* already in recorded
+/// history (`HistoryMatch::NoMatch`). That is the frontier, where an in-flight
+/// fixture lands. A candidate that **lowers** a cap is the false-GREEN
 /// direction: replay accepts an input the promoted worker will reject with
 /// `PayloadTooLarge`. A candidate that configures an **offload threshold**
-/// (issue #524) is the false-RED direction: an over-threshold payload is
-/// offloaded rather than capped, so a gate that knows the cap but not the
-/// threshold reports drift that will never happen.
+/// (issue #524) is the false-RED direction. An over-threshold payload is
+/// offloaded, not capped. A gate that knows the cap but not the threshold
+/// reports drift that will never happen.
 ///
-/// Carried as one value rather than four loose parameters so the two replay
-/// paths (strict and canary) have a single carry-through site and cannot drift
-/// apart — the same reason [`FixtureReplayDefaults`](crate::testing) exists.
+/// One value, not four loose parameters, gives the strict and canary replay
+/// paths a single carry-through site, so they cannot drift apart. The same
+/// reason applies to [`FixtureReplayDefaults`](crate::testing).
 ///
 /// [`Default`] is the library defaults plus no offload threshold, which is
 /// byte-for-byte the behavior of every caller that does not configure limits.
@@ -1220,64 +1203,59 @@ pub async fn run_workflow_strict(
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
     execution_timeout: Option<chrono::Duration>,
-    // Issue #772: the per-execution live effective `deadline_at` (pause/resume/
-    // redrive-shifted), threaded so the internal continue-as-new budget check
-    // reasons about the same deadline the timeout scanner enforces. `None` falls
-    // back to `start + execution_timeout` (the file/JSON replay path).
+    // Issue #772: the per-execution live effective `deadline_at`, shifted by
+    // pause/resume and redrive. The internal continue-as-new budget check then
+    // uses the deadline that the timeout scanner enforces. `None` falls back to
+    // `start + execution_timeout` (the file/JSON replay path).
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    // Issue #698: the spawning parent's execution id. `parent_execution_id` lives
-    // in no `WorkflowEvent`, so a pure-history replay cannot recover it — the
-    // replayer (`WorkflowReplayer::with_parent_execution_id`) threads it here so a
-    // child that branches command-affecting control flow on
-    // `ctx.info().parent_execution_id` replays deterministically. `None` models a
-    // top-level run.
+    // Issue #698: the spawning parent's execution id. It lives in no
+    // `WorkflowEvent`, so a pure-history replay cannot recover it.
+    // `WorkflowReplayer::with_parent_execution_id` threads it here. A child that
+    // branches command-affecting control flow on `ctx.info().parent_execution_id`
+    // then replays deterministically. `None` models a top-level run.
     parent_execution_id: Option<ExecutionId>,
-    // Issue #698: the logical workflow type name (mechanism 1 — the handler-lookup
-    // key already carried by the snapshot / DB row) and the business-level
-    // `workflow_id` (mechanism 2 — added field). Neither lives in a `WorkflowEvent`
-    // read by `ctx.info()` (the executor sets them on the live context via
-    // span_meta), so a pure-history replay must apply them here or a workflow that
-    // branches command-affecting control flow on `ctx.info().workflow_type` /
-    // `ctx.info().workflow_id` (or embeds either in an activity input) false-reports
-    // non-determinism. `workflow_id` is `None` for a raw-events fixture with no id.
+    // Issue #698: the logical workflow type name and the business-level
+    // `workflow_id`. The snapshot / DB row already carries the type name as the
+    // handler-lookup key (mechanism 1). `workflow_id` is an added field
+    // (mechanism 2). Neither lives in a `WorkflowEvent` that `ctx.info()` reads.
+    // The executor sets them on the live context via span_meta. So a
+    // pure-history replay must apply them here. Otherwise, a workflow that
+    // branches on `ctx.info().workflow_type` / `ctx.info().workflow_id`, or
+    // embeds either in an activity input, false-reports non-determinism.
+    // `workflow_id` is `None` for a raw-events fixture with no id.
     workflow_name: String,
     workflow_id: Option<String>,
     // Issue #798: the execution's task queue
     // (`harvest_workflow_executions.queue_name`). The live worker sets it from
-    // the task row via span_meta, but it lives in no `WorkflowEvent`, so a
-    // pure-history replay must apply it here or a workflow that branches
-    // command-affecting control flow on `ctx.queue_name()` — or embeds it in an
-    // activity input — replays under `""` and false-reports non-determinism.
-    // `None` (a legacy fixture that carries no queue) preserves the prior
-    // empty-string default.
+    // the task row via span_meta. It lives in no `WorkflowEvent`, so a
+    // pure-history replay must apply it here. Otherwise, a workflow that
+    // branches on `ctx.queue_name()`, or embeds it in an activity input,
+    // replays under `""` and false-reports non-determinism. `None` (a legacy
+    // fixture that carries no queue) keeps the prior empty-string default.
     queue_name: Option<String>,
     // Issue #798: the build id `ctx.build_id()` reports.
     //
     // Unlike every other value threaded here, this is **not** a recorded
     // per-execution row value. The live worker supplies its *own configured*
-    // `WorkerConfig::build_id` through span_meta — never the execution's
-    // recorded `assigned_build_id` — so for a replay gate the semantically
-    // correct value is the **candidate** build's id (what the worker about to be
-    // promoted will report), supplied uniformly by the caller. Sourcing it from
-    // the fixture would replay under the *old* build's id, hiding exactly the
-    // candidate-only divergence the gate exists to find. `None` (the default)
-    // preserves the prior behavior of reporting no build id.
+    // `WorkerConfig::build_id` through span_meta. It never uses the recorded
+    // `assigned_build_id` of the execution. So for a replay gate, the correct
+    // value is the id of the **candidate** build, which the worker about to be
+    // promoted reports. The caller supplies it uniformly. A fixture-sourced id
+    // would replay under the *old* build and hide the candidate-only
+    // divergence that the gate exists to find. `None` (the default) keeps the
+    // prior behavior of reporting no build id.
     build_id: Option<String>,
-    // Issue #614: the runtime registry's history policy
-    // (`registry.history_policy()`, threaded by the worker), so a strict/diagnosis
-    // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
-    // byte-faithful to the live worker rather than silently using the default
+    // Issue #614: the history policy of the runtime registry
+    // (`registry.history_policy()`, threaded by the worker). A strict/diagnosis
+    // replay of a workflow that branches on `ctx.should_continue_as_new()` then
+    // stays byte-faithful to the live worker and does not use the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
-    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
-    // them; leaving them at the library defaults makes the gate answer the wrong
-    // question when the candidate build changes a cap or an offload threshold.
+    // Issue #798: the **candidate** worker's payload limits (see
+    // [`ReplayPayloadLimits`]).
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
-    // `#[update]` handlers. The live worker registers these before any workflow
-    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
-    // branches on their presence replays down the wrong path without them.
+    // Issue #798: the candidate's declarative `#[query]` / `#[update]` handlers
+    // (see [`ReplayDeclarativeHandlers`]).
     declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
@@ -1301,8 +1279,8 @@ pub async fn run_workflow_strict(
         .with_metrics(metrics);
 
     // Mirror the live worker: register declarative handlers before any workflow
-    // code runs, so a body that branches on `ctx.list_query_names()` sees the
-    // candidate's registrations rather than an empty registry.
+    // code runs. A body that branches on `ctx.list_query_names()` then sees the
+    // registrations of the candidate, not an empty registry.
     let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -1340,15 +1318,11 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
-    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
-    // them; leaving them at the library defaults makes the gate answer the wrong
-    // question when the candidate build changes a cap or an offload threshold.
+    // Issue #798: the **candidate** worker's payload limits (see
+    // [`ReplayPayloadLimits`]).
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
-    // `#[update]` handlers. The live worker registers these before any workflow
-    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
-    // branches on their presence replays down the wrong path without them.
+    // Issue #798: the candidate's declarative `#[query]` / `#[update]` handlers
+    // (see [`ReplayDeclarativeHandlers`]).
     declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
@@ -1373,8 +1347,8 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_metrics(metrics);
 
     // Mirror the live worker: register declarative handlers before any workflow
-    // code runs, so a body that branches on `ctx.list_query_names()` sees the
-    // candidate's registrations rather than an empty registry.
+    // code runs. A body that branches on `ctx.list_query_names()` then sees the
+    // registrations of the candidate, not an empty registry.
     let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -1424,12 +1398,11 @@ async fn run_strict_with_ctx(
             // surface it before the other completion checks.
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
-                    // Issue #546 post-ship hardening: flush any push-based signal
-                    // handler whose target became claimable but was never picked
-                    // up by a real cursor-advancing call this cycle, BEFORE the
-                    // unconsumed-history check below (so a signal a registered
-                    // handler would have claimed is never mistaken for genuinely
-                    // unconsumed history).
+                    // Issue #546 post-ship hardening: flush each push-based signal
+                    // handler whose target became claimable but that no
+                    // cursor-advancing call picked up this cycle. This runs BEFORE
+                    // the unconsumed-history check below. A signal that a handler
+                    // would have claimed is then never taken for unconsumed history.
                     ctx.flush_pending_signal_handlers();
                     if ctx.history_has_unconsumed_events() {
                         let nd = ctx.take_nd_details().or_else(|| {
@@ -1450,18 +1423,17 @@ async fn run_strict_with_ctx(
                             unhandled_signals: std::collections::BTreeMap::new(),
                         }
                     } else if ctx.at_terminal_failure_frontier() {
-                        // Issue #952: the recorded history is sealed by a
-                        // terminal `WorkflowFailed`, so it stops at the failure
-                        // point and carries nothing to compare a post-failure
-                        // command against. A build that FIXED the failing check
-                        // (a raised payload cap, a now-registered handler) runs
-                        // past that point and completes — that is the fix
-                        // working, not drift, and the deploy gate must not
-                        // report it. Drift before the failure point is still
-                        // caught: every recorded event the code REACHED was
-                        // matched positionally above, and this arm runs only
-                        // after `history_has_unconsumed_events()` came back
-                        // false, so nothing recorded was skipped either.
+                        // Issue #952: a terminal `WorkflowFailed` seals the
+                        // recorded history. It stops at the failure point and
+                        // has nothing to compare a post-failure command against.
+                        // A build that FIXED the failing check (a raised payload
+                        // cap, a now-registered handler) runs past that point and
+                        // completes. That is the fix working, not drift, so the
+                        // deploy gate must not report it. Drift before the
+                        // failure point is still caught. Every recorded event the
+                        // code REACHED was matched positionally above. This arm
+                        // runs only after `history_has_unconsumed_events()` came
+                        // back false, so nothing recorded was skipped either.
                         WorkflowOutcome::Completed {
                             output,
                             unhandled_signals: std::collections::BTreeMap::new(),
@@ -1543,24 +1515,23 @@ async fn run_strict_with_ctx(
                     };
                 }
                 // A park that left recorded history unconsumed is a genuine
-                // divergence — the candidate build stopped short of an event the
-                // recorded run produced. Mirrors the canary path's identical
-                // check (`run_workflow_canary` below).
+                // divergence: the candidate build stopped short of an event the
+                // recorded run produced. The canary path (`run_workflow_canary`
+                // below) has the identical check.
                 //
-                // Issue #952 made this explicit rather than implicit: strict
-                // replay used to lean on `outcome_to_report` mapping EVERY
-                // `Suspended` outcome to `NonDeterminismDetected`, so an early
-                // park and a park at the live frontier were indistinguishable
-                // and both reported. Now that a park on a failing-tail history
-                // reports `ReplaySucceeded` (the failing cycle never suspended,
-                // so parking where it failed is faithful), the early park has to
-                // be separated out HERE, where the matcher is still in scope —
-                // `outcome_to_report` sees only the event list and cannot tell
-                // the two apart. The `InProgress` arms of
+                // Issue #952 made this explicit. Strict replay used to rely on
+                // `outcome_to_report` mapping EVERY `Suspended` outcome to
+                // `NonDeterminismDetected`. An early park and a park at the live
+                // frontier then looked the same, and both reported. Now a park on
+                // a failing-tail history reports `ReplaySucceeded`. The failing
+                // cycle never suspended, so parking where it failed is faithful.
+                // So the early park must be separated HERE, where the matcher is
+                // in scope. `outcome_to_report` sees only the event list and
+                // cannot tell the two apart. The `InProgress` arms of
                 // `spawn_child_workflow_raw` / `execute_local_activity_raw` /
-                // the child- and signal-race twins deliberately make no inline
-                // ND decision and fall through to this park, so this is the one
-                // place that catches a build which dropped a later command.
+                // the child- and signal-race twins make no inline ND decision.
+                // They fall through to this park. So this is the one place that
+                // catches a build which dropped a later command.
                 if ctx.history_has_unconsumed_events() {
                     let nd = ctx.take_nd_details().or_else(|| {
                         Some(crate::error::NonDeterministicDetails {
@@ -1610,9 +1581,8 @@ async fn run_strict_with_ctx(
 /// If it suspends *before* all events in history are processed, it fails.
 ///
 /// The same frontier tolerance applies if execution instead *completes*
-/// (issue #1175): a command emitted after recorded history is fully consumed
-/// is forward progress, not drift, whether the workflow parks on it or
-/// returns — the two terminal paths agree.
+/// (issue #1175). A command emitted after recorded history is fully consumed
+/// is forward progress, not drift. The park and return paths agree on that.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_lines,
@@ -1631,47 +1601,33 @@ pub(crate) async fn run_workflow_canary(
     // [`run_workflow_strict`]).
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
-    // `run_canary` sources it from the sampled `harvest_workflow_executions.parent_id`
-    // column so a parent-aware child does not false-report non-determinism in the
-    // deploy replay canary.
+    // `run_canary` reads it from the `parent_id` column of the sampled row.
     parent_execution_id: Option<ExecutionId>,
     // Issue #698: workflow type name / business `workflow_id` (see
-    // [`run_workflow_strict`]). `run_canary` sources both from the sampled
-    // `harvest_workflow_executions` row so a workflow that branches on
-    // `ctx.info().workflow_type` / `workflow_id` does not false-report
-    // non-determinism in the deploy replay canary.
+    // [`run_workflow_strict`]). `run_canary` reads both from the sampled
+    // `harvest_workflow_executions` row.
     workflow_name: String,
     workflow_id: Option<String>,
     // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
-    // `run_canary` sources it from the sampled
-    // `harvest_workflow_executions.queue_name` column so a workflow that branches
-    // on `ctx.queue_name()` does not false-report non-determinism in the deploy
-    // replay canary or the in-flight replay-drift gate.
+    // `run_canary` reads it from the `queue_name` column of the sampled row.
+    // The deploy replay canary and the in-flight replay-drift gate need it.
     queue_name: Option<String>,
     // Issue #798: the **candidate** build id (see [`run_workflow_strict`]).
     //
-    // Deliberately *not* sourced from the sampled row's `assigned_build_id`: the
-    // live worker reports its own configured build, and both this canary and the
-    // in-flight drift gate exist to answer "what will the build I am about to
-    // promote do with these histories?". Replaying under the recorded build
-    // would take the historical branch and report clean for candidate-only code
-    // that diverges on promotion.
+    // Deliberately *not* sourced from the `assigned_build_id` of the sampled
+    // row. The live worker reports its own configured build. This canary and the
+    // in-flight drift gate answer "what will the build I am about to promote do
+    // with these histories?". The recorded build would take the historical
+    // branch and report clean for candidate-only code that diverges on promotion.
     build_id: Option<String>,
-    // Issue #614: the runtime registry's history policy
-    // (`registry.history_policy()`, threaded by the worker), so a canary/diagnosis
-    // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
-    // byte-faithful to the live worker rather than silently using the default
-    // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
+    // Issue #614: the history policy of the runtime registry (see
+    // [`run_workflow_strict`]).
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
-    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
-    // them; leaving them at the library defaults makes the gate answer the wrong
-    // question when the candidate build changes a cap or an offload threshold.
+    // Issue #798: the **candidate** worker's payload limits (see
+    // [`ReplayPayloadLimits`]).
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
-    // `#[update]` handlers. The live worker registers these before any workflow
-    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
-    // branches on their presence replays down the wrong path without them.
+    // Issue #798: the candidate's declarative `#[query]` / `#[update]` handlers
+    // (see [`ReplayDeclarativeHandlers`]).
     declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
@@ -1695,8 +1651,8 @@ pub(crate) async fn run_workflow_canary(
         .with_metrics(metrics);
 
     // Mirror the live worker: register declarative handlers before any workflow
-    // code runs, so a body that branches on `ctx.list_query_names()` sees the
-    // candidate's registrations rather than an empty registry.
+    // code runs. A body that branches on `ctx.list_query_names()` then sees the
+    // registrations of the candidate, not an empty registry.
     let ctx = register_declarative_handlers(ctx, declarative_handlers);
 
     let span = tracing::info_span!(
@@ -1730,12 +1686,11 @@ pub(crate) async fn run_workflow_canary(
         match cycle_result {
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
-                    // Issue #546 post-ship hardening: flush any push-based signal
-                    // handler whose target became claimable but was never picked
-                    // up by a real cursor-advancing call this cycle, BEFORE the
-                    // unconsumed-history check below (so a signal a registered
-                    // handler would have claimed is never mistaken for genuinely
-                    // unconsumed history).
+                    // Issue #546 post-ship hardening: flush each push-based signal
+                    // handler whose target became claimable but that no
+                    // cursor-advancing call picked up this cycle. This runs BEFORE
+                    // the unconsumed-history check below. A signal that a handler
+                    // would have claimed is then never taken for unconsumed history.
                     ctx.flush_pending_signal_handlers();
                     if ctx.history_has_unconsumed_events() {
                         let nd = ctx.take_nd_details().or_else(|| {
@@ -1767,25 +1722,25 @@ pub(crate) async fn run_workflow_canary(
                         // - Issue #952: history sealed by a terminal `WorkflowFailed`
                         //   (`ctx.at_terminal_failure_frontier()`). A build that FIXED
                         //   the failing check (a raised payload cap, a now-registered
-                        //   handler) runs past that point and completes — that is the
+                        //   handler) runs past that point and completes. That is the
                         //   fix working, not drift.
-                        // - Issue #1175: a replay-significant command (e.g. the
-                        //   `RecordSideEffect` from `ctx.system_now()` / `new_uuid()`
-                        //   / `random_*()`) emitted past the frontier used to be
-                        //   rejected here even outside a failure tail — unlike the
-                        //   suspended arm's identical situation. That command is the
-                        //   candidate build making forward progress, not divergence.
+                        // - Issue #1175: a replay-significant command emitted past the
+                        //   frontier, e.g. the `RecordSideEffect` from
+                        //   `ctx.system_now()` / `new_uuid()` / `random_*()`. This arm
+                        //   used to reject it even outside a failure tail, unlike the
+                        //   suspended arm. That command is the candidate build making
+                        //   forward progress, not divergence.
                         //
-                        // In both cases, drift before the frontier is still caught:
-                        // every recorded event the code reached was matched
-                        // positionally above (this arm runs only after
-                        // `history_has_unconsumed_events()` came back false), and a
+                        // In both cases, drift before the frontier is still caught.
+                        // Every recorded event the code reached was matched
+                        // positionally above. This arm runs only after
+                        // `history_has_unconsumed_events()` came back false. A
                         // command that mismatches recorded history (wrong activity
                         // name, wrong order, …) resolves to `Diverged`/`NoMatch` in
-                        // the matcher and fails the cycle long before it would reach
-                        // here. `drain_commands()` is intentionally not called: no
-                        // caller reads pending commands off a `Completed` canary
-                        // outcome, and `ctx` is dropped with the buffer intact.
+                        // the matcher. It fails the cycle long before this point.
+                        // `drain_commands()` is intentionally not called. No caller
+                        // reads pending commands off a `Completed` canary outcome,
+                        // and `ctx` is dropped with the buffer intact.
                         WorkflowOutcome::Completed {
                             output,
                             unhandled_signals: std::collections::BTreeMap::new(),
@@ -1832,7 +1787,7 @@ pub(crate) async fn run_workflow_canary(
                     };
                 }
 
-                // If history still has unconsumed events when we suspend, that's non-deterministic
+                // Unconsumed history events at suspension are non-deterministic.
                 if ctx.history_has_unconsumed_events() {
                     let nd = ctx.take_nd_details().or_else(|| {
                         Some(crate::error::NonDeterministicDetails {
@@ -1929,11 +1884,9 @@ pub async fn run_workflow_with_state(
 /// Issue #526, test harness only. The context is built with
 /// [`WorkflowContext::with_advancing_timer_clock`] so that each durable timer
 /// resolved from history increments `ctx.now()` by its duration.
-// Mirrors its non-advancing-clock siblings, which are likewise a flat list of
-// independently-threaded context knobs (exec/history/handler/input/state/
-// span-meta/metrics/log-policy) rather than a struct — bundling them here alone
-// would diverge this harness entry point from the ones it must stay in step
-// with.
+// Its non-advancing-clock siblings also take a flat list of independent
+// context knobs, not a struct. A bundle here alone would make this harness
+// entry point diverge from the ones it must stay in step with.
 #[cfg(any(test, feature = "testing"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_workflow_with_state_advancing_clock(
@@ -1986,22 +1939,20 @@ pub(crate) fn advancing_clock_context(
         WorkflowHistoryPolicy::default(),
     )
     .with_advancing_timer_clock()
-    // Thread the workflow/queue names from span_meta into the context
-    // (mirrors run_workflow_with_state_history_policy_and_caps) so harness
-    // users — WorkflowTestEnv::with_workflow_name/with_queue_name — can
-    // assert metric label content (issue #801 post-review P3).
+    // Mirrors run_workflow_with_state_history_policy_and_caps. Harness users
+    // (WorkflowTestEnv::with_workflow_name/with_queue_name) can then assert
+    // metric label content (issue #801).
     .with_workflow_name(span_meta.map_or("", |m| m.workflow_name.as_str()))
-    // Issue #698: thread the business `workflow_id` (mirrors the caps sibling
-    // `run_workflow_with_state_history_policy_and_caps`) so `ctx.info().workflow_id`
+    // Issue #698: mirrors the caps sibling. `ctx.info().workflow_id` then
     // reports it under a WorkflowTestEnv run that sets it on `span_meta`.
     .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     // Issue #772: thread the execution-timeout budget so a WorkflowTestEnv run
     // can exercise deadline-aware continue-as-new.
     .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
-    // Issue #772: thread the authoritative absolute deadline (the effective,
-    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
-    // the timeout scanner rather than a stale start+timeout recompute.
+    // Issue #772: the effective `deadline_at`, shifted by pause/resume and
+    // redrive. `ctx.deadline()` then matches the timeout scanner, not a stale
+    // start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
     // Issue #2021: a cancel request the history does not hold yet.
@@ -2015,15 +1966,12 @@ pub(crate) fn advancing_clock_context(
             .and_then(|m| i32::try_from(m.shard_id).ok())
             .map(ShardId::new),
     )
-    // Issue #698: thread the spawning parent's execution id so a child workflow
-    // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
+    // Issue #698.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
     .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
-    // Issue #798: thread the worker build id (mirrors the caps sibling
-    // `run_workflow_with_state_history_policy_and_caps`, which already does) so a
+    // Issue #798: mirrors the caps sibling, so a
     // `WorkflowTestEnv::with_build_id` run can exercise a build-gated workflow.
-    // Without it this harness path silently drops the configured build and
-    // `ctx.build_id()` reports `None` inside the live run.
+    // Without it, `ctx.build_id()` reports `None` inside the live run.
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_metrics(metrics)
     // Issue #790.
@@ -2198,9 +2146,9 @@ pub(crate) fn build_task_context(
     .with_queue_name(span_meta.map_or("", |m| m.queue_name.as_str()))
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_execution_timeout(span_meta.and_then(|m| m.execution_timeout))
-    // Issue #772: thread the authoritative absolute deadline (the effective,
-    // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
-    // the timeout scanner rather than a stale start+timeout recompute.
+    // Issue #772: the effective `deadline_at`, shifted by pause/resume and
+    // redrive. `ctx.deadline()` then matches the timeout scanner, not a stale
+    // start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
     .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
     // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
@@ -2212,8 +2160,7 @@ pub(crate) fn build_task_context(
             .and_then(|m| i32::try_from(m.shard_id).ok())
             .map(ShardId::new),
     )
-    // Issue #698: thread the spawning parent's execution id so a child workflow
-    // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
+    // Issue #698.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
     .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
     // Issue #2021: a cancel request the history does not hold yet.
@@ -2229,8 +2176,8 @@ pub(crate) fn build_task_context(
     .with_payload_offload_threshold(payload_offload_threshold)
     .with_context_headers(context_headers)
     .with_metrics(metrics)
-    // Issue #620: thread the builder-level default activity retry/timeout floor
-    // so LOCAL activities (resolved in `execute_local_activity_with_opts`) fall
+    // Issue #620: the builder-level default activity retry/timeout floor.
+    // LOCAL activities (resolved in `execute_local_activity_with_opts`) fall
     // back to it when no call-site or activity-level default is set.
     .with_activity_defaults(
         default_activity_retry_policy,
@@ -2402,9 +2349,9 @@ fn execute_span(
     replay: Option<bool>,
 ) -> tracing::Span {
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
-    // harvest.replay defaults to false at span creation so subscribers that only
-    // observe on_new_span (e.g. tests) see the correct value for callers that
-    // don't supply span_meta. The worker passes span_meta to override it and to
+    // harvest.replay defaults to false at span creation. Subscribers that only
+    // observe on_new_span (e.g. tests) then see the correct value for callers
+    // that do not supply span_meta. The worker passes span_meta to override it and to
     // populate the Empty fields (workflow.id, shard.id, queue) that only the
     // worker context knows.
     let span = tracing::info_span!(
@@ -2542,21 +2489,20 @@ fn classify_cycle(
     };
 
     match cycle_result {
-        // Handler returned.  Drain any commands
-        // emitted during live execution (e.g. RecordUpdateResult from
-        // execute_admitted_update) so the worker can persist them before the
-        // terminal WorkflowCompleted/WorkflowFailed event.
+        // Drain the commands emitted during live execution (e.g.
+        // RecordUpdateResult from execute_admitted_update). The worker persists
+        // them before the terminal WorkflowCompleted/WorkflowFailed event.
         Ok(Ok(output)) => {
-            // Issue #546 post-ship hardening: flush any push-based signal
-            // handler whose target became claimable but was never picked
-            // up by a real cursor-advancing call this cycle (a workflow
-            // that registers a handler and then completes without ever
-            // awaiting an activity/timer/signal).
+            // Issue #546 post-ship hardening: flush each push-based signal
+            // handler whose target became claimable but that no
+            // cursor-advancing call picked up this cycle. Example: a workflow
+            // registers a handler, then completes without awaiting an
+            // activity, timer or signal.
             ctx.flush_pending_signal_handlers();
-            // Issue #684: snapshot the unconsumed signals (after the flush,
-            // so #546 push handlers claim first) and carry them out on the
-            // outcome; the WORKER emits from the map (see `unhandled_signals`
-            // docs — emission moved off the executor's pre-#603-gate path).
+            // Issue #684: snapshot the unconsumed signals after the flush, so
+            // #546 push handlers claim first. The outcome carries them out, and
+            // the WORKER emits from the map. Emission moved off the pre-#603-gate
+            // path of the executor (see the `unhandled_signals` docs).
             let unhandled_signals = ctx.unhandled_signals();
             // A plain-value built-in primitive (system_now/new_uuid/random_*)
             // may have absorbed a replay divergence and recorded it as a
@@ -2639,10 +2585,10 @@ fn classify_cycle(
             let mut commands = ctx.drain_commands();
             // ContinueAsNew is terminal: when the workflow body parks on
             // the dedicated suspension future, the latest command in the
-            // drain is the ContinueAsNew the user requested. Bookkeeping
-            // commands earlier in the drain (e.g. RecordMarker, side_effect)
-            // are returned as pending_cmds so the worker can still apply
-            // any UpsertSearchAttributes patches before sealing the execution.
+            // drain is the ContinueAsNew the user requested. Earlier bookkeeping
+            // commands (e.g. RecordMarker, side_effect) return as pending_cmds.
+            // The worker can then still apply UpsertSearchAttributes patches
+            // before it seals the execution.
             if let Some(idx) = commands
                 .iter()
                 .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
@@ -2663,10 +2609,6 @@ fn classify_cycle(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -2703,10 +2645,10 @@ mod tests {
         })
     }
 
-    /// A workflow whose handler panics **during future construction** — the panic
-    /// unwinds synchronously *before* the `Box::pin(...)` future is ever produced
-    /// (issue #782 / PR #1012 review). A hand-written `WorkflowInfo::handler` may
-    /// do synchronous work before returning its boxed future; this exercises the
+    /// A workflow whose handler panics **during future construction** (issue #782
+    /// / PR #1012 review). The panic unwinds synchronously *before* the
+    /// `Box::pin(...)` future exists. A hand-written `WorkflowInfo::handler` may
+    /// do synchronous work before it returns its boxed future. This exercises the
     /// construction-phase `catch_construct` guard, which the poll-time
     /// `catch_unwind` cannot reach.
     fn construction_panicking_workflow<'a>(
@@ -2805,9 +2747,9 @@ mod tests {
 
     #[tokio::test]
     async fn executor_prefers_deferred_drift_over_workflow_error() {
-        // Regression (issue #384): a primitive that drifts before the workflow
-        // returns Err from its own logic must surface as non-determinism rather
-        // than masquerading as an ordinary workflow failure.
+        // Regression (issue #384): a primitive drifts, then the workflow returns
+        // Err from its own logic. The result must be non-determinism, not an
+        // ordinary workflow failure.
         let exec_id = ExecutionId::new();
         let history = vec![
             WorkflowEvent::WorkflowStarted {
@@ -2846,9 +2788,9 @@ mod tests {
 
     #[tokio::test]
     async fn author_error_produces_failed_without_nd_details() {
-        // AC3 pin (issue #603): a workflow body's own Err(...) must carry NO
-        // NonDeterministicDetails — it is the worker's signal that the failure
-        // is a legitimate author decision and must stay terminal.
+        // AC3 pin (issue #603): an Err(...) from the workflow body must carry NO
+        // NonDeterministicDetails. That tells the worker the failure is a
+        // legitimate author decision and must stay terminal.
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -2923,11 +2865,10 @@ mod tests {
 
     #[tokio::test]
     async fn construction_phase_panicking_workflow_is_contained_as_handler_panic() {
-        // Issue #782 / PR #1012 review: a hand-written handler that panics while
-        // *constructing* its future (before returning the boxed future) must be
-        // contained identically to a poll-phase panic — the poll-time
-        // `catch_unwind` cannot cover it, so the construction call itself is
-        // wrapped. Proves the construction-phase containment path.
+        // Issue #782 / PR #1012 review: a handler that panics while
+        // *constructing* its future must be contained like a poll-phase panic.
+        // The poll-time `catch_unwind` cannot cover it, so the construction call
+        // itself is wrapped.
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -3003,8 +2944,8 @@ mod tests {
     async fn fabricated_handler_panic_error_type_does_not_set_handler_panic_flag() {
         // AC3 false-positive guard (issue #782 / Q11): an author who returns
         // Err(WorkflowFailure::new("HandlerPanic", ...)) reaches the normal
-        // Ok(Err(_)) arm with handler_panic = false, so it can never manufacture
-        // a panic-retry via the error-type string.
+        // Ok(Err(_)) arm with handler_panic = false. The error-type string can
+        // never manufacture a panic-retry.
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -3449,13 +3390,12 @@ mod tests {
     /// A workflow that reacts to a `cancel` signal via a push-based handler
     /// (issue #546) instead of a hand-coded `wait_for_signal` interleave.
     ///
-    /// Dispatch is deferred to the next history-consulting call (see
-    /// `register_and_dispatch_signal_handler`'s doc comment), so this reads
-    /// the handler-mutated flag *after* a trivial deterministic primitive
-    /// call rather than on the literal next line -- `ctx.system_now()` is
-    /// cheap, replay-safe, and (like any other `match_history`-routed call)
-    /// triggers the pump. A real workflow would typically have an actual
-    /// activity/timer/loop in between instead.
+    /// Dispatch waits for the next history-consulting call (see the doc comment
+    /// of `register_and_dispatch_signal_handler`). So this reads the
+    /// handler-mutated flag *after* a trivial deterministic primitive call, not
+    /// on the next line. `ctx.system_now()` is cheap and replay-safe. Like any
+    /// other `match_history`-routed call, it triggers the pump. A real workflow
+    /// would usually have an activity, timer or loop in between instead.
     fn signal_handler_workflow<'a>(
         ctx: &'a WorkflowContext,
         _input: Value,
@@ -3474,8 +3414,8 @@ mod tests {
     #[tokio::test]
     async fn executor_dispatches_signal_handler_end_to_end() {
         // The full production path: run_workflow drives the workflow function
-        // exactly as the worker would, with a signal already recorded in
-        // history before the handler is registered.
+        // as the worker would. A signal is in history before the handler is
+        // registered.
         let exec_id = ExecutionId::new();
         let history = vec![
             WorkflowEvent::WorkflowStarted {
@@ -3524,13 +3464,13 @@ mod tests {
 
     // ── signal.unhandled plumb-through via drive_workflow (issue #684) ─────
     //
-    // The executor NO LONGER emits harvest.signal.unhandled — it computes the
+    // The executor NO LONGER emits harvest.signal.unhandled. It computes the
     // unconsumed-signal map at the terminal frontier and carries it out on the
-    // Completed/Failed outcome; the worker emits from it (symmetric with #519's
-    // record_workflow_terminal). These tests prove (a) the terminal outcomes
-    // carry the map, (b) Suspended does not, and (c) the executor itself emits
-    // NOTHING (a recorder passed in sees zero samples — the emission moved to
-    // the worker).
+    // Completed/Failed outcome. The worker emits from it, like the
+    // record_workflow_terminal of #519. These tests prove three things:
+    // (a) the terminal outcomes carry the map, (b) Suspended does not, and
+    // (c) the executor itself emits NOTHING. A recorder passed in sees zero
+    // samples.
 
     /// Recording double: fails the test if the executor ever emits a sample.
     #[derive(Default)]
@@ -3674,9 +3614,9 @@ mod tests {
 
     #[tokio::test]
     async fn completed_outcome_carries_unhandled_signals_and_executor_does_not_emit() {
-        // A workflow that completes while a delivered SignalReceived was never
-        // consumed CARRIES the unconsumed map on its Completed outcome — and the
-        // executor emits NOTHING itself (the worker emits from the carried map).
+        // A workflow completes with a delivered SignalReceived never consumed.
+        // Its Completed outcome CARRIES the unconsumed map. The executor emits
+        // NOTHING itself; the worker emits from the carried map.
         let recorder = std::sync::Arc::new(UnhandledSignalRecorder::default());
         let meta = span_meta("notif", "q");
         let (outcome, _cmds, _span, _resolved_router) = run_workflow_with_state_advancing_clock(

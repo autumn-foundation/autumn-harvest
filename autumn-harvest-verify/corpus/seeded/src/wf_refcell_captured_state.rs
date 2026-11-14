@@ -3,17 +3,17 @@
 //!
 //! **Mechanism.** `Value`. `helpers::with_page_cursor` hands a reference to an
 //! ambient `thread_local! { static PAGE_CURSOR: RefCell<u32> }` to a closure
-//! defined *here*. The closure `borrow_mut()`s it and increments it, so the
-//! page number this workflow puts into the `ScheduleActivity` command depends
-//! on how many executions previously ran on this worker thread.
+//! defined *here*. The closure `borrow_mut()`s it and increments it. So the
+//! page number in the `ScheduleActivity` command depends on how many
+//! executions previously ran on this worker thread.
 //!
-//! **Launder.** Neither layer models interior mutability at all: there is no
-//! `RefCell`, `Cell`, `borrow`, `borrow_mut` or `LocalKey` pattern anywhere in
-//! HVG001–HVG011 or DET001–DET011, so the mechanism is invisible *even if the
-//! code were written inline in the body*. On top of that the state lives in
-//! another crate, and the mutation happens inside a closure body — a separate
-//! MIR item reached only through `<{closure@…} as FnOnce>::call_once`, which no
-//! syntactic call-graph walker can follow.
+//! **Launder.** Neither layer models interior mutability at all. No HVG001–HVG011
+//! or DET001–DET011 pattern names `RefCell`, `Cell`, `borrow`, `borrow_mut` or
+//! `LocalKey`. So the mechanism is invisible *even inline in the body*. Also,
+//! the state lives in another crate, and the mutation happens inside a closure
+//! body. That body is a separate MIR item, reached only through
+//! `<{closure@…} as FnOnce>::call_once`. No syntactic call-graph walker can
+//! follow that edge.
 //!
 //! **Expected trace hops.** `wf_refcell_captured_state` ⇒
 //! `harvest_verify_corpus_helpers::with_page_cursor` ⇒ `LocalKey::with` on

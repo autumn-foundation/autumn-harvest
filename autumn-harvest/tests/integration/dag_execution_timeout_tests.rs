@@ -1,21 +1,21 @@
 #![cfg(feature = "db")]
 //! Integration tests for DAG-level execution timeout and SLA — issue #743.
 //!
-//! Proves the whole pipeline end to end: a `DagInfo` with `execution_timeout`/
-//! `sla` set -> `DagInfo::as_workflow_info()` -> the shadow `WorkflowInfo` ->
-//! `StartWorkflowParams` (mirroring exactly how the scheduler tick resolves
-//! these fields today for `#[workflow]`s, see
-//! `scheduler::tick_one_workflow_schedule`) -> `deadline_at`/`sla_deadline_at`
-//! on the execution row -> the EXISTING #243/#487 scanners
-//! (`timeout::enforce_workflow_execution_timeouts`,
-//! `timeout::enforce_workflow_sla_breaches`). No new scanner, no new event
+//! Proves the whole pipeline end to end. A `DagInfo` with
+//! `execution_timeout`/`sla` set goes through `DagInfo::as_workflow_info()` to
+//! the shadow `WorkflowInfo`, then to `StartWorkflowParams`. That step mirrors
+//! how the scheduler tick resolves these fields for `#[workflow]`s
+//! (`scheduler::tick_one_workflow_schedule`). The start writes
+//! `deadline_at`/`sla_deadline_at` on the execution row. The EXISTING #243/#487
+//! scanners (`timeout::enforce_workflow_execution_timeouts`,
+//! `timeout::enforce_workflow_sla_breaches`) act on them. No new scanner, no new event
 //! variant, no new migration — issue #743 AC12.
 //!
 //! - AC1/AC3: a DAG-declared `execution_timeout` produces `deadline_at`, and a
 //!   crossed deadline is caught by the existing scanner (`TIMED_OUT`, tagged
 //!   `TimeoutType::WorkflowExecution` -- not the chain path).
-//! - AC2/AC4: a DAG-declared `sla` produces `sla_deadline_at`, and a crossed
-//!   SLA is caught by the existing scanner (metric exactly once, lifecycle
+//! - AC2/AC4: a DAG-declared `sla` produces `sla_deadline_at`. The existing
+//!   scanner catches a crossed SLA (metric exactly once, lifecycle
 //!   unaffected -- the run can still reach `COMPLETED`).
 //! - AC5: `sla` is clamped down to `execution_timeout` at start when it would
 //!   otherwise exceed it (reuses the shared clamp logic in `execution.rs`).
@@ -57,10 +57,10 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect")
 }
 
-/// Build a `DagInfo` carrying the given `execution_timeout`/`sla`, with a
-/// no-op builder and a trivial identity `workflow_handler` so
-/// `as_workflow_info()` returns `Some` -- exactly the shape the `#[dag]`
-/// macro's companion function produces (issue #743).
+/// Build a `DagInfo` carrying the given `execution_timeout`/`sla`. A no-op
+/// builder and an identity `workflow_handler` make `as_workflow_info()` return
+/// `Some`. This is the shape the `#[dag]` macro's companion function produces
+/// (issue #743).
 fn deadline_dag(
     name: &'static str,
     execution_timeout: Option<std::time::Duration>,
@@ -230,9 +230,9 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
-/// Leak a UNIQUE `&'static str` DAG name so a scheduler-tick-driven or
-/// directly-triggered DAG run's own row can be found unambiguously in the
-/// shared CI database (`DagInfo::name` requires `&'static str`).
+/// Leak a UNIQUE `&'static str` DAG name (`DagInfo::name` requires one). A
+/// scheduler-tick-driven or directly-triggered DAG run can then find its own
+/// row unambiguously in the shared CI database.
 fn leaked_dag_name(prefix: &str) -> &'static str {
     Box::leak(unique_name(prefix).into_boxed_str())
 }
@@ -310,9 +310,8 @@ async fn dag_execution_timeout_scanner_transitions_expired_run_to_timed_out() {
     .await
     .expect("start");
 
-    // Simulate time passing without waiting an hour: the same mechanism a
-    // real overrun uses (this is only what NOW() being later than the
-    // deadline would look like).
+    // Simulate time passing without waiting an hour. A real overrun uses the
+    // same mechanism: NOW() is later than the deadline.
     backdate_deadline_at(&mut conn, exec_id).await;
 
     let spy = TimeoutSpy::default();
@@ -489,8 +488,8 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     let dag_deadline_at = dag_row.deadline_at.expect("must be set");
 
     // A plain (non-DAG) start declaring the SAME 10h execution_timeout, capped
-    // by the SAME 1h ceiling -- mirrors exactly how a `#[workflow(execution_timeout
-    // = "10h")]` would resolve at start time.
+    // by the SAME 1h ceiling. It mirrors how a `#[workflow(execution_timeout
+    // = "10h")]` resolves at start time.
     let wf_name = unique_name("dag743_ceiling_workflow");
     let wf_exec_id = ExecutionId::new();
     let wf_before = Utc::now();
@@ -569,17 +568,16 @@ async fn dag_without_deadline_attributes_has_null_deadline_columns() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Codex review (PR #1141) on issue #743: the 7 tests above prove the
-// resolution mechanism (`DagInfo::as_workflow_info` -> `StartWorkflowParams`)
-// works correctly in isolation, but 3 REAL production code paths that also
-// start a scheduled/manual DAG run hardcoded `execution_timeout`/`sla`/the
-// fleet-wide ceiling to `None` instead of reading them from the shadow
-// `WorkflowInfo` the way `tick_one_workflow_schedule`'s NON-buffered branch
-// already correctly does. These 3 tests drive the REAL entry points
-// (`trigger_unified_dag`, `tick_once` via a buffered-drain fire, `tick_once`
-// with a fleet-wide ceiling configured) rather than hand-mirroring scheduler
-// resolution logic in the test itself -- exactly the gap that let these 3
-// sites go unnoticed by the 7 tests above.
+// Issue #743 (PR #1141): the 7 tests above prove the resolution mechanism
+// (`DagInfo::as_workflow_info` -> `StartWorkflowParams`) in isolation. But 3
+// REAL production code paths that start a scheduled/manual DAG run hardcoded
+// `execution_timeout`/`sla`/the fleet-wide ceiling to `None`. They did not
+// read them from the shadow `WorkflowInfo`, as the NON-buffered branch of
+// `tick_one_workflow_schedule` does. Findings #1-#3 below drive the REAL entry
+// points (`trigger_unified_dag`, `tick_once` via a buffered-drain fire,
+// `tick_once` with a fleet-wide ceiling configured). They do not hand-mirror
+// scheduler resolution logic in the test. That hand-mirroring is the gap that
+// hid these 3 sites from the 7 tests above.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dag_registry(dag: &DagInfo) -> Arc<HandlerRegistry> {
@@ -719,9 +717,9 @@ async fn trigger_unified_dag_threads_dag_declared_execution_timeout_and_sla() {
     );
 }
 
-// ── Finding #2: the scheduler's buffered-drain path (fired when
-//    overlap_policy is buffer_one/buffer_all and a collision was queued)
-//    must thread execution_timeout the same way the main tick path does.
+// ── Finding #2: the scheduler's buffered-drain path must thread
+//    execution_timeout the same way the main tick path does. It fires when
+//    overlap_policy is buffer_one/buffer_all and a collision was queued.
 
 #[tokio::test]
 async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() {
@@ -731,14 +729,14 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     let dag_name = leaked_dag_name("dag743_buffered");
     // `dag.schedule`/`dag.overlap_policy` must match the cadence and
     // overlap policy of the separately-registered `WorkflowSchedule` row
-    // below (`Interval(3600s)` / `BufferOne`) -- `register_schedules_for_shard`'s
-    // `upsert_schedule` (which runs on EVERY tick, before the buffered
-    // drain) treats the DAG's own attributes as authoritative and
+    // below (`Interval(3600s)` / `BufferOne`). The `upsert_schedule` of
+    // `register_schedules_for_shard` runs on EVERY tick, before the buffered
+    // drain. It treats the DAG's own attributes as authoritative and
     // unconditionally overwrites `overlap_policy` from the stored row.
     // A mismatched `overlap_policy` (e.g. `deadline_dag`'s default `Skip`)
-    // makes `is_buffering_policy = false`, which WIPES the just-seeded
-    // `buffered_runs` back to `[]` regardless of whether the cadence
-    // changed, before the drain ever queries it.
+    // makes `is_buffering_policy = false`. That WIPES the just-seeded
+    // `buffered_runs` back to `[]` before the drain queries it, whether or
+    // not the cadence changed.
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
         overlap_policy: OverlapPolicy::BufferOne,
@@ -748,10 +746,10 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     let catalog = compile_dag_catalog(vec![dag]).expect("compile dag catalog");
 
     insert_manual_workflow_schedule(&mut conn, dag_name, 1).await;
-    // Directly seed a due buffered fire time -- bypassing the real
-    // overlap-collision path (which requires a still-running prior execution)
-    // since only the buffered-drain CODE PATH is under test here, not the
-    // collision-detection logic that populates `buffered_runs` in production.
+    // Directly seed a due buffered fire time. This bypasses the real
+    // overlap-collision path, which needs a still-running prior execution.
+    // Only the buffered-drain CODE PATH is under test here, not the
+    // collision detection that populates `buffered_runs` in production.
     seed_buffered_run(&mut conn, dag_name, Utc::now() - ChronoDuration::seconds(1)).await;
 
     let pool = build_test_pool(&url);
@@ -789,12 +787,12 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     let dag_name = leaked_dag_name("dag743_ceiling_tick");
     // Declares a 10h execution_timeout; the fleet-wide ceiling (1h) must win.
     // `dag.schedule` must match the separately-registered `WorkflowSchedule`
-    // row's cadence below (also `Interval(3600s)`) -- see the identical note
-    // in `scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout`:
-    // a mismatched cadence makes `register_schedules_for_shard`'s
-    // `upsert_schedule` recompute (and NULL out) `next_run_at` from a `None`
-    // schedule, so the forced-due `next_run_at` set below is wiped before
-    // `tick_workflow_schedules` ever sees it as due.
+    // row's cadence below (also `Interval(3600s)`). See the identical note
+    // in `scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout`.
+    // With a mismatched cadence, the `upsert_schedule` of
+    // `register_schedules_for_shard` recomputes (and NULLs out) `next_run_at`
+    // from a `None` schedule. That wipes the forced-due `next_run_at` set below
+    // before `tick_workflow_schedules` sees it as due.
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
         ..deadline_dag(dag_name, Some(std::time::Duration::from_hours(10)), None)

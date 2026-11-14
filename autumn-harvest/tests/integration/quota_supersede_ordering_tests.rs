@@ -41,8 +41,8 @@ fn leaked(prefix: &str) -> &'static str {
 }
 
 /// Serializes this file's `GLOBAL_WORKFLOW_METADATA` installs against each
-/// other, mirroring the identical convention in `quota_enforcement_tests.rs`
-/// and `concurrency_supersede_tests.rs`.
+/// other, as `quota_enforcement_tests.rs` and `concurrency_supersede_tests.rs`
+/// do.
 static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -458,7 +458,7 @@ async fn defer_policy_still_enforces_the_quota_cap_unchanged() {
     );
 }
 
-/// Credit must not cross tenants (issue #1228 review, P1). Two tenants can
+/// Credit must not cross tenants (issue #1228). Two tenants can
 /// share one `concurrency_key` while each keeps its own `tenant_id`-derived
 /// quota key. A `cancel_running` supersede shedding the OTHER tenant's
 /// incumbent under that shared key must never credit THIS tenant's own
@@ -572,17 +572,16 @@ async fn end(conn: &mut AsyncPgConnection) {
 }
 
 /// `dry_run_supersede_credit`'s scan must NOT take a row lock (issue
-/// #1228 review). An earlier fix tried `FOR UPDATE ... SKIP LOCKED` to
-/// keep the scanned population stable. That lock cannot tell a row
-/// genuinely leaving the population apart from one merely held by
-/// [`autumn_harvest::store`]'s own ordinary `FOR UPDATE`, during ANY
-/// unrelated decision cycle. `next_event_id_for` takes exactly that lock,
-/// without ever changing the workflow's state. `SKIP LOCKED` would have
-/// skipped such a row, undercounting the credit. It could have made
-/// `enforce_quota_admission` reject an otherwise-healthy `cancel_running`
-/// admission with `QuotaExceeded`. `credited_ids` reconciliation (see
-/// `dry_run_supersede_credit`'s own doc comment) now covers the staleness
-/// a lock was meant to prevent, so no lock is needed here at all.
+/// #1228). An earlier fix tried `FOR UPDATE ... SKIP LOCKED` to keep the
+/// scanned population stable. That lock cannot tell a row that leaves the
+/// population from a row that [`autumn_harvest::store`]'s ordinary
+/// `FOR UPDATE` holds during an unrelated decision cycle.
+/// `next_event_id_for` takes exactly that lock, and never changes the
+/// workflow's state. `SKIP LOCKED` would skip such a row and undercount the
+/// credit. `enforce_quota_admission` could then reject a healthy
+/// `cancel_running` admission with `QuotaExceeded`. `credited_ids`
+/// reconciliation (see `dry_run_supersede_credit`'s doc comment) now covers
+/// the staleness that a lock was meant to prevent, so no lock is needed.
 ///
 /// Proven deterministically, not by timing: start two runs sharing one
 /// concurrency key and one quota key, so a `limit = 2` credits exactly the
@@ -656,12 +655,10 @@ async fn dry_run_credit_counts_a_row_locked_for_unrelated_reasons() {
             &mut scan_conn,
             wf,
             shared_key,
-            // limit = 2, not 1. There are 2 pre-existing candidates (x, y)
-            // plus the hypothetical new admission. `supersede_count` sheds
-            // down to the LIMIT, not to "limit minus the population".
-            // A limit of 1 here would shed BOTH x and y, not just the
-            // older one. limit = 2 sheds exactly 1 (the oldest, x). That is
-            // the scenario this test wants: one locked incumbent, one
+            // limit = 2, not 1. Two candidates exist (x, y), plus the hypothetical
+            // new admission. `supersede_count` sheds down to the LIMIT, not to
+            // "limit minus the population". A limit of 1 would shed both x and y.
+            // A limit of 2 sheds exactly the oldest, x: one locked incumbent, one
             // credit.
             2,
             ExecutionId::new(), // excludes neither x nor y

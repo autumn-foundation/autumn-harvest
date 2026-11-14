@@ -2,26 +2,28 @@
 //!
 //! # What this is
 //!
-//! A **stepping and diffing API over the existing replay machinery**. Given a
-//! recorded history (typically an exported
-//! [`HistorySnapshot`](crate::testing::HistorySnapshot)) it produces a
-//! [`ReplayTrace`]: one [`DebugStep`] per consumed event, each carrying the
-//! event index and type, the workflow's pending [`WorkflowCommand`]s at that
-//! point, the open awaitables (with the event index that opened each), the
-//! resolved version- and patch-gate values, and the recorded side-effect and
-//! marker values.
+//! A **stepping and diffing API over the existing replay machinery**. It takes
+//! a recorded history, typically an exported
+//! [`HistorySnapshot`](crate::testing::HistorySnapshot). It produces a
+//! [`ReplayTrace`] with one [`DebugStep`] per consumed event. Each step carries:
+//!
+//! * the event index and type;
+//! * the workflow's pending [`WorkflowCommand`]s at that point;
+//! * the open awaitables, with the event index that opened each;
+//! * the resolved version- and patch-gate values;
+//! * the recorded side-effect and marker values.
 //!
 //! # How it steps
 //!
 //! Replay is deterministic, so "stepping" is **prefix replay**: step `k` is a
-//! fresh replay of `events[0..=k]`. This is exactly the mechanism issue #949
-//! specifies ("re-replay from the top to that index — replay is deterministic,
-//! so 'backward' is re-run-forward") and it needs **no engine hook**.
+//! fresh replay of `events[0..=k]`. Issue #949 specifies this mechanism:
+//! "re-replay from the top to that index — replay is deterministic, so
+//! 'backward' is re-run-forward". It needs **no engine hook**.
 //!
 //! The load-bearing insight: on a replay, replay-significant commands are only
-//! emitted at the **live frontier**. So replaying a prefix yields precisely
-//! *"what does this code do next, given history so far"* — a per-step frontier
-//! command batch, and the ideal diff signal.
+//! emitted at the **live frontier**. So a prefix replay yields *"what does this
+//! code do next, given history so far"*. That per-step frontier command batch
+//! is the ideal diff signal.
 //!
 //! # Read-only by construction (AC5)
 //!
@@ -32,9 +34,9 @@
 //! [`WorkflowContext::drain_commands`]. Nothing is persisted, no activity runs,
 //! and no database is touched.
 //!
-//! Prefix replay uses **canary** (frontier-tolerant) mode rather than strict:
-//! a prefix of a history is exactly an in-flight execution parked at its
-//! frontier, which strict replay would report as a spurious divergence.
+//! Prefix replay uses **canary** (frontier-tolerant) mode, not strict mode. A
+//! history prefix is an in-flight execution parked at its frontier. Strict
+//! replay would report that as a spurious divergence.
 //!
 //! # Cost
 //!
@@ -47,31 +49,28 @@
 //! # Serialization is a display surface, not a round-trip format
 //!
 //! The snapshot types derive [`serde::Serialize`] but deliberately **not**
-//! `Deserialize`: they exist so `--format json` can be piped into `jq`, not so
-//! a trace can be persisted and read back. Several fields
-//! ([`CommandSnapshot::summary`], the rendered `event_type`) are *renderings*
-//! of engine types rather than the types themselves, so a round-trip would be
-//! lossy in ways a `Deserialize` impl would silently paper over. The
-//! round-trippable artefact is the **history** ([`HistorySnapshot`]) — feed
-//! that back in and rebuild the trace.
+//! `Deserialize`. They exist so `--format json` can be piped into `jq`, not to
+//! persist a trace and read it back. Some fields ([`CommandSnapshot::summary`],
+//! the rendered `event_type`) are *renderings* of engine types. A round-trip
+//! would be lossy, and a `Deserialize` impl would hide that. The round-trippable
+//! artefact is the **history** ([`HistorySnapshot`]). Feed it back in and
+//! rebuild the trace.
 //!
 //! # Relationship to issue #614
 //!
 //! `POST /workflows/{id}/replay-diagnosis` (#614) is the **one-shot,
 //! server-side** answer for a single live execution: "does this run diverge
 //! under the code deployed right now?". This debugger is the **local,
-//! interactive** counterpart: it works offline on an exported history, steps
-//! through it, and diffs *two* code registrations against each other. They
-//! complement rather than duplicate: #614 tells you *that* a run diverges;
-//! this tells you *where*, step by step, and *how the two builds differ*.
+//! interactive** counterpart. It works offline on an exported history, steps
+//! through it, and diffs *two* code registrations. #614 tells *that* a run
+//! diverges. This tells *where*, step by step, and *how the two builds differ*.
 //!
 //! # Gates at a truncated frontier
 //!
 //! Because a step replays `events[0..=k]`, an **intermediate** step models an
 //! execution parked at that truncated frontier. A [`ctx.patched`] /
-//! [`ctx.version`] gate reached there is therefore, correctly, *newly* patched:
-//! it records its marker and returns `true`, exactly as a live execution
-//! reaching that point for the first time would.
+//! [`ctx.version`] gate reached there is correctly *newly* patched. It records
+//! its marker and returns `true`, as a live execution would at that point.
 //!
 //! So a gated build legitimately differs from an ungated one at intermediate
 //! steps even when it replays the *full* recorded history perfectly. Two
@@ -82,11 +81,12 @@
 //! * "Does this build replay this history **cleanly**?" —
 //!   [`ReplayTrace::is_clean`].
 //!
-//! Use the second to confirm a fix. Ask those methods rather than scanning for
-//! `divergence.is_some()`: a step that timed out or panicked, and every step of
-//! a handler-free [`ReplayTrace::from_history`] projection, carries no
-//! divergence because nothing was ever compared — not because the build agreed.
-//! Both methods likewise refuse a trace `truncated` by `max_steps`. See
+//! Use the second to confirm a fix. Ask those methods, not
+//! `divergence.is_some()`. A step that timed out or panicked carries no
+//! divergence, and so does each step of a handler-free
+//! [`ReplayTrace::from_history`] projection. Nothing was compared, so the
+//! absence does not mean the build agreed. Both methods likewise refuse a trace
+//! `truncated` by `max_steps`. See
 //! `docs/replay-debugger.md`.
 //!
 //! [`ctx.patched`]: crate::context::WorkflowContext::patched
@@ -121,10 +121,10 @@ pub const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Marker-name prefix recorded by `ctx.version(change_id, ..)`.
 ///
-/// The engine builds the full name with [`crate::replay::version_marker_name`],
-/// which returns a `String` rather than exposing a prefix — so this constant is
-/// a *duplicate* of that convention, and `marker_prefixes_match_the_engine`
-/// below fails the build if the two ever drift apart.
+/// The engine builds the full name with [`crate::replay::version_marker_name`].
+/// That returns a `String` and exposes no prefix. So this constant *duplicates*
+/// the convention. `marker_prefixes_match_the_engine` fails the build if the two
+/// drift apart.
 const VERSION_MARKER_PREFIX: &str = "version:";
 /// Marker-name prefix recorded by `ctx.patched(patch_id)`.
 ///
@@ -145,11 +145,10 @@ const UNKNOWN: &str = "<unknown>";
 /// `Clone`, `PartialEq`, nor `Serialize`.
 ///
 /// Display and identity are **separated on purpose**. `summary` is a short,
-/// human-readable one-liner for a terminal; `payload` is the command's exact
-/// input value. Diffing compares the whole struct, so a divergence buried deep
-/// inside a large payload is still caught exactly — truncating the payload into
-/// `summary` and comparing only that would silently hide it, which on a
-/// divergence-finding tool is the worst possible failure mode.
+/// human-readable one-liner for a terminal. `payload` is the command's exact
+/// input value. Diffing compares the whole struct. So a divergence deep inside a
+/// large payload is still caught exactly. A comparison of a truncated `summary`
+/// would hide it. For a divergence-finding tool, that is the worst failure mode.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CommandSnapshot {
     /// The command's variant name, e.g. `"ScheduleActivity"`.
@@ -176,10 +175,10 @@ impl fmt::Display for CommandSnapshot {
 
 /// One awaitable the execution has opened and not yet closed, as of a step.
 ///
-/// Carries the **event index that opened it** — the projection in
-/// [`crate::awaitables`] is timestamp-based and operates on rows a
-/// [`HistorySnapshot`] does not carry, so this is a debugger-owned projection
-/// that reuses only that module's [`AwaitableKind`] vocabulary.
+/// Carries the **event index that opened it**. The projection in
+/// [`crate::awaitables`] is timestamp-based and reads rows that a
+/// [`HistorySnapshot`] does not carry. So this projection belongs to the
+/// debugger and reuses only that module's [`AwaitableKind`] vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OpenAwaitable {
     /// The awaitable's category.
@@ -257,16 +256,16 @@ impl StepOutcome {
     /// `true` only when the prefix replay actually ran to a conclusion.
     ///
     /// [`TimedOut`](Self::TimedOut) and [`Panicked`](Self::Panicked) mean the
-    /// replay **never finished**, so the step's `divergence: None` says nothing
-    /// about whether the build agrees with the recording — it only says nothing
-    /// was observed before the drive gave up. Treating that as a pass would
-    /// certify a build that spins or panics as replaying cleanly, which is the
-    /// same false-clean class as an unexamined suffix past `max_steps`.
+    /// replay **never finished**. The step's `divergence: None` then says nothing
+    /// about agreement with the recording. It only says that nothing was seen
+    /// before the drive gave up. A pass here would certify a build that spins or
+    /// panics as clean. That is the false-clean class of an unexamined suffix
+    /// past `max_steps`.
     ///
-    /// [`NotReplayed`](Self::NotReplayed) is likewise not a success: the
-    /// handler-free [`ReplayTrace::from_history`] projection never ran any
-    /// workflow code, so it cannot answer "does this build replay cleanly?" at
-    /// all. It is a history *explanation*, not a verdict.
+    /// [`NotReplayed`](Self::NotReplayed) is likewise not a success. The
+    /// handler-free [`ReplayTrace::from_history`] projection never ran workflow
+    /// code. So it cannot answer "does this build replay cleanly?". It is a
+    /// history *explanation*, not a verdict.
     #[must_use]
     pub const fn replay_succeeded(self) -> bool {
         matches!(self, Self::Suspended | Self::ReachedTerminal)
@@ -282,10 +281,10 @@ impl StepOutcome {
     ///   *success*, so a never-replayed projection cannot pass — it verified
     ///   nothing.
     /// * "Do these two traces agree?" ([`TraceDiff::is_clean`]) is spoiled only
-    ///   by *failure*. A handler-free fixture-vs-fixture diff — AC3's
-    ///   compare-two-recordings mode, and the CLI's primary diff path — is
-    ///   `NotReplayed` on both sides **by design**, and is fully conclusive:
-    ///   it compares history-derived facts, which the two recordings determine
+    ///   by *failure*. A handler-free fixture-vs-fixture diff is AC3's
+    ///   compare-two-recordings mode and the CLI's primary diff path. It is
+    ///   `NotReplayed` on both sides **by design**, and fully conclusive. It
+    ///   compares history-derived facts, which the two recordings determine
     ///   completely. Treating it as a doubt would make every fixture diff
     ///   inconclusive.
     #[must_use]
@@ -339,10 +338,10 @@ pub struct DebugStep {
     /// The event's complete semantic content with per-run identity normalized
     /// out — the key two fixture histories are diffed on.
     ///
-    /// `resolved_payload` above is a *display* projection; this is the
-    /// comparison key, and it is exhaustive by construction (it is the
-    /// serialized event), so a `WorkflowEvent` field this debugger has never
-    /// heard of still participates in the diff. See [`normalized_event_facts`].
+    /// `resolved_payload` above is a *display* projection. This is the
+    /// comparison key. It is the serialized event, so it is exhaustive by
+    /// construction. A `WorkflowEvent` field unknown to this debugger still
+    /// takes part in the diff. See [`normalized_event_facts`].
     pub event_facts: Value,
     /// The signal name, when this step consumed a `SignalReceived` event.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -439,12 +438,12 @@ impl ReplayTrace {
 
     /// The first step whose prefix replay did not run to a conclusion, if any.
     ///
-    /// A [`StepOutcome::TimedOut`] or [`StepOutcome::Panicked`] step — and every
-    /// step of a handler-free [`from_history`](Self::from_history) projection,
-    /// which is [`StepOutcome::NotReplayed`] — carries `divergence: None`
-    /// because nothing was ever compared, not because the build agreed.
-    /// Callers rendering a verdict should name this step rather than reporting
-    /// silence. See [`StepOutcome::replay_succeeded`].
+    /// A [`StepOutcome::TimedOut`] or [`StepOutcome::Panicked`] step carries
+    /// `divergence: None`. So does each step of a handler-free
+    /// [`from_history`](Self::from_history) projection, which is
+    /// [`StepOutcome::NotReplayed`]. Nothing was compared, so the `None` does
+    /// not mean that the build agreed. A caller that renders a verdict should
+    /// name this step, not report silence. See [`StepOutcome::replay_succeeded`].
     #[must_use]
     pub fn first_unsuccessful_step(&self) -> Option<usize> {
         self.steps
@@ -462,17 +461,18 @@ impl ReplayTrace {
             .map(|s| s.index)
     }
 
-    /// `true` only when **every** step of the **whole** history replayed to a
-    /// conclusion and none diverged — the answer to "does this build replay
-    /// this recorded history cleanly?".
+    /// `true` only when this build replays the recorded history cleanly.
+    ///
+    /// **Every** step of the **whole** history must replay to a conclusion,
+    /// and none may diverge.
     ///
     /// Scanning for `divergence.is_some()` alone is **not** the clean signal,
     /// for two independent reasons, each of which certifies a build that was
     /// never actually verified:
     ///
     /// * a step that [timed out](StepOutcome::TimedOut) or
-    ///   [panicked](StepOutcome::Panicked) reports no divergence because the
-    ///   replay never finished — a workflow that spins forever would otherwise
+    ///   [panicked](StepOutcome::Panicked) reports no divergence, because the
+    ///   replay never finished. A workflow that spins forever would otherwise
     ///   pass at every step;
     /// * a trace [truncated](Self::truncated) by `max_steps` never looked at
     ///   the suffix at all, the same unexamined-remainder trap
@@ -525,9 +525,11 @@ pub enum Breakpoint {
     EventType(String),
     /// Break at exactly this event index.
     EventIndex(usize),
-    /// Break when this activity is scheduled — either by the recorded event
-    /// (`ActivityScheduled` / `LocalActivityScheduled`) or by a pending
-    /// `ScheduleActivity` / `RunLocalActivity` command at the frontier.
+    /// Break when this activity is scheduled.
+    ///
+    /// Either the recorded event (`ActivityScheduled` / `LocalActivityScheduled`)
+    /// or a pending `ScheduleActivity` / `RunLocalActivity` frontier command
+    /// matches.
     ActivityName(String),
     /// Break when this signal is received, or when the workflow parks waiting
     /// for it.
@@ -573,14 +575,13 @@ fn step_names_signal(step: &DebugStep, name: &str) -> bool {
     let waiting = step
         .commands
         .iter()
-        // Exact, not segment-wise: a `WaitForSignal` summary *is* the signal
-        // name with no qualifier appended (unlike `ScheduleActivity`'s
-        // `"{name} -> {queue}"`), and a signal name may legitimately contain
-        // spaces — nothing in the engine or the `POST .../signal/{name}` route
-        // restricts it to one token. Splitting on whitespace made
-        // `SignalName("order approved")` unmatchable at exactly the step a
-        // breakpoint is for: a waiting frontier, where no `SignalReceived`
-        // exists yet to match instead.
+        // Exact, not segment-wise. A `WaitForSignal` summary *is* the signal
+        // name, with no qualifier (unlike `ScheduleActivity`'s
+        // `"{name} -> {queue}"`). A signal name may contain spaces. Neither
+        // the engine nor the `POST .../signal/{name}` route limits it to one
+        // token. A whitespace split made `SignalName("order approved")`
+        // unmatchable at a waiting frontier. That is the step a breakpoint is
+        // for, and no `SignalReceived` exists there yet to match instead.
         .any(|c| c.kind == "WaitForSignal" && c.summary == name);
     received_here || waiting
 }
@@ -612,12 +613,11 @@ fn decision_of(event: &WorkflowEvent) -> Option<DecisionAttribution> {
 /// **Strips the one known qualifier rather than tokenizing.** Only
 /// `ScheduleActivity` appends one (`"{name} -> {queue}"`, see
 /// [`render_command`]); `RunLocalActivity` and `ScheduleExternalActivity`
-/// summaries *are* the bare name. Splitting on whitespace (or on `,()=`) instead
-/// made `ActivityName("charge card")` unmatchable at exactly the step a
-/// breakpoint is for — a waiting frontier, where no `ActivityScheduled` event
-/// exists yet to match instead. Nothing in the engine restricts an activity name
-/// to one token: it is the free-form `#[activity]` fn name or a
-/// `execute_activity_raw` string.
+/// summaries *are* the bare name. A split on whitespace (or on `,()=`) made
+/// `ActivityName("charge card")` unmatchable at a waiting frontier. That is the
+/// step a breakpoint is for, and no `ActivityScheduled` event exists there yet.
+/// Nothing in the engine limits an activity name to one token. It is the
+/// free-form `#[activity]` fn name or a `execute_activity_raw` string.
 ///
 /// Split from the **right** so a name that itself contains `" -> "` still
 /// resolves — the queue qualifier is always appended last.
@@ -645,12 +645,11 @@ fn frontier_activity_name(command: &CommandSnapshot) -> Option<&str> {
 pub enum DiffKind {
     /// The two *histories* themselves differ at this step.
     ///
-    /// Every field of a [`DebugStep`] except `commands`/`outcome` is derived
-    /// from the recorded history alone, so a difference here means the two
-    /// traces are not replaying the same recording. This is the signal that
-    /// drives the **two fixture histories** arm of AC3 (and the only signal
-    /// available when neither side has registered workflow code, since a
-    /// handler-free trace emits no commands at all).
+    /// Every field of a [`DebugStep`] except `commands`/`outcome` comes from
+    /// the recorded history alone. So a difference here means the two traces
+    /// replay different recordings. This signal drives the **two fixture
+    /// histories** arm of AC3. It is the only signal when neither side has
+    /// registered workflow code, because a handler-free trace emits no commands.
     HistoryFacts {
         /// Which derived field differs, e.g. `"event_type"` or
         /// `"open_awaitables"`.
@@ -678,10 +677,10 @@ pub enum DiffKind {
     },
     /// Exactly one side recorded a replay divergence at this step.
     ///
-    /// A divergence is a *code-vs-history* fact (one build's code no longer
-    /// matches the recording), so it is reported as its own kind rather than
-    /// folded into [`DiffKind::HistoryFacts`] — the two recordings are
-    /// identical here; the two *builds* are not.
+    /// A divergence is a *code-vs-history* fact: one build's code no longer
+    /// matches the recording. So it is its own kind, not part of
+    /// [`DiffKind::HistoryFacts`]. The two recordings are identical here. The
+    /// two *builds* are not.
     Divergence {
         /// The left trace's divergence, if it had one.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -692,17 +691,16 @@ pub enum DiffKind {
     },
     /// The two traces belong to **different workflow types**.
     ///
-    /// `workflow_name` is an execution-*row* column — it appears in no
-    /// `WorkflowEvent` (not even `WorkflowStarted`), so `event_facts` cannot
-    /// see it. It also selects the handler that owns and interprets the
-    /// history, which makes it the one piece of metadata that must agree
-    /// before comparing anything else: two recordings of *different workflows*
-    /// are not "in agreement" no matter how similar their event arrays look.
+    /// `workflow_name` is an execution-*row* column. No `WorkflowEvent` holds
+    /// it, not even `WorkflowStarted`, so `event_facts` cannot see it. It also
+    /// selects the handler that owns and interprets the history. So it must
+    /// agree before anything else is compared. Two recordings of *different
+    /// workflows* never agree, however similar their event arrays look.
     ///
     /// `execution_id` is deliberately **not** compared alongside it. Two
-    /// independent recordings always carry different execution ids, so
-    /// comparing it would fabricate a divergence on every fixture-vs-fixture
-    /// diff — the same reason it is normalized out of `event_facts`.
+    /// independent recordings always carry different execution ids. Comparing
+    /// it would fabricate a divergence on every fixture-vs-fixture diff. For
+    /// the same reason, `event_facts` normalizes it out.
     WorkflowName {
         /// The left trace's workflow type.
         left: String,
@@ -715,11 +713,12 @@ pub enum DiffKind {
         left: usize,
         /// The right trace's step count.
         right: usize,
-        /// `true` when at least one side was capped by `max_steps`, so the
-        /// length difference is a **cap artefact** rather than a property of
-        /// the two traces. Diffing traces built with different caps is a
-        /// caller error; this field makes it self-diagnosing instead of
-        /// silently reporting a divergence that does not exist.
+        /// `true` when `max_steps` capped at least one side.
+        ///
+        /// The length difference is then a **cap artefact**, not a property of
+        /// the two traces. A diff of traces with different caps is a caller
+        /// error. This field makes it self-diagnosing, not a silent false
+        /// divergence.
         capped: bool,
     },
 }
@@ -757,10 +756,9 @@ pub struct TraceDiff {
     /// [`ReplayDebugger::max_steps`], so the comparison examined only a
     /// **prefix** of the two histories.
     ///
-    /// This is why callers must ask [`TraceDiff::is_clean`] rather than
-    /// testing `divergence.is_none()`: on a capped trace a `None` divergence
-    /// means "no difference in the part we looked at", which is emphatically
-    /// not the same claim.
+    /// So callers must ask [`TraceDiff::is_clean`], not test
+    /// `divergence.is_none()`. On a capped trace, a `None` divergence means
+    /// "no difference in the examined part". That is not the same claim.
     pub truncated: bool,
     /// The first compared step at which **both** traces failed to replay: both
     /// [timed out](StepOutcome::TimedOut) or both
@@ -770,14 +768,14 @@ pub struct TraceDiff {
     /// [`StepOutcome::replay_failed`]. A handler-free fixture-vs-fixture diff is
     /// `NotReplayed` throughout and is conclusive about what it claims.
     ///
-    /// Two builds that break the *same way* compare equal at every field, so
-    /// the walk reports no divergence — but neither replay ever finished, so
-    /// "they agree" is a statement about two non-answers. That is
-    /// the same unexamined-remainder trap as [`truncated`](Self::truncated),
-    /// one layer down, and [`is_clean`](Self::is_clean) refuses it too.
+    /// Two builds that break the *same way* compare equal at every field. So
+    /// the walk reports no divergence. But neither replay finished, so "they
+    /// agree" is a statement about two non-answers. That is the
+    /// unexamined-remainder trap of [`truncated`](Self::truncated), one layer
+    /// down. [`is_clean`](Self::is_clean) refuses it too.
     ///
-    /// When the two sides fail *differently* (one panics, one suspends) the
-    /// walk reports an ordinary [`DiffKind::Outcome`] divergence instead — that
+    /// When the two sides fail *differently* (one panics, one suspends), the
+    /// walk reports an ordinary [`DiffKind::Outcome`] divergence instead. That
     /// is a real, actionable behavioural difference, not a doubt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inconclusive_step: Option<usize>,
@@ -787,11 +785,11 @@ impl TraceDiff {
     /// `true` only when the two traces were compared **in full** and agree.
     ///
     /// `divergence.is_none()` alone is **not** the clean signal. When both
-    /// traces hit the same `max_steps` cap their step counts are equal, so the
-    /// [`DiffKind::TraceLength`] check — the only one carrying a `capped`
-    /// flag — never fires, and a difference living past the cap is reported as
-    /// silence. A CI gate reading `divergence.is_none()` would treat an
-    /// unexamined suffix as a pass; this method refuses to.
+    /// traces hit the same `max_steps` cap, their step counts are equal. The
+    /// [`DiffKind::TraceLength`] check, the only one with a `capped` flag, then
+    /// never fires. A difference past the cap is reported as silence. A CI gate
+    /// that reads `divergence.is_none()` would pass an unexamined suffix. This
+    /// method refuses to.
     ///
     /// It equally refuses a comparison in which neither side ever replayed
     /// successfully — see [`inconclusive_step`](Self::inconclusive_step).
@@ -807,14 +805,13 @@ impl TraceDiff {
 /// Diff two traces of the same history and report the **first** divergent
 /// command (AC3).
 ///
-/// The comparison walks steps in order and stops at the first difference, so a
-/// divergence cascade (one root cause producing dozens of downstream
-/// differences) reports exactly one actionable result.
+/// The comparison walks steps in order and stops at the first difference. So a
+/// divergence cascade, where one root cause makes dozens of downstream
+/// differences, reports exactly one actionable result.
 ///
 /// Read the verdict with [`TraceDiff::is_clean`], **not** with
-/// `divergence.is_none()`: when both traces were capped by `max_steps` only a
-/// prefix was compared, and a difference past the cap is indistinguishable
-/// from agreement.
+/// `divergence.is_none()`. When `max_steps` capped both traces, only a prefix
+/// was compared. A difference past the cap then looks like agreement.
 #[must_use]
 pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     let truncated = left.truncated || right.truncated;
@@ -825,16 +822,17 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     let left_steps = boundary_free_steps(left);
     let right_steps = boundary_free_steps(right);
     let shared = left_steps.len().min(right_steps.len());
-    // The first compared index where *neither* side replayed successfully. Both
-    // sides failing the same way compares equal at every field, so the walk
-    // below reports no divergence — but "they agree" would be a claim about two
-    // non-answers. Computed over the compared prefix only: a failure past
-    // `shared` is already covered by `truncated` / `DiffKind::TraceLength`.
-    // `replay_failed`, not `!replay_succeeded`: a handler-free projection is
-    // `NotReplayed` on both sides by design, and comparing two *recordings*
-    // (AC3's fixture-vs-fixture mode) is fully conclusive — the history facts
-    // it compares are determined entirely by the two histories. Only a replay
-    // that was attempted and did not finish makes agreement meaningless.
+    // The first compared index where *neither* side replayed successfully. Two
+    // sides that fail the same way compare equal at every field. So the walk
+    // below reports no divergence, but "they agree" would be a claim about two
+    // non-answers. Only the compared prefix counts: `truncated` /
+    // `DiffKind::TraceLength` already cover a failure past `shared`.
+    //
+    // `replay_failed`, not `!replay_succeeded`. A handler-free projection is
+    // `NotReplayed` on both sides by design. A comparison of two *recordings*
+    // (AC3's fixture-vs-fixture mode) is fully conclusive. The two histories
+    // fully determine the history facts it compares. Only a replay that was
+    // attempted and did not finish makes agreement meaningless.
     let inconclusive_step = (0..shared).find(|&i| {
         left_steps[i].raw.outcome.replay_failed() && right_steps[i].raw.outcome.replay_failed()
     });
@@ -848,12 +846,11 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
 
     // Before any step: the two recordings must belong to the same workflow
     // type. `workflow_name` lives on the execution row, not in any
-    // `WorkflowEvent`, so `event_facts` is structurally blind to it — two
-    // recordings of *different* workflows with similarly-shaped event arrays
-    // would otherwise walk every step and report agreement. Same principle as
-    // `step_diff_kind`'s history-facts-first ordering, one level up: if the
-    // recordings are not of the same thing, comparing what the code did next
-    // is apples to oranges.
+    // `WorkflowEvent`. So `event_facts` cannot see it. Two recordings of
+    // *different* workflows with similar event arrays would otherwise walk
+    // every step and report agreement. This is `step_diff_kind`'s
+    // history-facts-first rule, one level up. When the recordings differ, a
+    // comparison of what the code did next means nothing.
     if left.workflow_name != right.workflow_name {
         return finish(Some(TraceDivergence {
             step_index: 0,
@@ -861,9 +858,9 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
                 left: left.workflow_name.clone(),
                 right: right.workflow_name.clone(),
             },
-            // Trace-level, not step-level: the names are carried by the kind
-            // itself, and pinning a step here would imply the difference lives
-            // in that step's contents when it does not.
+            // Trace-level, not step-level. The kind itself carries the names.
+            // A pinned step would imply that the difference lives in that
+            // step's contents, and it does not.
             left: None,
             right: None,
         }));
@@ -948,12 +945,11 @@ fn boundary_free_steps(trace: &ReplayTrace) -> Vec<ComparedStep<'_>> {
 ///
 /// Comparison order is deliberate:
 ///
-/// 1. **History facts** — if the two recordings already differ here, comparing
-///    "what did the code do next" across them is apples to oranges, and this is
-///    the only signal a handler-free trace carries (it emits no commands).
+/// 1. **History facts** — when the two recordings already differ here, "what
+///    did the code do next" means nothing across them. This is also the only
+///    signal a handler-free trace carries, because it emits no commands.
 /// 2. **Divergence** — one side's code no longer matches the recording. That
-///    *is* the root cause; every later difference at this step is downstream
-///    of it.
+///    *is* the root cause. Every later difference at this step follows from it.
 /// 3. **Commands** — the actionable root cause when both sides replay the
 ///    *same* history against different code.
 /// 4. **Outcome** — usually a downstream consequence of (3), so it is reported
@@ -996,32 +992,35 @@ fn step_diff_kind(l: &DebugStep, r: &DebugStep) -> Option<DiffKind> {
 ///
 /// # Per-run identity is normalized out
 ///
-/// Two *independent recordings* of the same logical scenario necessarily differ
-/// on values that are freshly minted per run: activity/child execution UUIDs,
-/// and the recorded values of the non-deterministic side-effect kinds
-/// (`Now`/`Uuid`/`Random`, issue #384). Comparing those verbatim would make the
-/// "two fixture histories" arm of AC3 report a divergence at the first activity
-/// of every real pair — pure noise that would bury the signal.
+/// Two *independent recordings* of the same logical scenario always differ on
+/// values minted per run. These are activity/child execution UUIDs and the
+/// recorded values of the non-deterministic side-effect kinds
+/// (`Now`/`Uuid`/`Random`, issue #384). A verbatim comparison would make the
+/// "two fixture histories" arm of AC3 diverge at the first activity of every
+/// real pair. That noise would bury the signal.
 ///
 /// So this comparator normalizes them away and compares the **semantic** shape:
-/// event type, signal name, resolved payload, awaitable kind/name/opening
-/// index, version and patch gates, marker names and details, and the value of
-/// `Custom` side effects (which is application data, not engine identity).
+///
+/// * event type, signal name and resolved payload;
+/// * awaitable kind, name and opening index;
+/// * version and patch gates, marker names and details;
+/// * the value of `Custom` side effects, which is application data, not engine
+///   identity.
 ///
 /// This normalization cannot hide a code-caused divergence:
 ///
-/// * In the **one history, two code registrations** arm (AC3's primary case)
-///   both sides replay byte-identical events, so every normalized-away field is
-///   equal by construction and the divergence surfaces through `commands`.
-/// * In the **two fixture histories** arm, a change that actually matters —
-///   a renamed or reordered activity, a different input, a new marker, a
-///   changed version gate — moves a field that *is* compared.
+/// * In the **one history, two code registrations** arm (AC3's primary case),
+///   both sides replay byte-identical events. So every normalized-away field is
+///   equal by construction, and the divergence surfaces through `commands`.
+/// * In the **two fixture histories** arm, a change that matters moves a field
+///   that *is* compared. Examples are a renamed or reordered activity, a
+///   different input, a new marker, or a changed version gate.
 ///
 /// # Exhaustiveness
 ///
-/// The destructure below binds every [`DebugStep`] field, so adding a field
-/// without classifying it as history-derived (here) or code-derived (in
-/// [`step_diff_kind`]) is a compile error rather than a silent false "clean".
+/// The destructure below binds every [`DebugStep`] field. A new field must be
+/// classed as history-derived (here) or code-derived (in [`step_diff_kind`]).
+/// Otherwise it is a compile error, not a silent false "clean".
 fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     let DebugStep {
         index: _,
@@ -1066,15 +1065,14 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     if normalized_markers(l_markers) != normalized_markers(&r.markers) {
         return Some("markers");
     }
-    // Last, as the completeness backstop. The projections above are *curated*:
-    // each names a specific field, which is what makes the report legible to a
-    // human ("open_awaitables differ" beats "the events differ"). But a curated
-    // list is exactly the thing that silently rots as `WorkflowEvent` grows —
-    // the hole Codex found, where a semantic field nobody projected made two
-    // genuinely different histories compare EQUAL. `event_facts` is the whole
-    // serialized event with only per-run identity normalized away, so it is
-    // exhaustive by construction and catches anything the curated checks miss.
-    // Ordering it last keeps the good diagnostics and closes the hole.
+    // Last, as the completeness backstop. The projections above are *curated*.
+    // Each names a specific field, so the report is legible to a human
+    // ("open_awaitables differ" beats "the events differ"). But a curated list
+    // silently rots as `WorkflowEvent` grows. A semantic field that nobody
+    // projected once made two different histories compare EQUAL. `event_facts`
+    // is the whole serialized event, with only per-run identity normalized
+    // away. So it is exhaustive by construction and catches what the curated
+    // checks miss. Last place keeps the good diagnostics and closes that hole.
     if l_facts != &r.event_facts {
         return Some("event_facts");
     }
@@ -1083,13 +1081,12 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
 
 /// Replace every UUID-shaped token in a display label with the per-run marker.
 ///
-/// An awaitable's `name` is a *display* string that can embed engine identity —
+/// An awaitable's `name` is a *display* string that can embed engine identity.
 /// `ExternalSignalRequested` renders `"{signal_name} -> {target}"`, and an
-/// `ExternalTarget::ExecutionId` target is a per-run UUID. Dropping the
-/// separate `id` field is therefore not enough: without this, two independent
-/// recordings of one "signal a sibling workflow" scenario diff as different.
-/// That is noise rather than a false clean, but noise on a divergence-finding
-/// tool buries the signal it exists to surface.
+/// `ExternalTarget::ExecutionId` target is a per-run UUID. So dropping the
+/// separate `id` field is not enough. Without this, two independent recordings
+/// of one "signal a sibling workflow" scenario diff as different. That is noise,
+/// not a false clean. But on a divergence-finding tool, noise buries the signal.
 ///
 /// A business-id target (`ExternalTarget::WorkflowId`) contains no UUID and so
 /// still compares verbatim.
@@ -1107,18 +1104,19 @@ fn normalize_label_ids(label: &str) -> String {
         .join(" ")
 }
 
-/// Project open awaitables onto their comparable shape, dropping the per-run
-/// execution UUID — both the separate `id` field and any UUID embedded in the
-/// display `name` (see [`history_fact_diff`] and [`normalize_label_ids`]).
+/// Project open awaitables onto their comparable shape, without per-run UUIDs.
+///
+/// It drops the separate `id` field and any UUID in the display `name` (see
+/// [`history_fact_diff`] and [`normalize_label_ids`]).
 fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<String>, usize)> {
     awaitables
         .iter()
-        // `AwaitableKind::Signal` and `AwaitableKind::Mutex` are synthesized
-        // from frontier `WaitForSignal`/`AcquireMutex` commands, so they are
-        // *code*-derived, not recorded history facts. Comparing them here
-        // would report a code difference as "the recorded histories differ";
-        // `step_diff_kind`'s command comparison owns them and sees the same
-        // signal name / mutex key.
+        // `AwaitableKind::Signal` and `AwaitableKind::Mutex` come from frontier
+        // `WaitForSignal`/`AcquireMutex` commands. So they are *code*-derived,
+        // not recorded history facts. A comparison here would report a code
+        // difference as "the recorded histories differ". `step_diff_kind`'s
+        // command comparison owns them and sees the same signal name / mutex
+        // key.
         .filter(|a| !matches!(a.kind, AwaitableKind::Signal | AwaitableKind::Mutex))
         .map(|a| {
             (
@@ -1130,16 +1128,13 @@ fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<
         .collect()
 }
 
-/// Project side effects onto their comparable shape. The recorded `value` is
-/// compared only for `Custom` side effects — the `Now`/`Uuid`/`Random` kinds
-/// are freshly drawn per run by design (see [`history_fact_diff`]).
 /// Marker snapshots with engine-minted per-run identity stripped, for
 /// comparison only.
 ///
-/// [`MarkerSnapshot::details`] stays verbatim for *display* — a debugger showing
-/// `"<per-run>"` where a session id lives would be worse than useless — so the
-/// normalization lives here, on the comparison side. Same display/identity split
-/// as [`CommandSnapshot`]'s `summary` vs `payload`. See
+/// [`MarkerSnapshot::details`] stays verbatim for *display*. A debugger that
+/// shows `"<per-run>"` in place of a session id would be worse than useless. So
+/// the normalization lives here, on the comparison side. This is the
+/// display/identity split of [`CommandSnapshot`]'s `summary` vs `payload`. See
 /// [`is_engine_minted_marker`].
 fn normalized_markers(markers: &[MarkerSnapshot]) -> Vec<MarkerSnapshot> {
     markers
@@ -1158,6 +1153,9 @@ fn normalized_markers(markers: &[MarkerSnapshot]) -> Vec<MarkerSnapshot> {
         .collect()
 }
 
+/// Project side effects onto their comparable shape. The recorded `value` is
+/// compared only for `Custom` side effects. The `Now`/`Uuid`/`Random` kinds are
+/// drawn fresh per run by design (see [`history_fact_diff`]).
 fn side_effect_shapes(
     effects: &[SideEffectSnapshot],
 ) -> Vec<(&'static str, Option<&str>, usize, Option<&Value>)> {
@@ -1176,9 +1174,9 @@ fn side_effect_shapes(
 
 /// Whether an exported history document declares redacted payloads.
 ///
-/// `HistoryExportDocument` carries `payload_policy` at the top level but
-/// [`HistorySnapshot`] does not model it, so this reads the raw JSON — the same
-/// approach `harvest history sample`'s own redaction warning takes.
+/// `HistoryExportDocument` carries `payload_policy` at the top level, but
+/// [`HistorySnapshot`] does not model it. So this reads the raw JSON, as the
+/// redaction warning of `harvest history sample` does.
 #[must_use]
 pub fn is_redacted_export(json: &str) -> bool {
     serde_json::from_str::<RedactionProbe>(json).is_ok_and(|probe| probe.0)
@@ -1242,11 +1240,11 @@ pub enum DebugError {
 
     /// The exported history has redacted payloads.
     ///
-    /// Redaction rewrites every `input` / `output` / `payload` field in place,
-    /// so replaying against it makes the very first payload-bearing activity
-    /// report a divergence that is an artefact of the export, not of the code.
-    /// Refused rather than reported, because a divergence-finding tool must
-    /// never invent one.
+    /// Redaction rewrites every `input` / `output` / `payload` field in place.
+    /// A replay against it makes the first payload-bearing activity diverge.
+    /// That divergence is an artefact of the export, not of the code. It is
+    /// refused, not reported, because a divergence-finding tool must never
+    /// invent one.
     #[error(
         "this history was exported with redacted payloads, so every payload-bearing \
          activity would report a fabricated divergence; re-export with \
@@ -1256,9 +1254,9 @@ pub enum DebugError {
 
     /// A claim-check envelope could not be inflated from the configured store.
     ///
-    /// Refused rather than replayed against the raw envelope: a workflow that
-    /// inspects the payload would take a different branch and report a
-    /// divergence that is an artefact of the missing blob, not of the code.
+    /// Refused, not replayed against the raw envelope. A workflow that inspects
+    /// the payload would take a different branch and report a divergence. That
+    /// divergence is an artefact of the missing blob, not of the code.
     #[error("could not inflate an offloaded payload from the configured store: {reason}")]
     PayloadInflate {
         /// The underlying store or checksum failure.
@@ -1357,19 +1355,18 @@ impl ReplayDebugger {
     /// Register the candidate build's declarative `#[query]` handlers.
     ///
     /// The live worker registers a workflow's declarative handlers **before any
-    /// workflow code runs**, and [`WorkflowContext::list_query_names`] merges
-    /// them into its result — so a workflow that branches on which handlers
-    /// exist, or that dispatches a query, observes them. They live in no
-    /// `WorkflowEvent`, so a pure-history replay cannot recover them: without
-    /// this the debugger runs every prefix against an *empty* registry.
+    /// workflow code runs**. [`WorkflowContext::list_query_names`] merges them
+    /// into its result. So a workflow that branches on which handlers exist, or
+    /// that dispatches a query, sees them. They live in no `WorkflowEvent`, so a
+    /// pure-history replay cannot recover them. Without this, the debugger runs
+    /// every prefix against an *empty* registry.
     ///
     /// That is wrong in both directions, and both are false answers from a
-    /// divergence-finding tool. A candidate that **keeps** a registration the
-    /// recorded run had is the false-RED direction: replay takes the other
-    /// branch and reports drift on code nobody changed. A candidate that
-    /// **adds or removes** one is the false-GREEN direction: the branch the
-    /// promoted worker will take was never exercised, so the diff certifies a
-    /// build on evidence it never gathered.
+    /// divergence-finding tool. A candidate that **keeps** a registration of the
+    /// recorded run gives a false RED. Replay takes the other branch and reports
+    /// drift on code nobody changed. A candidate that **adds or removes** one
+    /// gives a false GREEN. The branch that the promoted worker takes never
+    /// runs here. So the diff certifies a build on evidence it never gathered.
     ///
     /// Pass the same `queries![…]` collection the candidate build registers;
     /// entries for other workflow types are filtered out, exactly as the worker
@@ -1392,18 +1389,18 @@ impl ReplayDebugger {
     /// Inflate large-payload claim-check envelopes before replay (issue #524).
     ///
     /// A deployment with a registered `PayloadStore` records an over-threshold
-    /// payload as a small reference envelope rather than the value itself. The
-    /// live worker inflates those envelopes back to the real payload before the
-    /// workflow body sees them, so a replay that skips inflation hands the
-    /// handler an envelope where the recorded run had a value — and a workflow
-    /// that inspects the payload takes a different branch, reporting a
-    /// divergence that is an artefact of the debugger rather than of the code.
+    /// payload as a small reference envelope, not the value itself. The live
+    /// worker inflates those envelopes to the real payload before the workflow
+    /// body sees them. A replay that skips inflation hands the handler an
+    /// envelope where the recorded run had a value. A workflow that inspects the
+    /// payload then takes a different branch. The divergence it reports is an
+    /// artefact of the debugger, not of the code.
     ///
-    /// **Optional by design.** With no offloader configured the envelopes are
-    /// displayed verbatim, which is AC4's contract for an export debugged with
-    /// no store to hand: an envelope displays as an envelope and is never an
-    /// error. Configure this when you have the store and want the workflow body
-    /// to see through it.
+    /// **Optional by design.** With no offloader configured, the envelopes are
+    /// displayed verbatim. That is AC4's contract for an export debugged with
+    /// no store at hand: an envelope displays as an envelope and is never an
+    /// error. Configure this when the store is available and the workflow body
+    /// must see through it.
     #[must_use]
     pub fn payload_offloader(
         mut self,
@@ -1458,17 +1455,17 @@ impl ReplayDebugger {
     /// `0` means "no cap").
     ///
     /// These live in no `WorkflowEvent`, so a pure-history replay cannot
-    /// recover them — the live worker supplies its own configured caps from
-    /// `BuiltHarvest`. Left at the library defaults, the debugger answers a
-    /// question about a worker that does not exist, and it does so in **both**
-    /// directions: a candidate that *lowers* a cap has an over-cap dispatch
-    /// accepted here and rejected in production, while a candidate that *raises*
-    /// one has a legitimate dispatch rejected here — an early-return divergence
-    /// fabricated against a perfectly good history.
+    /// recover them. The live worker supplies its own configured caps from
+    /// `BuiltHarvest`. At the library defaults, the debugger answers a question
+    /// about a worker that does not exist, in **both** directions. A candidate
+    /// that *lowers* a cap has an over-cap dispatch accepted here and rejected
+    /// in production. A candidate that *raises* one has a legitimate dispatch
+    /// rejected here. That is an early-return divergence fabricated against a
+    /// good history.
     ///
-    /// The cap is consulted only where a dispatch is not already in recorded
-    /// history, i.e. at the prefix frontier — which is exactly where every step
-    /// of a trace lands. Pass the values the candidate configures on its
+    /// The cap applies only where a dispatch is not yet in recorded history,
+    /// i.e. at the prefix frontier. Every step of a trace lands exactly there.
+    /// Pass the values the candidate configures on its
     /// `HarvestBuilder`; this mirrors
     /// [`WorkflowReplayer::with_payload_caps`](crate::testing::WorkflowReplayer::with_payload_caps)
     /// (issue #798).
@@ -1491,10 +1488,10 @@ impl ReplayDebugger {
 
     /// Apply the **candidate** build's large-payload offload threshold (#524).
     ///
-    /// A payload above the threshold is offloaded rather than capped, so a
-    /// debugger that knows the cap but not the threshold reports a divergence
-    /// the promoted worker would never hit. `None` (the default) models a
-    /// worker with no `PayloadStore` registered.
+    /// A payload above the threshold is offloaded, not capped. A debugger that
+    /// knows the cap but not the threshold reports a divergence that the
+    /// promoted worker would never hit. `None` (the default) models a worker with
+    /// no `PayloadStore` registered.
     #[must_use]
     pub const fn payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_limits.offload_threshold = threshold;
@@ -1555,10 +1552,10 @@ impl ReplayDebugger {
             });
         };
 
-        // Before *anything* reads the events — the projection and every prefix
-        // replay share one inflated list, so display and comparison can never
-        // disagree about what a payload is. A no-op when no offloader is
-        // configured, which is the AC4 default (envelopes display as envelopes).
+        // Before *anything* reads the events. The projection and every prefix
+        // replay share one inflated list. So display and comparison never
+        // disagree about what a payload is. With no offloader configured, this
+        // is a no-op. That is the AC4 default: envelopes display as envelopes.
         self.inflate(&mut snapshot.events).await?;
 
         // The handler-free projection supplies every AC1 field except the
@@ -1578,16 +1575,16 @@ impl ReplayDebugger {
                 .await;
             step.outcome = replayed.outcome;
             step.divergence = replayed.divergence;
-            // AC1 requires signal waits among the open awaitables, but some
-            // parks have no *opening event* — they exist only as a frontier
-            // command. A `wait_for_signal` park emits `WaitForSignal`, and a
-            // `ctx.mutex(k).acquire()` park emits `AcquireMutex` (its waiter
-            // row lives in `harvest_mutex_waiters`; only the *grant* records a
-            // `MutexGranted` event, issue #691). Synthesize both here, where
-            // the commands are known, so "why is this run parked?" is
-            // answerable for either and `history_fact_diff`'s
-            // `open_awaitables` comparison can see a changed name. The
-            // command → kind mapping mirrors `awaitables::…` so the debugger
+            // AC1 requires signal waits among the open awaitables. Some parks
+            // have no *opening event*, only a frontier command. A
+            // `wait_for_signal` park emits `WaitForSignal`. A
+            // `ctx.mutex(k).acquire()` park emits `AcquireMutex`. Its waiter
+            // row lives in `harvest_mutex_waiters`, and only the *grant*
+            // records a `MutexGranted` event (issue #691). Both are synthesized
+            // here, where the commands are known. So "why is this run parked?"
+            // has an answer for either. `history_fact_diff`'s
+            // `open_awaitables` comparison also sees a changed name. The
+            // command → kind mapping mirrors `awaitables::…`, so the debugger
             // and the operator-facing open-awaitables report agree.
             for command in &replayed.commands {
                 let kind = match command.kind {
@@ -1652,14 +1649,14 @@ impl ReplayDebugger {
         .with_workflow_name(snapshot.workflow_name.clone())
         .with_build_id(self.build_id.clone())
         // Every replay input the snapshot carries. `HistorySnapshot` documents
-        // these as replay inputs precisely because they are *row* columns that
-        // live in no `WorkflowEvent`, so a replay path that drops them makes a
-        // workflow branching on `ctx.info().parent_execution_id`, reading its
-        // execution deadline, or calling the deadline-sensitive
-        // `should_continue_as_new()` emit commands from defaults — a fabricated
-        // divergence on an otherwise valid production export. Threading them
-        // here keeps this new replay path aligned with the worker, the
-        // replayer, and the query-hydration paths (issues #698, #772).
+        // these as replay inputs because they are *row* columns that live in no
+        // `WorkflowEvent`. A workflow can branch on
+        // `ctx.info().parent_execution_id`, read its execution deadline, or call
+        // the deadline-sensitive `should_continue_as_new()`. A replay path that
+        // drops these inputs makes it emit commands from defaults. That
+        // fabricates a divergence on a valid production export. Threading them here keeps
+        // this replay path aligned with the worker, the replayer, and the
+        // query-hydration paths (issues #698, #772).
         .with_parent_execution_id(snapshot.parent_execution_id)
         // Issue #2082: the row's start source decides an entity's branch.
         .with_start_provenance(snapshot.start_provenance.unwrap_or_default())
@@ -1669,13 +1666,12 @@ impl ReplayDebugger {
         // setter is dead and `should_continue_as_new()` always sees the
         // default threshold and deadline fraction.
         .with_history_policy(self.history_policy)
-        // The candidate build's payload configuration (#798). Same class as
-        // `build_id` and `history_policy`: candidate configuration that lives in
-        // no `WorkflowEvent`, and that a replay left at library defaults gets
-        // wrong in both directions — see `ReplayDebugger::payload_caps`. The
-        // second argument is `max_activity_result`, which `WorkflowContext`
-        // never enforces, so it is pinned uncapped exactly as `run_workflow_strict`
-        // pins it.
+        // The candidate build's payload configuration (#798). Like `build_id`
+        // and `history_policy`, it is candidate configuration in no
+        // `WorkflowEvent`. A replay at library defaults gets it wrong in both
+        // directions (see `ReplayDebugger::payload_caps`). The second argument
+        // is `max_activity_result`. `WorkflowContext` never enforces it, so it
+        // is pinned uncapped, as `run_workflow_strict` pins it.
         .with_payload_caps(
             self.payload_limits.max_activity_input,
             0,
@@ -1723,11 +1719,11 @@ impl ReplayDebugger {
         // `Ok`/`Err`, so a non-determinism error is read back from the context's
         // structured slots.
         //
-        // Both slots are drained **unconditionally**: `record_deferred_nd`
-        // populates `nd_details` with empty `expected`/`actual` *and*
-        // `deferred_nd_error` with the real message, so a lazy `.or_else` chain
-        // would never reach the message and every deferred divergence — the
-        // whole `SideEffectDrift` class — would report `<unknown>`.
+        // Both slots are drained **unconditionally**. `record_deferred_nd`
+        // fills `nd_details` with empty `expected`/`actual`. It also fills
+        // `deferred_nd_error` with the real message. A lazy `.or_else` chain
+        // would never reach the message. Every deferred divergence, the whole
+        // `SideEffectDrift` class, would then report `<unknown>`.
         let deferred = ctx.take_deferred_nd_error();
         let position = ctx.replay_position();
         let divergence = ctx
@@ -1753,14 +1749,13 @@ impl ReplayDebugger {
                 })
             })
             // The engine's own runners apply one more check *after* the handler
-            // returns: a workflow that completes while recorded history is still
-            // unconsumed dropped work the recording did (`run_workflow_canary`,
-            // `run_strict_with_ctx`). Without this the debugger is strictly
-            // weaker than canary — a build that never calls an activity the
-            // history records replays 100% "clean", which is the worst possible
-            // answer for the single-trace "does this build replay cleanly?"
-            // check. Gated on `ReachedTerminal` to match the engine, which
-            // applies it only on the handler's `Ok` arm.
+            // returns (`run_workflow_canary`, `run_strict_with_ctx`). A workflow
+            // that completes with recorded history still unconsumed dropped
+            // work that the recording did. Without this check, the debugger is
+            // weaker than canary. A build that never calls a recorded activity
+            // would replay 100% "clean". That is the worst answer to "does this
+            // build replay cleanly?". Gated on `ReachedTerminal` to match the
+            // engine, which applies it only on the handler's `Ok` arm.
             .or_else(|| {
                 (outcome == QueryReplayOutcome::ReachedTerminal
                     && ctx.history_has_unconsumed_events())
@@ -1828,9 +1823,11 @@ impl HistoryAccumulator {
         });
     }
 
-    /// Closes the matching open awaitable, returning it so a caller can read
-    /// fields the *closing* event does not carry (a child terminal names only
-    /// the `child_id`, but its reserved race timer encodes the workflow name).
+    /// Closes the matching open awaitable and returns it.
+    ///
+    /// A caller can then read fields that the *closing* event does not carry. A
+    /// child terminal names only the `child_id`, but its reserved race timer
+    /// encodes the workflow name.
     fn close(&mut self, kind: AwaitableKind, id: &str) -> Option<OpenAwaitable> {
         let pos = self
             .open
@@ -1842,12 +1839,13 @@ impl HistoryAccumulator {
     /// Closes the oldest open reserved race-deadline timer whose id parses (via
     /// `parse`) to `name`.
     ///
-    /// A signal-win of a signal-or-deadline race (#476), or a child-win of a
-    /// child-or-deadline race (#779), tears its reserved deadline timer down
-    /// through an **event-less** `CancelRaceLosers` row delete: no `TimerFired`
-    /// and no `TimerCancelled` is ever recorded for the losing arm. Closing
-    /// only on those two events would therefore leave the loser open for every
-    /// later step, rendering a resolved race as a run still waiting on a timer.
+    /// A signal-win of a signal-or-deadline race (#476) tears its reserved
+    /// deadline timer down through an **event-less** `CancelRaceLosers` row
+    /// delete. So does a child-win of a child-or-deadline race (#779). No
+    /// `TimerFired` and no `TimerCancelled` is recorded for the losing arm. A
+    /// close on those two events only would leave the loser open for every
+    /// later step. A resolved race would then look like a run waiting on a
+    /// timer.
     ///
     /// This mirrors `awaitables::close_race_arm_for` (issue #615) — and calls
     /// the same id parsers, so a change to the reserved prefixes cannot drift
@@ -1866,10 +1864,10 @@ impl HistoryAccumulator {
     /// Fold one event into the running projection.
     fn apply(&mut self, index: usize, event: &WorkflowEvent) {
         match event {
-            // `ActivityAwaitingExternal` is included deliberately: an
-            // external-activity handoff emits *only* that event — there is no
-            // preceding `ActivityScheduled` — so without it the activity never
-            // opens at all and the run looks idle.
+            // `ActivityAwaitingExternal` is included deliberately. An
+            // external-activity handoff emits *only* that event, with no
+            // `ActivityScheduled` before it. Without it, the activity never
+            // opens and the run looks idle.
             WorkflowEvent::ActivityScheduled {
                 activity_id, name, ..
             }
@@ -1973,10 +1971,10 @@ impl HistoryAccumulator {
             }
 
             // Cross-workflow signal (#244) and cancel (#492) handoffs. A run
-            // parked on one of these is the single most common "why is this
-            // stuck?" question, so they must open an awaitable — otherwise the
-            // park is invisible here *and* to `history_fact_diff`'s
-            // `open_awaitables` comparison.
+            // parked on one of these is the most common "why is this stuck?"
+            // question. So they must open an awaitable. Otherwise the park is
+            // invisible here *and* to `history_fact_diff`'s `open_awaitables`
+            // comparison.
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
                 target,
@@ -2076,45 +2074,11 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
     }
 }
 
-/// The event's **complete semantic content**, with per-run identity normalized
-/// out — the key `history_fact_diff` compares two fixture histories on.
+/// Stand-in for a stripped per-run value.
 ///
-/// # Why the whole event rather than a projection
-///
-/// Top-level `data` field names the engine mints fresh on every run.
-///
-/// Derived mechanically from `WorkflowEvent`'s own declared field types. A
-/// field belongs here when the engine mints its value fresh on every run:
-///
-/// * a UUID newtype — `ActivityExecId`, `ExecutionId`, `UpdateId`,
-///   `ExternalSignalId`, `ExternalAwaitId`, `ExternalCancelId`,
-///   `ExternalActivityToken`, `Uuid`;
-/// * `WorkerId`, which is `String`-backed but whose value
-///   `WorkerRuntimeConfig::from` always mints as a fresh `Uuid::new_v4()` —
-///   there is no `WorkerConfig::with_worker_id`. Two independent recordings
-///   therefore differ at the *first* `ActivityStarted`, which would bury every
-///   later semantic difference behind a divergence that is pure per-run noise.
-///
-/// `WorkerId` is exactly why the value guard (does it parse as a UUID?) is
-/// retained *alongside* the name match: `WorkerRuntimeConfig::worker_id` is a
-/// `pub` field, so an embedder may set a stable human label
-/// (`WorkerId::new("worker-eu-1")`). A label does not parse as a UUID and so
-/// still compares verbatim — engine-minted identity is normalized, an
-/// operator's chosen name is preserved.
-///
-/// Deliberately **not** here, despite being UUID-shaped in practice:
-///
-/// * `idempotency_key` — a caller-chosen exactly-once key (#521). Semantic.
-/// * `timer_id` — a `String` newtype whose value is author-chosen
-///   (`ctx.timer("escalate", …)`), so it must compare verbatim.
-///
-/// `debugger_tests::engine_minted_id_fields_match_the_event_enum` re-derives
-/// this set from `event.rs` at test time, so an engine-minted field added to
-/// `WorkflowEvent` later fails until it is classified here.
-/// Stand-in for a stripped per-run value. A single shared marker keeps two
-/// recordings comparing equal on the field while leaving it visibly present,
-/// rather than deleting the key (which would make "absent" and "normalized"
-/// indistinguishable).
+/// A single shared marker keeps two recordings equal on the field, and the
+/// field stays visibly present. Deleting the key would make "absent" and
+/// "normalized" look the same.
 const NORMALIZED: &str = "<per-run>";
 
 /// The `MarkerRecorded` name prefix `ctx.create_session` records its session
@@ -2126,17 +2090,16 @@ const SESSION_MARKER_PREFIX: &str = "session:";
 ///
 /// `WorkflowContext::resolve_session_id` mints a fresh `SessionId::new()` at the
 /// frontier and records it as `MarkerRecorded { name: "session:{seq}", details:
-/// <uuid> }`. Two independent recordings — and the two sides of a diff whose
-/// frontier step *creates* the session — therefore carry different UUIDs for the
-/// same logical session, which without this would report a divergence that is
-/// pure per-run noise.
+/// <uuid> }`. So two independent recordings carry different UUIDs for the same
+/// logical session. So do the two sides of a diff whose frontier step *creates*
+/// the session. Without this, that per-run noise would report a divergence.
 ///
-/// Discriminated by the **marker name**, not by "the value looks like a UUID":
-/// an application marker (`ctx.side_effect`-adjacent bookkeeping, a
-/// `fan_out:{n}` count) may legitimately carry a caller-chosen UUID as its
-/// details, and that is semantic. The `Uuid::parse_str` guard is retained
-/// *alongside* the name match for the same reason it is in
-/// [`ENGINE_MINTED_ID_FIELDS`]: only an engine-minted value is stripped.
+/// Discriminated by the **marker name**, not by "the value looks like a UUID".
+/// An application marker may carry a caller-chosen UUID as its details, and
+/// that is semantic. Examples are `ctx.side_effect`-adjacent bookkeeping and a
+/// `fan_out:{n}` count. The `Uuid::parse_str` guard stays *alongside* the name
+/// match, as in [`ENGINE_MINTED_ID_FIELDS`]: only an engine-minted value is
+/// stripped.
 fn is_engine_minted_marker(name: &str, details: &Value) -> bool {
     name.starts_with(SESSION_MARKER_PREFIX)
         && details
@@ -2146,9 +2109,9 @@ fn is_engine_minted_marker(name: &str, details: &Value) -> bool {
 
 /// Strip a UUID-shaped value, preserving a non-UUID value verbatim.
 ///
-/// Callers map over an `Option`, so presence is preserved: `None` stays `None`
-/// and a build that joins a session still differs from one that does not — only
-/// the session's *identity* is normalized away.
+/// Callers map over an `Option`, so presence is kept. `None` stays `None`. A
+/// build that joins a session still differs from one that does not. Only the
+/// session's *identity* is normalized away.
 fn normalized_id(value: &str) -> String {
     if uuid::Uuid::parse_str(value).is_ok() {
         NORMALIZED.to_string()
@@ -2157,6 +2120,36 @@ fn normalized_id(value: &str) -> String {
     }
 }
 
+/// Top-level `data` field names the engine mints fresh on every run.
+///
+/// Derived mechanically from `WorkflowEvent`'s own declared field types. A
+/// field belongs here when the engine mints its value fresh on every run:
+///
+/// * a UUID newtype — `ActivityExecId`, `ExecutionId`, `UpdateId`,
+///   `ExternalSignalId`, `ExternalAwaitId`, `ExternalCancelId`,
+///   `ExternalActivityToken`, `Uuid`;
+/// * `WorkerId`, which is `String`-backed. `WorkerRuntimeConfig::from` always
+///   mints its value as a fresh `Uuid::new_v4()`, and there is no
+///   `WorkerConfig::with_worker_id`. So two independent recordings differ at
+///   the *first* `ActivityStarted`. That per-run noise would bury every later
+///   semantic difference.
+///
+/// `WorkerId` is why the value guard (does it parse as a UUID?) stays
+/// *alongside* the name match. `WorkerRuntimeConfig::worker_id` is a `pub`
+/// field, so an embedder may set a stable human label
+/// (`WorkerId::new("worker-eu-1")`). A label does not parse as a UUID, so it
+/// still compares verbatim. Engine-minted identity is normalized, and an
+/// operator's chosen name is kept.
+///
+/// Deliberately **not** here, despite being UUID-shaped in practice:
+///
+/// * `idempotency_key` — a caller-chosen exactly-once key (#521). Semantic.
+/// * `timer_id` — a `String` newtype whose value is author-chosen
+///   (`ctx.timer("escalate", …)`), so it must compare verbatim.
+///
+/// `debugger_tests::engine_minted_id_fields_match_the_event_enum` re-derives
+/// this set from `event.rs` at test time. So an engine-minted field added to
+/// `WorkflowEvent` later fails until it is classified here.
 const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "activity_id",
     "await_id",
@@ -2175,15 +2168,22 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "worker_id",
 ];
 
-/// The first cut compared a hand-written [`resolved_payload`] projection, whose
-/// `_ => None` arm silently swallowed every variant it did not enumerate. Two
-/// histories differing only in a `TimerStarted { duration_secs }` (30 vs 60) or
-/// an `ActivityFailed { error }` therefore compared **equal**, and
-/// `harvest debug diff` exited `0` — a false green on a documented CI gate, and
-/// on a divergence-finding tool the worst possible failure. Serializing the
-/// event makes the comparison exhaustive **by construction**: a `WorkflowEvent`
-/// variant added later carries its fields into the diff with no edit here, so
-/// the hole cannot reopen.
+/// The event's **complete semantic content**, with per-run identity
+/// normalized out.
+///
+/// `history_fact_diff` compares two fixture histories on this key.
+///
+/// # Why the whole event rather than a projection
+///
+/// The first cut compared a hand-written [`resolved_payload`] projection. Its
+/// `_ => None` arm silently swallowed every variant it did not list. So two
+/// histories that differed only in a `TimerStarted { duration_secs }` (30 vs
+/// 60) compared **equal**. So did two that differed only in an
+/// `ActivityFailed { error }`. `harvest debug diff` then exited `0`. That is a
+/// false green on a documented CI gate, the worst failure for this tool. The
+/// serialized event makes the comparison exhaustive **by construction**. A
+/// `WorkflowEvent` variant added later carries its fields into the diff with no
+/// edit here, so the hole cannot reopen.
 ///
 /// # What is normalized away, and why only at the top level
 ///
@@ -2201,15 +2201,15 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
 ///
 /// Field-name matching is load-bearing. A purely value-based test ("normalize
 /// anything that parses as a UUID") also eats
-/// `ExternalSignalRequested { idempotency_key }`, which is a caller-chosen
-/// exactly-once key (#521) — very commonly a UUID, and *semantic*: two
-/// histories differing only in it are genuinely different, and normalizing it
-/// would report them as equal.
+/// `ExternalSignalRequested { idempotency_key }`. That is a caller-chosen
+/// exactly-once key (#521). It is very often a UUID, and it is *semantic*. Two
+/// histories that differ only in it are different, and normalizing it would
+/// report them as equal.
 ///
-/// Top-level *only* is load-bearing for the same reason: engine identity lives
-/// there, while application data lives nested under
-/// `input`/`output`/`payload`/`details`, where a UUID is real business data a
-/// diff must not discard.
+/// Top-level *only* is load-bearing for the same reason. Engine identity lives
+/// there. Application data lives nested under
+/// `input`/`output`/`payload`/`details`, where a UUID is real business data
+/// that a diff must keep.
 fn normalized_event_facts(event: &WorkflowEvent) -> Value {
     let Ok(mut value) = serde_json::to_value(event) else {
         // `WorkflowEvent` is the persisted wire type, so this is unreachable in
@@ -2229,10 +2229,10 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
     let boundary = event.is_decision_boundary();
 
     for (key, slot) in data.iter_mut() {
-        // The UUID parse is kept *in addition to* the name match, not instead
-        // of it: `target` is `ExecutionId` on some variants and
-        // `ExternalTarget` on others, and the latter's business-id form
-        // serializes as an object that must compare verbatim.
+        // The UUID parse is kept *in addition to* the name match. `target` is
+        // `ExecutionId` on some variants and `ExternalTarget` on others. The
+        // business-id form of `ExternalTarget` serializes as an object that
+        // must compare verbatim.
         let is_per_run = key == "timestamp"
             || (nondeterministic_draw && key == "value")
             || boundary
@@ -2245,8 +2245,8 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         }
     }
 
-    // Cross-field, so it cannot live in the per-key loop above: an engine-minted
-    // session marker is identified by its *name*, and the value to strip is a
+    // Cross-field, so it cannot live in the per-key loop above. Its *name*
+    // identifies an engine-minted session marker, and the value to strip is a
     // sibling key. See `is_engine_minted_marker`.
     let minted_marker = match (
         data.get("name").and_then(Value::as_str),
@@ -2276,11 +2276,10 @@ fn workflow_input(events: &[WorkflowEvent]) -> Value {
 /// Project a [`WorkflowCommand`] onto its display + identity snapshot.
 ///
 /// **Deliberately exhaustive — no `_` arm**, here and in [`command_payload`].
-/// A catch-all would collapse two genuinely different commands onto the same
-/// [`CommandSnapshot`], which compare *equal* and would therefore silently hide
-/// a divergence — the worst failure mode a divergence-finding tool can have.
-/// Adding a `WorkflowCommand` variant must be a compile error here, not a false
-/// "clean".
+/// A catch-all would collapse two different commands onto the same
+/// [`CommandSnapshot`]. They would compare *equal* and silently hide a
+/// divergence, the worst failure mode for this tool. A new `WorkflowCommand`
+/// variant must be a compile error here, not a false "clean".
 fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
     let payload = command_payload(command);
     let (kind, summary) = match command {
@@ -2382,27 +2381,6 @@ fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
     }
 }
 
-/// The command's exact semantic content, where it carries any.
-///
-/// This is the **identity** half of a [`CommandSnapshot`]: it is never
-/// truncated, so a divergence deep inside a large payload is caught exactly.
-///
-/// # Every semantic field, not just the input
-///
-/// A dispatch command carries more intent than its input: the queue it routes
-/// to, its timeout and retry overrides, a detached child's close policy, a
-/// signal's idempotency key. Projecting only `input` made two builds that
-/// differ *only* in routing or timeout compare **equal**, so `diff_traces`
-/// reported them clean — a false "no divergence" on the exact class of change
-/// (a re-queued or re-timed activity) this tool exists to catch.
-///
-/// What is deliberately **excluded** is per-run identity that carries no code
-/// intent and would differ between any two runs: freshly-minted
-/// `activity_id` / `child_id` / `signal_id` / `cancel_id` / `await_id`
-/// execution ids, the external-activity `token`, a mutex `lock_seq` fencing
-/// token, and the replay-bookkeeping flags (`already_scheduled`,
-/// `already_requested`, `failed_attempts`, `last_error`) that are recovered
-/// from history rather than chosen by the code.
 /// The [`command_payload`] projection for [`WorkflowCommand::ScheduleActivity`].
 ///
 /// Split out only to keep `command_payload` under the line cap; it is otherwise
@@ -2436,23 +2414,45 @@ fn schedule_activity_payload(command: &WorkflowCommand) -> Option<Value> {
         },
         "queue": queue,
         "retry_policy": retry_policy_override,
-        // Full precision, NOT `as_secs()`: a caller passes a raw `Duration`, so
-        // 100ms and 900ms would both collapse to 0 and two genuinely different
-        // builds would compare equal. `Duration` is `Serialize`
+        // Full precision, NOT `as_secs()`. A caller passes a raw `Duration`.
+        // With `as_secs()`, 100ms and 900ms both collapse to 0, and two
+        // different builds compare equal. `Duration` is `Serialize`
         // (`{secs, nanos}`), so this is exact.
         "start_to_close": start_to_close_override,
         "schedule_to_start": schedule_to_start_override,
-        // Engine-minted at the frontier (`SessionId::new()`), so it differs per
-        // side while naming the same logical session; `None` vs `Some` is
-        // preserved, so joining a session still differs from not joining one.
-        // `session_worker_id` is *recovered from the recorded acquire activity's
-        // output*, so it is deterministic-from-history and compares verbatim.
+        // Engine-minted at the frontier (`SessionId::new()`). So it differs per
+        // side, though it names the same logical session. `None` vs `Some` is
+        // kept, so joining a session still differs from not joining one.
+        // `session_worker_id` comes *from the recorded acquire activity's
+        // output*. So it is deterministic from history and compares verbatim.
         // See `is_engine_minted_marker`.
         "session_id": session_id.as_ref().map(|id| normalized_id(&id.to_string())),
         "session_worker_id": session_worker_id.as_ref().map(ToString::to_string),
     }))
 }
 
+/// The command's exact semantic content, where it carries any.
+///
+/// This is the **identity** half of a [`CommandSnapshot`]. It is never
+/// truncated, so a divergence deep inside a large payload is caught exactly.
+///
+/// # Every semantic field, not just the input
+///
+/// A dispatch command carries more intent than its input. Examples are the
+/// queue it routes to, its timeout and retry overrides, a detached child's
+/// close policy, and a signal's idempotency key. With only `input` projected,
+/// two builds that differ *only* in routing or timeout compared **equal**. So
+/// `diff_traces` reported them clean. That was a false "no divergence" on a
+/// re-queued or re-timed activity, the change class this tool exists to catch.
+///
+/// Per-run identity is deliberately **excluded**. It carries no code intent
+/// and differs between any two runs:
+///
+/// * freshly-minted `activity_id` / `child_id` / `signal_id` / `cancel_id` /
+///   `await_id` execution ids;
+/// * the external-activity `token` and a mutex `lock_seq` fencing token;
+/// * the replay-bookkeeping flags (`already_scheduled`, `already_requested`,
+///   `failed_attempts`, `last_error`). History supplies these, not the code.
 fn command_payload(command: &WorkflowCommand) -> Option<Value> {
     match command {
         // Every semantic dispatch field; ids and channels excluded (see above).
@@ -2534,9 +2534,9 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
             "children": children.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "timers": timers.iter().map(ToString::to_string).collect::<Vec<_>>(),
         })),
-        // Commands whose whole identity already fits in the summary label:
-        // there is no second value that two otherwise-identical commands could
-        // differ on, so `None` here cannot hide a divergence.
+        // Commands whose whole identity fits in the summary label. Two
+        // otherwise-identical commands have no second value to differ on. So
+        // `None` here cannot hide a divergence.
         WorkflowCommand::WaitForActivity { .. }
         | WorkflowCommand::StartTimer { .. }
         | WorkflowCommand::CancelTimer { .. }
@@ -2614,13 +2614,13 @@ mod tests {
     /// The field types `WorkflowEvent` uses for values the engine mints fresh
     /// on every run.
     ///
-    /// Mostly UUID newtypes. `WorkerId` is the exception that proves the rule:
-    /// it wraps a `String`, but `WorkerRuntimeConfig::from` always mints its
-    /// value as a fresh `Uuid::new_v4()` and no builder overrides it, so by
-    /// *value* it is engine identity even though by *type* it is not. Keying
-    /// this list on the declared type is a mechanical proxy for the real
-    /// predicate ("is this minted per run?"), and `WorkerId` is where the
-    /// proxy needs an explicit entry rather than a type-shape inference.
+    /// Mostly UUID newtypes. `WorkerId` is the exception. It wraps a `String`,
+    /// but `WorkerRuntimeConfig::from` always mints its value as a fresh
+    /// `Uuid::new_v4()`, and no builder overrides it. So by *value* it is engine
+    /// identity, though by *type* it is not. A key on the declared type is a
+    /// mechanical proxy for the real predicate ("is this minted per run?").
+    /// `WorkerId` is where the proxy needs an explicit entry, not a type-shape
+    /// inference.
     const ENGINE_MINTED_FIELD_TYPES: &[&str] = &[
         "ActivityExecId",
         "ExecutionId",
@@ -2634,22 +2634,22 @@ mod tests {
     ];
 
     /// `normalized_event_facts` strips per-run identity by **field name**, and
-    /// that list is hand-written — so an engine-minted field added to
-    /// `WorkflowEvent` later would silently start being compared verbatim,
-    /// making two independent recordings of one scenario diff as different
-    /// (noise that buries the signal — the `worker_id` case Codex found in
-    /// round 3). Re-derive the set from `event.rs` itself so the omission
-    /// fails here instead.
+    /// that list is hand-written. An engine-minted field added to
+    /// `WorkflowEvent` later would silently start being compared verbatim.
+    /// Two independent recordings of one scenario would then diff as different.
+    /// That noise buries the signal, as a missed `worker_id` once did.
+    /// Re-derive the set from `event.rs` itself so the omission fails here
+    /// instead.
     ///
-    /// The inverse direction matters just as much: a field the engine does
+    /// The inverse direction matters just as much. A field the engine does
     /// *not* mint must never be in the list, because normalizing a semantic
-    /// field is a false clean — the `idempotency_key` (#521) case Codex found
-    /// in round 2.
+    /// field is a false clean. The `idempotency_key` (#521) field is the case
+    /// that showed this.
     #[test]
     fn engine_minted_id_fields_match_the_event_enum() {
-        // Normalized to LF: a Windows checkout terminates the enum with
-        // `\r\n}\r\n`, so the `"\n}\n"` scan below would find nothing and the
-        // test would panic on every non-Unix runner rather than assert.
+        // Normalized to LF. A Windows checkout ends the enum with `\r\n}\r\n`.
+        // The `"\n}\n"` scan below would then find nothing, and the test would
+        // panic on every non-Unix runner instead of asserting.
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event.rs"))
             .expect("event.rs is in this crate")
             .replace("\r\n", "\n");
@@ -2699,10 +2699,10 @@ mod tests {
 
     /// The debugger classifies a `MarkerRecorded` as a version or patch gate by
     /// `strip_prefix`, but the engine *builds* those names with the helpers in
-    /// `replay.rs`. Nothing structurally ties the two together, so if the
-    /// engine ever renames a prefix the debugger would silently reclassify
-    /// every gate as an ordinary marker — a false "clean" in the gate columns.
-    /// This is the guard that makes that a compile-time-ish failure instead.
+    /// `replay.rs`. Nothing structurally ties the two together. If the engine
+    /// renames a prefix, the debugger would silently reclassify every gate as an
+    /// ordinary marker. That is a false "clean" in the gate columns. This guard
+    /// makes that a near-compile-time failure instead.
     #[test]
     fn marker_prefixes_match_the_engine() {
         assert!(

@@ -12,10 +12,10 @@
 //!
 //! **Launder.** The workflow body has no `HashMap` token, so every DET
 //! substring table and every HVG rule is inert. Even inline it would escape
-//! HVG011/DET010: those flag only a `for … in` over a locally-bound hash ident,
-//! and there is no `for` loop here at all — the iteration is an adaptor chain in
-//! another crate over a **function parameter**, which `local_binding_target`
-//! documents as never tracked.
+//! HVG011/DET010, which flag only a `for … in` over a locally-bound hash ident.
+//! There is no `for` loop here. The iteration is an adaptor chain in another
+//! crate over a **function parameter**. `local_binding_target` documents that
+//! as never tracked.
 //!
 //! **Expected trace hops.** `wf_hashmap_join_string` ⇒
 //! `harvest_verify_corpus_helpers::values_joined` ⇒

@@ -7,15 +7,14 @@
 //! reappears. The connector must therefore make dispatch idempotent *by
 //! construction* rather than trusting the producer to send a key.
 //!
-//! The key is derived from [stable broker coordinates] — `{topic}:{partition}:
-//! {offset}` for Kafka, `MessageId` for SQS — and is
-//! **namespaced by the binding** exactly as the inbound webhook receiver
-//! namespaces `{path}:{signal_name}:{delivery_id}` (issue #344, PR #918
-//! review). Without that namespace, two bindings targeting the same
-//! `(workflow_name, workflow_id)` would silently swallow each other's signals
-//! whenever their raw broker ids happened to coincide — `signal_with_start`'s
-//! dedupe is scoped to `(workflow_name, workflow_id, idempotency_key)` and
-//! knows nothing about topics.
+//! The key derives from [stable broker coordinates]: `{topic}:{partition}:
+//! {offset}` for Kafka, `MessageId` for SQS. It is **namespaced by the
+//! binding**, as the inbound webhook receiver namespaces
+//! `{path}:{signal_name}:{delivery_id}` (issue #344, PR #918 review).
+//! `signal_with_start` dedupes on `(workflow_name, workflow_id,
+//! idempotency_key)` and knows nothing about topics. Without the namespace,
+//! two bindings with the same target and the same raw broker id would
+//! silently swallow each other's signals.
 //!
 //! [stable broker coordinates]: crate::connector::message::MessageCoordinates
 //!
@@ -23,9 +22,8 @@
 //!
 //! Components are joined with `:`, but a topic, a queue name, or a broker's
 //! own message id may itself contain `:`. A naive join is therefore
-//! **not** injective: binding `a` + id `b:c` and binding `a:b` + id `c` both
-//! flatten to `conn:a:b:c` — two genuinely different messages colliding onto
-//! one dedupe key.
+//! **not** injective. Binding `a` + id `b:c` and binding `a:b` + id `c` both
+//! flatten to `conn:a:b:c`: two different messages on one dedupe key.
 //!
 //! Each component is therefore encoded self-delimitingly, mirroring the
 //! `bound_key_component` scheme the per-key rate limiter uses (issue #699):
@@ -42,9 +40,9 @@
 //!
 //! `autumn_harvest::start_idempotency::MAX_START_IDEMPOTENCY_KEY_LEN` is 512
 //! bytes and `validate_start_idempotency_key` rejects anything longer. A
-//! broker-supplied id is caller-controlled and unbounded, so the encoding
-//! hashes any component over [`MAX_KEY_COMPONENT_LEN`], which caps the whole
-//! derived key well under that limit — see
+//! broker-supplied id is caller-controlled and unbounded. So the encoding
+//! hashes any component over [`MAX_KEY_COMPONENT_LEN`]. That caps the whole
+//! derived key well under the limit; see
 //! `derived_key_is_bounded_for_pathological_components`.
 
 use sha2::{Digest, Sha256};
@@ -52,33 +50,36 @@ use std::fmt::Write as _;
 
 /// Prefix marking a key as connector-derived, **including** its separator.
 ///
-/// Reserved, and *enforced* rather than merely conventional: derived keys share
-/// a durable uniqueness scope with caller-supplied ones — `(workflow_name,
-/// idempotency_key)` on `harvest_start_idempotency` for a `Starts` binding, and
-/// `(workflow_exec_id, idempotency_key)` on `harvest_signals` for a
-/// `SignalsWithStart` one — and they are *predictable* (Kafka coordinates are
-/// `{topic}:{partition}:{offset}`). A caller who landed a derived key first
-/// would make the broker's own delivery read as an idempotent replay, acked
-/// without ever dispatching its payload.
+/// Reserved, and *enforced* rather than merely conventional. Derived keys
+/// share a durable uniqueness scope with caller-supplied ones:
 ///
-/// So the caller-facing routes refuse this prefix outright; see
-/// [`autumn_harvest::start_idempotency::RESERVED_KEY_PREFIX`], which this
-/// aliases so the deriving and the refusing side can never drift apart.
+/// * `(workflow_name, idempotency_key)` on `harvest_start_idempotency` for a
+///   `Starts` binding.
+/// * `(workflow_exec_id, idempotency_key)` on `harvest_signals` for a
+///   `SignalsWithStart` binding.
+///
+/// Derived keys are also *predictable*: Kafka coordinates are
+/// `{topic}:{partition}:{offset}`. A caller who lands a derived key first makes
+/// the broker's delivery read as an idempotent replay. It is acked and its
+/// payload never dispatches.
+///
+/// So the caller-facing routes refuse this prefix outright. This aliases
+/// [`autumn_harvest::start_idempotency::RESERVED_KEY_PREFIX`], so the deriving
+/// and the refusing side cannot drift apart.
 pub const CONNECTOR_KEY_PREFIX: &str = autumn_harvest::start_idempotency::RESERVED_KEY_PREFIX;
 
 /// Longest component encoded literally; anything longer is SHA-256 hashed.
 ///
-/// Chosen so the whole derived key (prefix + three encoded components +
-/// separators) stays comfortably inside the 512-byte
-/// `MAX_START_IDEMPOTENCY_KEY_LEN` ceiling even when every component is
-/// over-length.
+/// The whole derived key (prefix, encoded components, separators) then stays
+/// inside the 512-byte `MAX_START_IDEMPOTENCY_KEY_LEN` ceiling. That holds even
+/// when every component is over-length.
 pub const MAX_KEY_COMPONENT_LEN: usize = 128;
 
 /// Encode one key component self-delimitingly and boundedly.
 ///
 /// Returns `L{len}:{value}` for a short literal and `H{64 hex}` for an
-/// over-length component (full SHA-256, so a collision is computationally
-/// infeasible — a 64-bit hash would not be safe against broker-supplied ids).
+/// over-length component. The full SHA-256 makes a collision computationally
+/// infeasible. A 64-bit hash would not be safe against broker-supplied ids.
 #[must_use]
 pub fn bound_key_component(component: &str) -> String {
     if component.len() > MAX_KEY_COMPONENT_LEN {
@@ -97,9 +98,8 @@ pub fn bound_key_component(component: &str) -> String {
 /// Derive the namespaced, injective, bounded idempotency key for one message.
 ///
 /// `signal_name` is `Some` for a `SignalsWithStart` binding and `None` for a
-/// `Starts` binding; including it is defence-in-depth (the binding name alone
-/// already disambiguates, since duplicate binding names are rejected at build
-/// time).
+/// `Starts` binding. It is defence-in-depth. The build rejects duplicate
+/// binding names, so the binding name alone already disambiguates.
 #[must_use]
 pub fn message_idempotency_key(
     binding: &str,
@@ -115,26 +115,26 @@ pub fn message_idempotency_key(
 ///
 /// Broker coordinates are only unique within one incarnation of the thing
 /// they address. Kafka's `{topic}:{partition}:{offset}` restarts at zero when
-/// a topic is deleted and recreated, and means nothing across a cutover to a
-/// different cluster — so the same coordinates come back around while the
-/// claims from their previous life are still live, and fresh records are
-/// classified as replays and acknowledged without ever dispatching. Neither
-/// half is observable from the consumer API: Kafka exposes no topic
-/// incarnation, and a bootstrap list is not a stable cluster identity.
+/// a topic is deleted and recreated. It means nothing across a cutover to a
+/// different cluster. So the same coordinates come back while the claims from
+/// their previous life are still live. Fresh records are then classified as
+/// replays and acked without ever dispatching. The consumer API shows neither
+/// case: Kafka exposes no topic incarnation, and a bootstrap list is not a
+/// stable cluster identity.
 ///
-/// The binding name is already the key namespace, so renaming the binding
-/// also rotates it — but that name is the `source` metric label too, so the
-/// remedy would cost every dashboard and alert built on the binding. This
-/// separates the two: rotate the dedupe namespace, keep the identity.
+/// The binding name is already the key namespace, so a rename also rotates
+/// it. But that name is the `source` metric label too, so a rename costs
+/// every dashboard and alert built on the binding. This separates the two:
+/// rotate the dedupe namespace, keep the identity.
 ///
 /// # Encoding
 ///
-/// The component is appended, and *only* when set, so a binding that never
-/// rotates derives byte-identical keys to a build without this parameter —
-/// the key is persisted, and changing the derivation would invalidate every
-/// live claim on upgrade. Appending stays injective for the same reason the
-/// other components are: each is self-delimiting, so a key with a trailing
-/// component can never read as one without.
+/// The component is appended *only* when set. So a binding that never rotates
+/// derives byte-identical keys to a build without this parameter. The key is
+/// persisted, and a new derivation would invalidate every live claim on
+/// upgrade. Appending stays injective because each component is
+/// self-delimiting. A key with a trailing component never reads as one
+/// without.
 #[must_use]
 pub fn message_idempotency_key_in(
     binding: &str,
@@ -185,11 +185,10 @@ mod tests {
     /// Kafka coordinates are only unique *within one incarnation* of a topic.
     ///
     /// Cut a binding over to another cluster, or delete and recreate its
-    /// topic, and offsets restart at zero — so `(topic, partition, offset)`
-    /// repeats values whose claims are still live. Without a way to rotate
-    /// the namespace those fresh records are classified as replays and acked
-    /// without ever dispatching: silent loss, exactly the failure the key
-    /// exists to prevent.
+    /// topic, and offsets restart at zero. So `(topic, partition, offset)`
+    /// repeats values whose claims are still live. Without a rotated namespace,
+    /// those fresh records read as replays and are acked without dispatch.
+    /// That is silent loss, the failure the key exists to prevent.
     #[test]
     fn a_rotated_incarnation_separates_a_recreated_topic_from_the_old_one() {
         let before = message_idempotency_key_in("orders", None, &kafka("orders", 0, 7), None);
@@ -208,10 +207,10 @@ mod tests {
 
     /// Rotating is opt-in, and the default must stay byte-identical.
     ///
-    /// This key is persisted: changing the derivation for bindings that set
-    /// no incarnation would invalidate every live claim on upgrade and
-    /// re-dispatch whatever the broker still holds. Pinned against a literal
-    /// so an accidental format change cannot pass.
+    /// This key is persisted. A new derivation for bindings with no
+    /// incarnation would invalidate every live claim on upgrade. It would
+    /// re-dispatch whatever the broker still holds. The literal pin stops an
+    /// accidental format change.
     #[test]
     fn an_unset_incarnation_leaves_the_key_byte_identical() {
         assert_eq!(
@@ -306,12 +305,11 @@ mod tests {
 
     /// The namespaces must be disjoint *by enforcement*, not by convention.
     ///
-    /// Derived keys are predictable — Kafka coordinates are
-    /// `{topic}:{partition}:{offset}` — so a caller who could claim one first
-    /// would make the broker's own delivery read as an idempotent replay and
-    /// be acked without dispatching. Asserted behaviourally rather than as a
-    /// string-equality pin on the two constants, so it still holds however
-    /// either is spelled.
+    /// Derived keys are predictable: Kafka coordinates are
+    /// `{topic}:{partition}:{offset}`. A caller who claims one first makes the
+    /// broker's delivery read as an idempotent replay, acked without dispatch.
+    /// The test asserts behaviour, not string equality of the two constants.
+    /// So it holds however either is spelled.
     #[test]
     fn every_derived_key_is_refused_from_a_caller() {
         for key in [
@@ -333,8 +331,8 @@ mod tests {
         }
     }
 
-    /// Adding the separator to the prefix must not have changed the derived
-    /// key's bytes: it is persisted, so a format change would invalidate every
+    /// Adding the separator to the prefix must not change the derived key's
+    /// bytes. The key is persisted, so a format change would invalidate every
     /// live claim on upgrade.
     #[test]
     fn the_prefix_carries_its_own_separator_and_the_key_is_unchanged() {

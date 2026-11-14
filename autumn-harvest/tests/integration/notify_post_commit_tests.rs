@@ -84,7 +84,6 @@ async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     exec_id
 }
 
-/// Count the stored events of one execution.
 async fn event_count(url: &str, exec_id: ExecutionId) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -100,7 +99,6 @@ async fn event_count(url: &str, exec_id: ExecutionId) -> i64 {
         .n
 }
 
-/// Count the queued tasks with one id.
 async fn task_count(url: &str, task_id: Uuid) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -116,7 +114,6 @@ async fn task_count(url: &str, task_id: Uuid) -> i64 {
         .n
 }
 
-/// Count the `PENDING` tasks with one id.
 async fn pending_count(url: &str, task_id: Uuid) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -621,7 +618,6 @@ async fn a_committed_and_an_open_note_send_only_the_committed_wake() {
 
 // ── A stamped write sends no stage probe (issue #2125) ─────────────────
 
-/// The backend pid of `conn`.
 async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
     #[derive(diesel::QueryableByName)]
     struct Pid {

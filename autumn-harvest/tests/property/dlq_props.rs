@@ -10,13 +10,12 @@
 //! - **total**: never panics on arbitrary input, including unicode, UUID/hex/
 //!   decimal runs, multi-line strings.
 //!
-//! Note — determinism vs. idempotence: we assert **determinism** (`f(x) == f(x)`),
-//! NOT idempotence (`f(f(x)) == f(x)`). Idempotence is technically *false* at the
-//! `SIGNATURE_MAX_LEN` boundary: `failure_signature` does
-//! `truncate_chars(normalized.trim(), SIGNATURE_MAX_LEN)` with no trailing trim,
-//! so an output ending in whitespace at exactly the cap loses that whitespace on
-//! re-application. Determinism is the documented contract and is what this suite
-//! exercises.
+//! Note: this suite asserts **determinism** (`f(x) == f(x)`), NOT idempotence
+//! (`f(f(x)) == f(x)`). Idempotence is *false* at the `SIGNATURE_MAX_LEN`
+//! boundary. `failure_signature` does
+//! `truncate_chars(normalized.trim(), SIGNATURE_MAX_LEN)` with no trailing trim.
+//! An output that ends in whitespace at exactly the cap loses that whitespace
+//! on re-application. Determinism is the documented contract.
 
 use autumn_harvest::dlq::{SIGNATURE_MAX_LEN, failure_signature};
 use proptest::prelude::*;
@@ -38,11 +37,10 @@ fn error_like() -> impl Strategy<Value = String> {
 }
 
 /// A strategy that GUARANTEES a first line far longer than `SIGNATURE_MAX_LEN`
-/// after normalization, so the truncation branch is actually exercised — the
-/// `error_like` generator above tops out around ~130 chars and never reaches the
-/// cap. 30+ non-collapsing `[a-z]` word tokens joined by spaces stay a single
-/// line and never normalize down to a placeholder, so the first line is always
-/// well past 200 chars.
+/// after normalization, so the truncation branch runs. The `error_like`
+/// generator tops out around ~130 chars and never reaches the cap. 30+
+/// non-collapsing `[a-z]` word tokens joined by spaces stay a single line. They
+/// never normalize to a placeholder, so the first line is well past 200 chars.
 fn long_error() -> impl Strategy<Value = String> {
     proptest::collection::vec("[a-z]{7,12}", 30..60).prop_map(|parts| parts.join(" "))
 }

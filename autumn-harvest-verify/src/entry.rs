@@ -6,14 +6,14 @@
 //!
 //! Discovery reads **two** places, and the second one is the interesting one.
 //! A companion whose *header* the MIR parser could not read never reaches
-//! [`MirDoc::bodies`] at all, so a pass that only walked the parsed bodies would
-//! answer "this target has no workflows" for a target whose markers are merely
-//! unreadable — `analyzed 0`, exit `0`, even under `--strict`. That is the one
-//! answer a verifier must never give. So [`MirDoc::parse_failures`] is scanned
-//! for the marker too, and the entry is synthesized from the failed header's
-//! text. Its body may itself be missing or unparsed; the analysis then attaches
-//! a `missing-body` or `mir-parse` boundary and the verdict is `unknown` — the
-//! workflow is *reported as not analyzed*, never silently absent.
+//! [`MirDoc::bodies`]. A pass over the parsed bodies alone would then answer
+//! "this target has no workflows" when the markers are merely unreadable. The
+//! run would print `analyzed 0` and exit `0`, even under `--strict`. A
+//! verifier must never give that answer. So discovery also scans [`MirDoc::parse_failures`] for the
+//! marker and builds the entry from the failed header's text. Its body may be
+//! missing or unparsed. The analysis then attaches a `missing-body` or
+//! `mir-parse` boundary and the verdict is `unknown`. The workflow is
+//! *reported as not analyzed*, never silently absent.
 
 use std::collections::BTreeSet;
 
@@ -60,9 +60,10 @@ pub fn discover(docs: &[MirDoc]) -> Vec<Entry> {
     entries
 }
 
-/// The entry for `workflow`, pointing at the async coroutine body when the dump
-/// has one and at the fn's own body otherwise (absent bodies are the analysis's
-/// problem, and it reports them as boundaries).
+/// The entry for `workflow`: the async coroutine body when the dump has one,
+/// else the fn's own body.
+///
+/// The analysis reports an absent body as a boundary.
 fn entry_for(doc: &MirDoc, paths: &BTreeSet<&str>, workflow: String) -> Entry {
     let coroutine = format!("{workflow}::{{closure#0}}");
     let body = if paths.contains(coroutine.as_str()) {
@@ -91,10 +92,10 @@ fn workflow_of_marker_path(path: &str) -> Option<String> {
 ///
 /// The recorded item is the offending header verbatim (truncated), not a path:
 /// `__autumn_workflow_info_wf(_1: u8 -> u8`, or `fn m::__autumn_workflow_info_wf()`
-/// for a truncated dump. So the marker is located inside the text, the name is
-/// read forward from it and the module prefix backward — and anything that does
-/// not look like a path is dropped rather than guessed at, leaving the workflow
-/// unqualified (which still yields an entry, and so still yields a verdict).
+/// for a truncated dump. So the function finds the marker inside the text. It
+/// reads the name forward from it and the module prefix backward. Anything
+/// that does not look like a path is dropped, not guessed at. The workflow
+/// then stays unqualified, which still yields an entry and so a verdict.
 fn workflow_in_failed_item(item: &str) -> Option<String> {
     let at = item.find(MARKER)?;
     let rest = item.get(at.checked_add(MARKER.len())?..)?;
@@ -114,8 +115,10 @@ fn workflow_in_failed_item(item: &str) -> Option<String> {
     Some(join_path(module_prefix(item.get(..at)?), name))
 }
 
-/// The `module::` prefix that immediately precedes the marker, or `""` when the
-/// text before it is not a path (a garbled header may hold anything at all).
+/// The `module::` prefix just before the marker, or `""` when that text is not
+/// a path.
+///
+/// A garbled header may hold anything at all.
 fn module_prefix(before: &str) -> &str {
     let candidate = before
         .rsplit(|c: char| c.is_whitespace())

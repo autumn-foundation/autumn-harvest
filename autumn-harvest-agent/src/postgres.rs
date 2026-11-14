@@ -199,7 +199,6 @@ impl PostgresAgents {
             .filter_map(|(_pool, shards)| shards.first().copied())
     }
 
-    /// A connection to the database of `shard`.
     async fn conn(&self, shard: ShardId) -> HarvestResult<autumn_harvest::pool::PooledConn> {
         autumn_harvest::pool::acquire_within_pool_bound(self.pool_for(shard)).await
     }

@@ -1,19 +1,17 @@
 //! How a DSN is *spelled*, shared by everything in the dev runtime that has to
 //! read one without connecting (issue #1286).
 //!
-//! Two modules here look at a connection string the developer typed rather than
-//! at a parsed [`tokio_postgres::Config`]: [`banner`](super::banner) has to
-//! blank out passwords before printing, and [`safety`](super::safety) has to
-//! name the `sslmode` values the client cannot model. Both need the same three
-//! facts — which syntax the string is in, where its options are, and what a
-//! percent-encoded query key really says — and when each answered them for
-//! itself they disagreed.
+//! Two modules here read the connection string the developer typed, not a
+//! parsed [`tokio_postgres::Config`]. [`banner`](super::banner) blanks out
+//! passwords before it prints. [`safety`](super::safety) names the `sslmode`
+//! values the client cannot model. Both need the same three facts: the syntax
+//! of the string, where its options are, and what a percent-encoded query key
+//! really says. When each answered them for itself, they disagreed.
 //!
 //! That disagreement was the bug. `safety` searched for the literal text
-//! `sslmode=` anywhere in the string, so `password='sslmode=require'` refused a
-//! perfectly legal loopback database as TLS-requiring, while `banner`'s scanner
-//! two modules over already knew that span was a password value. One scanner,
-//! two callers.
+//! `sslmode=` anywhere in the string. So `password='sslmode=require'` refused a
+//! perfectly legal loopback database as TLS-requiring. `banner`'s scanner
+//! already knew that span was a password value. One scanner, two callers.
 //!
 //! A fourth fact lives here too, for `banner` alone.
 //! [`is_connection_keyword`] says whether a scanned token is a real libpq
@@ -25,11 +23,11 @@
 //! # What this is not
 //!
 //! It is **not** a DSN parser, and nothing here decides what gets connected to.
-//! `tokio_postgres::Config::from_str` remains the only thing that answers "what
-//! will the client dial" — see [`safety`](super::safety)'s module docs for why
-//! a second opinion on that question is a bypass waiting to happen. These
-//! helpers only locate the bytes of a string; a span they miss costs a clearer
-//! message, never a connection the gate meant to refuse.
+//! Only `tokio_postgres::Config::from_str` answers "what will the client dial".
+//! [`safety`](super::safety)'s module docs explain why a second opinion on that
+//! question is a bypass waiting to happen. These helpers only locate the bytes
+//! of a string. A span they miss costs a clearer message, never a connection
+//! the gate meant to refuse.
 
 use std::ops::Range;
 
@@ -131,24 +129,22 @@ pub(super) struct KeywordOption<'a> {
 
 /// Read a libpq **keyword/value** connection string the way libpq reads it.
 ///
-/// A real scanner, not `split_whitespace()`. Options are separated by
-/// whitespace, `=` may have whitespace on either side, and a value may be
-/// single-quoted and contain spaces; `\` escapes the next character in both the
-/// quoted and the bare form. A whitespace split cannot see any of that, so
+/// A real scanner, not `split_whitespace()`. Whitespace separates options, and
+/// `=` may have whitespace on either side. A value may be single-quoted and
+/// contain spaces. `\` escapes the next character in both the quoted and the
+/// bare form. A whitespace split cannot see any of that. So
 /// `password='foo hunter2'` tokenizes as `password='foo` and leaves `hunter2'`
-/// standing — in a banner whose entire purpose is to be safe to paste into an
-/// issue.
+/// standing, in a banner that exists to be safe to paste into an issue.
 ///
-/// Lazy, so a caller looking for one option ([`safety`](super::safety) wants
-/// `sslmode`) stops at it rather than decoding every later value — including
-/// the password — into a `String` it never reads.
+/// Lazy, so a caller that wants one option stops at it. ([`safety`](super::safety)
+/// wants `sslmode`.) It does not decode every later value, the password
+/// included, into a `String` it never reads.
 ///
-/// Deliberately **lenient**: a token with no `=` is skipped, and an
-/// unterminated quote or a trailing `\` ends the scan where it ends the string,
-/// rather than failing the whole read. Both callers already have an authority
-/// for malformed input — `Config::from_str` refuses it, and the banner must
-/// still print something — so bailing out would only lose the options that were
-/// legible.
+/// Deliberately **lenient**: a token with no `=` is skipped. An unterminated
+/// quote or a trailing `\` ends the scan where it ends the string, and the read
+/// does not fail. Both callers already have an authority for malformed input.
+/// `Config::from_str` refuses it, and the banner must still print something. So
+/// a bail-out would only lose the options that were legible.
 pub(super) const fn keyword_options(dsn: &str) -> KeywordOptions<'_> {
     KeywordOptions { dsn, index: 0 }
 }
@@ -235,8 +231,8 @@ impl<'a> KeywordOptions<'a> {
         self.skip_whitespace();
         if self.peek() != Some('=') {
             // A bare token with no value. `self.index` is past `key_start`
-            // here — the loop above only stops on `=` (handled) or on
-            // whitespace it then consumed — so the scan still advances.
+            // here, so the scan still advances. The loop above stops only on
+            // `=` (handled) or on whitespace that it then consumed.
             return Some(KeywordToken::Bare);
         }
         self.index += 1;
@@ -251,20 +247,19 @@ impl<'a> KeywordOptions<'a> {
         }))
     }
 
-    /// The character at the cursor, without consuming it.
     fn peek(&self) -> Option<char> {
         self.dsn[self.index..].chars().next()
     }
 
     /// Advance past the run of whitespace at the cursor.
     ///
-    /// `char::is_whitespace`, deliberately, and not `u8::is_ascii_whitespace`:
-    /// the client's own reader separates options on the Unicode `White_Space`
-    /// property (`tokio_postgres::config`'s `skip_ws`), so a no-break space is
-    /// where one option ends and the next begins. A scan that only knows ASCII
-    /// reads `host=localhost\u{a0}password=hunter2` as a *single* option whose
-    /// value happens to contain the text `password=hunter2` — and the banner,
-    /// finding no `password` key to blank out, prints the credential.
+    /// `char::is_whitespace`, deliberately, and not `u8::is_ascii_whitespace`.
+    /// The client's own reader separates options on the Unicode `White_Space`
+    /// property (`tokio_postgres::config`'s `skip_ws`). So a no-break space
+    /// ends one option and starts the next. An ASCII-only scan reads
+    /// `host=localhost\u{a0}password=hunter2` as a *single* option. Its value
+    /// contains the text `password=hunter2`. The banner then finds no
+    /// `password` key to blank out, and prints the credential.
     fn skip_whitespace(&mut self) {
         while let Some(ch) = self.peek() {
             if !ch.is_whitespace() {
@@ -285,10 +280,10 @@ impl<'a> KeywordOptions<'a> {
 
         while let Some(ch) = self.peek() {
             match ch {
-                // `\` escapes the next character in both forms. Stepping a
-                // fixed two bytes would land inside a multi-byte escape like
-                // `\é` and the next slice would panic on a non-character
-                // boundary, so the whole character is consumed.
+                // `\` escapes the next character in both forms. Consume the
+                // whole character. A fixed two-byte step lands inside a
+                // multi-byte escape like `\é`, and the next slice panics on a
+                // non-character boundary.
                 '\\' => {
                     self.index += 1;
                     match self.peek() {
@@ -305,8 +300,8 @@ impl<'a> KeywordOptions<'a> {
                     break;
                 }
                 // An unquoted value ends at the whitespace that starts the
-                // next option; a quoted one runs to its closing `'`, spaces
-                // and all, which is why a quoted password may contain them.
+                // next option. A quoted one runs to its closing `'`, spaces
+                // included. So a quoted password may contain spaces.
                 _ if !quoted && ch.is_whitespace() => break,
                 _ => {
                     value.push(ch);
@@ -336,25 +331,25 @@ pub(super) struct QueryParameter {
 /// `None` when it has none.
 ///
 /// **Not simply the first `?`.** `tokio_postgres` reads userinfo with
-/// `take_until(&['@'])` across the whole remaining string *before* it looks for
-/// anything else, so in `postgres://u?x=1&y=z@localhost/app` the `?x=1&y=z` is
-/// part of the **username** and the DSN has no query string at all. Splitting
-/// at the first `?` there invents a parameter out of a credential — and when
-/// the invented key percent-decodes to `sslmode`, the gate refuses a loopback
-/// database it should have allowed, which is exactly the defect #1286 exists to
-/// remove, reintroduced through the other syntax.
+/// `take_until(&['@'])` across the whole remaining string *before* anything
+/// else. So in `postgres://u?x=1&y=z@localhost/app` the `?x=1&y=z` is part of
+/// the **username**, and the DSN has no query string. A split at the first `?`
+/// there invents a parameter out of a credential. The invented key can
+/// percent-decode to `sslmode`. Then the gate refuses a loopback database it
+/// should allow. That is the defect #1286 exists to remove, back through the
+/// other syntax.
 ///
-/// After the credentials the client's walk is unambiguous: the host stops at
-/// `/` or `?`, and a path stops at `?`, so either way the query begins at the
-/// first `?` that follows the credentials.
+/// After the credentials, the client's walk is unambiguous. The host stops at
+/// `/` or `?`, and a path stops at `?`. So the query begins at the first `?`
+/// after the credentials.
 pub(super) fn query_start(dsn: &str) -> Option<usize> {
-    // Leading whitespace is skipped for locating the scheme and nothing else —
-    // the same allowance [`is_uri_dsn`] makes, and it has to be the same one.
-    // `is_uri_dsn` sends a space-prefixed DSN down the URI branch, so a locator
-    // that then finds no scheme reports "no query string" and hands the banner
-    // back a DSN whose password was never looked at. Offsets stay absolute, so
-    // a splice still lands on the right bytes and the whitespace survives into
-    // the banner exactly as the developer typed it.
+    // Skip leading whitespace to find the scheme, and for nothing else. That
+    // is the allowance [`is_uri_dsn`] makes, and it must be the same one.
+    // `is_uri_dsn` sends a space-prefixed DSN down the URI branch. A locator
+    // that then finds no scheme reports "no query string". The banner then
+    // gets back a DSN whose password was never examined. Offsets stay
+    // absolute, so a splice still lands on the right bytes. The whitespace
+    // reaches the banner exactly as the developer typed it.
     let scheme_at = dsn.len() - dsn.trim_start().len();
     let after_scheme = scheme_at
         + ["postgres://", "postgresql://"]
@@ -373,11 +368,10 @@ pub(super) fn query_start(dsn: &str) -> Option<usize> {
 
 /// The query-string parameters of a **URI** DSN, keys and values percent-decoded.
 ///
-/// Splitting on `&` and then on the first `=` is exactly what the client's
-/// `parse_params` does, so a parameter's *value* can never be mistaken for the
-/// query string's own key — which is how `?application_name=sslmode=require`
-/// came to be read as a TLS demand. The query itself is located by
-/// [`query_start`], not by the first `?`.
+/// It splits on `&` and then on the first `=`, exactly as the client's
+/// `parse_params` does. So a parameter's *value* can never pass for a key of
+/// the query string. That mistake read `?application_name=sslmode=require` as
+/// a TLS demand. [`query_start`] finds the query, not the first `?`.
 pub(super) fn uri_query_parameters(dsn: &str) -> impl Iterator<Item = QueryParameter> + '_ {
     let start = query_start(dsn).unwrap_or(dsn.len());
     dsn[start..]
@@ -403,14 +397,13 @@ pub(super) fn uri_query_parameters(dsn: &str) -> impl Iterator<Item = QueryParam
 /// Percent-decode a URI query component, for comparison only.
 ///
 /// `tokio_postgres`'s URI reader decodes query keys and values before it
-/// matches them, so `%73slmode=verify-full` **is** the `sslmode` parameter as
-/// far as the code that dials is concerned — and comparing the raw bytes both
-/// printed a whole credential in the banner and missed a TLS demand in the
-/// safety gate.
+/// matches them. So for the code that dials, `%73slmode=verify-full` **is** the
+/// `sslmode` parameter. A compare of the raw bytes printed a whole credential
+/// in the banner. It also missed a TLS demand in the safety gate.
 ///
-/// Deliberately not a general URI decoder: nothing is re-encoded or reshaped
-/// from the result, and a malformed escape is left alone exactly as
-/// `percent_decode` leaves it.
+/// Deliberately not a general URI decoder. Nothing re-encodes or reshapes the
+/// result. A malformed escape stays as it is, exactly as `percent_decode`
+/// leaves it.
 pub(super) fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -549,9 +542,9 @@ mod tests {
     fn options_are_separated_the_way_the_client_separates_them() {
         // `tokio_postgres`'s reader skips option separators with
         // `char::is_whitespace` — the Unicode `White_Space` property, not
-        // ASCII. A scanner that knows only ASCII reads all of these as ONE
-        // option whose value contains the text `password=hunter2`, finds no
-        // `password` key, and lets the banner print the credential.
+        // ASCII. An ASCII-only scanner reads each of these as ONE option whose
+        // value contains the text `password=hunter2`. It finds no `password`
+        // key, and the banner prints the credential.
         for separator in [
             '\u{0009}', // tab
             '\u{000b}', // vertical tab — ASCII, but not `is_ascii_whitespace`
@@ -669,8 +662,8 @@ mod tests {
     #[test]
     fn the_query_starts_after_the_userinfo_not_at_the_first_question_mark() {
         // `postgres://u?x=1@host/db` has a USERNAME of `u?x=1`. The client
-        // consumes credentials to the first `@` before it looks for a query,
-        // so a `?` before that `@` is an ordinary character in a credential.
+        // consumes credentials to the first `@` before it looks for a query.
+        // So a `?` before that `@` is an ordinary character in a credential.
         for (dsn, expected) in [
             ("postgres://u?x=1@localhost/db", None),
             ("postgres://u?x=1&y=z@localhost/db", None),
@@ -679,16 +672,16 @@ mod tests {
             ("postgres://localhost/db?a=2", Some("a=2")),
             // No path: the host stops at the `?` and the query starts there.
             ("postgres://localhost?a=2", Some("a=2")),
-            // An `@` AFTER the `?` is credentials too, as far as the client is
-            // concerned — so everything before it, query-looking or not, is a
-            // username, and what follows has no query at all.
+            // For the client, an `@` AFTER the `?` also ends credentials. So
+            // everything before it is a username, even if it looks like a
+            // query. What follows has no query at all.
             ("postgres://localhost/db?a=2@c", None),
             ("postgresql://u@localhost/db?a=2", Some("a=2")),
             // Not a URI at all: no scheme, so no query to find.
             ("host=localhost dbname=db?a=2", None),
             // Leading whitespace is skipped for the scheme, exactly as
-            // `is_uri_dsn` skips it — otherwise the two disagree about whether
-            // this is a URI at all, and the query goes unnoticed.
+            // `is_uri_dsn` skips it. Otherwise the two disagree about whether
+            // this is a URI, and the query goes unnoticed.
             ("  postgres://u@localhost/db?a=2", Some("a=2")),
             ("\t\npostgresql://u@localhost/db?a=2", Some("a=2")),
             ("  postgres://u@localhost/db", None),

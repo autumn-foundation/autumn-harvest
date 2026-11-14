@@ -21,10 +21,10 @@
 //! loop, so the ack ordering, poison accounting and backpressure under test
 //! are the production code paths.
 //!
-//! Execution: honours `HARVEST_TEST_DATABASE_URL` (a migrated Postgres) so the
-//! suite runs where Docker is unavailable; otherwise boots a testcontainers
-//! Postgres from `autumn_harvest::test_init_sql()` plus this plugin's
-//! own connector dead-letter migration.
+//! Execution: the suite uses `HARVEST_TEST_DATABASE_URL` (a migrated Postgres)
+//! where Docker is unavailable. Otherwise it boots a testcontainers Postgres
+//! from `autumn_harvest::test_init_sql()` plus the plugin's connector
+//! dead-letter migration.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -343,9 +343,9 @@ async fn workflow_id_dedupe_cannot_survive_a_mapper_whose_workflow_id_drifts() {
     // dedupes" would be unfalsifiable -- every dedupe assertion would pass
     // under either mode, because a stable mapper makes the two indistinguishable.
     //
-    // This is also the honest warning for `SignalsWithStart`, which is forced
-    // into `WorkflowId` mode (a keyed start is mutually exclusive with the
-    // signal-with-start path): its mapping function MUST derive a stable id.
+    // It is also the warning for `SignalsWithStart`. A keyed start excludes
+    // the signal-with-start path, so `SignalsWithStart` is forced into
+    // `WorkflowId` mode. Its mapping function MUST derive a stable id.
     let (url, _c) = setup_database().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
@@ -421,11 +421,10 @@ async fn redelivered_message_delivers_exactly_one_signal() {
 
 #[tokio::test]
 async fn crash_between_commit_and_ack_dedupes_on_redelivery() {
-    // AC4's falsifiable bar. `settle` is what acks, so dropping the runtime
-    // right after `map_and_dispatch` commits — modelled here by dispatching
-    // through a runtime whose source is then replaced — leaves the message
-    // unacknowledged. The broker redelivers, and the redelivery must resolve
-    // as an idempotent replay rather than a second run.
+    // AC4's falsifiable bar. Only `settle` acks. A runtime dropped right after
+    // `map_and_dispatch` commits leaves the message unacknowledged. The test
+    // models that by replacing the source after the dispatch. The redelivery
+    // must resolve as an idempotent replay, not a second run.
     let (url, _c) = setup_database().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
@@ -479,9 +478,8 @@ async fn crash_between_commit_and_ack_dedupes_on_redelivery() {
 
 #[tokio::test]
 async fn a_rejected_dispatch_is_never_acked_as_success() {
-    // A target the registry does not know is a deterministic refusal (404), so
-    // it dead-letters rather than looping — but crucially it is never counted
-    // as a successful dispatch.
+    // An unknown target is a deterministic refusal (404), so it dead-letters
+    // and does not loop. It is never counted as a successful dispatch.
     let (url, _c) = setup_database().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
@@ -523,11 +521,11 @@ async fn a_rejected_dispatch_is_never_acked_as_success() {
 #[tokio::test]
 async fn a_second_dead_letter_for_one_key_is_reported_as_already_recorded() {
     // `ON CONFLICT (idempotency_key) DO NOTHING` makes the write idempotent,
-    // and the affected-row count is that conflict made observable. It is the
-    // only DURABLE answer to "is this a new poison message": the in-process
-    // tracker is emptied by the very restart that causes the redelivery (the
-    // process died between writing the record and acking the broker), so
-    // without this the `poisoned` counter gains a sample per restart.
+    // and the affected-row count makes that conflict observable. It is the
+    // only DURABLE answer to "is this a new poison message". The process died
+    // between the record write and the broker ack. The restart that causes the
+    // redelivery also empties the in-process tracker. Without this,
+    // the `poisoned` counter gains a sample per restart.
     let (url, _c) = setup_database().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
@@ -666,15 +664,13 @@ async fn one_poison_message_does_not_block_a_hundred_valid_ones() {
     };
     let rt = rt.with_config(config);
 
-    // Drained across passes, NOT in one: a pass receives at most
-    // `effective_max_batch(max_batch, max_in_flight)` — 16 here, not the
-    // configured 200 — because capping the prefetch at in-flight capacity IS
-    // the backpressure guarantee. Asserting a 101-message single pass would be
-    // asserting that the cap is absent. The poison sits at offset 0, so it is
-    // in the FIRST batch and every later batch has to get past it; that is
-    // exactly the head-of-line blocking AC6 forbids, and draining is what
-    // exposes it. Bounded so a genuine block fails on the counts below rather
-    // than hanging CI.
+    // Drained across passes, NOT in one. A pass receives at most
+    // `effective_max_batch(max_batch, max_in_flight)`, which is 16 here, not
+    // the configured 200. That cap on the prefetch IS the backpressure
+    // guarantee. A 101-message single pass would assert that the cap is absent.
+    // The poison sits at offset 0, in the FIRST batch, so every later batch has
+    // to get past it. That is the head-of-line blocking AC6 forbids. The loop
+    // is bounded, so a genuine block fails on the counts below, not by hanging.
     let mut total = autumn_harvest_plugin::connector::PassSummary::default();
     for _ in 0..64 {
         let pass = rt.run_once().await.expect("pass");
@@ -754,7 +750,7 @@ async fn a_broker_started_execution_records_broker_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn soak_ten_thousand_messages_with_redeliveries_and_poison() {
     // The issue's headline success metric, verbatim:
-    //   10,000 messages, 5% forced redeliveries, 10 poison messages
+    //   10,000 messages, 5% forced redeliveries, 10 poison messages.
     //   → exactly 10,000 − 10 dispatched outcomes, 0 duplicate executions,
     //     10 dead-lettered messages.
     const TOTAL: i64 = 10_000;

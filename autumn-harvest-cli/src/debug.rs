@@ -4,10 +4,9 @@
 //! # What this command can and cannot do
 //!
 //! The shipped `harvest` binary is statically linked and **cannot register your
-//! application's `#[workflow]` handler functions**. This is the same constraint
-//! `harvest-replay` already states ("copy this file into your application, add
-//! your handlers to `build_replayer()`"), and it splits issue #949's surface
-//! cleanly in two:
+//! application's `#[workflow]` handler functions**. `harvest-replay` states the
+//! same constraint ("copy this file into your application, add your handlers to
+//! `build_replayer()`"). This constraint splits issue #949's surface in two:
 //!
 //! | Capability | Needs your code? | Where |
 //! |---|---|---|
@@ -56,10 +55,10 @@ fn load_snapshot(path: &Path) -> Result<HistorySnapshot, CliError> {
         source: e,
     })?;
     // A redacted export rewrites every payload field in place. The
-    // handler-free CLI trace only *displays* payloads, so this degrades rather
-    // than fabricates — but the same file handed to `ReplayDebugger` would
-    // invent a divergence at the first payload-bearing activity, so warn here
-    // and refuse there.
+    // handler-free CLI trace only *displays* payloads, so it degrades and does
+    // not fabricate. The same file handed to `ReplayDebugger` would invent a
+    // divergence at the first payload-bearing activity. So warn here and
+    // refuse there.
     if is_redacted_export(&text) {
         eprintln!(
             "warning: this history was exported with redacted payloads; payload \
@@ -352,17 +351,17 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
     let Some(div) = &diff.divergence else {
         let examined = diff.left_steps.min(diff.right_steps);
         if diff.truncated {
-            // Not the same claim as agreement, and must never render as one:
-            // both traces stopped at the same cap, so a difference living past
-            // it is indistinguishable from silence.
+            // Not the same claim as agreement, and must never render as one.
+            // Both traces stopped at the same cap, so a difference past it is
+            // indistinguishable from silence.
             return format!(
                 "INCONCLUSIVE: {left_label} and {right_label} agree across the {examined} steps\n                 that were compared, but at least one trace was capped by --max-steps,\n                 so the remainder was never examined. Raise the cap to get a verdict.\n"
             );
         }
         if let Some(step) = diff.inconclusive_step {
             // Both sides failed to replay the same way, so they compare equal at
-            // every field — but neither was ever successfully replayed, so
-            // "they agree" would be a claim about two non-answers.
+            // every field. Neither side ever replayed successfully, so "they
+            // agree" would be a claim about two non-answers.
             return format!(
                 "INCONCLUSIVE: {left_label} and {right_label} match across the {examined} steps\n                 that were compared, but neither replayed successfully at step {step}\n                 (it timed out or panicked), so agreement there\n                 says nothing about the code. Fix the spin or panic to get a verdict.\n"
             );
@@ -408,11 +407,11 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
                             d.event_index, d.expected, d.actual
                         );
                     }
-                    // No divergence recorded is not the same as a clean replay:
+                    // No recorded divergence is not the same as a clean replay.
                     // `divergence` is compared BEFORE `outcome`, so this side may
-                    // have panicked or timed out and simply never got far enough
-                    // to disagree with anything. Naming a non-answer "clean" is
-                    // the same false-clean this tool exists to refuse.
+                    // have panicked or timed out before it could disagree.
+                    // Naming a non-answer "clean" is the false-clean this tool
+                    // exists to refuse.
                     None => match step {
                         Some(s) if !s.outcome.replay_succeeded() => {
                             let _ = writeln!(
@@ -457,11 +456,10 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
     out.push_str(&kind_line);
 
     // When the divergence is a *history fact*, name the field AND show it. The
-    // handler-free CLI arm emits no commands at all, so rendering only
-    // commands would print "the recorded histories differ (open_awaitables)"
-    // followed by two identical `<no pending commands>` lines — naming a
-    // difference the operator cannot see is worse than useless on a
-    // divergence-finding tool.
+    // handler-free CLI arm emits no commands. So rendering only commands would
+    // print "the recorded histories differ (open_awaitables)" and two identical
+    // `<no pending commands>` lines. On a divergence-finding tool, naming a
+    // difference the operator cannot see is worse than useless.
     let field = match &div.kind {
         DiffKind::HistoryFacts { field } => Some(*field),
         _ => None,
@@ -533,13 +531,13 @@ fn history_fact_line(step: &DebugStep, field: &str) -> String {
             .join(", "),
         // The whole recorded event with per-run identity (uuids, timestamps,
         // non-deterministic draws) normalized to `<per-run>`. This is the
-        // backstop field, so it fires for any semantic difference no curated
-        // projection names — printing it is what lets the operator SEE which
-        // part of the event moved.
+        // backstop field: it fires for any semantic difference that no curated
+        // projection names. Printing it lets the operator SEE which part of the
+        // event moved.
         "event_facts" => compact(&step.event_facts),
-        // `history_fact_diff` owns the field vocabulary; a new field name added
-        // there renders as "unavailable" rather than silently as "<none>",
-        // which would read as a real (empty) value.
+        // `history_fact_diff` owns the field vocabulary. A new field name there
+        // renders as "unavailable", not silently as "<none>", which would read
+        // as a real (empty) value.
         _ => "<not rendered by this CLI version>".to_string(),
     };
     let value = if value.is_empty() {
@@ -617,11 +615,11 @@ pub fn run_replay(
     let focus = resolve_focus(&trace, breakpoint.as_ref(), step);
 
     if tui {
-        // `--step` / `--break-*` seed the opening cursor rather than being
-        // silently discarded — and an *unsatisfiable* focus is an error here
-        // exactly as it is on the text and JSON paths. Opening at step 0
-        // instead would make `--tui --break-at-activity nonexistent` look like
-        // a hit and exit 0, which is the one thing a breakpoint must never do.
+        // `--step` / `--break-*` seed the opening cursor and are never silently
+        // discarded. An *unsatisfiable* focus is an error here, exactly as on
+        // the text and JSON paths. Opening at step 0 instead would make
+        // `--tui --break-at-activity nonexistent` look like a hit and exit 0.
+        // A breakpoint must never do that.
         let cursor = match focus {
             FocusResolution::BreakpointHit { index } | FocusResolution::Step { index } => index,
             FocusResolution::Whole => 0,
@@ -634,11 +632,11 @@ pub fn run_replay(
     }
 
     if format == DebugFormat::Json {
-        // JSON mode always emits the whole trace: a machine consumer does its
-        // own focusing, and silently emitting a partial document would be a
-        // trap for a `jq` pipeline. The breakpoint is still *evaluated*, so a
-        // miss sets the exit code — otherwise `--format json --break-at-…` in a
-        // pipeline is a false green whether or not the breakpoint exists.
+        // JSON mode always emits the whole trace. A machine consumer does its
+        // own focusing, and a silent partial document would trap a `jq`
+        // pipeline. The breakpoint is still *evaluated*, so a miss sets the exit
+        // code. Otherwise `--format json --break-at-…` in a pipeline is a false
+        // green, whether or not the breakpoint exists.
         println!(
             "{}",
             serde_json::to_string_pretty(&trace).map_err(|e| CliError::InvalidJson {

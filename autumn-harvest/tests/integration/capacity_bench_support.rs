@@ -26,7 +26,6 @@ pub const CAPACITY_DRAIN_GRACE_SECS: u64 = 20;
 /// Fewest runs a step must start before a verdict can rest on it. Each
 /// judged window then holds at least 100 runs, so its p99 is not its maximum.
 pub const CAPACITY_MIN_STEP_RUNS: usize = 400;
-// Each judged window holds at least 100 runs, so its p99 is not its maximum.
 const _: () = assert!(CAPACITY_MIN_STEP_RUNS / CAPACITY_WINDOWS >= 100);
 
 /// Fraction of the offered rate the generator must achieve.

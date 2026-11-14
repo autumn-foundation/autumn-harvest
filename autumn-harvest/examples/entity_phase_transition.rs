@@ -13,9 +13,9 @@
 //! 1. **One monolithic handler** that branches on a `phase` field forever. Every
 //!    phase's code is loaded, versioned and replayed by every other phase, and
 //!    the `ctx.patched()` gates never retire.
-//! 2. **Terminate and start a new type.** You get a clean handler per phase, but
-//!    the entity's stable `workflow_id` is broken across the seam, and any
-//!    `signal_with_start` (#244) / `update_with_start` (#479) racing the
+//! 2. **Terminate and start a new type.** You get a clean handler per phase.
+//!    But the entity's stable `workflow_id` breaks across the seam. A
+//!    `signal_with_start` (#244) / `update_with_start` (#479) that races the
 //!    transition lands on the wrong run.
 //!
 //! ## The solution: `ctx.continue_as_new_as_type(...)`
@@ -217,10 +217,10 @@ fn main() {
     );
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must
-// keep building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for an external consumer only when the
+// `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -280,9 +280,9 @@ mod tests {
         assert_eq!(recorded.as_deref(), Some("churned"));
     }
 
-    /// The billing phase's same-type monthly loop records **no** target type —
-    /// `None` is exactly what every pre-#803 history carries, so the plain
-    /// `continue_as_new` path is provably unchanged.
+    /// The billing phase's same-type monthly loop records **no** target type.
+    /// Every pre-#803 history carries `None`, so the plain `continue_as_new`
+    /// path is provably unchanged.
     #[tokio::test]
     async fn the_monthly_billing_loop_is_a_same_type_continuation() {
         let outcome = WorkflowTestEnv::new()

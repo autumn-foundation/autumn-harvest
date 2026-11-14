@@ -2151,7 +2151,6 @@ fn model_turn_agents(
     Ok(agents)
 }
 
-/// Compare the two runs turn by turn.
 fn diff_turns(recorded: &[ModelTurn], candidate: &[ModelTurn]) -> Vec<TurnDiff> {
     (0..recorded.len().max(candidate.len()))
         .map(|turn| {

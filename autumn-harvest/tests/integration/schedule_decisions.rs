@@ -71,10 +71,8 @@ async fn test_record_decision_graceful_success() {
     )
     .await;
 
-    // Verify metric did not increment
     assert_eq!(*metrics.write_failed_count.lock().unwrap(), 0);
 
-    // Read the database and verify the entry was written
     let decisions = harvest_schedule_decisions::table
         .load::<ScheduleDecision>(&mut conn)
         .await
@@ -98,15 +96,15 @@ async fn test_record_decision_graceful_success() {
 async fn test_record_decision_graceful_failure() {
     let (mut conn, container) = make_conn().await;
 
-    // Stop the database container to ensure database write fails
+    // Stop the container so the database write fails.
     drop(container);
 
     let metrics = TestMetrics::default();
     let next_fire_at = Utc::now() + chrono::Duration::hours(1);
     let occurred_at = Utc::now();
 
-    // Call record_decision_graceful. It should catch the DB error, log it,
-    // and record the metrics without crashing or returning an error.
+    // The call absorbs the DB error, logs it and records the metric. It
+    // returns no error.
     record_decision_graceful(
         &mut conn,
         Some(&metrics),
@@ -122,7 +120,6 @@ async fn test_record_decision_graceful_failure() {
     )
     .await;
 
-    // Verify metric incremented exactly once
     assert_eq!(*metrics.write_failed_count.lock().unwrap(), 1);
 }
 
@@ -131,7 +128,6 @@ async fn test_purge_old_schedule_decisions() {
     let (mut conn, _c) = make_conn().await;
     let metrics = TestMetrics::default();
 
-    // 1. Record an old decision (e.g. 10 days ago)
     let ten_days_ago = Utc::now() - chrono::Duration::days(10);
     record_decision_graceful(
         &mut conn,
@@ -148,7 +144,6 @@ async fn test_purge_old_schedule_decisions() {
     )
     .await;
 
-    // 2. Record a new decision (e.g. now)
     let now = Utc::now();
     record_decision_graceful(
         &mut conn,
@@ -165,7 +160,6 @@ async fn test_purge_old_schedule_decisions() {
     )
     .await;
 
-    // Verify both are present
     let count: i64 = harvest_schedule_decisions::table
         .count()
         .get_result(&mut conn)
@@ -173,13 +167,11 @@ async fn test_purge_old_schedule_decisions() {
         .expect("count");
     assert_eq!(count, 2);
 
-    // 3. Purge older than 7 days
     let purged = autumn_harvest::schedule_decision::purge_old_schedule_decisions(&mut conn, 7)
         .await
         .expect("purge");
     assert_eq!(purged, 1);
 
-    // 4. Verify only the new decision remains
     let remaining = harvest_schedule_decisions::table
         .load::<ScheduleDecision>(&mut conn)
         .await

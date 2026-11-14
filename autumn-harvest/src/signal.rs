@@ -1,8 +1,8 @@
 //! Workflow signal delivery and management.
 //!
-//! Signals provide a way to send asynchronous events or payloads into a running workflow.
-//! This module handles the durable enqueuing of signals into the database, loading pending
-//! signals for a workflow, and marking them as consumed once processed by the workflow context.
+//! A signal sends an asynchronous event or payload into a running workflow.
+//! This module enqueues signals durably, loads the pending signals of a
+//! workflow, and marks them consumed once the workflow context processes them.
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
 #[cfg(feature = "db")]
@@ -24,10 +24,12 @@ use crate::types::ExecutionId;
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
-/// the workflow execution does not exist,
+/// the workflow execution does not exist. Returns
 /// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
 /// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
-/// execution is already terminal, and
+/// execution is already terminal. Returns
+/// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable)
+/// if the execution is `MIGRATED` or `MIGRATING` on this shard. Returns
 /// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
 /// insert or wake fails.
 #[cfg(feature = "db")]
@@ -83,10 +85,12 @@ pub async fn send_signal_with_codecs(
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
-/// the workflow execution does not exist,
+/// the workflow execution does not exist. Returns
 /// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
 /// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
-/// execution is already terminal, and
+/// execution is already terminal. Returns
+/// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable)
+/// if the execution is `MIGRATED` or `MIGRATING` on this shard. Returns
 /// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
 /// insert or wake fails.
 #[cfg(feature = "db")]
@@ -123,10 +127,10 @@ fn signal_state_refusal(
         // delivered on resume. The wake after the insert re-pends the task, which
         // the claim gate defers until the execution is RUNNING.
         "RUNNING" | "PAUSED" => {}
-        // Issue #964. Neither is terminal, and calling them terminal is the
-        // damaging answer: a caller that sees "terminal" reasonably stops
-        // retrying, and the outbox records `target_terminal` in the
-        // sender's history for a workflow that is alive.
+        // Issue #964. Neither is terminal, and a "terminal" answer does
+        // damage. A caller that sees "terminal" stops retrying. The outbox
+        // then records `target_terminal` in the sender's history for a
+        // workflow that is alive.
         //
         // `MIGRATED` — the run was rebalanced onto another shard; this row
         // is the seal it left behind. The caller reached the wrong database
@@ -134,10 +138,10 @@ fn signal_state_refusal(
         // `MIGRATING` — a staged copy that is not live yet; it becomes
         // claimable at activation, moments away.
         //
-        // Both are reported as `ShardUnavailable`, which is the engine's
-        // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
-        // so the outbox leaves the row pending and tries again rather than
-        // failing the delivery permanently.
+        // Both report `ShardUnavailable`, the engine's existing RETRYABLE
+        // classification (`HarvestError::is_shard_unavailable`). So the
+        // outbox leaves the row pending and tries again. It does not fail
+        // the delivery permanently.
         //
         // `MIGRATING` covers two different moments (issue #1317). This
         // row cannot tell them apart. `commit_cutover` writes only the
@@ -267,12 +271,12 @@ pub async fn send_signal_idempotent_with_codecs(
                 idempotency_key,
             };
 
-            // Attempt the insert before validating state so a keyed retry that
-            // already landed dedupes to a no-op even after the workflow has gone
-            // terminal. `on_conflict_do_nothing()` (no explicit target) lets
-            // Postgres arbitrate against the partial unique index
-            // `uq_harvest_signals_idem`; a NULL key is excluded from the index,
-            // so the insert always succeeds (rows-affected = 1).
+            // Insert before the state check, so a keyed retry that already
+            // landed dedupes to a no-op even after the workflow went terminal.
+            // `on_conflict_do_nothing()` has no explicit target, so Postgres
+            // arbitrates against the partial unique index
+            // `uq_harvest_signals_idem`. The index excludes a NULL key, so that
+            // insert always succeeds (rows-affected = 1).
             let inserted = diesel::insert_into(harvest_signals::table)
                 .values(&row)
                 .on_conflict_do_nothing()
@@ -315,8 +319,8 @@ pub async fn send_signal_idempotent_with_codecs(
 /// (issue #843).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedSignalDelivery {
-    /// The execution the signal was actually queued for — the **live attempt**
-    /// of the logical run, which differs from the requested id whenever the
+    /// The execution that received the signal: the **live attempt** of the
+    /// logical run. It differs from the requested id whenever the
     /// workflow-level retry chain (#523) has advanced.
     pub target: ExecutionId,
     /// `true` when a row was freshly queued (the workflow was woken); `false`
@@ -327,34 +331,34 @@ pub struct RoutedSignalDelivery {
 /// Deliver a signal to the **live attempt** of the logical run named by
 /// `exec_id` (issue #843).
 ///
-/// A caller still holding the id returned by `start` targets the logical run,
-/// not one specific attempt: without routing, a signal sent after attempt 1
-/// sealed `FAILED` would be inserted against — and dropped with — the sealed
-/// predecessor while the retry ran on. For a workflow with no retry policy this
-/// is exactly [`send_signal_idempotent`].
+/// A caller that holds the id returned by `start` targets the logical run,
+/// not one specific attempt. Without routing, a signal sent after attempt 1
+/// sealed `FAILED` would land on the sealed predecessor and drop with it,
+/// while the retry ran on. For a workflow with no retry policy this is
+/// exactly [`send_signal_idempotent`].
 ///
-/// **Between-attempts contract.** There is no window in which the chain has no
-/// execution row: the retry successor is inserted in the same transaction that
-/// seals the predecessor `FAILED`, so a signal sent at any point routes to a
-/// row that exists. When that row's task is a still-delayed queued retry the
-/// signal simply waits in `harvest_signals` and is ingested into history when
-/// the retry is claimed — "deliver on the next attempt", with no synthetic
-/// buffering layer and no rejection window.
+/// **Between-attempts contract.** The chain always has an execution row. The
+/// retry successor is inserted in the same transaction that seals the
+/// predecessor `FAILED`. So a signal sent at any point routes to a row that
+/// exists. When that row's task is a still-delayed queued retry, the signal
+/// waits in `harvest_signals`. The claim of the retry ingests it into history.
+/// That is "deliver on the next attempt", with no synthetic buffering layer
+/// and no rejection window.
 ///
 /// **#521 idempotency keys** stay scoped to
 /// `(workflow_exec_id, idempotency_key)`. Routing moves *where* the row lands,
 /// so two keyed deliveries that both route to the same live attempt still
-/// dedupe to one row. A keyed delivery that was already consumed by an earlier
-/// attempt and is then re-sent after the chain advanced IS delivered again —
-/// correctly, because the retry replays a fresh history that has not seen it.
+/// dedupe to one row. An earlier attempt can consume a keyed delivery. A
+/// re-send after the chain advanced IS delivered again. That is correct,
+/// because the retry replays a fresh history that has not seen it.
 ///
-/// Race handling: if the attempt we resolved seals `FAILED` between the
-/// resolution and the insert, the delivery does not take effect — either the
-/// insert is rejected and rolled back by the state check, or a keyed insert
-/// dedupes against the stale attempt's existing row without ever reaching that
-/// check. Both report "not delivered", so both are re-driven against the
-/// freshly resolved live attempt; neither can double-deliver, because a
-/// re-drive only ever follows a delivery that was *not* queued.
+/// Race handling: the resolved attempt can seal `FAILED` between the
+/// resolution and the insert. The delivery then does not take effect. Either
+/// the state check rejects and rolls back the insert, or a keyed insert
+/// dedupes against the stale attempt's existing row before that check. Both
+/// report "not delivered", so both re-drive against the freshly resolved live
+/// attempt. Neither can double-deliver, because a re-drive only follows a
+/// delivery that was *not* queued.
 ///
 /// This form takes no codec registry, so it stores the payload in clear.
 /// Use [`send_signal_to_live_attempt_with_codecs`] to honour column
@@ -363,9 +367,11 @@ pub struct RoutedSignalDelivery {
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
-/// the execution does not exist, [`HarvestError::Cancelled`] /
-/// [`HarvestError::Config`] if the resolved live attempt is terminal, and
-/// [`HarvestError::Database`] if the insert or wake fails.
+/// the execution does not exist. Returns [`HarvestError::Cancelled`] /
+/// [`HarvestError::Config`] if the resolved live attempt is terminal. Returns
+/// [`HarvestError::ShardUnavailable`] if that attempt is `MIGRATED` or
+/// `MIGRATING` on its shard. Returns [`HarvestError::Database`] if the insert
+/// or wake fails.
 #[cfg(feature = "db")]
 pub async fn send_signal_to_live_attempt(
     conn: &mut AsyncPgConnection,
@@ -412,11 +418,10 @@ pub async fn send_signal_to_live_attempt_with_codecs(
     // to a different shard than `conn` currently holds.
     let (target, rebind) =
         crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
-    // Drop this checkout before `send_signal_from_resolved` binds again for
-    // the same shard (fresh review, P1). `rebind` is not reused below: this
-    // call passes `conn` and lets `send_signal_from_resolved` rebind on its
-    // own. Holding both open at once can deadlock a pool-size-one shard
-    // against itself.
+    // Drop this checkout before `send_signal_from_resolved` binds again for the
+    // same shard. `rebind` is not reused below: this call passes `conn` and
+    // lets `send_signal_from_resolved` rebind on its own. Holding both open at
+    // once can deadlock a pool-size-one shard against itself.
     drop(rebind);
     send_signal_from_resolved_with_codecs(
         conn,
@@ -435,11 +440,11 @@ pub async fn send_signal_to_live_attempt_with_codecs(
 ///
 /// `logical_exec_id` is the id the caller addressed (the one a re-drive
 /// re-resolves from); `resolved` is the live attempt that resolution produced.
-/// A handler that must inspect the resolved execution before delivering — the
-/// management API's `/signal` route validates the #610 payload schema against
-/// the resolved row's `workflow_name` — uses this so one request performs one
-/// chain walk instead of two, and so the row it validated against is provably
-/// the row it delivers to.
+/// A handler that must inspect the resolved execution before delivery uses
+/// this. The management API's `/signal` route is one: it validates the #610
+/// payload schema against the resolved row's `workflow_name`. So one request
+/// walks the chain once, not twice. And the row it validated is provably the
+/// row it delivers to.
 ///
 /// `resolved` may have been resolved by a caller that holds no
 /// [`crate::shard::ShardedDbPool`] of its own. This function's `conn`-only
@@ -521,10 +526,10 @@ pub async fn send_signal_from_resolved_with_codecs(
                     delivered: true,
                 });
             }
-            // A keyed dedup (`Ok(false)`) short-circuits *before* the state
-            // check, so it can report success against a row that has since
-            // sealed `FAILED` — swallowing a re-send the live attempt still
-            // needs. Nothing was queued, so re-driving cannot double-deliver.
+            // A keyed dedup (`Ok(false)`) returns *before* the state check.
+            // So it can report success against a row that has since sealed
+            // `FAILED`, and swallow a re-send the live attempt still needs.
+            // Nothing was queued, so re-driving cannot double-deliver.
             Ok(false) => {
                 drop(rebind);
                 let (fresh, fresh_rebind) =
@@ -575,31 +580,30 @@ pub async fn send_signal_from_resolved_with_codecs(
 /// Reassign **every** signal of `from` to `to`, resetting `consumed`, and
 /// return how many rows moved (issue #843).
 ///
-/// Called inside the transaction that seals a failed attempt and inserts its
-/// workflow-level retry successor (#523), so the successor inherits the logical
+/// The transaction that seals a failed attempt and inserts its workflow-level
+/// retry successor (#523) calls this. So the successor inherits the logical
 /// run's whole signal mailbox.
 ///
 /// **Consumed signals move too, and are re-armed.** `consumed = true` means
-/// "already ingested into *that attempt's* history" — and a retry starts from a
-/// completely fresh, empty history and re-executes every step from zero. A
-/// signal the failed attempt observed is therefore one the retry must observe
-/// again, or a workflow whose retry replays back to its `wait_for_signal` would
-/// block forever on a signal its caller was already told was delivered (and has
-/// no reason to re-send). Re-observing is the consistent choice for the same
-/// reason the retry re-runs every activity: nothing from the discarded attempt
-/// carries over except the mailbox.
+/// "already ingested into *that attempt's* history". A retry starts from a
+/// fresh, empty history and re-executes every step from zero. So the retry
+/// must observe again each signal the failed attempt observed. Otherwise a
+/// retry that replays back to its `wait_for_signal` blocks forever. Its caller
+/// was already told that the signal was delivered, and has no reason to
+/// re-send. The retry re-runs every activity for the same reason: nothing from
+/// the discarded attempt carries over except the mailbox.
 ///
 /// The failed attempt's own `SignalReceived` events remain in its history, so
 /// the audit record of what it observed is unaffected by the move.
 ///
-/// This deliberately diverges from the narrower reassignment `continue_as_new`
-/// performs (unconsumed only): a continue-as-new is *voluntary* and the
-/// workflow explicitly carries whatever it still needs into the successor's
-/// input, whereas a retry carries nothing forward at all.
+/// This deliberately differs from the narrower reassignment of
+/// `continue_as_new`, which moves unconsumed signals only. A continue-as-new
+/// is *voluntary*: the workflow carries what it still needs into the
+/// successor's input. A retry carries nothing forward at all.
 ///
-/// #521 idempotency keys move with their rows, so a caller's at-least-once
-/// re-send of an already-delivered key still dedupes against the live attempt
-/// rather than being swallowed by a sealed predecessor.
+/// #521 idempotency keys move with their rows. So a caller's at-least-once
+/// re-send of a delivered key still dedupes against the live attempt. A sealed
+/// predecessor does not swallow it.
 ///
 /// # Errors
 ///
@@ -629,23 +633,23 @@ pub async fn forward_signals_to_retry_attempt(
 /// request to a concrete execution and attempting delivery (issue #751).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ByIdSignalOutcome {
-    /// The signal was queued for the resolved (current) run — freshly
-    /// inserted or an idempotency-key replay of an existing one; either way
-    /// the target has (or already had) this signal queued for delivery.
+    /// The signal was queued for the resolved (current) run. It is a fresh
+    /// insert or an idempotency-key replay of an existing one. Either way the
+    /// target has (or already had) this signal queued for delivery.
     Delivered,
     /// No run has ever existed for this `(workflow_name, workflow_id)`.
     /// Callers apply the same grace-window policy used for an unrecognized
     /// `ExecutionId` before reporting a definitive `target_unknown` failure.
     NoRunFound,
-    /// The resolved run — whichever run was "current" at resolution time —
-    /// is already terminal. Unlike cancellation, a signal's goal is never
-    /// already met by a terminal target: the payload cannot be delivered, so
-    /// this is a genuine failure (`not_running`), never success.
+    /// The resolved run (the "current" run at resolution time) is already
+    /// terminal. Unlike cancellation, a terminal target never meets a
+    /// signal's goal. The payload cannot be delivered, so this is a genuine
+    /// failure (`not_running`), never success.
     NotRunning,
     /// The resolved run raced to `CONTINUED_AS_NEW` between resolution and
     /// the delivery attempt: a live successor now exists under the same
-    /// business key. Not success, not failure — the caller should leave this
-    /// attempt unresolved so a later attempt (immediate inline retry or the
+    /// business key. It is neither success nor failure. The caller leaves this
+    /// attempt unresolved. A later attempt (an immediate inline retry or the
     /// next outbox tick) re-resolves and finds the live successor.
     RacedToSuccessor,
 }
@@ -654,46 +658,43 @@ pub enum ByIdSignalOutcome {
 /// deliver a signal to it, closing the continue-as-new race by construction
 /// (issue #751, AC2/AC3/AC4).
 ///
-/// See [`crate::execution::resolve_and_cancel_by_workflow_id`] for the full
-/// proof that a **direct** resolution via
-/// [`crate::execution::resolve_execution_id_by_workflow_id`] can never
-/// itself return `state == "CONTINUED_AS_NEW"` — the same argument applies
-/// unchanged here, since both functions share the same resolve step. The one
-/// race that requires handling is the tiny window between this function's
-/// own resolve step and its delivery attempt: if the resolved run
-/// continues-as-new in that window,
-/// [`crate::execution::is_continued_as_new_race`] recognises it and this
-/// function reports [`ByIdSignalOutcome::RacedToSuccessor`] rather than
-/// misreporting either delivery or failure.
+/// [`crate::execution::resolve_and_cancel_by_workflow_id`] has the full proof
+/// that a **direct** resolution via
+/// [`crate::execution::resolve_execution_id_by_workflow_id`] never returns
+/// `state == "CONTINUED_AS_NEW"`. The same argument applies here, because
+/// both functions share the same resolve step. One race needs handling: the
+/// tiny window between this function's resolve step and its delivery
+/// attempt. If the resolved run continues-as-new in that window,
+/// [`crate::execution::is_continued_as_new_race`] recognises it. This
+/// function then reports [`ByIdSignalOutcome::RacedToSuccessor`], not a
+/// delivery or a failure.
 ///
 /// Unlike cancellation, a signal to an already-terminal resolved run is a
-/// genuine failure ([`ByIdSignalOutcome::NotRunning`]) — the payload was not,
-/// and cannot be, delivered — matching the existing `ExecutionId`-targeted
-/// signal contract's "no signal silently dropped" invariant (issue #244).
+/// genuine failure ([`ByIdSignalOutcome::NotRunning`]). The payload was not,
+/// and cannot be, delivered. That matches the "no signal silently dropped"
+/// invariant of the `ExecutionId`-targeted signal contract (issue #244).
 ///
 /// # Keyed retries (issue #751 code review, PR #1145)
 ///
-/// This function deliberately does **not** early-return `NotRunning` for a
-/// terminal resolved run before attempting delivery. A keyed retry (the
-/// caller-side outbox retrying a request whose target-shard insert already
-/// committed, but whose caller-shard transaction rolled back before it could
-/// record the delivery outcome) must dedupe to `Delivered` even after the
-/// target has since gone terminal — an early terminal check would deny
-/// [`send_signal_idempotent`]'s own "insert before validate" dedup (issue
-/// #521) the chance to ever observe the existing key collision, misreporting
-/// a request that was, in fact, already fulfilled.
+/// This function deliberately does **not** return `NotRunning` early for a
+/// terminal resolved run before it attempts delivery. Take a keyed retry from
+/// the caller-side outbox. Its target-shard insert already committed, but its
+/// caller-shard transaction rolled back before it recorded the outcome. That
+/// retry must dedupe to `Delivered` even after the target has gone terminal.
+/// An early terminal check would hide the existing key collision from the
+/// "insert before validate" dedup of [`send_signal_idempotent`] (issue #521).
+/// It would misreport a request that was, in fact, already fulfilled.
 ///
-/// A second, distinct race compounds this across a continue-as-new rotation:
-/// [`send_signal_idempotent`]'s dedup is scoped to
-/// `(workflow_exec_id, idempotency_key)`, so a key already used against a
-/// predecessor's `exec_id` does not collide against a successor's — a naive
+/// A second, distinct race compounds this across a continue-as-new rotation.
+/// The dedup of [`send_signal_idempotent`] is scoped to
+/// `(workflow_exec_id, idempotency_key)`. So a key used against a
+/// predecessor's `exec_id` does not collide against a successor's. A naive
 /// retry that re-resolves to the (now different) current run would insert a
 /// *second*, duplicate signal for one logical request. This function closes
 /// that gap with a `(workflow_name, workflow_id, idempotency_key)`-scoped
-/// pre-check (reusing [`crate::execution::lookup_idempotent_signal_dedupe`],
-/// the same lookup `signal_with_start` already uses for exactly this
-/// purpose, issue #244) before ever attempting a fresh insert against the
-/// freshly-resolved run.
+/// pre-check before any fresh insert against the freshly-resolved run. The
+/// pre-check reuses [`crate::execution::lookup_idempotent_signal_dedupe`],
+/// which `signal_with_start` uses for the same purpose (issue #244).
 ///
 /// This form takes no codec registry, so it stores the payload in clear.
 /// Use [`resolve_and_signal_by_workflow_id_with_codecs`] to honour column
@@ -765,9 +766,9 @@ pub async fn resolve_and_signal_by_workflow_id_with_codecs(
     let promise_signal = signal_name.starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
 
     // Cross-execution dedup: a keyed request already delivered to ANY
-    // execution in this (workflow_name, workflow_id) chain — including a
-    // predecessor sealed by a continue-as-new that raced ahead of this
-    // retry — is reported as already-delivered without a fresh insert.
+    // execution in this (workflow_name, workflow_id) chain reports as
+    // delivered, with no fresh insert. That includes a predecessor sealed by
+    // a continue-as-new that raced ahead of this retry.
     if let Some(key) = idempotency_key.filter(|k| !k.is_empty() && !promise_signal)
         && crate::execution::lookup_idempotent_signal_dedupe(conn, workflow_name, workflow_id, key)
             .await?
@@ -797,12 +798,11 @@ pub async fn resolve_and_signal_by_workflow_id_with_codecs(
             Ok(ByIdSignalOutcome::RacedToSuccessor)
         }
         Err(HarvestError::Config(_) | HarvestError::Cancelled(_)) => {
-            // A genuinely FRESH insert (the dedup pre-check above found no
-            // prior delivery for this key) against a target that is
-            // terminal — discovered either because `run` above already
-            // resolved to a terminal state (no idempotency key was
-            // supplied, or this key was never used before) or via the race
-            // window between our resolve and the signal attempt's own lock.
+            // A genuinely FRESH insert against a terminal target: the dedup
+            // pre-check found no prior delivery for this key. `run` may have
+            // resolved to a terminal state already (no key was supplied, or
+            // this key is new). Or the target sealed in the window between the
+            // resolve above and the signal attempt's own lock.
             Ok(ByIdSignalOutcome::NotRunning)
         }
         Err(e) => Err(e),
@@ -812,22 +812,22 @@ pub async fn resolve_and_signal_by_workflow_id_with_codecs(
 /// Read-only probe: does a queued signal row already exist for
 /// `(workflow_exec_id, idempotency_key)`?
 ///
-/// Used by the standalone signal route's committed-replay dedup short-circuit
-/// (issues #521 / #610): a keyed retry whose row already landed must return the
-/// documented `signal_delivered: false` no-op *before* any payload-schema
-/// (#610) or payload-cap (#252) validation that may have been published or
-/// tightened since the original delivery — otherwise a retry of an
-/// already-accepted signal could be rejected `400` instead of the documented
-/// `202`, regressing the exactly-once contract (including the "retry after the
-/// run went terminal" case). Side-effect free (no insert, no wake).
+/// The standalone signal route uses it for its committed-replay dedup
+/// short-circuit (issues #521 / #610). A keyed retry whose row already landed
+/// must return the documented `signal_delivered: false` no-op. That happens
+/// *before* any payload-schema (#610) or payload-cap (#252) validation. Either
+/// may have been published or tightened since the original delivery.
+/// Otherwise a retry of an accepted signal could get `400`, not the documented
+/// `202`. That breaks the exactly-once contract, including the "retry after
+/// the run went terminal" case. Side-effect free (no insert, no wake).
 ///
-/// The authoritative dedup remains [`send_signal_idempotent`]'s insert-time
-/// `ON CONFLICT`; this is only a fast path for already-committed rows, so a
-/// concurrent first-delivery race (neither request sees a row yet) still falls
-/// through to validation + the `ON CONFLICT` insert. An empty key is excluded
-/// from the partial unique index (never dedupes), so it reports `false` and the
-/// caller falls through to the normal path — mirroring
-/// [`send_signal_idempotent`]'s empty-key normalization.
+/// The authoritative dedup remains the insert-time `ON CONFLICT` of
+/// [`send_signal_idempotent`]. This is only a fast path for committed rows.
+/// In a concurrent first-delivery race, neither request sees a row yet. So
+/// both fall through to validation and the `ON CONFLICT` insert. The partial
+/// unique index excludes an empty key, which never dedupes. So an empty key
+/// reports `false` and the caller takes the normal path. That mirrors the
+/// empty-key normalization of [`send_signal_idempotent`].
 ///
 /// # Errors
 ///

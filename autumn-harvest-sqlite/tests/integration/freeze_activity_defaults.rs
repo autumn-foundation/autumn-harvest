@@ -1,26 +1,26 @@
 //! HARDENING ITEM 1 (issue #1068): **freeze resolved activity defaults on the
 //! task row.**
 //!
-//! Before this change the backend re-read an activity's registered defaults
-//! (`max_attempts`, the full `RetryPolicy`, `start_to_close`, and the total
-//! `schedule_to_close` deadline) from the MUTABLE in-memory registry on EVERY
-//! claim. So a task scheduled under spec A could, after a crash/reopen or a
-//! re-registration of the activity *between* attempts, retry under a DIFFERENT
-//! spec B — silently changing its policy/deadline mid-flight. The Postgres engine
-//! FREEZES these scalars onto the task row at schedule/claim time so an in-flight
-//! activity's contract is immutable.
+//! The backend once re-read an activity's registered defaults on EVERY claim. They
+//! are `max_attempts`, the full `RetryPolicy`, `start_to_close`, and the total
+//! `schedule_to_close` deadline. It read them from the MUTABLE in-memory registry.
+//! A crash, a reopen or a re-registration *between* attempts could then change
+//! them. A task scheduled under spec A retried under a DIFFERENT spec B, and its
+//! policy or deadline changed silently mid-flight. The Postgres engine FREEZES these
+//! scalars onto the task row at schedule or claim time. So an in-flight activity's
+//! contract is immutable.
 //!
-//! This backend now resolves the four fields ONCE — at schedule time when the
-//! activity is already registered, else at first claim for a late-registered
-//! activity — and FREEZES them on the durable `harvest_tasks` row
-//! (`defaults_frozen = 1`, plus the new absolute `schedule_to_close_at` column).
-//! Later claims read the frozen values verbatim and NEVER re-consult the registry
-//! for them (the activity BODY still always comes from the registry).
+//! This backend now resolves the four fields ONCE. That happens at schedule time
+//! for a registered activity, else at first claim for a late-registered one. It
+//! FREEZES them on the durable `harvest_tasks` row: `defaults_frozen = 1`, plus the
+//! absolute `schedule_to_close_at` column. Later claims read the frozen values
+//! verbatim and NEVER re-consult the registry for them. The activity BODY still
+//! comes from the registry.
 //!
-//! No Docker: `SQLite` is embedded (`rusqlite` `bundled`); retry backoff and the
-//! total-deadline clock are driven by the injected `*_as_of` clock, and the
-//! start-to-close budget by a real (short) `std::thread::sleep`, so nothing waits
-//! on wall time.
+//! No Docker: `SQLite` is embedded (`rusqlite` `bundled`). The injected `*_as_of`
+//! clock drives retry back-off and the total deadline. A short real
+//! `std::thread::sleep` drives the start-to-close budget. So nothing waits on wall
+//! time.
 
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
@@ -92,11 +92,10 @@ fn column_exists(raw: &rusqlite::Connection, table: &str, column: &str) -> bool 
 
 // ── HEADLINE: a frozen retry cap/policy survives a re-registration mid-retry ─────
 //
-// The activity is dispatched via the RAW path (`execute_activity_raw`) against an
-// INFO-registered activity, so pre-fix the defaults (max_attempts + the whole
-// retry policy) fell back to the registry AT CLAIM TIME — and a re-registration
-// under a different spec between attempts changed them. Post-fix they are frozen
-// onto the row at schedule time and are immutable for the rest of the run.
+// The RAW path (`execute_activity_raw`) dispatches an INFO-registered activity. The
+// defaults (max_attempts and the whole retry policy) once came from the registry AT
+// CLAIM TIME. A re-registration between attempts then changed them. Now they freeze
+// onto the row at schedule time and stay fixed for the rest of the run.
 
 #[activity(retry = RetryPolicy::fixed(3, Duration::from_secs(60)))]
 async fn flaky(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
@@ -125,10 +124,10 @@ fn failing_body(
     }
 }
 
-// RED pre-fix: the raw path re-read the registry at claim time, so re-registering
-// "flaky" with `max_attempts = 1` (no policy) between attempts 1 and 2 CUT the
-// in-flight run's cap to 1 — it went terminal at attempt 2 (2 body calls) instead
-// of honoring the ORIGINAL max_attempts = 3 (3 body calls, terminal at attempt 3).
+// Regression: the raw path re-read the registry at claim time. Re-registering
+// "flaky" with `max_attempts = 1` between attempts 1 and 2 CUT the in-flight cap. It
+// went terminal at attempt 2 (2 body calls). The ORIGINAL max_attempts = 3 means 3
+// body calls, terminal at attempt 3.
 #[tokio::test]
 async fn frozen_retry_policy_survives_re_registration() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -194,11 +193,10 @@ async fn frozen_retry_policy_survives_re_registration() {
 
 // ── A frozen schedule_to_close deadline survives a re-registration ───────────────
 //
-// The total (cross-retry) deadline was resolved from the registry at CLAIM time,
-// so re-registering the activity with a LONGER (or no) schedule_to_close between
-// attempts let the in-flight run outlive its original deadline. Post-fix the
-// absolute deadline is frozen on the row and governs regardless of later
-// re-registration.
+// The total (cross-retry) deadline once came from the registry at CLAIM time. A
+// re-registration with a LONGER or no schedule_to_close between attempts let the run
+// outlive its original deadline. Now the absolute deadline is frozen on the row. A
+// later re-registration does not change it.
 
 #[activity]
 async fn stc_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
@@ -225,10 +223,9 @@ fn stc_info_with_deadline(deadline: Duration) -> ActivityInfo {
     info
 }
 
-// RED pre-fix: the schedule_to_close deadline was re-resolved from the registry at
-// claim time, so re-registering `stc_act` with a 1h deadline between attempts let
-// the run keep backing off past its ORIGINAL 5m deadline (never timing out). With
-// the frozen absolute deadline the run times out at the original 5m mark.
+// Regression: the schedule_to_close deadline was re-resolved at claim time. A
+// re-registration of `stc_act` with a 1h deadline let the run back off past its
+// ORIGINAL 5m deadline. With the frozen deadline, it times out at the 5m mark.
 #[tokio::test]
 async fn frozen_schedule_to_close_deadline_survives_re_registration() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -245,8 +242,8 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
     let t0 = fixed_now();
     let exec = rt.start_workflow("stc_wf", json!(1)).unwrap();
 
-    // Attempt 1 (t0) fails; the next attempt is armed 4m out (t0+240s), still under
-    // the frozen 5m deadline, so it backs off rather than timing out.
+    // Attempt 1 (t0) fails. The next attempt arms 4m out (t0+240s), still under the
+    // frozen 5m deadline, so it backs off and does not time out.
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(
         matches!(state, RunState::WaitingTimer),
@@ -260,9 +257,9 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
         failing_body(&calls),
     );
 
-    // Drive at t0+4m: attempt 2 fails; its next attempt would land at t0+8m, which
-    // is PAST the FROZEN 5m deadline → sealed ActivityTimedOut { ScheduleToClose }.
-    // Under the bug the re-registered 1h deadline would requeue it instead.
+    // Drive at t0+4m: attempt 2 fails. Its next attempt would land at t0+8m, PAST the
+    // FROZEN 5m deadline. So it seals ActivityTimedOut { ScheduleToClose }. The bug
+    // would requeue it under the re-registered 1h deadline.
     let done = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(240))
         .await
@@ -282,10 +279,9 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
 
 // ── A frozen start_to_close budget survives a re-registration ────────────────────
 //
-// The per-attempt start-to-close budget fell back to the registry on the RAW path
-// at claim time, so re-registering with a generous budget between attempts let a
-// later, slow attempt escape its original tight budget. Post-fix the budget is
-// frozen on the row.
+// On the RAW path, the start-to-close budget once came from the registry at claim
+// time. A re-registration with a generous budget between attempts let a later, slow
+// attempt escape its original budget. Now the budget is frozen on the row.
 
 #[activity]
 async fn stc2_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
@@ -329,10 +325,9 @@ fn stc2_body(
     }
 }
 
-// RED pre-fix: the raw path re-read start_to_close from the registry at claim time,
-// so re-registering `stc2_act` with a 1h budget between attempts let the slow (40ms)
-// attempt 2 complete instead of timing out at the ORIGINAL 1ms budget. With the
-// frozen budget attempt 2 records ActivityTimedOut { StartToClose }.
+// Regression: the raw path re-read start_to_close at claim time. A re-registration
+// of `stc2_act` with a 1h budget let the slow (40ms) attempt 2 complete. With the
+// frozen 1ms budget, attempt 2 records ActivityTimedOut { StartToClose }.
 #[tokio::test]
 async fn frozen_start_to_close_survives_re_registration() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -354,8 +349,8 @@ async fn frozen_start_to_close_survives_re_registration() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "attempt 1 ran once");
 
-    // Re-register with a GENEROUS 1h budget. Pre-fix this would let the slow attempt
-    // 2 complete instead of timing out at the original 1ms budget.
+    // Re-register with a GENEROUS 1h budget. With the bug, the slow attempt 2 would
+    // complete.
     rt.register_activity_with_body(&stc2_info(Duration::from_secs(3600)), stc2_body(&calls));
 
     // Drive past the backoff: attempt 2 sleeps 40ms — over the FROZEN 1ms budget →
@@ -385,10 +380,9 @@ async fn frozen_start_to_close_survives_re_registration() {
 
 // ── An old-schema DB reopens and is migrated additively ──────────────────────────
 //
-// Guards the additive migration: a database file created before this change (whose
-// `harvest_tasks` lacks `schedule_to_close_at`/`defaults_frozen`) must reopen
-// cleanly (the columns are added, never dropped/renamed) and drive a fresh workflow
-// to completion.
+// Guards the additive migration. An older database file has a `harvest_tasks` with
+// no `schedule_to_close_at`/`defaults_frozen`. It must reopen cleanly and drive a
+// fresh workflow to completion. The columns are added, never dropped or renamed.
 
 // The pre-#1068 `harvest_tasks` DDL — the 14 columns that existed before the two
 // freeze columns were added.
@@ -424,18 +418,17 @@ async fn plain_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(out + 1)
 }
 
-// RED (after the schema/INSERT change but before the migration is wired): a fresh
-// `SqliteRuntime::open` on the old-schema file must ADD the two missing columns.
-// Without the migration the columns are absent and any fresh enqueue (which now
-// lists them) fails with "no such column".
+// A fresh `SqliteRuntime::open` on the old-schema file must ADD the two missing
+// columns. Without the migration, a fresh enqueue lists the absent columns and fails
+// with "no such column".
 #[tokio::test]
 async fn old_schema_db_reopens_and_migrates() {
     let (_dir, path) = temp_db();
 
     // Create the file with the OLD `harvest_tasks` shape (no freeze columns). The
-    // other tables are absent — `SqliteRuntime::open`'s `CREATE TABLE IF NOT EXISTS`
-    // creates them, and leaves the pre-existing `harvest_tasks` untouched (so it
-    // keeps the old shape until the additive migration runs).
+    // other tables are absent. `CREATE TABLE IF NOT EXISTS` in `SqliteRuntime::open`
+    // creates them. It leaves `harvest_tasks` in its old shape until the additive
+    // migration runs.
     {
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
@@ -479,8 +472,8 @@ async fn old_schema_db_reopens_and_migrates() {
 // ── Regression guard: the stable (never-re-registered) path is unchanged ─────────
 //
 // Freezing must not alter the common case. A single, stable registration resolves
-// the same values it did before (backoff timing, deadline, attempt cap), and the
-// task row is frozen with the expected absolute deadline.
+// the same back-off timing, deadline and attempt cap as before. The task row is
+// frozen with the expected absolute deadline.
 
 fn frozen_columns(path: &std::path::Path, exec: ExecutionId) -> (Option<i64>, i64) {
     let raw = rusqlite::Connection::open(path).unwrap();
@@ -542,8 +535,7 @@ async fn stable_registration_unchanged() {
         "the total deadline is frozen as scheduled_at + schedule_to_close"
     );
 
-    // Past the backoff the retry runs and the run completes normally (identical to
-    // pre-freeze behavior).
+    // Past the back-off the retry runs and the run completes normally.
     let done = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
         .await
@@ -557,20 +549,20 @@ async fn stable_registration_unchanged() {
 
 // ── CLAIM-time (first-claim) freeze: the frozen cap governs across re-registration ─
 //
-// Every test above registers the activity BEFORE `start_workflow`, exercising ONLY
-// the SCHEDULE-time freeze branch in `apply_schedule_activity`. This test drives the
-// CLAIM-time freeze branch in `worker::drain_ready`: the activity is scheduled
-// BEFORE it is registered, so the task row is enqueued UNFROZEN (`defaults_frozen =
-// 0`) and is frozen only at the FIRST claim, once the activity is registered. A
-// later re-registration under a hostile cap must NOT change the already-frozen cap.
+// Every test above registers the activity BEFORE `start_workflow`. They exercise
+// ONLY the SCHEDULE-time freeze branch in `apply_schedule_activity`. This test drives
+// the CLAIM-time freeze branch in `worker::drain_ready`. The activity is scheduled
+// BEFORE it is registered, so the task row is enqueued UNFROZEN
+// (`defaults_frozen = 0`). The FIRST claim after registration freezes it. A later
+// re-registration under a hostile cap must NOT change the frozen cap.
 
 #[activity(retry = RetryPolicy::fixed(3, Duration::from_secs(60)))]
 async fn late_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
-// Raw dispatch BY NAME — the ScheduleActivity command carries NO retry_policy_override,
-// so the frozen cap comes from the registered spec at first claim, not the command.
+// Raw dispatch BY NAME. The ScheduleActivity command has NO retry_policy_override,
+// so the frozen cap comes from the registered spec at first claim.
 #[workflow]
 async fn late_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let out = ctx
@@ -592,11 +584,10 @@ fn defaults_frozen_flag(path: &std::path::Path, exec: ExecutionId) -> i64 {
     .unwrap()
 }
 
-// RED without the claim-time freeze: the row stays UNFROZEN and re-resolves
-// `max_attempts` from the CURRENT registry at every claim, so re-registering
-// "late_act" with `max_attempts = 1` between attempts 1 and 2 caps the in-flight run
-// at attempt 2 (2 body calls) instead of honoring spec A's frozen `max_attempts = 3`
-// (3 body calls, terminal at attempt 3).
+// Without the claim-time freeze, the row stays UNFROZEN. Each claim re-resolves
+// `max_attempts` from the CURRENT registry. A re-registration of "late_act" with
+// `max_attempts = 1` between attempts 1 and 2 then caps the run at attempt 2 (2 body
+// calls). Spec A's frozen `max_attempts = 3` means 3 body calls.
 #[tokio::test]
 async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
     let (_dir, path) = temp_db();
@@ -609,9 +600,8 @@ async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
     let exec = rt.start_workflow("late_wf", json!(9)).unwrap();
 
     // (b) Drive with `late_act` UNREGISTERED. The workflow emits ScheduleActivity, so
-    // the PENDING task row is persisted UNFROZEN; `drain_ready` then claims it, finds
-    // no registered body, releases it back to PENDING, and surfaces the unregistered
-    // error out of the drive loop.
+    // the PENDING task row is persisted UNFROZEN. `drain_ready` claims it and finds no
+    // body. It releases the task back to PENDING and surfaces the unregistered error.
     let err = rt.run_until_blocked_as_of(exec, t0).await.unwrap_err();
     assert!(
         matches!(err, SqliteError::UnregisteredActivity(ref n) if n == "late_act"),
@@ -671,11 +661,10 @@ async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
         "the run fails terminally after exhausting the FROZEN 3 attempts; got {done:?}"
     );
 
-    // The falsifiable discriminators — the genuine proof this exercised the CLAIM-time
-    // freeze of spec A rather than a re-resolution against the hostile spec B: 3 body
-    // calls and a terminal ActivityFailed at attempt 3. WITHOUT the claim-time freeze
-    // the still-unfrozen row would re-resolve `max_attempts` from the re-registered
-    // spec B (= 1) at its next claim and go terminal at attempt 2 (only 2 calls).
+    // The falsifiable discriminators: 3 body calls and a terminal ActivityFailed at
+    // attempt 3. They prove the CLAIM-time freeze of spec A, not a re-resolution
+    // against spec B. WITHOUT the freeze, the row re-resolves `max_attempts` from
+    // spec B (= 1) at its next claim. It goes terminal at attempt 2 (only 2 calls).
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,

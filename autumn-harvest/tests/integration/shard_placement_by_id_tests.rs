@@ -3,31 +3,30 @@
 //! external signal/cancel.
 //!
 //! Issue #751 resolves a `(workflow_name, workflow_id)` target's owning shard
-//! by *re-deriving* `ShardRouter::pick_for_new_workflow` — a prediction of
-//! where a **new** workflow would be placed, not an observation of where an
+//! by *re-deriving* `ShardRouter::pick_for_new_workflow`. That is a prediction
+//! of where a **new** workflow would go, not an observation of where an
 //! **existing** one lives. The two diverge in exactly two ways:
 //!
 //! 1. **Explicit shard placement (issue #697).** A workflow started under
 //!    `ShardPlacement::Shard`/`ResidencyKey` is pinned to a shard the pure
 //!    hash may never compute.
 //! 2. **Writable-set drift.** `pick_writable` re-hashes over the *current*
-//!    `writable_shards` when the readable-set hash lands outside it, so
+//!    `writable_shards` when the readable-set hash lands outside it. So
 //!    draining a shard can move where the same business key resolves *after*
 //!    a workflow was already placed there.
 //!
 //! In both cases a `workflow_id`-addressed signal/cancel resolved to the wrong
-//! shard, found nothing, and reported `target_unknown` while the target was
-//! running. These tests fix the resolution rule: fan out across every expected
-//! shard, merge with the canonical `execution::select_resolved_run` ranking,
-//! and treat a shard that could not be inspected as *indeterminate* rather
-//! than as "not there".
+//! shard, found nothing, and reported `target_unknown` while the target was running.
+//! These tests fix the resolution rule. Fan out across every expected shard.
+//! Merge with the canonical `execution::select_resolved_run` ranking. Treat a
+//! shard that could not be inspected as *indeterminate*, not as "not there".
 //!
 //! Every test in this file uses **two genuinely separate Postgres databases**,
-//! one per logical shard — a single physical database mocked as two shards
+//! one per logical shard. A single physical database mocked as two shards
 //! cannot distinguish "found by fanning out" from "found because both shards
-//! are the same table". The pure merge/expected-shard rules are unit-tested in
-//! `external_target_location`'s own `#[cfg(test)]` module and deliberately not
-//! duplicated here.
+//! are the same table". `external_target_location`'s own `#[cfg(test)]` module
+//! unit-tests the pure merge/expected-shard rules, so this file does not
+//! duplicate them.
 
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
@@ -188,20 +187,23 @@ impl TwoShards {
 /// Restores the process-global router/pool to the single-shard default on drop.
 ///
 /// `install_global_router` and `ShardedDbPool::from_map` both write process
-/// globals shared by every test file in the one `integration` binary, and this
+/// globals shared by every test file in the one `integration` binary. This
 /// file installs a two-shard topology backed by databases it then drops. A
-/// sibling file that assumes the single-shard default — `cross_type_continue_as_new_tests`
-/// is one — would otherwise inherit a two-shard router pointing at dead pools.
-/// `workflow_id_targeted_tests::build_e2e_worker` defends itself by
-/// re-installing on entry; this restores on exit so neither side has to.
+/// sibling file that assumes the single-shard default, such as
+/// `cross_type_continue_as_new_tests`, would otherwise inherit a two-shard
+/// router pointing at dead pools. `workflow_id_targeted_tests::build_e2e_worker`
+/// defends itself by re-installing on entry. This guard restores on exit, so
+/// neither side has to.
 struct GlobalTopologyGuard {
     restore_pool: DbPool,
 }
 
 impl GlobalTopologyGuard {
-    /// `restore_pool` becomes the single shard's pool once the guard drops; it
-    /// must outlive the databases this test created, so pass a pool the caller
-    /// keeps alive (any live pool will do — nothing reads it after the test).
+    /// `restore_pool` becomes the single shard's pool once the guard drops.
+    ///
+    /// It must outlive the databases this test created. So pass a pool the
+    /// caller keeps alive. Any live pool will do, since nothing reads it after
+    /// the test.
     const fn new(restore_pool: DbPool) -> Self {
         Self { restore_pool }
     }
@@ -384,9 +386,10 @@ async fn history_event_types(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
         .collect()
 }
 
-/// A business key whose rendezvous hash under `router` lands on `away_from`,
-/// so pinning its execution anywhere else is a genuine hash-vs-placement
-/// divergence rather than a coincidence.
+/// A business key whose rendezvous hash under `router` lands on `to`.
+///
+/// Pinning its execution anywhere else is then a genuine
+/// hash-vs-placement divergence, not a coincidence.
 fn key_hashing_to(router: &ShardRouter, workflow_name: &str, prefix: &str, to: ShardId) -> String {
     (0..10_000)
         .map(|n| format!("{prefix}-{n}"))
@@ -624,8 +627,8 @@ async fn outbox_signal_by_id_reaches_a_target_pinned_off_its_hash_shard() {
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
     let sharded = shards.sharded_pool();
 
-    // Caller on shard 0. Target key hashes to shard 0 too — but the target is
-    // pinned on shard 1, so pre-#1146 the outbox looked only at shard 0, found
+    // Caller on shard 0. The target key hashes to shard 0 too, but the target
+    // is pinned on shard 1. Pre-#1146, the outbox looked only at shard 0, found
     // nothing, and failed the signal `target_unknown` once the grace window
     // expired.
     let workflow_id = key_hashing_to(&router, "pinned_target_wf", "e2e-sig", ShardId::new(0));
@@ -790,10 +793,10 @@ async fn outbox_never_reports_target_unknown_while_a_shard_cannot_be_inspected()
     // could be there, so the sweep must leave the request pending.
     let degraded = shards.sharded_pool_without(ShardId::new(1));
 
-    // Pin the key to the caller's own (poolful) shard. Without this the test
-    // could pass against the UNFIXED engine: a key hashing to shard 1 would hit
-    // the pre-#1146 "target shard has no pool -> leave pending" branch and
-    // record no failure either, for entirely the wrong reason.
+    // Pin the key to the caller's own (poolful) shard. Without this, the test
+    // could pass against the UNFIXED engine. A key hashing to shard 1 would hit
+    // the pre-#1146 "target shard has no pool -> leave pending" branch. It
+    // would record no failure either, for entirely the wrong reason.
     let workflow_id = key_hashing_to(
         &router,
         "unreachable_target_wf",
@@ -815,9 +818,9 @@ async fn outbox_never_reports_target_unknown_while_a_shard_cannot_be_inspected()
     autumn_harvest::timeout::enforce_external_signals_outbox(
         &mut caller_conn,
         &metrics,
-        // Grace window fully expired — the ONLY thing standing between this
-        // request and a permanent `target_unknown` is the fan-out refusing to
-        // conclude "not found" from an incomplete inspection.
+        // Grace window fully expired. The ONLY thing between this request and
+        // a permanent `target_unknown` is the fan-out refusing to conclude
+        // "not found" from an incomplete inspection.
         Duration::from_millis(0),
         &Some(degraded),
         &[ShardId::new(0)],
@@ -968,11 +971,12 @@ async fn outbox_still_reports_target_unknown_when_every_shard_answered() {
 // ─────────────────────────────────────────────────────────────────────────
 //
 // Issue #751 gives signal and cancel deliberately OPPOSITE semantics for a
-// target whose current run is already terminal: a signal's goal can never be
-// met by a dead target (genuine `not_running` failure), while a cancel's goal
-// — "nothing running under this key" — already is (no-op success). Both now
-// arrive through `DeliveryRoute::CrossShard` and a remote connection, which is
-// new code, so both are pinned here rather than assumed from the #751 suite.
+// target whose current run is already terminal. A dead target can never meet
+// a signal's goal, so that is a genuine `not_running` failure. A cancel's
+// goal, "nothing running under this key", is already met, so that is a no-op
+// success. Both now arrive through `DeliveryRoute::CrossShard` and a remote
+// connection, which is new code. So both are pinned here, not assumed from
+// the #751 suite.
 
 /// Seed a terminal-only run of `(name, id)` on shard 1 and a caller on shard 0.
 async fn seed_terminal_target_on_shard_one(
@@ -1236,9 +1240,9 @@ async fn outbox_signal_by_id_prefers_the_live_run_over_a_stale_terminal_on_the_c
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // The end-to-end form of the "no first-hit short circuit" rule: a fan-out
-    // that stopped at the caller's own shard would find the dead run and fail
-    // the signal `not_running` while the live target waits on shard 1.
+    // The end-to-end form of the "no first-hit short circuit" rule. A fan-out
+    // that stopped at the caller's own shard would find the dead run. It would
+    // fail the signal `not_running` while the live target waits on shard 1.
     let workflow_id = key_hashing_to(&router, "two_run_wf", "tworun", ShardId::new(0));
     let stale = ExecutionId::new_for_shard(ShardId::new(0));
     let mut conn0 = shards.conn(ShardId::new(0)).await;
@@ -1301,11 +1305,11 @@ async fn outbox_by_id_delivery_completes_when_each_shard_pool_holds_one_connecti
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // The production shape the other tests cannot model: the sweep's own
+    // The production shape the other tests cannot model. The sweep's own
     // connection is checked out of the caller shard's pool, which has exactly
     // one connection. A fan-out that re-acquired from that pool would park
-    // forever (`pool.get()` is unbounded — no deadpool `Timeouts` are
-    // configured), taking the whole timeout checker with it.
+    // forever, taking the whole timeout checker with it. `pool.get()` is
+    // unbounded, because no deadpool `Timeouts` are configured.
     let one_conn_pools: BTreeMap<ShardId, DbPool> = shards
         .urls
         .iter()
@@ -1372,11 +1376,11 @@ async fn outbox_by_id_delivery_completes_when_each_shard_pool_holds_one_connecti
 // ─────────────────────────────────────────────────────────────────────────
 //
 // Every test above drives the outbox scanners directly. This one drives the
-// production path — `worker::persist_external_signal_inline`, gated by
-// `external_target_location::inline_delivery_allowed` — because that gate is
-// the only part of #1146 that runs inside a workflow's OWN decision
-// transaction, where a wrong answer is written to the append-only history
-// immediately and irreversibly.
+// production path: `worker::persist_external_signal_inline`, gated by
+// `external_target_location::inline_delivery_allowed`. That gate is the only
+// part of #1146 that runs inside a workflow's OWN decision transaction. There
+// a wrong answer goes to the append-only history immediately and
+// irreversibly.
 
 fn e2e_wf_info(
     name: &'static str,
@@ -1521,11 +1525,11 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
     let sharded = shards.sharded_pool();
 
     // The business key hashes to the CALLER's shard, and a dead run of it sits
-    // there — the exact state in which the pre-#1146 gate allowed inline
-    // delivery and recorded a permanent `not_running` against a live target.
-    // Chosen — not assumed — to hash to the CALLER's shard. If it hashed
-    // elsewhere the pre-#1146 gate would have deferred to the outbox for an
-    // unrelated reason and this test would pass against the unfixed engine.
+    // there. In exactly that state the pre-#1146 gate allowed inline delivery
+    // and recorded a permanent `not_running` against a live target. The key is
+    // chosen, not assumed, to hash to the CALLER's shard. If it hashed
+    // elsewhere, the pre-#1146 gate would have deferred to the outbox for an
+    // unrelated reason. This test would then pass against the unfixed engine.
     // `StartWorkflowParams` takes `&'static str`, hence the leak; the test
     // process is about to exit.
     let target_id: &'static str = Box::leak(
@@ -1604,9 +1608,9 @@ async fn worker_by_id_signal_is_not_delivered_inline_against_a_stale_terminal_on
          shard and finding only the dead run — the bug #1146 closes"
     );
     // Wait for the live run to settle rather than sampling it. The earlier
-    // assertion — "queued, or consumed and completed" — had a real window
-    // between the two: the signal consumed and the run still RUNNING mid-decision
-    // counted as neither, and it flaked there. The target workflow completes on
+    // assertion, "queued, or consumed and completed", had a real window between
+    // the two. A consumed signal with the run still RUNNING mid-decision counted
+    // as neither, and the test flaked there. The target workflow completes on
     // receiving the signal, so its terminal state is the unambiguous evidence.
     let target_state = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -1636,16 +1640,16 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_query_never_answers() {
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // `FANOUT_ACQUIRE_BOUND` bounds the CHECKOUT; `FANOUT_PEER_BOUND` bounds the
-    // whole probe, and exists for a hazard the checkout bound cannot see: a peer
+    // `FANOUT_ACQUIRE_BOUND` bounds the CHECKOUT. `FANOUT_PEER_BOUND` bounds the
+    // whole probe. It exists for a hazard the checkout bound cannot see: a peer
     // that hands over a connection and then never answers on it. Its doc names
-    // an `ACCESS EXCLUSIVE` DDL lock as the everyday cause, which is exactly
-    // what this builds — the peer pool has a FREE connection, so acquisition
+    // an `ACCESS EXCLUSIVE` DDL lock as the everyday cause, and this test builds
+    // exactly that. The peer pool has a FREE connection, so acquisition
     // succeeds immediately and only the query stalls.
     //
-    // Without the outer bound this test hangs forever rather than failing, so
-    // the sweep is wrapped in a timeout of its own: a regression must surface as
-    // a red test, never as a wedged CI job.
+    // Without the outer bound this test hangs forever rather than failing. So
+    // the sweep has a timeout of its own: a regression must surface as a red
+    // test, never as a wedged CI job.
     let sharded = ShardedDbPool::from_map(shards.pools.clone(), ShardId::new(0));
 
     let workflow_id = key_hashing_to(&router, "stalled_peer_wf", "stalled", ShardId::new(0));
@@ -1716,7 +1720,7 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_query_never_answers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 7. Codex round 1 regressions
+// 7. Regression: the fan-out never waits on a busy peer shard
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1727,13 +1731,13 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 1 P1: `Worker` spawns one timeout checker per assigned shard,
-    // and each holds its own shard pool's connection for the whole
-    // `enforce_timeouts_once` pass. With one connection per pool, checker 0
-    // waiting on pool 1 while checker 1 waits on pool 0 is a circular wait.
-    // Bounding it at `SHARD_ACQUIRE_BOUND` (5s) made it survivable but still
-    // cost both scanners that stall on every tick; `FANOUT_ACQUIRE_BOUND` makes
-    // the fan-out decline to wait at all, so the cycle cannot form.
+    // `Worker` spawns one timeout checker per assigned shard. Each holds its own
+    // shard pool's connection for the whole `enforce_timeouts_once` pass. With
+    // one connection per pool, checker 0 waiting on pool 1 while checker 1
+    // waits on pool 0 is a circular wait. A bound at `SHARD_ACQUIRE_BOUND` (5s)
+    // made it survivable, but both scanners still stalled on every tick.
+    // `FANOUT_ACQUIRE_BOUND` makes the fan-out decline to wait at all, so the
+    // cycle cannot form.
     //
     // Modelled here by holding shard 1's only connection for the whole sweep —
     // standing in for the peer checker that would be holding it.
@@ -1806,7 +1810,7 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 8. Codex round 2 regressions
+// 8. Regressions: a by-id cancel over a partial view
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1821,8 +1825,8 @@ async fn outbox_cancel_by_id_withholds_its_terminal_while_a_shard_is_uninspected
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 2 P1. `ExternalCancelDelivered` asserts something about the
-    // whole business key — "nothing is running under it". Uniqueness is
+    // `ExternalCancelDelivered` asserts something about the whole business
+    // key: "nothing is running under it". Uniqueness is
     // shard-local, so a shard that could not be inspected may hold another live
     // run this cancellation never touched. Recording success over a partial view
     // durably closes the request and the outbox never looks again.
@@ -1992,7 +1996,7 @@ async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 9. Codex round 3 regression: two live runs of one key
+// 9. Regression: two live runs of one key
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2003,14 +2007,14 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 3 P1. `(workflow_name, workflow_id)` uniqueness is shard-local,
-    // so pinning a key to one shard (#697) while an unpinned start of the same
-    // key hashes to another produces TWO live runs that no single shard's unique
-    // index can see. A complete fan-out sees both; the ranking picks the most
+    // `(workflow_name, workflow_id)` uniqueness is shard-local. Suppose a key is
+    // pinned to one shard (#697) while an unpinned start of the same key hashes
+    // to another. That produces TWO live runs that no single shard's unique
+    // index can see. A complete fan-out sees both. The ranking picks the most
     // recently started as the current run. Cancelling only that one and
-    // recording `ExternalCancelDelivered` would leave the older run live — and
-    // the instant the newer is cancelled, that older one IS the current run for
-    // the key.
+    // recording `ExternalCancelDelivered` would leave the older run live. The
+    // instant the newer is cancelled, that older one IS the current run for the
+    // key.
     let workflow_id = key_hashing_to(&router, "twin_live_wf", "twin", ShardId::new(0));
     let older = ExecutionId::new_for_shard(ShardId::new(0));
     let mut conn0 = shards.conn(ShardId::new(0)).await;
@@ -2121,7 +2125,7 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 10. Codex round 5 regression: colocated shard aliases
+// 10. Regression: colocated shard aliases
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2132,18 +2136,17 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 5 P1. Several logical shard ids backed by clones of ONE
-    // physical pool is a supported topology — it is what a pre-split staging
-    // deployment looks like, and what `ShardedDbPool::from_map` produces when
-    // the same `DbPool` is inserted under more than one id (the shape
-    // `workflow_id_targeted_tests` already uses).
+    // Several logical shard ids backed by clones of ONE physical pool is a
+    // supported topology. A pre-split staging deployment looks like that.
+    // `ShardedDbPool::from_map` produces it when the same `DbPool` is inserted
+    // under more than one id (the shape `workflow_id_targeted_tests` already
+    // uses).
     //
-    // With one connection, the caller holds it as shard 0 and the fan-out then
-    // tried to acquire "shard 1" — which is the same pool. That acquisition
-    // cannot succeed until the sweep returns, so the alias was reported
-    // uninspected on every sweep, the answer was never authoritative, and a
-    // by-id cancel cancelled the live run and then withheld its terminal
-    // forever.
+    // With one connection, the caller holds it as shard 0. The fan-out then
+    // tried to acquire "shard 1", which is the same pool. That acquisition
+    // cannot succeed until the sweep returns. So every sweep reported the
+    // alias uninspected, and the answer was never authoritative. A by-id
+    // cancel cancelled the live run and then withheld its terminal forever.
     let one_conn = build_pool_with_max_size(&shards.urls[&ShardId::new(0)], 1);
     let mut aliased: BTreeMap<ShardId, DbPool> = BTreeMap::new();
     aliased.insert(ShardId::new(0), one_conn.clone());
@@ -2233,17 +2236,17 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 6, on the round-5 fix. The fan-out visits shards in ASCENDING
-    // order, and round 5 seeded the already-probed set inside the "this is the
-    // held shard" branch — too late whenever an alias sorts before the held
-    // shard. A checker holding shard 1 of an aliased {0, 1} pair therefore tried
-    // to acquire "shard 0", which is the pool it is itself holding, timed out,
-    // and marked it uninspected on every sweep — reinstating exactly the
-    // permanent withholding round 5 set out to fix.
+    // The fan-out visits shards in ASCENDING order. The first alias fix seeded
+    // the already-probed set inside the "this is the held shard" branch. That is
+    // too late whenever an alias sorts before the held shard. A checker holding
+    // shard 1 of an aliased {0, 1} pair therefore tried to acquire "shard 0".
+    // That is the pool it is itself holding. It timed out and marked the shard
+    // uninspected on every sweep. That brought back exactly the permanent
+    // withholding that the alias fix set out to remove.
     //
-    // The round-5 test pinned the caller to shard 0, the one ordering where
-    // seeding late still works, so it could not see this. This is that test with
-    // the caller on the OTHER side of the ordering.
+    // The test above pins the caller to shard 0, the one ordering where late
+    // seeding still works, so it could not see this. This is that test with the
+    // caller on the OTHER side of the ordering.
     let one_conn = build_pool_with_max_size(&shards.urls[&ShardId::new(0)], 1);
     let mut aliased: BTreeMap<ShardId, DbPool> = BTreeMap::new();
     aliased.insert(ShardId::new(0), one_conn.clone());

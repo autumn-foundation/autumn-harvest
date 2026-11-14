@@ -226,7 +226,7 @@ fn first_matching_gate_is_returned() {
 
 #[test]
 fn or_semantics_any_matching_gate_blocks() {
-    // gate1 is scoped to queue-A (won't match queue-B), gate2 is fleet
+    // gate1 is scoped to queue-A (will not match queue-B), gate2 is fleet
     let gates = [
         make_gate(GateScope::Queue("queue-A".to_string()), "queue A down"),
         make_gate(GateScope::Fleet, "full incident"),
@@ -328,7 +328,7 @@ fn gate_id_display_matches_inner_uuid() {
 #[test]
 fn max_active_gates_constant_is_documented() {
     // Confirm the constant exists and has a reasonable bound. Read through a
-    // runtime variable so clippy::assertions_on_constants doesn't fire.
+    // runtime variable so clippy::assertions_on_constants does not fire.
     let cap = autumn_harvest::admission_gate::MAX_ACTIVE_GATES;
     assert!(
         cap >= 10,
