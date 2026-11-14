@@ -221,6 +221,7 @@ impl CriticalPathAnalyzer {
                 for &up_idx in &task.upstreams {
                     is_sink[up_idx] = false;
                     if distances[up_idx] >= max_upstream_dist {
+                        // On a tie, the first predecessor found stays the best one.
                         if distances[up_idx] > max_upstream_dist || best_pred.is_none() {
                             max_upstream_dist = distances[up_idx];
                             best_pred = Some(up_idx);

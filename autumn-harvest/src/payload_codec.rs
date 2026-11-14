@@ -1094,8 +1094,8 @@ impl PayloadCodecs {
     ///
     /// Therefore: **deploy the version-2-capable binary to every reader in
     /// the fleet first, and only then activate a keyed codec.** While the
-    /// legacy key is active, no `kid` is written and envelopes stay version
-    /// 1. So the upgrade itself is safe to roll out in any order. Only the
+    /// legacy key is active, no `kid` is written and envelopes stay at
+    /// version 1. So the upgrade itself is safe to roll out in any order. Only the
     /// *activation* must come last. This crate cannot enforce the
     /// ordering: it has no fleet-wide view of which binaries are running.
     ///

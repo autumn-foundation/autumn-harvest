@@ -4349,9 +4349,10 @@ impl OldestPendingIndeterminateAge {
     }
 }
 
-/// Background outbox scanner that polls pending external signal requests. It
-/// attempts same-shard and cross-shard delivery via `GLOBAL_SHARDED_POOL`. It
-/// fails with `"target_unknown"` after `unknown_target_grace_window` has
+/// Background outbox scanner for pending external signal requests.
+///
+/// It attempts same-shard and cross-shard delivery via `GLOBAL_SHARDED_POOL`.
+/// It fails with `"target_unknown"` after `unknown_target_grace_window` has
 /// elapsed, and wakes up the caller workflow.
 ///
 /// # Errors
