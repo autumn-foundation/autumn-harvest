@@ -97,7 +97,8 @@ async fn subscription_renewal(
     // the execution id. Playbook step 4 in the migration guide needs a key
     // the caller supplies before routing the request to either engine.
     // `subscription_id` is that key. It names the same subscription on both
-    // sides of a dual-run cutover, whatever internal id the request carries.
+    // sides of a dual-run cutover, whatever engine-internal id the request
+    // carries.
     let idempotency_key = format!("{}-cycle-{}", state.subscription_id, state.cycles);
     let _: () = ctx
         .execute_activity(

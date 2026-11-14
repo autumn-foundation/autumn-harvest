@@ -878,10 +878,11 @@ pub struct SubscriptionState {
     pub cycles: u32,
 }
 
-/// A downstream idempotency key, plus the cycle number it applies to. See
-/// playbook step 4 in the migration guide: every side-effecting activity
-/// call needs its own caller-supplied key, derived from state already in
-/// history, so a retried attempt cannot charge the card twice.
+/// A downstream idempotency key, plus the cycle number it applies to.
+///
+/// Playbook step 4 in the migration guide: every side-effecting activity call
+/// needs its own caller-supplied key, derived from state already in history.
+/// So a retried attempt cannot charge the card twice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChargeRequest {
     pub idempotency_key: String,
@@ -924,9 +925,9 @@ async fn subscription_renewal(
     // Derive the key from `subscription_id`, not from `ctx.workflow_id()` or
     // the execution id. Playbook step 4 in the migration guide needs a key
     // the caller supplies before routing the request to either engine.
-    // `subscription_id` is that key: it names the same subscription on both
-    // sides of a dual-run cutover, no matter which engine's own internal id
-    // the request happens to carry.
+    // `subscription_id` is that key. It names the same subscription on both
+    // sides of a dual-run cutover, whatever engine-internal id the request
+    // carries.
     let idempotency_key = format!("{}-cycle-{}", state.subscription_id, state.cycles);
     let _: () = ctx
         .execute_activity(
