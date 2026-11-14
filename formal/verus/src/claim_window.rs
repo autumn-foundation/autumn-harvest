@@ -9,7 +9,7 @@
 //! tests of its gate. The full statement takes the window row first, then
 //! the deep row, then the full-scan row, each behind its gate.
 //!
-//! The copy below proves the kernel in `autumn-harvest/src/queue/claim_window.rs`.
+//! The copy below proves the kernel in `autumn-harvest/src/queue.rs`.
 //! The theorem proves that the split claim ends with the row of the full
 //! statement for every input.
 
@@ -38,7 +38,7 @@ pub open spec fn spec_window_step(claimed: bool, fallback: bool) -> WindowStep {
     }
 }
 
-// mirror: autumn-harvest/src/queue/claim_window.rs window_step
+// mirror: autumn-harvest/src/queue.rs window_step
 pub fn window_step(claimed: bool, fallback: bool) -> (r: WindowStep)
     ensures
         r == spec_window_step(claimed, fallback),

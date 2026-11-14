@@ -141,7 +141,9 @@ concurrency counts. Its `candidate` is `seek_candidate`. It keeps
 row: the claimed task, or no task, and a flag `claim_fallback`.
 
 The **full statement, unchanged**, runs only when the flag is set. It runs
-in the same claim transaction, after the window form. Ageing claims and
+in the same claim transaction, after the window form. Both statements go
+out from `queue::claim_task_one_statement`, the one function that sends a
+default claim. Ageing claims and
 fair claims skip the window, so they send the full statement alone, as
 before.
 
@@ -173,7 +175,7 @@ pins the gate text that the model assumes.
 
 ### How the text is built
 
-[`queue::claim_window::window_claim_sql`](../autumn-harvest/src/queue/claim_window.rs)
+[`queue::claim_window::window_claim_sql`](../autumn-harvest/src/queue.rs)
 derives the window form from the final text of each full statement, after
 every splice. So the DR fence, the kind predicate and the owned gate are
 already in it. It parses the top-level CTE list, drops nine named CTEs and
