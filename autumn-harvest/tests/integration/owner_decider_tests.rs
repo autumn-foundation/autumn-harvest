@@ -940,7 +940,12 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     }
     node.stop().await;
     let first = first_started(&mut conn, &queue).await;
-    assert_eq!(first, high.as_uuid(), "the high-priority run decides first");
+    if first != high.as_uuid() {
+        let dump = workflow_task_dump(&mut conn, &queue).await;
+        panic!(
+            "the high-priority run decides first: first {first}, high {high:?}, slow {slow:?}\n{dump}"
+        );
+    }
     assert_eq!(node.claims.count(ClaimKind::Workflow), 0, "all by take");
     db.drop_db().await;
 }
@@ -1026,6 +1031,30 @@ struct Started {
 }
 
 /// The run whose workflow task started second on `queue`, after the slow run.
+/// One text row.
+#[derive(QueryableByName)]
+struct Dump {
+    #[diesel(sql_type = Text)]
+    dump: String,
+}
+
+/// The workflow tasks of `queue` in start order, one line each. A failed order
+/// assertion prints it, so a CI failure shows the order the owner took.
+async fn workflow_task_dump(conn: &mut AsyncPgConnection, queue: &str) -> String {
+    let row: Dump = diesel::sql_query(
+        "SELECT COALESCE(string_agg(format('%s state=%s prio=%s attempt=%s created=%s \
+         scheduled=%s started=%s completed=%s', workflow_exec_id, state, priority, attempt, \
+         created_at, scheduled_at, started_at, completed_at), E'\\n' \
+         ORDER BY started_at NULLS LAST, id), '') AS dump \
+         FROM harvest_task_queue WHERE queue_name = $1 AND task_type = 'workflow'",
+    )
+    .bind::<Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("task dump");
+    row.dump
+}
+
 async fn first_started(conn: &mut AsyncPgConnection, queue: &str) -> uuid::Uuid {
     let row: Started = diesel::sql_query(
         "SELECT workflow_exec_id AS exec FROM harvest_task_queue \
