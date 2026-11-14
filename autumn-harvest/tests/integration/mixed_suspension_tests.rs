@@ -2,14 +2,15 @@
 //! End-to-end integration tests for **mixed-kind concurrent waits in one
 //! suspension batch** (issue #950).
 //!
-//! Before #950 the worker's suspension dispatcher pattern-matched a closed set
-//! of *homogeneous* batch shapes; anything else — an activity joined with a
-//! timer, a child raced against a signal — hit
+//! Before #950 the worker's suspension dispatcher matched a closed set of
+//! *homogeneous* batch shapes. Any other shape, such as an activity joined with
+//! a timer or a child raced against a signal, hit
 //! `"workflow task suspended with unsupported commands …; this command set is
-//! not implemented yet"` and terminally failed the workflow. These tests drive
-//! each composition end-to-end through a **real worker loop** against a
-//! throwaway Postgres, proving the heterogeneous batch is persisted in one
-//! transaction and every branch resolves independently.
+//! not implemented yet"` and terminally failed the workflow.
+//!
+//! These tests drive each composition through a **real worker loop** against a
+//! throwaway Postgres. They prove that the heterogeneous batch persists in one
+//! transaction and that every branch resolves independently.
 //!
 //! The success-metric matrix (≥ 6 compositions):
 //!
@@ -23,14 +24,15 @@
 //! | 6 | activity × child | activity |
 //! | 7 | activity × timer × signal (3-way) | activity |
 //!
-//! plus `futures::join!` wait-**all** over an activity and a durable timer
-//! (AC1), parallel timers parking at the earliest deadline, and the AC8
-//! local-activity rejection failing loudly with **no partial durable trace**.
+//! Other tests cover a `futures::join!` wait-**all** over an activity and a
+//! durable timer (AC1), and parallel timers that park at the earliest deadline.
+//! The AC8 local-activity rejection fails loudly with **no partial durable
+//! trace**.
 //!
-//! The one-transaction property itself is structural — everything durable is
-//! inside a single `conn.transaction` in `persist_mixed_suspension_batch` — and
-//! what these tests observe of it is that both branches of a batch always land
-//! together, and that a rejected batch leaves nothing behind.
+//! The one-transaction property is structural. Everything durable is inside a
+//! single `conn.transaction` in `persist_mixed_suspension_batch`. These tests
+//! observe that both branches of a batch always land together, and that a
+//! rejected batch leaves nothing behind.
 //!
 //! The deterministic-replay half of the success metric (1,000 randomized
 //! event-order replays per composition, 0 divergences) lives in
@@ -479,9 +481,11 @@ fn registry(workflows: Vec<WorkflowInfo>, activities: Vec<ActivityInfo>) -> Arc<
 }
 
 /// Poll until the parent has at least one `harvest_signals`-deliverable park,
-/// then deliver `signal_name`. Retries so the signal never races ahead of the
-/// park (a signal delivered before the park would be re-checked by the
-/// post-park pending-signal sweep anyway — this just keeps the test tight).
+/// then deliver `signal_name`.
+///
+/// The retries keep the signal from racing ahead of the park. The post-park
+/// pending-signal sweep re-checks an early signal anyway, so this only keeps
+/// the test tight.
 async fn deliver_signal_when_parked(
     database_url: &str,
     exec_id: ExecutionId,
@@ -512,10 +516,11 @@ async fn deliver_signal_when_parked(
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-/// Composition 1 — activity × timer, activity wins. The heterogeneous batch
-/// (`ScheduleActivity` + `StartTimer`) must persist in one transaction: the
-/// parent's history carries BOTH `ActivityScheduled` and `TimerStarted`, and
-/// the losing timer's durable row is torn down on the win.
+/// Composition 1 — activity × timer, activity wins.
+///
+/// The heterogeneous batch (`ScheduleActivity` + `StartTimer`) must persist in
+/// one transaction. The parent's history carries BOTH `ActivityScheduled` and
+/// `TimerStarted`, and the win tears down the losing timer's durable row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_beats_timer_in_a_mixed_batch() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -574,10 +579,9 @@ async fn activity_beats_timer_in_a_mixed_batch() {
     );
 
     // `CancelRaceLosers` -> `queue::delete_pending_timer` DELETES the unfired
-    // row, so the correct assertion is that no row survives — `all(|t| t.fired)`
-    // would be vacuously true on an empty set and would also pass if the timer
-    // had never been armed at all, which is the very thing this batch exists to
-    // do. The `TimerStarted` assertion above proves it WAS armed.
+    // row, so no row may survive. `all(|t| t.fired)` is vacuously true on an
+    // empty set. It also passes if the batch never armed the timer at all. The
+    // `TimerStarted` assertion above proves it WAS armed.
     let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
     assert!(
         timers.is_empty(),
@@ -586,9 +590,10 @@ async fn activity_beats_timer_in_a_mixed_batch() {
     );
 }
 
-/// Composition 2 — activity × timer, timer wins. The activity hangs well past
-/// the 2s deadline, so the durable timer fires first and the still-running
-/// activity task is durably cancelled with a synthetic terminal.
+/// Composition 2 — activity × timer, timer wins.
+///
+/// The activity hangs well past the 2s deadline, so the durable timer fires
+/// first. A synthetic terminal durably cancels the still-running activity task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timer_beats_activity_in_a_mixed_batch() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -864,8 +869,10 @@ async fn activity_beats_child_in_a_mixed_batch() {
     );
 }
 
-/// Composition 7 — the three-way activity × timer × signal batch: an activity
-/// enqueue, a durable timer row and a signal wait all in one transaction.
+/// Composition 7 — the three-way activity × timer × signal batch.
+///
+/// One transaction holds an activity enqueue, a durable timer row and a
+/// signal wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_way_activity_timer_signal_mixed_batch() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -1036,9 +1043,8 @@ async fn timer_beats_child_in_a_mixed_batch() {
 /// multi-timer batch, so this shape only exists on the generalized path.
 ///
 /// Load-bearing by construction: the long branch is 300s and
-/// `wait_for_execution_state` gives up after 10s, so a park that took the
-/// max (or the wrong timer's) deadline fails this test by timing out rather
-/// than by a wrong assertion.
+/// `wait_for_execution_state` gives up after 10s. A park at the max deadline,
+/// or at the wrong timer's deadline, fails this test by a timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_timers_park_at_the_earliest_deadline() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -1081,10 +1087,10 @@ async fn parallel_timers_park_at_the_earliest_deadline() {
     );
 }
 
-/// Composition 7b — the three-way batch resolved by its **signal** branch, so
-/// the signal wait is load-bearing rather than decoration: the activity is slow
-/// and the deadline is far away, leaving the delivered signal as the only way
-/// this workflow can complete.
+/// Composition 7b — the three-way batch resolved by its **signal** branch.
+///
+/// The activity is slow and the deadline is far away. The delivered signal is
+/// the only way this workflow can complete, so the signal wait is load-bearing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_way_mixed_batch_resolved_by_its_signal_branch() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;
@@ -1149,9 +1155,10 @@ async fn three_way_mixed_batch_resolved_by_its_signal_branch() {
 }
 
 /// AC8: a `RunLocalActivity` co-batched with a durable sibling wait terminally
-/// fails the execution with a typed error naming the conflict — and leaves
-/// **no partial durable trace**: the sibling timer is not armed, the sibling
-/// activity is not enqueued, and no branch event is recorded.
+/// fails the execution with a typed error that names the conflict.
+///
+/// It leaves **no partial durable trace**. The sibling timer is not armed, the
+/// sibling activity is not enqueued, and no branch event is recorded.
 ///
 /// Before this issue the batch "succeeded": `extract_run_local_activity`
 /// silently dropped the siblings, so the deadline was armed a whole decision
@@ -1627,8 +1634,7 @@ async fn cancel_the_loser(
     .map(|_| ())
 }
 
-/// Issue #1787, Codex P2: race-loser metrics must wait for the synthetic
-/// loser append.
+/// Issue #1787: race-loser metrics must wait for the synthetic loser append.
 ///
 /// An event-id conflict on that append now rolls back and re-drives the
 /// workflow task. The re-drive cancels the same loser again. A metric

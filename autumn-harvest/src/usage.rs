@@ -1,11 +1,11 @@
 //! Read-only per-tenant/per-workflow usage aggregation (issue #596).
 //!
-//! The *historical* companion to the *point-in-time* `GET /admin/concurrency`
-//! endpoint (issue #247): answers "how much did tenant X actually consume
-//! between two dates?" by aggregating already-durable data
+//! This is the *historical* companion to the *point-in-time*
+//! `GET /admin/concurrency` endpoint (issue #247). It answers "how much did
+//! tenant X consume between two dates?". It aggregates durable data
 //! (`harvest_workflow_executions` + `harvest_events`) over a caller-supplied
-//! time window, grouped by `workflow_name` or by a `search_attrs` JSON key
-//! (e.g. a tenant id). Read-only by construction: no new `WorkflowEvent`
+//! time window. It groups by `workflow_name` or by a `search_attrs` JSON key,
+//! such as a tenant id. Read-only by construction: no new `WorkflowEvent`
 //! variant and no replay-determinism impact. Issue #596 needed no migration.
 //! The `llm_*` metrics read `harvest_llm_ledger`, the agent cost ledger. Its
 //! table comes from the issue #1996 migration.
@@ -14,57 +14,55 @@
 //!
 //! - `workflow_starts`: executions whose `started_at` falls in `[from, to]`.
 //!   Counts every `harvest_workflow_executions` row, including
-//!   continue-as-new and issue #523 auto-retry successor rows — each such
-//!   row represents separately-billable compute, so this is a deliberate
-//!   consumption-accuracy choice, not an oversight (consistent with how
-//!   `activity_executions` below already counts every retry attempt).
+//!   continue-as-new and issue #523 auto-retry successor rows. Each such row
+//!   is separately-billable compute, so this choice is deliberate.
+//!   `activity_executions` also counts every retry attempt.
 //! - `completed`/`failed`/`cancelled`/`timed_out`: derived from the durable
 //!   terminal events (`WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/
 //!   `WorkflowExecutionTimedOut`) whose `harvest_events.timestamp` falls in
-//!   `[from, to]` — **not** from the mutable `harvest_workflow_executions`
-//!   row. This makes the counters immutable historical facts: an operator
-//!   redriving a `FAILED` execution back to `RUNNING` via
-//!   `reactivate_failed_execution` clears the row's `state`/`completed_at`
-//!   but never rewrites or removes the original `WorkflowFailed` event, so a
-//!   usage report re-run for the same window still reports the failure that
-//!   actually happened in it. If the redriven run later succeeds, its
-//!   `WorkflowCompleted` event is counted separately in whichever window
-//!   *that* event falls in — each terminal event is one billable/reportable
-//!   occurrence, not a mutually-exclusive final-state bucket. `cancelled` is
-//!   the one bucket that still consults the row: `terminate` (issue #504)
-//!   reuses the same `WorkflowCancelled` event type as a genuine cancel (no
-//!   new event variant), so a `WorkflowCancelled` event only counts toward
-//!   `cancelled` when the execution did *not* end up sealed `TERMINATED` by
-//!   a genuine terminate. Reaching `TERMINATED` by a *reset* instead (issue
-//!   #366's DAG retry / #148's reset-from-failed, `allow_terminal_source`)
-//!   does **not** disqualify it: a reset seal always appends a
-//!   `WorkflowResetTerminated` event on the source execution (unlike
-//!   `terminate_workflow_execution`, which never does), so the query can
-//!   tell "genuinely terminated" apart from "this old cancelled run was
-//!   later reforked for retry" and keep counting the latter — otherwise a
-//!   reset would retroactively erase a historical cancellation from past
-//!   report windows, the same immutability bug as the `failed` fix above.
+//!   `[from, to]`, **not** from the mutable `harvest_workflow_executions`
+//!   row. So the counters are immutable historical facts.
+//!   `reactivate_failed_execution` redrives a `FAILED` execution to
+//!   `RUNNING` and clears the row's `state`/`completed_at`. It never
+//!   rewrites or removes the original `WorkflowFailed` event. So a re-run
+//!   report for the same window still reports that failure. If the redriven
+//!   run later succeeds, its `WorkflowCompleted` event counts in the window
+//!   of *that* event. Each terminal event is one reportable occurrence, not
+//!   a mutually-exclusive final-state bucket.
+//!
+//!   `cancelled` is the one bucket that still consults the row. `terminate`
+//!   (issue #504) reuses the `WorkflowCancelled` event type of a genuine
+//!   cancel. So a `WorkflowCancelled` event counts toward `cancelled` only
+//!   when a genuine terminate did *not* seal the execution `TERMINATED`.
+//!   A *reset* to `TERMINATED` does **not** disqualify it. Examples are the
+//!   issue #366 DAG retry and the issue #148 reset-from-failed
+//!   (`allow_terminal_source`). A reset seal always appends a
+//!   `WorkflowResetTerminated` event on the source execution.
+//!   `terminate_workflow_execution` never does. So the query tells "genuinely
+//!   terminated" apart from "this cancelled run was later reforked for
+//!   retry", and keeps counting the latter. Otherwise a reset would erase a
+//!   historical cancellation from past report windows. That is the same
+//!   immutability bug as the `failed` case above.
 //!   `TERMINATED` and `CONTINUED_AS_NEW` are intentionally not broken out
 //!   (the issue's AC lists exactly these four terminal buckets).
 //! - `activity_executions`: count of `ActivityStarted` events in the window
 //!   (one per dispatch attempt — retries reuse the same `activity_id` but
 //!   each attempt appends a fresh `ActivityStarted`).
-//! - `activity_executions_failed`: count of terminal `ActivityFailed` +
-//!   `ActivityTimedOut` events in the window that have a matching
-//!   `ActivityStarted` (non-final retry attempts do not append an event, so
-//!   this is exhausted-retry-or-timeout only). The start-match requirement
-//!   excludes external activities whose `ActivityTimedOut` is appended by
-//!   `enforce_external_task_timeouts` with no `ActivityStarted` at all
-//!   (external activities are dispatched via `ActivityAwaitingExternal`,
-//!   never claimed/started by a worker) — otherwise they would be charged
-//!   as a failure despite `activity_executions`/`activity_compute_seconds`
-//!   correctly excluding them below.
-//! - `activity_compute_seconds`: for each activity whose terminal event
+//! - `activity_executions_failed`: terminal `ActivityFailed` +
+//!   `ActivityTimedOut` events in the window with a matching
+//!   `ActivityStarted`. Non-final retry attempts append no event, so this is
+//!   exhausted-retry-or-timeout only. The start match excludes external
+//!   activities. `enforce_external_task_timeouts` appends their
+//!   `ActivityTimedOut` with no `ActivityStarted`. They dispatch via
+//!   `ActivityAwaitingExternal`, and no worker claims or starts them.
+//!   Without the match they would count as failures, although
+//!   `activity_executions`/`activity_compute_seconds` exclude them.
+//! - `activity_compute_seconds`: covers each activity whose terminal event
 //!   (`ActivityCompleted`/`ActivityFailed`/`ActivityTimedOut`) falls in the
-//!   window, the wall-clock span from that activity's most recent
-//!   `ActivityStarted` (its final attempt) to the terminal event —
-//!   `harvest_events.timestamp` deltas, since event payloads carry no
-//!   timestamps of their own. Retry backoff wall time between earlier
+//!   window. It sums the wall-clock span from the most recent
+//!   `ActivityStarted` (the final attempt) to the terminal event. The span is
+//!   a `harvest_events.timestamp` delta, because event payloads carry no
+//!   timestamps. Retry backoff wall time between earlier
 //!   attempts is excluded by construction (only the final attempt's span is
 //!   summed).
 //! - `llm_calls`, `llm_input_tokens`, `llm_output_tokens`,
@@ -75,20 +73,19 @@
 //!   one shard only. The report skips the staged `MIGRATING` target copy. It
 //!   counts the sealed `MIGRATED` source until the move is `DONE`.
 //!
-//! Local activities (no `ActivityStarted`/worker compute) and
+//! The activity counters exclude local activities (no worker compute) and
 //! externally-completed activities (`ActivityAwaitingExternal` and
-//! siblings) are excluded from the activity counters — they never emit
-//! `ActivityStarted`, so they naturally fall out of every query above.
+//! siblings). They never emit `ActivityStarted`, so every query above skips
+//! them.
 //!
 //! ## Known limitation: `search_attr` value collision with the sentinel
 //!
-//! An execution whose `search_attrs` value for the requested key literally
-//! equals [`UNATTRIBUTED_GROUP`] (`"(unattributed)"`) is indistinguishable
-//! from an execution that lacks the key entirely — both merge into the same
-//! `"(unattributed)"` group. This is an accepted, documented limitation, not
-//! a defect: issue #596's AC mandates this exact literal for missing-key
-//! executions, so any internal separation of the two cases would still
-//! collapse to one flat string in the final JSON response. Operators
+//! Some executions have a `search_attrs` value equal to
+//! [`UNATTRIBUTED_GROUP`] (`"(unattributed)"`) for the requested key. They
+//! merge with executions that lack the key into one `"(unattributed)"` group.
+//! This limitation is accepted. Issue #596's AC mandates this literal for
+//! missing-key executions. An internal split would still collapse to one
+//! string in the JSON response. Operators
 //! choosing a `search_attr:<key>` should avoid keys whose legitimate values
 //! could collide with the sentinel string.
 
@@ -438,11 +435,10 @@ LIMIT $5
 
 /// Load grouped usage rows from a single shard without mutating state.
 ///
-/// `row_limit` bounds the number of grouped rows this single shard's query
-/// can return (a `LIMIT` clause in [`usage_sql`]) — callers should pass the
-/// configured group cap plus one, so the plugin can still detect and report
-/// an over-cap condition without ever materializing an unbounded result set
-/// for a single high-cardinality shard.
+/// `row_limit` bounds the grouped rows of this shard's query (a `LIMIT` in
+/// [`usage_sql`]). Pass the configured group cap plus one. The plugin then
+/// detects an over-cap condition without an unbounded result set from a
+/// high-cardinality shard.
 ///
 /// # Errors
 ///

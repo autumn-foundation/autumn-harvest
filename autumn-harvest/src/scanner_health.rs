@@ -12,10 +12,10 @@
 //! surfaces minutes to hours later. Examples are a workflow that should have
 //! timed out but did not, and an SLA that never fired.
 //!
-//! The pre-existing loop metrics cannot catch this: `record_retention_tick`,
+//! The pre-existing loop metrics cannot catch this. `record_retention_tick`,
 //! `record_schedule_fire_attempt`, and the timeout/SLA/quarantine counters
-//! only emit **when there is work to do**, so a healthy idle loop and a
-//! wedged loop both emit zero — indistinguishable.
+//! only emit **when there is work to do**. A healthy idle loop and a wedged
+//! loop both emit zero, so the two look the same.
 //!
 //! This module closes that gap with two halves that share **one choke point**
 //! ([`record_scanner_tick`]):
@@ -34,43 +34,43 @@
 //!
 //! # Scope
 //!
-//! Detection only. Auto-restart of a wedged loop, cross-replica scanner
-//! ownership, and any persisted (cross-process) heartbeat row are explicitly
-//! out of scope for issue #797 — this module introduces **no new
-//! `WorkflowEvent` variant, no `harvest_events` footprint, no migration, and
-//! no replay-determinism impact**.
+//! Detection only. Issue #797 excludes auto-restart of a wedged loop,
+//! cross-replica scanner ownership, and any persisted (cross-process)
+//! heartbeat row. This module introduces **no new `WorkflowEvent` variant, no
+//! `harvest_events` footprint, no migration, and no replay-determinism
+//! impact**.
 //!
 //! Two consequences of "in-process" worth stating plainly, because both can
 //! read as false assurance:
 //!
-//! * The registry is **per process**. Pointed at an API-only replica — or any
-//!   process that is not the wedged one — the `scanner_liveness` check reports
-//!   zero registered scanners and therefore `pass`. In a split API/worker
-//!   topology, run the check against the worker process, and use the
-//!   `harvest.scanner.tick` counter (which carries the scrape target's own
-//!   `instance` label) to find *which* replica went quiet.
+//! * The registry is **per process**. On an API-only replica, or any process
+//!   that is not the wedged one, the `scanner_liveness` check reports zero
+//!   registered scanners and so `pass`. In a split API/worker topology, run
+//!   the check against the worker process. The `harvest.scanner.tick`
+//!   counter carries the `instance` label of its scrape target. Use it to
+//!   find *which* replica went quiet.
 //! * A [`Scanner`] label may cover **more than one loop instance** in one
 //!   process. A multi-shard worker spawns a timeout checker, poison-pill
 //!   reclaimer, pause auto-resumer, and audit-export task per assigned
 //!   shard. Each instance is
 //!   tracked separately and the health check reports the **worst** of them, so
 //!   a healthy shard cannot mask a wedged sibling. The *metric* carries a
-//!   bounded `shard` label for the same reason: without it every per-shard
-//!   instance would increment one series on one scrape target, so a healthy
-//!   shard's ticks would hold `rate(...) > 0` while a sibling's loop was dead
-//!   and the paging alert would never fire — masking, not merely a lost
-//!   localization. The health check additionally names the shard in its
-//!   payload and lists **every** stale shard in `stale_shards`, so an
-//!   operator sees the full blast radius rather than one database.
+//!   bounded `shard` label for the same reason. Without it, every per-shard
+//!   instance increments one series on one scrape target. The ticks of a
+//!   healthy shard then hold `rate(...) > 0` while a sibling loop is dead.
+//!   The paging alert never fires: that is masking, not only a lost
+//!   localization. The health check also names the shard in its payload. It
+//!   lists **every** stale shard in `stale_shards`, so an operator sees the
+//!   full blast radius, not one database.
 //!
 //! # Residual: two runtimes on one shard in one process
 //!
-//! `(instance, scanner, shard)` separates every instance the deployment shapes
-//! Harvest supports actually produce — one worker process per shard, or one
-//! multi-shard worker — because a duplicate `shard_assignments` entry is
-//! deduplicated at the config boundary (`builder::dedup_shard_assignments`,
-//! applied by both `WorkerConfig::with_shard_assignments` and the
-//! `WorkerConfig -> WorkerRuntimeConfig` conversion).
+//! `(instance, scanner, shard)` separates every instance that the supported
+//! deployment shapes produce: one worker process per shard, or one
+//! multi-shard worker. The config boundary deduplicates a duplicate
+//! `shard_assignments` entry (`builder::dedup_shard_assignments`). Both
+//! `WorkerConfig::with_shard_assignments` and the
+//! `WorkerConfig -> WorkerRuntimeConfig` conversion apply it.
 //!
 //! What it does **not** separate is two *independently constructed* runtimes
 //! (two `Worker`s, or two `RetentionRuntime`s) living in one process and
@@ -78,19 +78,19 @@
 //! one holds `rate(...) > 0` after its peer wedges and the alert stays quiet.
 //!
 //! This is not closed with a per-owner metric label on purpose. Owner ids are
-//! monotonic and never reused, so a process that stops and restarts a runtime
-//! would mint label values without bound — an ADR-0001 §7 violation, and a
+//! monotonic and never reused. A process that stops and restarts a runtime
+//! would mint label values without bound. That violates ADR-0001 §7 and is a
 //! worse bug than the one it would fix. A separate "worst registered owner"
-//! gauge was likewise rejected: exporting it needs its own sampler loop, which
-//! is another background loop carrying the very wedge risk this module exists
-//! to detect, whereas a per-instance counter is self-reporting.
+//! gauge was also rejected. Its export needs its own sampler loop. That loop
+//! carries the very wedge risk this module exists to detect. A per-instance
+//! counter is self-reporting.
 //!
-//! The capability is not absent, only on a different surface: the registry
-//! tracks these owners **separately** (that is what [`ScannerOwner`] ids are
-//! for), so the `scanner_liveness` preflight check reports the worst of them
-//! and names the affected shard. An operator running two runtimes of the same
-//! kind in one process should treat that check — not the counter — as the
-//! authority for those scanners.
+//! The capability is not absent, only on a different surface. The registry
+//! tracks these owners **separately**: that is what [`ScannerOwner`] ids are
+//! for. So the `scanner_liveness` preflight check reports the worst of them
+//! and names the affected shard. An operator with two runtimes of the same
+//! kind in one process uses that check, not the counter, as the authority
+//! for those scanners.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,29 +114,29 @@ use crate::types::ShardId;
 /// it explicitly so the bound is never over-claimed.
 ///
 /// The reason is that a loop's *iteration period* is not its poll interval.
-/// Each pass sleeps `poll_interval` and **then** does real work: the timeout
-/// checker calls `pool.get().await` (deadpool waits for a free connection --
-/// by default with no timeout at all) and then runs a multi-query enforcement
-/// pass. Under a saturated pool or a slow query a perfectly healthy 500 ms
-/// loop can legitimately take seconds per iteration, so a 1 s threshold would
-/// report `stale` continuously on a busy-but-working system.
+/// Each pass sleeps `poll_interval` and **then** does real work. The timeout
+/// checker calls `pool.get().await`, and deadpool waits for a free connection,
+/// by default with no timeout. It then runs a multi-query enforcement pass.
+/// Under a saturated pool or a slow query, a healthy 500 ms loop can take
+/// seconds per iteration. A 1 s threshold would then report `stale`
+/// continuously on a busy-but-working system.
 ///
 /// The cost asymmetry decides it. This verdict feeds `GET /admin/preflight`,
 /// and the CLI exits `2` on `warn` / `1` on `fail`, so a false `warn` **breaks
 /// a deploy pipeline**. A missed 60 s of detection latency is a far cheaper
 /// error than a check that flaps under load. Sixty seconds absolute is also
-/// still well inside the issue's intent (catch a wedge in ~a minute, not in
-/// hours) -- and is *better* in absolute terms than the literal `2 x` bound
-/// would give the hourly retention janitor, which is 2 hours.
+/// well inside the intent of the issue: catch a wedge in about a minute, not
+/// in hours. It is *better* in absolute terms than the literal `2 x` bound
+/// for the hourly retention janitor, which is 2 hours.
 pub const MIN_SCANNER_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// The bounded `scanner` label value set for
 /// [`METRIC_SCANNER_TICK`](crate::telemetry::METRIC_SCANNER_TICK).
 ///
-/// Deliberately a closed enum rather than a free string (mirroring
-/// [`SlotType`](crate::telemetry::SlotType)): per ADR-0001 §7 a metric label
-/// must have bounded cardinality, and an enum makes that true *by
-/// construction* rather than by convention.
+/// A closed enum, not a free string, like
+/// [`SlotType`](crate::telemetry::SlotType). ADR-0001 §7 requires a metric
+/// label with bounded cardinality. An enum makes that true *by construction*,
+/// not by convention.
 ///
 /// # Shared liveness fate
 ///
@@ -147,14 +147,13 @@ pub const MIN_SCANNER_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
 /// liveness and **cannot diverge**: `timeout` healthy implies `sla` and
 /// `external_outbox` healthy.
 ///
-/// They keep distinct labels because issue #797 names them in the bounded set
-/// and because they name distinct responsibilities an operator reasons about —
-/// not because a divergence between them is observable. Ticking them from the
-/// loop body rather than mid-pass is deliberate: a mid-pass tick would sit
-/// behind a `?` and be skipped on a transient DB error, which would make a
-/// flat-lined counter mean two different things. Attributing a *partial* pass
-/// failure to a specific sub-pass is the job of that pass's own work counters
-/// and its `tracing::error!`, not of a liveness heartbeat.
+/// They keep distinct labels because issue #797 names them in the bounded set.
+/// They also name distinct responsibilities that an operator reasons about.
+/// A divergence between them is not observable. The loop body ticks them, not
+/// the middle of a pass. A mid-pass tick sits behind a `?` and is skipped on
+/// a transient DB error. A flat-lined counter would then mean two things. The
+/// work counters and `tracing::error!` of a pass attribute a *partial* pass
+/// failure to a sub-pass, not a liveness heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scanner {
     /// The timeout-enforcement loop (`spawn_timeout_checker`), which drives
@@ -305,11 +304,11 @@ pub struct ScannerStatus {
     /// `Stale` or `Wedged`, sorted and deduplicated.
     ///
     /// The worst-instance fold that produces [`shard`](Self::shard) is right
-    /// for the *verdict* — one verdict per scanner, reproducible from the
-    /// folded status — but wrong for the *blast radius*: two shards can be
-    /// wedged at once, and reporting only the worse of them tells an operator
-    /// to fix one database while the other stays unprotected. This field is
-    /// what populates the preflight check's standard `affected_shards`.
+    /// for the *verdict*: one verdict per scanner, reproducible from the
+    /// folded status. It is wrong for the *blast radius*. Two shards can be
+    /// wedged at once. A report of only the worse one tells an operator to fix
+    /// one database while the other stays unprotected. This field populates
+    /// the standard `affected_shards` of the preflight check.
     ///
     /// Empty when the scanner is healthy, and for the process-wide loops
     /// (`retention`, `schedule`) and single-shard deployments, which carry no
@@ -350,9 +349,9 @@ impl ScannerOwner {
 
     /// Which shard this instance polls, for the per-shard loops.
     ///
-    /// Carried on the handle rather than looked up at tick time so
-    /// [`record_scanner_tick`] can label the counter without touching the
-    /// registry lock on the hot path.
+    /// Carried on the handle, not looked up at tick time. So
+    /// [`record_scanner_tick`] labels the counter without the registry lock
+    /// on the hot path.
     #[must_use]
     pub const fn shard(self) -> Option<ShardId> {
         self.shard
@@ -392,8 +391,8 @@ impl OwnerState {
     /// `registered_at` before the first tick, which is what gives a
     /// just-booted loop its one-interval grace.
     ///
-    /// Because this is *per instance*, a newly starting peer's grace can no
-    /// longer mask an already-wedged sibling — the fold in
+    /// This is *per instance*, so the grace of a newly starting peer cannot
+    /// mask an already-wedged sibling. The fold in
     /// [`ScannerLiveness::snapshot_as_of`] reports the **worst** owner.
     fn reference(&self) -> Instant {
         self.last_tick
@@ -403,12 +402,11 @@ impl OwnerState {
 
 /// Live instances of one [`Scanner`], keyed by the id minted at registration.
 ///
-/// A map rather than a count so liveness folds by the **worst** instance
-/// instead of last-write-wins: on a multi-shard worker N loops share one
-/// `Scanner` label, and a shared last-tick would let three healthy shards hide
-/// the fourth's panicked loop — exactly the failure this module exists to
-/// detect. The map being empty is also what marks the scanner as no longer
-/// expected in this process.
+/// A map, not a count, so liveness folds by the **worst** instance, not
+/// last-write-wins. On a multi-shard worker, N loops share one `Scanner`
+/// label. A shared last-tick would let three healthy shards hide a panicked
+/// loop on the fourth. That is the failure this module exists to detect. An
+/// empty map marks the scanner as no longer expected in this process.
 type Owners = BTreeMap<u64, OwnerState>;
 
 /// In-process registry of background control-loop liveness.
@@ -460,9 +458,9 @@ impl ScannerLiveness {
     /// polling every `poll_interval`.
     ///
     /// Call once at spawn time and keep the returned handle for the loop's
-    /// lifetime. Each call mints a **distinct** instance: two workers in one
-    /// process, or the per-shard loops a multi-shard worker spawns, are
-    /// tracked independently rather than collapsing onto one shared last-tick.
+    /// lifetime. Each call mints a **distinct** instance. Two workers in one
+    /// process, or the per-shard loops of a multi-shard worker, are tracked
+    /// independently. They do not collapse onto one shared last-tick.
     pub fn register(&self, scanner: Scanner, poll_interval: Duration) -> ScannerOwner {
         self.register_at(scanner, poll_interval, Instant::now())
     }
@@ -471,11 +469,10 @@ impl ScannerLiveness {
     ///
     /// A multi-shard worker spawns one timeout checker, poison-pill reclaimer,
     /// pause auto-resumer, and audit-export task per assigned shard, all
-    /// sharing one [`Scanner`] label. Recording which shard each instance
-    /// polls does two things: it
-    /// lets the liveness snapshot name the database left unprotected, and it
-    /// supplies the `shard` metric label that keeps each instance on its own
-    /// `harvest.scanner.tick` series so a healthy sibling cannot mask a
+    /// sharing one [`Scanner`] label. The recorded shard lets the liveness
+    /// snapshot name the database left unprotected. It also supplies the
+    /// `shard` metric label. That label keeps each instance on its own
+    /// `harvest.scanner.tick` series, so a healthy sibling cannot mask a
     /// wedged one.
     pub fn register_for_shard(
         &self,
@@ -559,17 +556,17 @@ impl ScannerLiveness {
 
     /// [`tick`](Self::tick) with an injected monotonic clock reading.
     ///
-    /// A tick from a handle that has already been deregistered is dropped:
-    /// ids are never reused, so it can neither resurrect the retired instance
-    /// nor refresh a live peer's clock.
+    /// A tick from a deregistered handle is dropped. Ids are never reused, so
+    /// the tick can neither resurrect the retired instance nor refresh the
+    /// clock of a live peer.
     ///
     /// The injected clock exists for deterministic tests; not part of the
     /// operator-facing surface.
     #[doc(hidden)]
     pub fn tick_at(&self, owner: ScannerOwner, now: Instant) {
-        // Resolve the wall clock BEFORE taking the write lock: this runs on
-        // every iteration of every control loop, so the critical section is
-        // kept to the map mutation alone.
+        // Resolve the wall clock BEFORE the write lock. This runs on every
+        // iteration of every control loop, so the critical section holds the
+        // map mutation alone.
         let wall_now = Utc::now();
         let mut entries = self.write();
         if let Some(state) = entries
@@ -586,9 +583,9 @@ impl ScannerLiveness {
     /// How many live instances of `scanner` are registered.
     ///
     /// Exposed so a test can assert that a loop released its own registration
-    /// on shutdown without being perturbed by *other* registrations held
-    /// concurrently in the same process (parallel tests in one binary); not
-    /// part of the operator-facing surface.
+    /// on shutdown. *Other* registrations held concurrently in the same
+    /// process (parallel tests in one binary) do not perturb it. Not part of
+    /// the operator-facing surface.
     #[doc(hidden)]
     #[must_use]
     pub fn registrations(&self, scanner: Scanner) -> usize {
@@ -601,16 +598,16 @@ impl ScannerLiveness {
     /// existing single-status-per-scanner health-check payload is unchanged.
     ///
     /// The fold classifies **each instance against its own registered poll
-    /// interval** and then keeps the instance with the **worst verdict** —
-    /// rather than folding `age` and `poll_interval` independently and
-    /// classifying once. That distinction is load-bearing: two `Worker`s (or
-    /// two `RetentionRuntime`s) in one process may register the same
-    /// [`Scanner`] with *different* intervals, and taking `age` from the worst
-    /// instance while taking `poll_interval` from the most lenient one would
-    /// judge the wedged instance against a threshold it never agreed to — a
-    /// 30 s loop silent for 200 s would read `Healthy` next to an hourly
-    /// sibling. Every field below therefore describes **one** instance, so
-    /// `classify_scanner(&status)` reproduces the folded verdict exactly.
+    /// interval**, then keeps the instance with the **worst verdict**. It does
+    /// not fold `age` and `poll_interval` independently and classify once.
+    /// That distinction is load-bearing. Two `Worker`s (or two
+    /// `RetentionRuntime`s) in one process can register the same [`Scanner`]
+    /// with *different* intervals. With `age` from the worst instance and
+    /// `poll_interval` from the most lenient one, the wedged instance is judged
+    /// against a threshold it never agreed to. A 30 s loop silent for 200 s
+    /// would read `Healthy` next to an hourly sibling. So every field below
+    /// describes **one** instance, and `classify_scanner(&status)` reproduces
+    /// the folded verdict exactly.
     ///
     /// - `poll_interval`, `age`, `last_tick_at`, `has_ticked` — the worst
     ///   instance's own values, which is the configuration an operator needs
@@ -618,9 +615,9 @@ impl ScannerLiveness {
     /// - `tick_count` — the **sum** across instances, matching the counter
     ///   metric (which likewise carries no per-instance label).
     ///
-    /// Ties are broken by how far past its *own* threshold an instance has
-    /// drifted, then by raw age, so the reported instance is the most
-    /// meaningfully-worst rather than merely the oldest.
+    /// A tie breaks on how far an instance drifted past its *own* threshold,
+    /// then on raw age. So the reported instance is the most meaningfully
+    /// worst, not merely the oldest.
     #[must_use]
     pub fn snapshot(&self) -> Vec<ScannerStatus> {
         self.snapshot_as_of(Instant::now())
@@ -647,10 +644,10 @@ impl ScannerLiveness {
                             *age,
                         )
                     })?;
-                // Every stale instance's shard, not just the worst one's: two
-                // shards can be wedged at once, and the worst-instance fold
-                // that decides the *verdict* would otherwise silently drop the
-                // second unprotected database from the blast radius.
+                // The shard of every stale instance, not only the worst one.
+                // Two shards can be wedged at once. Without this, the
+                // worst-instance fold that decides the *verdict* would silently
+                // drop the second unprotected database from the blast radius.
                 let mut stale_shards: Vec<ShardId> = owners
                     .values()
                     .filter(|state| {
@@ -686,8 +683,8 @@ impl ScannerLiveness {
 /// Threading a handle through seven spawn signatures buys nothing over a
 /// single append-only registry.
 ///
-/// Instances are tracked individually: a scanner leaves the expected set only
-/// when its **last** instance deregisters on a clean shutdown, so a
+/// Instances are tracked individually. A scanner leaves the expected set only
+/// when its **last** instance deregisters on a clean shutdown. So a
 /// two-runtime (or multi-shard) process keeps reporting the survivors. A loop
 /// that panics or wedges never deregisters and correctly ages into
 /// `Stale`/`Wedged`.
@@ -706,10 +703,9 @@ pub fn global_scanner_liveness() -> &'static ScannerLiveness {
 /// [`deregister_scanner`] address.
 ///
 /// Also **initializes the scanner's tick series at zero**. Registration is the
-/// earliest moment the process knows the loop is supposed to be running, and a
-/// loop that panics or hangs on its *first* iteration never reaches a tick —
-/// so without this it would export no series at all and `rate(...) == 0` would
-/// match nothing, silently. See
+/// earliest moment the process knows the loop should run. A loop that panics
+/// or hangs on its *first* iteration never reaches a tick. Without this, it
+/// exports no series, and `rate(...) == 0` silently matches nothing. See
 /// [`MetricsRecorder::record_scanner_registered`].
 #[must_use]
 pub fn register_scanner(
@@ -730,10 +726,10 @@ pub fn register_scanner(
 ///
 /// The timeout checker, poison-pill reclaimer, pause auto-resumer, and
 /// audit-export task are spawned one-per-assigned-shard, all under one
-/// [`Scanner`] label. Passing the
-/// shard here both lets `scanner_liveness` name the unprotected database and
-/// puts each instance on its own `harvest.scanner.tick` series, so a healthy
-/// shard's ticks cannot hold the alert quiet while a sibling is wedged.
+/// [`Scanner`] label. The shard lets `scanner_liveness` name the unprotected
+/// database. It also puts each instance on its own `harvest.scanner.tick`
+/// series. So the ticks of a healthy shard cannot hold the alert quiet while
+/// a sibling is wedged.
 #[must_use]
 pub fn register_scanner_for_shard(
     metrics: &dyn MetricsRecorder,
@@ -780,13 +776,13 @@ pub fn deregister_scanner(owner: ScannerOwner) {
 /// both halves of issue #797.
 ///
 /// Bumps the process-global liveness timestamp **and** increments
-/// `harvest.scanner.tick`. Because one call drives both, a call site cannot
-/// emit the counter without the timestamp (or vice versa), and the liveness
-/// half keeps working when no metrics recorder is configured.
+/// `harvest.scanner.tick`. One call drives both, so a call site cannot emit
+/// the counter without the timestamp, or the reverse. The liveness half keeps
+/// working when no metrics recorder is configured.
 ///
-/// Call **at the end** of each iteration — "one full pass completed" is a
-/// strictly stronger liveness signal than "one pass was scheduled" — and
-/// call it unconditionally, whether or not the iteration found work.
+/// Call **at the end** of each iteration. "One full pass completed" is a
+/// strictly stronger liveness signal than "one pass was scheduled". Call it
+/// unconditionally, whether or not the iteration found work.
 pub fn record_scanner_tick(metrics: &dyn MetricsRecorder, owner: ScannerOwner) {
     record_scanner_tick_on(global_scanner_liveness(), metrics, owner);
 }

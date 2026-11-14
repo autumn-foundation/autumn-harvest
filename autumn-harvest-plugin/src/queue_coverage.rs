@@ -1,11 +1,10 @@
 //! Fleet-wide task-queue coverage read model (issue #774).
 //!
-//! Answers a single safe-deploy question: *"which task queues have pending
-//! work but zero live workers polling them?"* A workflow that schedules an
-//! activity onto a typo'd or undeployed queue produces a `harvest_task_queue`
-//! row no live worker will ever claim; without this surface the operator's
-//! only signal is a `schedule_to_start` timeout (if configured at all) or
-//! silence forever.
+//! Answers one safe-deploy question: which task queues have pending work
+//! but zero live workers polling them? A workflow that schedules an activity
+//! onto a typo'd or undeployed queue produces a `harvest_task_queue` row that
+//! no live worker ever claims. Without this surface the operator's only
+//! signal is a `schedule_to_start` timeout (if configured) or silence forever.
 //!
 //! ## "Coverage" vs. "capacity"
 //!
@@ -15,53 +14,49 @@
 //! out of scope here. Only **zero** live workers polling a
 //! queue makes it "uncovered".
 //!
-//! A worker is "live" for coverage purposes when its heartbeat is fresh
+//! A worker is "live" for coverage when its heartbeat is fresh
 //! (`WorkerHealth::Healthy`) and its lifecycle status is `Active` **or**
-//! `Draining` — a draining worker is still finishing in-flight work and
-//! still counts as covering the queue it was assigned. Only `Stopped`
-//! workers (and stale/absent heartbeats) fail to cover. A worker registered
-//! with an **empty** `shard_assignments` array (the `Worker::run` legacy
+//! `Draining`. A draining worker still finishes in-flight work, so it still
+//! covers its assigned queue. Only `Stopped` workers (and stale or absent
+//! heartbeats) fail to cover.
+//!
+//! A worker registered with an **empty** `shard_assignments` array covers
+//! *whichever shard is being inspected*. That is the `Worker::run` legacy
 //! single-shard path, which polls the default pool with no explicit
-//! assignment) is treated as covering *whichever shard is being inspected* —
-//! matching what it actually polls, not what its registration literally
-//! lists — since this module only ever asks that question against a worker
-//! row already known to be registered on that exact shard's own database.
+//! assignment. The rule matches what it polls, not what its registration
+//! lists. It is safe because this module asks only about a worker row read
+//! from that exact shard's own database.
 //!
 //! ## Distinct from build-id reachability (#171) and shard health (#522)
 //!
-//! This surface answers *"does any live worker poll this queue at all"* —
-//! not *"do the workers that poll it run a build compatible with this
-//! task's `required_build_id`"* (that is #171's `build_reachability`) and
-//! not the writable/candidate-shard-scoped promotion-safety check
-//! [`crate::shard_health`] already performs for rollout gating. Both of
-//! those existing surfaces stay unchanged; this module is a dedicated,
-//! all-shards, all-queues read purpose-built for the deploy/migration
-//! smoke-check use case issue #774 asks for.
+//! This surface answers *"does any live worker poll this queue at all"*. It
+//! does not answer *"do its pollers run a build compatible with this task's
+//! `required_build_id`"*: that is the `build_reachability` of #171. It is
+//! also not the shard-scoped promotion-safety check of [`crate::shard_health`]
+//! for rollout gating. Both of those surfaces stay unchanged. This module is
+//! a dedicated all-shards, all-queues read for the deploy smoke check of #774.
 //!
 //! ## Partial availability
 //!
-//! An unreachable shard is named in `shards` (never silently dropped) and
-//! the report `status` degrades to `partial`/`unavailable`, mirroring the
+//! An unreachable shard is named in `shards`, never silently dropped. The
+//! report `status` degrades to `partial`/`unavailable`. This mirrors the
 //! DLQ-aggregate / shard-health / workflow-reachability fan-out contract.
 //!
 //! ## Excluded: paused queues
 //!
 //! A queue currently paused via [`autumn_harvest::queue_pause`] is excluded
-//! from the uncovered list — its lack of live-worker action is deliberate
-//! operator intent, already surfaced by the separate
-//! `harvest_queue_paused_too_long` alert. Reporting it here too would
-//! duplicate that signal under a different name.
+//! from the uncovered list. Its idle state is deliberate operator intent,
+//! already surfaced by the separate `harvest_queue_paused_too_long` alert.
+//! Reporting it here too would duplicate that signal under a different name.
 //!
-//! That alert fires on pause *duration* alone, independent of whether the
-//! queue actually has stranded backlog, so a queue that is simultaneously
-//! paused *and* has zero live pollers *and* has real pending work can go
-//! unreported by that alert for its full grace window. To close that
-//! visibility gap without duplicating the alert's own signal, the exclusion
-//! itself is surfaced in [`QueueCoverageReport::excluded_paused_queues`] —
-//! the queue names that would be reported uncovered the moment they were
-//! unpaused without gaining a live poller. A paused queue that already has
-//! live pollers is not included there (nothing interesting to report — it
-//! would not have been uncovered anyway).
+//! That alert fires on pause *duration* alone, whatever the backlog. A queue
+//! can be paused, have zero live pollers, and have real pending work. That
+//! alert can then miss it for its full grace window. To close that gap, the
+//! exclusion itself is surfaced in
+//! [`QueueCoverageReport::excluded_paused_queues`]. It lists the queues that
+//! would be reported uncovered the moment they were unpaused without a live
+//! poller. A paused queue with live pollers is not listed there: it would
+//! not have been uncovered anyway.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
@@ -79,20 +74,17 @@ use uuid::Uuid;
 
 use crate::api::HarvestApiState;
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
-// Strict raw-query percent-decoding was extracted to `crate::strict_query`
-// (issue #1151) so every other management API route with the same
-// `Query<Vec<(String, String)>>` gap could share it rather than
-// reimplementing it. The `queue_coverage` handler itself now calls
-// `crate::strict_query::decode_or_queue_coverage_bad_request` directly, and
-// this module's own doc comments reference the strict decoder by its full
-// path, so nothing in THIS crate needs the re-export below any more.
+// Strict raw-query percent-decoding moved to `crate::strict_query` (issue
+// #1151). Every management API route with the same
+// `Query<Vec<(String, String)>>` gap shares it. The `queue_coverage` handler
+// calls `crate::strict_query::decode_or_queue_coverage_bad_request` directly.
+// Nothing in THIS crate needs the re-export below any more.
 //
-// It stays `pub` anyway (Codex review, PR #1334): `autumn-harvest-plugin` is
-// a published library crate, and `parse_raw_query_pairs_strict`/
-// `InvalidQueryEncoding` were already public at this path when issue #774
-// shipped -- dropping them would be a source-breaking change for any
-// external crate that imported `autumn_harvest_plugin::queue_coverage::
-// parse_raw_query_pairs_strict` directly, not merely internal dead code.
+// It stays `pub` anyway (PR #1334). `autumn-harvest-plugin` is a published
+// library crate. `parse_raw_query_pairs_strict` and `InvalidQueryEncoding`
+// were public at this path when issue #774 shipped. Dropping them would
+// break the source of any external crate that imports
+// `autumn_harvest_plugin::queue_coverage::parse_raw_query_pairs_strict`.
 pub use crate::strict_query::{InvalidQueryEncoding, parse_raw_query_pairs_strict};
 
 /// Query string accepted by `GET /admin/queue-coverage`.
@@ -111,38 +103,37 @@ impl QueueCoverageQuery {
     /// Parse raw `(key, value)` query-string pairs into a
     /// [`QueueCoverageQuery`].
     ///
-    /// Infallible by construction (issue #774 AC8, matching the
-    /// `dlq::DlqAggregateParams`/`workflow_count::WorkflowCountParams`/
-    /// `usage::UsageParams` convention) **once the pairs are already valid
-    /// decoded strings** — see [`crate::strict_query::parse_raw_query_pairs_strict`] for the
-    /// upstream check that actually can reject a request. `queue_name` is a
-    /// free-text filter with no invalid *decoded value* — any string is a
-    /// legitimate (if possibly never-scheduled) queue name — so unlike a
+    /// Infallible by construction **once the pairs are valid decoded
+    /// strings** (issue #774 AC8). This matches the convention of
+    /// `dlq::DlqAggregateParams`, `workflow_count::WorkflowCountParams` and
+    /// `usage::UsageParams`. The upstream check that can reject a request is
+    /// [`crate::strict_query::parse_raw_query_pairs_strict`]. `queue_name` is a
+    /// free-text filter with no invalid *decoded value*. Any string is a
+    /// legitimate, possibly never-scheduled, queue name. So unlike a
     /// `group_by`/`state`/date param, there is no value to reject here. A
-    /// repeated `queue_name` key resolves last-value-wins (never an error);
-    /// an unrecognized key is ignored for forward-compatibility.
+    /// repeated `queue_name` key resolves last-value-wins (never an error).
+    /// An unrecognized key is ignored for forward-compatibility.
     ///
-    /// The value is preserved **verbatim** (never trimmed) — only the
-    /// literal empty string `""` normalizes to "no filter". This
-    /// deliberately diverges from `WorkerFilters::queue`'s
-    /// trim-and-treat-blank-as-absent convention: `WorkerConfig::with_queues`
-    /// rejects only an *exactly-empty* queue name (`assert!(!q.is_empty())`)
-    /// — it does **not** reject leading/trailing whitespace or an
-    /// all-whitespace name, so a queue registered as e.g. `" priority "` or
-    /// `" "` is unusual but valid. Trimming the filter here would silently
-    /// retarget such a query onto a *different* (trimmed) queue name than
-    /// the one actually registered — this endpoint's whole job is confirming
-    /// coverage for one exact, operator-supplied name — and an
-    /// all-whitespace value would collapse to "unfiltered" (matching
-    /// *every* queue) rather than "match this one whitespace-named queue",
-    /// the opposite of what a caller who typed that value intended. An
-    /// exact match that legitimately finds nothing is safer than either.
-    /// This intentionally sidesteps a real pre-#774-hardening bug where the
-    /// derive-based `Query<QueueCoverageQuery>` extractor's built-in
-    /// duplicate-key rejection surfaced as a `400` with a `text/plain` body
-    /// rather than the JSON `400` AC8 requires — using this hand-parsed,
-    /// always-succeeding path removes that failure mode entirely instead of
-    /// just recoloring its response body.
+    /// The value is preserved **verbatim**, never trimmed. Only the literal
+    /// empty string `""` normalizes to "no filter". This deliberately diverges
+    /// from the trim-and-treat-blank-as-absent convention of
+    /// `WorkerFilters::queue`. `WorkerConfig::with_queues` rejects only an
+    /// *exactly-empty* queue name (`assert!(!q.is_empty())`). It does **not**
+    /// reject leading or trailing whitespace or an all-whitespace name. So a
+    /// queue registered as `" priority "` or `" "` is unusual but valid.
+    ///
+    /// Trimming the filter here would silently retarget such a query onto a
+    /// *different* (trimmed) queue name. This endpoint exists to confirm
+    /// coverage for one exact, operator-supplied name. An all-whitespace
+    /// value would also collapse to "unfiltered", matching *every* queue.
+    /// That is the opposite of what the caller intended. An exact match that
+    /// legitimately finds nothing is safer than either.
+    ///
+    /// This hand-parsed, always-succeeding path intentionally sidesteps a
+    /// pre-#774-hardening bug. The duplicate-key rejection of the derive-based
+    /// `Query<QueueCoverageQuery>` extractor returned a `400` with a
+    /// `text/plain` body. AC8 requires a JSON `400`. This path removes that
+    /// failure mode instead of recoloring its response body.
     #[must_use]
     pub fn from_query_pairs(pairs: &[(String, String)]) -> Self {
         let mut params = Self::default();
@@ -185,9 +176,9 @@ pub struct QueueCoverageReport {
     /// Echo of the `queue_name` filter, if any.
     pub filter: Option<String>,
     /// Top-level summary (AC4): `true` when at least one queue has pending
-    /// work and zero live pollers, so a CI/CD gate asserts "fully covered"
-    /// with a single-field check instead of walking `items`. Reflects only
-    /// the inspected shards.
+    /// work and zero live pollers. A CI/CD gate asserts "fully covered" with
+    /// this one field instead of walking `items`. Reflects only the inspected
+    /// shards.
     pub uncovered: bool,
     /// Count of distinct uncovered queue names — the single number a
     /// "fully covered" gate compares against.
@@ -196,12 +187,12 @@ pub struct QueueCoverageReport {
     pub items: Vec<QueueCoverageEntry>,
     /// Per-shard inspection outcomes, including any unavailable shard.
     pub shards: Vec<QueueCoverageShardInspection>,
-    /// Queue names with pending work and zero live pollers that were
-    /// EXCLUDED from `items`/`uncovered` solely because the queue is
-    /// currently paused (see the module-level "Excluded: paused queues"
-    /// doc). Sorted, deduped across shards. A queue in this list would be
-    /// reported uncovered the moment it is unpaused without gaining a live
-    /// poller. Empty when nothing pending is both paused and pollerless.
+    /// Queue names with pending work and zero live pollers, EXCLUDED from
+    /// `items`/`uncovered` only because the queue is paused. See the
+    /// module-level "Excluded: paused queues" doc. Sorted, deduped across
+    /// shards. A queue in this list would be reported uncovered the moment it
+    /// is unpaused without gaining a live poller. Empty when nothing pending
+    /// is both paused and pollerless.
     pub excluded_paused_queues: Vec<String>,
     /// Declared queues that no live worker polls on a writable shard
     /// (issue #2479). Sorted and deduped across shards.
@@ -222,7 +213,7 @@ pub struct QueueCoverageReport {
 /// inspected shards.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueCoverageEntry {
-    /// The uncovered queue's name.
+    /// Name of the uncovered queue.
     pub queue_name: String,
     /// Total `PENDING` tasks on this queue across inspected shards.
     pub pending_count: i64,
@@ -319,11 +310,10 @@ impl QueueCoverageAccumulator {
 
 /// Build the queue-coverage report without mutating any state.
 ///
-/// Infallible by construction (mirrors `shard_health`'s report handler): a
-/// per-shard DB or query failure is folded into that shard's
-/// [`ShardObservation`] error rather than an `Err`, so a partial fleet
-/// outage degrades the report's `status` instead of failing the whole
-/// request.
+/// Infallible by construction, like the report handler of `shard_health`. A
+/// per-shard DB or query failure folds into that shard's [`ShardObservation`]
+/// error, not an `Err`. So a partial fleet outage degrades the report's
+/// `status` instead of failing the whole request.
 pub async fn build_queue_coverage_report(
     api_state: &HarvestApiState,
     query: QueueCoverageQuery,
@@ -493,21 +483,18 @@ fn merge_queue_name_sets(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// Whether `worker` is live (fresh heartbeat, `Active`/`Draining`, not
 /// `Stopped`) **and** assigned to `shard_id`.
 ///
-/// The two parts of coverage that depend only on the worker and the shard
-/// being inspected, never on which queue is being asked about. Factored out
-/// of [`worker_covers_queue`] so [`partition_uncovered_and_paused`] can
-/// compute it once per worker instead of once per (worker, pending-queue)
-/// pair.
+/// These two parts of coverage depend only on the worker and the shard, never
+/// on the queue. They are factored out of [`worker_covers_queue`], so
+/// [`partition_uncovered_and_paused`] computes them once per worker, not once
+/// per (worker, pending-queue) pair.
 ///
-/// Shard-membership (including the empty-`shard_assignments` legacy-worker
-/// special case) is delegated to the shared
-/// [`shard_fanout::worker_covers_shard`] predicate -- see its doc comment
-/// for the full rationale. That helper also backs
-/// `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover`, which had
-/// the identical gap (issue #1150, discovered as a duplicate of this
-/// function's own bug while implementing #774) -- factoring the predicate
-/// into one shared function means the two consumers cannot drift apart
-/// again.
+/// Shard membership, with the empty-`shard_assignments` legacy-worker case,
+/// is delegated to the shared [`shard_fanout::worker_covers_shard`]
+/// predicate. Its doc comment gives the full rationale. That helper also
+/// backs `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover`.
+/// Those had the identical gap (issue #1150), found as a duplicate of this
+/// function's bug during #774. With one shared predicate, the two consumers
+/// cannot drift apart again.
 fn worker_is_live_and_assigned(worker: &WorkerRow, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
@@ -515,8 +502,9 @@ fn worker_is_live_and_assigned(worker: &WorkerRow, shard_id: i32) -> bool {
     is_live && shard_fanout::worker_covers_shard(worker, shard_id)
 }
 
-/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
-/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
+/// Whether `worker` is a live poller of `queue_name` on `shard_id`.
+///
+/// A live poller is assigned to the shard, has a fresh heartbeat, is
 /// `Active` or `Draining` (not `Stopped`), and lists the queue.
 pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
@@ -527,38 +515,38 @@ pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id
     worker_is_live_and_assigned(worker, shard_id) && has_queue
 }
 
-/// Load only the workers that can possibly count as coverage on this shard's
-/// own connection: `status IN (Active, Draining)` **and** a fresh heartbeat,
-/// both applied server-side, in a single query.
+/// Load only the workers that can count as coverage, on this shard's own
+/// connection. One query applies `status IN (Active, Draining)` **and** a
+/// fresh heartbeat server-side.
 ///
-/// `worker_covers_queue` only ever treats an `Active`/`Draining` worker with
-/// a fresh heartbeat as live -- a `Stopped` row, or a crashed-but-still-
-/// `Active` row (nothing ever calls `transition_status` on a dead process;
-/// only its heartbeat goes stale) can never contribute coverage. A prior
-/// revision reused the shared, general-purpose `list_workers`/`WorkerFilters`
-/// surface, which applies only `status` in SQL and filters heartbeat
-/// freshness (`health`) client-side, *after* loading every status-matching
-/// row (`autumn_harvest::workers::apply_worker_filters`) -- so once the
-/// artificial `WorkerFilters::MAX_LIMIT` cap that bug caused was removed
-/// (see the git history for that round), this call had **no** bound at all
-/// on how many crashed-but-`Active`/`Draining` rows it deserialized on every
-/// coverage check that finds even one pending task, on a long-lived
-/// deployment that never cleanly shuts down every worker (issue #774
-/// review, fourth round).
+/// `worker_covers_queue` treats only an `Active`/`Draining` worker with a
+/// fresh heartbeat as live. A `Stopped` row never contributes coverage. A
+/// crashed row that is still `Active` never does either. Nothing calls
+/// `transition_status` on a dead process; only its heartbeat goes stale.
 ///
-/// This bypasses `list_workers` entirely and issues a purpose-built
-/// existence query instead: the heartbeat cutoff
-/// (`Utc::now() - worker_stale_threshold`) is computed once, in Rust, then
-/// bound as a plain timestamp comparison alongside the `status IN (...)`
-/// filter -- so Postgres itself excludes every crashed/stale row before a
-/// single byte crosses the wire, and there is no need for (and no risk of
-/// re-truncating past) any row-count limit at all. `.ge(cutoff)` matches
-/// `WorkerHealth::classify`'s own boundary exactly (`elapsed <=
-/// stale_threshold` is Healthy, i.e. `last_heartbeat_at >= now -
-/// stale_threshold`), so a row that passes this SQL filter is *guaranteed*
-/// to classify as `Healthy` a moment later -- the trailing `WorkerHealth::classify`
-/// call below is therefore a cheap, defense-in-depth confirmation of an
-/// already-SQL-filtered set, not a second unbounded pass over stale rows.
+/// A prior revision reused the general-purpose `list_workers`/`WorkerFilters`
+/// surface. It applies only `status` in SQL. It filters heartbeat freshness
+/// (`health`) client-side, *after* it loads every status-matching row
+/// (`autumn_harvest::workers::apply_worker_filters`). That bug forced an
+/// artificial `WorkerFilters::MAX_LIMIT` cap. Once the cap was removed, the
+/// call had **no** bound on the crashed `Active`/`Draining` rows it
+/// deserialized. Each coverage check that found one pending task paid that
+/// cost. The cost grows on a long-lived deployment that never cleanly stops
+/// its workers (issue #774).
+///
+/// So this bypasses `list_workers` and issues a purpose-built query. Rust
+/// computes the heartbeat cutoff (`Utc::now() - worker_stale_threshold`)
+/// once. The query binds it as a timestamp comparison beside the
+/// `status IN (...)` filter. Postgres then excludes every crashed or stale
+/// row before a byte crosses the wire. No row-count limit is needed, so none
+/// can re-truncate the result.
+///
+/// `.ge(cutoff)` matches the boundary of `WorkerHealth::classify` exactly:
+/// `elapsed <= stale_threshold` is Healthy, so
+/// `last_heartbeat_at >= now - stale_threshold`. A row that passes this
+/// filter is *guaranteed* to classify as `Healthy` a moment later. The
+/// trailing `WorkerHealth::classify` call is a cheap defense-in-depth check
+/// of an already-filtered set, not a second unbounded pass.
 pub(crate) async fn fetch_potentially_live_workers(
     conn: &mut AsyncPgConnection,
     worker_stale_threshold: Duration,
@@ -713,8 +701,8 @@ pub fn partition_uncovered_and_paused(
     (rows, paused_uncovered)
 }
 
-/// The pre-fix per-demand scan, kept for the small-`pending` case. See
-/// [`partition_uncovered_and_paused`]'s doc comment. There is no upfront
+/// The pre-fix per-demand scan, kept for the small-`pending` case. See the
+/// body comment of [`partition_uncovered_and_paused`]. There is no upfront
 /// index here, so a single filtered demand costs at most one pass over
 /// `workers`, short-circuiting on the first covering one.
 fn partition_uncovered_and_paused_direct(
@@ -1279,12 +1267,11 @@ mod tests {
     #[test]
     fn legacy_worker_with_empty_shard_assignments_covers_shard_zero() {
         // A `Worker::run` legacy single-shard worker (no explicit
-        // `shard_assignments` configured) registers with a literal `[]`, but
-        // its poll loop falls back to the default pool and claims work
-        // against whatever database that pool points at -- this coverage
-        // check must treat that the same way, or every queue a perfectly
-        // healthy legacy worker actually polls is falsely reported
-        // uncovered.
+        // `shard_assignments`) registers with a literal `[]`. Its poll loop
+        // falls back to the default pool and claims work from whatever
+        // database that pool points at. This check must do the same.
+        // Otherwise every queue a healthy legacy worker polls is falsely
+        // reported uncovered.
         let worker = worker_row(
             WorkerStatus::Active,
             WorkerHealth::Healthy,
@@ -1296,15 +1283,14 @@ mod tests {
 
     #[test]
     fn legacy_worker_with_empty_shard_assignments_covers_a_nonzero_shard_too() {
-        // The empty-array normalization must NOT be hardcoded to shard 0:
-        // `worker_covers_queue` is only ever called by `observe_shard` with a
-        // worker/shard_id pair already scoped to that one shard's own
-        // connection, so an empty-array worker found there covers whatever
-        // `shard_id` is being evaluated -- including a deployment whose
-        // single/default shard is numbered something other than 0 (issue
-        // #774 review). A worker row is identical regardless of which shard
-        // it was fetched from; only the `shard_id` argument -- standing in
-        // for which shard's connection produced this row -- changes here.
+        // The empty-array normalization must NOT be hardcoded to shard 0.
+        // Only `observe_shard` calls `worker_covers_queue`, with a
+        // worker/shard_id pair scoped to that shard's own connection. So an
+        // empty-array worker found there covers whatever `shard_id` is
+        // evaluated. That includes a single or default shard numbered other
+        // than 0 (issue #774). A worker row is the same from any shard. Only
+        // the `shard_id` argument changes here. It stands in for the shard
+        // connection that produced the row.
         let worker = worker_row(
             WorkerStatus::Active,
             WorkerHealth::Healthy,
@@ -1371,10 +1357,10 @@ mod tests {
     #[test]
     fn build_incompatible_worker_still_covers_ac5() {
         // AC5: this check answers "does any live worker poll this queue at
-        // all", never "...with a build compatible with the pending task's
-        // required_build_id" — that distinction belongs to #171's
-        // `build_reachability`. `worker_covers_queue` must never consult
-        // `build_id`, so an arbitrary/incompatible build still covers.
+        // all". Build compatibility with the pending task's
+        // `required_build_id` belongs to `build_reachability` (#171).
+        // `worker_covers_queue` must never consult `build_id`, so an
+        // incompatible build still covers.
         let worker = worker_row_with_build(
             WorkerStatus::Active,
             WorkerHealth::Healthy,
@@ -1416,9 +1402,8 @@ mod tests {
 
     #[test]
     fn partition_paused_and_covered_queue_is_reported_nowhere() {
-        // A paused queue that already has a live poller has nothing
-        // interesting to report — it would not have been uncovered even if
-        // it were unpaused right now.
+        // A paused queue with a live poller has nothing to report. It would
+        // not be uncovered even if it were unpaused now.
         let pending = vec![pending_demand("paused_covered_q", 5)];
         let worker = worker_row(
             WorkerStatus::Active,
@@ -1532,10 +1517,10 @@ mod tests {
 
     #[test]
     fn from_query_pairs_duplicate_key_last_value_wins() {
-        // A repeated `queue_name` resolves last-value-wins, never a 400 —
-        // this is the direct fix for the pre-hardening AC8 regression
-        // where the derive-based extractor rejected a duplicate key with a
-        // `text/plain` body instead of the required JSON error shape.
+        // A repeated `queue_name` resolves last-value-wins, never a 400. This
+        // fixes the pre-hardening AC8 regression. The derive-based extractor
+        // rejected a duplicate key with a `text/plain` body, not the required
+        // JSON error shape.
         let pairs = vec![
             ("queue_name".to_string(), "first".to_string()),
             ("queue_name".to_string(), "second".to_string()),
@@ -1555,11 +1540,11 @@ mod tests {
 
     #[test]
     fn from_query_pairs_whitespace_only_value_is_preserved_as_exact_filter() {
-        // A whitespace-only value is NOT normalized away -- `with_queues`
-        // permits a queue name that is entirely whitespace (it only rejects
-        // the exactly-empty string), so trimming/dropping this filter would
-        // make it impossible to query coverage for such a queue, and would
-        // silently widen the filter to "match every queue" instead.
+        // A whitespace-only value is NOT normalized away. `with_queues`
+        // permits an all-whitespace queue name; it rejects only the
+        // exactly-empty string. Dropping this filter would make such a queue
+        // impossible to query. It would also silently widen the filter to
+        // "match every queue".
         let pairs = vec![("queue_name".to_string(), "   ".to_string())];
         let query = QueueCoverageQuery::from_query_pairs(&pairs);
         assert_eq!(query.queue_name.as_deref(), Some("   "));
@@ -1567,9 +1552,9 @@ mod tests {
 
     #[test]
     fn from_query_pairs_preserves_surrounding_whitespace() {
-        // Surrounding whitespace is preserved verbatim, not trimmed -- a
-        // queue registered as e.g. " email-workers " (unusual but valid
-        // under `with_queues`) must be filterable by its exact name.
+        // Surrounding whitespace is preserved verbatim, not trimmed. A queue
+        // registered as " email-workers " is unusual but valid under
+        // `with_queues`. It must be filterable by its exact name.
         let pairs = vec![("queue_name".to_string(), "  email-workers  ".to_string())];
         let query = QueueCoverageQuery::from_query_pairs(&pairs);
         assert_eq!(query.queue_name.as_deref(), Some("  email-workers  "));

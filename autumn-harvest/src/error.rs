@@ -1,8 +1,8 @@
 //! Error types for the harvest engine.
 //!
-//! `HarvestError` is a proper `std::error::Error` (via thiserror) so it can be
-//! propagated with `?` through internal engine code and wrapped in `AutumnError`
-//! at the boundary where workflow/activity results leave the engine.
+//! `HarvestError` implements `std::error::Error` through thiserror. Engine code
+//! propagates it with `?`. The boundary where workflow and activity results
+//! leave the engine wraps it in `AutumnError`.
 //!
 //! Note: `AutumnError` (from autumn-web) is intentionally NOT `std::error::Error`
 //! — it is an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
@@ -14,10 +14,6 @@ use crate::quota::QuotaResource;
 use crate::types::{
     ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget,
 };
-
-// ---------------------------------------------------------------------------
-// PayloadKind
-// ---------------------------------------------------------------------------
 
 /// The category of payload that exceeded a configured size cap (issue #252).
 ///
@@ -42,9 +38,9 @@ pub enum PayloadKind {
     /// Value passed to `WorkflowContext::side_effect` at recording time.
     SideEffectValue,
     /// A per-tenant [`crate::quota::QuotaPolicy`] key resolved from workflow
-    /// input at admission time (issue #946), rejected before it reaches the
-    /// indexed `quota_key` column because a Postgres B-tree index entry has
-    /// a hard size limit. See [`crate::quota::MAX_QUOTA_KEY_BYTES`].
+    /// input at admission time (issue #946). It is rejected before it reaches
+    /// the indexed `quota_key` column, because a Postgres B-tree index entry
+    /// has a hard size limit. See [`crate::quota::MAX_QUOTA_KEY_BYTES`].
     QuotaKey,
 }
 
@@ -118,9 +114,9 @@ pub struct NonDeterministicDetails {
 
 /// One shard's contribution to a refused codec-key retirement (issue #948).
 ///
-/// Either the shard still holds `rows` events referencing the key, or it could
-/// not be read at all (`reachable = false`) — which blocks retirement just as
-/// firmly, because an uncounted shard is never a zero.
+/// Either the shard still holds `rows` events that reference the key, or it
+/// could not be read (`reachable = false`). An unread shard blocks retirement
+/// just as firmly, because an uncounted shard is never a zero.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodecKeyShardRemainder {
     /// The shard this remainder was observed on.
@@ -299,15 +295,16 @@ pub enum HarvestError {
     #[error("workflow paused: {0}")]
     WorkflowPaused(ExecutionId),
 
-    /// Returned (under the start transaction's `FOR UPDATE` lock) when a start
-    /// would create a **fresh** execution for a workflow that has a debounce
-    /// policy, via an entry point that does not itself perform debounce
-    /// admission (the fresh path of plain start, signal-with-start,
-    /// update-with-start, or batch start). The caller routes this to debounce
-    /// admission (plain start) or rejects the request (signal/update/batch).
-    /// Because the decision is made under the lock, an attach/idempotent call
-    /// (no fresh execution created) never raises it — closing the TOCTOU of an
-    /// unlocked pre-scan (issue #499).
+    /// A start would create a **fresh** execution for a workflow with a
+    /// debounce policy (issue #499).
+    ///
+    /// The start transaction returns it under its `FOR UPDATE` lock. The entry
+    /// point does not perform debounce admission itself: it is the fresh path
+    /// of plain start, signal-with-start, update-with-start, or batch start.
+    /// The caller routes this to debounce admission (plain start) or rejects
+    /// the request (signal/update/batch). The decision is made under the lock,
+    /// so an attach or idempotent call (no fresh execution) never raises it.
+    /// That closes the TOCTOU of an unlocked pre-scan.
     #[error(
         "workflow '{workflow_name}' (id '{workflow_id}') has a debounce policy; \
          a fresh start must go through debounce admission, not this endpoint"
@@ -389,11 +386,10 @@ pub enum HarvestError {
     /// A stored codec envelope names a codec **key id** that is not registered
     /// (issue #948).
     ///
-    /// Distinct from [`HarvestError::UnknownPayloadCodec`]: the codec itself may
-    /// well be registered — it is the *key material* for that envelope's `kid`
-    /// that is missing, typically because the key was retired before the lazy
-    /// re-encryption sweep finished, or because a reader in a rotation window
-    /// was never given the outgoing key.
+    /// Distinct from [`HarvestError::UnknownPayloadCodec`]: the codec itself
+    /// may be registered. The *key material* for the envelope's `kid` is
+    /// missing. Usually the key was retired before the lazy re-encryption sweep
+    /// finished, or a reader in a rotation window never got the outgoing key.
     #[error("unknown payload codec key id {key_id} (codec {codec_id})")]
     UnknownCodecKey {
         /// The key id stored in the envelope's `kid` field.
@@ -415,8 +411,8 @@ pub enum HarvestError {
     ///
     /// `remaining` names, per shard, how many `harvest_events` rows still carry
     /// the key id. A shard that could not be read appears with
-    /// `reachable = false` and blocks retirement on its own — a shard we cannot
-    /// count is never counted as zero.
+    /// `reachable = false` and blocks retirement on its own. An uncounted shard
+    /// never counts as zero.
     #[error(
         "codec key id {key_id} cannot be retired: {} shard(s) still reference it or could not be \
          read ({})",
@@ -461,9 +457,10 @@ pub enum HarvestError {
     /// A payload-store operation (offload `put`, fetch `get`, or `delete`)
     /// failed, or an offloaded payload could not be reconstructed (issue #524).
     ///
-    /// Covers external-store I/O errors, an unknown `store_id` on read, and a
-    /// content-checksum mismatch between the fetched blob and the recorded
-    /// reference envelope (which would otherwise silently corrupt replay).
+    /// Covers external-store I/O errors and an unknown `store_id` on read. It
+    /// also covers a checksum mismatch between the fetched blob and the
+    /// recorded reference envelope, which would otherwise silently corrupt
+    /// replay.
     #[error("payload offload error: {0}")]
     PayloadOffload(String),
 
@@ -644,15 +641,16 @@ pub enum HarvestError {
         timeout_ms: u64,
     },
 
-    /// The execution row exists and is terminal, but its recorded history can
-    /// no longer be replayed to reconstruct final state for a post-mortem query
-    /// (issue #612). This happens when the history was pruned by retention,
-    /// released on reset (`TERMINATED`), or had its payloads erased (issue #495).
+    /// A terminal execution's history can no longer be replayed for a
+    /// post-mortem query (issue #612).
     ///
-    /// This is **distinct** from [`NotFound`][Self::NotFound] (row gone → 404):
-    /// here the row is present but its history is unqueryable, so returning a
-    /// partial/empty/erased answer would be misleading. Surfaces as `410 Gone`
-    /// at the management API layer.
+    /// The history was pruned by retention, released on reset (`TERMINATED`),
+    /// or had its payloads erased (issue #495).
+    ///
+    /// This is **distinct** from [`NotFound`][Self::NotFound] (row gone → 404).
+    /// Here the row is present but its history is unqueryable. A partial,
+    /// empty or erased answer would mislead. Surfaces as `410 Gone` at the
+    /// management API layer.
     #[error("history unavailable: {reason} ({exec_id})")]
     HistoryUnavailable {
         /// The execution whose history cannot be queried.
@@ -663,9 +661,9 @@ pub enum HarvestError {
 
     /// A payload exceeded the configured size cap at a write boundary.
     ///
-    /// Returned synchronously at the moment the oversized payload is detected
-    /// (activity input at schedule time, activity result at completion time,
-    /// signal payload at send time, etc.). No event is written to
+    /// Returned synchronously when the oversized payload is detected. Examples
+    /// are activity input at schedule time, activity result at completion
+    /// time, and signal payload at send time. No event is written to
     /// `harvest_events` for pre-event rejections.
     ///
     /// The cap is enforced **only on new writes**. Payloads already stored in
@@ -756,18 +754,18 @@ pub enum HarvestError {
     ///
     /// Returned by the admission check inside
     /// [`crate::execution::start_or_load_workflow_execution_collect`] —
-    /// **before** any `WorkflowStarted` event is written. No execution row,
-    /// no event, and no task queue row are created for a rejected start; the
-    /// caller sees a clean rejection rather than a partially-admitted run.
+    /// **before** any `WorkflowStarted` event is written. A rejected start
+    /// creates no execution row, no event and no task queue row. The caller
+    /// sees a clean rejection, not a partially-admitted run.
     ///
     /// `current` is the usage observed at rejection time, *before* this
     /// admission attempt — see [`crate::quota::check_quota`] for the exact
     /// `current >= limit` boundary semantics.
     ///
-    /// Surfaces as `429 Too Many Requests` at the management API layer with
-    /// a JSON body naming the exhausted `resource`, `key`, `limit`, and
-    /// `current` so callers can back off intelligently rather than retry
-    /// blindly (issue #946 AC4 — never a silent drop, never a `500`).
+    /// Surfaces as `429 Too Many Requests` at the management API layer. The
+    /// JSON body names the exhausted `resource`, `key`, `limit`, and `current`,
+    /// so callers can back off rather than retry blindly. Issue #946 AC4 rules
+    /// out a silent drop and a `500`.
     #[error(
         "quota exceeded for workflow '{workflow_name}' key '{key}': \
          {resource} at {current}/{limit}"
@@ -793,11 +791,10 @@ pub enum HarvestError {
     ///
     /// Raised by [`crate::replication::assert_fence`] on the persist path and
     /// by the worker's periodic self-fence check. It is **terminal for the
-    /// worker, not for the workflow**: the work is untouched and will be
-    /// claimed by a worker in the region that actually holds authority. A
-    /// worker that sees this must stop, never retry and never re-pin — re-
-    /// pinning to the newer generation is exactly the split-brain the epoch
-    /// exists to prevent.
+    /// worker, not for the workflow**. The work is untouched, and a worker in
+    /// the region that holds authority claims it. A worker that sees this must
+    /// stop, never retry and never re-pin. Re-pinning to the newer generation
+    /// is exactly the split-brain the epoch exists to prevent.
     ///
     /// `current` is `None` when the shard's `harvest_shard_generation` row is
     /// absent entirely. That also fences: a pinned worker with nothing to
@@ -840,15 +837,15 @@ pub enum HarvestError {
 
     /// A shard this operation must reach is not available from this process.
     ///
-    /// Raised when an opt-in cross-shard child placement (issue #956) resolves
-    /// to a shard that this node has no pool for, or whose pool cannot hand out
-    /// a connection. It is deliberately **not** a fallback: placing the child on
-    /// the parent's shard instead would break the placement contract silently,
-    /// which is exactly the failure mode issue #956 AC8 rules out.
+    /// An opt-in cross-shard child placement (issue #956) raises it. The
+    /// resolved shard has no pool on this node, or its pool cannot hand out a
+    /// connection. It is deliberately **not** a fallback. A child placed on
+    /// the parent's shard instead breaks the placement contract silently.
+    /// Issue #956 AC8 rules out exactly that failure mode.
     ///
-    /// **Retryable.** Nothing was written — the caller (a parked parent whose
-    /// decision cycle rolled back, or the cross-shard relay) should retry once
-    /// the shard is reachable again. Classify it with
+    /// **Retryable.** Nothing was written. The caller should retry once the
+    /// shard is reachable again. The caller is a parked parent whose decision cycle
+    /// rolled back, or the cross-shard relay. Classify it with
     /// [`HarvestError::is_shard_unavailable`] rather than by matching the
     /// variant, so a caller keeps compiling as this enum grows.
     ///
@@ -969,10 +966,12 @@ pub enum HarvestError {
     },
 
     /// A `ctx.await_external_workflow(...)` call could not observe the target's
-    /// terminal outcome (issue #757) — a **transport** failure, distinct from a
-    /// target that reached a non-`COMPLETED` terminal state (which surfaces as a
-    /// typed [`WorkflowFailed`](HarvestError::WorkflowFailed) carrying the
-    /// target's own terminal cause).
+    /// terminal outcome (issue #757).
+    ///
+    /// This is a **transport** failure. A target that reached a non-`COMPLETED`
+    /// terminal state is different: it surfaces as a typed
+    /// [`WorkflowFailed`](HarvestError::WorkflowFailed) with the target's own
+    /// terminal cause.
     ///
     /// `reason_code` is one of:
     /// - `"self_await"` — the target is the calling workflow's own `ExecutionId`.
@@ -1010,8 +1009,8 @@ pub enum HarvestError {
     /// #606).
     ///
     /// Distinct from an ordinary activity failure: partial local state
-    /// (a downloaded file, a warmed cache) may be lost, so this is
-    /// deliberately never silently retried onto a different worker. The
+    /// (a downloaded file, a warmed cache) may be lost. So the engine
+    /// deliberately never retries it silently onto a different worker. The
     /// workflow author must re-establish the session and restart the
     /// affected steps.
     #[error("session {session_id} broken: {reason}")]
@@ -1026,10 +1025,10 @@ pub enum HarvestError {
     /// A workflow tried to re-acquire a durable mutex key it already holds
     /// (issue #691).
     ///
-    /// Durable mutexes are non-reentrant: acquiring a key the same workflow
-    /// already holds would deadlock (the holder can never release while it is
-    /// blocked waiting for itself), so `ctx.mutex(key).acquire()` returns this
-    /// synchronously instead of parking. Author-catchable.
+    /// Durable mutexes are non-reentrant. A second acquire of a held key would
+    /// deadlock, because the holder cannot release while it waits for itself.
+    /// So `ctx.mutex(key).acquire()` returns this synchronously instead of
+    /// parking. Author-catchable.
     #[error("workflow already holds mutex '{key}'; re-acquiring the same key would deadlock")]
     MutexSelfDeadlock {
         /// The lock key the workflow already holds.
@@ -1039,22 +1038,22 @@ pub enum HarvestError {
     /// The worker that claimed a task has **no handler registered** for its
     /// workflow or activity type (issue #804).
     ///
-    /// This is a **blameless fleet condition, not a workload failure**: any
-    /// worker polling a queue can claim any task on it (the queue's
-    /// non-blocking claim query has no capability filter, and cannot have one
-    /// — a worker can enumerate the handlers it *has* registered, never the
-    /// ones it has not).
+    /// This is a **blameless fleet condition, not a workload failure**. Any
+    /// worker that polls a queue can claim any task on it. The non-blocking
+    /// claim query has no capability filter, and cannot have one. A worker can
+    /// enumerate the handlers it *has* registered, never the ones it has not.
     /// The routine trigger is the transient window of a rolling deploy that
     /// introduces a new workflow or activity type.
     ///
-    /// The worker's dispatch path intercepts this variant specifically and
-    /// **releases** the claim back to `PENDING` for a capable peer, up to
-    /// `WorkerConfig::capability_miss_max_redeliveries`, before falling through
-    /// to the ordinary terminal-failure path with a `no_capable_worker:` reason.
+    /// The worker's dispatch path intercepts this variant and **releases** the
+    /// claim back to `PENDING` for a capable peer. It does so up to
+    /// `WorkerConfig::capability_miss_max_redeliveries` times. Then it falls
+    /// through to the ordinary terminal-failure path with a
+    /// `no_capable_worker:` reason.
     ///
     /// It is a **dedicated variant rather than a `Config` string match** on
-    /// purpose: `Config` is a broad catch-all, and classifying on its message
-    /// would swallow every genuine configuration error into an infinite
+    /// purpose. `Config` is a broad catch-all. Classifying on its message would
+    /// swallow every genuine configuration error into an infinite
     /// release-and-retry loop.
     #[error("no {kind} handler registered for '{name}' on this worker")]
     HandlerNotRegistered {
@@ -1075,48 +1074,46 @@ pub enum HarvestError {
     /// (issue #1182).
     ///
     /// This is a **blameless, not-a-real-failure sentinel**, exactly like
-    /// [`Self::HandlerNotRegistered`]: it means "no terminal decision can be
-    /// made from here," never "the workflow failed." It exists so that
-    /// propagating it with `?` out of the *entire* persistence transaction —
-    /// including any lock the transaction holds and any bookkeeping write
-    /// made earlier in the same cycle — forces a full rollback before any
-    /// claim-release attempt runs.
+    /// [`Self::HandlerNotRegistered`]. It means "no terminal decision can be
+    /// made from here", never "the workflow failed". The caller propagates it
+    /// with `?` out of the *entire* persistence transaction. That forces a full
+    /// rollback before any claim-release attempt runs. The rollback covers any
+    /// lock the transaction holds and any bookkeeping write of the same cycle.
     ///
-    /// That ordering matters because Postgres does not release a row lock
-    /// when a nested `SAVEPOINT` is released, only when the *outermost*
-    /// transaction ends. The persistence transaction locks the execution row
-    /// (`check_paused_and_park`'s `FOR UPDATE`) for its whole duration, so a
-    /// claim-release attempted *while still inside* that transaction would
-    /// contend for the task row while still holding the execution row —
-    /// the exact ABBA cycle against `poison_pill::quarantine_orphan`'s
-    /// reversed (task-row-first) lock order that `SKIP LOCKED` exists to
-    /// avoid in the first place. Surfacing this variant instead lets the
-    /// transaction roll back and release the execution row *first*; the
-    /// actual release then runs standalone, after `?` and the `.await` on
-    /// the transaction have both returned, with no other lock held.
+    /// That ordering matters. Postgres does not release a row lock when a
+    /// nested `SAVEPOINT` is released, only when the *outermost* transaction
+    /// ends. The persistence transaction locks the execution row
+    /// (`check_paused_and_park`'s `FOR UPDATE`) for its whole duration. A
+    /// claim-release *inside* that transaction would contend for the task row
+    /// while it still holds the execution row. That is the exact ABBA cycle
+    /// against the reversed (task-row-first) lock order of
+    /// `poison_pill::quarantine_orphan`, which `SKIP LOCKED` exists to avoid.
+    /// This variant lets the transaction roll back and release the execution
+    /// row *first*. The actual release then runs standalone, with no other
+    /// lock held. It runs after `?` and the `.await` on the transaction have
+    /// both returned.
     #[error("suspended workflow dispatch made no progress and could not confirm claim ownership")]
     SuspendedClaimAmbiguous {
         /// The task-queue row whose ownership could not be confirmed.
         task_id: Uuid,
     },
 
-    /// An ordinary workflow-task terminal write (complete, fail, or an
-    /// operator-pause park) could not confirm it still owns the task's claim
-    /// under the row lock (issue #1184).
+    /// An ordinary workflow-task terminal write could not confirm that it
+    /// still owns the task's claim under the row lock (issue #1184).
     ///
-    /// Sibling of [`Self::SuspendedClaimAmbiguous`], not a reuse of it: that
-    /// variant is scoped to issue #1182's narrow empty-command-set escalation
-    /// branch specifically, while this one covers the ordinary completion/
-    /// failure/pause-park paths #1184 closes the same gap for. Same
-    /// blameless-sentinel contract and the same rollback/lock-ordering
-    /// rationale apply verbatim: propagating this with `?` out of the entire
-    /// persistence transaction rolls back every lock and bookkeeping write
-    /// from this cycle *before* any claim-release attempt runs, avoiding the
-    /// ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
-    /// (task-row-first) lock order that a release attempted while still
-    /// holding the execution row would risk. See
-    /// [`Self::SuspendedClaimAmbiguous`]'s doc comment for the full
-    /// explanation.
+    /// The write is a complete, a fail, or an operator-pause park.
+    ///
+    /// Sibling of [`Self::SuspendedClaimAmbiguous`], not a reuse of it. That
+    /// variant covers only the narrow empty-command-set escalation branch of
+    /// issue #1182. This one covers the ordinary completion, failure and
+    /// pause-park paths, where #1184 closes the same gap. The same
+    /// blameless-sentinel contract and rollback/lock-ordering rationale apply
+    /// verbatim. Propagating this with `?` out of the entire persistence
+    /// transaction rolls back every lock and bookkeeping write of this cycle.
+    /// That happens *before* any claim-release attempt runs. A release that
+    /// still holds the execution row risks the ABBA cycle against the reversed
+    /// (task-row-first) lock order of `poison_pill::quarantine_orphan`. See
+    /// [`Self::SuspendedClaimAmbiguous`] for the full explanation.
     #[error("a workflow-task terminal write could not confirm it still owns the task's claim")]
     TerminalWriteClaimAmbiguous {
         /// The task-queue row whose ownership could not be confirmed.
@@ -1147,28 +1144,27 @@ pub enum HarvestError {
 /// Getting this wrong is a two-sided hazard, which is why it is a phase rather
 /// than a blanket rule:
 /// - Always preserving lets a *healthy* workflow accumulate strikes from
-///   post-handler misses it had nothing to do with (its body finished fine;
-///   only persistence found an unregistered child/activity type), so a single
-///   later transient timeout can tip it into poison-pill quarantine.
-/// - Always clearing lets an incapable worker erase a *genuinely hung* — or
-///   genuinely worker-killing — execution's streak every time it happens to
-///   claim the row, so `poison_pill_threshold` is never reached in a mixed
-///   fleet and #494/#367's protection is silently defeated by a blameless third
-///   party.
+///   post-handler misses it had nothing to do with. Its body finished fine;
+///   only persistence found an unregistered child or activity type. A single
+///   later transient timeout can then tip it into poison-pill quarantine.
+/// - Always clearing lets an incapable worker erase the streak of a
+///   *genuinely hung* or worker-killing execution each time it claims the
+///   row. Then `poison_pill_threshold` is never reached in a mixed fleet. A
+///   blameless third party silently defeats the protection of #494 and #367.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityMissPhase {
     /// Detected before the handler was invoked — the workflow-type lookup in
     /// `process_workflow_task`, or the activity-type lookup in
     /// `process_activity_task`. The handler never ran.
     BeforeHandler,
-    /// Detected *while* the workflow body was executing: a local activity
-    /// (issue #98) is resolved inline, mid-suspension, so a worker without its
+    /// Detected *while* the workflow body was executing. A local activity
+    /// (issue #98) resolves inline, mid-suspension. A worker without its
     /// handler cannot carry the body forward. The body has **not** returned.
     DuringHandler,
-    /// Detected after the workflow body returned its commands, while persisting
-    /// the decision — an unregistered activity to schedule, or an unregistered
-    /// child workflow type to start. The body ran to a conclusion inside its
-    /// deadline.
+    /// Detected after the workflow body returned its commands, while the
+    /// decision persists. The miss is an unregistered activity to schedule, or
+    /// an unregistered child workflow type to start. The body ran to a
+    /// conclusion inside its deadline.
     AfterHandler,
 }
 
@@ -1189,7 +1185,7 @@ impl CapabilityMissPhase {
     /// Deliberately a **different** fact from
     /// [`Self::handler_ran_to_conclusion`], and the two disagree on exactly one
     /// phase — [`Self::DuringHandler`], which began the body but did not finish
-    /// it. The strike counters ask "did it finish?"; the dispatch-attempt
+    /// it. The strike counters ask "did it finish?". The dispatch-attempt
     /// question below asks "did it begin?", because everything that fires at
     /// the *start* of a dispatch has already fired by then.
     #[must_use]
@@ -1202,17 +1198,18 @@ impl CapabilityMissPhase {
     ///
     /// Only [`Self::BeforeHandler`]. `attempt` does double duty on a task row:
     ///
-    /// - it is the **retry budget** for an activity task, which a miss must not
-    ///   drain because the handler never ran (the exact bug issue #369 fixed
-    ///   for rate-limit deferrals); and
+    /// - it is the **retry budget** for an activity task. A miss must not
+    ///   drain it, because the handler never ran. Issue #369 fixed this exact
+    ///   bug for rate-limit deferrals.
     /// - it is the **"is this the first dispatch?"** signal `record_workflow_started`
     ///   reads on a workflow task (`task.attempt == 1` plus "no scheduling
     ///   events in history").
     ///
-    /// Those two roles want opposite things once the handler has run. A
-    /// post-handler miss — the persist-time pre-pass finding an unregistered
-    /// activity or child type — happens *after* the start metric fired, and its
-    /// persistence transaction rolls back, so no scheduling event lands either.
+    /// Those two roles want opposite things once the handler has run. In a
+    /// post-handler miss, the persist-time pre-pass finds an unregistered
+    /// activity or child type. That happens *after* the start metric fired.
+    /// Its persistence transaction rolls back, so no scheduling event lands
+    /// either.
     /// Restoring `attempt` there would leave the next capable claim looking
     /// exactly like a first dispatch. `harvest.workflow.started` would then be
     /// emitted a **second** time for one execution. That inflates start counts
@@ -1225,8 +1222,8 @@ impl CapabilityMissPhase {
     ///   activity-handler lookup in `process_activity_task`), so the retry
     ///   budget is still always restored where it is a budget.
     /// - Every [`Self::DuringHandler`]/[`Self::AfterHandler`] miss is on a
-    ///   **workflow** task, where `attempt` is read only by the metric gate
-    ///   above and the informational `attempts` field of a dead-letter row. It
+    ///   **workflow** task. There only the metric gate above and the
+    ///   informational `attempts` field of a dead-letter row read `attempt`. It
     ///   is not a claim filter (`claim_task` never selects on it) and not the
     ///   issue #523 workflow-level retry budget, which counts the
     ///   `harvest_workflow_executions.workflow_attempt` column instead.
@@ -1242,9 +1239,9 @@ impl CapabilityMissPhase {
     /// strike for the owning execution?
     ///
     /// Only [`Self::AfterHandler`]. [`Self::DuringHandler`] is deliberately
-    /// conservative: a mid-body miss is not a completed body, so a workflow
-    /// that hangs *after* its first local activity must not be able to reset
-    /// its own streak on every redelivery.
+    /// conservative, because a mid-body miss is not a completed body. A
+    /// workflow that hangs *after* its first local activity must not reset its
+    /// own streak on every redelivery.
     #[must_use]
     pub const fn clears_workflow_timeout_strike(self) -> bool {
         self.handler_ran_to_conclusion()
@@ -1259,10 +1256,10 @@ impl CapabilityMissPhase {
     /// pre-/mid-handler miss must leave the counter alone.
     ///
     /// Clearing it unconditionally would let an incapable worker launder a
-    /// poison task's history: in a heterogeneous fleet, an incapable claim
-    /// landing between two capable crashes resets the streak to zero every
-    /// time, so `poison_pill_threshold` is never reached and the task goes on
-    /// crashing replacement workers indefinitely. That is the same
+    /// poison task's history. In a heterogeneous fleet, an incapable claim
+    /// between two capable crashes resets the streak to zero every time. Then
+    /// `poison_pill_threshold` is never reached, and the task goes on crashing
+    /// replacement workers indefinitely. That is the same
     /// blameless-third-party defeat this type exists to prevent for #494.
     ///
     /// Preserving is still strictly weaker than *incrementing*: AC4 requires
@@ -1279,23 +1276,23 @@ impl CapabilityMissPhase {
     /// consecutive-workflow-handler-panic strike?
     ///
     /// The panic strike map counts how many times in a row this execution's
-    /// *body* panicked, so — exactly like the two counters above — only a
-    /// dispatch that ran the body to a conclusion is evidence the streak is
-    /// broken.
+    /// *body* panicked. As with the two counters above, only a dispatch that
+    /// ran the body to a conclusion is evidence that the streak is broken.
     ///
-    /// A capability miss that surfaces before or during the handler is a
-    /// **non-terminal** condition: the dispatch path releases the task for a
-    /// capable peer instead of failing the execution. Clearing the strike there
-    /// would let a worker that alternates between panicking on the body and
-    /// missing an unregistered local activity reset `workflow_panic_max_attempts`
-    /// forever, so the panic budget is never reached and #782's containment is
-    /// silently defeated — the same blameless-third-party defeat this type
-    /// already prevents for #494 and #367.
+    /// A capability miss before or during the handler is a **non-terminal**
+    /// condition. The dispatch path releases the task for a capable peer
+    /// instead of failing the execution. Take a worker that alternates between
+    /// a panic on the body and a miss on an unregistered local activity. If a
+    /// miss cleared the strike, that worker would reset
+    /// `workflow_panic_max_attempts` forever. The panic budget would never be
+    /// reached, and #782's containment would be silently defeated. That is
+    /// the same blameless-third-party defeat this type prevents for #494 and
+    /// #367.
     ///
-    /// A *terminal* failure still clears the entry regardless of phase, because
-    /// the execution ends there and a retained entry would leak one `u32` per
-    /// such execution; that decision belongs to the caller, which only consults
-    /// this predicate for a capability miss.
+    /// A *terminal* failure still clears the entry regardless of phase. The
+    /// execution ends there, and a retained entry would leak one `u32` per
+    /// such execution. That decision belongs to the caller, which consults
+    /// this predicate only for a capability miss.
     #[must_use]
     pub const fn clears_panic_strike(self) -> bool {
         self.handler_ran_to_conclusion()
@@ -1362,9 +1359,11 @@ impl HarvestError {
     }
 
     /// Build an [`ActivityFailed`](HarvestError::ActivityFailed) from a recorded
-    /// failure payload, decoding the typed `error_type` / `details` (issue #227
-    /// / #369) so workflow code can branch on the failure class without parsing
-    /// the human message.
+    /// failure payload.
+    ///
+    /// It decodes the typed `error_type` / `details` (issue #227 / #369). So
+    /// workflow code can branch on the failure class without parsing the human
+    /// message.
     ///
     /// `payload` is the engine-internal failure string (a typed `ActivityFailure`
     /// wire envelope, or a legacy `Err(String)` which maps to `error_type =
@@ -1483,11 +1482,11 @@ impl HarvestError {
     /// carrying a typed non-retryable [`WorkflowFailure`](crate::failure::WorkflowFailure).
     /// `false` for untyped failures or other variants.
     ///
-    /// This is an **advisory** classification hint for the caller /
-    /// completion-trigger — it is not a retry control input; the engine's
+    /// This is an **advisory** classification hint for the caller or
+    /// completion-trigger. It is not a retry control input. The engine's
     /// workflow-level retry (#523) loop never consults it (issue #767 scope).
     /// To gate the retry loop on a failure class, list its `error_type` in the
-    /// workflow's `RetryPolicy::non_retryable_errors` — the scheduler matches
+    /// workflow's `RetryPolicy::non_retryable_errors`. The scheduler matches
     /// that list against the decoded `error_type`, not against this flag.
     #[must_use]
     pub fn is_workflow_non_retryable(&self) -> bool {
@@ -1499,8 +1498,8 @@ impl HarvestError {
 
     /// Is this a [`HarvestError::ShardUnavailable`]?
     ///
-    /// A retryable "I cannot reach that shard right now" classification, kept
-    /// as a predicate so callers can classify without matching the variant —
+    /// A retryable "cannot reach that shard right now" classification. It is a
+    /// predicate so callers can classify without matching the variant, because
     /// this enum grows over releases (issue #956).
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
@@ -1568,18 +1567,18 @@ impl HarvestError {
     /// worker's wake-event ingest (`ingest_due_timers_and_signals`) appends
     /// `TimerFired`/`SignalReceived` at a `next_event_id` precomputed from an
     /// earlier history load, with no execution-row lock and no `MAX(event_id)`
-    /// recompute. A concurrent `append_single_event` writer — timeout
-    /// enforcement (`timeout.rs`), external-task completion (`external_task.rs`),
-    /// or the issue #779 child-timeout deadline materializer — can commit an
-    /// event at that same `event_id` first, and the ingest's batch insert then
-    /// hits this unique constraint.
+    /// recompute. A concurrent `append_single_event` writer can commit an event
+    /// at that same `event_id` first. The ingest's batch insert then hits this
+    /// unique constraint. Such writers are timeout enforcement (`timeout.rs`),
+    /// external-task completion (`external_task.rs`), and the issue #779
+    /// child-timeout deadline materializer.
     ///
     /// The correct response is to **re-drive the parent workflow task**, not to
-    /// terminally fail a healthy run: a fresh history load advances
-    /// `next_event_id` past the winner's already-committed event and an
-    /// already-`fired` timer is excluded from the next ingest, so the retry
-    /// provably cannot re-hit the same conflict — convergent in a single retry,
-    /// with no infinite loop.
+    /// terminally fail a healthy run. A fresh history load advances
+    /// `next_event_id` past the winner's committed event. The next ingest
+    /// excludes an already-`fired` timer. So the retry provably cannot re-hit
+    /// the same conflict. It converges in a single retry, with no infinite
+    /// loop.
     ///
     /// Matched on the exact Postgres constraint name embedded in the
     /// duplicate-key error message. A genuine/unrelated database error, or a
@@ -1594,9 +1593,9 @@ impl HarvestError {
     /// no handler registered for the task's workflow/activity type (issue #804).
     ///
     /// Returns `Some((kind, name))` for [`Self::HandlerNotRegistered`] and
-    /// `None` for every other variant. This is the single predicate the
-    /// worker's dispatch path keys on to decide release-vs-terminal-fail, so it
-    /// is deliberately **narrow**: a broad match (e.g. on [`Self::Config`]'s
+    /// `None` for every other variant. The worker's dispatch path keys on this
+    /// single predicate to decide release-vs-terminal-fail. So it is
+    /// deliberately **narrow**. A broad match (e.g. on [`Self::Config`]'s
     /// message text) would sweep genuine configuration bugs into an infinite
     /// release-and-retry loop instead of surfacing them.
     #[must_use]
@@ -1608,8 +1607,10 @@ impl HarvestError {
     }
 
     /// Classify this error as an **ambiguous suspended-dispatch claim**
-    /// (issue #1182): the dispatch made no progress and could not confirm it
-    /// still owns the task, so no terminal decision was made.
+    /// (issue #1182).
+    ///
+    /// The dispatch made no progress and could not confirm that it still owns
+    /// the task, so no terminal decision was made.
     ///
     /// Returns `Some(task_id)` for [`Self::SuspendedClaimAmbiguous`] and
     /// `None` for every other variant — the same blameless-sentinel pattern as
@@ -1645,8 +1646,10 @@ impl HarvestError {
     }
 
     /// Classify this error as an **ambiguous ordinary terminal-write claim**
-    /// (issue #1184): a complete/fail/pause-park write could not confirm it
-    /// still owns the task, so no terminal decision was made.
+    /// (issue #1184).
+    ///
+    /// A complete, fail or pause-park write could not confirm that it still
+    /// owns the task, so no terminal decision was made.
     ///
     /// Returns `Some(task_id)` for [`Self::TerminalWriteClaimAmbiguous`] and
     /// `None` for every other variant — the sibling accessor to
@@ -1665,10 +1668,10 @@ impl HarvestError {
     /// or `None` for every other variant.
     ///
     /// Split from [`Self::handler_not_registered`] rather than folded into its
-    /// tuple: that predicate is the release-vs-fail interception check and is
-    /// called on the hot error path, while the phase is consulted once, only by
-    /// the dispatch site deciding whether the release may also clear the issue
-    /// #494 timeout strike.
+    /// tuple. That predicate is the release-vs-fail interception check on the
+    /// hot error path. The phase is consulted once, only by the dispatch site.
+    /// That site decides whether the release may also clear the issue #494
+    /// timeout strike.
     #[must_use]
     pub const fn capability_miss_phase(&self) -> Option<CapabilityMissPhase> {
         match self {
@@ -1702,19 +1705,18 @@ pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
 
 /// Extracts a human-readable message from a caught panic payload.
 ///
-/// Shared by every `std::panic::catch_unwind` call site that guards a
-/// user-supplied handler closure (query, declarative query, and signal
-/// handlers) so the `&str` / `String` / "unknown panic" fallback chain is
-/// defined exactly once.
+/// Every `std::panic::catch_unwind` call site that guards a user-supplied
+/// handler closure shares it: query, declarative query, and signal handlers.
+/// So the `&str` / `String` / "unknown panic" fallback chain is defined once.
 ///
 /// Deliberately takes `payload` **by value** rather than by reference
-/// (`#[allow(clippy::needless_pass_by_value)]`): `Box<dyn Any + Send>` itself
-/// satisfies the blanket `impl<T: 'static> Any for T`, so a caller passing
-/// `&e` for `e: Box<dyn Any + Send>` to a by-reference `&(dyn Any + Send)`
-/// parameter can silently coerce by unsizing the *outer* `Box` (which *is*
-/// `Any`) rather than deref-coercing to the *inner* erased payload --
-/// `downcast_ref` then always misses and this always falls through to
-/// `"unknown panic"`. Taking the `Box` by value forces every call site to
+/// (`#[allow(clippy::needless_pass_by_value)]`). `Box<dyn Any + Send>` itself
+/// satisfies the blanket `impl<T: 'static> Any for T`. Take a caller that
+/// passes `&e` for `e: Box<dyn Any + Send>` to a `&(dyn Any + Send)`
+/// parameter. That reference can silently coerce by unsizing the *outer*
+/// `Box`, which *is* `Any`. It does not deref-coerce to the *inner* erased
+/// payload. `downcast_ref` then always misses, and this always falls through
+/// to `"unknown panic"`. Taking the `Box` by value forces every call site to
 /// pass the exact value `catch_unwind` produced, with no coercion ambiguity.
 ///
 /// ## Examples
@@ -1738,16 +1740,17 @@ pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Contain a panic raised while **constructing** a handler future (issue #782).
 ///
 /// The poll-time `catch_unwind` at each dispatch site wraps only the *future*
-/// returned by a handler `fn`. But a hand-written `WorkflowInfo`/`ActivityInfo`
-/// handler (a supported surface — the public `handler` fields,
-/// `WorkflowReplayer::register_fn`, etc.) may run synchronous work (an
-/// `unwrap()`, a `panic!()`) **before** returning its boxed future; that work
-/// runs when the handler is *called*, before the returned future is ever polled,
-/// so the poll-time guard does not cover it and the panic would otherwise unwind
-/// the spawned worker task uncaught — bypassing the `HandlerPanic` conversion and
-/// leaving the task on the poison-pill path. Wrapping the construction call here
-/// closes that gap uniformly. Macro-generated handlers put the whole body inside
-/// the returned async block, so this only ever fires for hand-written handlers.
+/// returned by a handler `fn`. A hand-written `WorkflowInfo`/`ActivityInfo`
+/// handler is a supported surface: the public `handler` fields,
+/// `WorkflowReplayer::register_fn`, and so on. Such a handler may run
+/// synchronous work (an `unwrap()`, a `panic!()`) **before** it returns its
+/// boxed future. That work runs when the handler is *called*, before the
+/// returned future is ever polled. The poll-time guard does not cover it. The
+/// panic would otherwise unwind the spawned worker task uncaught. It would
+/// bypass the `HandlerPanic` conversion and leave the task on the poison-pill
+/// path. Wrapping the construction call here closes that gap uniformly.
+/// Macro-generated handlers put the whole body inside the returned async
+/// block, so this only ever fires for hand-written handlers.
 ///
 /// Returns `Ok(fut)` with the constructed future, or `Err(message)` with the
 /// extracted panic message (via [`panic_message`]) on a construction-phase panic.
@@ -1771,10 +1774,9 @@ impl From<diesel::result::Error> for HarvestError {
 /// An explicit shard placement that could not be honoured is a caller
 /// configuration error (issue #697).
 ///
-/// Mapping onto [`HarvestError::Config`] means SDK callers get the same
-/// `400`-class treatment the HTTP layer gives, and the actionable message —
-/// which names the offending shard/key and the valid set — is preserved
-/// verbatim.
+/// Mapping onto [`HarvestError::Config`] gives SDK callers the same
+/// `400`-class treatment as the HTTP layer. The actionable message names the
+/// offending shard/key and the valid set, and is preserved verbatim.
 impl From<crate::shard::ShardPlacementError> for HarvestError {
     fn from(value: crate::shard::ShardPlacementError) -> Self {
         Self::Config(value.to_string())
@@ -1953,8 +1955,8 @@ mod tests {
     #[test]
     fn is_event_id_unique_violation_rejects_other_unique_constraints() {
         // A unique violation on a DIFFERENT constraint (e.g. the executions
-        // uniqueness index) must NOT be swept into the transient-conflict
-        // requeue path — it still fails as before.
+        // uniqueness index) must NOT enter the transient-conflict requeue
+        // path. It still fails as before.
         let err = database_error(
             "duplicate key value violates unique constraint \
              \"uq_harvest_workflow_executions_active_name_id\"",
@@ -2381,18 +2383,18 @@ mod tests {
     /// alone.
     ///
     /// The progress is real, but it is not evidence about what the counters
-    /// measure, because the crash / hang / panic they track happens *after* the
-    /// frontier that was retired. Worse, it is progress the task makes on
-    /// **every** dispatch: a body that hangs after local activity 1 completes
-    /// that activity every redelivery, so treating it as a streak-breaker makes
-    /// the #494 threshold unreachable for exactly the hang it exists to
-    /// contain — and identically for #367 and #782. It would also let an
-    /// incapable worker that registers local activity 1 but not 2 (the ordinary
-    /// rolling-deploy shape) zero a capable peer's streak on every claim, which
-    /// is the blameless-third-party defeat this whole type exists to prevent.
+    /// measure. The crash, hang or panic they track happens *after* the
+    /// retired frontier. Worse, the task makes that progress on **every**
+    /// dispatch. A body that hangs after local activity 1 completes that
+    /// activity on every redelivery. A streak-breaker there makes the #494
+    /// threshold unreachable for exactly the hang it exists to contain. The
+    /// same holds for #367 and #782. Take an incapable worker that registers
+    /// local activity 1 but not 2, the ordinary rolling-deploy shape. It would
+    /// zero a capable peer's streak on every claim. That is the
+    /// blameless-third-party defeat this whole type exists to prevent.
     ///
-    /// The counters are preserved, never incremented, so AC4 holds; genuine
-    /// progress still clears them through the clean continuation, which fires
+    /// The counters are preserved, never incremented, so AC4 holds. Genuine
+    /// progress still clears them through the clean continuation. That fires
     /// when the body carries forward to a suspension instead of stalling at a
     /// later frontier.
     #[test]
@@ -2418,9 +2420,9 @@ mod tests {
     #[test]
     fn capability_miss_phase_clears_crash_strikes_only_after_the_handler_ran() {
         // Issue #367's `crash_strikes` counts worker processes this task has
-        // killed. Only a dispatch that RAN the handler is evidence about that,
-        // and the truth table must therefore match the #494 one exactly --
-        // both are derived from `handler_ran_to_conclusion`.
+        // killed. Only a dispatch that RAN the handler is evidence about that.
+        // So the truth table must match the #494 one exactly. Both derive from
+        // `handler_ran_to_conclusion`.
         assert!(
             CapabilityMissPhase::AfterHandler.clears_crash_strikes(),
             "the body ran to a conclusion without killing this worker, so the \
@@ -2518,8 +2520,8 @@ mod tests {
             "the body ran to a conclusion, so the start metric already fired"
         );
         // This predicate is deliberately NOT the inverse of
-        // `handler_ran_to_conclusion`: the three strike predicates ask "did the
-        // body FINISH?" while this one asks "did the body BEGIN?".
+        // `handler_ran_to_conclusion`. The three strike predicates ask "did the
+        // body FINISH?". This one asks "did the body BEGIN?".
         // `DuringHandler` is the single phase that separates the two facts --
         // it began but did not finish, so BOTH answers are `false` there. Pin
         // that, or a later refactor could "simplify" this to
@@ -2555,10 +2557,10 @@ mod tests {
     #[test]
     fn other_errors_are_not_capability_misses() {
         // Deliberately includes `Config`, which is what the handler-miss sites
-        // returned BEFORE issue #804 — a broad, catch-all variant. Classifying
+        // returned BEFORE issue #804, a broad, catch-all variant. Classifying
         // on it would swallow every genuine configuration error into an
-        // infinite release loop, which is exactly why #804 introduces a
-        // dedicated variant rather than string-matching `Config`.
+        // infinite release loop. That is why #804 introduces a dedicated
+        // variant rather than string-matching `Config`.
         for err in [
             HarvestError::Config("no activity handler registered for 'x'".into()),
             HarvestError::NotFound("nope".into()),

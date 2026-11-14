@@ -72,10 +72,10 @@ impl<'de> Deserialize<'de> for ResetSignalReapplyPolicy {
 
 /// Logical anchor for resolving a reset boundary per-execution (issue #538).
 ///
-/// `EventId` preserves the existing raw-id path. The other variants are
-/// resolved against the execution's live event history at reset time, so the
-/// same `ResetPoint` produces the correct — and possibly different — event id
-/// for every execution in a batch.
+/// `EventId` preserves the existing raw-id path. The other variants resolve
+/// against the live event history of the execution at reset time. So one
+/// `ResetPoint` produces the correct, possibly different, event id for every
+/// execution in a batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResetPoint {
@@ -168,7 +168,6 @@ pub fn resolve_reset_point(
     point: &ResetPoint,
 ) -> Result<i64, ResetSkipReason> {
     if events.is_empty() {
-        // EmptyHistory is a skip for any logical point.
         return Err(ResetSkipReason::EmptyHistory);
     }
 
@@ -183,7 +182,6 @@ pub fn resolve_reset_point(
             {
                 return Err(ResetSkipReason::ContinueAsNew);
             }
-            // Find the first ActivityScheduled whose name matches.
             let idx = events
                 .iter()
                 .position(|e| match e {
@@ -207,10 +205,10 @@ pub fn resolve_reset_point(
                 return Err(ResetSkipReason::ContinueAsNew);
             }
             // Walk the full history and pick the highest valid decision boundary,
-            // skipping terminal and operational lifecycle events. Including a
-            // terminal event (WorkflowFailed, WorkflowCancelled, WorkflowExecutionTimedOut,
-            // WorkflowCompleted) in the fork history causes the replayer to hit that
-            // event and terminate immediately rather than re-running the workflow body.
+            // skipping terminal and operational lifecycle events. A terminal event
+            // (WorkflowFailed, WorkflowCancelled, WorkflowExecutionTimedOut,
+            // WorkflowCompleted) in the fork history makes the replayer terminate
+            // there. It does not re-run the workflow body.
             let last = events.len().saturating_sub(1);
             let (valid, _) = boundary_validity(events, last);
             let highest =
@@ -223,10 +221,10 @@ pub fn resolve_reset_point(
                         if !ok {
                             return None;
                         }
-                        // Exclude terminal and post-terminal tail events: including
-                        // them in the fork history causes replay to terminate
-                        // immediately or execute stale lifecycle side effects rather
-                        // than re-running the workflow body from a clean boundary.
+                        // Exclude terminal and post-terminal tail events. In the fork
+                        // history they make replay terminate immediately or execute
+                        // stale lifecycle side effects. Replay must re-run the
+                        // workflow body from a clean boundary.
                         //
                         // * WorkflowFailed / WorkflowCancelled / WorkflowCompleted /
                         //   WorkflowExecutionTimedOut — direct terminal events.
@@ -266,9 +264,9 @@ pub struct WorkflowResetRequest {
     /// `None` the API layer returns a 400 before this struct reaches the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_to_event_id: Option<i64>,
-    /// Optional logical reset anchor (issue #538). When `Some`, the anchor is
-    /// resolved against the execution's event history *before* `validate_reset_point`
-    /// so the caller does not need to know the per-execution raw event id.
+    /// Optional logical reset anchor (issue #538). When `Some`, the anchor
+    /// resolves against the event history *before* `validate_reset_point`.
+    /// So the caller does not need the per-execution raw event id.
     /// When `None`, `reset_to_event_id` is used directly (backward-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_point: Option<ResetPoint>,
@@ -277,17 +275,17 @@ pub struct WorkflowResetRequest {
     #[serde(default)]
     pub signal_reapply: ResetSignalReapplyPolicy,
     /// When `true`, the source execution may be in a terminal failure state
-    /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
-    /// used by the DAG retry-from-failed-node operator surface (issue #366),
-    /// which forks a *failed* DAG run; a terminal DAG run is the common case
-    /// there. `COMPLETED` and `TERMINATED` sources are always rejected.
+    /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. The DAG
+    /// retry-from-failed-node operator surface (issue #366) uses this opt-in.
+    /// It forks a *failed* DAG run, the common case there. `COMPLETED` and
+    /// `TERMINATED` sources are always rejected.
     ///
-    /// **Not settable from the wire.** This field is `#[serde(skip)]` so the
-    /// public `POST /workflows/{id}/reset` endpoint — which deserializes this
-    /// struct directly — can never enable it; the request body always
-    /// deserializes it to `false`, preserving that endpoint's strict
-    /// `RUNNING`-only contract. Only in-process callers (the DAG retry handler)
-    /// set it via struct construction.
+    /// **Not settable from the wire.** This field is `#[serde(skip)]`. The
+    /// public `POST /workflows/{id}/reset` endpoint deserializes this struct
+    /// directly, so it can never enable it. The request body always yields
+    /// `false`, which keeps the strict `RUNNING`-only contract of that
+    /// endpoint. Only in-process callers (the DAG retry handler) set it via
+    /// struct construction.
     #[serde(skip)]
     pub allow_terminal_source: bool,
 }
@@ -396,12 +394,12 @@ pub enum WorkflowResetError {
     /// The source execution currently holds a durable mutex (issue #691).
     ///
     /// A reset forks a fresh execution and seals the source `TERMINATED`. If the
-    /// source still holds a mutex, the fork would either phantom-inherit the
-    /// grant (its replayed history carries the `MutexGranted` event without a
-    /// live lock row) or leave the source's lock un-released and its waiters
-    /// stranded. Rather than silently strip the event, the reset is rejected so
-    /// the operator can let the critical section finish (or cancel/terminate the
-    /// source, which releases the lock via the terminal sweep) and retry.
+    /// source still holds a mutex, the fork can phantom-inherit the grant. Its
+    /// replayed history carries the `MutexGranted` event without a live lock
+    /// row. Or the lock of the source stays un-released and its waiters
+    /// stranded. The reset is rejected, not the event silently stripped. The
+    /// operator lets the critical section finish and retries. Cancel or
+    /// terminate also works: the terminal sweep releases the lock.
     #[error(
         "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
     )]
@@ -615,12 +613,12 @@ fn apply_event_to_pending(
             Some(timer_id.to_string()),
             event_id,
         ),
-        // A `TimerFired` resolves the pending arm; a cancellable timer's
-        // `TimerCancelled` (issue #768, from `cancel_timer()`/`reset()`) resolves
-        // it exactly the same way — the `TimerStarted` no longer represents an
-        // unresolved side effect. Without closing on the cancel, a reset point
-        // after a cancel/reset would leave the cancelled arming counted as pending
-        // and reset validation would reject or mis-plan the fork (Codex P2).
+        // A `TimerFired` resolves the pending arm. The `TimerCancelled` of a
+        // cancellable timer (issue #768, from `cancel_timer()`/`reset()`)
+        // resolves it the same way. The `TimerStarted` then no longer represents
+        // an unresolved side effect. Without a close on the cancel, a reset point
+        // after a cancel/reset counts the cancelled arming as pending. Reset
+        // validation then rejects or mis-plans the fork.
         WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id } => {
             remove_pending(pending, "TimerStarted", &timer_id.to_string());
         }
@@ -662,10 +660,10 @@ fn apply_event_to_pending(
         // LocalActivityFailed is an intermediate event (the worker may still retry),
         // so it must NOT close the pending entry. Only a true terminal event —
         // LocalActivityCompleted (success) or LocalActivityExhausted (retries
-        // exhausted) — closes the entry.  Closing on LocalActivityFailed alone
-        // would let an operator reset between intermediate attempts and fork a
-        // history that drops the terminal marker, potentially re-executing the
-        // local activity or losing the exhausted-marker guarantee.
+        // exhausted) — closes the entry. A close on LocalActivityFailed alone
+        // lets an operator reset between intermediate attempts. The fork history
+        // then drops the terminal marker. It can re-execute the local activity
+        // or lose the exhausted-marker guarantee.
         WorkflowEvent::LocalActivityCompleted { activity_id, .. }
         | WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
             remove_pending(pending, "LocalActivityScheduled", &activity_id.to_string());
@@ -773,9 +771,9 @@ pub async fn preview_workflow_reset(
     reject_if_source_erased(exec_id, &execution)?;
     // The same holds for the fork lineage of a fork (issue #2000).
     reject_unclean_fork_lineage(conn, exec_id, &execution).await?;
-    // A reset while the source holds a durable mutex would phantom-grant the
-    // lock to the fork; surface that in the preview so the operator sees the
-    // same rejection the actual reset would return (issue #691).
+    // A reset while the source holds a durable mutex phantom-grants the lock
+    // to the fork. The preview returns the same rejection as the actual reset
+    // (issue #691).
     reject_if_source_holds_mutex(conn, exec_id).await?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
@@ -1033,14 +1031,14 @@ fn validate_source_execution(
         // PAUSED is a non-terminal active state (issue #383) and is resettable.
         //
         // TERMINATED is deliberately excluded. Since issue #504 it covers two
-        // origins that are indistinguishable at row level (only a successor-fork
-        // lookup separates them): a reset-sealed source (already re-forked —
-        // re-forking again would duplicate the fork) and a force-terminated run
-        // (`/workflows/{id}/terminate`). Admitting it here would re-open the reset
-        // double-fork the seal exists to block, so both are rejected: terminate is
-        // the forceful/final path, mirroring the cancel(retryable)/terminate(final)
-        // split. A run intended to stay DAG-retryable should be cancelled
-        // (CANCELLED is admitted below), not terminated.
+        // origins that look the same at row level. Only a successor-fork lookup
+        // separates them. One is a reset-sealed source: it is already re-forked,
+        // and a second re-fork duplicates the fork. The other is a
+        // force-terminated run (`/workflows/{id}/terminate`). To admit it here
+        // re-opens the reset double-fork that the seal exists to block. So both
+        // are rejected. Terminate is the forceful/final path, like the
+        // cancel(retryable)/terminate(final) split. A run that must stay
+        // DAG-retryable is cancelled (CANCELLED is admitted below), not terminated.
         match execution.state.as_str() {
             "RUNNING" | "PAUSED" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
             other => {
@@ -1051,10 +1049,10 @@ fn validate_source_execution(
             }
         }
     } else if !matches!(execution.state.as_str(), "RUNNING" | "PAUSED") {
-        // PAUSED is non-terminal (issue #383): an operator who paused a bad run
-        // can reset it directly without resuming first (which would dispatch the
-        // parked decision they were trying to avoid). Sealing the source cancels
-        // its parked task, so the decision never lands.
+        // PAUSED is non-terminal (issue #383). An operator who paused a bad run
+        // can reset it without a resume first. A resume would dispatch the
+        // parked decision the operator wants to avoid. The seal cancels the
+        // parked task of the source, so the decision never lands.
         return Err(WorkflowResetError::TerminalSource {
             exec_id,
             state: execution.state.clone(),
@@ -1216,9 +1214,9 @@ fn reject_if_source_erased(
 ///
 /// Returns `Err(WorkflowResetError)` only for storage or DB failures that
 /// prevent the execution from being examined. Domain-level skips (CAN, child,
-/// terminal state, no matching activity, invalid boundary, empty history) are
-/// returned as `Ok(Err(ResetSkipReason))` so the batch handler can record them
-/// as skipped items without aborting the rest of the cohort.
+/// terminal state, no matching activity, invalid boundary, empty history) come
+/// back as `Ok(Err(ResetSkipReason))`. The batch handler records them as
+/// skipped items and does not abort the rest of the cohort.
 pub async fn resolve_batch_reset_one(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1271,13 +1269,11 @@ pub async fn resolve_batch_reset_one(
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
 
-    // Resolve logical point to a raw event id.
     let resolved_id = match resolve_reset_point(&events, point) {
         Ok(id) => id,
         Err(reason) => return Ok(Err(reason)),
     };
 
-    // Validate the boundary.
     let mut plan = match validate_reset_point(&events, resolved_id) {
         Ok(p) => p,
         Err(invalid) => {
@@ -1289,7 +1285,6 @@ pub async fn resolve_batch_reset_one(
         }
     };
 
-    // Attach DB counts (tasks/timers/signals) for the preview plan.
     attach_side_effect_counts(conn, exec_id, signal_reapply, &mut plan).await?;
 
     Ok(Ok((resolved_id, plan)))
@@ -1411,9 +1406,9 @@ async fn count_unconsumed_signals(
 /// (issue #691).
 ///
 /// A reset forks a fresh execution at a decision boundary and seals the source
-/// `TERMINATED`. Allowing that while the source holds a lock would either
-/// phantom-grant the mutex to the fork (the replayed `MutexGranted` event has no
-/// backing lock row) or strand the source's waiters. Guarded — when the mutex
+/// `TERMINATED`. If the source holds a lock, that would phantom-grant the
+/// mutex to the fork, or strand the waiters of the source. The replayed
+/// `MutexGranted` event has no backing lock row. Guarded: when the mutex
 /// tables are absent this is a no-op (`holder_holds_any_mutex` returns `None`).
 ///
 /// # Errors
@@ -1455,12 +1450,12 @@ async fn terminate_source_execution(
 
     // Seal the source run as TERMINATED. The state filter guards against a
     // concurrent reset double-sealing the same row. The standalone reset path
-    // reaches `RUNNING` or `PAUSED` (issue #383, both non-terminal); the DAG
+    // reaches `RUNNING` or `PAUSED` (issue #383, both non-terminal). The DAG
     // retry path (issue #366) accepts terminal failure states via
-    // `allow_terminal_source`, so those must also be sealed here — otherwise the
-    // update would match zero rows and leave the source in
-    // `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's `TERMINATED`
-    // re-fork guard.
+    // `allow_terminal_source`, so those are sealed here too. Otherwise the
+    // update matches zero rows and leaves the source in
+    // `FAILED`/`CANCELLED`/`TIMED_OUT`. That defeats the `TERMINATED` re-fork
+    // guard of the caller.
     let sealable_states: Vec<&str> = if request.allow_terminal_source {
         vec!["RUNNING", "PAUSED", "FAILED", "CANCELLED", "TIMED_OUT"]
     } else {
@@ -1486,13 +1481,12 @@ async fn terminate_source_execution(
         .await
         .map_err(database_error)?;
 
-    // Defense-in-depth (issue #691): the caller rejects a reset while the source
-    // holds a mutex, so by the time we seal `TERMINATED` here the source should
-    // hold nothing — but sweep anyway so a lock acquired in a race window (or on
-    // a future caller that forgets the pre-check) is released and its waiters
-    // woken rather than stranded. Runs inside the reset transaction, so the
-    // per-key advisory locks hold across the sweep. A no-op when the mutex
-    // tables are absent (guarded).
+    // Defense-in-depth (issue #691). The caller rejects a reset while the
+    // source holds a mutex, so the source should hold nothing at this seal.
+    // Sweep anyway. A lock acquired in a race window, or by a future caller
+    // that forgets the pre-check, is then released and its waiters woken. Runs
+    // inside the reset transaction, so the per-key advisory locks hold across
+    // the sweep. A no-op when the mutex tables are absent (guarded).
     crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
 
     let (deferred, closed_children) =
@@ -1573,13 +1567,13 @@ pub(crate) async fn insert_fork_row(
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor the soft SLA deadline per-fork (issue #487).
     let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
-    // Reset deliberately starts a NEW chain origin (issue #617), consistent with
-    // `first_exec_id: None` / `schedule_id: None` below — an operator reset breaks
-    // the continue-as-new lineage (mirroring the #488 lineage-break precedent), so
-    // the chain deadline is RE-ANCHORED to the fork's own start rather than carried
+    // Reset deliberately starts a NEW chain origin (issue #617), like
+    // `first_exec_id: None` / `schedule_id: None` below. An operator reset breaks
+    // the continue-as-new lineage, as in the #488 lineage-break precedent. So the
+    // chain deadline is RE-ANCHORED to the start of the fork, not carried
     // verbatim. A source with no chain cap yields `None` for both.
-    // `checked_add_signed` (not `+`) — an absurd operator ceiling can make the
-    // source's `chain_execution_timeout` reach `chrono::Duration::MAX`, and
+    // `checked_add_signed` (not `+`): an absurd operator ceiling can make the
+    // `chain_execution_timeout` of the source reach `chrono::Duration::MAX`.
     // `DateTime + Duration` panics on overflow; yield `None` instead (issue #617).
     let chain_deadline_at = source
         .chain_execution_timeout
@@ -1587,13 +1581,13 @@ pub(crate) async fn insert_fork_row(
     // Provenance ref for a reset fork is the source execution id (#740).
     let source_exec_id_str = source.id.to_string();
     // Strip the six replay-non-determinism diagnostic keys unconditionally
-    // (issue #603 fix): the source can legitimately be a currently-ND-blocked
-    // RUNNING execution (the documented escalation path for a stuck block),
-    // whose search_attrs still carries the diagnostic — the fresh fork itself
-    // has never diverged, so it must not display a phantom "blocked" reason.
-    // Guarded on `Some`, so a source with no search_attrs at all does not gain
-    // a stray `{}` object. `apply_raw_search_attrs_patch_in_memory` always
-    // returns `Some`, mirroring `store::update_search_attrs`'s DB semantics.
+    // (issue #603). The source can be a currently-ND-blocked RUNNING execution,
+    // the documented escalation path for a stuck block. Its search_attrs still
+    // carries the diagnostic. The fresh fork has never diverged, so it must not
+    // display a phantom "blocked" reason. Guarded on `Some`, so a source with
+    // no search_attrs at all does not gain a stray `{}` object.
+    // `apply_raw_search_attrs_patch_in_memory` always returns `Some`, like the
+    // DB semantics of `store::update_search_attrs`.
     let fork_search_attrs = source.search_attrs.as_ref().map(|_| {
         crate::worker::apply_raw_search_attrs_patch_in_memory(
             source.search_attrs.clone(),
@@ -1649,12 +1643,12 @@ pub(crate) async fn insert_fork_row(
         start_source: Some(spec.start_source.as_str()),
         start_source_ref: Some(source_exec_id_str.as_str()),
         started_by: None,
-        // A reset fork is an operator intervention that bypasses every other
-        // admission-time policy in this INSERT (no gate check, no cap
-        // enforcement) -- issue #946 AC3 scopes quota enforcement to
-        // registry-aware *start* paths (plain start, signal-/update-with-start,
-        // batch, schedule tick/backfill, debounce/throttle fires), which does
-        // not include reset. The fork is never refused here.
+        // A reset fork is an operator intervention. It bypasses every other
+        // admission-time policy in this INSERT: no gate check, no cap
+        // enforcement. Issue #946 AC3 scopes quota enforcement to registry-aware
+        // *start* paths, and reset is not one. Those paths are plain start,
+        // signal-/update-with-start, batch, schedule tick/backfill, and
+        // debounce/throttle fires. The fork is never refused here.
         //
         // `spec.quota_key` carries the key. A reset keeps the key of its
         // source (issue #1997). A fork of issue #2000 passes the key of its
@@ -2340,11 +2334,11 @@ pub(crate) mod tests {
 
     #[test]
     fn reset_point_timer_resolved_by_cancel_not_only_fire() {
-        // Codex P2 (issue #768): a cancellable timer's TimerCancelled resolves the
-        // pending TimerStarted arm exactly like a TimerFired. Without treating the
-        // cancel as a closer, any reset point after cancel_timer()/reset() would
-        // count the cancelled arming as an unresolved side effect and reset
-        // validation would reject or mis-plan the fork.
+        // Issue #768: the TimerCancelled of a cancellable timer resolves the
+        // pending TimerStarted arm exactly like a TimerFired. If the cancel is not
+        // a closer, a reset point after cancel_timer()/reset() counts the
+        // cancelled arming as an unresolved side effect. Reset validation then
+        // rejects or mis-plans the fork.
         let timer_id = TimerId::new("idle");
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -2669,7 +2663,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ── LastWorkflowTask terminal-event exclusion (issue #538 / Codex P1) ───
+    // ── LastWorkflowTask terminal-event exclusion (issue #538) ───────────────
 
     #[test]
     fn last_workflow_task_skips_workflow_failed_at_tail() {
@@ -2740,8 +2734,8 @@ pub(crate) mod tests {
     fn last_workflow_task_skips_workflow_retry_scheduled_at_tail() {
         // A FAILED run with an auto-retry linkage appended afterwards:
         //   started(0), scheduled(1), completed(2), failed(3), retry_scheduled(4).
-        // After completed(2) the pending set is empty, so boundary_validity[4] would
-        // be true — WorkflowRetryScheduled must be explicitly excluded, otherwise the
+        // After completed(2) the pending set is empty, so boundary_validity[4] is
+        // true. WorkflowRetryScheduled must be explicitly excluded. Otherwise the
         // fork carries WorkflowFailed at index 3 and replay terminates immediately.
         let act_id = crate::types::ActivityExecId::new();
         let retry_exec_id = ExecutionId::new();

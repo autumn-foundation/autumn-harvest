@@ -688,10 +688,10 @@ fn a_garbled_terminator_is_a_mir_parse_boundary_not_a_silent_proven() {
 
 // ── Synthetic dumps: shapes rustc cannot be asked to produce on demand ───────
 //
-// A 1 000-deep call chain and a call into a dependency that was never asked for
-// MIR are both easier to write as MIR text than to build as a crate, and the
-// parser is tolerant by design, so a hand-written dump exercises exactly the
-// same code path a real one would.
+// Two shapes are easier to write as MIR text than to build as a crate. One is a
+// 1 000-deep call chain. The other is a call into a dependency that was never
+// asked for MIR. The parser is tolerant by design, so a hand-written dump
+// exercises the same code path as a real one.
 
 fn analyze_text(text: &str) -> Vec<WorkflowVerdict> {
     let docs = vec![mir::parse("synthetic", "synthetic.mir", text)];
@@ -853,9 +853,9 @@ fn a_body_less_std_callee_is_not_a_boundary() {
 // ── Three false-`proven` shadowing / trust holes ────────────────────────────
 
 /// Finding 1: `a::COUNTER: u64` must not decide the verdict for `b::COUNTER:
-/// AtomicU64`. Both print with their FULL path in the `static` header and in
-/// the `allocN (static: ..)` footer on rustc 1.98, so nothing is ambiguous
-/// here — the index just has to keep them apart.
+/// AtomicU64`. On rustc 1.98 both print with their FULL path in the `static`
+/// header and in the `allocN (static: ..)` footer. So nothing is ambiguous
+/// here, and the index only has to keep them apart.
 #[test]
 fn a_shadowed_atomic_static_is_still_an_ambient_read() {
     let verdicts = run(
@@ -968,8 +968,8 @@ fn a_body_less_dependency_fn_is_not_trusted_by_its_result_type() {
 }
 
 /// The other half of finding 2: `format`, `must_use`, `String::len`,
-/// `Vec::new`, `Vec::push` and `Vec::len` are all body-less here and must stay
-/// trusted, or every workflow in the workspace goes `unknown`.
+/// `Vec::new`, `Vec::push` and `Vec::len` are all body-less here. They must
+/// stay trusted, or every workflow in the workspace goes `unknown`.
 #[test]
 fn body_less_std_receivers_and_free_fns_stay_trusted() {
     let verdicts = run(
@@ -991,10 +991,10 @@ fn body_less_std_receivers_and_free_fns_stay_trusted() {
     );
 }
 
-/// The conservative half of finding 1: when an `allocN` footer names only a
-/// bare last segment that two modules both define, and the pointee type does
-/// not pick one — both are `u64` here, and only their MUTABILITY differs — the
-/// read is ambient because ONE of the candidates is.
+/// The conservative half of finding 1: an `allocN` footer names only a bare
+/// last segment that two modules both define. The pointee type does not pick
+/// one: both are `u64` here, and only their MUTABILITY differs. The read is
+/// ambient because ONE of the candidates is.
 #[test]
 fn an_ambiguous_static_read_is_ambient_if_any_candidate_is() {
     let text = "static a::COUNTER: u64 = {\n\
@@ -1117,8 +1117,8 @@ fn shadowed_drop_glue_is_followed_into_the_dropped_types_own_impl() {
 
 #[test]
 fn drop_glue_with_no_readable_impl_header_is_unknown_never_proven() {
-    // How a pre-emitted `.mir` file is analyzed: no source root, so no
-    // `<impl at FILE:L:C>` header can be read back and nothing says these
+    // How a pre-emitted `.mir` file is analyzed: there is no source root. So no
+    // `<impl at FILE:L:C>` header can be read back, and nothing says these
     // `::drop` bodies are `Drop` impls at all.
     let v = run("shadowed_drops.mir", &SourceRoots::default()).1;
     for workflow in ["wf_drop_ambient_guard", "wf_drop_clean_guard"] {
@@ -1164,10 +1164,10 @@ fn a_std_trait_does_not_trust_a_dependencys_impl() {
     );
 }
 
-/// The other half: trust read off the qualified SELF type
-/// (`<std::string::String as std::convert::From<&str>>::from`), off a trimmed
-/// receiver's declared type (`Vec::<u32>::push` with `_7: &mut std::vec::Vec<u32>`)
-/// and off a `[[std_free_fn]]` row (`format`) all survive the stricter rule.
+/// The other half: three trust sources survive the stricter rule. They are the
+/// qualified SELF type (`<std::string::String as std::convert::From<&str>>::from`),
+/// a trimmed receiver's declared type (`Vec::<u32>::push` with
+/// `_7: &mut std::vec::Vec<u32>`), and a `[[std_free_fn]]` row (`format`).
 #[test]
 fn std_self_types_stay_trusted_under_the_stricter_rule() {
     let verdicts = run(

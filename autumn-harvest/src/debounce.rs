@@ -2,8 +2,8 @@
 //!
 //! # Overview
 //!
-//! Webhook deliveries and user actions arrive in bursts: a provider retries an
-//! event 5×, a user mashes "save", an upstream fan-out emits a dozen row-change
+//! Webhook deliveries and user actions arrive in bursts. A provider retries an
+//! event 5×. A user mashes "save". An upstream fan-out emits a dozen row-change
 //! notifications. Today every trigger starts a run. `DebouncePolicy` lets an
 //! embedder declare a *key expression* and a *window*:
 //!
@@ -158,9 +158,10 @@ pub struct DebounceStartOptions {
     /// row deserialises to today's behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_on_conflict: Option<crate::concurrency::ConcurrencyOnConflict>,
-    /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission
-    /// time, so a debounced run carries the same operator metadata as a normal
-    /// start (the fire path has no access to the plugin registry).
+    /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission.
+    ///
+    /// A debounced run then carries the same operator metadata as a normal start.
+    /// The fire path has no access to the plugin registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,10 +174,11 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_execution_timeout_ceiling_secs: Option<i64>,
     /// Effective chain-scoped lifetime cap DURATION (seconds), captured at
-    /// admission from the workflow-type `chain_execution_timeout` so a debounced /
-    /// throttled / batched start does NOT silently drop the declared chain cap
-    /// (issue #617). Mirrors `execution_timeout_secs` exactly. `None` = no
-    /// workflow-declared chain cap.
+    /// admission from the workflow-type `chain_execution_timeout` (issue #617).
+    ///
+    /// A debounced, throttled or batched start then keeps the declared chain cap.
+    /// Mirrors `execution_timeout_secs` exactly. `None` = no workflow-declared
+    /// chain cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_execution_timeout_secs: Option<i64>,
     /// Effective fleet-wide chain-cap ceiling / default (seconds), captured at
@@ -220,10 +222,12 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     /// Workflow-start provenance captured at admission and restored at fire
-    /// (issue #740), so a debounced/throttled/batched run records where it
-    /// truly came from (e.g. `webhook`, `api`, `batch`) rather than a hardcoded
-    /// carrier-specific default. `None` on a pre-#740 serialized row → the fire
-    /// path falls back to a sensible per-carrier default.
+    /// (issue #740).
+    ///
+    /// A debounced, throttled or batched run records its true source (e.g.
+    /// `webhook`, `api`, `batch`), not a hardcoded per-carrier default. On a
+    /// pre-#740 serialized row it is `None`, and the fire path uses a per-carrier
+    /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_source: Option<String>,
     /// Provenance correlation ref captured at admission (issue #740).
@@ -319,9 +323,9 @@ pub async fn admit_debounced_start(
 /// existing max_fire_at)`, increments `pending_count`, refreshes `queue_name`,
 /// and overwrites `last_input` and `start_options` with the most recent
 /// request's values (**last-input-wins**). The `workflow_id` is **kept from the
-/// first request** so the stable id echoed in every `202` response is the one
-/// the run will actually be created with; the stored id is returned so the
-/// caller can echo it rather than its own (possibly-discarded) generated id.
+/// first request**. So the stable id in every `202` response is the id the run
+/// gets. The stored id is returned, and the caller echoes it, not its own
+/// generated id, which may be discarded.
 ///
 /// **Legacy healing (issue #1430):** a row admitted before the #1353 empty-id
 /// check shipped can hold a stored empty `workflow_id`. Such a row can never
@@ -335,16 +339,18 @@ pub async fn admit_debounced_start(
 /// Returns `HarvestError` if the database upsert fails.
 ///
 /// `gate_active` carries the caller's admission-gate decision for this request's
-/// scope. The upsert and the gate decision run in **one transaction**: when the
-/// gate is active the transaction is rolled back so the row is never committed
-/// and `Ok(None)` is returned. This is the authoritative gate enforcement —
-/// doing it post-commit (delete after the upsert is visible) is racy, because a
-/// concurrent request for the same key could observe the row, update it, and be
-/// accepted, only for this cleanup to then delete the shared row and drop that
-/// accepted retrigger. Rolling back also preserves a pre-existing pending row
-/// (a gated *update* leaves the prior committed row intact), and blocks a
-/// burst update that would mutate a gate-relevant field (e.g. `queue_name`)
-/// into the gated scope. `Ok(Some(outcome))` is returned when admitted.
+/// scope. The upsert and the gate decision run in **one transaction**. When the
+/// gate is active, the transaction rolls back, the row is never committed, and
+/// the call returns `Ok(None)`. This is the authoritative gate enforcement.
+///
+/// A post-commit delete after the upsert is visible is racy. A concurrent
+/// request for the same key could see the row, update it, and be accepted. The
+/// cleanup would then delete the shared row and drop that accepted retrigger.
+///
+/// The rollback also keeps a pre-existing pending row: a gated *update* leaves
+/// the prior committed row intact. It also blocks a burst update that would move
+/// a gate-relevant field (e.g. `queue_name`) into the gated scope. The call
+/// returns `Ok(Some(outcome))` when admitted.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 pub async fn admit_debounced_start_with_codecs(
@@ -508,9 +514,9 @@ pub async fn admit_debounced_start_with_codecs(
                 .await?;
 
             // Roll back: a gated admission must not leave a committed row. The
-            // upsert held a row lock for the duration of this transaction, so a
-            // concurrent admission for the same key serialized behind it and
-            // never observed the rolled-back row.
+            // upsert holds a row lock until this transaction ends. So a
+            // concurrent admission for the same key waits behind it and never
+            // sees the rolled-back row.
             if gate_active {
                 return Err(AdmitTxnErr::Gated);
             }
@@ -534,16 +540,15 @@ pub async fn admit_debounced_start_with_codecs(
 }
 
 /// Maximum number of debounce rows fired per scanner tick.
-/// Prevents a single shard from being overwhelmed if many keys come due simultaneously.
+///
+/// It keeps one shard from being overwhelmed when many keys come due at once.
 pub const DEBOUNCE_FIRE_BATCH_SIZE: i64 = 100;
 
 /// Maximum allowed byte length for a debounce key.
 ///
-/// Keys that exceed this limit are rejected at admission time with
-/// [`crate::error::HarvestError::Config`] rather than being persisted and
-/// subsequently failing with a Postgres constraint violation (VARCHAR index
-/// limit). Embedders with long natural keys should hash or truncate them before
-/// use.
+/// Admission rejects a longer key with [`crate::error::HarvestError::Config`].
+/// Otherwise it would persist and then fail with a Postgres constraint
+/// violation (VARCHAR index limit). Hash or truncate long natural keys first.
 pub const DEBOUNCE_KEY_MAX_BYTES: usize = 2048;
 
 /// Internal row type returned by the debounce fire query.
@@ -699,20 +704,20 @@ pub(crate) fn without_payload_start_options(mut options: serde_json::Value) -> s
 ///
 /// The claim (`SELECT ... FOR UPDATE SKIP LOCKED`), the
 /// `start_or_load_workflow_execution_collect` call, and the row `DELETE` all run
-/// inside **one** transaction so the row lock is held from claim through delete.
-/// This is essential: a `FOR UPDATE` lock taken in autocommit mode is released
-/// the instant the `SELECT` completes, which would let a concurrent worker fire
-/// the same key twice and let a concurrent `admit_debounced_start` overwrite the
-/// row (extending the deadline / updating `last_input`) only to have the
-/// scanner fire a stale snapshot and delete the updated row — breaking the
-/// trailing-edge / last-input-wins guarantees. Holding the lock makes a
-/// concurrent upsert block until this transaction commits, after which the row
-/// is gone and the new trigger starts a fresh debounce cycle.
+/// inside **one** transaction, so the row lock is held from claim through delete.
+/// This is essential. In autocommit mode, a `FOR UPDATE` lock is released the
+/// instant the `SELECT` completes. A concurrent worker could then fire the same
+/// key twice. A concurrent `admit_debounced_start` could overwrite the row,
+/// extending the deadline or updating `last_input`. The scanner would then fire a
+/// stale snapshot and delete the updated row. That breaks the trailing-edge and
+/// last-input-wins guarantees. With the lock held, a concurrent upsert blocks
+/// until this transaction commits. The row is then gone, and the new trigger
+/// starts a fresh debounce cycle.
 ///
-/// Deferred completion-trigger starts (from `start_or_load_workflow_execution_collect`)
-/// are spawned **after** the outer transaction commits so a rollback on a later
-/// row can never leave orphaned completion-trigger workflows started for a start
-/// that did not become durable.
+/// Deferred completion-trigger starts (from
+/// `start_or_load_workflow_execution_collect`) are spawned **after** the outer
+/// transaction commits. So a rollback on a later row never leaves orphaned
+/// completion-trigger workflows for a start that did not become durable.
 ///
 /// # Note: scanner gate limitation
 ///
@@ -898,10 +903,10 @@ pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
-    // Spawn a shard's fired follow-ups + record metrics, returning the count.
-    // Done per-shard immediately after that shard's claim transaction commits, so
-    // an error on a *later* shard can never drop an earlier shard's already-
-    // committed completion-trigger/parent-close follow-ups (Codex 580).
+    // Spawn a shard's fired follow-ups and record metrics, returning the count.
+    // This runs per shard, right after that shard's claim transaction commits.
+    // So an error on a *later* shard never drops an earlier shard's committed
+    // completion-trigger/parent-close follow-ups (issue #499).
     async fn spawn_fired(
         fired: Vec<FiredDebounce>,
         metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -923,9 +928,9 @@ pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
             }
             crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
             metrics.record_debounce_fired(&workflow_name, &queue_name);
-            // issue #618, F1: the debounce scanner relays a start already
-            // admitted through the gate at HTTP time; count the deferred fire as
-            // an exempt bypass so an operator can see it never slips a gate
+            // Issue #618, F1: the debounce scanner relays a start that the gate
+            // already admitted at HTTP time. The deferred fire counts as an
+            // exempt bypass, so an operator sees that it never slips a gate
             // silently. See `admission_gate::producer_contract`.
             metrics
                 .record_admission_bypassed(crate::admission_gate::StartProducer::Debounce.as_str());
@@ -951,9 +956,9 @@ pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
                 else {
                     continue;
                 };
-                // Spawn this shard's results before moving on; on this shard's own
-                // error the transaction rolled back, so there is nothing committed
-                // to drain and propagating is safe.
+                // Spawn this shard's results before moving on. On this shard's own
+                // error the transaction rolled back. Nothing committed remains to
+                // drain, so propagating is safe.
                 let fired = fire_due_on_conn(&mut shard_conn, Some(metrics), codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
@@ -1054,11 +1059,13 @@ async fn redefer_debounce_row(
 /// delete the record. Must run inside the caller's transaction so the row lock
 /// taken by the claim `SELECT ... FOR UPDATE` is held through the delete.
 ///
-/// Returns `Some((workflow_name, queue_name, deferred_starts))` when a run was
-/// started (so the caller can spawn deferred trigger-starts and record the
-/// metric after the outer transaction commits), or `None` when the start was a
-/// no-op (e.g. `AlreadyExists` under a reject/duplicate reuse policy — the row
-/// is deleted so the scanner does not retry the doomed start forever).
+/// Returns `Some((workflow_name, queue_name, deferred_starts))` when a run
+/// started. The caller then spawns deferred trigger-starts and records the
+/// metric after the outer transaction commits.
+///
+/// Returns `None` when the start was a no-op, e.g. `AlreadyExists` under a
+/// reject/duplicate reuse policy. The row is deleted, so the scanner does not
+/// retry the doomed start forever.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 async fn fire_claimed_debounce_row(
@@ -1202,22 +1209,22 @@ async fn fire_claimed_debounce_row(
             );
             Ok(None)
         }
-        // issue #946 (Task #7 hardening): a declared per-tenant quota is
-        // exhausted at fire time. Unlike `AlreadyExists` above this is
-        // TEMPORARY — the tenant's usage can free up as an existing
-        // execution completes or is deleted — so the row is RE-DEFERRED
-        // (left, `effective_fire_at` bumped with backoff, clamped at
-        // `max_fire_at`) rather than dropped, and rather than (via a bare
-        // `?`) aborting this whole scanner-tick's claim transaction. A debounce
-        // admission never itself runs the quota check (no execution row
-        // exists to check yet — see the module docs), so this fire-time path
-        // is the FIRST point a debounced start can observe the cap; an
-        // un-caught `?` here would roll back every OTHER already-started row
-        // in the same batch and propagate out through `enforce_timeouts_once`,
-        // starving every later scanner duty (history-ceiling enforcement,
-        // broken-session/mutex-lease reclaim, start-idempotency sweep, …) on
-        // every tick for as long as one quota-blocked tenant sits at the head
-        // of the claim queue.
+        // Issue #946 (Task #7 hardening): a declared per-tenant quota is
+        // exhausted at fire time. Unlike `AlreadyExists` above, this is
+        // TEMPORARY. Usage frees up as an existing execution completes or is
+        // deleted. So the row is RE-DEFERRED, not dropped: it stays, with
+        // `effective_fire_at` bumped by a backoff and clamped at `max_fire_at`.
+        // A bare `?` would abort this whole scanner tick's claim transaction.
+        //
+        // A debounce admission never runs the quota check itself, because no
+        // execution row exists yet (see the module docs). So this fire-time
+        // path is the FIRST point where a debounced start sees the cap. An
+        // uncaught `?` here would roll back every OTHER started row in the
+        // batch and propagate out through `enforce_timeouts_once`. That starves
+        // every later scanner duty on every tick, while one quota-blocked tenant
+        // sits at the head of the claim queue. Those duties include
+        // history-ceiling enforcement, broken-session/mutex-lease reclaim and
+        // the start-idempotency sweep.
         Err(crate::error::HarvestError::QuotaExceeded {
             workflow_name,
             key,
@@ -1542,7 +1549,6 @@ mod tests {
         let max_wait = Duration::from_secs(60);
         let cap = t0 + chrono::Duration::seconds(60);
 
-        // Simulate 20 rapid-fire requests
         for i in 0..20i64 {
             let now = t0 + chrono::Duration::seconds(i * 5);
             let deadline = compute_fire_deadline(now, window, t0, max_wait);
@@ -1566,7 +1572,6 @@ mod tests {
         let t1 = t0 + chrono::Duration::seconds(15);
         let deadline_b = compute_fire_deadline(t1, window, t1, max_wait);
 
-        // Independent keys produce different deadlines
         assert_ne!(deadline_a, deadline_b);
         assert_eq!(deadline_a, t0 + chrono::Duration::seconds(30));
         assert_eq!(deadline_b, t0 + chrono::Duration::seconds(45));

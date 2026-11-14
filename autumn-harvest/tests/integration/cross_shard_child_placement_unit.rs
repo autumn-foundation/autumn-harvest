@@ -11,9 +11,9 @@
 //!    consult the router at all, so a deployment with no installed router keeps
 //!    working byte-for-byte.
 //! 2. **The relay state machine** (`shard::next_cross_shard_child_action`) — the
-//!    decision the cross-shard scanner makes for one outbox row, factored out of
-//!    the database so every branch (start, cancel, terminal delivery, close
-//!    cascade, retire) is exhaustively testable without Postgres.
+//!    decision the cross-shard scanner makes for one outbox row. It is factored
+//!    out of the database, so every branch (start, cancel, terminal delivery,
+//!    close cascade, retire) is exhaustively testable without Postgres.
 //!
 //! The multi-shard *runtime* coverage (real child rows on a second database,
 //! real parent wakes) lives in `cross_shard_children_tests.rs`, which needs
@@ -155,9 +155,9 @@ fn distributed_placement_never_picks_a_drained_shard() {
 
 #[test]
 fn distributed_placement_on_a_single_shard_router_stays_on_the_parent_shard() {
-    // AC1's "every existing single-shard deployment is unaffected" also has to
-    // hold for code that opts *in*: with one writable shard the rendezvous pick
-    // is that shard, which is the parent's, so nothing goes cross-shard.
+    // AC1's "every existing single-shard deployment is unaffected" also holds
+    // for code that opts *in*. With one writable shard, the rendezvous pick is
+    // the parent's shard, so nothing goes cross-shard.
     let router = ShardRouter::single();
     for i in 0..64 {
         let resolved = resolve_child_placement(
@@ -275,10 +275,10 @@ fn an_undeclared_residency_key_is_rejected_never_hashed() {
     );
 }
 
-/// A drain is a *transient* operational state, so it must not be rejected inside
-/// the workflow handler — where the ABI erases the error type and the executor
-/// turns it into a terminal failure. The resolver therefore returns the shard
-/// the caller named, and the rejection happens at the persist boundary.
+/// A drain is a *transient* operational state, so the workflow handler must not
+/// reject it. There the ABI erases the error type, and the executor turns it into
+/// a terminal failure. The resolver returns the shard the caller named, and the
+/// rejection happens at the persist boundary.
 // `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
 #[cfg(feature = "db")]
 #[test]
@@ -354,9 +354,9 @@ fn distributed_placement_with_no_writable_shard_stays_on_the_parents_shard() {
     );
 }
 
-/// A *cross-shard* drained target is still rejected at the persist boundary —
-/// that is the case the preflight exists for, and it does not deadlock any
-/// drain because the parent is not on that shard.
+/// A *cross-shard* drained target is still rejected at the persist boundary.
+/// The preflight exists for this case. It deadlocks no drain, because the
+/// parent is not on that shard.
 // `preflight_target_shard` takes a `ShardedDbPool`, which is `db`-gated.
 #[cfg(feature = "db")]
 #[test]
@@ -569,10 +569,10 @@ fn abandon_never_cascades() {
 /// exists. It is not held until the child or the parent terminates.
 ///
 /// `Abandon` is owed nothing after the start: no terminal to deliver, and by
-/// definition no cascade. Holding the row until the child ends is unbounded in
-/// exactly the case the policy exists for — a long-lived or never-terminating
-/// detached child — so repeated detached fan-out would grow the table and the
-/// per-sweep poll set without limit.
+/// definition no cascade. The policy exists for a long-lived or
+/// never-terminating detached child. Holding the row until that child ends is
+/// unbounded. Repeated detached fan-out would grow the table and the per-sweep
+/// poll set without limit.
 #[test]
 fn an_abandon_row_retires_once_the_child_has_started() {
     // Still starting: the row's one job is not done yet.
@@ -635,11 +635,10 @@ fn an_awaited_child_outliving_a_closed_parent_retires_the_row() {
 
 #[test]
 fn a_terminal_child_still_delivers_even_when_the_parent_has_closed() {
-    // The delivery step itself re-checks the parent under `FOR UPDATE` and
-    // skips the append when it is terminal (mirroring
-    // `notify_awaited_parent_of_child_terminal`), so preferring delivery here
-    // is the safe ordering: it can degrade to a row-delete, whereas retiring
-    // first would drop a wake the parent could still legitimately consume.
+    // The delivery step re-checks the parent under `FOR UPDATE` and skips the
+    // append when it is terminal, like `notify_awaited_parent_of_child_terminal`.
+    // So delivery first is the safe order: it can degrade to a row-delete.
+    // Retiring first would drop a wake the parent could still consume.
     let mut obs = awaited(CrossShardChildStatus::Started);
     obs.parent_terminal = Some(true);
     obs.child_state = Some("COMPLETED");
@@ -662,11 +661,11 @@ fn a_child_row_not_yet_visible_on_the_target_shard_waits() {
 /// **Regression.** A sweep that could not read the parents must decide nothing
 /// destructive.
 ///
-/// `Retire` deletes the outbox row outright with no second look at the parent,
-/// so collapsing a transient parent-read failure into "the parent is terminal"
-/// permanently loses the terminal wake of every awaited cross-shard child in the
-/// batch — and cascade-cancels detached children whose parents are alive. The
-/// unknown state is `None`, and only `Some(true)` retires or cascades.
+/// `Retire` deletes the outbox row with no second look at the parent. Reading a
+/// transient parent-read failure as "the parent is terminal" loses, for good,
+/// the terminal wake of every awaited cross-shard child in the batch. It also
+/// cascade-cancels detached children whose parents are alive. The unknown state
+/// is `None`, and only `Some(true)` retires or cascades.
 #[test]
 fn an_unreadable_parent_state_never_retires_or_cascades() {
     // Awaited, child still running, parent unknown -> wait, never retire.
@@ -680,10 +679,9 @@ fn an_unreadable_parent_state_never_retires_or_cascades() {
     );
 
     // Detached with a CASCADING policy, child still running, parent unknown ->
-    // wait, never cascade. `Abandon` is excluded deliberately: it retires
-    // regardless of the parent (it is owed no cascade at all), and retiring an
-    // Abandon row destroys nothing — the child is meant to outlive its parent
-    // and the row tracks no pending obligation.
+    // wait, never cascade. This excludes `Abandon`, which is owed no cascade and
+    // retires regardless of the parent. Retiring an Abandon row destroys
+    // nothing: the child outlives its parent and the row tracks no obligation.
     for policy in [
         ParentClosePolicy::RequestCancel,
         ParentClosePolicy::Terminate,
@@ -700,8 +698,8 @@ fn an_unreadable_parent_state_never_retires_or_cascades() {
 }
 
 /// The steps that do not depend on the parent still make progress while the
-/// parent read is failing — a parent-side blip must not stall child creation or
-/// a pending cancel.
+/// parent read fails. A parent-side blip must not stall child creation or a
+/// pending cancel.
 #[test]
 fn an_unreadable_parent_state_still_starts_and_cancels() {
     let mut pending = awaited(CrossShardChildStatus::PendingStart);
@@ -721,9 +719,9 @@ fn an_unreadable_parent_state_still_starts_and_cancels() {
     );
 }
 
-/// A terminal child is still delivered while the parent read is failing: the
-/// delivery step re-reads the parent under `FOR UPDATE` and skips the append
-/// itself if it has sealed, so this is safe and avoids stalling every wake.
+/// A terminal child is still delivered while the parent read fails. The
+/// delivery step re-reads the parent under `FOR UPDATE` and skips the append if
+/// the parent has sealed. So this is safe, and it stalls no wake.
 #[test]
 fn an_unreadable_parent_state_still_delivers_a_terminal_child() {
     let mut obs = awaited(CrossShardChildStatus::Started);

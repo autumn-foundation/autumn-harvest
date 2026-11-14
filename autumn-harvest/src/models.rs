@@ -180,7 +180,7 @@ pub struct WorkflowExecution {
     pub first_exec_id: Option<Uuid>,
     /// Wall-clock the per-execution legal hold was placed (issue #747).
     /// `None` = no hold. A hold is ACTIVE when this is non-`None` and
-    /// `legal_hold_until` is `None` or in the future; an active hold exempts
+    /// `legal_hold_until` is `None` or in the future. An active hold exempts
     /// this execution's history from retention deletion and PII erasure.
     pub legal_hold_set_at: Option<DateTime<Utc>>,
     /// Optional auto-expiry for the legal hold (issue #747). `None` =
@@ -686,11 +686,13 @@ pub struct TaskQueueItem {
     /// Ambient context headers propagated from the parent workflow (issue #481).
     #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
-    /// Row insert time (issue #501 review). `None` for pre-upgrade rows; the
-    /// schedule-to-start SLI uses `GREATEST(scheduled_at, created_at)` as the true
-    /// eligibility (an immediate task's backdated `scheduled_at` is corrected to its
-    /// insert time, a delayed/retried task keeps its explicit future `scheduled_at`)
-    /// and falls back to `scheduled_at` when this is `None`.
+    /// Row insert time (issue #501 review). `None` for pre-upgrade rows.
+    ///
+    /// The schedule-to-start SLI uses `GREATEST(scheduled_at, created_at)` as
+    /// the true eligibility. That corrects an immediate task's backdated
+    /// `scheduled_at` to its insert time. A delayed/retried task keeps its
+    /// explicit future `scheduled_at`. The SLI falls back to `scheduled_at`
+    /// when this is `None`.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
     /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
@@ -705,10 +707,10 @@ pub struct TaskQueueItem {
     /// Consecutive claims by workers with no handler registered for this task's
     /// type (issue #804).
     ///
-    /// Incremented each time a worker releases this task back to `PENDING`
-    /// because it has no handler for the workflow/activity type, so a capable
-    /// peer can claim it. Reset to `0` by every path that proves the claiming
-    /// worker *was* capable, so it measures **consecutive** capability misses.
+    /// Incremented each time a worker with no handler for the workflow/activity
+    /// type releases this task back to `PENDING` for a capable peer. Every path
+    /// that proves the claiming worker *was* capable resets it to `0`. So it
+    /// measures **consecutive** capability misses.
     /// At `WorkerConfig::capability_miss_max_redeliveries` the task escalates to
     /// the existing terminal-failure path with a `no_capable_worker:` reason.
     ///
@@ -719,13 +721,13 @@ pub struct TaskQueueItem {
     pub capability_misses: i32,
     /// Distinct worker ids that have missed this task (issue #804).
     ///
-    /// The redelivery budget is consumed **per distinct worker**: a repeat miss
+    /// The redelivery budget is consumed **per distinct worker**. A repeat miss
     /// by a worker already in this set still backs off and still increments
-    /// `capability_misses`, but does not consume budget. Without that, one
-    /// incapable worker winning the claim race `N + 1` times in a row could
-    /// terminally fail a run while a capable peer was live — the released task
-    /// is eligible to every worker again and the claim query has no capability
-    /// filter.
+    /// `capability_misses`, but does not consume budget. The released task is
+    /// eligible to every worker again, and the claim query has no capability
+    /// filter. Without this set, one incapable worker could win the claim race
+    /// `N + 1` times in a row. It would then terminally fail a run while a
+    /// capable peer is live.
     ///
     /// Cleared by exactly the paths that reset `capability_misses`, so the two
     /// stay consistent. Bounded in practice by the budget + 1, since exceeding
@@ -736,22 +738,22 @@ pub struct TaskQueueItem {
     /// Which handler the two counters above are evidence about, as
     /// `{kind}:{name}` (issue #804).
     ///
-    /// The counters describe **one frontier** — the position the workflow is
-    /// stuck at, and so the single handler a claiming worker must register to
-    /// move it. Without this, evidence survived a frontier change that no
-    /// reset covered: `prepare_workflow_task_with_cache` ingests due timers and
-    /// pending signals *before* the persist-time capability gate, so a signal
-    /// arriving while the task bounces on missing handler X can move the replay
-    /// onto a branch needing Y — no park, no inline progress, and X's missers
-    /// still on the row, counted as evidence about Y.
+    /// The counters describe **one frontier**: the position the workflow is
+    /// stuck at. That gives the single handler a claiming worker must register
+    /// to move it. Without this, evidence survived a frontier change that no
+    /// reset covered. `prepare_workflow_task_with_cache` ingests due timers and
+    /// pending signals *before* the persist-time capability gate. A signal that
+    /// arrives while the task bounces on missing handler X can move the replay
+    /// onto a branch needing Y. There is no park and no inline progress. X's
+    /// missers stay on the row, counted as evidence about Y.
     ///
-    /// A mismatch is treated as a **fresh** frontier by both the decision (the
-    /// read zeroes the counters) and the release (it resets them to this one
-    /// miss). `None` reads as a mismatch, which is the safe direction.
+    /// The decision and the release both treat a mismatch as a **fresh**
+    /// frontier. The read zeroes the counters, and the release resets them to
+    /// this one miss. `None` reads as a mismatch, which is the safe direction.
     ///
-    /// Deliberately **not** cleared by the paths that zero the counters: with
-    /// the counts already `0` a stale key is inert, since a match increments
-    /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
+    /// Deliberately **not** cleared by the paths that zero the counters. With
+    /// the counts already `0` a stale key is inert. A match increments
+    /// `0 -> 1` and a mismatch resets to `1`, the same row either way.
     #[serde(default)]
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub capability_miss_handler: Option<String>,
@@ -1455,8 +1457,8 @@ pub struct NewAuditRecord<'a> {
 
 /// One audit row as read by the exporter.
 ///
-/// A separate struct from [`AuditRecord`] deliberately: `AuditRecord` is the
-/// shape the management API serializes for `GET /audit`, and must not grow an
+/// A separate struct from [`AuditRecord`] deliberately. `AuditRecord` is the
+/// shape the management API serializes for `GET /audit`. It must not grow an
 /// internal bookkeeping column just because the exporter needs it.
 #[derive(Debug, Clone, Queryable, Selectable)]
 #[diesel(table_name = harvest_audit_log)]
@@ -1504,8 +1506,8 @@ pub struct AuditExportCursor {
     pub last_delivered_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     /// Set when an operator retired audit export for this shard. The row is
-    /// kept rather than deleted so `last_assigned_seq` outlives the audit rows
-    /// themselves; a retired cursor is inert — retention ignores it and a
+    /// kept rather than deleted, so `last_assigned_seq` outlives the audit rows
+    /// themselves. A retired cursor is inert: retention ignores it and a
     /// redrive refuses it.
     pub retired_at: Option<DateTime<Utc>>,
     /// Newest audit-chain link on this shard (issue #1838).
@@ -1976,9 +1978,10 @@ pub struct NewCompletionDelivery<'a> {
     pub next_attempt_at: DateTime<Utc>,
 }
 
-/// Changeset applied by the scanner after claiming a batch of due rows
-/// (transitions `PENDING`/`INFLIGHT` -> `INFLIGHT`, bumps `attempt`, and
-/// sets a short in-flight lease on `next_attempt_at`).
+/// Changeset applied by the scanner after claiming a batch of due rows.
+///
+/// It transitions `PENDING`/`INFLIGHT` -> `INFLIGHT`, bumps `attempt`, and
+/// sets a short in-flight lease on `next_attempt_at`.
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = harvest_completion_deliveries)]
 pub struct CompletionDeliveryClaim {
@@ -2109,7 +2112,7 @@ pub struct ExecutionSummary {
     pub parent_id: Option<Uuid>,
     pub summarized_at: DateTime<Utc>,
     /// The residence history carried over from the demoted execution row
-    /// (issue #964), so a cross-residence erasure can still reach the sealed
+    /// (issue #964). A cross-residence erasure can then still reach the sealed
     /// source copies after that row is collected. `None` for a run that never
     /// moved.
     pub migrated_from_shards: Option<serde_json::Value>,
@@ -2135,9 +2138,9 @@ pub struct NewExecutionSummary {
     /// Parent execution UUID when demoting a child workflow, else `None`
     /// (issue #752).
     pub parent_id: Option<Uuid>,
-    /// The demoted execution's residence history (issue #964), carried over so
-    /// a cross-residence erasure can still reach the sealed source copies after
-    /// the execution row is gone. `None` for a run that never moved.
+    /// The demoted execution's residence history (issue #964). A
+    /// cross-residence erasure can then still reach the sealed source copies
+    /// after the execution row is gone. `None` for a run that never moved.
     pub migrated_from_shards: Option<serde_json::Value>,
 }
 
@@ -2146,9 +2149,9 @@ pub struct NewExecutionSummary {
 /// A content-addressed WASM activity module row from `harvest_wasm_modules`
 /// (issue #965).
 ///
-/// Reads carry the full `wasm_bytes` blob; callers that only need to know which
-/// version is active should prefer the hash-only resolution helpers in
-/// [`crate::wasm_store`] to avoid loading the bytes.
+/// Reads carry the full `wasm_bytes` blob. A caller that only needs the active
+/// version should prefer the hash-only resolution helpers in
+/// [`crate::wasm_store`], which do not load the bytes.
 #[derive(
     Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
 )]

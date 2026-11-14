@@ -4,10 +4,10 @@
 //! during replay, matching each workflow command against history to return
 //! already-computed results instead of re-executing side effects.
 //!
-//! This is the brain of the durable execution model: when a workflow function
-//! calls `execute_activity("send_email", ...)`, the matcher checks whether
-//! history already contains a completed result for that activity and returns
-//! it directly, avoiding duplicate side effects.
+//! This is the core of the durable execution model. When a workflow function
+//! calls `execute_activity("send_email", ...)`, the matcher looks in history
+//! for a completed result of that activity. If one exists, the matcher returns
+//! it directly and avoids a duplicate side effect.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -161,8 +161,8 @@ pub enum HistoryMatch {
     },
     /// History shows an external activity was scheduled but no terminal event
     /// (completed/failed/timed-out) exists yet. The workflow should re-emit the
-    /// schedule command with the same token and activity ID (idempotent at the
-    /// worker level) and then suspend until the external completion arrives.
+    /// schedule command with the same token and activity ID, which is idempotent
+    /// at the worker level. It then suspends until the external completion arrives.
     AwaitingExternalCompletion {
         /// The activity execution ID already recorded in history.
         activity_id: ActivityExecId,
@@ -170,11 +170,11 @@ pub enum HistoryMatch {
         token: ExternalActivityToken,
     },
     /// History shows a child workflow was started but no terminal event
-    /// (completed/failed) exists yet.  This occurs when the parent wakes after
-    /// one of several parallel children completes while others are still
-    /// running.  The workflow should re-emit a `StartChildWorkflow` command
-    /// carrying the **existing** `child_id` from history (idempotent at the
-    /// worker level) and then suspend until the child's terminal event arrives.
+    /// (completed/failed) exists yet. This occurs when the parent wakes after
+    /// one of several parallel children completes while others still run.
+    /// The workflow should re-emit a `StartChildWorkflow` command with the
+    /// **existing** `child_id` from history, which is idempotent at the worker
+    /// level. It then suspends until the child's terminal event arrives.
     ChildInProgress {
         /// The child execution ID already recorded in history. Must be reused.
         child_id: ExecutionId,
@@ -212,16 +212,16 @@ pub enum HistoryMatch {
     ///
     /// This occurs when the worker crashed after appending the request event
     /// but before recording the delivery outcome. The caller must re-attempt
-    /// delivery using the **same** `signal_id` and the **same** `payload` so
-    /// the idempotency key is unchanged, and must NOT append a second
+    /// delivery with the **same** `signal_id` and the **same** `payload`, so
+    /// the idempotency key does not change. The caller must NOT append a second
     /// `ExternalSignalRequested` event.
     ExternalSignalInProgress {
         /// The `ExternalSignalId` already recorded in history. Must be reused.
         signal_id: ExternalSignalId,
         /// The payload stored in the durable `ExternalSignalRequested` event.
-        /// The worker must re-send this exact payload rather than the current
-        /// argument value, so that target receives consistent data if the
-        /// workflow code changed the payload expression between crash and recovery.
+        /// The worker must re-send this exact payload, not the current argument
+        /// value. The workflow code can change the payload expression between
+        /// crash and recovery, and the target must still receive consistent data.
         payload: serde_json::Value,
         /// Idempotency key recorded in the durable `ExternalSignalRequested`
         /// event, re-sent verbatim so re-delivery dedups against the target's
@@ -291,10 +291,10 @@ pub enum HistoryMatch {
 /// Result of matching a signal-vs-timer race against the event history
 /// (issue #476: `WorkflowContext::receive_signal_timeout`).
 ///
-/// The race is resolved **deterministically by recorded history order**:
-/// whichever of `SignalReceived` or `TimerFired` appears first in history
-/// wins on every replay, regardless of wall-clock timing on the replaying
-/// worker.
+/// The race is resolved **deterministically by recorded history order**.
+/// Whichever of `SignalReceived` or `TimerFired` appears first in history
+/// wins on every replay. Wall-clock timing on the replaying worker does not
+/// matter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalOrTimerMatch {
     /// The signal was recorded before the deadline timer fired (or before the
@@ -333,9 +333,9 @@ pub enum SignalOrTimerMatch {
 /// The race composes the existing
 /// `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed` and
 /// `TimerStarted`/`TimerFired` events — no new event variant. The winner is the
-/// resolution event that appears **first in recorded history**, so the outcome
-/// is deterministic across replays regardless of wall-clock timing on the
-/// replaying worker.
+/// resolution event that appears **first in recorded history**. So the outcome
+/// is deterministic across replays. Wall-clock timing on the replaying worker
+/// does not matter.
 // `serde_json::Value` fields (`output`, `details`) are `PartialEq` but not `Eq`,
 // so `Eq` cannot be derived; silence the false-positive lint suggestion.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -361,11 +361,11 @@ pub enum ChildOrTimerMatch {
         /// Advisory non-retryable classification hint.
         non_retryable: bool,
     },
-    /// The deadline timer fired before the child terminated. Carries the losing
-    /// child's `ExecutionId` (so the caller can durably request-cancel it) and
-    /// `child_already_terminal`, which is `true` iff the loser child's terminal
-    /// is already recorded in history (the caller then suppresses re-pushing
-    /// `CancelRaceLosers`).
+    /// The deadline timer fired before the child terminated. It carries the
+    /// losing child's `ExecutionId`, so the caller can durably request-cancel
+    /// it. `child_already_terminal` is `true` iff history already holds the
+    /// loser child's terminal. The caller then suppresses re-pushing
+    /// `CancelRaceLosers`.
     TimerFired {
         /// The `ExecutionId` of the losing child workflow.
         child_id: ExecutionId,
@@ -400,17 +400,17 @@ pub enum ChildOrTimerMatch {
 /// history (issue #768: `TimerHandle::await_fire`).
 ///
 /// The fire-vs-cancel outcome is resolved **deterministically by recorded
-/// history order**: whichever of `TimerFired` or `TimerCancelled` for the timer
-/// id appears first in history wins on every replay, regardless of wall-clock
-/// timing on the replaying worker.
+/// history order**. Whichever of `TimerFired` or `TimerCancelled` for the timer
+/// id appears first in history wins on every replay. Wall-clock timing on the
+/// replaying worker does not matter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerFireMatch {
     /// A `TimerFired` for the id was recorded before any `TimerCancelled`.
     Fired,
     /// A `TimerCancelled` for the id was recorded before any `TimerFired`.
     Cancelled,
-    /// The timer is armed but neither a fire nor a cancel is recorded yet, or
-    /// the cursor is past the end of history (first live await). The caller
+    /// The timer is armed, but history records neither a fire nor a cancel yet.
+    /// Or the cursor is past the end of history (first live await). The caller
     /// re-arms (idempotently) and suspends again.
     NoMatch,
 }
@@ -431,19 +431,19 @@ enum TimerScanStep {
 
 /// Result of matching a `patched()` call against recorded history (issue #687).
 ///
-/// A deliberate three-state result rather than a bare `bool`: the caller
-/// ([`crate::context::WorkflowContext::patched`]) must distinguish "the marker
-/// was recorded" (return `true`, consume nothing new) from "we are on the live
-/// frontier" (return `true` AND record a fresh `patch:{id}` marker) from
-/// "replaying pre-patch history" (return `false`, record nothing). Collapsing
-/// the first two into one boolean would force the caller to re-derive the
-/// live-vs-replay distinction after the fact — the ambiguity `match_version`'s
-/// "return max and let the caller re-check `is_replaying()`" trick papers over.
+/// A deliberate three-state result, not a bare `bool`. The caller
+/// ([`crate::context::WorkflowContext::patched`]) must tell three cases apart.
+/// On a recorded marker, it returns `true` and consumes nothing new. On the
+/// live frontier, it returns `true` AND records a fresh `patch:{id}` marker.
+/// On pre-patch replay, it returns `false` and records nothing. One boolean for
+/// the first two cases would force the caller to re-derive the live-vs-replay
+/// distinction after the fact. The `match_version` trick "return max and let
+/// the caller re-check `is_replaying()`" papers over that ambiguity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchMarkerMatch {
     /// A `patch:{id}` (or interop `version:{id}`) marker was consumed at the
-    /// cursor — or the id was previously deprecated and the memo says a marker
-    /// was present in history. The caller takes the new branch.
+    /// cursor. Or the id was previously deprecated, and the memo says history
+    /// had a marker. The caller takes the new branch.
     Recorded,
     /// Replaying, but no marker for this id at this position — pre-patch
     /// history; the caller must take the old branch. The cursor is not
@@ -458,7 +458,7 @@ pub enum PatchMarkerMatch {
 /// (issue #691).
 ///
 /// A [`WorkflowEvent::MutexGranted`] is the replay anchor for
-/// `ctx.mutex(key).acquire()`: it is appended at a clean resume cursor when the
+/// `ctx.mutex(key).acquire()`. It is appended at a clean resume cursor when the
 /// lock is granted, so the matcher is strictly positional (mirrors
 /// [`HistoryMatcher::match_timer_arm`]). Release is event-less bookkeeping, so
 /// no forward-scan skip-list needs updating.
@@ -496,13 +496,15 @@ pub enum MutexGrantMatch {
 /// [`match_side_effect_event`](HistoryMatcher::match_side_effect_event): a
 /// cursor holding a *non-`Now`* recorded event resolves to
 /// [`SideEffectNowMatch::NotRecorded`] (cursor left untouched, no divergence)
-/// rather than [`HistoryMatch::Diverged`]. This is what lets a workflow that
+/// rather than [`HistoryMatch::Diverged`].
+///
+/// This lets a workflow resume gracefully under a new binary when it
 /// declares an `execution_timeout` and calls `should_continue_as_new()` at the
-/// top of a run resume gracefully under a new binary even when its recorded
-/// history predates #772 (and so carries no `SideEffectRecorded{Now}` at that
-/// position): the deadline branch simply degrades to history-count-only for the
-/// pre-upgrade recorded portion instead of recording a non-determinism error
-/// and nd-blocking the run (issue #603).
+/// top of a run. That holds even when its recorded history predates #772 and
+/// so carries no `SideEffectRecorded{Now}` at that position. The deadline
+/// branch then degrades to history-count-only for the pre-upgrade recorded
+/// portion. It does not record a non-determinism error and nd-block the run
+/// (issue #603).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideEffectNowMatch {
     /// The cursor held the probe's own sentinel-named
@@ -513,14 +515,14 @@ pub enum SideEffectNowMatch {
         /// The recorded wall-clock instant, as Unix milliseconds.
         millis: i64,
     },
-    /// The cursor held some *other* recorded event — an old-history migration
-    /// (the `should_continue_as_new()` call site recorded no probe clock read
-    /// here) OR an author-side `system_now()` `Now` (`name: None`) that belongs
-    /// to the workflow's own code, not the probe. The cursor is left untouched
-    /// and no divergence is raised — the caller degrades the deadline branch to
-    /// "unavailable". Fail-safe by construction: it can never emit a wrong
-    /// command, never steals a user `Now`, and any genuine control-flow
-    /// divergence still nd-errors at the next real command.
+    /// The cursor held some *other* recorded event. It is either an old-history
+    /// migration (the `should_continue_as_new()` call site recorded no probe
+    /// clock read here) or an author-side `system_now()` `Now` (`name: None`).
+    /// That `Now` belongs to the workflow's own code, not the probe. The cursor
+    /// is left untouched and no divergence is raised. The caller degrades the
+    /// deadline branch to "unavailable". This is fail-safe by construction. It
+    /// can never emit a wrong command and never steals a user `Now`. Any
+    /// genuine control-flow divergence still nd-errors at the next real command.
     NotRecorded,
     /// The cursor is at the live frontier (past the end of recorded history).
     /// The caller records a fresh sentinel-named `Now` side-effect (like
@@ -532,12 +534,12 @@ pub enum SideEffectNowMatch {
 /// Reserved side-effect name for the engine-internal deadline-branch clock read
 /// (issue #772).
 ///
-/// The `should_continue_as_new()` deadline check records its wall-clock read as a
-/// `SideEffectRecorded { kind: Now, name: Some(this) }`, so
+/// The `should_continue_as_new()` deadline check records its wall-clock read as
+/// a `SideEffectRecorded { kind: Now, name: Some(this) }`. So
 /// [`match_side_effect_now_tolerant`](HistoryMatcher::match_side_effect_now_tolerant)
 /// can tell the probe's own `Now` apart from an author-side `ctx.system_now()`
-/// (recorded as `{ kind: Now, name: None }`). Follows the `__harvest_*` /
-/// `__signal_timeout:` reserved-name convention; author code never records a
+/// (recorded as `{ kind: Now, name: None }`). It follows the `__harvest_*` /
+/// `__signal_timeout:` reserved-name convention. Author code never records a
 /// `Now` under this name.
 pub const DEADLINE_PROBE_SIDE_EFFECT_NAME: &str = "__harvest_deadline_probe";
 
@@ -597,27 +599,27 @@ pub(crate) fn version_marker_name(change_id: &str) -> String {
 /// Result of matching a saga compensation dedup marker against recorded
 /// history (issue #801).
 ///
-/// Mirrors [`PatchMarkerMatch`]'s tolerant shape (minus the patch-specific
-/// deprecation memo / `version:` interop / same-cycle latch, none of which
-/// apply here), extended post-review with a fourth state so the caller
+/// Mirrors [`PatchMarkerMatch`]'s tolerant shape, minus the patch-specific
+/// deprecation memo, `version:` interop and same-cycle latch. None of those
+/// apply here. A fourth state lets the caller
 /// ([`crate::context::WorkflowContext::observe_saga_unwind_start`] /
 /// [`observe_saga_unwind_failed`](crate::context::WorkflowContext::observe_saga_unwind_failed))
-/// can resolve the whole unwind's disposition **once** and keep the
+/// resolve the whole unwind's disposition **once**. That keeps the
 /// compensated/failed counter pair coherent (invariant: `failed ≤
 /// compensated`, per unwind):
 ///
-/// - "the marker was recorded" → stay silent;
+/// - "the marker was recorded" → stay silent.
 /// - "live frontier" → record a fresh marker AND emit (the exactly-once
-///   point);
+///   point).
 /// - "drained-signal frontier" → a recorded position whose only remaining
-///   events were trailing un-awaited signals; whether to record is the
-///   caller's call, keyed to the unwind's disposition;
+///   events were trailing un-awaited signals. The caller decides whether to
+///   record, keyed to the unwind's disposition.
 /// - "pre-#801 marker-less history" → stay silent, touch nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SagaMarkerMatch {
-    /// A saga marker with this exact name was consumed at the cursor (or,
-    /// tolerantly, found past only command-less `WorkflowCancelled`
-    /// lifecycle events / trailing signals and consumed out-of-order) — the
+    /// A saga marker with this exact name was consumed at the cursor. Or the
+    /// tolerant scan found it past only command-less `WorkflowCancelled`
+    /// lifecycle events / trailing signals and consumed it out of order. The
     /// unwind was already counted on a previous cycle. The caller emits
     /// nothing.
     Recorded,
@@ -627,33 +629,32 @@ pub enum SagaMarkerMatch {
     /// still matches the next command; the caller records nothing and emits
     /// nothing.
     Absent,
-    /// Past recorded history — the first live execution of this unwind —
-    /// or separated from the frontier only by command-less
-    /// `WorkflowCancelled` lifecycle events (the cancel-and-compensate
-    /// pattern: the cancellation event has no workflow-command counterpart
-    /// and never leaves the cursor, so it must not hide the frontier from a
-    /// metrics-only marker). The caller records a fresh marker and emits the
-    /// counter exactly here — **unless** the context is a `WorkflowReplayer`
-    /// strict/canary probe: the matcher cannot distinguish the engine's
-    /// genuinely-live cancel-and-compensate cycle from a probe's read of a
-    /// pre-#801 marker-less *terminal* cancelled history (the two histories
-    /// are byte-identical), so the caller additionally gates this arm on
-    /// `WorkflowContext::is_replay_probe` (Codex P2, PR #973 review).
+    /// Past recorded history, the first live execution of this unwind. Or only
+    /// command-less `WorkflowCancelled` lifecycle events separate the cursor
+    /// from the frontier. That is the cancel-and-compensate pattern. The
+    /// cancellation event has no workflow-command counterpart and never leaves
+    /// the cursor, so it must not hide the frontier from a metrics-only marker.
+    /// The caller records a fresh marker and emits the counter exactly here.
+    /// The exception is a `WorkflowReplayer` strict/canary probe context. The
+    /// matcher cannot tell the engine's genuinely-live cancel-and-compensate
+    /// cycle from a probe's read of a pre-#801 marker-less *terminal* cancelled
+    /// history. The two histories are byte-identical. So the caller also gates
+    /// this arm on `WorkflowContext::is_replay_probe` (PR #973).
     LiveFrontier,
     /// Replaying pre-drain, but after stashing trailing un-awaited signal
-    /// events the cursor is past the end of recorded history — a
-    /// drained-signal frontier (canonically: a signal-with-start run whose
-    /// unwind begins before the staged signal is awaited, or a duplicate
-    /// webhook signal ingested at the final unwind cycle's wake).
+    /// events the cursor is past the end of recorded history. This is a
+    /// drained-signal frontier. Canonically, it is a signal-with-start run whose
+    /// unwind begins before the staged signal is awaited. Or it is a duplicate
+    /// webhook signal ingested at the final unwind cycle's wake.
     ///
-    /// Recording a marker here is replay-consistent (the marker lands past
-    /// the drained signals, exactly where the next cycle's drain re-finds
-    /// it), but whether to record is the **caller's** decision, keyed to the
-    /// unwind's disposition: `observe_saga_unwind_start` stays conservative
-    /// (parity with `ctx.patched()`'s signal-with-start caveat — the whole
-    /// unwind is uncounted), while `observe_saga_unwind_failed` records here
-    /// for a **counted** unwind so a trailing duplicate signal can never
-    /// suppress the page-severity failure counter (post-review P2-1).
+    /// Recording a marker here is replay-consistent: the marker lands past
+    /// the drained signals, exactly where the next cycle's drain re-finds it.
+    /// But the **caller** decides whether to record, keyed to the unwind's
+    /// disposition. `observe_saga_unwind_start` stays conservative, for parity
+    /// with `ctx.patched()`'s signal-with-start caveat (the whole unwind is
+    /// uncounted). `observe_saga_unwind_failed` records here for a **counted**
+    /// unwind, so a trailing duplicate signal can never suppress the
+    /// page-severity failure counter.
     DrainedSignalFrontier,
 }
 
@@ -1024,11 +1025,11 @@ impl ExternalCalls {
 }
 
 /// The frozen resolution recorded on a `LocalActivityScheduled` event
-/// (issue #620, AC8; Codex P2). Returned by
+/// (issue #620, AC8). Returned by
 /// [`HistoryMatcher::recorded_local_activity_resolution`].
 ///
 /// `Default` yields the "unresolved legacy" shape (`resolved == false`, both
-/// frozen fields `None`) so a pre-#620 event or an absent `activity_id` falls
+/// frozen fields `None`). So a pre-#620 event or an absent `activity_id` falls
 /// back to live re-derivation on crash recovery.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalActivityResolution {
@@ -1076,97 +1077,96 @@ pub struct HistoryMatcher {
     /// non-determinism, so every scan loop skips them via [`Self::is_consumed`].
     transparent_events: EventIndexSet,
     /// Event indices of the exact `SignalReceived` events that lost a
-    /// signal-or-deadline race (issue #476): for each race whose `TimerFired`
+    /// signal-or-deadline race (issue #476). For each race whose `TimerFired`
     /// precedes a matching signal, the **first** such signal event is the
-    /// loser. A late loser is a normal production occurrence on the timeout
-    /// branch — the workflow may intentionally never consume it — so
+    /// loser. A late loser is normal in production on the timeout branch, and
+    /// the workflow may intentionally never consume it. So
     /// [`Self::has_non_lifecycle_unconsumed`] must not report that specific
     /// event as early-completion non-determinism. Any other unconsumed signal
-    /// (a second same-name delivery, or the loser's exemption spent because a
-    /// later wait consumed it) still flags. The excused signal stays
-    /// deliverable to any subsequent signal wait (the exemption only
-    /// suppresses the completed-history check, never consumption).
+    /// still flags. Examples are a second same-name delivery, or a loser whose
+    /// exemption is spent because a later wait consumed it. The excused signal
+    /// stays deliverable to any later signal wait. The exemption only
+    /// suppresses the completed-history check, never consumption.
     late_race_signal_events: HashSet<usize>,
-    /// `SignalReceived` event indices that fall inside a still-open
-    /// signal-or-deadline race window (issue #476) for their signal name --
-    /// i.e. a `TimerStarted { timer_id: "__signal_timeout:{seq}:{name}" }`
-    /// precedes the index with no matching `TimerFired` recorded yet at or
-    /// before it. These are reserved for `Self::match_signal_or_timer`'s own
-    /// resolution and must never be claimed by `Self::claim_pending_signal`
-    /// (issue #546): doing so would silently flip the race outcome to
-    /// `TimerWon` even though the signal arrived first. A signal recorded
-    /// *after* its race's `TimerFired` (the race already resolved
-    /// `TimerWon`) is an ordinary "late loser" and is not reserved -- it
-    /// stays fair game for a push handler exactly like it already stays
-    /// fair game for a later plain signal wait.
+    /// `SignalReceived` event indices inside a still-open signal-or-deadline
+    /// race window (issue #476) for their signal name. That is, a
+    /// `TimerStarted { timer_id: "__signal_timeout:{seq}:{name}" }` precedes the
+    /// index, and no matching `TimerFired` is recorded yet at or before it.
+    /// These are reserved for `Self::match_signal_or_timer`'s own resolution.
+    /// `Self::claim_pending_signal` must never claim them (issue #546). Doing so
+    /// would silently flip the race outcome to `TimerWon`, even though the
+    /// signal arrived first. A signal recorded *after* its race's `TimerFired`
+    /// is an ordinary "late loser", because the race already resolved
+    /// `TimerWon`. It is not reserved. It stays fair game for a push handler,
+    /// exactly as it stays fair game for a later plain signal wait.
     ///
     /// In practice a push handler can never reach a signal still inside an
-    /// open race window anyway -- the race's own `TimerStarted` is not one
-    /// of the "transparent" events `Self::drain_early_signals` skips over,
-    /// so it hard-blocks the cursor until `Self::match_signal_or_timer`
-    /// itself consumes it. This set is kept as an explicit, independently
-    /// verified guarantee rather than an implicit consequence of that
-    /// scan-ordering detail.
+    /// open race window anyway. The race's own `TimerStarted` is not one of the
+    /// "transparent" events that `Self::drain_early_signals` skips over. So it
+    /// hard-blocks the cursor until `Self::match_signal_or_timer` itself
+    /// consumes it. This set keeps the guarantee explicit and independently
+    /// verified, not an implicit consequence of that scan-ordering detail.
     race_reserved_signal_events: HashSet<usize>,
     /// Deprecated patch ids (issue #687), memoizing whether a `patch:{id}` /
-    /// `version:{id}` marker was present anywhere in this history. Populated
-    /// by [`Self::deprecate_patch`], which marks every such marker consumed
-    /// (positional matching cannot apply — phase-2 code calls
+    /// `version:{id}` marker was present anywhere in this history.
+    /// [`Self::deprecate_patch`] fills it and marks every such marker consumed.
+    /// Positional matching cannot apply here. Phase-2 code calls
     /// `deprecate_patch` at a different, usually earlier, position than the
-    /// phase-1 `patched()` call that recorded the marker, so the marker must
-    /// become transparent wherever it sits or it would trip the next
-    /// `match_*` as a divergence). The memo keeps a *residual* `patched(id)`
-    /// call after `deprecate_patch(id)` deterministic: `true` for phase-1
-    /// histories, `false` for phase-0 histories AND for new executions
-    /// started post-deprecation, on both live and replay passes.
+    /// phase-1 `patched()` call that recorded the marker. So the marker must
+    /// become transparent wherever it sits, or it would trip the next `match_*`
+    /// as a divergence. The memo keeps a *residual* `patched(id)` call after
+    /// `deprecate_patch(id)` deterministic on both live and replay passes. It
+    /// returns `true` for phase-1 histories. It returns `false` for phase-0
+    /// histories AND for new executions started post-deprecation.
     deprecated_patches: HashMap<String, bool>,
     /// Patch/version ids whose marker was recorded on the **live frontier of
-    /// this very cycle** (issue #687, review hardening): a
+    /// this very cycle** (issue #687). A
     /// [`Self::match_patch_marker`] `NewlyPatched` result or a
     /// [`Self::match_version`] live-frontier `max_version` result means the
-    /// context is about to push a `RecordMarker` command that exists only as
-    /// a pending command — invisible to [`Self::deprecate_patch`]'s
+    /// context is about to push a `RecordMarker` command. That command exists
+    /// only as a pending command, invisible to [`Self::deprecate_patch`]'s
     /// full-history scan. Without this latch, a same-cycle
     /// `patched(id)` → `deprecate_patch(id)` → `patched(id)` sandwich would
-    /// memoize `false` on the live pass and `true` on every replay pass — a
+    /// memoize `false` live and `true` on every replay pass. That is a
     /// live/replay branch flip and a permanent nd-block (issue #603).
-    /// `deprecate_patch` ORs this set into its presence computation so the
+    /// `deprecate_patch` ORs this set into its presence computation, so the
     /// live cycle agrees with every replay cycle.
     patch_ids_recorded_this_cycle: HashSet<String>,
     /// Whether the MOST RECENT cancellable-timer forward scan
     /// ([`Self::match_timer_cancel`] / [`Self::match_timer_or_cancel`], issue
     /// #768) STOPPED at an unconsumed command-bearing event
-    /// ([`TimerScanStep::Stop`]) rather than claiming its target or running off
-    /// the end of history. Both scans reset this to `false` on entry (after
-    /// `prepare_match`) and set it `true` on the `Stop` break.
+    /// ([`TimerScanStep::Stop`]). The alternatives are claiming its target or
+    /// running off the end of history. Both scans reset this to `false` on
+    /// entry (after `prepare_match`) and set it `true` on the `Stop` break.
     ///
     /// A `NoMatch` return paired with this flag `true` means the scan was
-    /// **blocked**: a same-id `TimerCancelled`/`TimerFired` (or a genuinely new
-    /// cancel/await) is being emitted BEFORE a command history recorded first —
-    /// a real non-determinism divergence, distinct from a genuine live-frontier
-    /// `NoMatch` (scan ran off the end, cursor at the frontier) which is a
-    /// legitimate new live append. [`Self::timer_scan_stopped_at_command`]
-    /// exposes it to `cancel_timer`/`reset_timer`/`await_timer_fire`. They treat
-    /// a blocked scan as a divergence in NORMAL worker replay too, not only
-    /// under strict `WorkflowReplayer` mode (issue #768).
+    /// **blocked**. A same-id `TimerCancelled`/`TimerFired` (or a genuinely new
+    /// cancel/await) is being emitted BEFORE a command history recorded first.
+    /// That is a real non-determinism divergence. It differs from a genuine
+    /// live-frontier `NoMatch`, where the scan ran off the end and the cursor is
+    /// at the frontier. That case is a legitimate new live append.
+    /// [`Self::timer_scan_stopped_at_command`] exposes the flag to
+    /// `cancel_timer`/`reset_timer`/`await_timer_fire`. They treat a blocked scan
+    /// as a divergence in NORMAL worker replay too, not only under strict
+    /// `WorkflowReplayer` mode (issue #768).
     timer_scan_stopped_at_command: bool,
     /// Index of the first event of a **terminal-failure tail** (issue #952), or
     /// `None` when this history does not end in a failure.
     ///
-    /// A failing decision cycle's history is truncated by construction: the
-    /// commands the cycle issued were never turned into events, and no further
-    /// event can ever be appended to the sealed run. So a trailing terminal
-    /// `WorkflowFailed` (together with any post-terminal bookkeeping appended
-    /// after it) is made transparent in [`Self::new`] — every `match_*` at that
-    /// cursor answers `NoMatch` ("the run is failing") instead of `Diverged` —
-    /// and, once every pre-terminal event is consumed, the cursor is said to be
-    /// at the **failing frontier** ([`Self::at_terminal_failure_frontier`]),
-    /// where the strict-replay layers above stop reporting divergence.
+    /// A failing decision cycle's history is truncated by construction. The
+    /// commands the cycle issued never became events, and no further event can
+    /// ever be appended to the sealed run. So [`Self::new`] makes a trailing
+    /// terminal `WorkflowFailed` transparent, together with any post-terminal
+    /// bookkeeping appended after it. Every `match_*` at that cursor answers
+    /// `NoMatch` ("the run is failing") instead of `Diverged`. Once every
+    /// pre-terminal event is consumed, the cursor is at the **failing
+    /// frontier** ([`Self::at_terminal_failure_frontier`]). There the
+    /// strict-replay layers above stop reporting divergence.
     ///
-    /// Deliberately failure-only: a `WorkflowCompleted`/`WorkflowCancelled`
-    /// history is verified in full, and a `WorkflowFailed` that is *reopened* by
-    /// a `WorkflowRedriven` (#510) is not a tail — that case keeps its own,
-    /// redrive-anchored transparency rule.
+    /// This is deliberately failure-only. A `WorkflowCompleted`/`WorkflowCancelled`
+    /// history is verified in full. A `WorkflowFailed` that a `WorkflowRedriven`
+    /// (#510) *reopens* is not a tail. That case keeps its own redrive-anchored
+    /// transparency rule.
     terminal_failure_tail: Option<usize>,
     /// Signal names that a non-blocking claim probed while no unconsumed
     /// command event bounded its scan (issue #1798).
@@ -1277,14 +1277,15 @@ impl HistoryMatcher {
             .collect();
         // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
         // was sealed `FAILED` at quarantine time. Mark the redrive event AND the
-        // superseded terminal `WorkflowFailed` it sits behind as transparent so
-        // command dispatch advances the cursor past the reopened terminal instead
-        // of diverging when the re-enqueued task re-issues the failed command.
+        // superseded terminal `WorkflowFailed` it sits behind as transparent.
+        // Then command dispatch advances the cursor past the reopened terminal.
+        // It does not diverge when the re-enqueued task re-issues the failed
+        // command.
         //
         // This is **redrive-anchored**: only a `WorkflowFailed` immediately
         // preceding a `WorkflowRedriven` (skipping already-transparent events) is
         // made transparent. A bare trailing `WorkflowFailed` with no following
-        // redrive stays non-transparent — it is a genuinely failed run and its
+        // redrive stays non-transparent. It is a genuinely failed run, and its
         // replay (queries, the replayer harness) must be unaffected.
         let mut last_redrive: Option<usize> = None;
         for (i, event) in events.iter().enumerate() {
@@ -1310,23 +1311,23 @@ impl HistoryMatcher {
                 }
             }
         }
-        // Issue #952 x #510: a redrive REOPENS a run that a failing cycle sealed,
-        // and that cycle recorded the awaited work it abandoned (see
-        // `crate::event::ABANDONED_DISPATCH_REASON`). Those records exist to keep
-        // the audit trail honest about a run that is over — they must never
-        // become history the reopened run replays, or the redriven cycle would
-        // read back "this activity/child failed" and could never re-issue the
-        // dispatch the operator redrove it to complete. Mark each abandoned pair
-        // transparent so the reopened run emits it live, exactly as it did
+        // Issue #952 x #510: a redrive REOPENS a run that a failing cycle sealed.
+        // That cycle recorded the awaited work it abandoned (see
+        // `crate::event::ABANDONED_DISPATCH_REASON`). Those records keep the
+        // audit trail honest about a run that is over. They must never become
+        // history the reopened run replays. Otherwise the redriven cycle would
+        // read back "this activity/child failed". It could then never re-issue
+        // the dispatch the operator redrove it to complete. Mark each abandoned
+        // pair transparent, so the reopened run emits it live, exactly as it did
         // before #952 recorded anything at all.
         //
         // Bounded by the LAST redrive (issue #952): only a cycle a
         // redrive actually superseded is re-opened work. A run that was
         // redriven and then failed AGAIN wrote fresh abandoned pairs after that
-        // redrive; those belong to the terminal-failure tail's own cycle and
-        // stay opaque, so a replay resolves them from their synthetic terminal
-        // and re-derives the failure path the recorded run took instead of
-        // parking on a dispatch that never resolves.
+        // redrive. Those belong to the terminal-failure tail's own cycle and
+        // stay opaque. So a replay resolves them from their synthetic terminal
+        // and re-derives the failure path the recorded run took. It does not
+        // park on a dispatch that never resolves.
         if let Some(redrive_idx) = last_redrive {
             for i in Self::abandoned_dispatch_indices(&events[..redrive_idx]) {
                 transparent_events.insert(i);
@@ -1347,8 +1348,8 @@ impl HistoryMatcher {
             }
         }
         // Terminal-failure tail (issue #952): a run sealed FAILED can never
-        // grow another event, so everything from its terminal event onward is
-        // transparent to command-dispatch replay — mirroring how the
+        // grow another event. So everything from its terminal event onward is
+        // transparent to command-dispatch replay. This mirrors how the
         // pause/resume and redrive events above are pre-marked consumed.
         let terminal_failure_tail = Self::terminal_failure_tail_start(&events);
         if let Some(start) = terminal_failure_tail {
@@ -1427,10 +1428,10 @@ impl HistoryMatcher {
     /// `None` if it has none (issue #952).
     ///
     /// Walks backwards from the end over events that carry no workflow command
-    /// and are never consumed by the workflow function — operator pause/resume
-    /// (#383) and post-terminal bookkeeping appended *after* a terminal event
-    /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
-    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). It
+    /// and that the workflow function never consumes. Those are operator
+    /// pause/resume (#383) and post-terminal bookkeeping after a terminal event.
+    /// Examples are `WorkflowRetryScheduled` from a workflow-level retry (#523)
+    /// and `ChildWorkflowCascadeApplied` from a parent-close cascade (#347). It
     /// also skips a decision boundary (#1833), which follows the terminal of
     /// the last decision. If the first event it lands on is a `WorkflowFailed`,
     /// that index opens the tail.
@@ -1451,11 +1452,11 @@ impl HistoryMatcher {
                 continue;
             }
             // `idx > 0` guard: a history whose FIRST event is the terminal
-            // failure is not a run that failed after doing something — it is a
-            // truncated or corrupt export (a real run always opens with
-            // `WorkflowStarted`). Excusing everything a candidate build does
+            // failure is not a run that failed after doing something. It is a
+            // truncated or corrupt export, because a real run always opens with
+            // `WorkflowStarted`. Excusing everything a candidate build does
             // against such a fixture would let a malformed export pass the gate
-            // unconditionally, so it keeps the pre-#952 strict treatment.
+            // unconditionally. So it keeps the pre-#952 strict treatment.
             return (idx > 0 && matches!(event, WorkflowEvent::WorkflowFailed { .. }))
                 .then_some(idx);
         }
@@ -1486,21 +1487,22 @@ impl HistoryMatcher {
     }
 
     /// Indices of the **abandoned-dispatch records** a failing cycle wrote
-    /// (issue #952): each `ActivityFailed` / `ChildWorkflowFailed` carrying
-    /// [`crate::event::ABANDONED_DISPATCH_REASON`], together with the
-    /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
-    /// precedes it.
+    /// (issue #952).
     ///
-    /// `events` is the **prefix of history the caller wants scanned** (see
-    /// [`Self::new`]: everything before the last `WorkflowRedriven`), so the
-    /// returned indices are always valid indices into the full history too.
+    /// Each is an `ActivityFailed` / `ChildWorkflowFailed` carrying
+    /// [`crate::event::ABANDONED_DISPATCH_REASON`], plus the preceding
+    /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id.
     ///
-    /// The reason constant is the engine's own reserved marker — the same device
-    /// as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
-    /// `fan_out:{n}` markers (#601). For a child terminal, whose `error` carries
-    /// the CHILD's own author string, the reason is matched together with the
-    /// exact shape the engine writes (untyped, non-retryable) so an author
-    /// message that happens to collide keeps its genuine terminal.
+    /// `events` is the **prefix of history the caller wants scanned**: everything
+    /// before the last `WorkflowRedriven` (see [`Self::new`]). So the returned
+    /// indices are always valid indices into the full history too.
+    ///
+    /// The reason constant is the engine's own reserved marker. It is the same
+    /// device as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
+    /// `fan_out:{n}` markers (#601). A child terminal's `error` carries the
+    /// CHILD's own author string. So for a child, the reason is matched together
+    /// with the exact shape the engine writes (untyped, non-retryable). Then an
+    /// author message that happens to collide keeps its genuine terminal.
     ///
     /// An activity author can also quote the reason AND match the shape (issue
     /// #1265): `ActivityFailure::non_retryable` reproduces both. The
@@ -1528,15 +1530,15 @@ impl HistoryMatcher {
                 }
                 // An activity's `error` is the ACTIVITY author's own message,
                 // exactly as a child's is. So the reason string alone is not
-                // proof that the engine wrote this event. Pair it
-                // with the full shape `abandoned_dispatch_events` writes —
-                // first attempt, untyped `"Error"` class, non-retryable, no
-                // structured details — so a genuine activity failure that
-                // happens to return this message keeps its real terminal
-                // instead of being re-dispatched (and its side effects
-                // repeated) by a redriven run. A real `ActivityStarted` /
-                // `ActivityHeartbeat` for this id is the same guard, checked
-                // structurally instead of by field value (issue #1265).
+                // proof that the engine wrote this event. Pair it with the full
+                // shape `abandoned_dispatch_events` writes: first attempt,
+                // untyped `"Error"` class, non-retryable, no structured details.
+                // Then a genuine activity failure that happens to return this
+                // message keeps its real terminal. A redriven run does not
+                // re-dispatch it and repeat its side effects. A real
+                // `ActivityStarted` / `ActivityHeartbeat` for this id is the same
+                // guard, checked structurally instead of by field value (issue
+                // #1265).
                 WorkflowEvent::ActivityFailed {
                     activity_id,
                     error,
@@ -1553,8 +1555,8 @@ impl HistoryMatcher {
                 }
                 // A child's `error` is normally the CHILD's own author-produced
                 // string, so the reason alone is not proof the engine wrote this
-                // event. Pair it with the exact shape the engine writes — untyped
-                // and non-retryable — so a child that coincidentally returns the
+                // event. Pair it with the exact shape the engine writes: untyped
+                // and non-retryable. Then a child that coincidentally returns the
                 // same message keeps its genuine terminal.
                 WorkflowEvent::ChildWorkflowFailed {
                     child_id,
@@ -1657,10 +1659,10 @@ impl HistoryMatcher {
     /// Whether the cursor has consumed every pre-terminal event of a history
     /// that ends in a terminal failure — the **failing frontier** (issue #952).
     ///
-    /// Past this point the recorded history says only "the run failed here", so
-    /// a new command, an early return, or a park is not a divergence: there is
-    /// nothing left to compare against. Callers use it to suppress strict-replay
-    /// divergence reporting; it is never used to skip a *positional* match
+    /// Past this point the recorded history says only "the run failed here". So
+    /// a new command, an early return, or a park is not a divergence, because
+    /// nothing is left to compare against. Callers use it to suppress
+    /// strict-replay divergence reporting. It never skips a *positional* match
     /// against a real recorded event.
     #[must_use]
     pub fn at_terminal_failure_frontier(&self) -> bool {
@@ -1671,18 +1673,21 @@ impl HistoryMatcher {
     /// an unconsumed command-bearing event (issue #768).
     ///
     /// Meaningful only immediately after a [`Self::match_timer_cancel`] /
-    /// [`Self::match_timer_or_cancel`] call that returned `NoMatch`: `true`
-    /// means the scan was **blocked** (a divergence — the cancel/await/fire is
-    /// being emitted before a command history recorded first), `false` means the
-    /// scan reached the live frontier (a legitimate new live append).
+    /// [`Self::match_timer_or_cancel`] call that returned `NoMatch`. `true`
+    /// means the scan was **blocked**: a divergence, because the
+    /// cancel/await/fire is being emitted before a command history recorded
+    /// first. `false` means the scan reached the live frontier (a legitimate new
+    /// live append).
     #[must_use]
     pub const fn timer_scan_stopped_at_command(&self) -> bool {
         self.timer_scan_stopped_at_command
     }
 
-    /// Extracts the signal name from a signal-or-deadline race timer ID
-    /// (issue #476's `__signal_timeout:{seq}:{signal_name}` convention), or
-    /// `None` if `timer_id` is not one of these internal race timers.
+    /// Extracts the signal name from a signal-or-deadline race timer ID.
+    ///
+    /// The ID follows issue #476's `__signal_timeout:{seq}:{signal_name}`
+    /// convention. Returns `None` if `timer_id` is not one of these internal
+    /// race timers.
     fn signal_timeout_race_name(timer_id: &str) -> Option<&str> {
         timer_id
             .strip_prefix("__signal_timeout:")?
@@ -1690,10 +1695,11 @@ impl HistoryMatcher {
             .map(|(_seq, name)| name)
     }
 
-    /// One-time index build (issue #546): marks exactly which `SignalReceived`
-    /// indices are reserved for an open signal-or-deadline race (issue #476)
-    /// for their name -- see [`Self::race_reserved_signal_events`] for the
-    /// full rationale.
+    /// One-time index build (issue #546).
+    ///
+    /// It marks exactly which `SignalReceived` indices are reserved for an
+    /// open signal-or-deadline race (issue #476) for their name. See
+    /// [`Self::race_reserved_signal_events`] for the full rationale.
     fn build_race_reserved_signal_events(events: &[WorkflowEvent]) -> HashSet<usize> {
         let mut race_reserved_signal_events: HashSet<usize> = HashSet::new();
         // signal_name -> currently-open race timer_ids for that name.
@@ -1711,11 +1717,11 @@ impl HistoryMatcher {
                         // first in code-execution order, so it is the first to
                         // consume an available occurrence. `open_race_timers`
                         // is in TimerStarted encounter order. Remove only
-                        // that ONE race: with concurrent same-name races (two
+                        // that ONE race. With concurrent same-name races (two
                         // overlapping `receive_signal_timeout` calls), a later
-                        // race still needs its OWN future occurrence, so
-                        // closing every open race here would let a push
-                        // handler steal it (PR #890 review follow-up).
+                        // race still needs its OWN future occurrence. Closing
+                        // every open race here would let a push handler steal
+                        // it (PR #890).
                         timers.remove(0);
                     }
                 }
@@ -1838,9 +1844,10 @@ impl HistoryMatcher {
         )
     }
 
-    /// Returns `true` for the DLQ redrive reactivation event (issue #510), which
-    /// reopens a `FAILED` run and is a transparent no-op for command-dispatch
-    /// replay (together with the `WorkflowFailed` it supersedes).
+    /// Returns `true` for the DLQ redrive reactivation event (issue #510).
+    ///
+    /// It reopens a `FAILED` run. Together with the `WorkflowFailed` it
+    /// supersedes, it is a transparent no-op for command-dispatch replay.
     const fn is_redrive_lifecycle_event(event: &WorkflowEvent) -> bool {
         matches!(event, WorkflowEvent::WorkflowRedriven { .. })
     }
@@ -1996,23 +2003,24 @@ impl HistoryMatcher {
         self.consumed_signal_events.insert(cursor);
     }
 
-    /// Stashes a "transparent" external-primitive event at `cursor` — a plain
-    /// signal, or an `ExternalSignal`/`ExternalCancel`/`ExternalAwait` triplet
-    /// member — so the owning primitive's own matcher can find it later, and
-    /// marks the event consumed so the calling scan does not treat it as its
-    /// own terminal or as an unconsumed ordering point (issue #492, issue
-    /// #757).
+    /// Stashes a "transparent" external-primitive event at `cursor`, so the
+    /// owning primitive's own matcher can find it later.
     ///
-    /// This only mutates stash/consumed-event state; it does not touch a
+    /// The event is a plain
+    /// signal or an `ExternalSignal`/`ExternalCancel`/`ExternalAwait` triplet
+    /// member. It also marks the event consumed (issue #492, issue #757). Then
+    /// the calling scan does not treat it as its own terminal or as an
+    /// unconsumed ordering point.
+    ///
+    /// This only mutates stash/consumed-event state. It does not touch a
     /// cursor or return a value. Callers keep full control of their own
-    /// control flow (loop-continue, an early `return`, or a `TimerScanStep`)
-    /// and call this only for the subset of the 10 variants below that their
-    /// own scan treats as transparent — e.g. `match_external_signal` excludes
-    /// `ExternalSignalRequested`/`Delivered`/`Failed`, since those are its own
-    /// subject rather than a transparent sibling event there. Panics (via the
-    /// final `unreachable!`) if called for the event at `cursor` when that
-    /// event is not one of the 10 handled variants — every call site's own
-    /// match arm pattern is what guarantees that never happens.
+    /// control flow (loop-continue, an early `return`, or a `TimerScanStep`).
+    /// They call this only for the subset of the 10 variants below that their
+    /// own scan treats as transparent. For example, `match_external_signal`
+    /// excludes `ExternalSignalRequested`/`Delivered`/`Failed`, since those are
+    /// its own subject there. Panics (via the final `unreachable!`) if the
+    /// event at `cursor` is not one of the 10 handled variants. Each call
+    /// site's own match arm pattern guarantees that this never happens.
     fn stash_transparent_external_event(&mut self, cursor: usize) {
         match &self.events[cursor] {
             WorkflowEvent::SignalReceived {
@@ -2114,9 +2122,9 @@ impl HistoryMatcher {
 
     /// Returns `true` for events transparent to main workflow command replay.
     ///
-    /// Update events are transparent to the main workflow replay sequence —
-    /// they are skipped during activity/timer/signal/child-workflow matching
-    /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
+    /// Update events are transparent to the main workflow replay sequence.
+    /// Activity/timer/signal/child-workflow matching skips them, and the
+    /// `match_update` / `drain_admitted_updates` APIs consume them.
     /// `WorkflowResetFork` is informational and likewise has no workflow
     /// command counterpart. So are the two fork events of issue #2000.
     const fn is_update_event(event: &WorkflowEvent) -> bool {
@@ -2133,10 +2141,11 @@ impl HistoryMatcher {
 
     /// Format the `actual` field for a [`HistoryMatch::Diverged`] result.
     ///
-    /// When the unexpected event is a `MarkerRecorded` its name is included so
-    /// the replayer's `classify_kind` can recognise `"MarkerRecorded(version:…)"`
-    /// and return [`crate::testing::NonDeterminismKind::VersionMarkerMismatch`]
-    /// instead of the generic command-level mismatch kind.
+    /// When the unexpected event is a `MarkerRecorded`, its name is included.
+    /// Then the replayer's `classify_kind` can recognise
+    /// `"MarkerRecorded(version:…)"` and return
+    /// [`crate::testing::NonDeterminismKind::VersionMarkerMismatch`] instead of
+    /// the generic command-level mismatch kind.
     fn actual_event_name(event: &WorkflowEvent) -> String {
         match event {
             WorkflowEvent::MarkerRecorded { name, .. } => format!("MarkerRecorded({name})"),
@@ -2188,14 +2197,15 @@ impl HistoryMatcher {
             // command so the cursor returns to it after matching the
             // terminal event. Deterministic side-effect captures (issue
             // #384) are cursor-ordered like markers and treated the same. A
-            // cancellable-timer arm/cancel (issue #768, e.g. a concurrent
-            // `start_timer()`/`handle.cancel()`/`reset()` — a reset emits
-            // both) is likewise an interleaved command: the rewind keeps it
-            // at the cursor for its own claimer (`match_timer_arm` /
-            // `match_timer_cancel`) to re-scan. `TimerStarted` is included
-            // here for symmetry with `TimerCancelled` so a `reset`'s
-            // `[TimerCancelled, TimerStarted]` pair does not break the scan
-            // mid-way (`match_signal_or_timer` tolerates both too).
+            // cancellable-timer arm/cancel (issue #768) is likewise an
+            // interleaved command. An example is a concurrent
+            // `start_timer()`/`handle.cancel()`/`reset()`, where a reset emits
+            // both. The rewind keeps it at the cursor for its own claimer
+            // (`match_timer_arm` / `match_timer_cancel`) to re-scan.
+            // `TimerStarted` is included for symmetry with `TimerCancelled`,
+            // so a `reset`'s `[TimerCancelled, TimerStarted]` pair does not
+            // break the scan mid-way (`match_signal_or_timer` tolerates both
+            // too).
             //
             // The timer scan reads these roles too (issue #2338). If it
             // stepped over the cancel only, it would stop at the paired
@@ -2209,14 +2219,15 @@ impl HistoryMatcher {
             | WorkflowEvent::TimerCancelled { .. }
             | WorkflowEvent::LocalActivityScheduled { .. } => ScanRole::Interleaved,
             // Progress/terminal events of concurrent siblings from a mixed
-            // suspension batch — a sibling timer's fire (an expired timer
-            // firing before this activity's terminal, e.g.
-            // `tokio::join!(activity, ctx.timer(...))`), a child workflow's
-            // terminal, or a local activity's terminal — are transparent to
-            // this activity's terminal scan. Cross them NON-CONSUMINGLY,
-            // leaving each for its own matcher to claim after the rewind
-            // (issue #1071 manifestation #2). Keep this sibling-terminal set
-            // in sync with `match_signal_or_timer`'s (issue #1071).
+            // suspension batch are transparent to this activity's terminal scan.
+            // Examples are a sibling timer's fire, a child workflow's terminal,
+            // or a local activity's terminal. An expired timer can fire before
+            // this activity's terminal, as in
+            // `tokio::join!(activity, ctx.timer(...))`. Cross them
+            // NON-CONSUMINGLY, leaving each for its own matcher to claim after
+            // the rewind (issue #1071 manifestation #2). Keep this
+            // sibling-terminal set in sync with `match_signal_or_timer`'s (issue
+            // #1071).
             //
             // A timer scan stops at its own fire only. A foreign fire belongs
             // to the scan of its own timer, so this scan must not consume it.
@@ -2503,8 +2514,8 @@ impl HistoryMatcher {
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    // Local activities carry no typed failure payload (and may
-                    // not declare a circuit breaker), so the error-type is the
+                    // Local activities carry no typed failure payload and may
+                    // not declare a circuit breaker. So the error type is the
                     // legacy "Error" fallback with no structured details.
                     let result = HistoryMatch::Failed {
                         error: error.clone(),
@@ -2529,12 +2540,12 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // Signals can be ingested while a local activity is retrying.
-                // ExternalSignal events can be interleaved before the local
-                // activity's terminal event when a crash recovery case writes
-                // signal events first (the RunLocalActivity + SignalExternalWorkflow
-                // mixed batch). ExternalCancel/ExternalAwait triplets are
-                // likewise transparent here (issue #492, issue #757). Stash
-                // them all so their own matchers can find them later.
+                // A crash recovery case can write signal events first (the
+                // RunLocalActivity + SignalExternalWorkflow mixed batch). Then
+                // ExternalSignal events sit before the local activity's terminal
+                // event. ExternalCancel/ExternalAwait triplets are likewise
+                // transparent here (issue #492, issue #757). Stash them all so
+                // their own matchers can find them later.
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::ExternalSignalRequested { .. }
                 | WorkflowEvent::ExternalSignalDelivered { .. }
@@ -2553,11 +2564,12 @@ impl HistoryMatcher {
                 }
                 // Fan-out markers and deterministic side-effect captures (issue
                 // #384) can be interleaved during concurrent execution. A
-                // cancellable-timer arm/cancel (issue #768) — e.g. a concurrent
-                // `start_timer()`/`handle.cancel()`/`reset()`, where a reset emits
-                // both `[TimerCancelled, TimerStarted]` — is likewise interleavable
-                // here (mirrors `scan_activity_terminal`): rewind without consuming
-                // so `match_timer_arm` / `match_timer_cancel` claim each later.
+                // cancellable-timer arm/cancel (issue #768) is likewise
+                // interleavable here (mirrors `scan_activity_terminal`). An
+                // example is a concurrent `start_timer()`/`handle.cancel()`/`reset()`,
+                // where a reset emits both `[TimerCancelled, TimerStarted]`.
+                // Rewind without consuming, so `match_timer_arm` /
+                // `match_timer_cancel` claim each later.
                 WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
                 | WorkflowEvent::TimerStarted { .. }
@@ -2626,9 +2638,11 @@ impl HistoryMatcher {
         )
     }
 
-    /// Advances the cursor past already-consumed events, drains any signals
-    /// (and update/external-signal/external-cancel events) sitting at the
-    /// current cursor into their pending stashes, and resolves any external
+    /// Advances the cursor past already-consumed events.
+    ///
+    /// It drains any signals
+    /// (and update/external-signal/external-cancel events) at the current
+    /// cursor into their pending stashes. It also resolves any external
     /// signal/cancel terminals visible further ahead. Returns whether the
     /// matcher is still replaying afterward.
     ///
@@ -2666,10 +2680,10 @@ impl HistoryMatcher {
     /// intentionally more conservative than the user-visible `ctx.is_replaying()`
     /// check, which uses the cursor-based [`is_replaying`](Self::is_replaying).
     ///
-    /// The distinction matters for metrics suppression: `pending_signals` in the stash
-    /// were drained from the event stream ahead of the cursor during
-    /// `drain_early_signals`, but the workflow's current code position is at the
-    /// live frontier. Using this method for `ctx.is_replaying()` would incorrectly
+    /// The distinction matters for metrics suppression. `drain_early_signals`
+    /// drained the `pending_signals` in the stash from the event stream ahead of
+    /// the cursor. But the workflow's current code position is at the live
+    /// frontier. Using this method for `ctx.is_replaying()` would incorrectly
     /// suppress metrics emitted between an activity completion and a
     /// `wait_for_signal` call.
     #[must_use]
@@ -2746,10 +2760,11 @@ impl HistoryMatcher {
             .sum()
     }
 
-    /// Returns `true` if there are unconsumed events that are not terminal
-    /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
-    /// `WorkflowCancelled`, `WorkflowContinuedAsNew`), or if there are buffered
-    /// signals that were never delivered via `wait_for_signal`.
+    /// Returns `true` if unconsumed events other than terminal lifecycle events
+    /// remain, or if buffered signals were never delivered via `wait_for_signal`.
+    ///
+    /// The terminal lifecycle events are `WorkflowCompleted`, `WorkflowFailed`,
+    /// `WorkflowCancelled` and `WorkflowContinuedAsNew`.
     ///
     /// The strict and canary executors use this check. The worker path uses
     /// the narrower [`first_unconsumed_command_event`](Self::first_unconsumed_command_event)
@@ -2768,9 +2783,9 @@ impl HistoryMatcher {
     pub fn has_non_lifecycle_unconsumed(&self) -> bool {
         // The exact SignalReceived events that lost a signal-or-deadline race
         // (issue #476) are excused: the timeout branch may intentionally never
-        // consume them. Any other unconsumed signal still flags — including a
-        // second same-name delivery when the loser was consumed by a later
-        // wait (the exemption travels with the losing event, not the name).
+        // consume them. Any other unconsumed signal still flags. That includes a
+        // second same-name delivery when a later wait consumed the loser. The
+        // exemption travels with the losing event, not the name.
         let mut cursor = self.cursor;
         while cursor < self.events.len() {
             if !self.is_consumed(cursor)
@@ -2914,16 +2929,15 @@ impl HistoryMatcher {
     /// End-of-drive count of genuinely-unconsumed `SignalReceived` events,
     /// keyed by signal name (issue #684).
     ///
-    /// Mirrors [`Self::has_non_lifecycle_unconsumed`]'s two sources — the
-    /// cursor scan for still-in-history `SignalReceived` events, plus the
-    /// `pending_signals` buffer for signals drained early by a `prepare_match`
-    /// sweep but never consumed by a `wait_for_signal`/push handler — but
-    /// restricted to `SignalReceived` and grouped by name. Signals excused by
-    /// a lost signal-or-deadline race (issue #476, `late_race_signal_events`)
-    /// are excluded, exactly as they are from the boolean check. A signal
-    /// consumed by a wait or claimed by a push handler is in
-    /// `consumed_signal_events` and removed from `pending_signals`, so it never
-    /// appears in either source.
+    /// Mirrors [`Self::has_non_lifecycle_unconsumed`]'s two sources, restricted
+    /// to `SignalReceived` and grouped by name. The first source is the cursor
+    /// scan for still-in-history `SignalReceived` events. The second is the
+    /// `pending_signals` buffer: signals a `prepare_match` sweep drained early
+    /// that no `wait_for_signal`/push handler consumed. Signals excused by a
+    /// lost signal-or-deadline race (issue #476, `late_race_signal_events`)
+    /// are excluded, exactly as they are from the boolean check. A signal that
+    /// a wait consumes or a push handler claims is in `consumed_signal_events`
+    /// and removed from `pending_signals`. So it never appears in either source.
     ///
     /// Read-only (`&self`): the caller is expected to have already driven the
     /// matcher to the terminal frontier.
@@ -2964,20 +2978,20 @@ impl HistoryMatcher {
     /// Count unconsumed `ActivityScheduled` events at or after the current
     /// cursor, stopping early once `cap` is reached.
     ///
-    /// **Read-only**: does *not* mutate the cursor or any consumed-set — it is
+    /// **Read-only**: does *not* mutate the cursor or any consumed-set. It is
     /// safe to call as a pure inspection before deciding how to dispatch.
     ///
-    /// Used by the windowed activity fan-out (issue #750) to size the
-    /// already-scheduled prefix `[0..s)` that must be *resumed* (as one
-    /// homogeneous batch) before any fresh remainder is dispatched. Called
-    /// immediately after the fan-out's count marker has been consumed, so the
-    /// cursor sits on the fan-out's first `ActivityScheduled` and the next `s`
-    /// unconsumed `ActivityScheduled` events (a contiguous prefix, since the
-    /// fan-out dispatches strictly in input order) are exactly its own
-    /// already-dispatched slots. `cap` is the fan-out's own slot count, which
-    /// both bounds the scan and prevents ever counting a *later*, unrelated
-    /// activity that a fully-completed fan-out's continuation may have already
-    /// scheduled into history.
+    /// The windowed activity fan-out (issue #750) uses it to size the
+    /// already-scheduled prefix `[0..s)`. That prefix must be *resumed* as one
+    /// homogeneous batch before any fresh remainder is dispatched. The call
+    /// comes right after the fan-out's count marker is consumed. So the cursor
+    /// sits on the fan-out's first `ActivityScheduled`. The next `s` unconsumed
+    /// `ActivityScheduled` events are exactly its own already-dispatched slots.
+    /// They form a contiguous prefix, since the fan-out dispatches strictly in
+    /// input order. `cap` is the fan-out's own slot count. It bounds the scan.
+    /// It also prevents counting a *later*, unrelated activity that a
+    /// fully-completed fan-out's continuation may have already scheduled into
+    /// history.
     #[must_use]
     pub(crate) fn count_pending_scheduled_activities(&self, cap: usize) -> usize {
         let mut n = 0;
@@ -3066,11 +3080,11 @@ impl HistoryMatcher {
     /// Drain any `SignalReceived` and update events at the current cursor.
     ///
     /// Signals can be ingested into history at any point (when the worker
-    /// picks up a task), so they may appear before an `ActivityScheduled`,
-    /// `TimerStarted`, or `ChildWorkflowStarted` event even though the
-    /// workflow code only calls `wait_for_signal` later.  This helper
-    /// buffers those early signals so the normal matcher methods do not
-    /// mis-report them as non-determinism.
+    /// picks up a task). So they may appear before an `ActivityScheduled`,
+    /// `TimerStarted`, or `ChildWorkflowStarted` event, even though the
+    /// workflow code calls `wait_for_signal` only later. This helper buffers
+    /// those early signals, so the normal matcher methods do not mis-report
+    /// them as non-determinism.
     ///
     /// Update events (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`) are
     /// also transparent to the main workflow replay sequence. This method
@@ -3081,10 +3095,9 @@ impl HistoryMatcher {
         while self.cursor < self.events.len() {
             match &self.events[self.cursor] {
                 // Drain signals, and ExternalSignal/ExternalCancel/ExternalAwait
-                // event pairs (issue #492, issue #757), so they can be matched
-                // by their own primitives regardless of where they fall in
-                // history relative to ActivityScheduled / TimerStarted events
-                // (mixed batches).
+                // event pairs (issue #492, issue #757). Their own primitives
+                // then match them wherever they fall in history relative to
+                // ActivityScheduled / TimerStarted events (mixed batches).
                 ev if Self::is_transparent_external_event(ev) => {
                     self.stash_transparent_external_event(self.cursor);
                     self.cursor += 1;
@@ -3277,10 +3290,10 @@ impl HistoryMatcher {
             self.consumed_out_of_order_events.insert(terminal_cursor);
             // Also mark any ActivityStarted/Heartbeat events for the settled
             // activity that appear between the interleaved command and the
-            // terminal. Without this, after the cursor rewinds to the
-            // interleaved command and the marker/fan-out branch is replayed,
-            // those progress events remain unconsumed and the next workflow
-            // command match diverges against them.
+            // terminal. Otherwise the cursor rewinds to the interleaved command
+            // and the marker/fan-out branch is replayed, but those progress
+            // events remain unconsumed. The next workflow command match then
+            // diverges against them.
             let activity_id = match &self.events[terminal_cursor] {
                 WorkflowEvent::ActivityCompleted { activity_id, .. }
                 | WorkflowEvent::ActivityFailed { activity_id, .. }
@@ -3523,10 +3536,10 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // A second ActivityAwaitingExternal for the same activity can
-                // appear when a workflow is woken by a signal while still
-                // awaiting external completion: the worker re-runs
+                // appear when a signal wakes a workflow still awaiting external
+                // completion. The worker re-runs
                 // persist_scheduled_external_activity, but record_external_task
-                // is idempotent (ON CONFLICT DO NOTHING).  Skip the duplicate.
+                // is idempotent (ON CONFLICT DO NOTHING). Skip the duplicate.
                 //
                 // Consume the duplicate too. No other call claims it, and the
                 // end-of-cycle drift guard would otherwise report it as a
@@ -3627,23 +3640,23 @@ impl HistoryMatcher {
         let stash_size_before = self.external.signals.len();
         let has_history = self.prepare_match();
 
-        // Check the stash (which now includes any newly drained events from
-        // the current cursor position, as well as events stashed by prior
-        // prepare_match calls).
+        // Check the stash. It now includes any newly drained events from the
+        // current cursor position, and events stashed by prior prepare_match
+        // calls.
         //
-        // Note: stash-based matching is position-independent — if two concurrent
+        // Note: stash-based matching is position-independent. If two concurrent
         // signal_external calls share a drain batch, swapping their call order in
-        // the workflow code will not be detected as non-determinism.  This is an
-        // accepted trade-off: concurrent signals have no authoritative ordering in
-        // history; sequential calls (each in their own execution cycle) always reach
-        // cursor-based matching below and DO detect reordering.
+        // the workflow code is not detected as non-determinism. This is an
+        // accepted trade-off: concurrent signals have no authoritative ordering
+        // in history. Sequential calls (each in their own execution cycle) always
+        // reach cursor-based matching below and DO detect reordering.
         if let Some(result) = try_stash(&mut self.external.signals) {
             return result;
         }
         if !has_history {
             // If prepare_match drained ExternalSignal events (stash grew) and
             // none matched, history recorded a *different* signal at this
-            // position — report non-determinism instead of silently issuing a
+            // position. Report non-determinism instead of silently issuing a
             // new live signal.
             if self.external.signals.len() > stash_size_before {
                 let actual = &self.external.signals[stash_size_before];
@@ -3955,9 +3968,9 @@ impl HistoryMatcher {
 
     /// Match `await_external_workflow(target)` against history (issue #757).
     ///
-    /// Mirrors `match_external_cancel` but keyed on the awaited `target`, and
+    /// Mirrors `match_external_cancel` but keyed on the awaited `target`. It
     /// carries the target's terminal cause (output on success, typed failure
-    /// otherwise) frozen into the awaiter's own history.
+    /// otherwise), frozen into the awaiter's own history.
     ///
     /// Returns:
     /// - `Matched { output }` when `ExternalAwaitResolved` is in history (target
@@ -4176,12 +4189,12 @@ impl HistoryMatcher {
     /// Pure, read-only scan: does recorded history contain **any**
     /// `TimerStarted` event for `timer_id`?
     ///
-    /// Used by `wait_for_signal_timeout`'s signal-win branch (issue #476) to
-    /// decide whether a durable deadline-timer row was ever armed and therefore
-    /// needs a `CancelRaceLosers` teardown. When a signal arrived *before* the
-    /// race started on the live run, `match_signal_or_timer` short-circuits to
-    /// `SignalWon` without ever recording a `TimerStarted` — no timer row exists,
-    /// so no teardown must be emitted. Does not touch the cursor or any
+    /// Used by `wait_for_signal_timeout`'s signal-win branch (issue #476). It
+    /// decides whether a durable deadline-timer row was ever armed and so
+    /// needs a `CancelRaceLosers` teardown. A signal can arrive *before* the
+    /// race starts on the live run. Then `match_signal_or_timer` short-circuits
+    /// to `SignalWon` without ever recording a `TimerStarted`. No timer row
+    /// exists, so no teardown must be emitted. Does not touch the cursor or any
     /// consumption state.
     #[must_use]
     pub fn history_contains_timer_started(&self, timer_id: &str) -> bool {
@@ -4335,16 +4348,17 @@ impl HistoryMatcher {
 
     /// Match a durable-mutex acquire against history (issue #691).
     ///
-    /// Positional (like a marker / [`Self::match_timer_arm`]): expects a
+    /// Positional, like a marker or [`Self::match_timer_arm`]. It expects a
     /// [`WorkflowEvent::MutexGranted`] with the matching `key` at the current
-    /// cursor, consumes it, and returns [`MutexGrantMatch::Granted`] carrying the
-    /// recorded `lock_seq`/`acquired_at`. Because acquire is a SOLO suspension
-    /// (its `MutexGranted` anchor always lands at a clean resume cursor), no
-    /// forward scan and no other-scan skip-list changes are needed.
+    /// cursor and consumes it. It returns [`MutexGrantMatch::Granted`] carrying
+    /// the recorded `lock_seq`/`acquired_at`. Acquire is a SOLO suspension: its
+    /// `MutexGranted` anchor always lands at a clean resume cursor. So no forward
+    /// scan and no other-scan skip-list changes are needed.
     ///
-    /// Returns [`MutexGrantMatch::NoMatch`] when the cursor is past end (first
-    /// live acquire — the caller suspends on an `AcquireMutex` command) and
-    /// [`MutexGrantMatch::Diverged`] when a different event / key is at the cursor.
+    /// Returns [`MutexGrantMatch::NoMatch`] when the cursor is past end. That is
+    /// the first live acquire, and the caller suspends on an `AcquireMutex`
+    /// command. Returns [`MutexGrantMatch::Diverged`] when a different event /
+    /// key is at the cursor.
     pub fn match_mutex_granted(&mut self, key: &str) -> MutexGrantMatch {
         if !self.prepare_match() {
             return MutexGrantMatch::NoMatch;
@@ -4387,29 +4401,33 @@ impl HistoryMatcher {
     /// `TimerCancelled { timer_id }`, claiming it out of order (marks it
     /// consumed) and returning [`HistoryMatch::Matched`].
     ///
-    /// Returns [`HistoryMatch::NoMatch`] when no such event exists (live
-    /// cancel — the caller emits a `CancelTimer` command; in strict replay the
-    /// caller surfaces the divergence via
-    /// [`crate::context::WorkflowContext::check_strict_replay_no_match`]).
+    /// Returns [`HistoryMatch::NoMatch`] when no such event exists. That is a
+    /// live cancel, and the caller emits a `CancelTimer` command. In strict
+    /// replay the caller surfaces the divergence via
+    /// [`crate::context::WorkflowContext::check_strict_replay_no_match`].
     ///
     /// # Soundness — the scan STOPS at intervening commands
     ///
     /// The forward scan is deliberately **not** a "skip everything until the
-    /// cancel" loop. It shares [`Self::timer_scan_cross_or_stop`]'s crossable-set
-    /// discipline **exactly** with [`Self::match_timer_or_cancel`]: it may cross
-    /// only (a) already-`is_consumed` events (the workflow ran other operations —
-    /// an activity, a side effect — BEFORE the cancel, so those were consumed by
-    /// their own `match_*` calls in program order) and (b) a small allowlist of
-    /// genuinely transparent / interleavable events (markers, side effects,
-    /// detached-child spawns, sibling `reset()` arm/cancel interleaving, stashed
-    /// signals & external-signal/cancel triplets, and update events). It STOPS
-    /// (returns [`HistoryMatch::NoMatch`]) at any UNCONSUMED command-bearing event
-    /// NOT on that allowlist. Consider a code change that moves the
-    /// `cancel_timer` BEFORE an activity recorded first. Without the stop, it
-    /// could claim the trailing `TimerCancelled` across the unconsumed
+    /// cancel" loop. It shares [`Self::timer_scan_cross_or_stop`]'s
+    /// crossable-set discipline **exactly** with [`Self::match_timer_or_cancel`].
+    /// It may cross only two kinds of event:
+    ///
+    /// - (a) already-`is_consumed` events. The workflow ran other operations
+    ///   (an activity, a side effect) BEFORE the cancel. Their own `match_*`
+    ///   calls consumed those events in program order.
+    /// - (b) a small allowlist of genuinely transparent / interleavable events.
+    ///   These are markers, side effects, detached-child spawns, sibling
+    ///   `reset()` arm/cancel interleaving, stashed signals &
+    ///   external-signal/cancel triplets, and update events.
+    ///
+    /// It STOPS (returns [`HistoryMatch::NoMatch`]) at any UNCONSUMED
+    /// command-bearing event NOT on that allowlist. Consider a code change that
+    /// moves the `cancel_timer` BEFORE an activity recorded first. Without the
+    /// stop, it could claim the trailing `TimerCancelled` across the unconsumed
     /// `ActivityScheduled`. It would then pass strict replay despite a real
-    /// command-order change. The stop closes that false
-    /// negative, as the same stop does in `match_timer_or_cancel`.
+    /// command-order change. The stop closes that false negative, as the same
+    /// stop does in `match_timer_or_cancel`.
     pub fn match_timer_cancel(&mut self, timer_id: &str) -> HistoryMatch {
         // Reset the blocked-scan flag on entry. The callers read it after a
         // NoMatch return. It tells a blocked scan (divergence) from a genuine
@@ -4451,8 +4469,8 @@ impl HistoryMatcher {
     /// One step of the shared crossable-set discipline for the cancellable-timer
     /// forward scans ([`Self::match_timer_or_cancel`] / [`Self::match_timer_cancel`],
     /// issue #768). The caller has already handled its own timer-specific
-    /// *target* event(s) and the `is_consumed` skip; this decides what to do with
-    /// any OTHER unconsumed event at `scan`.
+    /// *target* event(s) and the `is_consumed` skip. This decides what to do
+    /// with any OTHER unconsumed event at `scan`.
     ///
     /// Returns [`TimerScanStep::Cross`] for the genuinely transparent /
     /// interleavable classes. It performs the same stashing side effects that
@@ -4468,24 +4486,24 @@ impl HistoryMatcher {
     ///
     /// Returns [`TimerScanStep::Stop`] for any other command-bearing event
     /// (`ActivityScheduled`/`Completed`/`Failed`, an attached `ChildWorkflow*`,
-    /// `LocalActivity*`, ...): a timer outcome/cancel
-    /// claim is NOT allowed to cross a real command-ordering point, or a code
-    /// change that moved the await/cancel BEFORE such a command would silently
-    /// pass strict replay (Codex P2 soundness fix). Factoring this into one shared
-    /// helper keeps the two scans' crossable sets provably identical.
+    /// `LocalActivity*`, ...). A timer outcome/cancel claim is NOT allowed to
+    /// cross a real command-ordering point. Otherwise a code change that moved
+    /// the await/cancel BEFORE such a command would silently pass strict
+    /// replay. Factoring this into one shared helper keeps the two scans'
+    /// crossable sets provably identical.
     ///
     /// # Same-id `TimerStarted`/`TimerCancelled` is an ANCHOR, not transparent
     ///
-    /// The scan is id-aware: an UNCONSUMED **same-id** `TimerStarted` (or
-    /// `TimerCancelled`) is this timer's own command-ordering anchor — the arm
-    /// that must precede its cancel/fire — so the scan STOPS at it. Only a
+    /// The scan is id-aware. An UNCONSUMED **same-id** `TimerStarted` (or
+    /// `TimerCancelled`) is this timer's own command-ordering anchor: the arm
+    /// that must precede its cancel/fire. So the scan STOPS at it. Only a
     /// **foreign** (different-id) sibling timer's arm/cancel lifecycle is
-    /// transparent. Without this, strict replay of
-    /// `start_timer("idle"); cancel_timer("idle")` with the two lines reordered to
-    /// `cancel_timer("idle"); start_timer("idle")` would let
-    /// `match_timer_cancel("idle")` skip the unconsumed same-id `TimerStarted`,
-    /// claim the later `TimerCancelled`, and then let `start_timer` consume the
-    /// start — accepting a real command-order change.
+    /// transparent. Consider strict replay of
+    /// `start_timer("idle"); cancel_timer("idle")` with the two lines reordered
+    /// to `cancel_timer("idle"); start_timer("idle")`. Without this rule,
+    /// `match_timer_cancel("idle")` would skip the unconsumed same-id
+    /// `TimerStarted` and claim the later `TimerCancelled`. Then `start_timer`
+    /// would consume the start, and a real command-order change would pass.
     #[allow(clippy::too_many_lines)]
     fn timer_scan_cross_or_stop(&mut self, scan: usize, timer_id: &str) -> TimerScanStep {
         match &self.events[scan] {
@@ -4494,21 +4512,21 @@ impl HistoryMatcher {
             | WorkflowEvent::SideEffectRecorded { .. }
             | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => TimerScanStep::Cross,
             // A FOREIGN sibling timer's arm/cancel/fire interleaving is
-            // transparent; an UNCONSUMED SAME-id `TimerStarted`/`TimerCancelled` is
-            // this id's own command-ordering anchor and falls through to `_ => Stop`
-            // below. Our-id fire/cancel *targets* are claimed by
-            // the caller BEFORE this call, so a same-id one reaching here is a
+            // transparent. An UNCONSUMED SAME-id `TimerStarted`/`TimerCancelled`
+            // is this id's own command-ordering anchor and falls through to
+            // `_ => Stop` below. The caller claims this id's own fire/cancel
+            // *targets* BEFORE this call. So a same-id one that reaches here is a
             // genuine unconsumed ordering point the scan must not cross.
             //
             // A FOREIGN `TimerFired` is a concurrent-await sibling's own outcome
             // (issue #768). With `tokio::join!(slow.await_fire(),
             // fast.await_fire())` both rows are armed. The worker planner wakes
             // at the minimum deadline, so `fast` may fire first. On replay the
-            // `slow` branch is polled first; its outcome scan must CROSS the
-            // unconsumed `TimerFired(fast)` NON-CONSUMINGLY (leaving it for `fast`'s
-            // own `match_timer_or_cancel` to claim) rather than treating it as an
-            // unrelated command and diverging. A sibling timer fire is a legitimate
-            // interleaving, not a command-ordering point.
+            // `slow` branch is polled first. Its outcome scan must CROSS the
+            // unconsumed `TimerFired(fast)` NON-CONSUMINGLY, leaving it for
+            // `fast`'s own `match_timer_or_cancel` to claim. It must not treat it
+            // as an unrelated command and diverge. A sibling timer fire is a
+            // legitimate interleaving, not a command-ordering point.
             WorkflowEvent::TimerStarted { timer_id: id, .. }
             | WorkflowEvent::TimerCancelled { timer_id: id }
             | WorkflowEvent::TimerFired { timer_id: id }
@@ -4516,9 +4534,9 @@ impl HistoryMatcher {
             {
                 TimerScanStep::Cross
             }
-            // Signals can arrive while a timer is armed, and ExternalSignal /
+            // Signals can arrive while a timer is armed. ExternalSignal /
             // ExternalCancel / ExternalAwait triplets can interleave with an
-            // in-flight timer too (issue #492, issue #757); stash them for
+            // in-flight timer too (issue #492, issue #757). Stash them for
             // their own matchers and cross.
             WorkflowEvent::SignalReceived { .. }
             | WorkflowEvent::ExternalSignalRequested { .. }
@@ -4544,36 +4562,41 @@ impl HistoryMatcher {
     /// Observe a cancellable durable timer's outcome (issue #768).
     ///
     /// Forward-scans from the cursor for the **first** unconsumed
-    /// `TimerFired { timer_id }` or `TimerCancelled { timer_id }` — whichever
-    /// appears first in history decides the outcome (`Fired` vs `Cancelled`),
-    /// giving deterministic recorded-order resolution of a genuine fire-vs-cancel
-    /// race. Claims the winning event (marks it consumed).
+    /// `TimerFired { timer_id }` or `TimerCancelled { timer_id }`. Whichever
+    /// appears first in history decides the outcome (`Fired` vs `Cancelled`).
+    /// That gives a genuine fire-vs-cancel race a deterministic recorded-order
+    /// resolution. Claims the winning event (marks it consumed).
     ///
     /// Returns [`TimerFireMatch::NoMatch`] when neither is recorded yet (the
     /// timer is armed but unresolved, or the cursor is past end): the caller
     /// re-arms idempotently and suspends.
     ///
-    /// # Soundness — the scan STOPS at intervening commands (Codex P2, issue #768)
+    /// # Soundness — the scan STOPS at intervening commands (issue #768)
     ///
     /// The forward scan is deliberately **not** a "skip everything until the
-    /// outcome" loop. It may cross only (a) already-`is_consumed` events — the
-    /// legitimate case where the workflow ran other operations (an activity, a
-    /// side effect) BEFORE awaiting the timer, so those events were consumed by
-    /// their own `match_*` calls in program order — and (b) a small allowlist of
-    /// genuinely transparent / interleavable events (mirroring
-    /// [`Self::match_timer_strict`]'s transparent set: markers, side effects,
-    /// detached-child spawns, the reset `TimerCancelled`/`TimerStarted`
-    /// interleaving, stashed signals & external-signal/cancel triplets, and
-    /// update events, and a foreign sibling's `TimerFired`). It STOPS (returns
-    /// [`TimerFireMatch::NoMatch`]) at any UNCONSUMED command-bearing event NOT on
-    /// that allowlist
+    /// outcome" loop. It may cross only two kinds of event:
+    ///
+    /// - (a) already-`is_consumed` events. This is the legitimate case where
+    ///   the workflow ran other operations (an activity, a side effect) BEFORE
+    ///   awaiting the timer. Their own `match_*` calls consumed those events in
+    ///   program order.
+    /// - (b) a small allowlist of genuinely transparent / interleavable events.
+    ///   It mirrors [`Self::match_timer_strict`]'s transparent set. That set
+    ///   holds markers, side effects, detached-child spawns and the reset
+    ///   `TimerCancelled`/`TimerStarted` interleaving. It also holds stashed
+    ///   signals & external-signal/cancel triplets, update events, and a
+    ///   foreign sibling's `TimerFired`.
+    ///
+    /// It STOPS (returns [`TimerFireMatch::NoMatch`]) at any UNCONSUMED
+    /// command-bearing event NOT on that allowlist
     /// (`ActivityScheduled`/`Completed`/`Failed`, attached `ChildWorkflow*`,
-    /// `LocalActivity*`, ...). Without the stop, a code
-    /// change that awaits the timer BEFORE such a command would let the scan claim
-    /// the trailing `TimerFired` across the unrelated command and pass strict
-    /// replay despite a real command-order change; stopping surfaces it as a
-    /// non-determinism divergence instead. The crossable set is shared verbatim
-    /// with [`Self::match_timer_cancel`] via [`Self::timer_scan_cross_or_stop`].
+    /// `LocalActivity*`, ...). Consider a code change that awaits the timer
+    /// BEFORE such a command. Without the stop, the scan would claim the
+    /// trailing `TimerFired` across the unrelated command. It would then pass
+    /// strict replay despite a real command-order change. Stopping surfaces it
+    /// as a non-determinism divergence instead. The crossable set is shared
+    /// verbatim with [`Self::match_timer_cancel`] via
+    /// [`Self::timer_scan_cross_or_stop`].
     pub fn match_timer_or_cancel(&mut self, timer_id: &str) -> TimerFireMatch {
         // Reset the blocked-scan flag on entry (see `match_timer_cancel`, issue
         // #768).
@@ -4607,9 +4630,9 @@ impl HistoryMatcher {
                 _ => {}
             }
             // Any other unconsumed event: cross it if transparent/interleavable,
-            // otherwise STOP (a code change that awaited the timer BEFORE such a
-            // command would otherwise silently claim a future TimerFired across it
-            // and pass strict replay — Codex P2 soundness fix, issue #768). The
+            // otherwise STOP. Otherwise a code change that awaited the timer
+            // BEFORE such a command would silently claim a future TimerFired
+            // across it. It would then pass strict replay (issue #768). The
             // crossable set is shared verbatim with `match_timer_cancel`.
             match self.timer_scan_cross_or_stop(scan, timer_id) {
                 TimerScanStep::Cross => scan += 1,
@@ -4630,18 +4653,18 @@ impl HistoryMatcher {
     ///
     /// The forward scan of this method (and of `match_timer_strict` /
     /// `scan_activity_terminal`) crosses an interleaved sibling's `TimerFired`
-    /// NON-CONSUMINGLY when the awaited signal wins, advancing the cursor PAST
-    /// the fire. If that fire belongs to a **cancellable timer** (issue #768:
-    /// `ctx.start_timer(...)` + `TimerHandle::await_fire()`) composed with this
-    /// plain signal wait in the SAME suspension batch — e.g.
-    /// `join!(ctx.wait_for_signal("go"), handle.await_fire())` where the
-    /// cancellable timer's `TimerFired` is recorded BEFORE the signal — the
+    /// NON-CONSUMINGLY when the awaited signal wins. That advances the cursor
+    /// PAST the fire. That fire can belong to a **cancellable timer** (issue
+    /// #768: `ctx.start_timer(...)` + `TimerHandle::await_fire()`) composed with
+    /// this plain signal wait in the SAME suspension batch. An example is
+    /// `join!(ctx.wait_for_signal("go"), handle.await_fire())`, where history
+    /// records the cancellable timer's `TimerFired` BEFORE the signal. Then the
     /// signal-win strands that fire BEHIND the cursor. `await_fire` resolves via
     /// `match_timer_or_cancel`, whose outcome scan only moves FORWARD from the
-    /// cursor, so it misses the behind-cursor fire and cannot resolve —
-    /// diverging strict `WorkflowReplayer` replay. On a live worker this
-    /// self-heals (the arm re-fires), but the composition is unsupported;
-    /// use `ctx.receive_signal_timeout` (issue #476) for a signal-or-deadline
+    /// cursor. So it misses the behind-cursor fire and cannot resolve, and
+    /// strict `WorkflowReplayer` replay diverges. On a live worker this
+    /// self-heals (the arm re-fires), but the composition is unsupported. Use
+    /// `ctx.receive_signal_timeout` (issue #476) for a signal-or-deadline
     /// shape. Pinned by
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
@@ -4687,9 +4710,9 @@ impl HistoryMatcher {
     /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
     ///
     /// Identical scanning, with one difference: an interleaved event this scan
-    /// does not recognise never diverges — it is crossed as a sibling command
-    /// and the scan continues, and reaching the end of history without the
-    /// signal returns [`HistoryMatch::NoMatch`] rather than a divergence.
+    /// does not recognise never diverges. The scan crosses it as a sibling
+    /// command and continues. Reaching the end of history without the signal
+    /// returns [`HistoryMatch::NoMatch`], not a divergence.
     ///
     /// `match_signal`'s divergence-on-stray-event behaviour exists for a *solo*
     /// `wait_for_signal`. Say the workflow expected a signal at this cursor and
@@ -4697,19 +4720,19 @@ impl HistoryMatcher {
     /// Parking on a signal that never arrives would hang the workflow forever
     /// (issue #768). Inside a `ctx.race()` neither premise holds. Sibling
     /// branches legitimately record their own dispatch and terminal events
-    /// around this one — that is the whole point of a mixed batch — and a
-    /// signal branch that simply lost the race has **no recorded
-    /// event at all**, which is the normal outcome, not a divergence. A race
-    /// branch also cannot hang the workflow on a never-arriving signal: some
-    /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
-    /// outcome for every later replay.
-    /// `settle_marker` is this race's own `race_winner:{seq}` marker name; it
+    /// around this one. That is the whole point of a mixed batch. A signal
+    /// branch that simply lost the race has **no recorded event at all**. That
+    /// is the normal outcome, not a divergence. A race branch also cannot hang
+    /// the workflow on a never-arriving signal. Some other branch resolves it,
+    /// and the `race_winner:{seq}` marker fixes the outcome for every later
+    /// replay.
+    /// `settle_marker` is this race's own `race_winner:{seq}` marker name. It
     /// **bounds** the scan. A `SignalReceived` recorded at or after that marker
-    /// was delivered once the race had already resolved, so it cannot be this
-    /// branch's resolution — it belongs to a later waiter. Without the bound a
+    /// was delivered once the race had already resolved. So it cannot be this
+    /// branch's resolution. It belongs to a later waiter. Without the bound, a
     /// *losing* signal branch would scan to end-of-history and silently consume
-    /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
-    /// a signal already delivered.
+    /// that signal. The real `ctx.wait_for_signal` that owns it would then stay
+    /// parked on a signal already delivered.
     pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
         self.match_signal_inner(signal_name, Some(settle_marker), None)
     }
@@ -4763,14 +4786,14 @@ impl HistoryMatcher {
 
         let from = self.cursor;
         let len = self.events.len();
-        // `first_interleaved_command` is the rewind target: on a win the cursor
-        // returns to the first sibling command crossed, so each one is claimed by
-        // its own matcher in program order. It is NOT a verdict. A crossed
-        // command may belong to a sibling branch of this decision (a #950 mixed
-        // batch, which parks). Or it may be stray (issue #768, which must
-        // nd-block). This scan runs too early to tell. See the sibling-command
-        // arm of `signal_scan_step` for why that verdict is deferred to the end
-        // of the cycle.
+        // `first_interleaved_command` is the rewind target. On a win, the
+        // cursor returns to the first sibling command crossed, so its own
+        // matcher claims each one in program order. It is NOT a verdict. A
+        // crossed command may belong to a sibling branch of this decision (a
+        // #950 mixed batch, which parks). Or it may be stray (issue #768, which
+        // must nd-block). This scan runs too early to tell. See the
+        // sibling-command arm of `signal_scan_step` for why that verdict is
+        // deferred to the end of the cycle.
         let mut first_interleaved_command = None;
         let mut at = from;
         while at < len {
@@ -4807,17 +4830,17 @@ impl HistoryMatcher {
         // signal: the awaited signal has not arrived yet, so this wait parks.
         // The indexed scan ends the same way.
         //
-        // Any interleaved command crossed on the way (a sibling's
-        // `ActivityScheduled`/`ChildWorkflowStarted`, or a `TimerStarted`/
-        // `TimerCancelled`/detached spawn) was crossed NON-CONSUMINGLY, so it is
-        // left for its own claimer. That is what makes returning `NoMatch` here
-        // safe for BOTH readings of a crossed command:
+        // Any interleaved command crossed on the way was crossed
+        // NON-CONSUMINGLY, so it is left for its own claimer. Examples are a
+        // sibling's `ActivityScheduled`/`ChildWorkflowStarted`, or a
+        // `TimerStarted`/`TimerCancelled`/detached spawn. That is what makes
+        // returning `NoMatch` here safe for BOTH readings of a crossed command:
         //
-        //   * a sibling branch of this decision claims it later in the same
-        //     cycle (the #950 mixed batch) → the frontier is clean when the body
-        //     suspends and the park is correct;
-        //   * nothing claims it (a stray left by code that no longer runs,
-        //     issue #768) → it is still unconsumed at suspend. The
+        //   * A sibling branch of this decision claims it later in the same
+        //     cycle (the #950 mixed batch). The frontier is then clean when the
+        //     body suspends, and the park is correct.
+        //   * Nothing claims it (a stray left by code that no longer runs,
+        //     issue #768). It is still unconsumed at suspend. The
         //     end-of-cycle drift guard in `executor.rs` then fails the cycle.
         //     The run does not park forever on a signal that never arrives.
         //     Strict and canary replay use `history_has_unconsumed_events()`.
@@ -4886,37 +4909,37 @@ impl HistoryMatcher {
             }
             // A reserved deadline timer (issue #476's
             // `__signal_timeout:{seq}:{name}` convention) for THIS awaited
-            // signal — a spent deadline from this wait's own signal-or-deadline
-            // composition, recorded earlier in the batch, where the plain
-            // signal ultimately won AFTER the deadline event. Cross it WITHOUT
-            // setting `first_interleaved_command` (its paired `TimerFired`
-            // crosses via the arm below), so the awaited signal recorded after
-            // the spent deadline is found and the reserved events end up behind
-            // the cursor on the win — never flagging early completion (issue
-            // #1071 manifestation #3).
+            // signal. It is a spent deadline from this wait's own
+            // signal-or-deadline composition, recorded earlier in the batch.
+            // The plain signal ultimately won AFTER the deadline event. Cross it
+            // WITHOUT setting `first_interleaved_command`; its paired
+            // `TimerFired` crosses via the arm below. Then the scan finds the
+            // awaited signal recorded after the spent deadline. On the win, the
+            // reserved events end up behind the cursor and never flag early
+            // completion (issue #1071 manifestation #3).
             //
-            // The guard is scoped to THIS signal's OWN name. A reserved
-            // deadline for a DIFFERENT signal name (e.g. matching
-            // `wait_for_signal("a")` while a concurrent
-            // `receive_signal_timeout("b", …)` armed `__signal_timeout:N:b`)
-            // belongs to that sibling race's own `match_signal_or_timer("b")`,
-            // which positionally re-anchors on its `TimerStarted`. Crossing a
-            // FOREIGN reserved timer WITHOUT rewind here would advance the
-            // cursor past the sibling's reserved events, so its later poll can
-            // no longer find its own `TimerStarted` → false EarlyCompletion / a
-            // re-armed spent timer (Codex P1 on PR #1084). So a foreign-name
-            // reserved timer instead falls through to the generic
-            // `TimerStarted` rewind arm below (as does a genuine user
-            // `ctx.timer` sibling), which sets `first_interleaved_command` so
-            // the sibling race / `match_timer_strict` re-matches after the win.
+            // The guard is scoped to THIS signal's OWN name. Take a reserved
+            // deadline for a DIFFERENT signal name, for example while this scan
+            // matches `wait_for_signal("a")` and a concurrent
+            // `receive_signal_timeout("b", …)` armed `__signal_timeout:N:b`. It
+            // belongs to that sibling race's own `match_signal_or_timer("b")`.
+            // That call re-anchors positionally on its `TimerStarted`. Crossing
+            // a FOREIGN reserved timer WITHOUT rewind here would advance the
+            // cursor past the sibling's reserved events. Its later poll could
+            // then no longer find its own `TimerStarted`. The result is a false
+            // EarlyCompletion or a re-armed spent timer (PR #1084). So a
+            // foreign-name reserved timer falls through to the generic
+            // `TimerStarted` rewind arm below, as a genuine user `ctx.timer`
+            // sibling does. That arm sets `first_interleaved_command`, so the
+            // sibling race / `match_timer_strict` re-matches after the win.
             //
             // NOTE (issue #1071): this arm assumes the SAME-name reserved
-            // deadline is SPENT (the signal won after the deadline event was
-            // recorded). It does not disambiguate a same-name race that is
-            // still OPEN at this cursor and racing THIS plain wait for the same
-            // signal (a plain `wait_for_signal("go")` interleaved with a
-            // still-open `receive_signal_timeout("go", …)` for the same name in
-            // the same batch) — that composition is an unsupported/exotic shape.
+            // deadline is SPENT: the signal won after the deadline event was
+            // recorded. It does not disambiguate a same-name race still OPEN at
+            // this cursor that races THIS plain wait for the same signal. An
+            // example is a plain `wait_for_signal("go")` interleaved with a
+            // still-open `receive_signal_timeout("go", …)` in the same batch.
+            // That composition is an unsupported/exotic shape.
             WorkflowEvent::TimerStarted { timer_id, .. }
                 if Self::signal_timeout_race_name(timer_id.as_str()) == Some(signal_name) =>
             {
@@ -4924,18 +4947,18 @@ impl HistoryMatcher {
             }
             // Issue #950: a race branch's scan stops at its OWN settlement
             // marker. This arm MUST precede the generic sibling-command arm
-            // below, which also matches `MarkerRecorded` and would otherwise
-            // swallow the bound — letting a losing signal branch scan past
-            // the resolved race and consume a signal belonging to a later
-            // `ctx.wait_for_signal`.
+            // below, which also matches `MarkerRecorded`. Otherwise that arm
+            // would swallow the bound. A losing signal branch would then scan
+            // past the resolved race and consume a signal that belongs to a
+            // later `ctx.wait_for_signal`.
             WorkflowEvent::MarkerRecorded { name, .. }
                 if tolerate_interleaved == Some(name.as_str()) =>
             {
                 Some(HistoryMatch::NoMatch)
             }
-            // An interleaved sibling COMMAND. Cross it as an interleaved
-            // command (rewind to it on a win, so its own matcher claims it in
-            // program order) and keep scanning for the awaited signal.
+            // An interleaved sibling COMMAND. Cross it as an interleaved command
+            // and keep scanning for the awaited signal. On a win the scan rewinds
+            // to it, so its own matcher claims it in program order.
             //
             // Two histories put a command here and they are NOT
             // distinguishable at this point:
@@ -4943,9 +4966,9 @@ impl HistoryMatcher {
             //   * a sibling branch of THIS decision (issue #950) —
             //     `join!(ctx.wait_for_signal(..), ctx.timer(..))` or
             //     `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`.
-            //     `join!` polls the signal first, so the batch records the
+            //     `join!` polls the signal first. So the batch records the
             //     sibling's `TimerStarted`/`ActivityScheduled` and nothing for
-            //     the signal wait; on the next drive this scan starts ON that
+            //     the signal wait. On the next drive this scan starts ON that
             //     event, and the sibling's own `match_timer_strict` /
             //     `scan_activity_terminal` claims it later in the same cycle.
             //     The correct outcome is a park.
@@ -4954,8 +4977,8 @@ impl HistoryMatcher {
             //     same-cycle `reset()` records). Nothing claims it, and
             //     parking would wait forever on a signal that never arrives.
             //
-            // What separates them is not the event, it is whether anything in
-            // this decision claims it — which this scan cannot know, because it
+            // What separates them is not the event. It is whether anything in
+            // this decision claims it. This scan cannot know that, because it
             // runs BEFORE the sibling branches are polled. So it crosses
             // everything NON-CONSUMINGLY. Each event stays claimable exactly
             // once by `match_timer_cancel` / `match_timer_arm` / etc. The
@@ -4989,17 +5012,16 @@ impl HistoryMatcher {
                 first_interleaved_command.get_or_insert(at);
                 None
             }
-            // Progress and terminal events of those concurrent siblings —
-            // and a foreign timer's fire (a sibling deadline that fired
-            // before the awaited signal arrived, e.g. a concurrent
-            // `receive_signal_timeout`/`ctx.timer` in the same batch whose
-            // `TimerFired` is recorded ahead of the delivered
-            // `SignalReceived`, issue #1071 manifestation #3) — are
-            // transparent to this scan. Cross them NON-CONSUMINGLY, leaving
-            // each for its own matcher to claim, and keep scanning for the
-            // awaited signal. `activity_scan_role` gives the activity and
-            // timer scans the same treatment. Keep the two sets in sync
-            // (issues #1071, #950 and #2338).
+            // Progress and terminal events of those concurrent siblings are
+            // transparent to this scan. So is a foreign timer's fire: a sibling
+            // deadline that fired before the awaited signal arrived. An example
+            // is a concurrent `receive_signal_timeout`/`ctx.timer` in the same
+            // batch whose `TimerFired` is recorded ahead of the delivered
+            // `SignalReceived` (issue #1071 manifestation #3). Cross them
+            // NON-CONSUMINGLY, leaving each for its own matcher to claim, and
+            // keep scanning for the awaited signal. `activity_scan_role` gives
+            // the activity and timer scans the same treatment. Keep the two
+            // sets in sync (issues #1071, #950 and #2338).
             //
             // Crossing non-consumingly keeps the issue #768 stray-command
             // protection intact without a scan-time guess. Take a lone stale
@@ -5017,10 +5039,10 @@ impl HistoryMatcher {
             | WorkflowEvent::LocalActivityFailed { .. }
             | WorkflowEvent::TimerFired { .. } => None,
             // ExternalSignal event triplets can appear before SignalReceived
-            // when a mixed batch (e.g. tokio::join!(wait_for_signal, signal_external))
-            // wrote signal events first, and ExternalCancel/ExternalAwait
-            // triplets are likewise transparent here (issue #492, issue
-            // #757). Stash them for their own matchers.
+            // when a mixed batch wrote signal events first, for example
+            // tokio::join!(wait_for_signal, signal_external).
+            // ExternalCancel/ExternalAwait triplets are likewise transparent
+            // here (issue #492, issue #757). Stash them for their own matchers.
             WorkflowEvent::ExternalSignalRequested { .. }
             | WorkflowEvent::ExternalSignalDelivered { .. }
             | WorkflowEvent::ExternalSignalFailed { .. }
@@ -5035,17 +5057,16 @@ impl HistoryMatcher {
             }
             other => {
                 // Issue #950: inside a race, an unrecognised event is a
-                // sibling branch's own command/terminal, not a divergence —
-                // cross it as an interleaved command (so a later win rewinds
-                // the cursor to it for its own claimer) and keep scanning,
-                // bounded by the race's own settlement marker.
+                // sibling branch's own command/terminal, not a divergence. Cross
+                // it as an interleaved command, so a later win rewinds the
+                // cursor to it for its own claimer. Keep scanning, bounded by
+                // the race's own settlement marker.
                 //
                 // Checked BEFORE the `is_some()` early-return below. That
-                // guard is what makes the SOLO wait stop after one crossed
-                // event, and since this arm is what SETS
-                // `first_interleaved_command`, ordering it second would let a
-                // race branch cross exactly one event and then bail — while
-                // the normal shape is two (`ActivityScheduled` +
+                // guard makes the SOLO wait stop after one crossed event. This
+                // arm SETS `first_interleaved_command`. So ordering it second
+                // would let a race branch cross exactly one event and then bail.
+                // The normal shape is two events (`ActivityScheduled` +
                 // `ActivityStarted`) before the signal.
                 // The settlement-marker bound is applied by its own arm
                 // above, ahead of the sibling-command arm.
@@ -5142,50 +5163,49 @@ impl HistoryMatcher {
     ///
     /// Unlike [`match_signal`](Self::match_signal), which resolves a single
     /// pull-based wait at the current cursor position, this claims **every**
-    /// currently-stashed `SignalReceived { signal_name }` payload not yet
-    /// claimed by anything else, in ascending event order. "Currently
-    /// stashed" is the key constraint: this method calls
-    /// [`prepare_match`](Self::prepare_match) (the same cursor-advancing,
-    /// signal-draining sweep every other `match_*` method opens with) and
-    /// then only inspects `pending_signals` -- it never reaches ahead of
-    /// wherever the workflow's own code-driven cursor progression has
+    /// unclaimed payload. It takes each currently-stashed
+    /// `SignalReceived { signal_name }` that nothing else claimed yet, in
+    /// ascending event order. "Currently stashed" is the key constraint. This
+    /// method calls [`prepare_match`](Self::prepare_match), the same
+    /// cursor-advancing, signal-draining sweep every other `match_*` method
+    /// opens with. It then inspects only `pending_signals`. It never reaches
+    /// ahead of wherever the workflow's own code-driven cursor progression has
     /// carried the matcher so far.
     ///
     /// This is deliberate and is the fix for a real production bug (issue
-    /// #546 post-ship hardening). An earlier version of this method also
-    /// indexed and claimed *every* recorded `SignalReceived` for `name`,
-    /// regardless of cursor position. A handler registered at the top of a
-    /// workflow function could then fire on a signal recorded *after* an
-    /// activity or timer. The workflow had not reached that activity or timer
-    /// yet in this replay cycle. That silently reordered observable side
-    /// effects relative to history. Because `prepare_match`'s
-    /// `drain_early_signals` sweep halts at the first non-transparent event (an
-    /// `ActivityScheduled`, `TimerStarted`, etc. not yet consumed), a signal
-    /// recorded after such an event is invisible here until whatever `match_*`
-    /// call the workflow body actually makes for that event advances the cursor
-    /// past it -- exactly mirroring `wait_for_signal`'s own history-order
-    /// contract.
+    /// #546). An earlier version of this method also indexed and claimed
+    /// *every* recorded `SignalReceived` for `name`, regardless of cursor
+    /// position. A handler registered at the top of a workflow function could
+    /// then fire on a signal recorded *after* an activity or timer. The
+    /// workflow had not reached that activity or timer yet in this replay
+    /// cycle. That silently reordered observable side effects relative to
+    /// history. `prepare_match`'s `drain_early_signals` sweep halts at the
+    /// first non-transparent event (an `ActivityScheduled`, `TimerStarted`,
+    /// etc. not yet consumed). So a signal recorded after such an event stays
+    /// invisible here. It appears once the workflow body's own `match_*` call
+    /// for that event advances the cursor past it. This exactly mirrors
+    /// `wait_for_signal`'s own history-order contract.
     ///
-    /// Claiming marks the returned event indices consumed, so a later
-    /// `wait_for_signal`/`receive_signal` call for the same name will not see
-    /// them again, and vice versa — the two consumption styles never
+    /// Claiming marks the returned event indices consumed. So a later
+    /// `wait_for_signal`/`receive_signal` call for the same name does not see
+    /// them again, and vice versa. The two consumption styles never
     /// double-deliver a single `SignalReceived` event. Calling this again
     /// immediately (with no intervening cursor advancement) for the same
     /// `signal_name` returns an empty `Vec`.
     ///
     /// An event reserved for an open signal-or-deadline race for the same
     /// name (see [`Self::race_reserved_signal_events`]) is never claimed
-    /// here, regardless of call order: a push handler must not be able to
-    /// silently steal the signal a concurrent `receive_signal_timeout` /
-    /// `wait_for_signal_timeout` race is waiting to resolve on. In practice
-    /// the race's own unconsumed `TimerStarted` already blocks the cursor
-    /// from reaching that signal at all (see the field doc), so this is a
-    /// second, independent layer of protection rather than the only one.
+    /// here, regardless of call order. A push handler must not silently steal
+    /// the signal that a concurrent `receive_signal_timeout` /
+    /// `wait_for_signal_timeout` race waits to resolve on. In practice the
+    /// race's own unconsumed `TimerStarted` already blocks the cursor from
+    /// reaching that signal at all (see the field doc). So this is a second,
+    /// independent layer of protection, not the only one.
     ///
-    /// Returns `(event_index, payload)` pairs -- not just payloads -- so a
-    /// caller dispatching to *multiple* differently-named handlers in one
-    /// pump (as [`WorkflowContext`](crate::context::WorkflowContext) does)
-    /// can sort by index to dispatch in true historical order across
+    /// Returns `(event_index, payload)` pairs, not just payloads. A caller
+    /// that dispatches to *multiple* differently-named handlers in one pump
+    /// (as [`WorkflowContext`](crate::context::WorkflowContext) does) can then
+    /// sort by index. It then dispatches in true historical order across
     /// handler names, not just within one name.
     pub(crate) fn claim_pending_signal(&mut self, signal_name: &str) -> Vec<(usize, Value)> {
         self.prepare_match();
@@ -5195,10 +5215,10 @@ impl HistoryMatcher {
         let matched = self
             .pending_signals
             .take_of_name(signal_name, |entry| !reserved.contains(&entry.index));
-        // Every stashed entry already has its index in `consumed_signal_events`
-        // (set by `stash_signal` at stash time), but re-asserting it here makes
-        // the no-double-delivery invariant explicit at the point of use rather
-        // than relying on the reader to trace it back to the stash call site.
+        // `stash_signal` already put every stashed entry's index in
+        // `consumed_signal_events` at stash time. Re-asserting it here makes
+        // the no-double-delivery invariant explicit at the point of use. The
+        // reader need not trace it back to the stash call site.
         for entry in &matched {
             self.consumed_signal_events.insert(entry.index);
         }
@@ -5214,21 +5234,20 @@ impl HistoryMatcher {
     /// This is the single-occurrence sibling of
     /// [`claim_pending_signal`](Self::claim_pending_signal) and the matcher
     /// engine for [`WorkflowContext::try_receive_signal`](crate::context::WorkflowContext::try_receive_signal).
-    /// Like `match_signal`'s fast path it removes exactly one entry from
-    /// `pending_signals`, but it adds the same two guards `claim_pending_signal`
-    /// carries: it first runs [`prepare_match`](Self::prepare_match) (the
+    /// Like `match_signal`'s fast path, it removes exactly one entry from
+    /// `pending_signals`. But it adds the same two guards `claim_pending_signal`
+    /// carries. First, it runs [`prepare_match`](Self::prepare_match), the
     /// cursor-advancing, signal-draining sweep every `match_*` method opens
-    /// with) so a signal recorded at — but not yet drained to — the current
-    /// cursor is visible, and it skips any event reserved for an open
+    /// with. So a signal recorded at, but not yet drained to, the current
+    /// cursor is visible. Second, it skips any event reserved for an open
     /// signal-or-deadline race (see [`Self::race_reserved_signal_events`]).
     ///
-    /// Crucially, because it only inspects `pending_signals` after
-    /// `prepare_match`, it can never reach ahead of the workflow's own
-    /// code-driven cursor position: a signal recorded *after* an unconsumed
-    /// activity/timer is invisible until the workflow's own `match_*` call for
-    /// that event advances the cursor past it. It **never** falls through to a
-    /// suspension — a `None` return means "nothing buffered right now", not
-    /// "park until a signal arrives".
+    /// It inspects only `pending_signals` after `prepare_match`. So it can
+    /// never reach ahead of the workflow's own code-driven cursor position. A
+    /// signal recorded *after* an unconsumed activity/timer is invisible until
+    /// the workflow's own `match_*` call for that event advances the cursor
+    /// past it. It **never** falls through to a suspension. A `None` return
+    /// means "nothing buffered right now", not "park until a signal arrives".
     ///
     /// The claimed event's index is marked consumed, so a later
     /// `match_signal`/`claim_pending_signal` call for the same name (and vice
@@ -5268,11 +5287,14 @@ impl HistoryMatcher {
     }
 
     /// Settle the bookkeeping for a signal-branch win of a signal-or-deadline
-    /// race (issue #476): consume the winning `SignalReceived` event, consume
-    /// the stray `TimerFired` of the race timer if it is already recorded (if
-    /// the timer fires only after this replay cycle, the next full replay
-    /// re-runs the same scan and consumes it then), and settle the cursor on
-    /// the first interleaved sibling command, or just past the winning signal.
+    /// race (issue #476).
+    ///
+    /// It consumes the winning `SignalReceived` event. It
+    /// consumes the stray `TimerFired` of the race timer if history already
+    /// records it. If the timer fires only after this replay cycle, the next
+    /// full replay re-runs the same scan and consumes it then. Last, it settles
+    /// the cursor on the first interleaved sibling command, or just past the
+    /// winning signal.
     fn settle_race_signal_won(
         &mut self,
         signal_pos: usize,
@@ -5322,13 +5344,12 @@ impl HistoryMatcher {
     ) -> SignalOrTimerMatch {
         let replaying = self.prepare_match();
 
-        // A signal stashed by an earlier scan — or drained by prepare_match
-        // just now — whose recorded position precedes this race point arrived
-        // before the race started: the signal wins and the timer was never
-        // started on the matching live run. Stashed signals recorded at or
-        // after the race point must NOT short-circuit here — history order
-        // decides, so they compete at their recorded index during the scan
-        // below.
+        // A signal stashed by an earlier scan, or drained by prepare_match
+        // just now, can precede this race point. Such a signal arrived before
+        // the race started. The signal wins, and the matching live run never
+        // started the timer. Stashed signals recorded at or after the race
+        // point must NOT short-circuit here. History order decides, so they
+        // compete at their recorded index during the scan below.
         let race_pos = self.cursor;
         let early = self
             .pending_signals
@@ -5389,7 +5410,7 @@ impl HistoryMatcher {
             if self.is_consumed(scan_cursor) {
                 // A matching signal stashed by a sibling scan (consumed but
                 // still undelivered in the pending buffer) competes at its
-                // recorded position: if it precedes the race's TimerFired in
+                // recorded position. If it precedes the race's TimerFired in
                 // history, the signal branch wins.
                 if let Some(payload) = self.take_stashed_signal_at(scan_cursor, signal_name) {
                     self.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
@@ -5412,7 +5433,7 @@ impl HistoryMatcher {
                 WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
                     // The first matching signal recorded after this fire is
                     // the exact event that lost the race. It stays deliverable
-                    // to a later signal wait, but if the timeout branch
+                    // to a later signal wait. If the timeout branch
                     // intentionally ignores it, the completed history must
                     // still pass the strict unconsumed check. Each race claims
                     // a distinct loser, so skip indices already claimed.
@@ -5449,8 +5470,8 @@ impl HistoryMatcher {
 
                 // Concurrent commands (tokio::join! siblings) can interleave
                 // with the pending race. Keep the first one as the next replay
-                // cursor — mirroring scan_activity_terminal — and scan past it
-                // so a resolution event recorded later is still found.
+                // cursor, as scan_activity_terminal does. Scan past it so a
+                // resolution event recorded later is still found.
                 WorkflowEvent::ChildWorkflowStarted { .. }
                 | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
                 | WorkflowEvent::ActivityScheduled { .. }
@@ -5459,9 +5480,9 @@ impl HistoryMatcher {
                 | WorkflowEvent::SideEffectRecorded { .. }
                 | WorkflowEvent::TimerStarted { .. }
                 // A cancellable-timer cancel (issue #768) interleaved with the
-                // race is an interleaved command: rewind to it after the race
-                // settles so its own claimer can re-scan, rather than skipping
-                // past it (which would make it unreachable).
+                // race is an interleaved command. Rewind to it after the race
+                // settles, so its own claimer can re-scan. Skipping past it
+                // would make it unreachable.
                 | WorkflowEvent::TimerCancelled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
@@ -5469,7 +5490,7 @@ impl HistoryMatcher {
 
                 // Progress and terminal events of those concurrent siblings
                 // (and fires of foreign timers) are transparent to the race
-                // scan — their own matchers consume them after the rewind.
+                // scan. Their own matchers consume them after the rewind.
                 WorkflowEvent::ActivityStarted { .. }
                 | WorkflowEvent::ActivityHeartbeat { .. }
                 | WorkflowEvent::ActivityCompleted { .. }
@@ -5520,11 +5541,11 @@ impl HistoryMatcher {
     /// current cursor.
     ///
     /// Both the input **and** the successor type are part of the recorded
-    /// command (issue #803): a code change that redirects a continuation to a
-    /// different workflow type — or that adds/removes the cross-type call
-    /// entirely — surfaces as non-determinism rather than silently forking the
-    /// chain into a different phase on replay. `None` (same type) and
-    /// `Some(t)` are distinct recorded intents and never compare equal.
+    /// command (issue #803). A code change can redirect a continuation to a
+    /// different workflow type, or add/remove the cross-type call entirely.
+    /// That surfaces as non-determinism, not as a silent fork of the chain into
+    /// a different phase on replay. `None` (same type) and `Some(t)` are
+    /// distinct recorded intents and never compare equal.
     pub fn match_continue_as_new(
         &mut self,
         input: &Value,
@@ -5582,11 +5603,11 @@ impl HistoryMatcher {
     /// (issue #803).
     ///
     /// It scans back from the cursor, so it can be consulted *after*
-    /// [`Self::match_continue_as_new`] has advanced past the event. Exists
-    /// solely to back a `debug_assert!` on the `Matched` arm, where the
-    /// successor type is emitted from the live argument rather than echoed
-    /// from history; a history with no recorded continuation reports `true`
-    /// (there is nothing to contradict).
+    /// [`Self::match_continue_as_new`] has advanced past the event. It exists
+    /// solely to back a `debug_assert!` on the `Matched` arm. There the
+    /// successor type comes from the live argument, not from history. A
+    /// history with no recorded continuation reports `true` (there is nothing
+    /// to contradict).
     ///
     /// It reads the last continuation before the cursor, which is the one
     /// just matched. A malformed history can hold two continuations. The
@@ -5742,12 +5763,12 @@ impl HistoryMatcher {
 
     /// Settle a child-vs-deadline race won by the child (issue #779).
     ///
-    /// Marks the winning child terminal consumed (it is matched out of order),
-    /// strays the race's deadline `TimerFired` if it was recorded after the
-    /// child won (so a subsequent match does not diverge against it and the
-    /// strict unconsumed check passes), and advances the cursor. Mirrors
-    /// [`Self::settle_race_signal_won`] with the winner role swapped from a
-    /// signal to a child terminal.
+    /// Marks the winning child terminal consumed (it is matched out of order).
+    /// If the race's deadline `TimerFired` was recorded after the child won, it
+    /// strays that event. Then a later match does not diverge against it, and
+    /// the strict unconsumed check passes. Last, it advances the cursor.
+    /// Mirrors [`Self::settle_race_signal_won`] with the winner role swapped
+    /// from a signal to a child terminal.
     fn settle_race_child_won(
         &mut self,
         terminal_pos: usize,
@@ -5769,9 +5790,9 @@ impl HistoryMatcher {
         }
         // Intentional divergence from `settle_race_signal_won`, which resumes at
         // `signal_pos + 1` (just past the winning signal). Here the child/timer
-        // start pair was matched positionally, so the cursor rewinds to
-        // `resume_pos` (the first event after the started pair) and
-        // `advance_to_next_unconsumed_event` then skips the just-consumed winning
+        // start pair was matched positionally. So the cursor rewinds to
+        // `resume_pos`, the first event after the started pair. Then
+        // `advance_to_next_unconsumed_event` skips the just-consumed winning
         // terminal (marked above) plus any consumed interleaved events. Verified
         // equivalent: the winning terminal is `consumed_out_of_order_events`, so
         // both forms land the cursor at the same next-unconsumed event.
@@ -5803,28 +5824,29 @@ impl HistoryMatcher {
         false
     }
 
-    /// After a `ctx.race()` (issue #600) records its winner on the first
-    /// resolving cycle (the else branch of `WorkflowContext::settle_race`),
-    /// consume the still in-flight LOSER branches' progress-frontier events so
-    /// the matcher cursor advances past them, letting a follow-on positional
-    /// command in the SAME decision cycle land cleanly (issue #1126).
+    /// Consumes the in-flight loser events of a `ctx.race()` (issue #600).
     ///
-    /// The winner's terminal (and its own `ActivityStarted`) are already
-    /// consumed by its own `match_activity`. The loser branches, however,
-    /// resolved as `ActivityInProgress` this cycle — their synthetic
-    /// `ActivityFailed` (from the pending `CancelRaceLosers` command) is
-    /// appended only at *persist* time and is invisible to this cycle's
-    /// matcher, so their in-flight `ActivityStarted` / `ActivityHeartbeat`
-    /// (and, defensively, a losing child's `ChildWorkflowStarted`) are left
-    /// unconsumed straddling the cursor. Without consuming them, the next
-    /// positional `match_*` call diverges on the leftover event -> nd-block.
+    /// A race records its winner on the first resolving cycle (the else branch
+    /// of `WorkflowContext::settle_race`). This call then advances the matcher
+    /// cursor past the loser events. So a follow-on positional command in the
+    /// SAME decision cycle lands cleanly (issue #1126).
     ///
-    /// Consumes ONLY events belonging to the given loser ids, so it is safe
-    /// under `futures::join!(race1, race2)` interleaving (a sibling race's
-    /// events are left untouched). Called ONLY on the first winner-recording
-    /// cycle; later replays take `settle_race`'s `peek_u64_marker` branch,
-    /// where each loser resolves via its recorded terminal and everything is
-    /// already positioned correctly (so this is never invoked then).
+    /// The winner's own `match_activity` already consumed its terminal (and
+    /// its own `ActivityStarted`). The loser branches resolved as
+    /// `ActivityInProgress` this cycle. Their synthetic `ActivityFailed` (from
+    /// the pending `CancelRaceLosers` command) is appended only at *persist*
+    /// time, so this cycle's matcher cannot see it. So their in-flight
+    /// `ActivityStarted` / `ActivityHeartbeat` stay unconsumed, straddling the
+    /// cursor. So, defensively, does a losing child's `ChildWorkflowStarted`.
+    /// Without consuming them, the next positional `match_*` call diverges on
+    /// the leftover event -> nd-block.
+    ///
+    /// Consumes ONLY events of the given loser ids. So it is safe under
+    /// `futures::join!(race1, race2)` interleaving: a sibling race's events
+    /// stay untouched. Called ONLY on the first winner-recording cycle. Later
+    /// replays take `settle_race`'s `peek_u64_marker` branch, where each loser
+    /// resolves via its recorded terminal. Everything is then already
+    /// positioned correctly, so this is never invoked then.
     pub(crate) fn consume_race_loser_frontier(
         &mut self,
         loser_activity_ids: &[ActivityExecId],
@@ -5844,13 +5866,13 @@ impl HistoryMatcher {
                         self.consumed_out_of_order_events.insert(scan);
                     }
                     // Defensive: a losing CHILD branch resolves as
-                    // `ChildInProgress`, whose `match_child_workflow` already
+                    // `ChildInProgress`. Its `match_child_workflow` already
                     // advances the cursor PAST the child's own
-                    // `ChildWorkflowStarted` (a child has no separate started
-                    // event to strand the way an activity does), so in practice
-                    // this arm is unreachable today. Kept so a future child-race
-                    // shape that leaves a child's start unconsumed is handled
-                    // by the same in-cycle consume rather than nd-blocking.
+                    // `ChildWorkflowStarted`. A child has no separate started
+                    // event to strand the way an activity does. So in practice
+                    // this arm is unreachable today. It stays so a future
+                    // child-race shape that leaves a child's start unconsumed
+                    // gets the same in-cycle consume, not an nd-block.
                     WorkflowEvent::ChildWorkflowStarted { child_id, .. }
                         if loser_child_ids.contains(child_id) =>
                     {
@@ -5867,42 +5889,43 @@ impl HistoryMatcher {
     /// Read-only peek: does a recorded `ChildWorkflowStarted` already sit at the
     /// cursor a [`Self::match_child_or_timer`] call would land on (issue #779)?
     ///
-    /// Used by [`crate::context::WorkflowContext::spawn_child_workflow_timeout`]
-    /// to decide, *before* calling `match_child_or_timer`, whether this call is a
-    /// **fresh dispatch** (no recorded child-timeout start yet) so the
-    /// payload-cap pre-check can run first — mirroring the fan-out's
-    /// [`peek_fan_out_count`](crate::context::WorkflowContext) marker peek. On a
-    /// live over-cap call the child is never dispatched, so no child/timer events
-    /// are recorded; on replay of that history the matcher would otherwise see
-    /// the next real event (`WorkflowFailed`, or a caught-and-continued activity)
-    /// at the cursor and report a spurious non-determinism instead of
-    /// reproducing the same `PayloadTooLarge`. Gating the cap check to a fresh
-    /// dispatch also keeps an already-recorded child (under-cap at record time)
-    /// from being re-judged against a possibly-changed cap.
+    /// [`crate::context::WorkflowContext::spawn_child_workflow_timeout`] calls
+    /// it *before* `match_child_or_timer`. It decides whether this call is a
+    /// **fresh dispatch** (no recorded child-timeout start yet), so the
+    /// payload-cap pre-check can run first. This mirrors the fan-out's
+    /// [`peek_fan_out_count`](crate::context::WorkflowContext) marker peek. A
+    /// live over-cap call never dispatches the child, so no child/timer events
+    /// are recorded. On replay of that history, the matcher would otherwise see
+    /// the next real event (`WorkflowFailed`, or a caught-and-continued
+    /// activity) at the cursor. It would report a spurious non-determinism
+    /// instead of reproducing the same `PayloadTooLarge`. Gating the cap check
+    /// to a fresh dispatch also keeps an already-recorded child (under-cap at
+    /// record time) from being re-judged against a possibly-changed cap.
     ///
-    /// It never mutates the cursor and never consumes anything —
+    /// It never mutates the cursor and never consumes anything.
     /// `match_child_or_timer` remains the sole authority for resolving the race.
-    /// The skip set mirrors [`Self::drain_early_signals`] so the peek agrees with
-    /// where the real match will land even when signals or update events precede
-    /// the recorded child start.
+    /// The skip set mirrors [`Self::drain_early_signals`]. So the peek agrees
+    /// with where the real match lands, even when signals or update events
+    /// precede the recorded child start.
     ///
-    /// The recorded start is **fingerprinted by `expected_timer_id`** (the call's
-    /// `__child_timeout:{seq}:{name}` deadline timer, unique per call site because
-    /// `seq` is a burned per-context counter). Without that fingerprint, a caught
-    /// over-cap call — which records **nothing** — would peek the *next*
-    /// child-timeout call's `ChildWorkflowStarted` at the cursor, wrongly conclude
-    /// it was already dispatched, skip its own payload-cap re-check, and then
-    /// diverge (spurious non-determinism) instead of reproducing the same
-    /// `PayloadTooLarge`. This mirrors exactly how the fan-out's seq-keyed
-    /// `fan_out:{seq}` marker peek keeps a caught call from being miscredited the
-    /// *following* call's marker (issue #779).
+    /// The recorded start is **fingerprinted by `expected_timer_id`**. That is
+    /// the call's `__child_timeout:{seq}:{name}` deadline timer. It is unique
+    /// per call site, because `seq` is a burned per-context counter. A caught
+    /// over-cap call records **nothing**. Without the fingerprint, it would peek
+    /// the *next* child-timeout call's `ChildWorkflowStarted` at the cursor. It
+    /// would wrongly conclude it was already dispatched and skip its own
+    /// payload-cap re-check. It would then diverge (spurious non-determinism)
+    /// instead of reproducing the same `PayloadTooLarge`. The fan-out's
+    /// seq-keyed `fan_out:{seq}` marker peek works the same way. It keeps a
+    /// caught call from being miscredited the *following* call's marker (issue
+    /// #779).
     #[must_use]
     pub(crate) fn peek_child_start_at_cursor(&self, expected_timer_id: &str) -> bool {
         // Advance `cursor` past consumed indices and the leading run of
         // early-drainable signal / external-signal / external-cancel / update
-        // events, exactly as `prepare_match` -> `drain_early_signals` will before
-        // reading the structural event at the cursor. Returns `false` when the
-        // history end is reached without a structural event.
+        // events. `prepare_match` -> `drain_early_signals` does exactly the
+        // same before it reads the structural event at the cursor. Returns
+        // `false` when the history end is reached without a structural event.
         let skip_to_structural = |cursor: &mut usize| -> bool {
             while *cursor < self.events.len() {
                 let ev = &self.events[*cursor];
@@ -5964,7 +5987,7 @@ impl HistoryMatcher {
     /// recorded history**.
     ///
     /// Positional invariant: the worker persists `ChildWorkflowStarted`
-    /// immediately followed by `TimerStarted` in one transaction, so both are
+    /// immediately followed by `TimerStarted` in one transaction. So both are
     /// matched positionally (Diverge on mismatch) before the forward scan for
     /// the first resolution event. Interleaved concurrent-sibling events are
     /// stashed / rewound exactly as in [`Self::match_signal_or_timer`].
@@ -6102,8 +6125,8 @@ impl HistoryMatcher {
                 WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
                     // A loser child terminal recorded after the fire (the
                     // synthetic `ChildWorkflowFailed` from the race-loser
-                    // cancellation) is deliverable to nobody, so consume it and
-                    // report `child_already_terminal` so the caller pushes
+                    // cancellation) is deliverable to nobody. So consume it and
+                    // report `child_already_terminal`. Then the caller pushes
                     // `CancelRaceLosers` only on the one live cycle the child is
                     // still running.
                     let child_already_terminal =
@@ -6149,7 +6172,7 @@ impl HistoryMatcher {
 
                 // Progress and terminal events of concurrent siblings (foreign
                 // timer fires, terminals of other children) are transparent to
-                // the race scan — their own matchers consume them after a rewind.
+                // the race scan. Their own matchers consume them after a rewind.
                 WorkflowEvent::ActivityStarted { .. }
                 | WorkflowEvent::ActivityHeartbeat { .. }
                 | WorkflowEvent::ActivityCompleted { .. }
@@ -6280,11 +6303,11 @@ impl HistoryMatcher {
 
     /// Match a deterministic side-effect capture against history (issue #384).
     ///
-    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
-    /// `new_uuid()`, `random_*()`, and `side_effect()` — lower onto a single
-    /// [`WorkflowEvent::SideEffectRecorded`] variant and match through this
-    /// method in command (cursor) order. The recorded `value` is returned via
-    /// [`HistoryMatch::Matched`].
+    /// All of the `WorkflowContext` deterministic primitives lower onto a single
+    /// [`WorkflowEvent::SideEffectRecorded`] variant: `system_now()`,
+    /// `new_uuid()`, `random_*()`, and `side_effect()`. Each matches through
+    /// this method in command (cursor) order. The recorded `value` is returned
+    /// via [`HistoryMatch::Matched`].
     ///
     /// `kind` distinguishes the built-in helper; `name` is `Some` only for the
     /// author-named `side_effect()` path. A mismatch in either the `kind` or the
@@ -6350,9 +6373,9 @@ impl HistoryMatcher {
 
     /// Tolerant deadline-branch wall-clock read (issue #772).
     ///
-    /// Peeks the cursor for the deadline probe's own recorded clock read — a
-    /// `SideEffectRecorded { kind: Now, name: Some(DEADLINE_PROBE_SIDE_EFFECT_NAME) }`
-    /// — and resolves to one of three states; see [`SideEffectNowMatch`] for the
+    /// Peeks the cursor for the deadline probe's own recorded clock read, a
+    /// `SideEffectRecorded { kind: Now, name: Some(DEADLINE_PROBE_SIDE_EFFECT_NAME) }`.
+    /// It resolves to one of three states; see [`SideEffectNowMatch`] for the
     /// full rationale. Unlike the strict
     /// [`match_side_effect_event`](Self::match_side_effect_event), a cursor
     /// holding any *other* recorded event resolves to
@@ -6361,17 +6384,18 @@ impl HistoryMatcher {
     ///
     /// **Reserved-name gating (migration safety).** The probe matches ONLY its
     /// own sentinel-named `Now`. A `SideEffectRecorded { kind: Now, name: None }`
-    /// at the cursor is an author-side [`system_now`](crate::context::WorkflowContext::system_now)
-    /// read — a real value the workflow's own code will consume — so it resolves
-    /// to `NotRecorded` (cursor untouched), never stolen by the probe. This is
-    /// what lets a pre-#772 history whose `should_continue_as_new()` check sits
-    /// immediately before a `ctx.system_now()`/`sleep_until()` call replay
-    /// cleanly on upgrade: the deadline branch degrades to history-count-only for
-    /// the pre-upgrade recorded portion, and the user's own `Now` is matched by
-    /// its own strict read.
+    /// at the cursor is an author-side
+    /// [`system_now`](crate::context::WorkflowContext::system_now) read. It is
+    /// a real value that the workflow's own code consumes. So it resolves to
+    /// `NotRecorded` (cursor untouched), and the probe never steals it. This
+    /// lets a pre-#772 history replay cleanly on upgrade when its
+    /// `should_continue_as_new()` check sits immediately before a
+    /// `ctx.system_now()`/`sleep_until()` call. The deadline branch degrades to
+    /// history-count-only for the pre-upgrade recorded portion. The user's own
+    /// `Now` is matched by its own strict read.
     ///
     /// Uses the same [`prepare_match`](Self::prepare_match) preamble as the
-    /// strict matcher, so it lands on exactly the same cursor position — the
+    /// strict matcher, so it lands on exactly the same cursor position. The
     /// only difference is the non-diverging treatment of a non-probe event.
     #[must_use]
     pub fn match_side_effect_now_tolerant(&mut self) -> SideEffectNowMatch {
@@ -6397,11 +6421,12 @@ impl HistoryMatcher {
                     None => SideEffectNowMatch::NotRecorded,
                 }
             }
-            // Any other recorded event — including a user `system_now()` Now
-            // (`{ kind: Now, name: None }`) or a differently-named `Now` — do NOT
-            // consume the cursor, do NOT diverge. The deadline branch degrades to
-            // history-count-only for the recorded portion of a pre-#772 history,
-            // and a user `Now` is left for its own strict read to consume.
+            // This covers any other recorded event, including a user
+            // `system_now()` Now (`{ kind: Now, name: None }`) or a
+            // differently-named `Now`. Do NOT consume the cursor, and do NOT
+            // diverge. The deadline branch degrades to history-count-only for
+            // the recorded portion of a pre-#772 history. A user `Now` is left
+            // for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
         }
     }
@@ -6612,20 +6637,20 @@ impl HistoryMatcher {
     }
 
     /// The frozen resolution (retry policy + `start_to_close`) a local activity
-    /// was scheduled with at first-schedule time (issue #620, AC8; Codex P2).
+    /// was scheduled with at first-schedule time (issue #620, AC8).
     /// Read-only, cursor-independent: scans recorded history for the
     /// `LocalActivityScheduled` event carrying `activity_id` and clones its
     /// three additive fields in one pass.
     ///
-    /// `resolved` is the disambiguation marker: `true` for a #620+ event whose
-    /// frozen `retry_policy`/`start_to_close_nanos` are authoritative on
-    /// recovery even when `None` ("explicitly resolved to no floor"); `false`
-    /// for a pre-#620 legacy event (all three fields absent → the marker
-    /// deserializes to `false`), which the crash-recovery path in
+    /// `resolved` is the disambiguation marker. It is `true` for a #620+ event,
+    /// whose frozen `retry_policy`/`start_to_close_nanos` are authoritative on
+    /// recovery even when `None` ("explicitly resolved to no floor"). It is
+    /// `false` for a pre-#620 legacy event: all three fields are absent, so the
+    /// marker deserializes to `false`. The crash-recovery path in
     /// [`WorkflowContext::execute_local_activity_raw`](crate::context::WorkflowContext::execute_local_activity_raw)
-    /// treats as "re-derive from the live defaults" for backward compatibility.
-    /// A missing `activity_id` (no matching scheduled event) reports the same
-    /// unresolved default.
+    /// treats that as "re-derive from the live defaults" for backward
+    /// compatibility. A missing `activity_id` (no matching scheduled event)
+    /// reports the same unresolved default.
     #[must_use]
     pub(crate) fn recorded_local_activity_resolution(
         &self,
@@ -6670,10 +6695,10 @@ impl HistoryMatcher {
         let marker_name = format!("version:{change_id}");
 
         // Check BEFORE draining: if already past cursor-based history, this is
-        // a genuinely new code path → record max_version. This is exactly the
-        // case where the context will push a `version:{change_id}` marker
-        // command, so latch the id for a same-cycle `deprecate_patch`
-        // (issue #687 interop — see `patch_ids_recorded_this_cycle`).
+        // a genuinely new code path → record max_version. The context then
+        // pushes a `version:{change_id}` marker command. So latch the id for a
+        // same-cycle `deprecate_patch` (issue #687 interop; see
+        // `patch_ids_recorded_this_cycle`).
         if !self.is_replaying() {
             self.patch_ids_recorded_this_cycle
                 .insert(change_id.to_string());
@@ -6684,10 +6709,10 @@ impl HistoryMatcher {
         // in a mixed batch (e.g. tokio::join!(ctx.version(...), signal_external)).
         self.drain_early_signals();
 
-        // After draining: if cursor is past end (only stashed ExternalSignal
-        // events were the remaining history), this is an unversioned position —
-        // return min_version so existing executions stay on the old branch
-        // instead of recording a new marker and jumping to max_version.
+        // After draining: if the cursor is past end, only stashed ExternalSignal
+        // events were the remaining history. This is an unversioned position.
+        // Return min_version so existing executions stay on the old branch.
+        // Do not record a new marker and jump to max_version.
         if !self.is_replaying() {
             return min_version;
         }
@@ -6712,28 +6737,29 @@ impl HistoryMatcher {
 
     /// Match a `patched(patch_id)` call against recorded history.
     ///
-    /// Mirrors [`Self::match_version`]'s scan discipline exactly, but returns
-    /// the three-state [`PatchMarkerMatch`] instead of a numeric version so
-    /// the caller never has to re-derive live-vs-replay after the fact:
+    /// Mirrors [`Self::match_version`]'s scan discipline exactly. But it
+    /// returns the three-state [`PatchMarkerMatch`] instead of a numeric
+    /// version, so the caller never has to re-derive live-vs-replay after the
+    /// fact:
     ///
     /// 1. If `patch_id` was previously deprecated (see
     ///    [`Self::deprecate_patch`]), the memoized presence is returned
-    ///    immediately — [`PatchMarkerMatch::Recorded`] if a marker was in
-    ///    history, [`PatchMarkerMatch::Absent`] otherwise — WITHOUT touching
-    ///    the cursor. This is what keeps a residual `patched(id)` call after
-    ///    `deprecate_patch(id)` deterministic.
+    ///    immediately, WITHOUT touching the cursor. That is
+    ///    [`PatchMarkerMatch::Recorded`] if history had a marker, and
+    ///    [`PatchMarkerMatch::Absent`] otherwise. This keeps a residual
+    ///    `patched(id)` call after `deprecate_patch(id)` deterministic.
     /// 2. Past the end of cursor-based history →
-    ///    [`PatchMarkerMatch::NewlyPatched`] (live frontier — the caller
+    ///    [`PatchMarkerMatch::NewlyPatched`] (live frontier: the caller
     ///    records a fresh marker).
     /// 3. After draining early signal events, if only stashed signal events
-    ///    remained → [`PatchMarkerMatch::Absent`] (this is a recorded
-    ///    position; the old branch applies, nothing is recorded).
+    ///    remained → [`PatchMarkerMatch::Absent`]. This is a recorded
+    ///    position: the old branch applies, and nothing is recorded.
     /// 4. A `MarkerRecorded` at the cursor named `patch:{id}` **or**
-    ///    `version:{id}` (interop: a run that recorded a version marker under
-    ///    the old `ctx.version()` API is observed as patched — presence alone
-    ///    decides, regardless of the recorded number, because `version()`
-    ///    only ever records a marker when it returned `max` on live
-    ///    execution) → consume it, return [`PatchMarkerMatch::Recorded`].
+    ///    `version:{id}` → consume it, return [`PatchMarkerMatch::Recorded`].
+    ///    The `version:{id}` case is interop. A run that recorded a version
+    ///    marker under the old `ctx.version()` API counts as patched. Presence
+    ///    alone decides, regardless of the recorded number. `version()` only
+    ///    ever records a marker when it returned `max` on live execution.
     /// 5. Anything else at the cursor → [`PatchMarkerMatch::Absent`], cursor
     ///    untouched.
     pub fn match_patch_marker(&mut self, patch_id: &str) -> PatchMarkerMatch {
@@ -6761,9 +6787,9 @@ impl HistoryMatcher {
         // in a mixed batch (e.g. tokio::join!(ctx.patched(...), signal_external)).
         self.drain_early_signals();
 
-        // After draining: if the cursor is past the end (only stashed signal
-        // events were the remaining history), this is an unpatched recorded
-        // position — take the old branch instead of recording a new marker.
+        // After draining: if the cursor is past the end, only stashed signal
+        // events were the remaining history. This is an unpatched recorded
+        // position. Take the old branch instead of recording a new marker.
         if !self.is_replaying() {
             return PatchMarkerMatch::Absent;
         }
@@ -6784,24 +6810,6 @@ impl HistoryMatcher {
         }
     }
 
-    /// Deprecate a patch id (issue #687): make every recorded `patch:{id}` /
-    /// `version:{id}` marker transparent to all subsequent scans, and memoize
-    /// whether any such marker was present.
-    ///
-    /// Positional matching cannot apply here: a phase-1 run recorded the
-    /// marker at the old `patched()` call position, while phase-2 code calls
-    /// `deprecate_patch(id)` at a different (usually earlier) position — so
-    /// the marker must become transparent wherever it sits, or it would trip
-    /// the next `match_*` call as a divergence. The full-history scan marks
-    /// each matching marker's index consumed via the same consumed-index set
-    /// every scan loop already consults through [`Self::is_consumed`].
-    ///
-    /// Returns whether a marker was found (memoized — the call is
-    /// idempotent). The memo also drives [`Self::match_patch_marker`] so a
-    /// residual `patched(id)` call stays deterministic; note that on a NEW
-    /// execution (empty history) the memo is `false`, so a residual
-    /// `patched(id)` treats post-deprecation runs as unpatched — the
-    /// documented footgun whose fix is deleting the residual call.
     /// The number of non-cancellable blocks that the history leaves open
     /// (issue #1984).
     pub(crate) fn open_non_cancellable_blocks(&self) -> usize {
@@ -6813,6 +6821,26 @@ impl HistoryMatcher {
         self.deprecated_patches.contains_key(patch_id)
     }
 
+    /// Deprecate a patch id (issue #687).
+    ///
+    /// Every recorded `patch:{id}` / `version:{id}` marker becomes transparent
+    /// to all later scans. The call also memoizes whether any such marker was
+    /// present.
+    ///
+    /// Positional matching cannot apply here. A phase-1 run recorded the
+    /// marker at the old `patched()` call position. Phase-2 code calls
+    /// `deprecate_patch(id)` at a different, usually earlier, position. So the
+    /// marker must become transparent wherever it sits, or it would trip the
+    /// next `match_*` call as a divergence. The full-history scan marks each
+    /// matching marker's index consumed. It uses the same consumed-index set
+    /// that every scan loop already consults through [`Self::is_consumed`].
+    ///
+    /// Returns whether a marker was found (memoized, so the call is
+    /// idempotent). The memo also drives [`Self::match_patch_marker`], so a
+    /// residual `patched(id)` call stays deterministic. On a NEW execution
+    /// (empty history) the memo is `false`. So a residual `patched(id)` treats
+    /// post-deprecation runs as unpatched. That is the documented footgun, and
+    /// its fix is to delete the residual call.
     pub fn deprecate_patch(&mut self, patch_id: &str) -> bool {
         if let Some(&present) = self.deprecated_patches.get(patch_id) {
             return present;
@@ -6821,10 +6849,10 @@ impl HistoryMatcher {
         let patch_name = patch_marker_name(patch_id);
         let version_name = version_marker_name(patch_id);
         // A marker recorded earlier in this SAME cycle (by `patched()` or
-        // `version()` on the live frontier) is not in history yet — it is a
-        // pending `RecordMarker` command — but it counts as present, or the
-        // live cycle's memo would disagree with every replay cycle's
-        // (the sandwich flip, review finding on issue #687).
+        // `version()` on the live frontier) is not in history yet. It is a
+        // pending `RecordMarker` command. But it counts as present. Otherwise
+        // the live cycle's memo would disagree with every replay cycle's (the
+        // sandwich flip, issue #687).
         let mut present = self.patch_ids_recorded_this_cycle.contains(patch_id);
         for (idx, event) in self.events.iter().enumerate() {
             if let WorkflowEvent::MarkerRecorded { name, .. } = event
@@ -6844,43 +6872,42 @@ impl HistoryMatcher {
     /// Match a saga compensation dedup marker (`saga_compensated:{seq}` or
     /// `saga_compensation_failed:{seq}`) against recorded history.
     ///
-    /// Clones [`Self::match_patch_marker`]'s tolerant scan discipline —
-    /// the mechanism that exists precisely to retrofit markers into an
-    /// existing API without breaking already-recorded histories — extended
-    /// post-review with two saga-specific tolerances (a distinguishable
-    /// drained-signal frontier, and transparency to command-less
-    /// `WorkflowCancelled` lifecycle events):
+    /// Clones [`Self::match_patch_marker`]'s tolerant scan discipline. That
+    /// mechanism exists precisely to retrofit markers into an existing API
+    /// without breaking already-recorded histories. It adds two saga-specific
+    /// tolerances: a distinguishable drained-signal frontier, and transparency
+    /// to command-less `WorkflowCancelled` lifecycle events.
     ///
     /// 1. Past the end of cursor-based history →
-    ///    [`SagaMarkerMatch::LiveFrontier`] (the caller records a fresh
-    ///    marker and emits the counter — the exactly-once point).
+    ///    [`SagaMarkerMatch::LiveFrontier`]. The caller records a fresh
+    ///    marker and emits the counter (the exactly-once point).
     /// 2. After draining early signal events, if only stashed signal events
-    ///    remained → [`SagaMarkerMatch::DrainedSignalFrontier`] (a recorded
-    ///    position; the caller decides whether to record, keyed to the
-    ///    unwind's disposition — see the variant docs).
+    ///    remained → [`SagaMarkerMatch::DrainedSignalFrontier`]. This is a
+    ///    recorded position. The caller decides whether to record, keyed to the
+    ///    unwind's disposition (see the variant docs).
     /// 3. A `MarkerRecorded` at the cursor with exactly `marker_name` →
     ///    consume it, return [`SagaMarkerMatch::Recorded`].
     /// 4. Otherwise, a bounded non-destructive lookahead skips
-    ///    `WorkflowCancelled` lifecycle events (which have no
-    ///    workflow-command counterpart, are never consumed by any other
-    ///    matcher, and would otherwise permanently hide the frontier from
-    ///    the cancel-and-compensate pattern) and any `SignalReceived`
-    ///    recorded behind them (unreachable by `drain_early_signals`):
-    ///    - exactly `marker_name` found → consume it **out-of-order**
-    ///      (mirroring [`Self::deprecate_patch`]'s mechanism; the cursor is
-    ///      untouched so every other match is unaffected), return
-    ///      [`SagaMarkerMatch::Recorded`];
+    ///    `WorkflowCancelled` lifecycle events. Those have no workflow-command
+    ///    counterpart, and no other matcher consumes them. Otherwise they would
+    ///    permanently hide the frontier from the cancel-and-compensate
+    ///    pattern. The lookahead also skips any `SignalReceived` recorded
+    ///    behind them, which `drain_early_signals` cannot reach. Then:
+    ///    - exactly `marker_name` found → consume it **out-of-order** and
+    ///      return [`SagaMarkerMatch::Recorded`]. This mirrors
+    ///      [`Self::deprecate_patch`]'s mechanism. The cursor is untouched, so
+    ///      every other match is unaffected.
     ///    - the frontier reached past only cancellation events →
     ///      [`SagaMarkerMatch::LiveFrontier`] (countable: the
-    ///      cancel-and-compensate unwind IS the live frontier);
+    ///      cancel-and-compensate unwind IS the live frontier).
     ///    - the frontier reached but a trailing signal was skipped →
     ///      [`SagaMarkerMatch::DrainedSignalFrontier`] (same conservative
-    ///      treatment as arm 2);
+    ///      treatment as arm 2).
     ///    - any other event → [`SagaMarkerMatch::Absent`], cursor untouched.
-    ///      This is the backward-compat arm: a pre-#801 history mid-unwind
-    ///      holds the first compensation's `ActivityScheduled` here (and a
-    ///      full-history replay of a terminal run holds its terminal event)
-    ///      and must proceed unharmed — no divergence, no emission, no
+    ///      This is the backward-compat arm. A pre-#801 history mid-unwind
+    ///      holds the first compensation's `ActivityScheduled` here. A
+    ///      full-history replay of a terminal run holds its terminal event.
+    ///      Both must proceed unharmed: no divergence, no emission, no
     ///      marker.
     pub fn match_saga_marker(&mut self, marker_name: &str) -> SagaMarkerMatch {
         self.advance_to_next_unconsumed_event();
@@ -6895,9 +6922,9 @@ impl HistoryMatcher {
         // marker in a mixed batch.
         self.drain_early_signals();
 
-        // After draining: if the cursor is past the end (only stashed signal
-        // events were the remaining history), report the drained-signal
-        // frontier and let the caller resolve it against the unwind's
+        // After draining: if the cursor is past the end, only stashed signal
+        // events were the remaining history. Report the drained-signal
+        // frontier, and let the caller resolve it against the unwind's
         // disposition.
         if !self.is_replaying() {
             return SagaMarkerMatch::DrainedSignalFrontier;
@@ -6928,8 +6955,8 @@ impl HistoryMatcher {
                 // arm/cancel (issue #768) interleaved in a compensation cycle, is
                 // transparent to the saga marker scan. A `reset()` records
                 // `[TimerCancelled, TimerStarted]`, so BOTH are skipped for
-                // symmetry — stopping on the re-arm would wrongly return `Absent`
-                // (Codex P2, issue #768). Left unconsumed so `match_timer_cancel`
+                // symmetry. Stopping on the re-arm would wrongly return `Absent`
+                // (issue #768). Left unconsumed so `match_timer_cancel`
                 // / `match_timer_arm` claim them later.
                 WorkflowEvent::WorkflowCancelled { .. }
                 | WorkflowEvent::TimerCancelled { .. }
@@ -7015,10 +7042,10 @@ impl HistoryMatcher {
     /// current cursor position, keyed by an arbitrary caller-supplied name.
     ///
     /// Generalizes [`Self::match_fan_out_marker`]'s count-verification shape
-    /// for any `u64`-valued marker. Used by `WorkflowContext::race` (issue
-    /// #600) to record and verify both the race's branch count (the "open"
-    /// marker) and its winning branch index (the "winner" marker) — mirroring
-    /// the fan-out marker idiom without introducing a new event variant.
+    /// for any `u64`-valued marker. `WorkflowContext::race` (issue #600) uses
+    /// it to record and verify the race's branch count (the "open" marker) and
+    /// its winning branch index (the "winner" marker). This mirrors the fan-out
+    /// marker idiom without a new event variant.
     ///
     /// Returns:
     /// - [`HistoryMatch::Matched`] — marker found and recorded value equals `expected`.
@@ -7065,14 +7092,13 @@ impl HistoryMatcher {
     /// A worker session's identity ([`crate::types::SessionId`]) is a
     /// randomly generated UUID, recorded once via `MarkerRecorded { name:
     /// "session:{seq}", details: <uuid string> }` on the session's first live
-    /// dispatch. Unlike [`Self::match_fan_out_marker`] (which *verifies* a
-    /// caller-supplied value against the recording) there is no independently
-    /// derivable "expected" value here — the UUID exists only because it was
-    /// recorded — so this method *discovers* the previously recorded id
-    /// rather than comparing it to one, mirroring [`Self::peek_u64_marker`]'s
-    /// discovery role but at a fixed cursor position (sessions are opened
-    /// sequentially, not raced concurrently, so no interleave tolerance is
-    /// needed).
+    /// dispatch. [`Self::match_fan_out_marker`] *verifies* a caller-supplied
+    /// value against the recording. Here no independently derivable "expected"
+    /// value exists, because the UUID exists only because it was recorded. So
+    /// this method *discovers* the previously recorded id instead of comparing
+    /// it to one. This mirrors [`Self::peek_u64_marker`]'s discovery role, but
+    /// at a fixed cursor position. Sessions are opened sequentially, not raced
+    /// concurrently, so no interleave tolerance is needed.
     ///
     /// Returns:
     /// - [`HistoryMatch::Matched`] — marker found; `output` carries the
@@ -7115,41 +7141,19 @@ impl HistoryMatcher {
         }
     }
 
-    /// Non-destructively check whether a `u64`-valued `MarkerRecorded` event
-    /// named `marker_name` exists ahead in history, returning its value and
-    /// consuming it if so.
+    /// Whether any unclaimed `SignalReceived { signal_name }` remains (issue
+    /// #950).
     ///
-    /// Unlike [`Self::match_u64_marker`] this takes no expected value, so it
-    /// can be used to *discover* a previously recorded decision (e.g.
-    /// `WorkflowContext::race`'s winner marker) rather than verify one already
-    /// known to the caller.
+    /// The signal may be already stashed in `pending_signals`, or still
+    /// unconsumed at or after the current cursor.
     ///
-    /// **Interleave-tolerant** (mirrors [`Self::scan_activity_terminal`]'s
-    /// forward scan): when two `ctx.race()` calls (or a race alongside a
-    /// fan-out / side-effect / child-workflow race) are driven concurrently
-    /// via `futures::join!`, a sibling primitive's own marker or branch
-    /// events can legitimately sit between the cursor and this marker's true
-    /// recorded position — e.g. race #2's `race:2` open marker and branch
-    /// schedules landing between race #1's own branch schedules and its
-    /// `race_winner:1` marker. Those tolerated event kinds are scanned past
-    /// (tracked, not consumed) rather than treated as an immediate miss; on
-    /// a match, the cursor rewinds to the first such tolerated event (like
-    /// [`Self::settle_terminal`]) so a sibling's own later scan still finds
-    /// it. On a genuine miss (scan exhausted, or an event outside the
-    /// tolerated set is encountered) the cursor is left unchanged if nothing
-    /// was skipped, or parked at the first tolerated event otherwise — in
-    /// both cases safe to call speculatively.
-    /// Whether any unclaimed `SignalReceived { signal_name }` remains — either
-    /// already stashed in `pending_signals`, or still unconsumed at/after the
-    /// current cursor (issue #950).
-    ///
-    /// A **pure read**: consumes nothing and never moves the cursor. Used by the
-    /// strict/canary replay frontier test for a signal wait, where "cursor at end
-    /// of history" is the wrong question: a mixed suspension batch legitimately
-    /// leaves a SIBLING branch's events unconsumed ahead of the cursor while the
-    /// signal wait itself has nothing to match. What actually distinguishes a
-    /// healthy in-flight park from a real divergence is whether a matching signal
-    /// is still available anywhere.
+    /// A **pure read**: consumes nothing and never moves the cursor. The
+    /// strict/canary replay frontier test for a signal wait uses it. There,
+    /// "cursor at end of history" is the wrong question. A mixed suspension
+    /// batch legitimately leaves a SIBLING branch's events unconsumed ahead of
+    /// the cursor, while the signal wait itself has nothing to match. A healthy
+    /// in-flight park differs from a real divergence by one fact: whether a
+    /// matching signal is still available anywhere.
     #[must_use]
     pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
         if self.pending_signals.contains_name(signal_name) {
@@ -7516,10 +7520,10 @@ impl HistoryMatcher {
     /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
     /// after the current cursor (issue #950).
     ///
-    /// A **pure read**: unlike [`Self::peek_u64_marker`] it consumes nothing and
-    /// never moves the cursor, so it is safe to call mid-decision (e.g. between
-    /// a race's branch checks) where a consuming peek would steal the marker
-    /// from the settling step that owns it.
+    /// A **pure read**: unlike [`Self::peek_u64_marker`], it consumes nothing
+    /// and never moves the cursor. So it is safe to call mid-decision, for
+    /// example between a race's branch checks. There a consuming peek would
+    /// steal the marker from the settling step that owns it.
     #[must_use]
     pub fn has_unconsumed_marker(&self, marker_name: &str) -> bool {
         self.events
@@ -7532,6 +7536,31 @@ impl HistoryMatcher {
             })
     }
 
+    /// Non-destructively check whether a `u64`-valued `MarkerRecorded` event
+    /// named `marker_name` exists ahead in history.
+    ///
+    /// If so, return its value and consume it.
+    ///
+    /// Unlike [`Self::match_u64_marker`], this takes no expected value. So it
+    /// can *discover* a previously recorded decision (for example
+    /// `WorkflowContext::race`'s winner marker), not only verify one the
+    /// caller already knows.
+    ///
+    /// **Interleave-tolerant** (mirrors [`Self::scan_activity_terminal`]'s
+    /// forward scan). Two `ctx.race()` calls can be driven concurrently via
+    /// `futures::join!`, or a race alongside a fan-out / side-effect /
+    /// child-workflow race. Then a sibling primitive's own marker or branch
+    /// events can legitimately sit between the cursor and this marker's true
+    /// recorded position. For example, race #2's `race:2` open marker and
+    /// branch schedules can land between race #1's own branch schedules and
+    /// its `race_winner:1` marker. The scan passes over those tolerated event
+    /// kinds (tracked, not consumed) instead of treating them as an immediate
+    /// miss. On a match, the cursor rewinds to the first such tolerated event
+    /// (like [`Self::settle_terminal`]), so a sibling's own later scan still
+    /// finds it. A genuine miss is an exhausted scan, or an event outside the
+    /// tolerated set. On a miss the cursor stays unchanged if nothing was
+    /// skipped. Otherwise it parks at the first tolerated event. Both cases
+    /// are safe to call speculatively.
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;
@@ -7581,8 +7610,8 @@ impl HistoryMatcher {
                 }
                 // Anything else (signals, external-signal/cancel triplets,
                 // update events, terminal lifecycle events, ...) is outside
-                // the tolerated set for this scan -- stop rather than
-                // silently skipping past something that might matter.
+                // the tolerated set for this scan. Stop rather than silently
+                // skip past something that might matter.
                 _ => break,
             }
         }
@@ -7602,14 +7631,14 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::Matched`] — the event at cursor is `MarkerRecorded`
     ///   with the exact `name`, `expected_task` (in `details.task`), and
     ///   matching `expected_upstreams` (in `details.upstreams`, when present).
-    /// - [`HistoryMatch::Diverged`] — a different event, a marker with a
-    ///   different name, a different task name, or (for new-format markers) a
-    ///   different upstream set is at the cursor — a non-determinism violation.
+    /// - [`HistoryMatch::Diverged`] — a non-determinism violation. The cursor
+    ///   holds a different event, or a marker with a different name or task
+    ///   name. For new-format markers, a different upstream set also diverges.
     /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
     ///
-    /// **Backward compatibility:** old markers without an `upstreams` field (written
-    /// before this field was introduced) pass the upstream check unconditionally,
-    /// so in-flight executions are not broken on upgrade.
+    /// **Backward compatibility:** old markers without an `upstreams` field
+    /// (written before this field was introduced) pass the upstream check
+    /// unconditionally. So in-flight executions do not break on upgrade.
     pub fn match_named_marker(
         &mut self,
         marker_name: &str,
@@ -8333,7 +8362,7 @@ mod tests {
 
     #[test]
     fn matcher_signal_scan_skips_interleaved_timer_cancel() {
-        // FINDING 3: a `[CancelTimer, WaitForSignal]` batch (a cancel_timer()/
+        // A `[CancelTimer, WaitForSignal]` batch (a cancel_timer()/
         // reset() in the same cycle as a wait_for_signal, or a push signal
         // handler cancelling a timer) records `[TimerCancelled, SignalReceived]`.
         // The signal scan must step over the interleaved TimerCancelled and
@@ -8363,11 +8392,11 @@ mod tests {
 
     #[test]
     fn matcher_activity_scan_skips_interleaved_timer_started() {
-        // FINDING 3: symmetry with the interleaved-TimerCancelled case — a
-        // reset interleaved with an activity records `[TimerCancelled,
-        // TimerStarted]` between Scheduled and Completed; the activity scan must
-        // step over BOTH and still match the terminal (before the fix it rewound
-        // on TimerCancelled but broke on TimerStarted → ActivityInProgress).
+        // Symmetry with the interleaved-TimerCancelled case. A reset
+        // interleaved with an activity records `[TimerCancelled,
+        // TimerStarted]` between Scheduled and Completed. The activity scan must
+        // step over BOTH and still match the terminal. Before the fix it rewound
+        // on TimerCancelled but broke on TimerStarted → ActivityInProgress.
         let aid = ActivityExecId::new();
         let events = vec![
             WorkflowEvent::ActivityScheduled {
@@ -8471,7 +8500,7 @@ mod tests {
     }
 
     /// AC6: redirecting a continuation to a *different* type is a code change
-    /// the recorded history cannot satisfy — it must surface as divergence,
+    /// that the recorded history cannot satisfy. It must surface as divergence,
     /// not silently fork the chain into another phase.
     #[test]
     fn matcher_continue_as_new_type_mismatch_diverges() {
@@ -8648,9 +8677,9 @@ mod tests {
 
     #[test]
     fn matcher_deprecate_patch_marks_all_matching_markers_consumed() {
-        // Two markers for the same id (patched() called twice in phase 1),
-        // one of them *later* in history than the cursor when deprecation
-        // runs — both must become transparent.
+        // Two markers for the same id (patched() called twice in phase 1).
+        // One of them is *later* in history than the cursor when deprecation
+        // runs. Both must become transparent.
         let events = vec![
             WorkflowEvent::MarkerRecorded {
                 name: "patch:x".into(),
@@ -8703,15 +8732,14 @@ mod tests {
 
     #[test]
     fn matcher_patch_marker_trailing_signal_history_is_absent() {
-        // Pinned deliberately (review finding F3, exact parity with
-        // match_version): a fresh execution whose first-task history ends in
-        // un-awaited signals at the gate point — canonically EVERY
-        // signal-with-start run, since the signal is staged before first
-        // dispatch — drains the signal, lands past cursor-based history, and
-        // must conservatively take the OLD branch (Absent, no marker
-        // recorded). The history is ambiguous with a phase-0 run parked at a
-        // first-line wait_for_signal, so this is not treated as a live
-        // frontier.
+        // Pinned deliberately (exact parity with match_version). Take a fresh
+        // execution whose first-task history ends in un-awaited signals at the
+        // gate point. Canonically that is EVERY signal-with-start run, since the
+        // signal is staged before first dispatch. It drains the signal and lands
+        // past cursor-based history. It must conservatively take the OLD branch
+        // (Absent, no marker recorded). The history is ambiguous with a phase-0
+        // run parked at a first-line wait_for_signal, so this is not treated as
+        // a live frontier.
         let events = vec![WorkflowEvent::SignalReceived {
             signal_name: "kick".into(),
             payload: serde_json::json!({"n": 1}),
@@ -8728,7 +8756,7 @@ mod tests {
 
     #[test]
     fn matcher_patch_marker_later_marker_does_not_match_at_cursor() {
-        // Positional-semantics pin (review finding F5): the marker lookup is
+        // Positional-semantics pin: the marker lookup is
         // cursor-based, not a whole-history scan. A `patch:x` marker recorded
         // LATER in history must not satisfy a patched() call at an earlier
         // position.
@@ -8760,12 +8788,12 @@ mod tests {
 
     #[test]
     fn matcher_deprecate_patch_sees_marker_recorded_this_cycle() {
-        // The sandwich flip (review finding F1): on the LIVE cycle a
-        // `patched(id)` call records its marker only as a pending
-        // WorkflowCommand — a subsequent `deprecate_patch(id)`'s full-history
-        // scan cannot see it. Without the this-cycle latch the memo latches
-        // `false`, a residual `patched(id)` returns false on the live pass
-        // and true on every replay pass → permanent nd-block.
+        // The sandwich flip: on the LIVE cycle a `patched(id)` call records
+        // its marker only as a pending WorkflowCommand. A later
+        // `deprecate_patch(id)`'s full-history scan cannot see it. Without the
+        // this-cycle latch the memo latches `false`. Then a residual
+        // `patched(id)` returns false on the live pass and true on every
+        // replay pass → permanent nd-block.
         let mut matcher = HistoryMatcher::new(vec![]);
         assert_eq!(
             matcher.match_patch_marker("x"),
@@ -8784,10 +8812,10 @@ mod tests {
 
     #[test]
     fn matcher_deprecate_patch_sees_version_marker_recorded_this_cycle() {
-        // Version-interop variant of the sandwich flip: a live
-        // `ctx.version(id, ..)` call returning max is exactly the case where
-        // the context pushes a `version:{id}` marker command — a same-cycle
-        // `deprecate_patch(id)` must observe it as present.
+        // Version-interop variant of the sandwich flip. A live
+        // `ctx.version(id, ..)` call that returns max makes the context push a
+        // `version:{id}` marker command. A same-cycle `deprecate_patch(id)`
+        // must observe it as present.
         let mut matcher = HistoryMatcher::new(vec![]);
         assert_eq!(matcher.match_version("x", 1, 2), 2);
         assert!(
@@ -8862,10 +8890,9 @@ mod tests {
     #[test]
     fn matcher_saga_marker_drained_signal_frontier_after_trailing_signals() {
         // Post-drain arm: a history whose tail is un-awaited signals at the
-        // unwind point is reported as the distinguishable drained-signal
-        // frontier — the CALLER resolves it against the unwind's disposition
-        // (conservative for the start observe, coupled for the failed
-        // observe; post-review P2-1/P2-2).
+        // unwind point reports the distinguishable drained-signal frontier.
+        // The CALLER resolves it against the unwind's disposition. The start
+        // observe is conservative, and the failed observe is coupled.
         let events = vec![WorkflowEvent::SignalReceived {
             signal_name: "kick".into(),
             payload: serde_json::json!({"n": 1}),
@@ -8882,9 +8909,10 @@ mod tests {
 
     #[test]
     fn matcher_saga_marker_recorded_past_drained_trailing_signal() {
-        // The shape the P2-1 fix itself persists: the failure marker recorded
-        // past a drained trailing signal must be found (and consumed) on the
-        // next cycle so the counter never re-emits.
+        // The shape that `observe_saga_unwind_failed` persists for a counted
+        // unwind. The next cycle must find (and consume) the failure marker
+        // recorded past a drained trailing signal, so the counter never
+        // re-emits.
         let events = vec![
             WorkflowEvent::SignalReceived {
                 signal_name: "dup_cancel".into(),
@@ -8906,8 +8934,8 @@ mod tests {
     #[test]
     fn matcher_saga_marker_live_frontier_past_trailing_cancellation_event() {
         // Cancel-and-compensate: WorkflowCancelled has no workflow-command
-        // counterpart and is never consumed by any matcher, so it must not
-        // hide the frontier from a metrics-only marker — the unwind of a
+        // counterpart, and no matcher ever consumes it. So it must not hide
+        // the frontier from a metrics-only marker. The unwind of a
         // freshly-cancelled run IS the live frontier.
         let events = vec![WorkflowEvent::WorkflowCancelled {
             reason: "operator shutdown".into(),
@@ -8958,9 +8986,9 @@ mod tests {
 
     #[test]
     fn matcher_saga_marker_absent_at_terminal_event_after_cancellation() {
-        // A fully-recorded terminal run (e.g. a WorkflowReplayer fixture of a
-        // pre-#801 cancelled run) must stay uncounted: the lookahead stops at
-        // the terminal event — never a retroactive count.
+        // A fully-recorded terminal run must stay uncounted, for example a
+        // WorkflowReplayer fixture of a pre-#801 cancelled run. The lookahead
+        // stops at the terminal event, so a retroactive count never happens.
         let events = vec![
             WorkflowEvent::WorkflowCancelled {
                 reason: "operator shutdown".into(),
@@ -9860,7 +9888,7 @@ mod tests {
     fn claim_pending_signal_does_not_steal_from_pull_based_wait() {
         // A later `wait_for_signal`/`match_signal` call for the same name must
         // never see an event that a prior `claim_pending_signal` call already
-        // claimed (issue #546 AC: no double-delivery between push and pull).
+        // claimed. Issue #546 AC: no double-delivery between push and pull.
         let events = vec![WorkflowEvent::SignalReceived {
             signal_name: "cancel".into(),
             payload: serde_json::json!({"reason": "manual"}),
@@ -9924,9 +9952,9 @@ mod tests {
     fn claim_pending_signal_does_not_steal_from_an_open_signal_timeout_race() {
         // Regression: a push handler registered for the same name as an
         // in-flight signal-or-deadline race (issue #476) must not claim the
-        // race's own signal -- doing so used to silently flip the race
-        // outcome from SignalWon to TimerWon even though the signal
-        // genuinely arrived before the deadline.
+        // race's own signal. Doing so used to silently flip the race outcome
+        // from SignalWon to TimerWon, even though the signal genuinely arrived
+        // before the deadline.
         let timer_id = "__signal_timeout:1:approval";
         let events = vec![
             WorkflowEvent::TimerStarted {
@@ -9945,8 +9973,8 @@ mod tests {
         // A push handler registered first (the idiomatic top-of-function
         // ordering) must not be able to claim the race's own signal. The
         // still-open race's own TimerStarted also hard-blocks the cursor
-        // from reaching it at all, so this asserts the belt-and-suspenders
-        // reservation check independently of that blocking behavior.
+        // from reaching it at all. So this test checks the belt-and-suspenders
+        // reservation independently of that blocking behavior.
         let mut matcher = HistoryMatcher::new(events);
         let claimed = matcher.claim_pending_signal("approval");
         assert!(
@@ -9968,10 +9996,10 @@ mod tests {
 
     #[test]
     fn claim_pending_signal_reserves_only_the_racing_occurrence_not_other_signals() {
-        // A second, unrelated "approval" delivery (recorded well after the
-        // race already resolved) is a completely separate signal and must
-        // still be freely available to a push handler once the workflow's
-        // own code has driven the cursor past the resolved race.
+        // A second, unrelated "approval" delivery, recorded well after the
+        // race already resolved, is a separate signal. It must still be freely
+        // available to a push handler once the workflow's own code has driven
+        // the cursor past the resolved race.
         let timer_id = "__signal_timeout:1:approval";
         let events = vec![
             WorkflowEvent::TimerStarted {
@@ -10015,10 +10043,10 @@ mod tests {
 
     #[test]
     fn claim_pending_signal_only_reserves_the_first_racing_signal_not_a_later_one() {
-        // Regression (PR #890 review): the race resolves at the FIRST matching
+        // Regression (PR #890): the race resolves at the FIRST matching
         // signal (match_signal_or_timer never looks past it), so only that
         // occurrence is reserved. A second same-name delivery recorded before
-        // the timer fires is unrelated to the race and becomes claimable once
+        // the timer fires is unrelated to the race. It becomes claimable once
         // the race has resolved and the cursor has moved past it.
         let timer_id = "__signal_timeout:1:approval";
         let events = vec![
@@ -10059,14 +10087,13 @@ mod tests {
 
     #[test]
     fn claim_pending_signal_reserves_one_occurrence_per_concurrent_race() {
-        // Regression (PR #890 review follow-up): two CONCURRENT
-        // signal-or-deadline races for the same name each need their OWN
-        // signal occurrence, in start order (match_signal_or_timer's scan for
-        // the race started first runs first during replay and so consumes
-        // the first available occurrence, leaving the second for the race
-        // started second). Closing every open race for the name on the
-        // first resolving signal (rather than just the oldest) let a push
-        // handler steal the second race's own signal.
+        // Regression (PR #890): two CONCURRENT signal-or-deadline races for
+        // the same name each need their OWN signal occurrence, in start order.
+        // During replay, match_signal_or_timer's scan for the first-started race
+        // runs first. So it consumes the first available occurrence and leaves
+        // the second for the race started second. The old code closed every
+        // open race for the name on the first resolving signal, not just the
+        // oldest. That let a push handler steal the second race's own signal.
         let timer_a = "__signal_timeout:1:approval";
         let timer_b = "__signal_timeout:2:approval";
         let events = vec![
@@ -10100,9 +10127,9 @@ mod tests {
 
     #[test]
     fn try_claim_pending_signal_returns_oldest_only_leaving_rest() {
-        // The single-claim sibling of `claim_pending_signal`: it must return
+        // The single-claim sibling of `claim_pending_signal`. It must return
         // exactly the OLDEST buffered matching signal (FIFO recorded-history
-        // order) and leave every later occurrence claimable by a following
+        // order). Every later occurrence must stay claimable by a following
         // call. This is the matcher-level engine for `try_receive_signal`.
         let events = vec![
             WorkflowEvent::SignalReceived {
@@ -10251,11 +10278,11 @@ mod tests {
     #[test]
     fn try_claim_pending_signal_drains_a_signal_that_lost_a_resolved_timer_race() {
         // The AC7 "already lost a resolved TimerWon race is fair game" claim,
-        // made concrete for the non-blocking drain. A signal recorded AFTER its
-        // race timer FIRED (TimerStarted, TimerFired, then SignalReceived) never
-        // reserved the occurrence — the timer resolved the race before the
-        // signal arrived — so it is drainable once the workflow's own code has
-        // driven the cursor past the resolved race.
+        // made concrete for the non-blocking drain. Here a signal is recorded
+        // AFTER its race timer FIRED (TimerStarted, TimerFired, then
+        // SignalReceived). It never reserved the occurrence, because the timer
+        // resolved the race before the signal arrived. So it is drainable once
+        // the workflow's own code has driven the cursor past the resolved race.
         let timer_id = "__signal_timeout:0:approval";
         let events = vec![
             WorkflowEvent::TimerStarted {
@@ -10446,12 +10473,12 @@ mod tests {
 
     #[test]
     fn matcher_timer_reaches_fire_past_interleaved_reset() {
-        // Codex P2 (issue #768): a sibling branch `reset()` of another timer
-        // records `[TimerCancelled(idle), TimerStarted(idle)]` between this
+        // Issue #768: a sibling branch `reset()` of another timer records
+        // `[TimerCancelled(idle), TimerStarted(idle)]` between this
         // `ctx.timer("sleep")`'s own TimerStarted and its TimerFired. The fire
         // scan must step over BOTH the cancel AND the paired re-arm and still
-        // reach the fire — skipping only the cancel would STOP on the re-arm and
-        // return NoMatch, failing strict replay and re-parking a fired timer.
+        // reach the fire. Skipping only the cancel would STOP on the re-arm and
+        // return NoMatch. That fails strict replay and re-parks a fired timer.
         let events = vec![ts("sleep", 30), tc("idle"), ts("idle", 300), tf("sleep")];
         let mut m = HistoryMatcher::new(events);
         assert_eq!(
@@ -10475,10 +10502,10 @@ mod tests {
 
     #[test]
     fn matcher_signal_scan_skips_interleaved_reset() {
-        // Codex P2 (issue #768): a `wait_for_signal` polled before a same-cycle
+        // Issue #768: a `wait_for_signal` polled before a same-cycle
         // `reset()` branch sees `[TimerCancelled(idle), TimerStarted(idle),
         // SignalReceived]`. The signal scan must step over BOTH timer events and
-        // still match the signal — skipping only the cancel would STOP on the
+        // still match the signal. Skipping only the cancel would STOP on the
         // re-arm and wrongly report a missing signal.
         let events = vec![
             tc("idle"),
@@ -10553,12 +10580,12 @@ mod tests {
 
     #[test]
     fn matcher_signal_scan_parks_on_lone_open_deadline_timer() {
-        // Determinism-review finding 1.2 (issue #1071): a LONE reserved
-        // signal-or-deadline race timer (`__signal_timeout:{seq}:{name}`, issue
-        // #476) with NO matching `TimerFired` and NO signal represents a
-        // legitimate concurrent OPEN `receive_signal_timeout` race whose signal
-        // has not arrived yet. A plain `match_signal` over that history must
-        // return `NoMatch` (park until the signal arrives), NOT `Diverged`.
+        // Issue #1071: a LONE reserved signal-or-deadline race timer
+        // (`__signal_timeout:{seq}:{name}`, issue #476) has NO matching
+        // `TimerFired` and NO signal. It represents a legitimate concurrent OPEN
+        // `receive_signal_timeout` race whose signal has not arrived yet. A
+        // plain `match_signal` over that history must return `NoMatch` (park
+        // until the signal arrives), NOT `Diverged`.
         // The reserved-timer arm crosses it WITHOUT setting
         // `first_interleaved_command`. So the issue #768 stray-`TimerStarted`
         // park-forever guard does not falsely nd-block the open race.
@@ -10576,9 +10603,9 @@ mod tests {
         // Legit case: a sequential
         // `reset_timer(); receive_signal().await` records
         // `[TimerCancelled, TimerStarted, SignalReceived]`. The reset's own
-        // matchers run FIRST and consume the two timer events, so by the time
-        // the signal scan runs they are already `is_consumed` (skipped at the
-        // top of the loop). The signal must still be found → Matched.
+        // matchers run FIRST and consume the two timer events. So when the
+        // signal scan runs, they are already `is_consumed` (skipped at the top
+        // of the loop). The signal must still be found → Matched.
         let events = vec![
             tc("idle"),
             ts("idle", 300),
@@ -10611,8 +10638,8 @@ mod tests {
         // Legit suspend case: a sequential `reset_timer(); receive_signal()`
         // where the signal has NOT yet arrived records only
         // `[TimerCancelled, TimerStarted]`. The reset's matchers consume both
-        // timer events first, so the signal scan crosses NOTHING unconsumed and
-        // must return `NoMatch` (a genuine suspend) — NOT a false `Diverged`.
+        // timer events first. So the signal scan crosses NOTHING unconsumed. It
+        // must return `NoMatch` (a genuine suspend), NOT a false `Diverged`.
         let events = vec![tc("idle"), ts("idle", 300)];
         let mut m = HistoryMatcher::new(events);
         assert!(matches!(
@@ -10670,7 +10697,7 @@ mod tests {
     #[test]
     fn matcher_pause_resume_are_not_unconsumed_history() {
         // A trailing pause/resume pair (e.g. paused-and-resumed with no pending
-        // work) must not be reported as unconsumed history, otherwise the
+        // work) must not be reported as unconsumed history. Otherwise the
         // executor would flag spurious non-determinism / never-settle.
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -10819,10 +10846,10 @@ mod tests {
     // ── Terminal-failure tail transparency tests (issue #952) ─────────────
 
     /// Superseded by issue #952: a bare trailing `WorkflowFailed` used to stay
-    /// opaque, which made every in-progress `match_*` on a failed run diverge
+    /// opaque. That made every in-progress `match_*` on a failed run diverge
     /// (see the two known-limitation tests in `tests/integration/replayer_tests.rs`).
-    /// It is now transparent — a failing cycle's history is truncated by
-    /// construction, so there is nothing past the failure point to verify.
+    /// It is now transparent. A failing cycle's history is truncated by
+    /// construction, so nothing past the failure point needs verifying.
     #[test]
     fn bare_trailing_failed_is_transparent() {
         let events = vec![
@@ -10846,8 +10873,9 @@ mod tests {
     #[test]
     fn in_progress_match_past_a_trailing_failed_is_no_match_not_diverged() {
         // The whole point of the tail: a workflow that issues a match attempt
-        // and only then fails (a payload-cap / missing-handler / missing-store
-        // check) must observe "the run is failing" (NoMatch), not a divergence.
+        // and only then fails must observe "the run is failing" (NoMatch). It
+        // must not observe a divergence. The failure is a payload-cap /
+        // missing-handler / missing-store check.
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -10906,9 +10934,9 @@ mod tests {
     #[test]
     fn a_failed_event_followed_by_real_history_is_not_a_tail() {
         // Guard against over-reach: only the LAST terminal block is transparent.
-        // A WorkflowFailed with genuine command history after it (the #510
-        // redrive shape, here without the redrive marker) must keep today's
-        // behaviour — the redrive-anchored rule, not the tail rule, decides.
+        // A WorkflowFailed with genuine command history after it must keep
+        // today's behaviour. That is the #510 redrive shape, here without the
+        // redrive marker. The redrive-anchored rule decides, not the tail rule.
         let activity_id = ActivityExecId::new();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -10936,9 +10964,9 @@ mod tests {
 
     #[test]
     fn completed_and_cancelled_tails_are_not_terminal_failure_tails() {
-        // The relaxation is failure-only: a COMPLETED history is verified in
-        // full, so its terminal event must stay opaque (an extra command at that
-        // cursor is a genuine early-completion divergence).
+        // The relaxation is failure-only. A COMPLETED history is verified in
+        // full, so its terminal event must stay opaque. An extra command at
+        // that cursor is a genuine early-completion divergence.
         for terminal in [
             WorkflowEvent::WorkflowCompleted {
                 output: Value::Null,
@@ -10968,10 +10996,10 @@ mod tests {
 
     #[test]
     fn redrive_tail_is_not_a_terminal_failure_tail() {
-        // A redriven run is REOPENED, not failing: the #510 rule already makes
-        // its superseded terminal transparent, and the failing-frontier
-        // relaxations (which suppress strict-replay divergence reporting) must
-        // NOT apply to it.
+        // A redriven run is REOPENED, not failing. The #510 rule already makes
+        // its superseded terminal transparent. The failing-frontier relaxations
+        // (which suppress strict-replay divergence reporting) must NOT apply
+        // to it.
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -11116,8 +11144,8 @@ mod tests {
         );
     }
 
-    /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch
-    /// records its failing cycle wrote must become transparent — otherwise the
+    /// Issue #952 x #510: a redrive REOPENS the run. So the abandoned-dispatch
+    /// records its failing cycle wrote must become transparent. Otherwise the
     /// reopened cycle reads back "this dispatch failed" and can never re-issue
     /// the work the operator redrove it to complete.
     #[test]
@@ -12289,8 +12317,8 @@ mod tests {
 
     #[test]
     fn matcher_local_activity_with_recorded_failures_returns_in_progress() {
-        // The replay engine does not know max_attempts, so it always returns
-        // LocalActivityInProgress when there is no completion event — even if
+        // The replay engine does not know max_attempts. So it always returns
+        // LocalActivityInProgress when there is no completion event, even if
         // all retries may be exhausted. The worker checks max_attempts and
         // either returns last_error immediately or runs the next attempt.
         let id = ActivityExecId::new();
@@ -13096,9 +13124,9 @@ mod tests {
 
     #[test]
     fn signal_or_timer_in_progress_rewinds_to_interleaved_command() {
-        // The race is unresolved but a concurrent activity already has events
-        // in history: InProgress must leave the cursor on the interleaved
-        // command so the sibling matcher still finds it.
+        // The race is unresolved, but a concurrent activity already has events
+        // in history. InProgress must leave the cursor on the interleaved
+        // command, so the sibling matcher still finds it.
         let timer_id = TimerId::new("__signal_timeout:1:approval");
         let activity_id = ActivityExecId::new();
         let events = vec![
@@ -13172,9 +13200,9 @@ mod tests {
     #[test]
     fn signal_or_timer_timer_win_late_signal_is_not_flagged_unconsumed() {
         // Timeout branch with a late approval that the workflow intentionally
-        // ignores (the documented auto-reject case): the leftover signal must
-        // not be reported as early-completion non-determinism by the strict
-        // replay check.
+        // ignores (the documented auto-reject case). The strict replay check
+        // must not report the leftover signal as early-completion
+        // non-determinism.
         let timer_id = TimerId::new("__signal_timeout:1:approval");
         let events = vec![
             WorkflowEvent::TimerStarted {
@@ -13418,7 +13446,7 @@ mod tests {
     #[test]
     fn late_race_exemption_is_voided_when_loser_is_consumed() {
         // The exemption tracks the exact event that lost the race. If a later
-        // wait consumes that signal, the exemption is spent with it: a second
+        // wait consumes that signal, the exemption is spent with it. A second
         // same-name unconsumed signal (e.g. from a removed/skipped wait) must
         // still be reported as non-determinism.
         let timer_id = TimerId::new("__signal_timeout:1:approval");
@@ -13528,7 +13556,7 @@ mod tests {
     #[test]
     fn signal_or_timer_stashed_signal_before_fire_still_wins() {
         // The mirror case: the stashed approval was recorded BEFORE this
-        // race's TimerFired, so the signal branch wins even though a sibling
+        // race's TimerFired. So the signal branch wins, even though a sibling
         // scan moved the event into the pending stash.
         let r1 = TimerId::new("__signal_timeout:1:other");
         let r2 = TimerId::new("__signal_timeout:2:approval");
@@ -14105,10 +14133,10 @@ mod tests {
     #[test]
     fn child_or_timer_child_win_across_interleaved_signal_is_transparent() {
         // A signal recorded between the child/timer start pair and the child's
-        // terminal must be STASHED (transparent to the race scan) — the #476
-        // "ignored late signal" analog — so the race still resolves to
-        // ChildCompleted and the signal remains observable by a later
-        // signal-wait. It must NOT flip the winner or trip a divergence.
+        // terminal must be STASHED (transparent to the race scan). This is the
+        // #476 "ignored late signal" analog. The race still resolves to
+        // ChildCompleted, and a later signal-wait can still observe the signal.
+        // It must NOT flip the winner or trip a divergence.
         let timer_id = child_timer_id();
         let child_id = ExecutionId::new();
         let events = vec![
@@ -14399,9 +14427,10 @@ mod tests {
     }
 
     /// Migration-path fix (issue #772): a user-side `system_now()` Now
-    /// (`{ kind: Now, name: None }`) at the cursor is NOT the probe's read — the
-    /// tolerant matcher must leave it untouched (`NotRecorded`) so the user's own
-    /// strict `system_now()` read consumes it, rather than the probe stealing it.
+    /// (`{ kind: Now, name: None }`) at the cursor is NOT the probe's read. The
+    /// tolerant matcher must leave it untouched (`NotRecorded`). Then the
+    /// user's own strict `system_now()` read consumes it, and the probe does
+    /// not steal it.
     #[test]
     fn match_side_effect_now_tolerant_does_not_consume_a_user_now() {
         let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::SideEffectRecorded {
@@ -14675,18 +14704,18 @@ mod tests {
     }
 
     // ── Issue #1338: characterization tests for the 10 sites consolidated onto
-    // `stash_transparent_external_event`. Before this suite, `ExternalCancel`
-    // triplet transparency (issue #492) had zero direct test coverage at any
-    // of the 10 sites, and `ExternalAwait` triplet transparency (issue #757)
-    // was covered only at `scan_activity_terminal` (the test above). These
-    // pin per-site behavior so a future event-family addition that misses a
-    // site is caught here instead of only in production (the exact failure
-    // class issue #1338 documents from `33595ff5`). ──────────────────────
+    // `stash_transparent_external_event`. Before this suite, no test covered
+    // `ExternalCancel` triplet transparency (issue #492) directly at any of the
+    // 10 sites. `ExternalAwait` triplet transparency (issue #757) was covered
+    // only at `scan_activity_terminal` (the test above). These tests pin
+    // per-site behavior. So a future event-family addition that misses a site
+    // is caught here, not only in production. Issue #1338 documents that exact
+    // failure class from `33595ff5`. ───────────────
 
     /// Builds a fresh `ExternalCancelRequested` + `ExternalCancelDelivered`
-    /// pair for the characterization tests below, returning the id/target a
-    /// test needs for its own follow-up `match_external_cancel` assertion
-    /// alongside the two events to splice into that test's own history.
+    /// pair for the characterization tests below. It returns the two events to
+    /// splice into a test's own history, plus the id/target that the test
+    /// needs for its own follow-up `match_external_cancel` assertion.
     fn external_cancel_triplet() -> (
         ExternalCancelId,
         crate::types::ExternalTarget,
@@ -14819,11 +14848,11 @@ mod tests {
 
     #[test]
     fn drain_early_signals_stashes_interleaved_external_cancel_triplet() {
-        // Direct unit test of `drain_early_signals` (Site 3, issue #1338) —
-        // this call site mutates `self.cursor` in place (rather than a local
+        // Direct unit test of `drain_early_signals` (Site 3, issue #1338).
+        // This call site mutates `self.cursor` in place (not a local
         // scan_cursor) and does an extra `advance_to_next_unconsumed_event()`
-        // per arm, so it is pinned directly rather than only through a public
-        // wrapper that might resolve the pair via a different site first.
+        // per arm. So it is pinned directly, not only through a public wrapper
+        // that might resolve the pair via a different site first.
         let (cancel_id, _, requested, delivered) = external_cancel_triplet();
         let events = vec![requested, delivered];
         let mut matcher = HistoryMatcher::new(events);

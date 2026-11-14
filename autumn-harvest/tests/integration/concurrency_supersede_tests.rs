@@ -14,8 +14,8 @@
 )]
 //! Latest-wins concurrency (`on_conflict = "cancel_running"`) — issue #811.
 //!
-//! Drives the real start primitive against Postgres and asserts the invariant
-//! the strategy exists to hold: **at most `limit` non-terminal runs per
+//! Drives the real start primitive against Postgres. Asserts the invariant of
+//! the strategy: **at most `limit` non-terminal runs per
 //! `(workflow_name, concurrency_key)`, and the newest admission wins.**
 //!
 //! Coverage:
@@ -129,19 +129,17 @@ impl MetricsRecorder for CapturingMetrics {
 
 /// Serializes tests that install `GLOBAL_WORKFLOW_METADATA` against each
 /// other. CI runs this suite with `--test-threads=1` (see
-/// `.github/ci/integration-suites.txt`), so this is primarily a local
-/// `cargo test`-without-that-flag safeguard — mirroring the `TEST_SERIAL`
-/// convention already used by `completion_callback_tests.rs` and
-/// `quota_enforcement_tests.rs`.
+/// `.github/ci/integration-suites.txt`). So this guards a local `cargo test`
+/// without that flag. `completion_callback_tests.rs` and
+/// `quota_enforcement_tests.rs` use the same `TEST_SERIAL` convention.
 static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// RAII installer for [`GLOBAL_WORKFLOW_METADATA`] (ported from
-/// `quota_enforcement_tests.rs`'s identical helper): installs the given map
-/// and restores whatever was there before on drop — including on a mid-test
-/// panic, unlike a bare manual take/restore pair (which would leak a
-/// polluted global into every subsequent test in the process on an assertion
-/// failure).
+/// RAII installer for [`GLOBAL_WORKFLOW_METADATA`], ported from the identical
+/// helper in `quota_enforcement_tests.rs`. It installs the given map and
+/// restores the previous value on drop, also on a mid-test panic. A manual
+/// take/restore pair leaks a polluted global into each later test on an
+/// assertion failure.
 struct MetadataGuard {
     previous: Option<HashMap<String, WorkflowMetadata>>,
     _permit: tokio::sync::MutexGuard<'static, ()>,
@@ -252,11 +250,11 @@ fn params<'a>(
 
 /// Start one run through the REAL production wrapper.
 ///
-/// Deliberately `start_or_load_workflow_execution_with_metrics` rather than the
-/// lower-level `_collect`: it is the wrapper every HTTP/CLI start funnels
-/// through, so the test exercises the emission plumbing (post-commit
-/// `emit_start_cancel_metrics`) as well as the supersede itself — a regression
-/// that dropped the counter at a consumer would still be caught.
+/// Uses `start_or_load_workflow_execution_with_metrics`, not the lower-level
+/// `_collect`. Every HTTP and CLI start goes through that wrapper. So the test
+/// covers the emission plumbing (post-commit `emit_start_cancel_metrics`) as
+/// well as the supersede. It catches a regression that drops the counter at a
+/// consumer.
 async fn start_run(
     conn: &mut AsyncPgConnection,
     metrics: &CapturingMetrics,
@@ -766,10 +764,10 @@ async fn success_metric_hundred_rapid_starts_leave_exactly_one_survivor() {
         "exactly one supersede count per superseded run"
     );
 
-    // The survivor must be able to actually RUN. A supersede pass that failed
-    // (or that cancelled the survivor's OWN task row) would leave the execution
-    // row `RUNNING` forever while the run hangs -- and every assertion above
-    // would still pass. Assert the workflow task is claimable.
+    // The survivor must be able to RUN. Suppose a supersede pass failed, or
+    // cancelled the OWN task row of the survivor. The execution row then stays
+    // `RUNNING` forever while the run hangs, and every assertion above still
+    // passes. So assert that the workflow task is claimable.
     assert_eq!(
         workflow_task_state(&mut conn, last).await.as_deref(),
         Some("PENDING"),
@@ -781,14 +779,13 @@ async fn success_metric_hundred_rapid_starts_leave_exactly_one_survivor() {
 
 /// The distinguishing half of AC6.
 ///
-/// Every other test in this file starts runs strictly sequentially, so
-/// admission order and `started_at` order coincide — an implementation that
-/// resolved the winner purely from wall-clock would pass them all. Here the
-/// incumbent's `started_at` is pushed into the FUTURE before the second run is
-/// admitted, so the two orders disagree: a wall-clock implementation would
-/// keep the "newest" (future-stamped) incumbent and cancel the newcomer.
-/// Latest-wins must still supersede the incumbent, because the newcomer is the
-/// later ADMISSION.
+/// Every other test in this file starts runs strictly sequentially. So
+/// admission order and `started_at` order agree, and a wall-clock winner
+/// would pass them all. Here the `started_at` of the incumbent moves into the
+/// FUTURE before the second admission, so the two orders disagree. A
+/// wall-clock implementation keeps the future-stamped incumbent and cancels
+/// the newcomer. Latest-wins must still supersede the incumbent, because the
+/// newcomer is the later ADMISSION.
 #[tokio::test]
 async fn later_admitted_run_wins_even_when_its_started_at_is_older() {
     let (url, _c) = setup_db().await;
@@ -838,13 +835,13 @@ async fn later_admitted_run_wins_even_when_its_started_at_is_older() {
     assert_eq!(metrics.superseded.lock().unwrap().len(), 1);
 }
 
-/// AC3's "**in the same shard-local serialized critical section**" + AC6 under
-/// genuine contention: N same-key admissions racing on separate pooled
-/// connections must converge to exactly ONE survivor with zero errors.
+/// AC3 "**in the same shard-local serialized critical section**" and AC6
+/// under real contention. N same-key admissions race on separate pooled
+/// connections. They must converge to exactly ONE survivor with zero errors.
 ///
-/// The advisory lock in `supersede_running_for_key` is what makes this hold; a
-/// build without it would let two admissions each observe the other as absent
-/// and leave two non-terminal runs.
+/// The advisory lock in `supersede_running_for_key` makes this hold. Without
+/// it, two admissions can each see the other as absent and leave two
+/// non-terminal runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_admissions_converge_to_one_survivor() {
     let (url, _c) = setup_db().await;
@@ -1133,14 +1130,13 @@ async fn scan_limit_clamps_shed_per_admission_and_still_converges() {
 ///
 /// The scheduler resolves the declared `on_conflict` from the registered
 /// `WorkflowInfo` and threads it into `StartWorkflowParams`, so a scheduled
-/// tick genuinely *does* supersede an incumbent. But it called the
-/// metrics-discarding `start_or_load_workflow_execution` wrapper, so neither
-/// `harvest.concurrency.superseded` nor the cancelled terminal counter was
-/// emitted for that shed run — AC7 says "once per superseded run", and a
-/// scheduled fire is a superseding run like any other.
+/// tick *does* supersede an incumbent. But it called the metrics-discarding
+/// `start_or_load_workflow_execution` wrapper. So the shed run emitted neither
+/// `harvest.concurrency.superseded` nor the cancelled terminal counter. AC7
+/// says "once per superseded run", and a scheduled fire is a superseding run.
 ///
 /// Drives the REAL public `tick_once` against a due schedule with a live
-/// incumbent, so the fix has to be in the production plumbing rather than in a
+/// incumbent. So the fix must be in the production plumbing, not in a
 /// test-only shim.
 #[tokio::test]
 async fn scheduled_tick_supersede_emits_the_counters() {
@@ -1288,10 +1284,9 @@ async fn scheduled_tick_supersede_emits_the_counters() {
 ///
 /// `AllowDuplicateFailedOnly` over a FAILED prior, and `TerminateIfRunning`
 /// over a terminal prior, both seal THIS `workflow_id`'s own prior and insert a
-/// fresh run. Sealing our own prior says nothing about a *different*
-/// `workflow_id` holding the same concurrency key, so skipping the supersede
-/// pass on those arms let a `limit = 1` group retain BOTH runs despite
-/// `cancel_running`.
+/// fresh run. That seal does not cover a *different* `workflow_id` that holds
+/// the same concurrency key. Those arms skipped the supersede pass, so a
+/// `limit = 1` group kept BOTH runs despite `cancel_running`.
 #[tokio::test]
 async fn allow_duplicate_failed_only_replacement_sheds_other_runs_on_the_key() {
     let (url, _c) = setup_db().await;
@@ -1496,13 +1491,13 @@ async fn defer_replacement_admission_sheds_nothing() {
 /// emission but left it EAGER. It fired at return, inside the source
 /// execution's still-open terminal transaction. A later rollback of that
 /// transaction then left a phantom count for a cancellation that never became
-/// durable. Issue #1197 closes that residual:
+/// durable. Issue #1197 closes that residual.
 /// `evaluate_triggers_for_execution_collecting` COLLECTS the samples into
-/// `pending` instead of emitting them, and the caller is responsible for
-/// calling `emit_start_cancel_metrics` only after its own transaction
-/// commits — exactly what every real production call site now does (see
-/// `completion_trigger_supersede_rollback_never_emits_metrics` below for the
-/// rollback half of this contract).
+/// `pending` and does not emit them. The caller calls
+/// `emit_start_cancel_metrics` only after its own transaction commits. Every
+/// production call site now does that.
+/// `completion_trigger_supersede_rollback_never_emits_metrics` covers the
+/// rollback half of this contract.
 #[tokio::test]
 async fn completion_trigger_supersede_emits_the_counters() {
     use autumn_harvest::completion_trigger::{
@@ -1646,22 +1641,22 @@ async fn completion_trigger_supersede_emits_the_counters() {
     );
 }
 
-/// RED phase for issue #1197, item 1: a completion-trigger supersede inside a
-/// terminal transaction that is SUBSEQUENTLY ROLLED BACK must emit neither
-/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal.
+/// RED phase for issue #1197, item 1. A completion-trigger supersede inside a
+/// terminal transaction that is LATER ROLLED BACK must emit nothing. Neither
+/// `harvest.concurrency.superseded` nor the cancelled terminal of the
+/// incumbent may move.
 ///
-/// This is exactly the residual issue #1197 describes:
-/// `evaluate_triggers_for_execution`'s same-shard inline trigger start used to
-/// call `start_or_load_workflow_execution_with_metrics`, which emits at
-/// return — INSIDE the source workflow's still-uncommitted terminal
-/// transaction. If later processing in that same transaction rolled it back
-/// (simulated here by returning `Err` right after the trigger evaluation),
-/// the incumbent would still be RUNNING (correctly rolled back) while the
-/// metrics recorder would already have counted a cancellation that never
-/// became durable — an over-count. `evaluate_triggers_for_execution_collecting`
-/// closes this by never emitting on its own: only an explicit
-/// `emit_start_cancel_metrics` call, which real production call sites make
-/// exclusively on the `Ok` (post-commit) path, can move the counters.
+/// This is the residual that issue #1197 describes. The same-shard inline
+/// trigger start of `evaluate_triggers_for_execution` called
+/// `start_or_load_workflow_execution_with_metrics`. That emits at return,
+/// INSIDE the uncommitted terminal transaction of the source workflow. Later
+/// processing in that transaction can roll it back. The test simulates that
+/// with an `Err` right after the trigger evaluation. The incumbent is then
+/// still RUNNING, correctly rolled back. But the recorder has already counted
+/// a cancellation that never became durable, which is an over-count.
+/// `evaluate_triggers_for_execution_collecting` never emits on its own. Only
+/// an explicit `emit_start_cancel_metrics` call moves the counters.
+/// Production call sites make that call only on the `Ok` (post-commit) path.
 #[tokio::test]
 async fn completion_trigger_supersede_rollback_never_emits_metrics() {
     use autumn_harvest::completion_trigger::{
@@ -1742,10 +1737,9 @@ async fn completion_trigger_supersede_rollback_never_emits_metrics() {
     metrics.cancelled_terminals.lock().unwrap().clear();
 
     // Simulate "later trigger evaluation or terminal processing rolls that
-    // transaction back" (issue #1197's own framing): the trigger evaluation
-    // itself succeeds (it performs the supersede), but the ENCLOSING
-    // transaction is made to fail right afterward, rolling everything in it
-    // back — including the supersede's cancellation.
+    // transaction back", in the framing of issue #1197. The trigger evaluation
+    // succeeds and performs the supersede. The ENCLOSING transaction then
+    // fails. That rolls back everything in it, including the cancellation.
     let result: Result<(), HarvestError> =
         Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
             let mut pending_cancel_metrics = Vec::new();
@@ -1802,12 +1796,12 @@ async fn completion_trigger_supersede_rollback_never_emits_metrics() {
     );
 }
 
-/// The legacy `evaluate_triggers_for_execution` wrapper is kept for call sites
-/// with no convenient post-commit hook (the 56 pre-#1197 test call sites, and
-/// any production site not yet migrated) — but that means it must NEVER emit
-/// the latest-wins supersede counters itself, even though the underlying
-/// same-shard trigger start still performs the DB-level supersede correctly.
-/// This documents that trade-off explicitly rather than leaving it implicit.
+/// The legacy `evaluate_triggers_for_execution` wrapper stays for call sites
+/// with no convenient post-commit hook. Those are the 56 pre-#1197 test call
+/// sites and any production site not yet migrated. So it must NEVER emit the
+/// latest-wins supersede counters itself. The same-shard trigger start under
+/// it still performs the DB-level supersede correctly. This test makes that
+/// trade-off explicit.
 #[tokio::test]
 async fn evaluate_triggers_for_execution_plain_wrapper_discards_supersede_metrics() {
     use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
@@ -1916,27 +1910,25 @@ async fn evaluate_triggers_for_execution_plain_wrapper_discards_supersede_metric
 // ── issue #1197, item 2: nested self-referential trigger admission ────────
 
 /// A `cancel_running` workflow whose own completion trigger targets itself on
-/// the same key: cancelling an incumbent can synchronously start a NEW run of
-/// the same workflow, on the same key, which is itself a `cancel_running`
-/// admission (issue #1197, item 2).
+/// the same key (issue #1197, item 2). Cancelling an incumbent can then start
+/// a NEW run of the same workflow on the same key. That run is itself a
+/// `cancel_running` admission.
 ///
 /// With `limit = 1`: admission B supersedes incumbent A. Cancelling A runs
-/// its terminal chokepoint, which (via the self-referential completion
-/// trigger) synchronously starts run C on the SAME key. C's own admission
-/// tries to shed down to `limit = 1` too — but the only other non-terminal
-/// run at that point is B, and B is a PROTECTED in-flight admission (its own
-/// start transaction is still open on this task, via the `ADMITTING`
-/// task-local C inherits into). C can never select a protected run, so it
-/// has nothing it may shed: `target = 1`, `shed = 0`. Both B and C commit,
-/// leaving the key transiently over its declared limit of 1.
+/// its terminal chokepoint. Through the self-referential completion trigger,
+/// that starts run C on the SAME key. C also tries to shed down to
+/// `limit = 1`. But the only other non-terminal run is B, a PROTECTED
+/// in-flight admission. The start transaction of B is still open on this
+/// task, through the `ADMITTING` task-local that C inherits. C never selects
+/// a protected run, so it has nothing to shed: `target = 1`, `shed = 0`.
+/// Both B and C commit, and the key is briefly over its limit of 1.
 ///
-/// This is the exact residual issue #1197 describes as bounded and
-/// self-healing (the next ordinary admission for the key sees both B and C
-/// unprotected and sheds down to the limit) — the issue's chosen resolution
-/// is to make it observable via a counter rather than to change the
-/// convergence behaviour itself (the "obvious" rescan-and-retry alternative
-/// does not converge for a cyclic trigger configuration; see the issue and
-/// `supersede_plan`'s doc comment).
+/// Issue #1197 describes this residual as bounded and self-healing. The next
+/// ordinary admission for the key sees B and C unprotected and sheds down to
+/// the limit. The issue makes the residual observable with a counter. It does
+/// not change the convergence behaviour. The "obvious" rescan-and-retry
+/// alternative does not converge for a cyclic trigger configuration. See the
+/// issue and the doc comment of `supersede_plan`.
 #[tokio::test]
 async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
     use autumn_harvest::admission_gate::{global_admission_metrics, set_global_admission_metrics};
@@ -1968,22 +1960,21 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
     // nested admission recursing off of it could then reach a recorder only
     // through the process-global fallback. A caller that supplies its own
     // recorder without also installing a global one lost the sample entirely.
-    // Fixed by threading the real caller recorder through instead. Install a
-    // *poisoned* global recorder here — if the fix regresses, the residual
-    // sample would land here instead of on `dummy_metrics` below, and the
-    // negative assertion at the end catches it.
+    // The fix threads the real caller recorder through. This installs a
+    // *poisoned* global recorder. If the fix regresses, the residual sample
+    // lands here, not on `dummy_metrics`, and the final negative assertion
+    // catches it.
     let previous_global_metrics = global_admission_metrics();
     let poisoned_global_metrics = Arc::new(CapturingMetrics::default());
     set_global_admission_metrics(Some(
         poisoned_global_metrics.clone() as Arc<dyn MetricsRecorder>
     ));
 
-    // Self-referential: the trigger's source and target are the SAME
-    // workflow type. `Static` input mapping (not `Passthrough`) because a
-    // CANCELLED source has a NULL recorded output — a `Passthrough` mapping
-    // would deliver `Null`, `resolve_concurrency_key` would resolve no key,
-    // and the nested admission would never reach `run_latest_wins_supersede`
-    // at all.
+    // Self-referential: the source and target of the trigger are the SAME
+    // workflow type. The input mapping is `Static`, not `Passthrough`. A
+    // CANCELLED source has a NULL recorded output, so `Passthrough` delivers
+    // `Null`. `resolve_concurrency_key` then resolves no key, and the nested
+    // admission never reaches `run_latest_wins_supersede`.
     let trigger_id = uuid::Uuid::new_v4();
     diesel::sql_query(
         "INSERT INTO harvest_completion_triggers \

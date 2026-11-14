@@ -12,11 +12,11 @@ pub enum InputMapping {
     /// execution's recorded terminal state + row fields (issue #748).
     ///
     /// A source that reached a non-`Completed` terminal state has a `NULL`
-    /// recorded output, so a `Passthrough`/`Projection` mapping delivers
-    /// `Null` and a failure-routed handler starts blind. This variant instead
-    /// projects already-recorded execution data — the terminal state, the
-    /// source identity, the output (only on `COMPLETED`), and the error /
-    /// cancel reason — into a fixed envelope:
+    /// recorded output. So a `Passthrough`/`Projection` mapping delivers
+    /// `Null`, and a failure-routed handler starts blind. This variant
+    /// projects already-recorded execution data into a fixed envelope. The
+    /// envelope holds the terminal state, the source identity, the output
+    /// (only on `COMPLETED`), and the error or cancel reason:
     ///
     /// ```json
     /// {
@@ -29,10 +29,10 @@ pub enum InputMapping {
     /// }
     /// ```
     ///
-    /// `projection = None` yields the full envelope; `projection = Some(path)`
-    /// plucks a dotted field from it using the same [`project_json_path`]
-    /// mechanism `Projection` uses (e.g. `Some("error")` → the bare error
-    /// string). Read-side projection only — no `WorkflowEvent` variant, no
+    /// `projection = None` yields the full envelope. `projection = Some(path)`
+    /// plucks a dotted field from it with the [`project_json_path`]
+    /// mechanism of `Projection` (e.g. `Some("error")` → the bare error
+    /// string). Read-side projection only: no `WorkflowEvent` variant, no
     /// migration.
     Outcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,32 +95,32 @@ pub const MAX_CONDITION_IN_VALUES: usize = 64;
 /// Bounded, declarative output guard for a [`CompletionTrigger`] (issue #810).
 ///
 /// Evaluated **server-side at terminal-commit time** against the source
-/// workflow's recorded output JSON — a pure, deterministic function (same
-/// output → same fire/skip decision on every redelivery). This is a fixed
-/// comparison AST, deliberately **not** an expression/CEL engine; an unknown
-/// operator is a serde deserialization error, which the HTTP registration
-/// route surfaces as a `400`.
+/// workflow's recorded output JSON. It is a pure, deterministic function:
+/// the same output gives the same fire/skip decision on every redelivery.
+/// It is a fixed comparison AST, deliberately **not** an expression/CEL
+/// engine. An unknown operator is a serde deserialization error, which the
+/// HTTP registration route surfaces as a `400`.
 ///
-/// Leaf operators resolve `path` (a dotted JSON path, the same
-/// [`project_json_path`] machinery `InputMapping::Projection` uses; the empty
-/// path means the whole output) and compare the projected value:
+/// Leaf operators resolve `path` and compare the projected value. `path` is
+/// a dotted JSON path, read by the [`project_json_path`] machinery of
+/// `InputMapping::Projection`. The empty path means the whole output.
 ///
 /// - **Missing path or explicit `null`** ⇒ every comparison operator
-///   (`Eq`/`NotEq`/ordering/`In`) evaluates to `false` — never a panic or an
+///   (`Eq`/`NotEq`/ordering/`In`) evaluates to `false`, never a panic or an
 ///   error. Test absence/nullness explicitly with `Exists` / `IsNull` /
 ///   `Not(Exists)`.
-/// - **`Exists`** is `true` when the path is present (including an explicit
-///   `null` value); **`IsNull`** is `true` only when the path is present AND
-///   the value is exactly `null` — so `Exists`/`IsNull` genuinely distinguish
+/// - **`Exists`** is `true` when the path is present, even with an explicit
+///   `null` value. **`IsNull`** is `true` only when the path is present AND
+///   the value is exactly `null`. So `Exists`/`IsNull` distinguish
 ///   present-null from absent.
 /// - **Numeric coercion rule**: for `Eq`/`NotEq`/`In` and the ordering
-///   operators, two **integers** compare exactly (full `i64`/`u64` range,
-///   mixed signs included — distinct integers above 2^53 never collapse);
-///   when at least one side is a genuine float, both sides coerce to `f64`
-///   (so `1 == 1.0`, with `f64` precision governing mixed int/float pairs
-///   above 2^53). Otherwise comparison is strict `Value` equality (a number
-///   never equals a numeric string; the coercion never recurses into arrays
-///   or objects). The ordering operators
+///   operators, two **integers** compare exactly. That covers the full
+///   `i64`/`u64` range, mixed signs included, so distinct integers above
+///   2^53 never collapse. When at least one side is a genuine float, both
+///   sides coerce to `f64` (so `1 == 1.0`). Then `f64` precision governs
+///   mixed int/float pairs above 2^53. Otherwise comparison is strict
+///   `Value` equality: a number never equals a numeric string, and the
+///   coercion never recurses into arrays or objects. The ordering operators
 ///   (`GreaterThan`/`GreaterThanOrEq`/`LessThan`/`LessThanOrEq`) are
 ///   **numeric-only**: unless both sides are numbers the result is `false`.
 ///   Note the deliberate asymmetry: `NotEq` on a missing/null path is
@@ -129,10 +129,10 @@ pub const MAX_CONDITION_IN_VALUES: usize = 64;
 /// - `All([])` is `true`, `Any([])` is `false` (conventional identities).
 ///
 /// A source that reached a non-`Completed` terminal state typically has a
-/// `NULL` recorded output, which evaluates as a literal JSON `null` root:
-/// every member path is missing, so comparisons are `false` — but a
-/// `Not(Exists(..))`-style guard can still meaningfully fire. Guards are
-/// output-only by design (the failure-cause envelope is issue #748's story).
+/// `NULL` recorded output. That evaluates as a literal JSON `null` root, so
+/// every member path is missing and comparisons are `false`. A
+/// `Not(Exists(..))`-style guard can still fire. Guards are output-only by
+/// design. The failure-cause envelope is the job of issue #748.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data")]
 pub enum TriggerCondition {
@@ -159,20 +159,20 @@ fn as_exact_int(v: &Value) -> Option<i128> {
         .or_else(|| v.as_u64().map(i128::from))
 }
 
-/// Equality with the documented numeric-coercion rule: two integers compare
-/// **exactly** (via `i128`, covering the full `i64`/`u64` range and mixed
-/// signs), so distinct integers above 2^53 — snowflake-style IDs — never
+/// Equality with the documented numeric-coercion rule. Two integers compare
+/// **exactly** via `i128`, which covers the full `i64`/`u64` range and mixed
+/// signs. So distinct integers above 2^53, such as snowflake-style IDs, never
 /// collapse through lossy `f64` coercion. Only when at least one side is a
-/// genuine float do both sides coerce to `f64` (so `1 == 1.0`); otherwise
-/// strict `Value` equality.
+/// genuine float do both sides coerce to `f64` (so `1 == 1.0`). Otherwise
+/// this is strict `Value` equality.
 fn values_eq(projected: &Value, candidate: &Value) -> bool {
     if let (Some(a), Some(b)) = (as_exact_int(projected), as_exact_int(candidate)) {
         return a == b;
     }
     if let (Some(a), Some(b)) = (projected.as_f64(), candidate.as_f64()) {
-        // Deterministic exact f64 comparison — this branch is only reached
-        // when at least one side is a genuine float; no epsilon fuzzing
-        // (that would make the guard non-obvious to reason about).
+        // Exact f64 comparison. This branch runs only when at least one side
+        // is a genuine float. No epsilon fuzzing: that would make the guard
+        // hard to reason about.
         #[allow(clippy::float_cmp)]
         return a == b;
     }
@@ -234,11 +234,12 @@ impl TriggerCondition {
     }
 
     /// Boundedness validation, enforced at **both** registration surfaces
-    /// (`HarvestBuilder::try_build` and `POST /admin/completion-triggers`):
-    /// nesting depth ≤ [`MAX_CONDITION_DEPTH`], total nodes ≤
-    /// [`MAX_CONDITION_NODES`], `In` sets ≤ [`MAX_CONDITION_IN_VALUES`], and
-    /// every non-empty path free of empty segments (`"a..b"`, `".a"`, `"a."`
-    /// are malformed; the empty path selects the whole output and is valid).
+    /// (`HarvestBuilder::try_build` and `POST /admin/completion-triggers`).
+    /// It checks nesting depth ≤ [`MAX_CONDITION_DEPTH`], total nodes ≤
+    /// [`MAX_CONDITION_NODES`] and `In` sets ≤ [`MAX_CONDITION_IN_VALUES`].
+    /// Every non-empty path must be free of empty segments: `"a..b"`, `".a"`
+    /// and `"a."` are malformed. The empty path selects the whole output and
+    /// is valid.
     ///
     /// # Errors
     ///
@@ -321,25 +322,26 @@ pub enum ConditionGate {
     /// row), do not start.
     Unmet,
     /// Stored condition failed to deserialize or violates the boundedness
-    /// caps: **fail closed** — skip with a distinct reason and a warning,
-    /// never fire on an unintelligible guard, never error the terminal
-    /// commit. Unlike `Unmet` (a final, correct decision over recorded
-    /// output), `Invalid` means "this binary cannot understand the guard"
-    /// (mixed-version deploy skew, corrupt row), so **no fires row is
-    /// written** (mirroring the `validation_failed` precedent): the pair is
-    /// left *unresolved* rather than durably suppressed, and a later
-    /// re-entry into trigger evaluation re-evaluates it. **Recovery limit
-    /// (honest contract):** trigger evaluation runs only inside a source
-    /// terminal commit and no scanner re-visits unresolved pairs, so a
-    /// re-entry for an already-terminal execution is rare (e.g. a
-    /// parent-close-cascade race) and NOT guaranteed — without one, the
-    /// fire is lost for that terminal. Treat every `condition_invalid`
-    /// skip (warn log + the `harvest.completion_trigger.skipped{reason=
-    /// "condition_invalid"}` counter) as a fire to re-trigger by hand, and
-    /// avoid the window entirely by registering conditions that use newly
-    /// added operators only after the whole fleet runs the new binary. A
-    /// durable re-evaluation queue is a named follow-up (issue #810 /
-    /// PR #972 review).
+    /// caps. **Fail closed**: skip with a distinct reason and a warning.
+    /// Never fire on an unintelligible guard, and never fail the terminal
+    /// commit. `Unmet` is a final, correct decision over recorded output.
+    /// `Invalid` means "this binary cannot understand the guard", e.g. after
+    /// mixed-version deploy skew or on a corrupt row. So **no fires row is
+    /// written**, like the `validation_failed` precedent. The pair stays
+    /// *unresolved*, not durably suppressed, and a later re-entry into
+    /// trigger evaluation re-evaluates it.
+    ///
+    /// **Recovery limit (honest contract):** trigger evaluation runs only
+    /// inside a source terminal commit, and no scanner re-visits unresolved
+    /// pairs. So a re-entry for an already-terminal execution is rare (e.g.
+    /// a parent-close-cascade race) and NOT guaranteed. Without one, the
+    /// fire is lost for that terminal. Treat every `condition_invalid` skip
+    /// as a fire to re-trigger by hand. The skip emits a warn log and the
+    /// `harvest.completion_trigger.skipped{reason="condition_invalid"}`
+    /// counter. Avoid the window: register conditions that use new
+    /// operators only after the whole fleet runs the new binary. A durable
+    /// re-evaluation queue is a named follow-up (issue #810 / PR #972
+    /// review).
     Invalid,
 }
 
@@ -444,18 +446,18 @@ pub fn project_json_path(value: &Value, path: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Build the terminal-outcome envelope for [`InputMapping::Outcome`] (issue
-/// #748). A pure read-side projection of already-recorded execution data — no
-/// event variant, no migration.
+/// Build the terminal-outcome envelope for [`InputMapping::Outcome`]
+/// (issue #748). A pure read-side projection of already-recorded execution
+/// data: no event variant, no migration.
 ///
-/// Envelope semantics: `output` is non-null **only** on `COMPLETED` (the
+/// Envelope semantics: `output` is non-null **only** on `COMPLETED`. The
 /// caller passes `Some(&output)` only when `state == TerminalState::Completed`,
-/// else `None`); `error` carries the failure message on `FAILED`/`TIMED_OUT`
-/// and the cancel reason on `CANCELLED` when one was recorded (the caller just
-/// forwards `execution.error`, which is naturally `None` on `COMPLETED`).
+/// else `None`. `error` carries the failure message on `FAILED`/`TIMED_OUT`
+/// and the cancel reason on `CANCELLED`, when one was recorded. The caller
+/// forwards `execution.error`, which is `None` on `COMPLETED`.
 /// `terminal_state` is the state's canonical string (e.g. `"FAILED"`).
 // The sole non-test caller (`evaluate_triggers_for_execution`) is `db`-gated,
-// so this is genuinely unused in a `--no-default-features` lib build.
+// so this is unused in a `--no-default-features` lib build.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn build_outcome_envelope(
     exec_id: crate::types::ExecutionId,
@@ -475,10 +477,10 @@ pub(crate) fn build_outcome_envelope(
     })
 }
 
-/// Borrowing sibling of [`project_json_path`] that distinguishes a **missing**
-/// path (`None`) from a **present-and-null** value (`Some(&Value::Null)`) —
-/// the distinction [`TriggerCondition::Exists`] / [`TriggerCondition::IsNull`]
-/// are defined on (issue #810). Same walker, same segment semantics.
+/// Borrowing sibling of [`project_json_path`] that tells a **missing** path
+/// (`None`) from a **present-and-null** value (`Some(&Value::Null)`).
+/// [`TriggerCondition::Exists`] and [`TriggerCondition::IsNull`] rely on
+/// that distinction (issue #810). Same walker, same segment semantics.
 fn project_json_path_opt<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     if path.is_empty() {
         return Some(value);
@@ -513,7 +515,7 @@ pub async fn sync_completion_triggers(
     let triggers = triggers.to_vec();
 
     Box::pin(conn.transaction(async |tx| {
-        // First, delete any static triggers that are no longer present in the builder's triggers list.
+        // Delete static triggers that the builder's list no longer holds.
         if active_ids.is_empty() {
             diesel::delete(dsl::harvest_completion_triggers)
                 .filter(dsl::is_static.eq(true))
@@ -588,13 +590,12 @@ pub struct WorkflowMetadata {
     pub sla: Option<std::time::Duration>,
     /// Declared workflow-type retry policy default (issue #523).
     pub retry_policy: Option<crate::policy::RetryPolicy>,
-    /// Declared per-tenant resource quota policy (issue #946), enforced at
-    /// admission inside `start_or_load_workflow_execution_collect` -- the
-    /// completion-trigger start path (both the same-shard inline start and
-    /// the cross-shard outbox relay) funnels through that same function, so
-    /// mirroring this field here is what makes a completion-trigger-started
-    /// workflow observe its declared quota just like every other
-    /// registry-aware start path.
+    /// Declared per-tenant resource quota policy (issue #946). Admission in
+    /// `start_or_load_workflow_execution_collect` enforces it. The
+    /// completion-trigger start path funnels through that function, for both
+    /// the same-shard inline start and the cross-shard outbox relay. So this
+    /// mirrored field makes a completion-trigger start observe its declared
+    /// quota like every other registry-aware start path.
     pub quota: Option<crate::quota::QuotaPolicy>,
 }
 
@@ -858,8 +859,8 @@ pub async fn resolve_target_queue(
 /// The shard-independent default start queue: the process-global registered
 /// default (`GLOBAL_DEFAULT_WORKFLOW_QUEUE`), else the literal `"default"`.
 ///
-/// This is the correct answer whenever a schedule-level queue override cannot be
-/// read — it depends on no shard's `harvest_schedules` and so can never return a
+/// This is the right answer whenever a schedule-level queue override cannot be
+/// read. It depends on no shard's `harvest_schedules`, so it can never return a
 /// wrong-shard queue.
 #[cfg(feature = "db")]
 fn default_workflow_queue() -> String {
@@ -946,9 +947,9 @@ async fn resolve_target_queues_batch(
 /// Resolve the start queue for a **cross-shard** completion-trigger target.
 ///
 /// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
-/// time: on a fresh connection to the target shard's own pool, so the inline
-/// admission-gate check (issue #618) evaluates the exact queue the
-/// deferred start will use.
+/// time: on a fresh connection to the target shard's own pool. So the inline
+/// admission-gate check (issue #618) evaluates the exact queue the deferred
+/// start will use.
 ///
 /// The source transaction connection is **deliberately not a parameter** (issue
 /// #618). The schedule-level queue override lives only on the target shard.
@@ -1039,19 +1040,20 @@ const OUTBOX_RETRY_ELIGIBLE_PREDICATE: &str = "next_attempt_at <= NOW()";
 #[cfg(feature = "db")]
 enum RelayOutcome {
     /// Another processor (the sibling immediate/scanner path, or a peer replica)
-    /// already owns this outbox row this instant → skip; no metric, no double
+    /// already owns this outbox row this instant → skip. No metric, no double
     /// processing.
     Skipped,
-    /// The target ran (fresh create, idempotent attach, or already-existed) → the
-    /// outbox row was deleted, the fires row left `NULL` (a real fire); count a
-    /// `completion_trigger_outbox` bypass.
+    /// The target ran (fresh create, idempotent attach, or already-existed).
+    /// The outbox row was deleted, and the fires row left `NULL` (a real fire).
+    /// Count a `completion_trigger_outbox` bypass.
     Delivered,
-    /// A genuinely fresh admission the gate blocked → the outbox row was deleted and
-    /// the fires row marked `admission_blocked`. The core start primitive already
-    /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014), so the
-    /// relay does NOT re-record it — `reason` is kept only for the tracing log.
+    /// The gate blocked a fresh admission. The outbox row was deleted, and the
+    /// fires row marked `admission_blocked`. The core start primitive already
+    /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014).
+    /// So the relay does NOT re-record it. `reason` is kept only for the
+    /// tracing log.
     Blocked { reason: String },
-    /// A declared per-tenant quota (issue #946, Task #7 hardening) is exhausted
+    /// A declared per-tenant quota (issue #946) is exhausted
     /// on the target at relay time. `Blocked` is an operator-lifted admission
     /// gate with no natural "retry later" cadence, so its row is dropped.
     /// This outcome is TEMPORARY instead. The tenant's usage frees up as an
@@ -1065,7 +1067,7 @@ enum RelayOutcome {
     /// re-record it here.
     ///
     /// The row's `next_attempt_at` is stamped to `now() + QUOTA_REDEFER_BACKOFF`
-    /// (issue #1227, Finding 4) so the claim query excludes it until the
+    /// (issue #1227), so the claim query excludes it until the
     /// backoff elapses. Pre-#1227 the row had no cadence tracking at all.
     /// A target durably at quota cap could then dominate every unordered
     /// `LIMIT 50` claim batch on every scanner tick. That row starved any
@@ -1094,24 +1096,27 @@ const RELAY_CLAIM_QUERY: &str = "SELECT id FROM harvest_completion_trigger_outbo
 /// a source-row claim, then apply the source-shard bookkeeping (issue #618).
 ///
 /// **Mutual exclusion.** Both the immediate `DeferredTriggerStart::spawn()`
-/// relay and the scanner ([`enforce_completion_triggers_outbox`]) — and any two
-/// scanner replicas assigned the same shard — reach this one function. Without
-/// ownership of the source outbox row they could BOTH process it and reach
-/// DIVERGENT decisions: one starts the target (its `execution_exists_by_key` and
-/// gate check saw no target and no gate), the other — a gate having been raised in
-/// the interim, and the first relay's target start not yet visible on the target
-/// shard — BLOCKS it, and whichever wins the source-row delete durably records the
-/// wrong outcome (an `admission_blocked` fire for a target that actually ran). This
-/// function eliminates that race by claiming the source outbox row
-/// `FOR UPDATE SKIP LOCKED` and holding the claim across the ENTIRE relay
-/// (existence check → gate → cross-shard target start → source delete/block): only
-/// one path owns the row and makes the decision; a concurrent path's `SKIP LOCKED`
-/// returns nothing → [`RelayOutcome::Skipped`]. If the owner crashes mid-flight the
-/// claim transaction rolls back → the row stays present + unlocked. The
-/// delivered-if-target-exists retry then makes the next attempt correct. The
-/// claim is held across the cross-shard target start (a bounded, per-row
-/// source-shard row lock on a tiny transient row); a peer never waits on it
-/// (`SKIP LOCKED`) — it simply retries the row on the next tick.
+/// relay and the scanner ([`enforce_completion_triggers_outbox`]) reach this
+/// one function. So do any two scanner replicas assigned the same shard.
+/// Without ownership of the source outbox row, both could process it and
+/// reach DIVERGENT decisions. One starts the target: its
+/// `execution_exists_by_key` and gate check saw no target and no gate. The
+/// other BLOCKS it: a gate was raised in the interim, and the first relay's
+/// target start is not yet visible on the target shard. Whichever path wins
+/// the source-row delete durably records the wrong outcome: an
+/// `admission_blocked` fire for a target that actually ran.
+///
+/// This function removes that race. It claims the source outbox row
+/// `FOR UPDATE SKIP LOCKED`. It holds the claim across the ENTIRE relay:
+/// existence check → gate → cross-shard target start → source delete/block.
+/// Only one path owns the row and makes the decision. A concurrent path's
+/// `SKIP LOCKED` returns nothing → [`RelayOutcome::Skipped`]. If the owner
+/// crashes mid-flight, the claim transaction rolls back, and the row stays
+/// present and unlocked. The delivered-if-target-exists retry then makes the
+/// next attempt correct. The claim is held across the cross-shard target
+/// start: a bounded, per-row source-shard lock on a tiny transient row. A
+/// peer never waits on it (`SKIP LOCKED`). It retries the row on the next
+/// tick.
 ///
 /// Under the claim, the decision is:
 /// - target already exists in ANY state → DELIVERED: delete the outbox
@@ -1148,22 +1153,23 @@ async fn relay_gate_checked_start(
         id: Uuid,
     }
 
-    // The relay-time gate decision (issue #618, PR #1014) is now enforced
-    // AUTHORITATIVELY inside the core start primitive: the `Some(GateMode::CheckCached)`
+    // The core start primitive enforces the relay-time gate decision
+    // AUTHORITATIVELY (issue #618, PR #1014). The `Some(GateMode::CheckCached)`
     // argument to `start_or_load_workflow_execution_with_metrics` below makes
-    // `_collect` apply the gate iff it will CREATE a new execution (issue #618,
-    // F-round18). The any-state `execution_exists_by_key` check first short-circuits
-    // a target that exists in ANY state to DELIVERED, so by the time control reaches
-    // the start no target exists → `will_create` is trivially `true` and the gate
-    // always applies to a fresh cross-shard delivery. `CheckCached` honours the
-    // last-known snapshot (never the fail-closed sentinel) — the relay materializes
-    // pre-committed in-flight-continuation work, so the same no-permanent-drop
-    // rationale as the inline path applies. The primitive records the
-    // `harvest.admission.blocked` count itself, so the relay only performs the
-    // fires-row `admission_blocked` bookkeeping + outbox-row drop on a block.
+    // `_collect` apply the gate iff it will CREATE a new execution. The
+    // any-state `execution_exists_by_key` check first short-circuits a target
+    // that exists in ANY state to DELIVERED. So when control reaches the
+    // start, no target exists: `will_create` is `true`, and the gate always
+    // applies to a fresh cross-shard delivery. `CheckCached` honours the
+    // last-known snapshot, never the fail-closed sentinel. The relay
+    // materializes pre-committed in-flight-continuation work, so the
+    // no-permanent-drop rationale of the inline path applies. The primitive
+    // records the `harvest.admission.blocked` count itself. So on a block the
+    // relay only does the fires-row `admission_blocked` bookkeeping and the
+    // outbox-row drop.
 
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
-    // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
+    // the whole relay (issue #618). `source_tx` is the claim transaction; `target_conn`
     // is a separate connection whose own transaction commits independently.
     //
     // The claim's `WHERE` re-checks the SAME backoff eligibility predicate the
@@ -1253,23 +1259,21 @@ async fn relay_gate_checked_start(
                     .map_err(crate::error::database_error)?;
                     Ok(RelayOutcome::Blocked { reason })
                 }
-                // issue #946 (Task #7 hardening): a declared per-tenant quota
-                // is exhausted on the target at relay time. Must be matched
-                // BEFORE the generic `Err(e)` arm below: that arm propagates
-                // via `?` out of this whole claim transaction, which would
-                // (a) abort this relay attempt for no better reason than a
-                // TEMPORARY per-tenant condition and (b) -- since this
-                // function is called in a loop from
-                // `enforce_completion_triggers_outbox`, itself one of many
-                // `?`-chained scanner duties inside `enforce_timeouts_once`
-                // -- starve every OTHER completion-trigger relay this tick
-                // and every LATER scanner duty (history-ceiling enforcement,
-                // broken-session/mutex-lease reclaim, start-idempotency
-                // sweep, ...) on every tick for as long as this one
-                // quota-blocked target sits at the head of the outbox scan.
-                // Leave the row claimable (neither delete nor touch fires) so
-                // a later scan re-attempts it once the target's usage frees
-                // up.
+                // Issue #946: a declared per-tenant quota is exhausted on the
+                // target at relay time. Match it BEFORE the generic `Err(e)`
+                // arm below. That arm propagates via `?` out of this whole
+                // claim transaction. (a) It would abort this relay attempt
+                // for a TEMPORARY per-tenant condition. (b) This function runs
+                // in a loop from `enforce_completion_triggers_outbox`, one of
+                // many `?`-chained scanner duties in `enforce_timeouts_once`.
+                // So the error would starve every OTHER completion-trigger
+                // relay this tick and every LATER scanner duty. Those duties
+                // include history-ceiling enforcement, broken-session/
+                // mutex-lease reclaim and the start-idempotency sweep. That
+                // repeats on every tick while this quota-blocked target heads
+                // the outbox scan. Leave the row claimable (neither delete nor
+                // touch fires), so a later scan re-attempts it once the
+                // target's usage frees up.
                 Err(crate::error::HarvestError::QuotaExceeded {
                     key,
                     resource,
@@ -1343,9 +1347,9 @@ async fn relay_gate_checked_start(
             }
         }
         RelayOutcome::Blocked { reason } => {
-            // The block count was already recorded by the core start primitive
-            // (`record_start_gate_block` inside `_collect`), so the relay does NOT
-            // re-record it here — that would double-count (issue #618, PR #1014).
+            // The core start primitive already recorded the block count
+            // (`record_start_gate_block` inside `_collect`). So the relay does NOT
+            // re-record it here: that would double-count (issue #618, PR #1014).
             tracing::info!(
                 reason = %reason,
                 "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropped the outbox row"
@@ -1357,10 +1361,9 @@ async fn relay_gate_checked_start(
             limit,
             current,
         } => {
-            // `harvest.quota.rejected` was already recorded by the core start
-            // primitive inside `start_or_load_workflow_execution_collect`; the
-            // relay does NOT re-record it (issue #946, mirrors the `Blocked`
-            // arm's no-double-count precedent above).
+            // The core start primitive already recorded `harvest.quota.rejected`
+            // inside `start_or_load_workflow_execution_collect`. The relay does
+            // NOT re-record it (issue #946), like the `Blocked` arm above.
             tracing::debug!(
                 outbox_id = %outbox_id,
                 quota_key = %key,
@@ -1416,9 +1419,9 @@ pub struct DeferredTriggerStart {
 
 #[cfg(feature = "db")]
 impl DeferredTriggerStart {
-    // Pre-existing, unrelated to issue #605: this function sits just over the
-    // 100-line clippy threshold on trunk already; allowed here rather than
-    // refactored to keep this change scoped to completion callbacks.
+    // This function predates issue #605 and is just over the 100-line clippy
+    // threshold. The allow keeps the issue #605 change scoped to completion
+    // callbacks, with no unrelated refactor.
     #[allow(clippy::too_many_lines)]
     pub fn spawn(self) {
         let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
@@ -1591,18 +1594,18 @@ impl DeferredTriggerStart {
 /// discarding any latest-wins supersede cancellation metrics the same-shard
 /// inline start path collects.
 ///
-/// This is the pre-issue-#1197 entry point, kept byte-for-byte for the 56 test
-/// call sites and any production call site with no convenient post-commit
-/// point of its own. It delegates to
-/// [`evaluate_triggers_for_execution_collecting`] with a throwaway collector,
-/// so a same-shard supersede performed here emits neither
-/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal —
-/// matching the behaviour before issue #811 gave this path a metrics-emitting
-/// start call at all (an unconditional under-count, not a regression: see
-/// issue #1197). A caller that has its own post-commit hook should call
-/// [`evaluate_triggers_for_execution_collecting`] directly instead and emit
-/// the collected metrics via [`crate::execution::emit_start_cancel_metrics`]
-/// once its enclosing transaction has actually committed.
+/// This is the pre-issue-#1197 entry point. It stays byte-for-byte for the 56
+/// test call sites and for any production call site with no post-commit point
+/// of its own. It delegates to [`evaluate_triggers_for_execution_collecting`]
+/// with a throwaway collector. So a same-shard supersede here emits neither
+/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal.
+/// That matches the behaviour before issue #811 gave this path a
+/// metrics-emitting start call. It is an unconditional under-count, not a
+/// regression (see issue #1197). A caller with its own post-commit hook
+/// should call [`evaluate_triggers_for_execution_collecting`] directly. It
+/// then emits the collected metrics via
+/// [`crate::execution::emit_start_cancel_metrics`] once its enclosing
+/// transaction commits.
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1658,19 +1661,19 @@ pub fn evaluate_triggers_for_execution_with_codecs<'a>(
 
 /// Evaluate completion triggers for a just-sealed terminal execution.
 ///
-/// Identical to [`evaluate_triggers_for_execution`] except for one thing: a
+/// Identical to [`evaluate_triggers_for_execution`] except for one thing. A
 /// same-shard inline trigger start that performs a latest-wins supersede
 /// (issue #811) pushes its [`crate::execution::StartCancelledRun`] samples
-/// into `pending` instead of emitting them immediately. The emission side
-/// (`start_or_load_workflow_execution_with_metrics`) fires at return, which is
-/// INSIDE this function's caller's still-open terminal transaction — if that
-/// transaction later rolls back, an eager emission would already have counted
-/// a cancellation that never became durable (issue #1197, item 1).
+/// into `pending` instead of emitting them at once. The emission side
+/// (`start_or_load_workflow_execution_with_metrics`) fires at return. That is
+/// INSIDE the still-open terminal transaction of this function's caller. If
+/// that transaction later rolls back, an eager emission would already have
+/// counted a cancellation that never became durable (issue #1197, item 1).
 ///
 /// Callers MUST call [`crate::execution::emit_start_cancel_metrics`] with the
 /// accumulated `pending` list only **after** their enclosing transaction has
-/// committed — the exact same discipline already required of the
-/// `StartCancelledRun`s a fresh workflow start collects.
+/// committed. A fresh workflow start already requires the same discipline for
+/// the `StartCancelledRun`s it collects.
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution_collecting<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1739,12 +1742,11 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             return Ok(deferred_starts);
         };
 
-        // Durable completion callbacks (issue #605): enqueue any matching
-        // delivery rows inside this same terminal transaction. Reuses the
-        // execution row already loaded above; a no-op when no completion-
-        // callback config has ever been registered
-        // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
-        // no target matches this terminal state.
+        // Durable completion callbacks (issue #605): enqueue matching delivery
+        // rows inside this terminal transaction, from the execution row loaded
+        // above. A no-op when no completion-callback config was ever registered
+        // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`), or when no
+        // target matches this terminal state.
         // Issue #2000: a recorded fork must not notify an outside system or
         // start a run, so it skips callbacks and triggers. A quiet live fork
         // skips them too (issue #2378). It still releases its mutexes below.
@@ -1756,12 +1758,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             .await?;
         }
 
-        // Durable mutex terminal auto-release (issue #691): this is the single
-        // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
-        // timeout/poison-pill), so releasing every lock a now-terminal holder
-        // held and waking the next waiters here covers every terminal path in
-        // one place. It runs inside this same terminal transaction, so the
-        // per-key `pg_advisory_xact_lock`s the release/wake take hold across the
+        // Durable mutex terminal auto-release (issue #691). This is the single
+        // chokepoint for every terminal transition (complete/fail/cancel/
+        // terminate/timeout/poison-pill). So releasing a terminal holder's locks
+        // and waking the next waiters here covers every terminal path. It runs
+        // inside this terminal transaction, so the per-key
+        // `pg_advisory_xact_lock`s that the release/wake take hold across the
         // whole sweep. A no-op when the mutex tables are absent (guarded). The
         // non-terminal nd-block path (issue #603) deliberately does NOT reach
         // this function, so a blocked holder keeps its locks.
@@ -1798,27 +1800,26 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             let trigger_name = trigger_db.id.to_string();
             let source_output = decoded_output.clone().unwrap_or(Value::Null);
 
-            // Output guard (issue #810): evaluated against the RAW source
-            // output — deliberately before (and independent of) input
-            // mapping, so issue #748 can later change input assembly without
-            // touching guard semantics. Pure and deterministic: the same
-            // recorded output yields the same fire/skip decision on every
-            // redelivery. An UNMET guard is a final decision over recorded
-            // output and is recorded as resolved through the same
-            // ON CONFLICT DO NOTHING fires-row PK path as a real fire (AC5),
-            // so cascade re-entry dedupes identically. An unparseable or
-            // over-cap stored condition FAILS CLOSED: skip with the
-            // distinct `condition_invalid` reason and NO fires row
-            // (mirroring the `validation_failed` precedent below) — a
-            // "this binary cannot understand the guard" state must never
-            // durably resolve the pair, so a re-entry into evaluation
-            // re-evaluates it once the fleet is upgraded or the operator
-            // repairs the condition. Honest recovery contract (PR #972
-            // review): evaluation runs only inside a source terminal
-            // commit and no scanner re-visits unresolved pairs, so such a
-            // re-entry is NOT guaranteed — without one the fire is lost
-            // for this terminal; the warn + counter below are the
-            // operator's detection signal (see ConditionGate::Invalid).
+            // Output guard (issue #810), evaluated against the RAW source output.
+            // It runs before, and independent of, input mapping. So issue #748 can
+            // change input assembly without touching guard semantics. Pure and
+            // deterministic: the same recorded output yields the same fire/skip
+            // decision on every redelivery.
+            //
+            // An UNMET guard is a final decision over recorded output. It is
+            // recorded as resolved through the same ON CONFLICT DO NOTHING fires-row
+            // PK path as a real fire (AC5). So cascade re-entry dedupes identically.
+            //
+            // An unparseable or over-cap stored condition FAILS CLOSED. It skips
+            // with the distinct `condition_invalid` reason and NO fires row, like
+            // the `validation_failed` precedent below. A "this binary cannot
+            // understand the guard" state must never durably resolve the pair. So a
+            // re-entry re-evaluates it once the fleet is upgraded or the operator
+            // repairs the condition. Honest recovery contract (PR #972 review):
+            // evaluation runs only inside a source terminal commit, and no scanner
+            // re-visits unresolved pairs. So such a re-entry is NOT guaranteed.
+            // Without one, the fire is lost for this terminal. The warn and counter
+            // below are the operator's detection signal (see ConditionGate::Invalid).
             // Neither case fires or errors the terminal commit.
             match gate_stored_condition(trigger_db.condition.as_ref(), &source_output) {
                 ConditionGate::Pass => {}
@@ -1869,18 +1870,17 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 InputMapping::Passthrough => source_output,
                 InputMapping::Static(v) => v,
                 InputMapping::Projection(ref path) => project_json_path(&source_output, path),
-                // Issue #748: assemble the terminal-outcome envelope from the
-                // already-loaded execution row. `output` is threaded only on a
-                // COMPLETED source (else NULL); `error` carries the failure /
-                // cancel reason. This single `target_input` flows to BOTH the
-                // same-shard start and the cross-shard outbox row below, so
-                // inline/outbox parity (AC5) holds by construction.
+                // Issue #748: assemble the terminal-outcome envelope from the execution
+                // row loaded above. `output` is threaded only on a COMPLETED source
+                // (else NULL). `error` carries the failure or cancel reason. This one
+                // `target_input` flows to BOTH the same-shard start and the cross-shard
+                // outbox row below. So inline/outbox parity (AC5) holds by construction.
                 InputMapping::Outcome { ref projection } => {
-                    // Reuse the already-owned `source_output` clone (the guard's
-                    // clone from above) on a COMPLETED source instead of
-                    // re-borrowing `execution.output` and cloning a second time
-                    // inside the builder. `source_output` is unused by this arm
-                    // otherwise, so moving it here is free.
+                    // Reuse the owned `source_output` clone from the guard above on
+                    // a COMPLETED source. That avoids re-borrowing
+                    // `execution.output` and cloning it again inside the builder.
+                    // This arm does not otherwise use `source_output`, so the
+                    // move is free.
                     let output_for_env = if matches!(state, TerminalState::Completed) {
                         Some(source_output)
                     } else {
@@ -1926,7 +1926,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 }
             }
 
-            // Resolve routing + target metadata BEFORE the fires-row insert so
+            // Resolve routing and target metadata BEFORE the fires-row insert. Then
             // the admission-gate check (issue #618) can evaluate every scope
             // (Fleet/WorkflowName/Queue/ShardId/Owner) and record the correct
             // resolved outcome.
@@ -1966,38 +1966,38 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             let run_defaults = target_run_defaults(&trigger_db.target_workflow_name);
             let target_sla = run_defaults.sla.and_then(|d| d.to_std().ok());
 
-            // issue #618: completion triggers are an in-process start producer
-            // and MUST honour an active admission gate. This runs INSIDE the
-            // source workflow's terminal-commit transaction, so a block is a
-            // CLEAN SKIP that NEVER rolls back the source's terminal commit —
-            // mirroring the #810 `condition_unmet` resolved-skip shape. The
-            // blocked start is DROPPED, not deferred: identically to a direct
-            // API start being refused during an incident. The resolved skip is
-            // recorded through the same ON CONFLICT DO NOTHING fires-row PK path
-            // a real fire uses (exactly-once, so cascade re-entry dedupes it and
-            // this terminal never retries the start), with the distinct
-            // `admission_blocked` outcome. When no gate cache is installed (the
-            // common path / standalone integrations) the check is skipped and
-            // resolution below is byte-identical to pre-#618.
+            // Issue #618: completion triggers are an in-process start producer and
+            // MUST honour an active admission gate. This runs INSIDE the source
+            // workflow's terminal-commit transaction. So a block is a CLEAN SKIP
+            // that NEVER rolls back the source's terminal commit, like the #810
+            // `condition_unmet` resolved skip. The blocked start is DROPPED, not
+            // deferred, exactly like a refused direct API start during an incident.
+            // The resolved skip goes through the same ON CONFLICT DO NOTHING
+            // fires-row PK path as a real fire, with the distinct
+            // `admission_blocked` outcome. That path is exactly-once: cascade
+            // re-entry dedupes it, and this terminal never retries the start. With
+            // no gate cache installed (the common path, standalone integrations),
+            // the check is skipped. Resolution below is then byte-identical to
+            // pre-#618.
             //
-            // Fail-closed handling (issue #618): consult the
-            // LAST-KNOWN cached snapshot via `check_cached`, which ignores the
-            // fail-closed/initialized flag and returns only a REAL matching gate
-            // (never the nil sentinel). `set_fail_closed()` retains the snapshot,
-            // so a gate loaded before a transient gate-DB read error still blocks
-            // a matching completion-trigger start (block+drop+count) — otherwise
-            // completion triggers would BYPASS an active gate uncounted during
-            // exactly the incident the gate exists for, while direct API starts
-            // still block. When no cached gate matches (empty snapshot in the boot
-            // window, or a transient blip with no gate targeting this start) we
-            // PROCEED rather than permanently dropping in-flight continuation (a
-            // completion-trigger start cannot retry, unlike an API caller). This
-            // is a deliberate, documented divergence from the API path: when
-            // initialized-and-healthy both see identical gates; under fail-closed
-            // the API blocks everything (caller retries) while triggers honour
-            // only known-cached gates. Bounded caveat: a gate ADDED during a
-            // gate-DB outage (never loaded into the snapshot) does not block
-            // triggers until the next successful refresh.
+            // Fail-closed handling (issue #618): consult the LAST-KNOWN cached
+            // snapshot via `check_cached`. It ignores the fail-closed/initialized
+            // flag and returns only a REAL matching gate, never the nil sentinel.
+            // `set_fail_closed()` retains the snapshot. So a gate loaded before a
+            // transient gate-DB read error still blocks a matching completion-trigger
+            // start (block, drop, count). Otherwise completion triggers would BYPASS
+            // an active gate uncounted during the very incident the gate exists for,
+            // while direct API starts still block. When no cached gate matches, the
+            // start PROCEEDS instead of permanently dropping in-flight continuation.
+            // That covers an empty snapshot in the boot window, or a transient blip
+            // with no gate targeting this start. A completion-trigger start cannot
+            // retry, unlike an API caller. This is a deliberate, documented
+            // divergence from the API path. When initialized and healthy, both see
+            // the same gates. Under fail-closed, the API blocks everything (the
+            // caller retries), while triggers honour only known cached gates.
+            // Bounded caveat: a gate ADDED during a gate-DB outage is never loaded
+            // into the snapshot. It does not block triggers until the next
+            // successful refresh.
             // Resolve the target queue at most ONCE per trigger (issue #618, F9):
             // the gate check below and the same-shard start further down both
             // need it. `None` = not yet resolved (no gate cache installed, so the
@@ -2008,26 +2008,24 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     q.clone()
                 } else if target_shard == source_shard {
                     // Same-shard target: the source transaction connection IS the
-                    // target shard's connection, so resolve directly — no extra
-                    // DB round-trip (preserves the no-gate/same-shard common-case
-                    // property; F9's single-resolution reuse below still applies).
+                    // target shard's connection, so resolve directly, with no extra DB
+                    // round trip. That keeps the no-gate/same-shard common case cheap.
+                    // The single-resolution reuse (F9) below still applies.
                     resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
                 } else {
-                    // Cross-shard target (issue #618, F2 re-review): the outbox
-                    // relay resolves the ACTUAL start queue on the TARGET
-                    // connection at fire time (see
-                    // `enforce_completion_triggers_outbox`). Resolve identically
-                    // here — on a fresh target-shard connection — so the inline
-                    // gate check evaluates the SAME queue the start will use.
-                    // `resolve_cross_shard_target_queue` deliberately takes NO
-                    // source connection: for a target hashing to shard 0, querying
-                    // `harvest_schedules` on the source `conn` would read the wrong
-                    // shard and could miss a Queue(q) gate scoped to the real
-                    // target queue. If the target-shard pool is unavailable it
-                    // falls back to the shard-independent default queue (never the
-                    // source connection); Fleet/name gates still match — only a
-                    // schedule-override Queue gate could be missed in that
-                    // double-fault edge.
+                    // Cross-shard target (issue #618): the outbox relay resolves the
+                    // ACTUAL start queue on the TARGET connection at fire time (see
+                    // `enforce_completion_triggers_outbox`). Resolve it the same way here,
+                    // on a fresh target-shard connection. So the inline gate check
+                    // evaluates the SAME queue the start will use.
+                    // `resolve_cross_shard_target_queue` deliberately takes NO source
+                    // connection. For a target hashing to shard 0, querying
+                    // `harvest_schedules` on the source `conn` would read the wrong shard.
+                    // It could miss a Queue(q) gate scoped to the real target queue. If the
+                    // target-shard pool is unavailable, it falls back to the
+                    // shard-independent default queue, never the source connection.
+                    // Fleet/name gates still match. Only a schedule-override Queue gate
+                    // could be missed in that double-fault edge.
                     resolve_cross_shard_target_queue(&trigger_db.target_workflow_name, target_shard)
                         .await
                 };
@@ -2064,22 +2062,22 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             .execute(conn)
                             .await
                             .map_err(crate::error::database_error)?;
-                    // Resolve the recorder: the caller's explicit param when
-                    // supplied (worker / timeout paths), else the process-global
-                    // recorder the plugin publishes at boot (issue #618, F-round5).
-                    // The cancel / terminate / parent-close-cascade paths in
-                    // `execution.rs` all call this with `metrics: None`, so without
-                    // the fallback a completion-trigger start blocked by a gate on
-                    // one of those terminal paths would be dropped-and-recorded but
-                    // NEVER counted — a hole in the "zero un-counted blocks" bar.
+                    // Resolve the recorder: the caller's explicit param when supplied
+                    // (worker / timeout paths), else the process-global recorder the
+                    // plugin publishes at boot (issue #618). The cancel / terminate /
+                    // parent-close-cascade paths in `execution.rs` all pass
+                    // `metrics: None`. Without the fallback, a gate-blocked
+                    // completion-trigger start on one of those paths would be dropped and
+                    // recorded but NEVER counted. That is a hole in the "zero un-counted
+                    // blocks" bar.
                     let resolved_metrics =
                         crate::admission_gate::resolve_metrics_with_global_fallback(metrics);
                     if let Some(m) = resolved_metrics.as_dyn() {
-                        // Only count the FIRST resolution of this (source, trigger)
-                        // pair (issue #618, F4): cascade re-entry / multi-terminal-
-                        // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
-                        // and must not double-count. Mirrors the sibling
-                        // `condition_unmet` -> `deduped` shape.
+                        // Count only the FIRST resolution of this (source, trigger) pair
+                        // (issue #618, F4). Cascade re-entry, or a re-evaluation from
+                        // another terminal path, hits ON CONFLICT DO NOTHING (inserted == 0)
+                        // and must not double-count. Mirrors the sibling `condition_unmet`
+                        // -> `deduped` shape.
                         if blocked_inserted > 0 {
                             m.record_admission_blocked(scope_kind, &reason);
                         } else {
@@ -2119,7 +2117,6 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 continue;
             }
 
-            // Resolve target concurrency parameters
             // Issue #2407: an operator override wins over the declared limit.
             let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
                 target_concurrency(&trigger_db.target_workflow_name)
@@ -2128,7 +2125,6 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         (key, Some(policy.limit), policy.on_conflict)
                     });
 
-            // Resolve target input caps
             let max_workflow_input_bytes = {
                 let global_default = GLOBAL_MAX_WORKFLOW_INPUT_BYTES.read().as_deref().copied().unwrap_or(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
@@ -2154,20 +2150,18 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                // `_collect` (issue #1197, item 1): a latest-wins supersede
-                // performed by this same-shard target must still be counted
-                // (issue #811), but NOT emitted here. This call runs INSIDE
-                // the source execution's own still-open terminal transaction.
-                // `_with_metrics` used to emit at return. So a rollback of
-                // that enclosing transaction left both
-                // `harvest.concurrency.superseded` and the incumbent's
-                // cancelled terminal counted for a cancellation that never
-                // became durable. `_collect` performs the identical start
-                // (including the nested supersede) but returns the collected
-                // `StartCancelledRun`s instead of emitting them; they are
-                // pushed onto `pending` below and left for the caller of
-                // `evaluate_triggers_for_execution_collecting` to emit once
-                // ITS OWN enclosing transaction has actually committed.
+                // `_collect` (issue #1197, item 1): a latest-wins supersede by this
+                // same-shard target must still be counted (issue #811), but NOT
+                // emitted here. This call runs INSIDE the source execution's own
+                // still-open terminal transaction. `_with_metrics` used to emit at
+                // return. So a rollback of that enclosing transaction left both
+                // `harvest.concurrency.superseded` and the incumbent's cancelled
+                // terminal counted for a cancellation that never became durable.
+                // `_collect` performs the identical start, nested supersede included.
+                // It returns the collected `StartCancelledRun`s instead of emitting
+                // them. They go onto `pending` below. The caller of
+                // `evaluate_triggers_for_execution_collecting` emits them once ITS
+                // OWN enclosing transaction commits.
                 let (start_res, cancel_deferred_starts, cancel_deferred_checks, cancel_metrics) =
                     match start_or_load_workflow_execution_collect_with_codecs(
                     conn,
@@ -2212,11 +2206,11 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     false,
                     false,
                     metrics,
-                    // The inline same-shard completion-trigger start keeps its own
-                    // unlocked pre-check gate above (it also performs the fires-row
-                    // `admission_blocked` bookkeeping and the first-time-only block
-                    // counting that the primitive cannot), so it is not gated again
-                    // here — pass `None` to avoid double-counting (issue #618).
+                    // The inline same-shard start keeps its own unlocked pre-check gate
+                    // above. That gate also does the fires-row `admission_blocked`
+                    // bookkeeping and the first-time-only block counting, which the
+                    // primitive cannot. So it is not gated again here. Pass `None` to
+                    // avoid double-counting (issue #618).
                     None,
                     codecs,
                 )
@@ -2240,13 +2234,11 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             "Oversized trigger input payload; skipping trigger execution."
                         );
                         // Resolve the fires row inserted above, same as the
-                        // cross-shard outbox's own PayloadTooLarge arm
-                        // (Codex follow-up x15). This inline start runs on
-                        // `conn`, inside the source's own still-open
-                        // terminal transaction. A plain update on the same
-                        // connection is enough. No separate claim or
-                        // transaction is needed the way the outbox path
-                        // requires.
+                        // cross-shard outbox's own PayloadTooLarge arm (issue #1401).
+                        // This inline start runs on `conn`, inside the source's own
+                        // still-open terminal transaction. A plain update on the same
+                        // connection is enough. No separate claim or transaction is
+                        // needed the way the outbox path requires.
                         diesel::update(
                             fires_dsl::harvest_completion_trigger_fires
                                 .filter(fires_dsl::source_exec_id.eq(exec_id.as_uuid()))
@@ -2261,45 +2253,39 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         }
                         continue;
                     }
-                    // issue #946: a same-shard target's
-                    // per-tenant quota is exhausted right now. This branch runs
-                    // INLINE inside the SOURCE execution's own terminal
-                    // transaction (see the fn's callers in worker.rs/timeout.rs/
-                    // execution.rs/poison_pill.rs, all of which commit this
-                    // trigger evaluation as part of sealing the source's terminal
-                    // state) -- unlike the `Blocked`/`QuotaBlocked` handling in
-                    // `relay_gate_checked_start` above, which only ever runs
-                    // AFTER that transaction has already committed. So neither
-                    // of that function's two options apply here as-is:
-                    // propagating the error via `?`/`return Err(e)` (the
-                    // pre-fix behaviour) rolls back the SOURCE's own
-                    // completion/failure right along with the blocked trigger --
-                    // a full tenant quota can therefore wedge every unrelated
-                    // source workflow that happens to fire a trigger at this
-                    // target, forever, until the quota frees up on its own.
-                    // `continue`-ing like the `PayloadTooLarge` arm above is
-                    // also wrong. An oversized payload can never succeed, no
-                    // matter how many retries. A quota is a TEMPORARY
-                    // condition. So silently dropping the trigger here would
-                    // permanently lose it.
+                    // Issue #946: a same-shard target's per-tenant quota is exhausted
+                    // right now. This branch runs INLINE inside the SOURCE execution's
+                    // own terminal transaction. The callers in worker.rs/timeout.rs/
+                    // execution.rs/poison_pill.rs all commit this trigger evaluation as
+                    // part of sealing the source's terminal state. The `Blocked`/
+                    // `QuotaBlocked` handling in `relay_gate_checked_start` above
+                    // differs: it runs only AFTER that transaction has committed. So
+                    // neither of that function's two options applies here as-is.
+                    // Propagating the error via `?`/`return Err(e)` (the pre-fix
+                    // behaviour) rolls back the SOURCE's own completion/failure along
+                    // with the blocked trigger. A full tenant quota could then wedge
+                    // every unrelated source workflow that fires a trigger at this
+                    // target. That lasts until the quota frees up on its own.
+                    // `continue`-ing like the `PayloadTooLarge` arm above is also wrong.
+                    // An oversized payload can never succeed, no matter how many retries.
+                    // A quota is a TEMPORARY condition. So silently dropping the trigger
+                    // here would permanently lose it.
                     //
-                    // The fix: fall back to the exact same durable outbox +
-                    // `DeferredTriggerStart` retry mechanism the cross-shard
-                    // branch below already uses for every one of its starts,
-                    // with `target_shard == source_shard`. The outbox row is
-                    // inserted on THIS connection, so it commits atomically
-                    // with the source's own terminal transaction (never
-                    // orphaned by a rollback, never leaked by a commit that
-                    // somehow skipped it); `enforce_completion_triggers_outbox`
-                    // already scans by `target_shard.eq_any(shard_assignments)`
-                    // with no same-shard-vs-cross-shard distinction, so it
-                    // requires no change to retry this row on its own shard.
-                    // The trigger's own `harvest.quota.rejected` metric was
-                    // already recorded by `enforce_quota_admission` inside the
-                    // failed start attempt above; only `completion_trigger_fired`
-                    // needs recording here, using the SAME "started" label the
-                    // cross-shard branch uses for "queued for async delivery"
-                    // (as opposed to "delivered") -- see the `else` branch below.
+                    // The fix: fall back to the same durable outbox plus
+                    // `DeferredTriggerStart` retry mechanism that the cross-shard branch
+                    // below uses for every start, with `target_shard == source_shard`.
+                    // The outbox row is inserted on THIS connection. So it commits
+                    // atomically with the source's own terminal transaction. A rollback
+                    // never orphans it, and a commit never leaks it.
+                    // `enforce_completion_triggers_outbox` already scans by
+                    // `target_shard.eq_any(shard_assignments)`, with no same-shard vs
+                    // cross-shard distinction. So it needs no change to retry this row on
+                    // its own shard. `enforce_quota_admission` already recorded the
+                    // trigger's `harvest.quota.rejected` metric inside the failed start
+                    // attempt above. Only `completion_trigger_fired` needs recording
+                    // here. It uses the SAME "started" label that the cross-shard branch
+                    // uses for "queued for async delivery", as opposed to "delivered".
+                    // See the `else` branch below.
                     Err(crate::error::HarvestError::QuotaExceeded {
                         key,
                         resource,
@@ -2380,14 +2366,13 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     Err(e) => return Err(e),
                 };
 
-                // Mirrors `start_or_load_workflow_execution_with_metrics`'s own
-                // post-`_collect` bookkeeping: spawn this start's own deferred
-                // follow-ups and run its unfinished-handler checks immediately
-                // (unchanged from before this fix — that timing is not the
-                // issue #1197 residual). Only the cancellation SAMPLES are new:
-                // pushed onto `pending` rather than emitted, for the caller of
-                // `evaluate_triggers_for_execution_collecting` to emit after ITS
-                // enclosing transaction commits.
+                // Mirrors the post-`_collect` bookkeeping of
+                // `start_or_load_workflow_execution_with_metrics`: spawn this start's
+                // deferred follow-ups and run its unfinished-handler checks at once.
+                // That timing is not the issue #1197 residual. Only the cancellation
+                // SAMPLES differ: they go onto `pending`, not out as metrics. The
+                // caller of `evaluate_triggers_for_execution_collecting` emits them
+                // after ITS enclosing transaction commits.
                 for start in cancel_deferred_starts {
                     start.spawn();
                 }
@@ -2859,15 +2844,15 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
         };
 
         // Existence-aware relay-time start/block via `gate_checked_start_or_load`
-        // (issue #618, F-round13): identical to the immediate `spawn()` relay, and
-        // now robust to a STALE outbox row whose target ALREADY exists (the
-        // immediate relay started the target but then failed to delete the source
-        // row). On this retry the locked-live target is treated as DELIVERED (delete
-        // outbox + count bypass), never wrongly blocked/dropped. A fresh target with
-        // a matching gate is blocked (drop outbox + mark fires `admission_blocked` +
-        // count block); a fresh target with no gate is a counted bypass. All gated on
-        // the source-shard delete for exactly-once vs the immediate relay. `conn` is
-        // the source shard.
+        // (issue #618), identical to the immediate `spawn()` relay. It is robust to
+        // a STALE outbox row whose target ALREADY exists. The immediate relay leaves
+        // one when it starts the target but then fails to delete the source row. On
+        // this retry the locked-live target is DELIVERED (delete outbox, count a
+        // bypass), never wrongly blocked or dropped. A fresh target with a matching
+        // gate is blocked: drop the outbox row, mark fires `admission_blocked` and
+        // count a block. A fresh target with no gate is a counted bypass. All of
+        // this is gated on the source-shard delete, for exactly-once against the
+        // immediate relay. `conn` is the source shard.
         match relay_gate_checked_start(
             &mut target_conn,
             conn,
@@ -2898,14 +2883,13 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 // permanent, correctly-handled rejection as a delivered
                 // relay whose target is missing (issue #1401).
                 //
-                // Both writes commit or roll back TOGETHER (issue #1401,
-                // Codex follow-up). Two separate autocommitted statements
-                // left a crash window between them. The outbox row gone
-                // but the fires row still `outcome IS NULL` is EXACTLY the
-                // shape a restore-verification pass reads as a lost
-                // delivery. A rolled-back transaction leaves the outbox row
-                // in place, so the next scanner tick retries this same
-                // rejection from scratch.
+                // Both writes commit or roll back TOGETHER (issue #1401).
+                // Two separate autocommitted statements left a crash window
+                // between them. The outbox row gone but the fires row still
+                // `outcome IS NULL` is EXACTLY the shape a restore-verification
+                // pass reads as a lost delivery. A rolled-back transaction
+                // leaves the outbox row in place, so the next scanner tick
+                // retries this same rejection from scratch.
                 tracing::error!(
                     target_workflow = %task.target_workflow_name,
                     kind = %kind,
@@ -2915,22 +2899,20 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 );
 
                 // Claim (delete) the outbox row FIRST, and check delivery
-                // LAST (issue #1401, Codex follow-up x8). Checking first
-                // left a window. Another attempt could deliver the target
-                // and roll back only its OWN outbox delete, in between our
-                // check and our delete. Our check would never see that.
-                // Deleting first closes the window. Once our delete
-                // commits, no other attempt can touch this row again. An
-                // existence check run immediately after is therefore the
-                // last possible look, and cannot miss a delivery that beat
-                // us to the target.
+                // LAST (issue #1401). Checking first left a window. Another
+                // attempt could deliver the target and roll back only its OWN
+                // outbox delete, between this check and this delete. This
+                // check would never see that. Deleting first closes the
+                // window. Once this delete commits, no other attempt can touch
+                // the row again. An existence check right after it is the last
+                // possible look. It cannot miss a delivery that reached the
+                // target first.
                 //
-                // The claim, the check, and the fires update all run
-                // inside ONE open transaction (issue #1401, Codex follow-up
-                // x9), not as separate steps. A failure at any step rolls
-                // back the delete too. The outbox row is restored for the
-                // next scan tick to retry, instead of being permanently
-                // lost while `fires.outcome` stays NULL.
+                // The claim, the check, and the fires update all run inside
+                // ONE open transaction (issue #1401), not as separate steps. A
+                // failure at any step rolls back the delete too. The outbox row
+                // is restored for the next scan tick to retry. It is not lost
+                // for good while `fires.outcome` stays NULL.
                 let resolved: Result<bool, crate::error::HarvestError> =
                     Box::pin(conn.transaction(async |tx| {
                         let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
@@ -2939,8 +2921,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             .await
                             .map_err(crate::error::database_error)?;
                         // Zero rows deleted means another attempt already
-                        // claimed and resolved this row (issue #1401, Codex
-                        // follow-up). Nothing left for us to do.
+                        // claimed and resolved this row (issue #1401). Nothing
+                        // is left to do.
                         if deleted == 0 {
                             return Ok(false);
                         }
@@ -2952,10 +2934,9 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                         )
                         .await?
                             // A LIVE check alone is not proof of non-delivery
-                            // (issue #1401, Codex follow-up x10): retention
-                            // can remove the row within seconds of
-                            // completion. A summary, when the deployment
-                            // captures one, outlives that window.
+                            // (issue #1401): retention can remove the row
+                            // within seconds of completion. A summary, when
+                            // the deployment captures one, outlives that window.
                             || crate::execution::execution_summary_exists_by_key(
                                 &mut target_conn,
                                 &task.target_workflow_name,
@@ -2973,7 +2954,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                             return Ok(false);
                         }
 
-                        // Neither check proved delivery here (Codex follow-up).
+                        // Neither check proved delivery here.
                         // Per `execution_summary_exists_by_key`'s own doc
                         // comment, that is still not proof of NON-delivery
                         // when summaries are disabled or expired.
@@ -3017,10 +2998,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                              permanently-rejected fire; backing off this outbox row"
                         );
                         // The whole transaction rolled back on any Err, so
-                        // the outbox row is untouched here (issue #1401,
-                        // Codex follow-up). Without this backoff it would
-                        // retry at full poll cadence forever, mirroring the
-                        // generic error arm below.
+                        // the outbox row is untouched here (issue #1401).
+                        // Without this backoff it would retry at full poll
+                        // cadence forever, mirroring the generic error arm
+                        // below.
                         stamp_outbox_relay_backoff(conn, task.id).await;
                     }
                     Ok(true) => {}
@@ -3246,9 +3227,9 @@ mod tests {
 
     #[test]
     fn outcome_mapping_projection_missing_path_yields_null() {
-        // Graceful degradation for the `Outcome` variant: a projection path
-        // that does not exist in the envelope resolves to `Null` (same as the
-        // inline arm's `project_json_path(&envelope, path)`), never an error.
+        // Graceful degradation for the `Outcome` variant. A projection path
+        // that is not in the envelope resolves to `Null`, never an error. That
+        // matches the inline arm's `project_json_path(&envelope, path)`.
         let exec_id = crate::types::ExecutionId::new();
         let env = build_outcome_envelope(
             exec_id,
@@ -3263,9 +3244,9 @@ mod tests {
 
     #[test]
     fn outcome_envelope_terminated_state() {
-        // TERMINATED is a valid trigger-firing terminal state (issue #504) not
-        // named in AC1 but must produce a coherent envelope: the terminate
-        // reason lands in `error`, output is null.
+        // TERMINATED is a valid trigger-firing terminal state (issue #504).
+        // AC1 does not name it, but it must produce a coherent envelope: the
+        // terminate reason lands in `error`, and output is null.
         let exec_id = crate::types::ExecutionId::new();
         let env = build_outcome_envelope(
             exec_id,
@@ -3513,7 +3494,7 @@ mod tests {
 
     #[test]
     fn condition_large_integers_compare_exactly() {
-        // Two distinct integers above 2^53 must never compare equal: the
+        // Two distinct integers above 2^53 must never compare equal. The
         // exact-integer fast path bypasses lossy f64 coercion entirely
         // (2^53 = 9007199254740992; +1 is unrepresentable in f64).
         let out = json!({
@@ -3968,9 +3949,9 @@ mod tests {
             gate_stored_condition(Some(&over_cap), &out),
             ConditionGate::Invalid
         );
-        // A stored JSONB `'null'` (JSON null, not SQL NULL — only writable
-        // via direct SQL / external tooling) is Some(&Value::Null): a parse
-        // error → Invalid, fail closed, never a legacy-style Pass.
+        // A stored JSONB `'null'` is Some(&Value::Null). That is JSON null,
+        // not SQL NULL, and only direct SQL or external tooling can write it.
+        // It is a parse error → Invalid, fail closed, never a legacy-style Pass.
         assert_eq!(
             gate_stored_condition(Some(&Value::Null), &out),
             ConditionGate::Invalid

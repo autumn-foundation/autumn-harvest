@@ -200,11 +200,11 @@ fn from_history_opens_timer_and_child_awaitables() {
 
 #[test]
 fn a_signal_win_closes_its_event_less_reserved_race_timer() {
-    // A signal-win of a signal-or-deadline race (#476) tears
-    // the reserved deadline timer down through an EVENT-LESS `CancelRaceLosers`
-    // row delete — no `TimerFired`, no `TimerCancelled`. Closing timers only on
-    // those two events leaves the loser open for every later step, rendering a
-    // resolved race as a run still waiting on a timer.
+    // A signal-win of a signal-or-deadline race (#476) tears the reserved
+    // deadline timer down with an EVENT-LESS `CancelRaceLosers` row delete. No
+    // `TimerFired` or `TimerCancelled` follows. Closing timers only on those two
+    // events leaves the loser open for every later step. A resolved race then
+    // shows as a run still waiting on a timer.
     let events = vec![
         started(),
         WorkflowEvent::TimerStarted {
@@ -297,9 +297,9 @@ fn an_ordinary_timer_survives_an_unrelated_signal() {
 
 #[test]
 fn a_timer_win_leaves_no_double_close_for_a_late_signal() {
-    // A timer-win recorded `TimerFired` first, so the arm is already closed and
-    // a genuinely LATE signal is a no-op — it must not reach past the reserved
-    // arm and close an unrelated open timer.
+    // A timer-win recorded `TimerFired` first, so the arm is already closed. A
+    // genuinely LATE signal is a no-op. It must not reach past the reserved arm
+    // and close an unrelated open timer.
     let events = vec![
         started(),
         WorkflowEvent::TimerStarted {
@@ -606,10 +606,10 @@ async fn diff_identifies_the_first_divergent_command_step() {
 
 // ── Regressions: dispatch options are part of a command's identity
 //
-// A `CommandSnapshot` is the diff key. If it carries only a command's *name*
-// and *input*, two builds that dispatch the same activity with different
-// scheduling options compare EQUAL and the debugger reports a false clean —
-// the single worst outcome for a divergence-finding tool. These pin the
+// A `CommandSnapshot` is the diff key. Suppose it carries only a command's
+// *name* and *input*. Two builds that dispatch the same activity with different
+// scheduling options then compare EQUAL, and the debugger reports a false
+// clean. That is the worst outcome for a divergence-finding tool. These pin the
 // known classes (`ScheduleExternalActivity` queue/deadline,
 // `ScheduleActivity` per-call retry/timeout overrides). The summary label
 // alone does not distinguish them.
@@ -778,9 +778,9 @@ async fn a_start_to_close_only_change_on_an_activity_is_a_divergence() {
 // ── Regressions: timeouts, builder defaults and caller-chosen keys ──────────
 
 /// A local activity whose per-call timeout is sub-second. Only the typed
-/// `_with_opts` path carries a full `Duration` — the public `_raw` escape
-/// hatch takes whole seconds — so the test drives the typed API, which is also
-/// the one an application uses.
+/// `_with_opts` path carries a full `Duration`. The public `_raw` escape hatch
+/// takes whole seconds. So the test drives the typed API, which applications
+/// also use.
 #[allow(clippy::unused_async)] // the #[activity] macro requires an `async fn`.
 #[activity(local = true, start_to_close = "5s")]
 async fn checksum(_ctx: &autumn_harvest::context::ActivityContext) -> Result<Value, String> {
@@ -828,9 +828,9 @@ fn local_activity_900ms<'a>(
 async fn a_subsecond_local_activity_timeout_change_is_a_divergence() {
     // A caller passes a raw `Duration`, so a local activity legitimately
     // carries a sub-second timeout. Rendering it through `as_secs()` collapses
-    // 100ms and 900ms to the same `0` and the two builds compare EQUAL — the
-    // same false-clean class as the queue/deadline drops, reintroduced by the
-    // fix for them.
+    // 100ms and 900ms to the same `0`, and the two builds compare EQUAL. That
+    // is the false-clean class of the queue/deadline drops. Their fix
+    // reintroduced it.
     let div = diff_two_builds(
         "local_wf",
         vec![started()],
@@ -937,10 +937,10 @@ async fn candidate_activity_retry_default_reaches_prefix_replay() {
 
 #[test]
 fn a_uuid_shaped_idempotency_key_is_compared_not_normalized() {
-    // `idempotency_key` (#521) is a CALLER-chosen exactly-once key, very
-    // commonly a UUID. Normalizing it because it *looks* like an engine id
-    // would make two genuinely different histories compare equal — so
-    // per-run normalization keys on the field NAME, never on the value shape.
+    // `idempotency_key` (#521) is a CALLER-chosen exactly-once key, often a
+    // UUID. Normalizing it because it *looks* like an engine id would make two
+    // different histories compare equal. So per-run normalization keys on the
+    // field NAME, never on the value shape.
     let request = |key: &str| {
         vec![
             started(),
@@ -1051,11 +1051,11 @@ fn mutex_park<'a>(
 
 #[tokio::test]
 async fn a_mutex_park_is_reported_as_an_open_awaitable() {
-    // A parked `ctx.mutex(k).acquire()` has no opening *event* — the waiter row
-    // lives in `harvest_mutex_waiters` and only the grant records
-    // `MutexGranted` — so it is visible solely as a frontier `AcquireMutex`
-    // command. Without synthesis the debugger would show a mutex-blocked run as
-    // waiting on nothing at all.
+    // A parked `ctx.mutex(k).acquire()` has no opening *event*. The waiter row
+    // lives in `harvest_mutex_waiters`, and only the grant records
+    // `MutexGranted`. So only a frontier `AcquireMutex` command shows it.
+    // Without synthesis, the debugger would show a mutex-blocked run as waiting
+    // on nothing.
     let trace = debugger("mutex_wf", mutex_park)
         .trace_snapshot(snapshot("mutex_wf", vec![started()]))
         .await
@@ -1078,13 +1078,14 @@ async fn a_mutex_park_is_reported_as_an_open_awaitable() {
 
 // ── Success metric: the ≥10-scenario divergence corpus ──────────────────────
 //
-// Issue #949's success metric: "On a seeded corpus of ≥10 divergence scenarios
-// (drawn from `NonDeterminismKind` classes: SideEffectDrift, count-mismatch
-// fan-out, reordered commands, version-gate changes), the diff mode identifies
-// the exact first divergent command index in 10/10."
+// Issue #949's success metric: the diff mode identifies the exact first
+// divergent command index in 10/10 of a seeded corpus of ≥10 divergence
+// scenarios. The scenarios come from `NonDeterminismKind` classes:
+// SideEffectDrift, count-mismatch fan-out, reordered commands, version-gate
+// changes.
 //
-// Each scenario below pairs a BASELINE handler (which recorded the history)
-// with a CANDIDATE handler (the "new build"), and asserts `diff_traces`
+// Each scenario below pairs a BASELINE handler, which recorded the history,
+// with a CANDIDATE handler (the "new build"). It asserts that `diff_traces`
 // reports the divergence at the exact expected step.
 
 macro_rules! wf {
@@ -1207,9 +1208,9 @@ wf!(fan_out_three, ctx, {
 });
 
 // 13. Fan-out whose *second* slot's input changed. The `fan_out:` marker and
-// slot 0 are identical, so the first divergent *command* is not index 0 — the
-// one scenario that proves the corpus asserts a real command index rather than
-// a constant.
+// slot 0 are identical, so the first divergent *command* is not index 0. Only
+// this scenario proves that the corpus asserts a real command index, not a
+// constant.
 wf!(fan_out_two_changed_tail, ctx, {
     ctx.execute_activity_fan_out_raw(vec![
         ("worker".to_string(), json!(0), "default".to_string()),
@@ -1282,9 +1283,9 @@ struct Scenario {
     /// The expected `DiffKind::CommandMismatch { command_index }`, or `None`
     /// when the scenario resolves as a different kind.
     ///
-    /// The issue's success metric names the *command* index, so asserting only
-    /// the step index would leave that dimension unproven — and a stub
-    /// hardcoding `command_index: 0` would satisfy every scenario.
+    /// The issue's success metric names the *command* index. Asserting only the
+    /// step index would leave that dimension unproven. A stub hardcoding
+    /// `command_index: 0` would then satisfy every scenario.
     expected_command_index: Option<usize>,
 }
 
@@ -1492,10 +1493,10 @@ async fn diff_reports_trace_length_when_one_side_is_capped_shorter() {
     let div = diff_traces(&left, &right)
         .divergence
         .expect("differing trace lengths must be reported");
-    // `capped: true` marks this as a *cap artefact* — the right trace was
-    // truncated by `max_steps`, so the length difference says nothing about
-    // the two traces themselves. Without it, diffing traces built with
-    // different caps would silently report a divergence that does not exist.
+    // `capped: true` marks this as a *cap artefact*. `max_steps` truncated the
+    // right trace, so the length difference says nothing about the two traces.
+    // Without it, diffing traces built with different caps would silently
+    // report a divergence that does not exist.
     assert!(matches!(
         div.kind,
         DiffKind::TraceLength {
@@ -1530,9 +1531,10 @@ async fn first_divergence_breakpoint_finds_the_diverging_step() {
 // AC3, second arm: diffing two *fixture histories* (no registered code).
 //
 // A handler-free trace emits no commands at all, so the only available signal
-// is the history-derived facts. These pin that (a) a semantic difference is
-// caught, and (b) per-run identity noise is normalized away — without which the
-// arm would report a divergence at the first activity of every real pair.
+// is the history-derived facts. These pin two things. (a) The diff catches a
+// semantic difference. (b) It normalizes per-run identity noise away. Without
+// that, the arm would report a divergence at the first activity of every real
+// pair.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn fixture_pair_events(activity_name: &str) -> Vec<WorkflowEvent> {
@@ -1586,11 +1588,10 @@ fn a_renamed_activity_diverges_at_the_scheduling_step() {
 
 #[test]
 fn a_changed_activity_input_diverges_at_the_scheduling_step() {
-    // The input is application data — a semantic field of `ActivityScheduled`
-    // that is compared verbatim (never normalized away). It is caught by
-    // `event_facts`, the exhaustive whole-event backstop, rather than by one of
-    // the curated projections, which is exactly the point: no curated list has
-    // to remember `input`.
+    // The input is application data, a semantic field of `ActivityScheduled`.
+    // The diff compares it verbatim and never normalizes it away. `event_facts`,
+    // the exhaustive whole-event backstop, catches it, not a curated
+    // projection. That is the point: no curated list has to remember `input`.
     let left = handler_free_trace(&fixture_pair_events("charge"));
     let mut right_events = fixture_pair_events("charge");
     if let WorkflowEvent::ActivityScheduled { input, .. } = &mut right_events[1] {
@@ -1687,9 +1688,9 @@ fn a_custom_side_effect_value_is_compared_verbatim() {
 /// The debugger source must never reach for persistence.
 ///
 /// AC5 ("no engine-runtime change; read-only by construction") is otherwise
-/// only true by inspection. This makes it falsifiable: adding a `diesel` call,
-/// a `store::` write, or an event append to `debugger.rs` fails the build's
-/// own test suite rather than passing review unnoticed.
+/// only true by inspection. This test makes it falsifiable. A `diesel` call, a
+/// `store::` write, or an event append in `debugger.rs` fails the build's own
+/// test suite. It does not pass review unnoticed.
 #[test]
 fn debugger_source_never_touches_persistence() {
     let src = include_str!("../../src/debugger.rs");
@@ -1795,10 +1796,10 @@ async fn a_panicking_workflow_is_contained() {
 
 #[tokio::test]
 async fn a_spinning_build_is_not_certified_as_replaying_cleanly() {
-    // A step that timed out reports `divergence: None`
-    // because the replay never finished, not because the build agreed — so the
-    // old documented check (scan for `divergence.is_some()`) certified a
-    // workflow that spins forever as replaying cleanly. `is_clean()` refuses.
+    // A step that timed out reports `divergence: None` because the replay
+    // never finished, not because the build agreed. So the old documented check
+    // (scan for `divergence.is_some()`) certified a workflow that spins forever
+    // as replaying cleanly. `is_clean()` refuses.
     fn spins<'a>(
         _ctx: &'a WorkflowContext,
         _input: Value,
@@ -2037,9 +2038,9 @@ async fn the_candidate_payload_cap_is_applied_during_prefix_replay() {
 
     // A candidate that lowers the cap below the input rejects it with
     // `PayloadTooLarge`, so the handler returns early instead of parking. Left
-    // unthreaded, this trace would be byte-identical to the permissive one —
-    // the false-GREEN direction, where the debugger accepts a dispatch the
-    // promoted worker will reject.
+    // unthreaded, this trace would be byte-identical to the permissive one.
+    // That is the false-GREEN direction: the debugger accepts a dispatch that
+    // the promoted worker will reject.
     let strict = ReplayDebugger::new()
         .register_fn("wf", dispatches_a_big_input)
         .payload_caps(16, 0, 0)
@@ -2059,8 +2060,8 @@ async fn the_candidate_payload_cap_is_applied_during_prefix_replay() {
 #[tokio::test]
 async fn the_candidate_offload_threshold_exempts_an_over_cap_payload() {
     // The false-RED direction (#524): an over-cap payload is *offloaded*, not
-    // rejected, so a debugger that knows the cap but not the threshold reports
-    // a divergence the promoted worker would never hit.
+    // rejected. A debugger that knows the cap but not the threshold reports a
+    // divergence that the promoted worker would never hit.
     let history = vec![started()];
 
     let capped_only = ReplayDebugger::new()
@@ -2136,8 +2137,8 @@ async fn a_full_export_is_accepted() {
 #[tokio::test]
 async fn a_signal_park_opens_a_signal_awaitable() {
     // AC1 lists signal waits among the open awaitables. A signal wait has no
-    // opening *event*, so it is synthesized from the frontier command — which
-    // means it is only available on a handler-backed trace.
+    // opening *event*, so the debugger synthesizes it from the frontier command.
+    // Only a handler-backed trace has it.
     fn waits<'a>(
         ctx: &'a WorkflowContext,
         _input: Value,
@@ -2171,12 +2172,11 @@ async fn a_signal_park_opens_a_signal_awaitable() {
 
 // ── AC3: the remaining `DiffKind` variants ──────────────────────────────────
 //
-// `CommandMismatch`, `HistoryFacts` and `TraceLength` are all exercised
-// end-to-end by the corpus and the trace-length test above. `CommandCount` and
-// `Outcome` are *comparator* behaviours that only fire when the two sides agree
-// on every shared command — a shape no pair of real builds in the corpus
-// produces — so they are asserted directly against `diff_traces`, which is the
-// unit under test either way.
+// The corpus and the trace-length test above exercise `CommandMismatch`,
+// `HistoryFacts` and `TraceLength` end-to-end. `CommandCount` and `Outcome`
+// are *comparator* behaviours. They fire only when the two sides agree on every
+// shared command, and no pair of real builds in the corpus does. So these
+// tests assert them directly against `diff_traces`, the unit under test.
 
 /// A minimal step carrying only the fields these comparator tests vary.
 const fn bare_step(
@@ -2393,8 +2393,8 @@ fn two_recordings_of_different_workflow_types_diverge() {
 #[test]
 fn differing_execution_ids_alone_are_not_a_divergence() {
     // The guard on the fix above: `execution_id` differs on EVERY pair of
-    // independent recordings, so comparing it alongside `workflow_name` would
-    // fabricate a divergence on every fixture-vs-fixture diff.
+    // independent recordings. Comparing it with `workflow_name` would fabricate
+    // a divergence on every fixture-vs-fixture diff.
     let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
     let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
     let right = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
@@ -2406,10 +2406,10 @@ fn differing_execution_ids_alone_are_not_a_divergence() {
 
 #[test]
 fn equally_capped_traces_are_inconclusive_not_clean() {
-    // Both traces hit the SAME cap, so their step counts are equal and the
-    // `TraceLength` check — the only one carrying a `capped` flag — never
-    // fires. A difference living past the cap is then reported as silence.
-    // `is_clean()` is what refuses to call that a pass.
+    // Both traces hit the SAME cap, so their step counts are equal. The
+    // `TraceLength` check, the only one with a `capped` flag, never fires. A
+    // difference past the cap then shows as silence. `is_clean()` refuses to
+    // call that a pass.
     let long = |tail: &str| {
         vec![
             started(),
@@ -2447,12 +2447,12 @@ fn an_uncapped_agreeing_comparison_is_clean() {
 
 #[test]
 fn a_handler_free_fixture_diff_is_conclusive_not_inconclusive() {
-    // The carve-out that keeps AC3's compare-two-recordings mode working — and
-    // the CLI's primary diff path with it. A handler-free projection is
-    // `NotReplayed` at every step, but that is *by design*, not a failed
-    // replay: the comparison is over history-derived facts, which the two
-    // recordings determine completely. Folding `NotReplayed` in with
-    // timed-out/panicked would make every fixture diff exit 2.
+    // This carve-out keeps AC3's compare-two-recordings mode working, and the
+    // CLI's primary diff path with it. A handler-free projection is
+    // `NotReplayed` at every step. That is *by design*, not a failed replay. The
+    // comparison is over history-derived facts, which the two recordings
+    // determine completely. Folding `NotReplayed` in with timed-out/panicked
+    // would make every fixture diff exit 2.
     let events = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
     let left = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
     let right = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
@@ -2476,9 +2476,8 @@ fn a_handler_free_fixture_diff_is_conclusive_not_inconclusive() {
 fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
     // Signal names are not restricted to one token, and a `WaitForSignal`
     // summary IS the whole name with no qualifier. Splitting it on whitespace
-    // made `SignalName("order approved")` unmatchable at precisely the step a
-    // breakpoint is for: a waiting frontier, where no `SignalReceived` exists
-    // yet to match instead.
+    // made `SignalName("order approved")` unmatchable at the step a breakpoint
+    // is for. That is a waiting frontier, where no `SignalReceived` exists yet.
     let step = bare_step(
         0,
         vec![cmd("WaitForSignal", "order approved")],
@@ -2508,13 +2507,12 @@ fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
 
 #[test]
 fn an_activity_breakpoint_matches_a_multi_word_name_at_a_dispatching_frontier() {
-    // The sibling of the signal case above, and the same failure: an activity
-    // name is the free-form `#[activity]` fn name or an
-    // `execute_activity_raw` string, so nothing restricts it to one token.
-    // Tokenizing `ScheduleActivity`'s `"{name} -> {queue}"` summary on
-    // whitespace made `ActivityName("charge card")` unmatchable at exactly the
-    // step the breakpoint is for — a dispatching frontier, where no
-    // `ActivityScheduled` event exists yet to match instead.
+    // The sibling of the signal case above, with the same failure. An activity
+    // name is the free-form `#[activity]` fn name or an `execute_activity_raw`
+    // string, so nothing restricts it to one token. Tokenizing the
+    // `"{name} -> {queue}"` summary of `ScheduleActivity` on whitespace made
+    // `ActivityName("charge card")` unmatchable at the step the breakpoint is
+    // for. That is a dispatching frontier, where no `ActivityScheduled` exists.
     let trace = ReplayTrace {
         workflow_name: "wf".to_string(),
         execution_id: ExecutionId::new(),
@@ -2566,7 +2564,7 @@ fn an_activity_breakpoint_survives_a_name_containing_the_queue_separator() {
 }
 
 /// A workflow that opens a worker session (issue #606) and then dispatches a
-/// member activity — the shape whose session identity is minted fresh per run.
+/// member activity. This shape mints a fresh session identity per run.
 fn session_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2588,8 +2586,8 @@ async fn two_identical_registrations_agree_across_a_frontier_session_mint() {
     // `ctx.create_session` mints a fresh `SessionId::new()` at the frontier and
     // records it as `MarkerRecorded { name: "session:0", details: <uuid> }`.
     // Comparing that UUID verbatim makes two runs of the *same code* disagree
-    // on the very first frontier step — a fabricated divergence that buries
-    // every real one behind it.
+    // on the first frontier step. That fabricated divergence buries every real
+    // one behind it.
     let snapshot = snapshot("sessioned", vec![started()]);
     let dbg = debugger("sessioned", session_workflow);
 
@@ -2619,9 +2617,9 @@ async fn two_identical_registrations_agree_across_a_frontier_session_mint() {
 #[tokio::test]
 async fn two_recordings_agree_when_only_their_session_marker_differs() {
     // The fixture-vs-fixture arm (AC3's second mode): two independent
-    // recordings of the same logical run carry different session UUIDs, which
-    // `history_fact_diff` compared verbatim through `markers` (and, behind it,
-    // `event_facts`).
+    // recordings of the same logical run carry different session UUIDs.
+    // `history_fact_diff` compared them verbatim through `markers` and, behind
+    // it, `event_facts`.
     let recording = |session: &str| {
         vec![
             started(),
@@ -2716,11 +2714,11 @@ fn progress_query_info(workflow: &'static str) -> autumn_harvest::info::QueryHan
 #[tokio::test]
 async fn declarative_query_handlers_are_registered_before_the_body_runs() {
     // The live worker registers a workflow's declarative handlers before any
-    // workflow code runs, and `list_query_names` merges them in — so a body
-    // that branches on them observes them. They live in no `WorkflowEvent`, so
-    // a replay that never registers them runs every prefix against an empty
-    // registry and takes the *other* branch: a divergence invented by the
-    // debugger on code nobody changed.
+    // workflow code runs, and `list_query_names` merges them in. So a body that
+    // branches on them observes them. They live in no `WorkflowEvent`. A replay
+    // that never registers them runs every prefix against an empty registry and
+    // takes the *other* branch. The debugger then invents a divergence on code
+    // nobody changed.
     let snapshot = snapshot("gated", vec![started()]);
 
     let with = ReplayDebugger::new()

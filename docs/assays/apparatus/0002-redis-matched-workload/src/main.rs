@@ -2,17 +2,17 @@
 // autumn-harvest-redis's existing public API only; it does not modify or
 // depend on any workspace crate other than that one.
 //
-// Reproduces docs/performance.md's "Claim latency vs backlog depth" scenario
-// shape against RedisTaskQueue instead of Postgres: 8 concurrent claimers,
-// backlog spread round-robin across 4 queues, a bounded-fraction claim-only
-// draw (never more than a fifth of the seeded backlog), split exactly across
-// claimers. The scenario constants and helper functions below are ported by
-// value from `autumn-harvest/tests/integration/claim_bench_support.rs`
-// (`measured_claims_for`, `claims_for_claimer`, `measured_window`), not
-// re-derived from the docs prose, so this apparatus measures the same shape
-// docs/performance.md's table does. See
+// Reproduces the "Claim latency vs backlog depth" scenario of docs/performance.md
+// against RedisTaskQueue instead of Postgres. The shape: 8 concurrent claimers,
+// a backlog spread round-robin across 4 queues, and a claim-only draw split
+// exactly across claimers. The draw never exceeds a fifth of the seeded backlog.
+// The scenario constants and helpers are ported by value from
+// `autumn-harvest/tests/integration/claim_bench_support.rs`
+// (`measured_claims_for`, `claims_for_claimer`, `measured_window`). They are not
+// re-derived from the docs prose, so this apparatus measures the same shape as
+// the table in docs/performance.md. See
 // ../../0002-redis-matched-workload-vs-postgres.md for the pre-registration
-// this apparatus was built to answer.
+// this apparatus answers.
 
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,34 +108,37 @@ struct ClaimerOutcome {
     span: (Instant, Instant),
 }
 
-/// Ported verbatim from `claim_bench_support.rs::arrive_at_start_gate`: wait
-/// at the barrier bounded by the scenario deadline (so a claimer that never
-/// gets this far still releases the others), and report the resume instant
-/// as this claimer's own observation of when the gate opened.
+/// Ported verbatim from `claim_bench_support.rs::arrive_at_start_gate`.
+///
+/// Waits at the barrier, bounded by the scenario deadline, so a claimer that
+/// never gets this far still releases the others. Returns the resume instant:
+/// the time at which this claimer sees the gate open.
 async fn arrive_at_start_gate(gate: &Barrier, deadline: Instant) -> Instant {
     let _ = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), gate.wait())
         .await;
     Instant::now()
 }
 
-/// One claimer: `per_claimer` claim-only attempts against all `QUEUES` queue
-/// names, no enqueue and no complete/ack during the measured phase (matches
-/// what `docs/performance.md`'s table itself measures: `claim_task` alone).
+/// One claimer: `per_claimer` claim-only attempts against all `QUEUES` queues.
 ///
-/// **Post-review correction.** `RedisTaskQueue::claim_inner` checks the given
-/// queue list *in order* and returns as soon as the first queue yields an
-/// entry (`autumn-harvest-redis/src/redis_queue.rs:416-464`); it does not
-/// select globally across queues the way Postgres's `queue_name = ANY($2)`
-/// does. Passing the same fixed `[q0, q1, q2, q3]` order to every call would
-/// mean every claim in the registered cell comes from `q0` alone (it holds
-/// far more than the 800-op measured budget), leaving `q1..q3` completely
-/// unread — a single-queue run in a four-stream costume, not a match for the
-/// scenario it claims to reproduce. `next_rotation` hands each call a
-/// distinct rotation of the queue list (a shared, call-ordered counter
-/// across every claimer, so the rotation is fair across the whole
-/// concurrent run, not just within one claimer's own calls), so claims
-/// actually distribute across all four queues. See the Assay section for
-/// the post-fix per-queue drain counts that verify this.
+/// The measured phase has no enqueue and no complete or ack. That matches what
+/// the table in `docs/performance.md` measures: `claim_task` alone.
+///
+/// `RedisTaskQueue::claim_inner` checks the given queue list *in order*. It
+/// returns as soon as the first queue yields an entry
+/// (`autumn-harvest-redis/src/redis_queue.rs:416-464`). It does not select
+/// globally across queues the way the Postgres `queue_name = ANY($2)` does.
+/// With the same fixed `[q0, q1, q2, q3]` order on every call, every claim in
+/// the registered cell comes from `q0` alone. `q0` holds far more than the
+/// 800-op measured budget, so `q1..q3` stay unread. That is a single-queue run
+/// in a four-stream costume, not a match for the scenario.
+///
+/// The shared `rotation` counter gives each call a distinct rotation of the
+/// queue list, so claims distribute across all four queues. The counter is
+/// call-ordered across every claimer. So the rotation is fair across the
+/// whole concurrent run, not just within the calls of one claimer. The Assay
+/// section of `0002-redis-matched-workload-vs-postgres.md` gives the post-fix
+/// per-queue drain counts that verify this.
 async fn run_claimer(
     queue: RedisTaskQueue,
     worker_id: String,
@@ -145,10 +148,9 @@ async fn run_claimer(
     per_claimer: usize,
     deadline: Instant,
 ) -> ClaimerOutcome {
-    // `arrive_at_start_gate`, not a bare `.wait()`: ported from
-    // `claim_bench_support.rs`, which bounds the barrier wait itself by the
-    // scenario deadline on every claimer's path, not only the failed-connect
-    // one.
+    // Use `arrive_at_start_gate`, not a bare `.wait()`. This is ported from
+    // `claim_bench_support.rs`, which bounds the barrier wait by the scenario
+    // deadline on every claimer path, not only on the failed-connect path.
     let my_start = arrive_at_start_gate(&start_gate, deadline).await;
     let mut observed = Vec::with_capacity(per_claimer);
     for _ in 0..per_claimer {
@@ -160,12 +162,11 @@ async fn run_claimer(
         let rotated: Vec<String> =
             queues.iter().cycle().skip(start_at).take(queues.len()).cloned().collect();
         let call_start = Instant::now();
-        // Post-review correction: bound the call itself, not just the loop
-        // head, mirroring `claim_bench_support.rs`'s
-        // `tokio::time::timeout(deadline - now, queue::claim_task(...))` — an
-        // unbounded await on a stalled Redis would otherwise sit past the
-        // advertised scenario ceiling with the loop-top check never running
-        // again.
+        // Bound the call itself, not just the loop head, as
+        // `claim_bench_support.rs` does with
+        // `tokio::time::timeout(deadline - now, queue::claim_task(...))`.
+        // Otherwise an unbounded await on a stalled Redis sits past the
+        // advertised scenario ceiling, and the loop-top check never runs again.
         match tokio::time::timeout(deadline - now, queue.claim(&rotated, &worker_id)).await {
             Ok(Ok(Some(_claimed))) => {
                 let ms = call_start.elapsed().as_secs_f64() * 1000.0;
@@ -223,7 +224,7 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
     let queues = Arc::new(queue_names(&prefix));
     // Shared across every claimer so the queue-list rotation each call uses
     // is fair over the whole concurrent run, not just within one claimer's
-    // own calls. See `run_claimer`'s doc comment (post-review correction).
+    // own calls. See the doc comment of `run_claimer`.
     let rotation = Arc::new(AtomicUsize::new(0));
     let start_gate = Arc::new(Barrier::new(CLAIMERS + 1));
     let deadline = Instant::now() + scenario_budget;
@@ -241,12 +242,12 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
         let start_gate = Arc::clone(&start_gate);
         let redis_url = redis_url.to_string();
         handles.push(tokio::spawn(async move {
-            // Post-review correction: bound connection establishment by the
-            // remaining scenario deadline too, mirroring the Postgres
-            // harness's `tokio::time::timeout(..., pool.get())` around
-            // checkout — an unbounded connect to an unreachable/stalled
-            // Redis would otherwise hang `run_cell` past
-            // `BENCH_SCENARIO_SECS` with no truncated report to show for it.
+            // Bound the connect by the remaining scenario deadline too. The
+            // Postgres harness does the same with
+            // `tokio::time::timeout(..., pool.get())` around checkout.
+            // Otherwise an unbounded connect to an unreachable or stalled
+            // Redis hangs `run_cell` past `BENCH_SCENARIO_SECS`, with no
+            // truncated report to show for it.
             //
             // A timed-out or failed connect does not panic the whole
             // scenario. It still clears the start gate, so the other
@@ -265,10 +266,10 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
             let queue = match connect_result {
                 Ok(Ok(queue)) => queue,
                 Ok(Err(_)) | Err(_) => {
-                    // Still worth a real observation of when the gate
-                    // released, mirroring `measured_window`'s fold logic —
-                    // an early-resumed placeholder can only move the shared
-                    // window's start earlier, never later.
+                    // Still take a real observation of when the gate
+                    // released. This mirrors the fold logic of
+                    // `measured_window`. An early-resumed placeholder can only
+                    // move the start of the shared window earlier, never later.
                     let resumed = arrive_at_start_gate(&start_gate, deadline).await;
                     return ClaimerOutcome { observed: Vec::new(), span: (resumed, resumed) };
                 }
@@ -280,12 +281,12 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
 
     start_gate.wait().await;
 
-    // Mirrors `ClaimerOutcome::from_observed`: per claimer, the head
-    // `collected / WARMUP_DIVISOR` observations are warmup and are dropped
-    // from the latency samples and the post-warmup claimed/empty counts, but
-    // `total_claimed` (the throughput numerator) counts every successful
-    // claim including warmup, because `wall_secs` starts at the first
-    // warmup call too.
+    // Mirrors `ClaimerOutcome::from_observed`. Per claimer, the head
+    // `collected / WARMUP_DIVISOR` observations are warmup. They are dropped
+    // from the latency samples and from the post-warmup claimed and empty
+    // counts. `total_claimed`, the throughput numerator, counts every
+    // successful claim including warmup, because `wall_secs` starts at the
+    // first warmup call too.
     let mut spans = Vec::with_capacity(CLAIMERS);
     let mut samples = Vec::with_capacity(total_ops);
     let mut claimed = 0usize;

@@ -5748,11 +5748,12 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
 /// Whether `key` is a libpq connection keyword.
 ///
 /// Deliberately a superset of what tokio-postgres itself accepts. Erring wide
-/// only risks handing back a redacted label for a DSN the driver will reject
-/// anyway; erring narrow would downgrade a legitimate DSN's label to
-/// `<unparseable dsn>` and cost an operator the identity of the failing shard.
-/// What it must not admit is a token that is keyword-shaped but not a keyword,
-/// which is how a mistyped URL smuggles a password past redaction.
+/// only risks a redacted label for a DSN that the driver rejects anyway.
+/// Erring narrow would downgrade a legitimate DSN's label to
+/// `<unparseable dsn>`. The operator would then lose the identity of the
+/// failing shard. The list must not admit a token that is keyword-shaped but
+/// not a keyword. A mistyped URL uses such a token to smuggle a password past
+/// redaction.
 ///
 /// `autumn-harvest-plugin`'s dev runtime solves the same problem for DSN
 /// redaction. See `is_connection_keyword` in

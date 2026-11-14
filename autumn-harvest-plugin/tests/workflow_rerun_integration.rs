@@ -1,15 +1,15 @@
 //! HTTP integration tests for operator re-run of a terminal workflow (issue #777).
 //!
-//! Exercises `POST /workflows/{id}/rerun` end-to-end: a brand-new execution is
-//! started from a terminal source run's recorded start parameters, the source
-//! is sealed to `CONTINUED_AS_NEW` when the business key is reused (with its
-//! `completed_at` / `output` / `error` preserved), and provenance is stamped
-//! via the issue #740 columns.
+//! Exercises `POST /workflows/{id}/rerun` end-to-end. A brand-new execution
+//! starts from the recorded start parameters of a terminal source run. When the
+//! business key is reused, the source is sealed to `CONTINUED_AS_NEW`, and its
+//! `completed_at` / `output` / `error` are preserved. The issue #740 columns
+//! stamp provenance.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (run this file `--test-threads=1`, since one test
-//! mutates the process-global admission-gate cache); otherwise a fresh
-//! testcontainers Postgres is booted with the full migration set (Docker).
+//! against it directly. Run this file `--test-threads=1`, because one test
+//! mutates the process-global admission-gate cache. Otherwise a fresh
+//! testcontainers Postgres boots with the full migration set (Docker).
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
@@ -235,9 +235,9 @@ fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp 
 }
 
 /// An app whose completion-callback SSRF policy allowlists `hook.example`
-/// (issue #605), for tests whose seeded `completion_callbacks` must survive
-/// re-run validation intact rather than exercising `build_app`'s default
-/// (empty-allowlist, always-reject) posture — see R-64.
+/// (issue #605). It is for tests whose seeded `completion_callbacks` must
+/// survive re-run validation. The default of `build_app` has an empty
+/// allowlist and always rejects (see R-64).
 fn build_app_allowing_hook_example(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     let api_state = api_state_with(infos, pool, true);
     api_state.set_completion_callback_ssrf_policy(
@@ -431,11 +431,10 @@ async fn seed_terminal(
 }
 
 /// Seed a minimal execution row whose `retry_of_exec_id` points at
-/// `predecessor` (issue #523's workflow-level retry chain), so a re-run of
-/// `predecessor` can be shown to detect an in-flight or already-run automatic
-/// retry successor (Codex review, issue #777 PR #1152). `state` need not be
-/// terminal — the retry-chain gate under test disqualifies on EXISTENCE of a
-/// successor row, not on its state.
+/// `predecessor` (the workflow-level retry chain of issue #523). A re-run of
+/// `predecessor` must then detect an in-flight or finished automatic retry
+/// successor (issue #777, PR #1152). `state` need not be terminal. The
+/// retry-chain gate disqualifies on EXISTENCE of a successor row, not its state.
 async fn seed_retry_successor(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -565,10 +564,10 @@ async fn load_exec(conn: &mut AsyncPgConnection, exec_id: &str) -> ExecRow {
 
 /// Load every execution under one `(workflow_name, workflow_id)` business key.
 ///
-/// Scoped to the KEY, never just the workflow name: `HARVEST_TEST_DATABASE_URL`
-/// points at a shared, persistent database, so a name-scoped count would
-/// accumulate rows from previous runs of this suite and make the "no new run
-/// was created" assertions drift. Every test mints a `uuid`-suffixed
+/// Scoped to the KEY, never just the workflow name. `HARVEST_TEST_DATABASE_URL`
+/// points at a shared, persistent database. A name-scoped count would gather
+/// rows from earlier runs of this suite, and the "no new run was created"
+/// assertions would drift. Every test mints a `uuid`-suffixed
 /// `workflow_id`, so the key is unique per test invocation.
 async fn load_execs_for_key(
     conn: &mut AsyncPgConnection,
@@ -619,8 +618,8 @@ async fn events_of(conn: &mut AsyncPgConnection, exec_id: &str) -> Vec<EventRow>
     .unwrap()
 }
 
-/// Task-queue rows for one execution, so a re-run can be shown to be actually
-/// DISPATCHABLE (a new execution row with no queued task would never run).
+/// Task-queue rows for one execution, to prove a re-run is DISPATCHABLE.
+/// A new execution row with no queued task would never run.
 #[derive(diesel::QueryableByName, Debug)]
 struct TaskRow {
     #[diesel(sql_type = Text)]
@@ -674,12 +673,12 @@ fn rerun_uri(exec_id: &str) -> String {
     format!("/workflows/{exec_id}/rerun")
 }
 
-// ── Multi-shard harness (Codex review, PR #1152) ────────────────────────────
+// ── Multi-shard harness (PR #1152) ───────────────────────────────────────────
 //
 // A second, fully-migrated shard database on the SAME Postgres server as
-// `admin_url`, mirroring `lineage_tree_integration.rs`'s multi-shard harness.
-// Every other test in this file is single-shard; these helpers are additive
-// and touch nothing the rest of the suite depends on.
+// `admin_url`. It mirrors the multi-shard harness of
+// `lineage_tree_integration.rs`. Every other test in this file is single-shard.
+// These helpers are additive and touch nothing the rest of the suite uses.
 
 /// Admin URL of a Postgres that can `CREATE DATABASE`, plus a keep-alive guard.
 async fn setup_shard_server() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -761,12 +760,12 @@ fn build_multi_shard_app(
     harvest_api_router(api_state)
 }
 
-/// Variant of [`build_multi_shard_app`] whose SHARDED-POOL default is shard 1
-/// (independent of the router's own default, which only affects id-less
-/// `pick_for_new_workflow` routing — irrelevant here). For tests that need
-/// `HarvestDbPool::default_pool()` specifically to resolve to a given shard,
-/// while an execution explicitly encoded onto a DIFFERENT shard still routes
-/// correctly via `pool_for_execution`.
+/// Variant of [`build_multi_shard_app`] whose SHARDED-POOL default is shard 1.
+/// The router's own default is separate and only affects id-less
+/// `pick_for_new_workflow` routing, which is irrelevant here. Use it when
+/// `HarvestDbPool::default_pool()` must resolve to a given shard. An execution
+/// encoded onto a DIFFERENT shard still routes correctly via
+/// `pool_for_execution`.
 fn build_multi_shard_app_default_shard1(
     pool0: &DbPool,
     pool1: &DbPool,
@@ -797,10 +796,9 @@ fn build_multi_shard_app_default_shard1(
     harvest_api_router(api_state)
 }
 
-/// Seed a terminal (COMPLETED) source directly on shard 0's connection, with
-/// an explicitly shard-0-encoded exec id (`ExecutionId::new_for_shard`)
-/// rather than relying on the table's default UUID generator, whose shard
-/// bits would be effectively random.
+/// Seed a terminal (COMPLETED) source directly on the shard 0 connection. Its
+/// exec id is explicitly shard-0-encoded (`ExecutionId::new_for_shard`). The
+/// default UUID generator of the table would give effectively random shard bits.
 async fn seed_terminal_on_shard0(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -936,9 +934,9 @@ async fn rerun_workflow_id_override_that_hashes_elsewhere_but_is_free_now_succee
     let wf = "rr_xshard_free_wf";
     let source_wf_id = unique("rr-xshard-free-src");
 
-    // Find an override workflow_id the router hashes to a DIFFERENT shard
-    // than the source's (shard 0) — computed via the SAME hashing function
-    // every ordinary start uses, not hand-picked.
+    // Find an override workflow_id that the router hashes to a DIFFERENT shard
+    // than the source (shard 0). It uses the SAME hash as every ordinary
+    // start, not a hand-picked value.
     let override_id = (0..1000)
         .map(|i| format!("rr-xshard-free-override-{i}"))
         .find(|candidate| {
@@ -1205,9 +1203,8 @@ async fn rerun_workflow_id_override_that_hashes_to_an_unreachable_shard_fails_cl
 }
 
 /// Regression guard for the fix above: an override that hashes to the SAME
-/// shard as the source must still succeed (the guard must not over-fire on
-/// same-shard overrides, which is the common case even in a multi-shard
-/// deployment).
+/// shard as the source must still succeed. The guard must not over-fire on
+/// same-shard overrides. They are the common case, even with many shards.
 #[tokio::test]
 async fn rerun_workflow_id_override_that_hashes_to_the_same_shard_still_succeeds() {
     let (admin, _guard) = setup_shard_server().await;
@@ -1267,25 +1264,25 @@ async fn rerun_workflow_id_override_that_hashes_to_the_same_shard_still_succeeds
     );
 }
 
-/// Codex review finding (PR #1152, P2): the malformed-JSON-body audit ran
-/// BEFORE the execution id was parsed and always wrote through
-/// `pool.default_pool()`. When the caller's execution id IS well-formed, its
-/// shard is already known — so the audit should route through THAT shard's
-/// connection instead, the same way every post-id-parse failure in this
-/// handler already does. Proven end to end: two shards, with the
-/// SHARDED-POOL default deliberately pointed at an unreachable address while
-/// the source lives on a DIFFERENT, healthy shard — the pre-fix code would
-/// have silently dropped this audit entirely (`acquire_conn` on the broken
-/// default pool fails and the whole `audit_rerun_failure_via_pool` call is a
-/// silent no-op by design).
+/// PR #1152: the malformed-JSON-body audit ran BEFORE the execution id was
+/// parsed, and always wrote through `pool.default_pool()`. When the execution
+/// id of the caller IS well-formed, its shard is already known. So the audit
+/// should use the connection of THAT shard. Every post-id-parse failure in
+/// this handler already does so.
+///
+/// Proven end to end with two shards. The SHARDED-POOL default deliberately
+/// points at an unreachable address. The source lives on a DIFFERENT, healthy
+/// shard. The pre-fix code would have silently dropped this audit. There,
+/// `acquire_conn` on the broken default pool fails. The whole
+/// `audit_rerun_failure_via_pool` call is then a silent no-op by design.
 #[tokio::test]
 async fn rerun_malformed_body_audits_via_source_shard_when_default_shard_is_unavailable() {
     let (admin, _guard) = setup_shard_server().await;
     let url0 = create_shard_db(&admin, &unique("rerun_mb0").replace('-', "_")).await;
     let pool0 = build_pool(&url0);
-    // Deliberately unreachable (loopback, refused instantly) — proves the
-    // audit does NOT route via the default-shard pool, which the pre-fix code
-    // always used for this case regardless of whether the id was well-formed.
+    // Deliberately unreachable (loopback, refused instantly). It proves the
+    // audit does NOT route via the default-shard pool. The pre-fix code always
+    // used that pool here, even for a well-formed id.
     let broken_pool1 = build_pool("postgres://postgres:postgres@127.0.0.1:1/nonexistent");
     let mut conn0 = AsyncPgConnection::establish(&url0)
         .await
@@ -1321,9 +1318,9 @@ async fn rerun_malformed_body_audits_via_source_shard_when_default_shard_is_unav
         "a malformed body must start nothing"
     );
 
-    // The failed audit row landed on the SOURCE's own (healthy) shard even
-    // though the sharded-pool default (shard 1) is unreachable — this would
-    // have been silently dropped entirely before the fix.
+    // The failed audit row landed on the healthy shard of the SOURCE, though
+    // the sharded-pool default (shard 1) is unreachable. Before the fix, the
+    // row was silently dropped.
     let rows = audit_rows(&mut conn0, "workflow.rerun", &source).await;
     assert_eq!(
         rows.len(),
@@ -1347,10 +1344,10 @@ fn two_shard_router_shard0_drained() -> ShardRouter {
     )
 }
 
-/// The mirror image: shard 1 drained, shard 0 (where every test source in
-/// this section lives) stays writable — the negative control proving the
-/// gate below checks the SOURCE's own shard, not "is any shard in the
-/// deployment drained".
+/// The mirror image: shard 1 drained, shard 0 stays writable. Every test
+/// source in this section lives on shard 0. This negative control proves that
+/// the gate below checks the shard of the SOURCE. It does not check "is any
+/// shard in the deployment drained".
 fn two_shard_router_shard1_drained() -> ShardRouter {
     ShardRouter::new(
         vec![
@@ -1395,19 +1392,19 @@ fn build_multi_shard_app_with_router(
     harvest_api_router(api_state)
 }
 
-/// Codex review finding (PR #1152, P1): the DEFAULT (no `workflow_id`
-/// override) rerun path constructs the new execution's id unconditionally
-/// via `ExecutionId::new_for_shard(source.shard_id)`, with NO check that
-/// `source.shard_id` is still in `writable_shards`. Unlike the override
-/// path — guarded above by the shard-consistency check, which can only ever
-/// resolve to a WRITABLE shard via `ShardRouter::pick_for_new_workflow` —
-/// the default path had no protection at all: an operator draining shard 0
-/// (removing it from `writable_shards` so it stops accepting new
-/// admissions) would still see re-runs of shard-0 work silently land
-/// brand-new executions there. A re-run is a fresh admission — exactly what
-/// `writable_shards` exists to gate (`docs/sharding.md`: "placing new work
-/// on a shard the operator is draining contradicts the drain"). Fixed by
-/// rejecting a re-run whose source lives on a non-writable shard.
+/// PR #1152: the DEFAULT rerun path (no `workflow_id` override) builds the new
+/// execution id unconditionally via `ExecutionId::new_for_shard(source.shard_id)`.
+/// It does NOT check that `source.shard_id` is still in `writable_shards`.
+///
+/// The override path has a guard above: the shard-consistency check. That can
+/// only resolve to a WRITABLE shard via `ShardRouter::pick_for_new_workflow`.
+/// The default path had no protection at all. An operator can drain shard 0 by
+/// removing it from `writable_shards`, so it stops taking new admissions.
+/// Re-runs of shard-0 work would still silently land new executions there. A
+/// re-run is a fresh admission, which is what `writable_shards` gates.
+/// `docs/sharding.md` says: "placing new work on a shard the operator is
+/// draining contradicts the drain". The fix rejects a re-run whose source
+/// lives on a non-writable shard.
 #[tokio::test]
 async fn rerun_is_rejected_when_the_source_shard_has_been_drained() {
     let (admin, _guard) = setup_shard_server().await;
@@ -1480,10 +1477,9 @@ async fn rerun_is_rejected_when_the_source_shard_has_been_drained() {
     );
 }
 
-/// Negative control for the fix above: draining a DIFFERENT shard (shard 1)
-/// while the source's own shard (0) stays writable must not affect the
-/// re-run — the gate must check the SOURCE's specific shard, not "is any
-/// shard in the deployment drained".
+/// Negative control for the fix above. Shard 1 is drained, and the source
+/// shard (0) stays writable. The re-run must not be affected. The gate must
+/// check the shard of the SOURCE, not "is any shard in the deployment drained".
 #[tokio::test]
 async fn rerun_still_succeeds_when_a_different_shard_is_drained() {
     let (admin, _guard) = setup_shard_server().await;
@@ -1587,10 +1583,10 @@ async fn rerun_clones_start_params_verbatim() {
     let mut conn = pool.get().await.unwrap();
 
     let wf_id = unique("rr-clone");
-    // A schema-complete `CallbackTarget` (with `filter`) — the shape the
-    // production start route and delivery-time re-validation both expect;
-    // a bare `{"url": ...}` object fails deserialization under the new
-    // re-run validation and is not representative of a real stored row.
+    // A schema-complete `CallbackTarget` (with `filter`). The production start
+    // route and the delivery-time re-validation both expect that shape. A bare
+    // `{"url": ...}` object fails deserialization under the re-run validation.
+    // It does not represent a real stored row.
     let callback_targets = vec![autumn_harvest::completion_callback::CallbackTarget::new(
         "https://hook.example/done",
         autumn_harvest::completion_callback::EventFilter::AnyTerminal,
@@ -2117,9 +2113,9 @@ async fn rerun_rejects_when_business_key_held_by_another_run() {
     assert_eq!(rows[0].actor, TEST_ACTOR);
 }
 
-/// R-28b: a `workflow_id` OVERRIDE onto a key already held by a live run is
-/// rejected via the distinct `AlreadyExists` path (a different response body
-/// from the same-key R-28 conflict), and starts nothing.
+/// R-28b: a `workflow_id` OVERRIDE onto a key held by a live run is rejected,
+/// and starts nothing. It takes the distinct `AlreadyExists` path, whose body
+/// differs from the same-key R-28 conflict.
 #[tokio::test]
 async fn rerun_workflow_id_override_onto_occupied_key_is_rejected() {
     let (url, _c) = setup_database().await;
@@ -2290,9 +2286,9 @@ async fn rerun_respects_admission_gate() {
         "a gated re-run must not seal the source"
     );
 
-    // The failed audit row rides the CALLER'S connection (issue #777 review):
-    // before that fix it was written through a second pool checkout and could
-    // silently vanish under connection pressure.
+    // The failed audit row rides the CALLER'S connection (issue #777). Before
+    // that fix, it went through a second pool checkout. It could silently
+    // vanish under connection pressure.
     let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
     assert_eq!(rows.len(), 1, "a gated re-run must still be audited");
     assert_eq!(rows[0].status, "failed");
@@ -2332,10 +2328,10 @@ async fn rerun_requires_admin() {
 
 /// R-33: an unknown execution id returns 404 FROM THE HANDLER.
 ///
-/// A bare `assert_eq!(status, NOT_FOUND)` would pass vacuously: axum answers an
-/// unmatched route with 404 too, so a typo in `rerun_uri` or a dropped route
-/// registration would keep this test green while the handler never ran. The
-/// body message and the failed audit row are what prove it reached the handler.
+/// A bare `assert_eq!(status, NOT_FOUND)` would pass vacuously. Axum answers an
+/// unmatched route with 404 too. A typo in `rerun_uri` or a dropped route would
+/// keep this test green while the handler never ran. The body message and the
+/// failed audit row prove that the request reached the handler.
 #[tokio::test]
 async fn rerun_unknown_execution_returns_404() {
     let (url, _c) = setup_database().await;
@@ -2492,12 +2488,11 @@ async fn rerun_strips_nd_diagnostic_search_attrs() {
     );
 }
 
-/// R-37b (Codex review, issue #777): `search_attrs` is an unvalidated JSON
-/// value at the model layer -- the start API and core accept a scalar or
-/// array, not only an object. The ND-diagnostic strip above must not
-/// silently discard such a value into `{}`: none of the six diagnostic keys
-/// could ever exist inside a non-object value, so stripping them is a no-op
-/// by definition, and the "clone verbatim" contract demands it survive.
+/// R-37b (issue #777): `search_attrs` is an unvalidated JSON value at the model
+/// layer. The start API and core accept a scalar or array, not only an object.
+/// The ND-diagnostic strip above must not silently turn such a value into `{}`.
+/// None of the six diagnostic keys can exist inside a non-object value. So the
+/// strip is a no-op by definition, and the "clone verbatim" contract keeps it.
 #[tokio::test]
 async fn rerun_preserves_non_object_search_attrs_verbatim() {
     let (url, _c) = setup_database().await;
@@ -2640,10 +2635,9 @@ async fn rerun_response_never_echoes_input() {
     );
 }
 
-/// R-40: PINS the documented R1 consequence — after a re-run seals the source,
-/// `GET /workflows/{source}/result` observes it as CONTINUED_AS_NEW and follows
-/// the chain (issue #527's chain-following) rather than reporting the original
-/// terminal outcome.
+/// R-40: PINS the documented R1 consequence. After a re-run seals the source,
+/// `GET /workflows/{source}/result` observes it as CONTINUED_AS_NEW. It follows
+/// the chain (issue #527) and does not report the original terminal outcome.
 #[tokio::test]
 async fn rerun_source_result_route_reports_continued_as_new() {
     let (url, _c) = setup_database().await;
@@ -2674,8 +2668,8 @@ async fn rerun_source_result_route_reports_continued_as_new() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     // AFTER the re-run the source is sealed CONTINUED_AS_NEW. This test pins
-    // whatever the /result route actually does with that (the deliberate R1
-    // consequence of reusing the business key) so a future change is a
+    // what the /result route does with that. It is the deliberate R1
+    // consequence of reusing the business key. A future change is then a
     // conscious decision, not a silent regression.
     let (s_after, b_after) = get_json(&app, &format!("/workflows/{source}/result")).await;
     // Observed exactly: `200 {"completed_at": "...", "state": "continued_as_new"}`
@@ -2689,10 +2683,10 @@ async fn rerun_source_result_route_reports_continued_as_new() {
     );
     // The KNOWN CONSEQUENCE, pinned exactly: the original failure reason is
     // dropped from THIS surface. It survives in `harvest_events` (the terminal
-    // event) and on the describe surface (`execution.error`), and the pre-seal
-    // state is returned by the re-run response and persisted in the succeeded
-    // `workflow.rerun` audit row — so nothing is lost overall, but a caller
-    // polling /result for the SOURCE id can no longer see why it failed.
+    // event) and on the describe surface (`execution.error`). The re-run
+    // response returns the pre-seal state, and the succeeded `workflow.rerun`
+    // audit row stores it. So nothing is lost overall. But a caller that polls
+    // /result for the SOURCE id can no longer see why it failed.
     assert_eq!(
         b_after["error"],
         Value::Null,
@@ -2737,10 +2731,10 @@ async fn rerun_sets_no_continue_as_new_backlinks() {
     assert_eq!(event_count(&mut conn, &new_id).await, 1);
 }
 
-/// R-42 (issue #373): an explicitly supplied `input` OVERRIDE is validated
-/// against the workflow's published input schema, and a violation is rejected
-/// at the edge with the standard `{error, violations}` body — nothing is
-/// started and the source is not sealed.
+/// R-42 (issue #373): an explicit `input` OVERRIDE is validated against the
+/// published input schema of the workflow. The edge rejects a violation with
+/// the standard `{error, violations}` body. Nothing starts, and the source is
+/// not sealed.
 #[tokio::test]
 async fn rerun_input_override_violating_schema_is_rejected() {
     let (url, _c) = setup_database().await;
@@ -2796,9 +2790,9 @@ async fn rerun_input_override_violating_schema_is_rejected() {
 }
 
 /// R-43 (issue #373): the VERBATIM CLONE is deliberately NOT validated. A run
-/// started under an older or looser schema must stay re-runnable even after the
-/// schema is tightened — otherwise tightening a schema would silently strand
-/// every historical run of that workflow type.
+/// started under an older or looser schema must stay re-runnable after the
+/// schema is tightened. Otherwise a tighter schema would silently strand every
+/// historical run of that workflow type.
 #[tokio::test]
 async fn rerun_does_not_validate_the_cloned_input() {
     let (url, _c) = setup_database().await;
@@ -2870,9 +2864,9 @@ async fn rerun_input_override_satisfying_schema_is_accepted() {
 
 /// R-45 (issue #488 / #534): a default-key re-run of a SCHEDULE-ATTRIBUTED
 /// source is rejected. Sealing it to CONTINUED_AS_NEW would put the slot in a
-/// state `resolve_carryover` recognises in neither of its sets, rolling the
-/// next fire's incremental cursor backward and deflating the schedule's
-/// success ratio. The source row must be left byte-untouched.
+/// state that neither set of `resolve_carryover` recognises. That rolls the
+/// incremental cursor of the next fire backward and deflates the success ratio
+/// of the schedule. The source row must be left byte-untouched.
 #[tokio::test]
 async fn rerun_of_schedule_attributed_source_is_rejected() {
     let (url, _c) = setup_database().await;
@@ -2927,9 +2921,9 @@ async fn rerun_of_schedule_attributed_source_is_rejected() {
     assert_eq!(rows[0].status, "failed");
 }
 
-/// R-46: the supported way to re-run scheduled work — an explicit `workflow_id`
-/// override never seals, so the schedule's lineage is untouched and the new run
-/// is deliberately NOT schedule-attributed.
+/// R-46: the supported way to re-run scheduled work. An explicit `workflow_id`
+/// override never seals, so the lineage of the schedule is untouched. The new
+/// run is deliberately NOT schedule-attributed.
 #[tokio::test]
 async fn rerun_of_schedule_attributed_source_with_override_is_allowed() {
     let (url, _c) = setup_database().await;
@@ -2982,9 +2976,9 @@ async fn rerun_of_schedule_attributed_source_with_override_is_allowed() {
 }
 
 /// R-47 (issue #495): a re-run-with-override of an ERASED source must not clone
-/// the erasure tombstones out of `memo` / `search_attrs` onto the fresh,
-/// never-erased run — that would pollute `?search_attr=` filtering and mislead
-/// compliance tooling into believing the new run had been erased.
+/// the erasure tombstones of `memo` / `search_attrs` onto the fresh run. That
+/// would pollute `?search_attr=` filtering. It would also mislead compliance
+/// tooling into believing that the new run had been erased.
 #[tokio::test]
 async fn rerun_of_erased_source_does_not_propagate_tombstones() {
     let (url, _c) = setup_database().await;
@@ -3041,8 +3035,8 @@ async fn rerun_of_erased_source_does_not_propagate_tombstones() {
 }
 
 /// R-48 (issue #617): the chain-scoped lifetime cap is CLONED, but its absolute
-/// deadline is RE-ANCHORED — a re-run is a fresh chain origin, so it must not
-/// inherit the source's already-elapsed `chain_deadline_at`.
+/// deadline is RE-ANCHORED. A re-run is a fresh chain origin. So it must not
+/// inherit the already-elapsed `chain_deadline_at` of the source.
 #[tokio::test]
 async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
     let (url, _c) = setup_database().await;
@@ -3097,7 +3091,7 @@ async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
 }
 
 /// R-49: a body-less POST (zero bytes, no `Content-Type` JSON payload) is
-/// accepted and clones the source input verbatim — the whole reason the handler
+/// accepted and clones the source input verbatim. That is why the handler
 /// takes raw `Bytes` rather than `Option<Json<…>>`.
 #[tokio::test]
 async fn rerun_with_empty_body_clones_input() {
@@ -3205,7 +3199,7 @@ async fn rerun_resolves_concurrency_key_from_effective_input() {
 }
 
 /// R-51: a source whose workflow type is no longer registered on this node is
-/// rejected 404 — the fresh run would otherwise wedge immediately in
+/// rejected 404. Otherwise the fresh run would wedge at once in a
 /// HandlerNotFound replay failure.
 #[tokio::test]
 async fn rerun_unregistered_workflow_type_returns_404() {
@@ -3356,8 +3350,8 @@ async fn rerun_malformed_body_returns_400_and_audits_failure() {
     assert_eq!(rows[0].status, "failed");
 }
 
-/// R-55: the describe surface carries the issue #740 provenance of the new run,
-/// so an operator can see WHERE it came from without reading the audit log.
+/// R-55: the describe surface carries the issue #740 provenance of the new run.
+/// An operator sees WHERE it came from without reading the audit log.
 #[tokio::test]
 async fn rerun_describe_surface_shows_provenance() {
     let (url, _c) = setup_database().await;
@@ -3379,9 +3373,9 @@ async fn rerun_describe_surface_shows_provenance() {
     assert_eq!(b["execution"]["started_by"], json!(TEST_ACTOR));
 }
 
-/// R-56: re-running a re-run works, and provenance is ONE HOP — the second
-/// run's `start_source_ref` points at the run it was re-run from, never
-/// transitively back at the original source.
+/// R-56: re-running a re-run works, and provenance is ONE HOP. The
+/// `start_source_ref` of the second run points at the run it was re-run from.
+/// It never points transitively back at the original source.
 #[tokio::test]
 async fn rerun_of_a_rerun_records_one_hop_provenance() {
     let (url, _c) = setup_database().await;
@@ -3460,9 +3454,9 @@ async fn rerun_oversized_input_override_returns_413() {
     );
 }
 
-/// R-58: a `workflow_id` override colliding with a COMPLETED (terminal but
-/// still key-holding) run is rejected 409 — RejectDuplicate surfaces
-/// AlreadyExists, and the occupant is never disturbed.
+/// R-58: a `workflow_id` override that collides with a COMPLETED run is
+/// rejected 409. That run is terminal but still holds the key. RejectDuplicate
+/// surfaces AlreadyExists, and the occupant is never disturbed.
 #[tokio::test]
 async fn rerun_override_onto_completed_occupant_is_rejected() {
     let (url, _c) = setup_database().await;
@@ -3597,10 +3591,10 @@ async fn rerun_run_chain_endpoint_reports_separate_chains() {
     );
 }
 
-/// R-61: two concurrent re-runs of the SAME source serialize on the source
-/// row's `FOR UPDATE` lock — exactly one creates a run, the loser observes the
-/// sealed CONTINUED_AS_NEW state and is rejected. A double-start here would
-/// duplicate real work under one business key.
+/// R-61: two concurrent re-runs of the SAME source serialize on the
+/// `FOR UPDATE` lock of the source row. Exactly one creates a run. The loser
+/// observes the sealed CONTINUED_AS_NEW state and is rejected. A double-start
+/// here would duplicate real work under one business key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_reruns_of_one_source_start_exactly_one_run() {
     let (url, _c) = setup_database().await;
@@ -3658,13 +3652,13 @@ async fn concurrent_reruns_of_one_source_start_exactly_one_run() {
     );
 }
 
-/// R-62 (issue #777 review, the P2-1 fix): every failure audit raised AFTER the
-/// caller's connection is checked out must ride THAT connection.
+/// R-62 (issue #777): every failure audit raised AFTER the caller's connection
+/// is checked out must ride THAT connection.
 ///
-/// Pinned with a SIZE-1 pool, which is what makes the assertion load-bearing:
-/// the previous pool-acquiring form asked for a second connection while this
-/// handler still held the only one, so the checkout blocked until the pool
-/// timeout and the audit was silently dropped (`let _ =`). Mirrors the #608 test
+/// A SIZE-1 pool makes the assertion load-bearing. The old pool-acquiring form
+/// asked for a second connection while this handler held the only one. So the
+/// checkout blocked until the pool timeout, and the audit was silently dropped
+/// (`let _ =`). Mirrors the #608 test
 /// `decode_audit_reuses_callers_connection_under_single_connection_pool`.
 #[tokio::test]
 async fn failure_audits_ride_the_callers_connection_under_a_size_one_pool() {
@@ -3772,15 +3766,14 @@ async fn rerun_rejects_unparseable_stored_start_parameters() {
     );
 }
 
-/// R-64 (issue #605 review, Codex, PR #1152): a re-run clones the source's
-/// `completion_callbacks` verbatim, so a target that has since been dropped
-/// from the SSRF allowlist must be re-validated BEFORE the re-run is
-/// created — otherwise it silently succeeds and the delivery is later
-/// dropped without error at `enqueue_completion_deliveries`'s own
-/// live-policy re-validation. `build_app`'s `HarvestApiState::new()`
-/// installs `SsrfPolicy::default()` (empty allowlist), so any bare
-/// `https://…` target is already "not (or no longer) allowlisted" without
-/// any extra test setup — exactly the scenario the finding describes.
+/// R-64 (issue #605, PR #1152): a re-run clones the `completion_callbacks` of
+/// the source verbatim. A target since dropped from the SSRF allowlist must be
+/// re-validated BEFORE the re-run is created. Otherwise the re-run silently
+/// succeeds. The live-policy re-validation in `enqueue_completion_deliveries`
+/// later drops the delivery without error. `HarvestApiState::new()` in
+/// `build_app` installs `SsrfPolicy::default()` (empty allowlist). So any bare
+/// `https://…` target is already "not (or no longer) allowlisted" with no
+/// extra test setup. That is exactly the hazard under test.
 #[tokio::test]
 async fn rerun_rejects_a_cloned_completion_callback_no_longer_allowlisted() {
     let (url, _c) = setup_database().await;
@@ -3849,15 +3842,14 @@ async fn rerun_with_no_completion_callbacks_is_unaffected() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
-/// R-65 (Codex review, issue #777 PR #1152, P1): a FAILED source that already
-/// has an automatic workflow-level retry successor (issue #523,
-/// `retry_of_exec_id`) is rejected. `persist_workflow_failure` atomically
-/// starts that successor in the SAME transaction that seals the predecessor
-/// FAILED whenever attempts remain, so without this gate an operator could
-/// re-run the FAILED predecessor while its successor is RUNNING — a THIRD
-/// execution racing the engine's own retry. Existence alone disqualifies,
-/// regardless of the successor's own state: this test uses RUNNING (the
-/// literal race the finding names).
+/// R-65 (issue #777, PR #1152): a FAILED source that already has an automatic
+/// workflow-level retry successor (issue #523, `retry_of_exec_id`) is rejected.
+/// While attempts remain, `persist_workflow_failure` starts that successor
+/// atomically. It does so in the SAME transaction that seals the predecessor
+/// FAILED. Without this gate, an operator could re-run the FAILED predecessor
+/// while its successor is RUNNING. That is a THIRD execution racing the retry
+/// of the engine. Existence alone disqualifies, whatever the successor state.
+/// This test uses RUNNING, the literal race.
 #[tokio::test]
 async fn rerun_rejects_failed_source_with_a_running_retry_successor() {
     let (url, _c) = setup_database().await;
@@ -3904,10 +3896,9 @@ async fn rerun_rejects_failed_source_with_a_running_retry_successor() {
     );
 }
 
-/// R-65b: existence of a retry successor is disqualifying regardless of ITS
-/// state — a successor that has SINCE completed still means this
-/// predecessor's failure was already superseded by the chain moving on, so
-/// re-running the stale predecessor would still duplicate completed work.
+/// R-65b: a retry successor disqualifies whatever ITS state. A successor that
+/// has SINCE completed still means the chain moved on past this failure. So
+/// re-running the stale predecessor would duplicate completed work.
 #[tokio::test]
 async fn rerun_rejects_failed_source_with_a_completed_retry_successor() {
     let (url, _c) = setup_database().await;
@@ -3931,10 +3922,10 @@ async fn rerun_rejects_failed_source_with_a_completed_retry_successor() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
-/// R-65c: regression guard — a plain FAILED source with NO retry successor
-/// (the overwhelmingly common case: a manual failure with no configured
-/// workflow-level retry policy, or one whose attempts are simply not yet
-/// exhausted-and-superseded) re-runs exactly as before.
+/// R-65c: regression guard. A plain FAILED source with NO retry successor
+/// re-runs exactly as before. That is the most common case. Either no
+/// workflow-level retry policy is set, or its attempts are not yet
+/// exhausted-and-superseded.
 #[tokio::test]
 async fn rerun_of_failed_source_with_no_retry_successor_still_works() {
     let (url, _c) = setup_database().await;

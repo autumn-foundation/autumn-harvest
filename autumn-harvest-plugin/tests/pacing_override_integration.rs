@@ -3,28 +3,28 @@
 #![allow(clippy::items_after_statements)]
 //! HTTP integration tests for TTL'd runtime pacing overrides (issue #945).
 //!
-//! Proves the success metric end to end, against the real dispatch/admission
-//! primitives (not just the pure `resolve_effective_rate_limit` helper unit
-//! tests already covering the math in isolation):
+//! They prove the success metric end to end, against the real
+//! dispatch/admission primitives. Unit tests of the pure
+//! `resolve_effective_rate_limit` helper already cover the math alone.
 //!
 //! - `POST /admin/rate-limits/{activity_name}/override` takes effect on the
-//!   **existing** `claim_task` dispatch path with **no worker restart** — the
-//!   very next claim attempt against the same connection pool observes it.
-//! - The override **self-expires** at its TTL with **no operator action** —
-//!   nothing clears the row; Postgres's own `> NOW()` comparison inside
-//!   `claim_task_query` simply stops matching once the deadline passes.
+//!   **existing** `claim_task` dispatch path with **no worker restart**. The
+//!   next claim attempt on the same connection pool observes it.
+//! - The override **self-expires** at its TTL with **no operator action**.
+//!   Nothing clears the row. The `> NOW()` comparison inside
+//!   `claim_task_query` stops matching once the deadline passes.
 //! - `DELETE .../override` clears an override **before** its TTL, and that
 //!   also takes effect immediately on the same dispatch path.
-//! - The workflow-start throttle side (`POST /admin/start-throttle/{name}/
-//!   override`) is gated by the very same `harvest_rate_limit_buckets` /
-//!   `try_consume_rate_limit_token` mechanism, exercised here through the
-//!   real `POST /workflows/{name}/start` admission path (not a bare call to
-//!   the underlying primitive) — the most literal reading of "one CLI call
-//!   changes downstream behaviour with no restart".
+//! - The same `harvest_rate_limit_buckets` / `try_consume_rate_limit_token`
+//!   mechanism gates the workflow-start throttle side
+//!   (`POST /admin/start-throttle/{name}/override`). The tests drive it
+//!   through the real `POST /workflows/{name}/start` admission path. That is
+//!   the most literal reading of "one CLI call changes downstream behaviour
+//!   with no restart".
 //!
-//! Tests run against a real Postgres (set `HARVEST_TEST_DATABASE_URL` to a
-//! migrated database to run directly with `--test-threads=1`, otherwise a
-//! fresh testcontainers Postgres is booted with the full migration set).
+//! Tests run against a real Postgres. Set `HARVEST_TEST_DATABASE_URL` to a
+//! migrated database to run directly with `--test-threads=1`. Otherwise a
+//! fresh testcontainers Postgres boots with the full migration set.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -61,11 +61,11 @@ use uuid::Uuid;
 
 type HarvestApiApp = axum::Router;
 
-/// Leak a UNIQUE `&'static str` name so each test's activity/workflow (and
-/// therefore its `harvest_rate_limit_buckets`/`harvest_start_throttle` rows)
-/// is isolated even when `HARVEST_TEST_DATABASE_URL` points every test in
-/// this binary -- and every past/future `cargo test` invocation -- at the
-/// SAME shared local Postgres database (mirrors `chain_timeout_tests.rs`).
+/// Leak a UNIQUE `&'static str` name, so each test's activity/workflow and its
+/// `harvest_rate_limit_buckets`/`harvest_start_throttle` rows stay isolated.
+///
+/// `HARVEST_TEST_DATABASE_URL` can point every test, and every past and future
+/// `cargo test` run, at one shared database (mirrors `chain_timeout_tests.rs`).
 fn leaked_name(prefix: &str) -> &'static str {
     Box::leak(format!("{prefix}_{}", Uuid::new_v4().simple()).into_boxed_str())
 }
@@ -103,7 +103,7 @@ fn build_pool(url: &str) -> DbPool {
 /// A pool pointed at an unreachable host -- every `get()`/query against it
 /// fails immediately with a connection error. Mirrors the dead-port pattern
 /// already used in `completion_triggers_integration.rs` for simulating one
-/// down shard alongside one live shard (issue #945 review, P2).
+/// down shard alongside one live shard (issue #945).
 fn dead_pool() -> DbPool {
     build_pool("postgres://postgres:postgres@localhost:12345/non_existent")
 }
@@ -120,10 +120,11 @@ fn shard_url(base_url: &str, dbname: &str) -> String {
     )
 }
 
-/// A single fresh, migrated shard database (guard `None` under
-/// `HARVEST_TEST_DATABASE_URL`, `Some` when backed by a fresh testcontainers
-/// Postgres) -- used as the ONE *live* shard for the shard-outage tests
-/// below, paired with a [`dead_pool`] for the unreachable shard.
+/// A single fresh, migrated shard database, the ONE *live* shard for the
+/// shard-outage tests below. A [`dead_pool`] stands for the unreachable shard.
+///
+/// The guard is `None` under `HARVEST_TEST_DATABASE_URL`, and `Some` when a
+/// fresh testcontainers Postgres backs it.
 async fn setup_one_shard() -> (String, Option<ContainerAsync<Postgres>>) {
     let (admin_url, guard) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         (url, None)
@@ -244,14 +245,13 @@ fn build_app(
     harvest_api_router(api_state)
 }
 
-/// Sharded variant of [`build_app`] -- lets a caller install an arbitrary
-/// [`HarvestDbPool`] (e.g. one built with an unreachable pool for a given
-/// shard, via [`ShardedDbPool::from_map`]) instead of always wrapping a
-/// single live pool. Used to exercise `get_start_throttle_pacing_override`'s
-/// partial/total shard-outage handling (issue #945 review, P2): a status
-/// read that silently degrades a real live override into
-/// `{"override_active": false}` on a shard outage is worse than an explicit
-/// failure.
+/// Sharded variant of [`build_app`] that installs any [`HarvestDbPool`].
+///
+/// A caller can pass a pool with an unreachable shard, built via
+/// [`ShardedDbPool::from_map`]. This exercises the partial/total shard-outage
+/// handling of `get_start_throttle_pacing_override` (issue #945). A status
+/// read that turns a live override into `{"override_active": false}` on a
+/// shard outage is worse than an explicit failure.
 fn build_sharded_app(
     harvest_pool: HarvestDbPool,
     router: ShardRouter,
@@ -339,17 +339,14 @@ async fn delete_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 /// within a generous tolerance, rather than requiring byte-identical
 /// strings.
 ///
-/// A pacing-override `expires_at` value is legitimately re-serialized
-/// through two different clocks in this test suite: the SET/CLEAR HTTP
-/// response reports the Rust-side `chrono::Utc::now() + ttl` read
-/// (nanosecond precision), while a later GET reflects what Postgres
-/// actually persisted in the `TIMESTAMPTZ` column (microsecond precision
-/// -- Postgres truncates, it does not round, so the two values can differ
-/// by up to ~1 microsecond even though they describe the same override).
-/// Comparing raw strings is over-strict and flags that expected precision
-/// truncation as a failure; comparing parsed instants with a tolerance
-/// proves the two reads agree on the override's expiry without being
-/// brittle to it.
+/// A pacing-override `expires_at` passes through two clocks in this suite.
+/// The SET/CLEAR HTTP response reports the Rust-side
+/// `chrono::Utc::now() + ttl` read (nanosecond precision). A later GET
+/// reflects what Postgres persisted in the `TIMESTAMPTZ` column (microsecond
+/// precision). Postgres truncates, it does not round. So the two values can
+/// differ by up to ~1 microsecond for the same override. A raw string
+/// comparison flags that truncation as a failure. Parsed instants with a
+/// tolerance prove the two reads agree on the expiry.
 fn assert_close_instant(a: Option<&str>, b: Option<&str>, msg: &str) {
     let parse = |s: &str| {
         chrono::DateTime::parse_from_rfc3339(s)
@@ -384,15 +381,16 @@ async fn set_bucket_tokens(conn: &mut AsyncPgConnection, key: &str, tokens: f64)
 }
 
 /// Directly writes every accrual-relevant column on a `harvest_rate_limit_buckets`
-/// row -- baseline rate/burst, current `tokens`, `last_refilled_at` (anchored
-/// `last_refilled_seconds_ago` seconds in the past), and the TTL'd override
-/// fields (anchored so the override EXPIRED `override_expired_seconds_ago`
-/// seconds ago, when `Some`) -- bypassing both `ensure_rate_limit_bucket`'s
-/// insert-only semantics and the HTTP override route's `NOW() + ttl` /
-/// positive-rate validation, so a P1-regression scenario (an override that
-/// expired PARTWAY through the elapsed interval, with no intervening write
-/// to settle the bucket) can be constructed deterministically (issue #945
-/// review, P1).
+/// row.
+///
+/// It writes the baseline rate/burst, the current `tokens`, and
+/// `last_refilled_at`, set `last_refilled_seconds_ago` seconds in the past.
+/// When `override_expired_seconds_ago` is `Some`, the TTL'd override fields
+/// expire that many seconds ago. This bypasses the insert-only
+/// `ensure_rate_limit_bucket` and the `NOW() + ttl` / positive-rate checks of
+/// the HTTP override route. So a test can build the phantom-refill case
+/// deterministically (issue #945). In that case, an override expired PARTWAY
+/// through the elapsed interval, and no write settled the bucket.
 #[allow(clippy::too_many_arguments)]
 async fn set_bucket_accrual_state(
     conn: &mut AsyncPgConnection,
@@ -437,9 +435,10 @@ async fn set_bucket_accrual_state(
 }
 
 /// Reads the LIVE numeric result of `queue::effective_available_tokens_expr`
-/// executed against a real Postgres row -- the strongest possible proof that
-/// the rendered SQL, not just its string shape, computes the mathematically
-/// correct piecewise accrual (issue #945 review, P1).
+/// on a real Postgres row (issue #945).
+///
+/// This proves that the rendered SQL, not just its string shape, computes the
+/// correct piecewise accrual.
 async fn read_available_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -495,13 +494,13 @@ async fn claim(conn: &mut AsyncPgConnection, queue: &str) -> Option<uuid::Uuid> 
         .map(|t| t.id)
 }
 
-/// Delete a workflow's pending throttle backlog row(s), simulating that the
-/// scanner (`throttle::fire_due_throttled_starts`) has already drained it.
+/// Delete a workflow's pending throttle backlog row(s), as if the scanner
+/// (`throttle::fire_due_throttled_starts`) had drained it.
+///
 /// The FIFO fast-path guard in `reserve_or_defer` defers any NEW start for a
-/// `bucket_key` with a still-pending backlog entry -- regardless of an active
-/// override -- so a test proving "the override activates the very next
-/// admission" must first prove the backlog it created to demonstrate the
-/// gated baseline is gone, exactly as a live scanner tick would clear it.
+/// `bucket_key` with a pending backlog entry, even under an active override.
+/// A test of "the override activates the next admission" must first clear the
+/// backlog it made for the gated baseline, as a scanner tick would.
 async fn clear_throttle_backlog(conn: &mut AsyncPgConnection, bucket_key: &str) {
     diesel::sql_query("DELETE FROM harvest_start_throttle WHERE bucket_key=$1")
         .bind::<diesel::sql_types::Text, _>(bucket_key)
@@ -572,14 +571,12 @@ async fn rate_limit_override_activates_immediately_and_reverts_at_ttl_with_no_re
 
     // Let the TTL fully lapse with NO operator action (nothing calls
     // DELETE .../override here) BEFORE draining the bucket again. The
-    // drain-to-zero must land strictly AFTER the override has expired:
-    // resetting the bucket WHILE the override is still counting down
-    // would let tokens legitimately re-accrue at the (still-active)
-    // override rate for whatever life it has left -- correct
-    // piecewise-accrual math (issue #945 review, P1), but not what this
-    // step is proving. This step proves the narrower, AC2-literal claim:
-    // a FRESH drain taken strictly after `expires_at` is governed purely
-    // by the reverted baseline rate, with zero override residue.
+    // drain-to-zero must land strictly AFTER the override has expired. A
+    // reset WHILE the override still counts down lets tokens re-accrue at the
+    // override rate for the rest of its life. That is correct piecewise
+    // accrual (issue #945), but not what this step proves. This step proves
+    // the AC2-literal claim: a FRESH drain after `expires_at` follows only the
+    // reverted baseline rate, with zero override residue.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     let task2 = {
         let mut conn = pool.get().await.expect("conn");
@@ -629,8 +626,8 @@ async fn rate_limit_override_delete_reverts_immediately_before_ttl() {
             .expect("ensure bucket");
     }
 
-    // A long-lived override (5 minutes) so a real TTL lapse can never be the
-    // reason dispatch reverts below -- only the explicit DELETE can explain it.
+    // A long-lived override (5 minutes), so a TTL lapse cannot be the reason
+    // dispatch reverts below. Only the explicit DELETE can explain it.
     let (status, body) = post_json(
         &app,
         &format!("/admin/rate-limits/{name}/override"),
@@ -697,13 +694,12 @@ async fn rate_limit_override_expiring_mid_interval_accrues_piecewise_not_the_rev
 
     // Baseline: a comparatively fast 1 token/sec. Override: fully paused
     // (0.0 tokens/sec) for the whole time it was active. The bucket was
-    // last settled 10 DAYS ago and the override expired only 1 second ago
-    // (i.e. it was active for the ENTIRE ~10-day span minus that last
-    // second, then reverted to baseline just before "now" plus whatever
-    // this test's own overhead adds). This is the shape that actually
-    // exercises the P1 bug: almost the WHOLE elapsed interval was
-    // legitimately override-governed (and paused), with only a sliver of
-    // genuine post-expiry baseline accrual.
+    // last settled 10 DAYS ago, and the override expired only 1 second ago.
+    // So the override was active for the ENTIRE ~10-day span minus that last
+    // second. Baseline governs that second plus this test's own overhead.
+    // This shape exercises the phantom-refill bug. Almost the WHOLE elapsed
+    // interval was paused by the override, with only a sliver of post-expiry
+    // baseline accrual.
     set_bucket_accrual_state(
         &mut conn,
         name,
@@ -720,21 +716,20 @@ async fn rate_limit_override_expiring_mid_interval_accrues_piecewise_not_the_rev
     let available = read_available_tokens(&mut conn, name).await;
 
     // BUGGY (pre-fix) shape: `elapsed_total(~10 days) * baseline_rate(1.0)`
-    // is enormous and clamps to the burst ceiling -- the token bucket would
-    // read as FULL (1000.0) the instant the TTL lapsed, even though the
-    // override was paused for all but the last second of that 10-day span.
+    // is enormous and clamps to the burst ceiling. The bucket would read as
+    // FULL (1000.0) the instant the TTL lapsed. Yet the override was paused for
+    // all but the last second of that 10-day span.
     assert!(
         available < 1000.0,
         "must not clamp to the full burst via a phantom instant refill at \
          the reverted baseline rate applied across the WHOLE elapsed \
          interval; available={available}"
     );
-    // CORRECT (piecewise) shape: segment 1 (the ~10-day override-active
-    // span) contributes EXACTLY zero at override_refill_rate=0.0 regardless
-    // of its exact duration, so only segment 2 -- the ~1-second post-expiry
-    // tail, plus this test's own real overhead -- can accrue anything, at
-    // the 1 token/sec baseline. Generous even against tens of seconds of
-    // CI overhead, while still an order of magnitude below the buggy 1000.0.
+    // CORRECT (piecewise) shape: segment 1, the ~10-day override-active span,
+    // contributes EXACTLY zero at override_refill_rate=0.0. So only segment 2
+    // can accrue, at the 1 token/sec baseline. That is the ~1-second
+    // post-expiry tail plus this test's own overhead. The bound tolerates tens
+    // of seconds of CI overhead and is still 10x below the buggy 1000.0.
     assert!(
         (0.0..100.0).contains(&available),
         "expected only the short post-expiry tail (~1s of accrual at \
@@ -751,18 +746,15 @@ async fn rate_limit_override_expiring_mid_interval_does_not_phantom_refill_the_d
     let queue = leaked_name("email-queue");
     let mut conn = pool.get().await.expect("conn");
 
-    // Identical accrual shape to the pure-formula test above (an override
-    // that was paused for essentially the WHOLE ~10-day span and expired
-    // only 1 second ago), but proven through the REAL dispatch/claim path
-    // (the same gate every activity task is admitted through), not a raw
-    // SELECT of the formula. The baseline rate here is deliberately much
-    // slower (0.01/s, vs. 1.0/s above) so that even a generous multi-
-    // second margin for this test's OWN wall-clock overhead between the
-    // write and the claim keeps the correct segment-2 accrual (~1 second
-    // of post-expiry tail at 0.01/s) safely under the 1.0-token dispatch
-    // threshold, while the buggy flat-rate shape (applying 0.01/s across
-    // the whole ~10-day interval) is off by four orders of magnitude and
-    // clamps straight to the burst ceiling either way.
+    // The same accrual shape as the pure-formula test above: the override
+    // paused the WHOLE ~10-day span and expired only 1 second ago. Here the
+    // REAL dispatch/claim path proves it, not a raw SELECT of the formula.
+    // The baseline rate is much slower on purpose (0.01/s, not 1.0/s). So
+    // even with seconds of test overhead between the write and the claim,
+    // the correct segment-2 accrual stays under the 1.0-token dispatch
+    // threshold. The buggy flat-rate shape applies 0.01/s across the whole
+    // ~10-day interval. It is off by four orders of magnitude and clamps to
+    // the burst ceiling.
     set_bucket_accrual_state(
         &mut conn,
         name,
@@ -820,20 +812,18 @@ async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforce
 
     let mut conn = pool.get().await.expect("conn");
 
-    // Identical accrual shape to the second claim-path P1 test above
-    // (`..._does_not_phantom_refill_the_dispatch_gate`), including its
-    // deliberately SLOW 0.01/s baseline: the bucket was last settled 10
-    // DAYS ago, an override paused it at EXACTLY 0.0 tokens/sec for
-    // essentially that whole span, and the override expired only 1 second
-    // ago. The slow baseline keeps the correct post-expiry-tail accrual
-    // (~1s at 0.01/s) safely under the 1.0-token dispatch threshold even
-    // with this test's own wall-clock overhead (worker registration + an
-    // HTTP round trip) between the write and the eligibility read -- a
-    // FAST baseline (e.g. 1.0/s, as the pure-formula test above uses) would
-    // let that same overhead alone accrue >= 1.0 tokens and mask the bug.
-    // `claim_task` (proven by the test immediately above, with the same
-    // 0.01/s shape) refuses to claim this task -- the eligibility endpoint
-    // must agree.
+    // The same accrual shape as the second claim-path test above
+    // (`..._does_not_phantom_refill_the_dispatch_gate`), with its SLOW 0.01/s
+    // baseline. The bucket was last settled 10 DAYS ago. An override paused
+    // it at EXACTLY 0.0 tokens/sec for nearly that whole span and expired
+    // only 1 second ago.
+    //
+    // The slow baseline keeps the correct post-expiry accrual (~1s at 0.01/s)
+    // under the 1.0-token dispatch threshold. That holds even with the test
+    // overhead (worker registration + an HTTP round trip) before the
+    // eligibility read. A FAST baseline such as 1.0/s would let that overhead
+    // alone accrue >= 1.0 tokens and mask the bug. `claim_task` refuses this
+    // task (see the test above), and the eligibility endpoint must agree.
     set_bucket_accrual_state(
         &mut conn,
         name,
@@ -849,9 +839,9 @@ async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforce
 
     enqueue_gated_activity(&mut conn, queue, name).await;
 
-    // An otherwise perfectly eligible worker: right queue, right shard,
-    // fresh heartbeat, no build/sticky/capability constraint -- the ONLY
-    // thing that can make it ineligible is the rate-limit bucket above.
+    // A worker that passes every other gate: right queue, right shard, fresh
+    // heartbeat, no build/sticky/capability constraint. Only the rate-limit
+    // bucket above can make it ineligible.
     register_worker(
         &mut conn,
         worker_id,
@@ -873,17 +863,15 @@ async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforce
     assert_eq!(status, StatusCode::OK, "eligibility response: {body}");
 
     // BUGGY (pre-fix) shape: `elapsed_total(~10 days) * effective_refill_rate
-    // (0.01, the reverted baseline)` is off by four orders of magnitude and
-    // clamps straight to the burst ceiling -- the diagnostic would read the
-    // bucket as FULL and report the worker ELIGIBLE, even though
-    // `claim_task` refuses the very same task.
+    // (0.01, the reverted baseline)` is off by four orders of magnitude. It
+    // clamps to the burst ceiling. The diagnostic would read the bucket as
+    // FULL and report the worker ELIGIBLE, though `claim_task` refuses the
+    // same task.
     //
-    // CORRECT (piecewise) shape: segment 1 (the ~10-day override-active
-    // span) contributes EXACTLY zero at override_refill_rate=0.0, so only
-    // the short post-expiry tail can have accrued -- well under the 1.0
-    // needed to dispatch at the slow 0.01/s baseline -- and the worker must
-    // be reported INELIGIBLE with `rate_limit_exhausted`, agreeing with the
-    // real claim gate.
+    // CORRECT (piecewise) shape: segment 1, the ~10-day override-active span,
+    // contributes EXACTLY zero at override_refill_rate=0.0. Only the short
+    // post-expiry tail can accrue, well under the 1.0 needed at 0.01/s. So the
+    // worker is INELIGIBLE with `rate_limit_exhausted`, like the claim gate.
     let ineligible = body["ineligible_workers"]
         .as_array()
         .unwrap_or_else(|| panic!("ineligible_workers must be an array: {body}"));
@@ -972,10 +960,9 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
 
     // Let the TTL fully lapse with no operator action (nothing calls
     // DELETE here) BEFORE draining the bucket back to zero. The drain
-    // must land strictly AFTER the override has expired -- see the
-    // matching comment on the rate-limit-side TTL test above for why
-    // resetting mid-override would legitimately re-accrue tokens at the
-    // still-active override rate under correct piecewise-accrual math.
+    // must land strictly AFTER the override has expired. The matching comment
+    // on the rate-limit-side TTL test above explains why. A reset mid-override
+    // re-accrues tokens at the still-active override rate.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     {
         let mut conn = pool.get().await.expect("conn");
@@ -1019,12 +1006,11 @@ async fn throttle_scanner_honors_active_override_in_its_candidate_gate() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let name = leaked_name("onboard_user");
-    // Baseline: 1 token per HOUR, burst 1 (~0.000278/s) -- so slow relative
-    // to this test's short sleep window that the scanner's candidate
-    // pre-filter would never select a drained bucket's backlog row within
-    // the lifetime of this test unless the override rate governs it: at
-    // 0.000278/s even a full second of elapsed time accrues under 0.0003
-    // tokens, four orders of magnitude below the 1.0 threshold.
+    // Baseline: 1 token per HOUR, burst 1 (~0.000278/s). In this test's short
+    // sleep window, the scanner's candidate pre-filter never selects a
+    // drained bucket's backlog row unless the override rate governs it. At
+    // 0.000278/s, a full second accrues under 0.0003 tokens. That is four
+    // orders of magnitude below the 1.0 threshold.
     let app = build_app(&pool, vec![], vec![static_throttled_info(name, "1/h", 1.0)]);
 
     let start_uri = format!("/workflows/{name}/start");
@@ -1057,10 +1043,9 @@ async fn throttle_scanner_honors_active_override_in_its_candidate_gate() {
     assert_eq!(status, StatusCode::OK, "override response: {body}");
     assert_eq!(body["override_active"], json!(true));
 
-    // Give the override rate a tiny, real window to accrue (1000 tokens/sec
-    // needs well under 1ms to reach the 1.0-token threshold; a short sleep
-    // here is just headroom against CI scheduling jitter, not load-bearing
-    // math).
+    // Give the override rate a tiny, real window to accrue. At 1000 tokens/sec
+    // it needs well under 1ms to reach 1.0. The sleep is only headroom against
+    // CI scheduling jitter.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Drive the REAL scanner directly, not a manual row deletion. At the
@@ -1131,12 +1116,11 @@ async fn throttle_override_delete_reverts_immediately_before_ttl() {
     assert_eq!(status, StatusCode::OK, "override response: {body}");
     assert_eq!(body["override_active"], json!(true));
 
-    // Drain the bucket to zero BEFORE asserting job-1 is admitted. Without
-    // this, a brand-new bucket's own declared baseline (burst 1.0) already
-    // has exactly enough headroom for one first start regardless of whether
-    // the override is active -- the assertion below would pass even if the
-    // override did nothing at all. Draining first makes admission provably
-    // depend on the override's much higher rate/burst.
+    // Drain the bucket to zero BEFORE asserting job-1 is admitted. A new
+    // bucket's baseline (burst 1.0) already allows one first start, with or
+    // without the override. Without the drain, the assertion below would pass
+    // even if the override did nothing. The drain makes admission depend on
+    // the override's much higher rate/burst.
     let key = autumn_harvest::throttle::bucket_key(name, "");
     {
         let mut conn = pool.get().await.expect("conn");
@@ -1431,14 +1415,12 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
         "expires_at should land ~100s after the SET call (was {delta}s), body={body}"
     );
 
-    // The read surface (GET /admin/rate-limits) reports the same
-    // expires_at the SET response promised -- compared as parsed instants,
-    // not raw strings: the SET response reports the Rust-side
-    // `chrono::Utc::now()` read (nanosecond precision) while the list read
-    // reflects what Postgres actually persisted (TIMESTAMPTZ is
-    // microsecond precision), so the two strings legitimately differ in
-    // their trailing sub-microsecond digits even though they describe the
-    // same instant to within Postgres's storage precision.
+    // The read surface (GET /admin/rate-limits) reports the same expires_at
+    // as the SET response, compared as parsed instants, not raw strings. The
+    // SET response reports the Rust-side `chrono::Utc::now()` read
+    // (nanosecond precision). The list read reflects what Postgres persisted
+    // (TIMESTAMPTZ, microsecond precision). So the strings differ in their
+    // sub-microsecond digits for the same instant.
     let (status, list) = get_json(&app, "/admin/rate-limits").await;
     assert_eq!(status, StatusCode::OK);
     let entry = list
@@ -1465,14 +1447,12 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
 
 // ── GET /admin/start-throttle/{workflow_name}/override — read-only lookup ──
 //
-// The read-only companion route (added to close a visibility gap: the
-// backlog-driven `GET /admin/start-throttle` list only ever surfaces a
-// workflow while it has pending deferred starts, so an override active on a
-// currently-quiet workflow -- or one set before any admission pressure has
-// ever occurred -- would otherwise be invisible). Proves it resolves and
-// reports live override state directly against the bucket the
-// token-consumption path (`throttle::reserve_or_defer`) actually reads,
-// independent of the backlog.
+// The read-only companion route closes a visibility gap. The backlog-driven
+// `GET /admin/start-throttle` list shows a workflow only while it has pending
+// deferred starts. An override on a quiet workflow, or one set before any
+// admission pressure, would be invisible. These tests prove the route reports
+// live override state from the bucket that `throttle::reserve_or_defer`
+// reads, independent of the backlog.
 
 #[tokio::test]
 async fn get_start_throttle_override_reflects_live_state_across_set_and_delete() {
@@ -1569,11 +1549,10 @@ async fn get_start_throttle_override_undeclared_and_dynamic_key_errors() {
 // ── Audit trail: every SET/CLEAR writes a readable audit record ────────────
 //
 // AC4 requires "every set/clear writes an audit record". The prior tests
-// only proved the mechanism statically (the handler always calls
-// `audit::insert_audit` before returning); these read the record BACK
-// through the real `GET /admin/audit` route after a genuine HTTP SET/CLEAR
-// call, closing the gap between "the code path exists" and "the row is
-// actually queryable by an operator".
+// proved only the mechanism, because the handler always calls
+// `audit::insert_audit` before it returns. These tests read the record BACK
+// through the real `GET /admin/audit` route after an HTTP SET/CLEAR call. So
+// the row is shown to be queryable by an operator.
 
 #[tokio::test]
 async fn rate_limit_override_set_and_clear_record_audit_rows() {
@@ -1757,10 +1736,10 @@ async fn rate_limit_override_reports_persisted_baseline_not_registry_after_legac
     .await;
     assert_eq!(status, StatusCode::OK, "legacy permanent set: {body}");
 
-    // SET a TTL'd override touching ONLY refill_rate. `declared_*` in the
-    // response must be the PERSISTED 999.0/999.0, never the registry's
-    // 5.0/5.0 — and the omitted burst's effective value must fall back to
-    // the persisted 999.0, not the registry's 5.0.
+    // SET a TTL'd override that sets ONLY refill_rate. `declared_*` in the
+    // response must be the PERSISTED 999.0/999.0, never the 5.0/5.0 of the
+    // registry. The effective value of the omitted burst falls back to the
+    // persisted 999.0, not 5.0.
     let (status, body) = post_json(
         &app,
         &format!("/admin/rate-limits/{name}/override"),
@@ -1815,9 +1794,9 @@ async fn throttle_override_reports_persisted_baseline_not_registry_after_legacy_
     let key = autumn_harvest::throttle::bucket_key(name, "");
 
     // Permanently change the persisted baseline via the SAME shared-table
-    // legacy route, addressed by the throttle's own bucket key directly —
-    // never touches the registry's declared `5/m` (5.0/60.0 refill_rate) /
-    // 5.0 burst.
+    // legacy route, addressed by the throttle's own bucket key. It never
+    // touches the declared `5/m` (5.0/60.0 refill_rate) / 5.0 burst of the
+    // registry.
     let (status, body) = post_json(
         &app,
         &format!("/admin/rate-limits/{key}"),
@@ -1920,9 +1899,9 @@ async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_
     let name = leaked_name("onboard_user");
     let key = autumn_harvest::throttle::bucket_key(name, "");
 
-    // Seed an ACTIVE override directly on the live shard -- bypasses the SET
-    // route so this test isolates the GET route's partial-outage handling
-    // from SET's own (separately covered) partial-write behaviour.
+    // Seed an ACTIVE override directly on the live shard, without the SET
+    // route. So this test isolates the partial-outage handling of the GET
+    // route from the partial-write behaviour of SET, covered separately.
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
     {
         let mut conn = live_pool.get().await.expect("live conn");
@@ -2002,9 +1981,9 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
     let name = leaked_name("onboard_user");
     let key = autumn_harvest::throttle::bucket_key(name, "");
 
-    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1
-    // -- this is what makes the pre-fix "fewest tokens wins" merge pick the
-    // WRONG (inactive) shard as the representative.
+    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1.
+    // So the pre-fix "fewest tokens wins" merge picks the WRONG (inactive)
+    // shard as the representative.
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
@@ -2124,9 +2103,9 @@ async fn list_rate_limits_reports_disagreement_across_live_shards() {
 
     let name = leaked_name("send_email");
 
-    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1
-    // -- this is what makes the pre-fix "fewest tokens wins" merge pick the
-    // WRONG (inactive) shard as the sole representative.
+    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1.
+    // So the pre-fix "fewest tokens wins" merge picks the WRONG (inactive)
+    // shard as the sole representative.
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
@@ -2306,9 +2285,9 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
     let name = leaked_name("onboard_user");
     let key = autumn_harvest::throttle::bucket_key(name, "");
 
-    // Shard 0: baseline burst = 20.0 (as if a fully successful legacy SET),
-    // override_refill_rate = 5.0, override_burst = NULL (falls back to
-    // this shard's baseline: 20.0).
+    // Shard 0: baseline burst = 20.0, as after a fully successful legacy SET.
+    // override_refill_rate = 5.0, and override_burst = NULL falls back to the
+    // shard baseline of 20.0.
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
@@ -2328,12 +2307,11 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
         .expect("seed shard 0");
     }
 
-    // Shard 1: DIVERGED baseline burst = 30.0 (as if a partial legacy
-    // `POST /admin/rate-limits/{key}` only reached shard 0, or a later
-    // fan-out to shard 1 alone changed it), the SAME
-    // override_refill_rate = 5.0, override_burst = NULL (falls back to
-    // THIS shard's baseline: 30.0). Raw override columns are byte-identical
-    // to shard 0's.
+    // Shard 1: DIVERGED baseline burst = 30.0. A partial legacy
+    // `POST /admin/rate-limits/{key}` may have reached only shard 0, or a
+    // later fan-out changed shard 1 alone. The SAME override_refill_rate =
+    // 5.0, and override_burst = NULL falls back to THIS shard's baseline of
+    // 30.0. The raw override columns are byte-identical to shard 0's.
     {
         let mut conn = pool_1.get().await.expect("shard 1 conn");
         diesel::sql_query(
@@ -2573,12 +2551,11 @@ async fn clear_start_throttle_pacing_override_reports_router_known_shard_with_no
 // fan-out reads via `pools_by_shard`/`expected_shards` (`state.rs`). A
 // single-shard fixture has only one pool. An unreachable pool kills the
 // audit connection too. The handler then 503s on "audit DB connection
-// unavailable". It never reaches the `{"errors": shard_errors}` branch this
-// PR's fix touches. A Codex review comment on this PR (issue #1229) caught
-// that. An earlier version of these tests used `dead_pool()` and asserted
-// only `body.get("errors").is_some()`. That wrong-branch response also
-// satisfies this assertion. Its problem-details envelope carries an
-// unrelated, always-present, empty `errors` field.
+// unavailable". It never reaches the `{"errors": shard_errors}` branch that
+// the fix of issue #1229 touches. An earlier version of these tests used
+// `dead_pool()` and asserted only `body.get("errors").is_some()`. That
+// wrong-branch response also satisfies this assertion. Its problem-details
+// envelope carries an unrelated, always-present, empty `errors` field.
 //
 // Instead the fixture stays on ONE live, reachable connection, so the audit
 // write still succeeds. It drops `harvest_rate_limit_buckets`, the table

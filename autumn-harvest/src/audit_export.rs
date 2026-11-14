@@ -3,18 +3,22 @@
 //! # Overview
 //!
 //! Every mutating management-API operation writes a row to
-//! `harvest_audit_log` ([`crate::audit`], issue #158) — but those rows live
-//! *per-shard, inside the same Postgres database they describe*, readable
-//! only through Harvest's own API. For a security/compliance team that is
+//! `harvest_audit_log` ([`crate::audit`], issue #158). Those rows live
+//! *per-shard, inside the same Postgres database they describe*. Only
+//! Harvest's own API reads them. For a security/compliance team that is
 //! backwards: SIEM pipelines need privileged-action logs centralized,
 //! off-box, and gap-detectable.
 //!
-//! This module ships that export as a deliberate replay of the durable
-//! completion-callback design (issue #605): a boxed async transport trait in
-//! core with **no HTTP client dependency** ([`AuditSink`]), a `reqwest`-based
-//! signed-webhook implementation in `autumn-harvest-plugin`, a
-//! two-transaction claim/deliver scanner that never holds a row lock across
-//! network I/O, at-least-once delivery, and an operator redrive path.
+//! This module replays the durable completion-callback design (issue #605)
+//! for that export. It has these parts:
+//!
+//! - A boxed async transport trait in core with **no HTTP client
+//!   dependency** ([`AuditSink`]).
+//! - A `reqwest`-based signed-webhook implementation in
+//!   `autumn-harvest-plugin`.
+//! - A two-transaction claim/deliver scanner that never holds a row lock
+//!   across network I/O.
+//! - At-least-once delivery, and an operator redrive path.
 //!
 //! # Determinism contract
 //!
@@ -54,8 +58,8 @@
 //! `harvest_audit_log` — is wrong twice over:
 //!
 //! 1. **It would lose records.** A serial value is handed out *before* the
-//!    transaction commits, so two concurrent audited operations can take
-//!    sequence 5 and 6 and commit in the order 6, 5. A cursor of the form
+//!    transaction commits. So two concurrent audited operations can take
+//!    sequences 5 and 6 and commit as 6, 5. A cursor of the form
 //!    `WHERE seq > last_exported` that ships 6 first would then skip 5
 //!    forever, which is precisely the silent loss AC2 forbids "by
 //!    construction". `occurred_at` has the same defect (it is transaction
@@ -63,9 +67,9 @@
 //!    inserts).
 //! 2. **It would break under DR failover.** As
 //!    `migrations/20260726000000_harvest_shard_generation/up.sql` records for
-//!    issue #954, logical replication does not replicate sequence values — a
+//!    issue #954, logical replication does not replicate sequence values. A
 //!    promoted standby would re-issue sequence numbers it had already
-//!    exported, corrupting the receiver's `(shard, seq)` accounting.
+//!    exported. That corrupts the receiver's `(shard, seq)` accounting.
 //!
 //! Instead the exporter assigns the sequence itself, under the per-shard
 //! cursor row lock, to rows it can actually *see* (`export_seq IS NULL`).
@@ -78,13 +82,12 @@
 //! # At-least-once, never at-most-once
 //!
 //! Unlike a completion callback, an audit record may **never** be dropped
-//! after N attempts — the export *is* the compliance artifact. There is
-//! therefore no dead-letter arm in [`classify_export_outcome`]: a failing
-//! sink backs off (capped exponential) and retries forever, and the cursor
-//! never advances past the failure. A batch can consequently be delivered
-//! more than once (a process death between the POST and the cursor write
-//! re-sends it); receivers deduplicate on `(shard, seq)`, exactly as #605
-//! specifies for callbacks.
+//! after N attempts — the export *is* the compliance artifact. So
+//! [`classify_export_outcome`] has no dead-letter arm. A failing sink backs
+//! off (capped exponential) and retries forever. The cursor never advances
+//! past the failure. So a batch can be delivered more than once: a process
+//! death between the POST and the cursor write re-sends it. Receivers
+//! deduplicate on `(shard, seq)`, exactly as #605 specifies for callbacks.
 //!
 //! # OTLP-logs mapping
 //!
@@ -119,12 +122,12 @@ pub use crate::completion_callback::{CallbackSecret, SIGNATURE_HEADER, TIMESTAMP
 /// HTTP header naming the shard a batch came from.
 ///
 /// **Routing and triage metadata only — not covered by the signature.** The
-/// signature (per #605's scheme) is over the request body alone, so a
-/// receiver must read the authoritative `(shard, seq)` pair from each record
-/// *in the body*. Deduplicating on these headers would mean deduplicating on
-/// unauthenticated input: an attacker replaying a captured, validly-signed
-/// batch with a shifted range could mark a real range as already-seen and
-/// create exactly the silent gap this feature exists to prevent.
+/// signature (per #605's scheme) covers the request body alone. So a receiver
+/// must read the authoritative `(shard, seq)` pair from each record *in the
+/// body*. Deduplicating on these headers means deduplicating on
+/// unauthenticated input. An attacker could replay a captured, validly-signed
+/// batch with a shifted range. That marks a real range as already-seen and
+/// creates the silent gap this feature exists to prevent.
 pub const SHARD_HEADER: &str = "X-Harvest-Audit-Shard";
 /// HTTP header carrying the first (lowest) `seq` in the batch. Unsigned — see
 /// [`SHARD_HEADER`].
@@ -138,9 +141,9 @@ pub const DEFAULT_EXPORT_BATCH_SIZE: i64 = 500;
 
 /// Hard ceiling on the configurable batch size.
 ///
-/// A batch is buffered in memory and `POSTed` as one body; an unbounded value
-/// would let a misconfiguration try to serialize an entire retention window
-/// into a single request.
+/// A batch is buffered in memory and `POSTed` as one body. Without a ceiling,
+/// a misconfiguration could try to serialize an entire retention window into
+/// one request.
 pub const MAX_EXPORT_BATCH_SIZE: i64 = 5_000;
 
 /// One exported audit record.
@@ -152,9 +155,9 @@ pub const MAX_EXPORT_BATCH_SIZE: i64 = 5_000;
 /// stable object shape across every batch. The two chain fields are the
 /// exception: they are omitted when absent (issue #1838).
 ///
-/// Carries no workflow payloads, activity inputs, or signal bodies: the
-/// audit trail deliberately is not a second PII store ([`crate::audit`]),
-/// and exporting it must not make it one.
+/// Carries no workflow payloads, activity inputs, or signal bodies. The
+/// audit trail is not a second PII store ([`crate::audit`]), and exporting it
+/// must not make it one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditExportRecord {
     /// The shard whose database this record was read from — half of the
@@ -169,10 +172,10 @@ pub struct AuditExportRecord {
     /// `harvest_audit_log.shard_id`.
     ///
     /// Distinct from [`Self::shard`], which names the database the record was
-    /// read from and is the dedup dimension. The two normally agree, but a
-    /// control-plane mutation writes its audit row on the default shard while
-    /// naming the shard it acted on, so exporting only one of them would make
-    /// a receiver's correlation silently wrong.
+    /// read from and is the dedup dimension. The two normally agree. A
+    /// control-plane mutation, though, writes its audit row on the default
+    /// shard and names the shard it acted on. Exporting only one of them would
+    /// silently break a receiver's correlation.
     pub shard_id: Option<i32>,
     pub occurred_at: DateTime<Utc>,
     pub actor: String,
@@ -249,9 +252,9 @@ fn chain_hex(bytes: Option<&[u8]>) -> Option<String> {
 /// Serialize a batch as JSON lines — one compact JSON object per line,
 /// newline-terminated.
 ///
-/// These are the exact bytes that get signed and delivered; a caller must
-/// sign *these* bytes, never a re-serialization, so the receiver verifies
-/// precisely what it received. `serde_json` emits struct fields in
+/// These are the exact bytes that get signed and delivered. A caller signs
+/// *these* bytes, never a re-serialization, so the receiver verifies exactly
+/// what it received. `serde_json` emits struct fields in
 /// declaration order with no interior newlines, so the output is
 /// deterministic — which is what makes a redrive byte-identical (AC6).
 ///
@@ -259,9 +262,9 @@ fn chain_hex(bytes: Option<&[u8]>) -> Option<String> {
 /// batch).
 ///
 /// # Errors
-/// Returns `Err` only if a record fails to serialize, which cannot happen
-/// for [`AuditExportRecord`]'s field types; kept fallible so a future field
-/// change cannot silently panic in the delivery path.
+/// Returns `Err` only if a record fails to serialize. That cannot happen for
+/// [`AuditExportRecord`]'s field types. It stays fallible so a future field
+/// change cannot panic in the delivery path.
 pub fn serialize_batch(records: &[AuditExportRecord]) -> Result<Vec<u8>, serde_json::Error> {
     let mut out = Vec::with_capacity(records.len() * 256);
     for record in records {
@@ -308,10 +311,10 @@ pub fn export_headers(
 /// Either a response status was observed (`status`, whatever it was), or the
 /// request never got one (`transport_error` — connect failure, timeout, TLS
 /// or DNS error). Mirrors
-/// [`crate::completion_callback::DeliveryAttempt`] rather than reusing it so
-/// a future change to callback delivery semantics cannot silently alter
-/// audit-export semantics, where the cost of a misclassification is a
-/// compliance gap rather than a missed notification.
+/// [`crate::completion_callback::DeliveryAttempt`] rather than reusing it.
+/// So a change to callback delivery semantics cannot silently alter
+/// audit-export semantics. Here a misclassification costs a compliance gap,
+/// not a missed notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkAttempt {
     pub status: Option<u16>,
@@ -339,9 +342,9 @@ impl SinkAttempt {
 
     /// `true` only for a 2xx response status.
     ///
-    /// A 3xx is deliberately *not* a success: the plugin sink never follows
-    /// redirects (`redirect::Policy::none()`), so a 3xx means the batch was
-    /// not accepted and must be retried, not acknowledged.
+    /// A 3xx is *not* a success. The plugin sink never follows redirects
+    /// (`redirect::Policy::none()`). So a 3xx means the batch was not accepted
+    /// and must be retried, not acknowledged.
     #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self.status, Some(s) if (200..300).contains(&s))
@@ -351,9 +354,8 @@ impl SinkAttempt {
 /// One batch handed to an [`AuditSink`].
 ///
 /// Carries both the canonical `body` (the signed bytes an HTTP sink POSTs
-/// verbatim) and the parsed `records`, so a non-HTTP sink — Kinesis, a file,
-/// an OTLP-logs bridge — can map the structured form without re-parsing what
-/// core just serialized.
+/// verbatim) and the parsed `records`. A non-HTTP sink, such as Kinesis, a
+/// file or an OTLP-logs bridge, maps the structured form without re-parsing.
 pub struct AuditBatch<'a> {
     /// Shard this batch was read from.
     pub shard: i32,
@@ -381,13 +383,12 @@ pub type SinkFuture<'a> =
 /// Implementations are a thin transport: hand `batch` to the destination and
 /// report what happened. Batching, sequencing, HMAC signing, cursor
 /// management, retry/backoff, and lag accounting all happen in core, above
-/// this trait — an implementation does not need to reason about any of it,
-/// and **must not** acknowledge a batch it did not durably accept: a
-/// `success` return advances the cursor past those records.
+/// this trait. An implementation **must not** acknowledge a batch it did not
+/// durably accept. A `success` return advances the cursor past those records.
 ///
-/// Core ships no HTTP client, so there is no default implementation here;
+/// Core ships no HTTP client, so there is no default implementation here.
 /// `autumn-harvest-plugin` supplies the `reqwest`-based signed-webhook sink,
-/// exactly as it does for [`crate::completion_callback::CompletionCallbackDeliverer`]
+/// as it does for [`crate::completion_callback::CompletionCallbackDeliverer`]
 /// and [`crate::payload_store::PayloadStore`].
 pub trait AuditSink: Send + Sync + 'static {
     fn deliver<'a>(&'a self, batch: &'a AuditBatch<'a>) -> SinkFuture<'a>;
@@ -399,11 +400,10 @@ pub trait AuditSink: Send + Sync + 'static {
 
 /// Capped exponential backoff for a failing sink.
 ///
-/// Deliberately *not* [`crate::policy::RetryPolicy`]: that type carries a
-/// `max_attempts` ceiling whose whole purpose is to eventually give up and
-/// dead-letter, which must never happen to an audit record. Only the
-/// backoff math is shared (via [`crate::policy::compute_retry_delay`]), so
-/// the two cannot drift.
+/// Not [`crate::policy::RetryPolicy`]: that type has a `max_attempts` ceiling
+/// that eventually gives up and dead-letters. That must never happen to an
+/// audit record. Only the backoff math is shared (via
+/// [`crate::policy::compute_retry_delay`]), so the two cannot drift.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportBackoff {
     /// Delay after the first failure.
@@ -418,10 +418,9 @@ pub struct ExportBackoff {
 impl Default for ExportBackoff {
     /// 1s -> 2s -> 4s ... capped at 60s.
     ///
-    /// The cap is what bounds recovery time after an outage: the success
-    /// metric asks for zero gaps after a 10-minute sink outage, and a
-    /// 60-second ceiling means at most one minute of extra lag once the sink
-    /// returns.
+    /// The cap bounds recovery time after an outage. The success metric asks
+    /// for zero gaps after a 10-minute sink outage. A 60-second ceiling adds
+    /// at most one minute of lag once the sink returns.
     fn default() -> Self {
         Self {
             initial_interval: std::time::Duration::from_secs(1),
@@ -451,9 +450,8 @@ pub enum ExportOutcome {
 
 /// Decide what to write after one delivery attempt.
 ///
-/// Pure, so the "never advance past a failure" invariant (AC2) is pinned by
-/// a unit test rather than requiring a database and a broken sink to
-/// observe.
+/// Pure, so a unit test pins the "never advance past a failure" invariant
+/// (AC2). It needs no database and no broken sink.
 ///
 /// `consecutive_failures` is the count *before* this attempt; the returned
 /// [`ExportOutcome::Backoff`] carries the incremented value (saturating).
@@ -518,15 +516,14 @@ pub enum RewindOutcome {
 
 /// Resolve a redrive request. **A cursor may only ever move backwards.**
 ///
-/// Moving it forward would mark records delivered that never were — the
-/// exact gap this feature exists to make impossible — so a forward request
-/// is refused outright rather than clamped and applied, and the caller
-/// reports the refusal to the operator instead of silently doing nothing
-/// useful.
+/// Moving it forward would mark records delivered that never were. That is
+/// the exact gap this feature exists to make impossible. So a forward request
+/// is refused outright, not clamped and applied. The caller reports the
+/// refusal to the operator instead of silently doing nothing useful.
 ///
 /// A negative request is clamped to `0` (re-export everything still
-/// retained) rather than rejected: `0` is its only sane reading, and writing
-/// a negative cursor would violate the table's `CHECK (last_acked_seq >= 0)`.
+/// retained), not rejected. `0` is its only sane reading. A negative cursor
+/// would violate the table's `CHECK (last_acked_seq >= 0)`.
 #[must_use]
 pub const fn resolve_rewind(current_acked: i64, requested: i64) -> RewindOutcome {
     let target = if requested < 0 { 0 } else { requested };
@@ -599,8 +596,8 @@ pub struct AuditExportBuilderConfig {
 /// origin is what makes a config dump useful ("which host is this pointed at?")
 /// and is the part that is not a credential.
 ///
-/// Falls back to a marker rather than the input when the URL cannot be parsed:
-/// an unparseable string must not be echoed on the assumption it is harmless.
+/// Falls back to a marker, not the input, when the URL cannot be parsed. An
+/// unparseable string must not be echoed on the assumption that it is harmless.
 ///
 /// Reads the origin from a full [`url::Url::parse`], not a hand-rolled
 /// split (issue #1274). A manual split trusts the input's shape. It
@@ -689,18 +686,17 @@ impl AuditExportBuilderConfig {
     ///
     /// `true` when a signed webhook is configured but no HMAC key is.
     ///
-    /// Fails the build rather than warning (issue #953 review): the signature
-    /// *is* the tamper-evidence control this feature promises, and HMAC-SHA256
-    /// accepts a zero-length key happily — so an unconfigured secret does not
-    /// produce a missing header, it produces a well-formed
-    /// `X-Harvest-Signature` that anyone can recompute. A receiver verifying
-    /// it would see a valid signature on a batch any third party could have
-    /// forged, which is worse than no signature at all. A startup
-    /// `tracing::warn!` on a fleet is not a control.
+    /// Fails the build rather than warning (issue #953). The signature *is*
+    /// the tamper-evidence control this feature promises. HMAC-SHA256 accepts
+    /// a zero-length key. So an unconfigured secret does not produce a missing
+    /// header. It produces a well-formed `X-Harvest-Signature` that anyone can
+    /// recompute. A receiver would then see a valid signature on a batch any
+    /// third party could have forged. That is worse than no signature at all.
+    /// A startup `tracing::warn!` on a fleet is not a control.
     ///
     /// Only the *webhook* path is gated. An embedder-supplied [`AuditSink`]
-    /// may authenticate however it likes (IAM, mTLS, a local file), so an
-    /// absent HMAC key there is a legitimate configuration and only warns.
+    /// may authenticate however it likes (IAM, mTLS, a local file). So an
+    /// absent HMAC key there is legitimate and only warns.
     #[must_use]
     pub fn webhook_is_missing_a_secret(&self) -> bool {
         if self.sink.is_some() || self.webhook_url.is_none() {
@@ -720,13 +716,13 @@ impl AuditExportBuilderConfig {
 
     /// Validate the webhook URL against the SSRF policy.
     ///
-    /// Skipped entirely when an embedder-supplied `sink` is set, matching
-    /// [`Self::webhook_is_missing_a_secret`] and the documented precedence:
-    /// the sink wins, no `ReqwestAuditSink` is ever constructed, and no request
-    /// can reach the URL. Failing startup on a stale or non-allowlisted URL
-    /// that nothing will call is a false positive (issue #953, Codex review
-    /// P2) — the two webhook checks must agree about when a webhook is live,
-    /// or a config that skips one still trips the other.
+    /// Skipped entirely when an embedder-supplied `sink` is set. This matches
+    /// [`Self::webhook_is_missing_a_secret`] and the documented precedence.
+    /// The sink wins, no `ReqwestAuditSink` is ever constructed, and no
+    /// request can reach the URL. Failing startup on a stale or
+    /// non-allowlisted URL that nothing calls is a false positive (issue
+    /// #953). The two webhook checks must agree about when a webhook is live.
+    /// Otherwise a config that skips one still trips the other.
     ///
     /// # Errors
     /// Returns the `(url, rejection)` pair when the webhook URL fails
@@ -744,25 +740,23 @@ impl AuditExportBuilderConfig {
         crate::completion_callback::validate_target_url(url, &policy)
             .map(|_| ())
             // The REDACTED origin, never the full URL (issue #953). This pair
-            // becomes
-            // `HarvestBuilderError::AuditSinkRejected`, whose `Display` a
-            // startup failure writes straight to the logs -- and a SIEM ingest
+            // becomes `HarvestBuilderError::AuditSinkRejected`. A startup
+            // failure writes its `Display` straight to the logs. A SIEM ingest
             // URL carries its credential in the path or query. Redacting here
             // rather than at the construction site means the full URL cannot
             // escape through this result at all.
             //
-            // Nothing diagnostic is lost: every `SsrfRejection` variant
-            // discriminates on an ORIGIN property -- scheme, host, port, IP
-            // literal, userinfo -- so the origin is exactly what explains the
-            // rejection, and the part that is dropped is exactly the part that
-            // is a secret.
+            // Nothing diagnostic is lost. Every `SsrfRejection` variant
+            // discriminates on an ORIGIN property: scheme, host, port, IP
+            // literal or userinfo. So the origin explains the rejection, and
+            // the dropped part is exactly the secret part.
             .map_err(|rejection| (redact_webhook_url(url), rejection))
     }
 
     /// The claim lease, floored at one second.
     ///
-    /// A zero lease would make every claim immediately reclaimable and give
-    /// the sink call a zero timeout, so every batch would fail before it was
+    /// A zero lease makes every claim immediately reclaimable and gives the
+    /// sink call a zero timeout. Every batch would then fail before it was
     /// sent.
     #[must_use]
     pub fn effective_lease(&self) -> std::time::Duration {
@@ -786,26 +780,26 @@ impl AuditExportBuilderConfig {
 // M4: process-global runtime config (opt-in; `None` == scanner fully inert)
 // ---------------------------------------------------------------------
 
-/// Bound on acquiring a shard's connection inside the scanner (issue #953,
-/// Codex review P1).
+/// Bound on acquiring a shard's connection inside the scanner (issue #953).
 ///
-/// `pool.get()` can be an **unbounded** wait — a pool may have no deadpool
-/// `Timeouts`. The scanner is already holding a connection when it runs (the
-/// timeout checker checks one out before calling `enforce_timeouts_once`), and
-/// for a per-shard checker that connection comes from the very pool this
-/// function then asks for a second one. On a one-connection pool that is a
-/// self-deadlock: the wait never returns, audit export never runs, and every
-/// scanner resident sequenced after it is wedged with it.
+/// `pool.get()` can be an **unbounded** wait, because a pool may have no
+/// deadpool `Timeouts`. The scanner already holds a connection when it runs.
+/// The timeout checker checks one out before it calls
+/// `enforce_timeouts_once`. For a per-shard checker, that connection comes
+/// from the same pool this function then asks for a second one. On a
+/// one-connection pool that is a self-deadlock. The wait never returns, audit
+/// export never runs, and every scanner resident sequenced after it is
+/// wedged with it.
 ///
-/// Bounding converts the indefinite park into "skip this shard for one tick",
-/// which is visible in the log and self-heals, mirroring
-/// `worker::shard_acquire_bound` (added for the same class of bug in #961).
-/// Deliberately generous: the bound exists to stop an *indefinite* block, not
-/// to police normal contention on a busy pool.
+/// The bound converts the indefinite park into "skip this shard for one
+/// tick". That is visible in the log and self-heals. It mirrors
+/// `worker::shard_acquire_bound`, added for the same class of bug in #961.
+/// It is generous on purpose: it stops an *indefinite* block, and does not
+/// police normal contention on a busy pool.
 pub const SHARD_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bound reserved for the acknowledgement query itself, on top of
-/// [`SHARD_ACQUIRE_BOUND`] (Codex review on PR #1520, follow-up P2).
+/// [`SHARD_ACQUIRE_BOUND`] (PR #1520).
 ///
 /// `SHARD_ACQUIRE_BOUND` alone only reserves time for the post-delivery
 /// connection checkout. A checkout that uses nearly all of that bound
@@ -820,7 +814,7 @@ pub const ACK_QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(
 
 /// Splits a reserve between the post-delivery checkout and the
 /// acknowledgement query. The split keeps their uncapped proportion
-/// (Codex review on PR #1520, follow-up P1).
+/// (PR #1520).
 ///
 /// The caller never passes a `reserve` above `SHARD_ACQUIRE_BOUND` plus
 /// `ACK_QUERY_BOUND`, only at or below it. So this only ever shrinks the
@@ -842,16 +836,16 @@ fn split_reserve(reserve: std::time::Duration) -> (std::time::Duration, std::tim
 /// Default lease held on a shard's cursor while a batch is in flight.
 ///
 /// Long enough to cover a slow sink, short enough that a crashed exporter's
-/// shard resumes promptly. A lease expiring early is safe — it costs a
-/// duplicate delivery, which the receiver dedupes on `(shard, seq)` — while a
-/// lease expiring late costs export lag.
+/// shard resumes promptly. A lease that expires early is safe: it costs a
+/// duplicate delivery, which the receiver dedupes on `(shard, seq)`. A lease
+/// that expires late costs export lag.
 ///
 /// **It also bounds the sink call itself.** The exporter wraps every
-/// `deliver` in a timeout of exactly the configured lease, so a sink can
-/// never outlive its own claim: without that, a sink slower than the lease
-/// would livelock (each attempt superseded by the next claim, the cursor
-/// never advancing) and would additionally wedge the shared background
-/// scanner behind an embedder-supplied `await`.
+/// `deliver` in a timeout of exactly the configured lease. So a sink can
+/// never outlive its own claim. Without that, a sink slower than the lease
+/// would livelock: each attempt is superseded by the next claim, and the
+/// cursor never advances. It would also wedge the shared background scanner
+/// behind an embedder-supplied `await`.
 pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Everything the exporter needs at runtime, installed once at startup.
@@ -907,23 +901,22 @@ impl AuditExportRuntimeConfig {
 // skips the disable tracking of issue #1506, and the gauges then keep their
 // last value.
 //
-// `Arc`-wrapped for the same reason as `GLOBAL_CALLBACK_CONFIG` (issue #605
-// review): every read clones the value out of the lock, and the struct carries
-// owned fields that would otherwise be deep-copied on every scanner tick for a
-// value that only ever changes at startup.
+// `Arc`-wrapped for the same reason as `GLOBAL_CALLBACK_CONFIG` (issue #605).
+// Every read clones the value out of the lock. Without the `Arc`, each scanner
+// tick would deep-copy the owned fields of a value that changes only at
+// startup.
 pub static GLOBAL_AUDIT_EXPORT_CONFIG: std::sync::RwLock<
     Option<std::sync::Arc<AuditExportRuntimeConfig>>,
 > = std::sync::RwLock::new(None);
 
 /// Read [`GLOBAL_AUDIT_EXPORT_CONFIG`], tolerating a poisoned lock.
 ///
-/// Mirrors `completion_callback::read_global_callback_config`: a poisoned
-/// `RwLock` means some other thread panicked while holding the write guard,
-/// but the single `*lock = Some(..)` that write path performs is not a
-/// multi-step invariant a panic could leave half-applied, so the data behind
-/// the guard is still valid. Recovering it avoids the failure mode of a bare
-/// `.read().ok()`, where one unrelated panic would silently stop exporting
-/// audit records — a compliance gap — for the rest of the process's life.
+/// Mirrors `completion_callback::read_global_callback_config`. A poisoned
+/// `RwLock` means another thread panicked while it held the write guard. The
+/// write path performs a single `*lock = Some(..)`, which a panic cannot
+/// leave half-applied. So the data behind the guard is still valid. A bare
+/// `.read().ok()` would instead let one unrelated panic silently stop audit
+/// export, a compliance gap, for the rest of the process's life.
 fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntimeConfig>> {
     match GLOBAL_AUDIT_EXPORT_CONFIG.read() {
         Ok(guard) => guard.clone(),
@@ -943,11 +936,10 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 ///
 /// Mirrors
 /// [`crate::completion_callback::install_global_callback_config_for_direct_worker`]
-/// and exists for the same reason (issue #921 review): the plugin's runner is
-/// the only installer this crate ships, so a direct core embedder would
-/// otherwise get an `audit_export_*` builder API that silently did nothing —
-/// and a silently-inert audit export is a compliance gap discovered at audit
-/// time.
+/// and exists for the same reason (issue #921). The plugin's runner is the
+/// only installer this crate ships. Without this, a direct core embedder would
+/// get an `audit_export_*` builder API that silently did nothing. A
+/// silently-inert audit export is a compliance gap found at audit time.
 ///
 /// Only an **embedder-supplied [`AuditSink`]** can be installed here: core
 /// ships no HTTP client, so a bare `audit_export_webhook(...)` has no
@@ -955,8 +947,8 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 /// embedder plainly intended export to happen.
 ///
 /// **Clears any prior config when this runtime configures none**, for the
-/// same reason as the callback installer: the config is a single process-wide
-/// static, so a second runtime built without a sink must not keep shipping
+/// same reason as the callback installer. The config is a single process-wide
+/// static. So a second runtime built without a sink must not keep shipping
 /// audit records to the first runtime's destination.
 ///
 /// That clear marks export as disabled (issue #1506). Each export tick then
@@ -1114,12 +1106,11 @@ fn report_if_disabled(
 ///
 /// Two callers, and both matter:
 /// - [`crate::audit::purge_old_audit_records`] uses it to decide whether the
-///   "never purge an unexported record" guard is live. The guard cannot be
-///   inferred from the cursor table alone: an empty table means *either*
-///   "export was never configured" (purge freely) *or* "export is configured
-///   but has not ticked on this shard yet" (purge nothing), and a stale
-///   cursor row left behind by a since-disabled exporter would otherwise
-///   block retention forever.
+///   "never purge an unexported record" guard is live. The cursor table
+///   alone cannot decide the guard. An empty table means *either* "export
+///   was never configured" (purge freely) *or* "export is configured but has
+///   not ticked here yet" (purge nothing). And a stale cursor row left by a
+///   since-disabled exporter would otherwise block retention forever.
 /// - `GET /admin/audit-export` reports it as `sink_configured`, so an
 ///   operator can see export configured on the web app but not on the worker
 ///   fleet (or vice versa).
@@ -1150,31 +1141,30 @@ pub struct ClaimedBatch {
     /// written to the cursor row inside the claim transaction.
     ///
     /// Delivery is bounded by what **remains** of this, not by the full lease
-    /// (issue #953). The lease starts running when
-    /// the claim commits; serializing the batch and reaching the sink consumes
-    /// some of it. Bounding the sink call by the whole lease therefore lets a
-    /// delivery outlive the row lease, at which point another exporter can
-    /// reclaim the shard and bump the epoch, so this attempt's acknowledgement
-    /// is refused. With sink latency consistently near the lease that repeats
-    /// indefinitely: the cursor never advances and the sink is handed the same
-    /// batch over and over.
+    /// (issue #953). The lease starts running when the claim commits.
+    /// Serializing the batch and reaching the sink consume some of it. A sink
+    /// call bounded by the whole lease can outlive the row lease. Another
+    /// exporter can then reclaim the shard and bump the epoch, so this
+    /// attempt's acknowledgement is refused. With sink latency near the lease,
+    /// that repeats indefinitely. The cursor never advances and the sink gets
+    /// the same batch over and over.
     pub lease_until: DateTime<Utc>,
 }
 
 /// Create this shard's cursor row if it does not exist, and heartbeat it if it
 /// does. **Never reactivates a retired cursor** — see issue #1273.
 ///
-/// Deliberately not seeded by the migration: a shard's database cannot know
-/// its own shard id (see the migration's comment, and
-/// `replication::ensure_generation_row` for the same pattern in #954).
+/// Not seeded by the migration, because a shard's database cannot know its
+/// own shard id. See the migration's comment, and
+/// `replication::ensure_generation_row` for the same pattern in #954.
 ///
-/// **`updated_at` doubles as an exporter heartbeat** (issue #953, Codex review
-/// P1). Called on every scanner tick, including ticks that claim nothing, so a
+/// **`updated_at` doubles as an exporter heartbeat** (issue #953). It is
+/// written on every scanner tick, including ticks that claim nothing. So a
 /// fresh `updated_at` means "an exporter is running against this shard right
-/// now" — durable, shared state that a *different process* can read. That is
-/// what lets [`crate::audit::purge_old_audit_records`] protect unexported rows
-/// in a split web/worker deployment, where the process running retention may
-/// have no sink configured and so cannot answer the question locally.
+/// now". That is durable, shared state that a *different process* can read.
+/// It lets [`crate::audit::purge_old_audit_records`] protect unexported rows
+/// in a split web/worker deployment. There the process running retention may
+/// have no sink configured, so it cannot answer the question locally.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1185,9 +1175,9 @@ pub async fn ensure_cursor_row(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
-    // Two defences for the sequence high-water mark, because re-issuing a
-    // `(shard, seq)` pair that names a *different* record is the one way to
-    // make a receiver deduping on that pair discard genuine audit events.
+    // Two defences for the sequence high-water mark. A receiver dedupes on
+    // `(shard, seq)`. Re-issuing a pair that names a *different* record is the
+    // one way to make it discard genuine audit events.
     //
     // 1. The row is retired rather than deleted ([`decommission_cursor`]), so
     //    `last_assigned_seq` survives even when retention later purges every
@@ -1198,9 +1188,9 @@ pub async fn ensure_cursor_row(
     //    the cursor's `last_acked_seq <= last_assigned_seq` CHECK the moment a
     //    retained batch is acknowledged.
     //
-    // On a fresh INSERT `last_acked_seq` stays 0, so a cursor rebuilt from
-    // stamped rows re-delivers them rather than assuming they shipped:
-    // at-least-once, deduped by the receiver on a now-stable pair, erring
+    // On a fresh INSERT `last_acked_seq` stays 0. So a cursor rebuilt from
+    // stamped rows re-delivers them rather than assuming they shipped. That is
+    // at-least-once, deduped by the receiver on a now-stable pair. It errs
     // toward re-export over silent loss.
     //
     // The ON CONFLICT arm is guarded by `WHERE retired_at IS NULL` (issue
@@ -2130,32 +2120,31 @@ pub async fn decommission_cursor(
 /// [`decommission_cursor`] without the surrounding transaction.
 ///
 /// The **explicit decommission step** for audit export (issue #953). While a
-/// cursor row exists,
-/// [`crate::audit::purge_old_audit_records`] will not delete a record that
-/// shard still owes the sink — the row's presence, not a timeout, is what says
-/// "an exporter is responsible for this shard".
+/// cursor row exists, [`crate::audit::purge_old_audit_records`] will not
+/// delete a record that shard still owes the sink. The row's presence, not a
+/// timeout, says "an exporter is responsible for this shard".
 ///
-/// This deliberately replaced a 24-hour heartbeat TTL. A TTL cannot tell
-/// "export was intentionally removed" from "the worker has been down since
-/// Friday". It used to resolve that ambiguity by *deleting audit records* —
-/// the one outcome this feature exists to prevent, arriving precisely during
-/// an outage. Unbounded table growth is the strictly better failure: it is
-/// loud (`harvest.audit.export_lag`, the `last_error` on
-/// `GET /admin/audit-export`), it is bounded by the genuine unexported
-/// backlog rather than by the whole table (fully-acknowledged records are
-/// purged normally), and it is *reversible* — deleted audit records are not.
+/// This replaced a 24-hour heartbeat TTL. A TTL cannot tell "export was
+/// intentionally removed" from "the worker has been down since Friday". It
+/// used to resolve that ambiguity by *deleting audit records*. That is the one
+/// outcome this feature exists to prevent, and it arrived precisely during an
+/// outage. Unbounded table growth is the strictly better failure. It is loud
+/// (`harvest.audit.export_lag`, the `last_error` on `GET /admin/audit-export`).
+/// The genuine unexported backlog bounds it, not the whole table, because
+/// fully-acknowledged records are purged normally. And it is *reversible*;
+/// deleted audit records are not.
 ///
 /// So retiring an export configuration is an operator action, not an inferred
 /// one. See `docs/audit-export.md`.
 ///
 /// The row is **retired, never deleted** (issue #953).
 /// `last_assigned_seq` has to outlive the audit rows themselves, and retiring
-/// the cursor is precisely what lets retention purge them: seeding a recreated
-/// cursor from `MAX(export_seq)` preserves the counter only while at least one
-/// stamped row survives, so a decommission followed by a full purge would reset
-/// it to 0 and re-issue `(shard, seq)` pairs the SIEM still holds against
-/// different records. Keeping the row makes the high-water mark durable
-/// independently of retention.
+/// the cursor is precisely what lets retention purge them. A recreated cursor
+/// seeds from `MAX(export_seq)`. That preserves the counter only while at
+/// least one stamped row survives. So a decommission followed by a full purge
+/// would reset it to 0. It would then re-issue `(shard, seq)` pairs the SIEM
+/// still holds against different records. Keeping the row makes the
+/// high-water mark durable independently of retention.
 ///
 /// Reversible via [`reactivate_cursor`], an explicit, audited operator action
 /// that resumes from the preserved `last_assigned_seq`. Records purged while
@@ -2195,13 +2184,13 @@ pub async fn decommission_cursor_locked(
     }
 
     // Bumping `claim_epoch` invalidates any delivery still in flight (issue
-    // #953). `apply_outcome` is guarded on
-    // `(shard_id, claim_epoch)` alone, so without this an attempt claimed
-    // before the retirement could land after it -- advancing the cursor or
-    // writing backoff state onto a row the status route now reports as a
-    // frozen `RETIRED` snapshot, and racing retention, which is permitted to
-    // purge the shard the moment it is retired. Clearing `lease_until` in the
-    // same statement means the row does not also read as mid-delivery.
+    // #953). `apply_outcome` is guarded on `(shard_id, claim_epoch)` alone.
+    // Without this bump, an attempt claimed before the retirement could land
+    // after it. It could advance the cursor or write backoff state onto a row
+    // that the status route reports as a frozen `RETIRED` snapshot. It would
+    // also race retention, which may purge the shard the moment it is retired.
+    // Clearing `lease_until` in the same statement means the row does not also
+    // read as mid-delivery.
     diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
         .set((
             cur::retired_at.eq(Some(now)),
@@ -2315,9 +2304,9 @@ struct HighWater {
 /// Claim a shard for export: assign sequences to newly-visible audit rows and
 /// load the next batch, all under the cursor row's lock.
 ///
-/// This is transaction 1 of the two-transaction shape (#605): it takes the
+/// This is transaction 1 of the two-transaction shape (#605). It takes the
 /// cursor row lock, does only local work, and commits **before** any network
-/// I/O happens. No row lock is ever held across a sink call.
+/// I/O. No row lock is ever held across a sink call.
 ///
 /// Returns `Ok(None)` when the shard is not due (backing off), is already
 /// leased by another exporter, or has nothing to deliver.
@@ -2396,9 +2385,10 @@ pub async fn claim_shard_chained(
                 return Ok(None);
             }
 
-            // Backing off after a sink failure, or another exporter (or this
-            // one, on a previous tick whose HTTP call has not returned) holds
-            // a live lease. Either way this shard is not ours right now.
+            // The shard backs off after a sink failure, or an exporter holds a
+            // live lease. That exporter may be this one, on a previous tick
+            // whose HTTP call has not returned. Either way this shard is not
+            // ours right now.
             if cursor.next_attempt_at > now {
                 return Ok(None);
             }
@@ -2408,23 +2398,24 @@ pub async fn claim_shard_chained(
 
             // ── Assign sequences to rows that are now visible ──────────────
             //
-            // Ordered by `(occurred_at, id)` purely for a stable, index-backed
-            // scan; correctness does NOT depend on that order matching commit
-            // order, because a row that commits later is still `NULL` here and
-            // simply receives a later sequence on a later tick. That is the
-            // whole reason the sequence is stamped by the exporter rather than
-            // handed out by a `BIGSERIAL` before commit — see the module docs.
-            // The high-water mark is read back from the rows actually
-            // stamped (`MAX(export_seq)`), never inferred from the affected
-            // row count (issue #953 review): the two diverge if any row in
-            // the CTE's snapshot disappears before the UPDATE takes its
-            // lock, and a high-water mark one short of the highest sequence
-            // handed out would let the NEXT tick reissue that sequence to a
-            // different record -- two audit records sharing a `(shard, seq)`,
-            // which a receiver deduping on that key silently drops.
+            // Ordered by `(occurred_at, id)` only for a stable, index-backed
+            // scan. Correctness does NOT depend on that order matching commit
+            // order. A row that commits later is still `NULL` here and gets a
+            // later sequence on a later tick. That is why the exporter stamps
+            // the sequence, not a `BIGSERIAL` before commit. See the module
+            // docs.
+            //
+            // The high-water mark is read back from the rows actually stamped
+            // (`MAX(export_seq)`), never inferred from the affected row count
+            // (issue #953). The two diverge if a row in the CTE's snapshot
+            // disappears before the UPDATE takes its lock. A high-water mark
+            // one short of the highest sequence would let the NEXT tick
+            // reissue that sequence to a different record. Two audit records
+            // would then share a `(shard, seq)`, and a receiver deduping on
+            // that key silently drops one.
             //
             // The outer `AND a.export_seq IS NULL` repeats the CTE's
-            // predicate under the row lock for the same reason: without it
+            // predicate under the row lock for the same reason. Without it,
             // the UPDATE would overwrite a sequence another writer assigned
             // between the CTE's evaluation and the lock.
             let assigned: HighWater = diesel::sql_query(
@@ -2504,9 +2495,9 @@ pub async fn claim_shard_chained(
 
             // ── Load the batch to deliver ─────────────────────────────────
             //
-            // Everything above the cursor, not merely what was just assigned:
-            // a retry after a failed delivery, and a redrive that rewound the
-            // cursor, both re-send already-sequenced records. Reading by
+            // Everything above the cursor, not merely what was just assigned.
+            // A retry after a failed delivery and a redrive that rewound the
+            // cursor both re-send already-sequenced records. Reading by
             // `export_seq` (never re-stamping) is what makes a re-export
             // byte-identical (AC6).
             let rows: Vec<crate::models::AuditExportRow> = log::harvest_audit_log
@@ -2576,11 +2567,11 @@ pub async fn claim_shard_chained(
 
 /// Apply a delivery outcome to a shard's cursor.
 ///
-/// Every write is guarded on `claim_epoch = $epoch`, so an attempt whose sink
-/// call outlived its lease — and whose batch a later claim has already
-/// re-delivered — can never apply a stale outcome over the fresher one, and a
-/// redrive that ran mid-flight (which bumps the epoch) can never be silently
-/// undone by the in-flight batch's acknowledgement.
+/// Every write is guarded on `claim_epoch = $epoch`. Take an attempt whose
+/// sink call outlived its lease, and whose batch a later claim already
+/// re-delivered. It can never apply a stale outcome over the fresher one. A
+/// redrive that ran mid-flight bumps the epoch. So the in-flight batch's
+/// acknowledgement can never silently undo it.
 ///
 /// Returns `true` when the guarded write applied.
 ///
@@ -2608,10 +2599,9 @@ pub async fn apply_outcome(
             through_seq,
             status,
         } => {
-            // Plain assignment, not `GREATEST(...)`: the epoch guard already
-            // rules out a stale attempt writing here, and a `GREATEST` would
-            // defeat a legitimate redrive by re-raising a cursor an operator
-            // deliberately rewound.
+            // Plain assignment, not `GREATEST(...)`. The epoch guard already
+            // rules out a stale attempt writing here. A `GREATEST` would defeat
+            // a legitimate redrive by re-raising a cursor an operator rewound.
             diesel::update(target)
                 .set((
                     cur::last_acked_seq.eq(*through_seq),
@@ -2703,11 +2693,11 @@ pub fn delivery_state(
     retired_at: Option<DateTime<Utc>>,
 ) -> &'static str {
     // A retired cursor's other columns are a frozen snapshot of whatever the
-    // exporter last did (issue #953). Deriving IDLE,
-    // BACKOFF or RETRYING from them would tell an operator that records are
-    // pending delivery when no exporter owes them and retention is free to
-    // purge them. `RETIRED` is checked first because it overrides every other
-    // reading of those columns.
+    // exporter last did (issue #953). Deriving IDLE, BACKOFF or RETRYING from
+    // them would tell an operator that records are pending delivery. In fact
+    // no exporter owes them, and retention may purge them. `RETIRED` is
+    // checked first because it overrides every other reading of those
+    // columns.
     if retired_at.is_some() {
         return "RETIRED";
     }
@@ -2742,8 +2732,8 @@ pub struct AuditExportShardStatus {
     /// `NOT_STARTED` for a shard with no cursor row at all, which this struct
     /// cannot represent (there is no cursor to describe).
     ///
-    /// `RETIRED` means an operator ran `decommission_cursor`: the row survives
-    /// only to preserve the sequence high-water mark, no exporter owes this
+    /// `RETIRED` means an operator ran `decommission_cursor`. The row survives
+    /// only to preserve the sequence high-water mark. No exporter owes this
     /// shard records, and retention may purge them. The remaining fields are a
     /// frozen snapshot of the last export activity, not a live one.
     pub delivery_state: String,
@@ -2939,12 +2929,12 @@ pub async fn export_status(
     };
 
     // A retired cursor owes nothing, so there is no backlog to report (issue
-    // #953). Recomputing it from the live audit table
-    // would keep `pending_records` and `lag_seconds` climbing for a shard no
-    // exporter is responsible for -- firing backlog alerts that no action can
-    // clear, and contradicting the contract's promise that a retired entry's
-    // fields are a frozen snapshot. Skipping the query is also the honest
-    // answer to what the fields mean: how much the exporter still owes.
+    // #953). A recompute from the live audit table would keep `pending_records`
+    // and `lag_seconds` climbing for a shard no exporter owes. That fires
+    // backlog alerts no action can clear. It also breaks the contract's promise
+    // that a retired entry's fields are a frozen snapshot. Skipping the query
+    // is also the honest answer to what the fields mean: how much the exporter
+    // still owes.
     let (pending_records, lag_seconds) = if cursor.retired_at.is_some() {
         (0, 0.0)
     } else {
@@ -2990,8 +2980,8 @@ pub enum RewindRequest {
 /// Rewind a shard's export cursor so already-delivered records re-export
 /// (AC6), after sink-side data loss.
 ///
-/// Re-exported records are **byte-identical**: `export_seq` is never
-/// re-stamped, so a record carries the same `(shard, seq)` and the same JSON
+/// Re-exported records are **byte-identical**. `export_seq` is never
+/// re-stamped. So a record carries the same `(shard, seq)` and the same JSON
 /// on every delivery, and the receiver dedupes.
 ///
 /// The cursor may only ever move **backwards** — see [`resolve_rewind`].
@@ -2999,9 +2989,10 @@ pub enum RewindRequest {
 /// when the rewind lands cannot acknowledge over it.
 ///
 /// Opens its own transaction. A caller that must commit the rewind together
-/// with something else — the management route pairs it with its own audit
-/// record, so a rewind can never be applied unaudited — should open the
-/// transaction itself and call [`rewind_cursor_locked`].
+/// with something else should open the transaction itself and call
+/// [`rewind_cursor_locked`]. The management route does this to pair the
+/// rewind with its own audit record. So a rewind can never be applied
+/// unaudited.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -3024,8 +3015,8 @@ pub async fn rewind_cursor(
 
 /// [`rewind_cursor`] without the surrounding transaction.
 ///
-/// Takes the cursor row's `FOR UPDATE` lock and applies the rewind but leaves
-/// the commit to the caller, so a caller can bind the rewind to another write
+/// Takes the cursor row's `FOR UPDATE` lock and applies the rewind, but leaves
+/// the commit to the caller. So a caller can bind the rewind to another write
 /// in the same unit. The management route uses this to write its
 /// `audit_export.redrive` record *before* committing, which makes an applied
 /// but unaudited redrive unrepresentable rather than merely unlikely.
@@ -3066,7 +3057,7 @@ pub async fn rewind_cursor_locked(
             // is free to purge the very records a rewind would target. No
             // exporter is running to ship them either.
             // Answering 200 "rewound" there is a promise the system cannot
-            // keep, so a retired shard is reported exactly as an unconfigured
+            // keep. So a retired shard is reported exactly as an unconfigured
             // one was before the row began to persist.
             let Some(cursor) = cursor.filter(|c| c.retired_at.is_none()) else {
                 return Ok(RewindOutcome::NotConfigured);
@@ -3077,25 +3068,25 @@ pub async fn rewind_cursor_locked(
                 RewindRequest::Before(instant) => {
                     // The LOWEST sequence among records that occurred at or
                     // after `instant`, minus one -- never `MAX(seq)` over the
-                    // records *before* it (issue #953 review).
+                    // records *before* it (issue #953).
                     //
                     // The two are not equivalent, and the difference is the
                     // same hazard this whole design is built around.
-                    // `occurred_at` is transaction START time, so a
+                    // `occurred_at` is transaction START time. So a
                     // long-running request's audit row can carry an earlier
-                    // `occurred_at` than a row that committed sooner and yet
-                    // be sequenced later. Taking the max over the "before"
-                    // side would then land ABOVE records the operator asked to
-                    // re-export, and they would silently never be re-sent --
+                    // `occurred_at` than a row that committed sooner, yet be
+                    // sequenced later. Taking the max over the "before" side
+                    // would then land ABOVE records the operator asked to
+                    // re-export. They would silently never be re-sent. That is
                     // the exact skew the forward path is immune to,
                     // reintroduced in the recovery path.
                     //
                     // Anchoring on the "at or after" side is monotone in the
-                    // safe direction: any skew makes the rewind reach FURTHER
-                    // back, costing duplicate deliveries the receiver dedupes
-                    // on `(shard, seq)`, never a missing record. No sequenced
-                    // record at or after the instant means there is nothing to
-                    // re-export from there, so the cursor stays put.
+                    // safe direction. Any skew makes the rewind reach FURTHER
+                    // back. That costs duplicate deliveries the receiver
+                    // dedupes on `(shard, seq)`, never a missing record. No
+                    // sequenced record at or after the instant means there is
+                    // nothing to re-export from there, so the cursor stays put.
                     //
                     // This MIN sees only SURVIVING rows. Retention may have
                     // purged the earliest records at or after `instant`.
@@ -3251,17 +3242,16 @@ pub async fn redrive_window_truncated(
 
 /// Deliver `batch`, bounded by what remains of this claim's database lease.
 ///
-/// Never the full `config.lease` (issue #953). The
-/// lease starts running when the claim commits, and claiming, serializing and
-/// signing the batch have already consumed part of it. Bounding by the whole
-/// lease would let the call outlive the row lease, after which another exporter
-/// can reclaim the shard and bump the epoch — so this attempt's acknowledgement
-/// is refused and the batch is redelivered. At sink latencies consistently near
-/// the lease that never converges: the cursor stays put while the sink receives
-/// the same batch forever.
+/// Never the full `config.lease` (issue #953). The lease starts running when
+/// the claim commits. Claiming, serializing and signing the batch have already
+/// consumed part of it. Bounding by the whole lease would let the call outlive
+/// the row lease. Another exporter can then reclaim the shard and bump the
+/// epoch. So this attempt's acknowledgement is refused and the batch is
+/// redelivered. At sink latencies near the lease, that never converges. The
+/// cursor stays put while the sink receives the same batch forever.
 ///
-/// An already-elapsed remainder is not skipped, it is an immediate timeout —
-/// classified like any other transport failure, so the cursor is held and the
+/// An already-elapsed remainder is not skipped. It is an immediate timeout,
+/// classified like any other transport failure. So the cursor is held and the
 /// batch retried under a fresh claim. Never a loss.
 #[cfg(feature = "db")]
 async fn deliver_within_lease(
@@ -3294,26 +3284,25 @@ async fn deliver_within_lease(
 /// `read_global_audit_export_config` clones the `Arc` at the top of a tick. A
 /// second runtime that publishes a different sink does not disturb that clone.
 /// So the batch reaches the OLD destination (issue #953). `apply_outcome` is
-/// guarded on `claim_epoch`, which a config swap does
-/// not change, so a 2xx from the old sink would advance the cursor: the records
-/// would be delivered, marked delivered, and absent from the SIEM the operator
-/// actually configured.
+/// guarded on `claim_epoch`, which a config swap does not change. So a 2xx
+/// from the old sink would advance the cursor. The records would be
+/// delivered, marked delivered, and absent from the SIEM the operator actually
+/// configured.
 ///
 /// Comparing the `Arc` this attempt used against the one now installed closes
 /// that window. A mismatch becomes a transport failure, so the cursor is held
 /// and the batch is redelivered under the new sink. The old sink keeps its
 /// copy — that is the at-least-once contract, not a leak.
 ///
-/// A `current` of `None` also counts as swapped: export was turned off
-/// mid-flight, and advancing the cursor on the strength of the retired sink's
-/// answer would strand those records.
+/// A `current` of `None` also counts as swapped. Export was turned off
+/// mid-flight. Advancing the cursor on the retired sink's answer would strand
+/// those records.
 ///
-/// Takes `current` rather than reading the global itself, so the decision is a
-/// pure function of its inputs — the same shape as [`classify_export_outcome`].
-/// That is deliberate: a version of this that read the process-wide static
-/// internally could only be tested by mutating that static, and two tests in
-/// this PR have already failed on CI for exactly that reason while passing
-/// locally.
+/// Takes `current` rather than reading the global itself. So the decision is
+/// a pure function of its inputs, the same shape as
+/// [`classify_export_outcome`]. A version that read the process-wide static
+/// could only be tested by mutating that static. Two tests failed on CI for
+/// exactly that reason while they passed locally.
 #[cfg(feature = "db")]
 fn fence_against_sink_swap(
     attempt: SinkAttempt,
@@ -3343,8 +3332,8 @@ async fn export_once_on_conn(
 
     let now = Utc::now();
     let Some(claim) = config.claim(conn, shard_id, now).await? else {
-        // Nothing claimed, but the lag gauge must still be emitted: an
-        // operator's "is the export keeping up?" signal has to stay live
+        // Nothing claimed, but the lag gauge must still be emitted. An
+        // operator's "is the export keeping up?" signal must stay live
         // exactly when deliveries are NOT happening.
         emit_lag_and_observed(conn, shard_id, metrics).await;
         return Ok(0);
@@ -3356,13 +3345,13 @@ async fn export_once_on_conn(
     let body = match serialize_batch(&claim.records) {
         Ok(body) => body,
         Err(error) => {
-            // Cannot serialize what we claimed. Hold the cursor AND write a
-            // real backoff (issue #953 review): a bare `release_claim` leaves
-            // `next_attempt_at` in the past, so the next tick re-claims the
-            // same unserializable batch immediately and the shard hot-spins
-            // once per poll interval with the cursor frozen and nothing but a
-            // log line per iteration. A backoff paces the failure and surfaces
-            // it on `GET /admin/audit-export`.
+            // The claimed batch cannot be serialized. Hold the cursor AND
+            // write a real backoff (issue #953). A bare `release_claim` leaves
+            // `next_attempt_at` in the past. The next tick then re-claims the
+            // same unserializable batch at once. The shard hot-spins once per
+            // poll interval, with the cursor frozen and only a log line per
+            // iteration. A backoff paces the failure and surfaces it on
+            // `GET /admin/audit-export`.
             tracing::error!(
                 shard = shard_id,
                 error = %error,
@@ -3404,17 +3393,17 @@ async fn export_once_on_conn(
         headers: &headers,
     };
 
-    // Bound the embedder-supplied call by the claim's own lease (issue #953
-    // review). Two failures this closes:
+    // Bound the embedder-supplied call by the claim's own lease (issue #953).
+    // This closes two failures:
     //
-    //   * A sink slower than the lease livelocks: its claim is superseded by
-    //     the next tick's before its 2xx lands, that acknowledgement is
-    //     refused by the epoch guard, and the cursor never advances while the
-    //     sink receives the same batch forever.
+    //   * A sink slower than the lease livelocks. The next tick's claim
+    //     supersedes it before its 2xx lands. The epoch guard refuses that
+    //     acknowledgement. The cursor never advances while the sink receives
+    //     the same batch forever.
     //   * `fire_due_audit_exports` is awaited inline in
-    //     `enforce_timeouts_once`, so an un-timed `await` on embedder code
-    //     would wedge the shared scanner -- and every resident sequenced after
-    //     it -- for as long as the sink hangs.
+    //     `enforce_timeouts_once`. So an un-timed `await` on embedder code
+    //     would wedge the shared scanner, and every resident sequenced after
+    //     it, for as long as the sink hangs.
     //
     // A timeout is classified exactly like any other transport failure: the
     // cursor is held and the batch is retried. Never a loss.
@@ -3545,11 +3534,11 @@ async fn emit_lag_and_observed(
 /// present, every assigned shard — including a lone one — is exported through
 /// that shard's own pool, acquired under [`SHARD_ACQUIRE_BOUND`].
 ///
-/// Deliberately no inference that a single `shard_assignments` entry means
-/// `conn` belongs to it. This is a `pub` primitive an embedder may drive by
-/// hand, nothing here can verify which database `conn` points at, and being
-/// wrong stamps one shard's audit rows under another shard's key — silent
-/// corruption of the `(shard, seq)` identity the whole feature rests on.
+/// No inference that a single `shard_assignments` entry means `conn` belongs
+/// to it. This is a `pub` primitive an embedder may drive by hand. Nothing
+/// here can verify which database `conn` points at. A wrong guess stamps one
+/// shard's audit rows under another shard's key. That silently corrupts the
+/// `(shard, seq)` identity the whole feature rests on.
 /// Acquiring the exact pool can at worst skip a shard, loudly. See the comment
 /// in the match arm for the full reasoning and its cost.
 ///
@@ -3588,17 +3577,16 @@ pub async fn fire_due_audit_exports(
         Some(sp) if !shard_assignments.is_empty() => {
             // EVERY shard is exported through its own pool, including a single
             // assignment. An earlier revision reused the caller's `conn` when
-            // `shard_assignments.len() == 1`, inferring from that alone that
-            // `conn` belonged to the named shard (issue #953, Codex review
-            // rounds 3, 14 and 18 -- the same question, answered three times).
+            // `shard_assignments.len() == 1`. It inferred from that alone that
+            // `conn` belonged to the named shard (issue #953).
             //
-            // The inference is not sound for a `pub` primitive. A caller that
-            // hands over a default-pool connection with a single NON-default
-            // assignment -- which `enforce_timeouts_once` cannot detect --
-            // would have its rows stamped in the default database under
-            // another shard's key, a cursor created there under that key, the
-            // real shard left unexported, and the mislabelled records deduped
-            // against the true shard's sequence stream by the receiver.
+            // The inference is not sound for a `pub` primitive. Take a caller
+            // that hands over a default-pool connection with a single
+            // NON-default assignment, which `enforce_timeouts_once` cannot
+            // detect. Its rows would be stamped in the default database under
+            // another shard's key, with a cursor created there under that key.
+            // The real shard would stay unexported. The receiver would dedupe
+            // the mislabelled records against the true shard's sequence stream.
             //
             // That is silent cross-shard corruption of the very `(shard, seq)`
             // identity this feature exists to guarantee. Acquiring the exact
@@ -3607,10 +3595,10 @@ pub async fn fire_due_audit_exports(
             // inference is gone.
             //
             // The cost is that a shard pool sized 1 cannot export while the
-            // scanner holds its only connection. That is already true of every
-            // other per-shard resident of this loop (#605's delivery included),
-            // so such a pool is not a supported configuration; the skip is
-            // logged with that cause, and
+            // scanner holds its only connection. Every other per-shard
+            // resident of this loop has the same limit, #605's delivery
+            // included. So such a pool is not a supported configuration. The
+            // skip is logged with that cause, and
             // autumn-foundation/autumn-harvest#1269 removes the constraint
             // outright by giving export its own task.
             for shard in shard_assignments {
@@ -3647,10 +3635,10 @@ pub async fn fire_due_audit_exports(
                             continue;
                         }
                     };
-                // One shard's failure must never stop the others: an
-                // unreachable shard is an availability problem, but silently
+                // One shard's failure must never stop the others. An
+                // unreachable shard is an availability problem. Silently
                 // skipping every *later* shard's export would be a compliance
-                // one.
+                // problem.
                 match export_once_on_conn(&mut shard_conn, &config, shard.as_i32(), metrics).await {
                     Ok(n) => total += n,
                     Err(e) => {
@@ -3668,19 +3656,20 @@ pub async fn fire_due_audit_exports(
         }
         _ => {
             // Unsharded deployment, or a pool with no assignments. Label the
-            // records with the pool's own default shard rather than a hardcoded
-            // `0` (issue #953 review): a sharded pool whose default is not 0
+            // records with the pool's own default shard, not a hardcoded `0`
+            // (issue #953). Take a sharded pool whose default is not 0. It
             // would otherwise write a cursor row keyed `0` into that shard's
-            // database, alongside the correctly-keyed cursor a worker assigned
-            // to it maintains -- two independent counters stamping `export_seq`
-            // on the same rows from different bases, which breaks per-shard
-            // density and the receiver's contiguity check.
+            // database. A worker assigned to that shard keeps the
+            // correctly-keyed cursor beside it. Two independent counters would
+            // then stamp `export_seq` on the same rows from different bases.
+            // That breaks per-shard density and the receiver's contiguity
+            // check.
             let shard = sharded_pool
                 .as_ref()
                 .map_or(0, |sp| sp.default_shard().as_i32());
             // Logged and swallowed for the same reason as the sharded arm
-            // above: `fire_due_audit_exports` is one resident of
-            // `enforce_timeouts_once`, and a transient audit-export database
+            // above. `fire_due_audit_exports` is one resident of
+            // `enforce_timeouts_once`. A transient audit-export database
             // error must not abort the timeout/SLA/session residents
             // sequenced after it.
             match export_once_on_conn(conn, &config, shard, metrics).await {
@@ -3712,8 +3701,8 @@ pub async fn fire_due_audit_exports(
 /// Acquire one shard's connection, bounded, for the dedicated export task.
 ///
 /// `bound` is normally [`SHARD_ACQUIRE_BOUND`], but the post-delivery
-/// reacquire passes a narrower, lease-derived bound instead (Codex review
-/// on PR #1520, follow-up P1) — see [`split_reserve`].
+/// reacquire passes a narrower, lease-derived bound instead (PR #1520). See
+/// [`split_reserve`].
 ///
 /// A connection-acquisition failure or timeout is logged and marks the
 /// shard unobserved, then returns `None`. It is not a database error, so
@@ -3763,10 +3752,10 @@ async fn acquire_shard_conn_for_export(
 /// embedder driving [`fire_due_audit_exports`] by hand.
 ///
 /// It is wrong for [`spawn_audit_export_checker_for_shard`]'s own dedicated
-/// task (Codex review on PR #1520 P1). On a `max_size(1)` shard pool,
-/// holding the connection for the whole delivery would block every other
-/// user of that pool. The timeout checker is one of them, for up to the
-/// claim lease. That is exactly the coupling issue #1269 exists to remove.
+/// task (PR #1520). On a `max_size(1)` shard pool, holding the connection for
+/// the whole delivery would block every other user of that pool. The timeout
+/// checker is one of them, for up to the claim lease. That is exactly the
+/// coupling issue #1269 exists to remove.
 ///
 /// This checks a connection out for the claim transaction, then releases it
 /// before the network call. It checks one out again — not necessarily the
@@ -3775,8 +3764,7 @@ async fn acquire_shard_conn_for_export(
 ///
 /// The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
 /// `ACK_QUERY_BOUND` off the lease, capped at half the configured lease.
-/// Both the reserve and its cap follow Codex review on PR #1520 (follow-up
-/// P1 and follow-up P2).
+/// Both the reserve and its cap come from PR #1520.
 ///
 /// The reserve covers the second checkout and the acknowledgement query it
 /// runs. Both steps are bounded, but bounded is not free. A successful
@@ -3786,29 +3774,26 @@ async fn acquire_shard_conn_for_export(
 /// entire delivery window to a fixed reserve.
 ///
 /// [`split_reserve`] splits that same reserve between the two steps, so a
-/// capped reserve shrinks both bounds together (Codex review on PR #1520,
-/// follow-up P1). Reacquiring under the fixed, uncapped `SHARD_ACQUIRE_BOUND`
-/// regardless of the cap could let the checkout alone consume a reserve
-/// meant to cover both steps.
+/// capped reserve shrinks both bounds together (PR #1520). Reacquiring under
+/// the fixed, uncapped `SHARD_ACQUIRE_BOUND` regardless of the cap could let
+/// the checkout alone consume a reserve meant to cover both steps.
 ///
 /// `cancel` races the delivery wait, never the claim or the acknowledgement
-/// (Codex review on PR #1520, follow-up P1). A shutdown mid-delivery
-/// abandons the wait and leaves the claim exactly where it was, for the
-/// next attempt to redeliver. It never blocks the caller's shutdown for up
-/// to the full lease.
+/// (PR #1520). A shutdown mid-delivery abandons the wait and leaves the
+/// claim exactly where it was, for the next attempt to redeliver. It never
+/// blocks the caller's shutdown for up to the full lease.
 ///
 /// `config_arc` is a snapshot the caller already read, not re-read here
-/// (Codex review on PR #1520, follow-up P2). The caller uses that same
-/// snapshot to decide the registered liveness interval. A second, separate
-/// read inside this function could observe a runtime swap the caller's
-/// read missed. That would register this tick's own tolerance against a
-/// lease it is not actually using.
+/// (PR #1520). The caller uses that same snapshot to decide the registered
+/// liveness interval. A second, separate read inside this function could
+/// observe a runtime swap the caller's read missed. That would register this
+/// tick's own tolerance against a lease it is not actually using.
 ///
 /// `fence_against_sink_swap` reads the global fresh, deliberately, and runs
 /// immediately before the acknowledgement write, not right after delivery
-/// (Codex review on PR #1520, follow-up P1). A swap could otherwise land
-/// during the reacquire wait between the two, after an earlier fence check
-/// but before a stale `Advance` outcome commits.
+/// (PR #1520). A swap could otherwise land during the reacquire wait between
+/// the two, after an earlier fence check but before a stale `Advance` outcome
+/// commits.
 ///
 /// Returns `Ok(0)` before any query when no sink is configured (AC8). It
 /// reports the shard unobserved if a sink was removed after it was enabled
@@ -3857,14 +3842,13 @@ async fn export_once_via_pool(
         ),
     )
     .await;
-    // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
-    // round). `claim_shard`'s locked read can wait indefinitely behind
-    // another session holding the cursor row. A bare await here would then
-    // block graceful shutdown for as long as that lock is held. That is
-    // exactly the failure mode the delivery wait below is raced against.
-    // Nothing has been claimed yet at this point. Abandoning the wait
-    // leaves no state to clean up: the next tick's `claim_shard` retries
-    // the same locked row from scratch.
+    // Raced against `cancel` (PR #1520). `claim_shard`'s locked read can wait
+    // indefinitely behind another session holding the cursor row. A bare await
+    // here would then block graceful shutdown for as long as that lock is held.
+    // That is exactly the failure mode the delivery wait below is raced
+    // against. Nothing has been claimed yet at this point. Abandoning the wait
+    // leaves no state to clean up: the next tick's `claim_shard` retries the
+    // same locked row from scratch.
     let claim = tokio::select! {
         result = async {
             ensure_cursor_row(&mut conn, shard_id).await?;
@@ -3877,15 +3861,13 @@ async fn export_once_via_pool(
                 "[audit_export] shutdown requested while claiming a batch; discarding \
                  the connection and abandoning the wait for the next attempt to retry"
             );
-            // `claim_shard` runs inside its own Diesel transaction (Codex
-            // review on PR #1520, follow-up P2, sixth round -- P1).
+            // `claim_shard` runs inside its own Diesel transaction (PR #1520).
             // Dropping this future mid-flight sends no ROLLBACK. Silently
-            // returning `conn` to the pool could then hand the next
-            // checkout a connection still holding an open transaction and
-            // the cursor row's lock. `Object::take` detaches it from the
-            // pool instead of recycling it. Dropping the raw connection
-            // then closes the socket, and Postgres rolls back whatever
-            // that session still had open.
+            // returning `conn` to the pool could then hand the next checkout a
+            // connection still holding an open transaction and the cursor row's
+            // lock. `Object::take` detaches it from the pool instead of
+            // recycling it. Dropping the raw connection then closes the socket,
+            // and Postgres rolls back whatever that session still had open.
             drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
@@ -3906,9 +3888,9 @@ async fn export_once_via_pool(
     let body = match serialize_batch(&claim.records) {
         Ok(body) => body,
         Err(error) => {
-            // Cannot serialize what we claimed. Hold the cursor AND write a
-            // real backoff, mirroring `export_once_on_conn`'s own handling
-            // of this case.
+            // The claimed batch cannot be serialized. Hold the cursor AND write
+            // a real backoff, mirroring `export_once_on_conn`'s own handling of
+            // this case.
             tracing::error!(
                 shard = shard_id,
                 error = %error,
@@ -3959,10 +3941,9 @@ async fn export_once_via_pool(
 
     // The delivery deadline reserves `SHARD_ACQUIRE_BOUND` plus
     // `ACK_QUERY_BOUND` off the end of the lease. That covers the
-    // post-delivery reacquire-and-acknowledge step below (Codex review on
-    // PR #1520, follow-up P1 and follow-up P2). Without a reserve, a sink
-    // finishing near `lease_until` could leave that step to run PAST the
-    // lease.
+    // post-delivery reacquire-and-acknowledge step below (PR #1520).
+    // Without a reserve, a sink finishing near `lease_until` could leave that
+    // step to run PAST the lease.
     //
     // A second exporter would then see the lease already expired. It would
     // reclaim the shard and bump `claim_epoch`. This attempt's
@@ -3970,22 +3951,21 @@ async fn export_once_via_pool(
     // genuinely delivered. Under sustained near-lease latency that repeats
     // forever: delivered, but never acknowledged.
     //
-    // The reserve is capped at half the configured lease (Codex review on
-    // PR #1520, follow-up P1). A builder-configured lease can be as short
-    // as one second. Subtracting the full, fixed reserve from a lease that
-    // short leaves no delivery window at all. Every batch would then time
-    // out immediately and back off forever. Capping the reserve instead
-    // shrinks the delivery window and the reacquire-and-acknowledge window
-    // together on a short lease. A short lease then always keeps some
-    // genuine delivery time.
+    // The reserve is capped at half the configured lease (PR #1520). A
+    // builder-configured lease can be as short as one second. Subtracting the
+    // full, fixed reserve from a lease that short leaves no delivery window at
+    // all. Every batch would then time out immediately and back off forever.
+    // Capping the reserve instead shrinks the delivery window and the
+    // reacquire-and-acknowledge window together on a short lease. A short lease
+    // then always keeps some genuine delivery time.
     let reserve = (SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND).min(config.lease / 2);
     let delivery_deadline = claim.lease_until
         - chrono::Duration::from_std(reserve).unwrap_or_else(|_| chrono::Duration::zero());
 
     // The reserve is split between the reacquire below and the
-    // acknowledgement query that follows it (Codex review on PR #1520,
-    // follow-up P1). The split keeps their uncapped proportion. A capped
-    // `reserve` can be smaller than the fixed `SHARD_ACQUIRE_BOUND`.
+    // acknowledgement query that follows it (PR #1520). The split keeps their
+    // uncapped proportion. A capped `reserve` can be smaller than the fixed
+    // `SHARD_ACQUIRE_BOUND`.
     // Reacquiring under that fixed bound regardless could let the checkout
     // alone consume the whole capped reserve, leaving the acknowledgement
     // no margin at all. See [`split_reserve`].
@@ -3995,12 +3975,12 @@ async fn export_once_via_pool(
     // like any other transport failure: the cursor is held and the batch is
     // retried. Never a loss.
     //
-    // Raced against `cancel` (Codex review on PR #1520 P1). A bare await
-    // here does not return until the sink finishes or the delivery deadline
-    // elapses. Both worker shutdown paths join every export task's handle.
-    // An in-flight delivery could otherwise hold up a graceful shutdown for
-    // the whole lease. That is 60s by default, longer if configured -- well
-    // past a typical deployment's termination grace period.
+    // Raced against `cancel` (PR #1520). A bare await here does not return
+    // until the sink finishes or the delivery deadline elapses. Both worker
+    // shutdown paths join every export task's handle. An in-flight delivery
+    // could otherwise hold up a graceful shutdown for the whole lease. That is
+    // 60s by default, longer if configured -- well past a typical deployment's
+    // termination grace period.
     //
     // Cancellation drops the delivery future without recording an outcome.
     // The claim's cursor and lease are untouched. The batch is safely
@@ -4017,8 +3997,8 @@ async fn export_once_via_pool(
         }
     };
     // Reacquired under `checkout_bound`, the reserve's own share for this
-    // step (Codex review on PR #1520, follow-up P1). The fixed
-    // `SHARD_ACQUIRE_BOUND` above is for the claim checkout only.
+    // step (PR #1520). The fixed `SHARD_ACQUIRE_BOUND` above is for the claim
+    // checkout only.
     let Some(mut conn) =
         acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, checkout_bound).await
     else {
@@ -4030,15 +4010,15 @@ async fn export_once_via_pool(
     };
 
     // Fenced and classified here, immediately before the acknowledgement
-    // write below, not right after delivery (Codex review on PR #1520,
-    // follow-up P1). A sink swap landing during the reacquire wait just
-    // above must still be caught before a stale `Advance` outcome can
-    // commit. Fencing any earlier would miss exactly that swap.
+    // write below, not right after delivery (PR #1520). A sink swap landing
+    // during the reacquire wait just above must still be caught before a
+    // stale `Advance` outcome can commit. Fencing any earlier would miss
+    // exactly that swap.
     //
     // A swap landing during the acknowledgement write itself, after this
-    // comparison, is not caught (Codex review on PR #1520, follow-up P1,
-    // second round). Closing that too means holding this read across the
-    // `apply_outcome` await below, so no writer can land in between.
+    // comparison, is not caught (PR #1520). Closing that too means holding this
+    // read across the `apply_outcome` await below, so no writer can land in
+    // between.
     //
     // `GLOBAL_AUDIT_EXPORT_CONFIG` is a `std::sync::RwLock`. Its read guard
     // is not `Send`, confirmed by `cargo test`, not assumed. It cannot
@@ -4064,9 +4044,9 @@ async fn export_once_via_pool(
     );
 
     // Bounded by `ack_bound`, the reserve's own share for this query
-    // (Codex review on PR #1520, follow-up P1). A timeout here is treated
-    // exactly like the failed-reacquire case above: the outcome cannot be
-    // recorded this tick, but nothing is lost.
+    // (PR #1520). A timeout here is treated exactly like the failed-reacquire
+    // case above: the outcome cannot be recorded this tick, but nothing is
+    // lost.
     let applied = match tokio::time::timeout(
         ack_bound,
         apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()),
@@ -4081,27 +4061,25 @@ async fn export_once_via_pool(
                 "[audit_export] timed out acknowledging an export batch; the next tick \
                  will redeliver it"
             );
-            // The shard must not still look observed after this (Codex
-            // review on PR #1520, follow-up P2, third round). Without it,
-            // `export_observed` keeps its last-good value. The cursor then
-            // stalls silently behind repeated acknowledgement timeouts.
+            // The shard must not still look observed after this (PR #1520).
+            // Without it, `export_observed` keeps its last-good value. The
+            // cursor then stalls silently behind repeated acknowledgement
+            // timeouts.
             //
-            // Recorded directly, not via `emit_lag_and_observed` (Codex
-            // review on PR #1520, follow-up P2, fourth round). That
-            // helper's own success path reports `true` whenever it can
+            // Recorded directly, not via `emit_lag_and_observed` (PR #1520).
+            // That helper's own success path reports `true` whenever it can
             // read the cursor row, which it almost always can. This
-            // acknowledgement is genuinely indeterminate: the write may
-            // have landed on the database side after the client gave up
-            // waiting. `false` is the only honest reading here, not
-            // whatever the row happens to show right now.
+            // acknowledgement is genuinely indeterminate: the write may have
+            // landed on the database side after the client gave up waiting.
+            // `false` is the only honest reading here, not whatever the row
+            // happens to show right now.
             metrics.record_audit_export_observed(shard_u16, false);
-            // Discarded, not returned to the pool (Codex review on PR
-            // #1520, follow-up P2, seventh round -- P1). This mirrors the
+            // Discarded, not returned to the pool (PR #1520). This mirrors the
             // claim-cancellation fix above. Dropping this future does not
-            // cancel the already-dispatched `UPDATE`. A connection stuck
-            // behind a locked row would otherwise be recycled anyway. Every
-            // later user of a size-one shard pool would then queue behind
-            // that same blocked statement.
+            // cancel the already-dispatched `UPDATE`. A connection stuck behind
+            // a locked row would otherwise be recycled anyway. Every later user
+            // of a size-one shard pool would then queue behind that same
+            // blocked statement.
             drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
@@ -4178,25 +4156,22 @@ async fn export_once_via_pool(
 /// timeout checker and the poison-pill reclaimer.
 ///
 /// The registered interval accounts for the configured export lease, not
-/// just the poll interval (Codex review on PR #1520 P2). A single tick can
-/// legitimately run as long as the lease allows. A bare poll-interval
-/// threshold would flag a healthy, still-within-lease delivery as `Stale`
-/// or `Wedged`. Re-checked every tick and re-registered on an actual
-/// change (Codex review on PR #1520, follow-up). A later runtime
-/// publishing a longer lease is picked up without needing this task
-/// restarted.
+/// just the poll interval (PR #1520). A single tick can legitimately run as
+/// long as the lease allows. A bare poll-interval threshold would flag a
+/// healthy, still-within-lease delivery as `Stale` or `Wedged`. It is
+/// re-checked every tick and re-registered on an actual change (PR #1520).
+/// So a later runtime that publishes a longer lease is picked up without a
+/// restart of this task.
 ///
-/// The three stages are summed, not maxed (Codex review on PR #1520,
-/// follow-up P2, second round). One tick sleeps for `interval`. It then
-/// may spend up to `SHARD_ACQUIRE_BOUND` acquiring its initial connection.
-/// Only then does the lease-bounded claim/delivery/acknowledge cycle
-/// start. These are three sequential stages, not alternatives, so their
-/// worst cases add. The prior formula registered only
-/// `interval.max(lease)`. That understated the true worst case by up to
-/// `SHARD_ACQUIRE_BOUND`, plus whichever of `interval` or `lease` was not
-/// the max. `scanner_liveness` grants `2 x` the registered interval before
-/// paging. That grace could then be shorter than one legitimately slow
-/// tick.
+/// The three stages are summed, not maxed (PR #1520). One tick sleeps for
+/// `interval`. It then may spend up to `SHARD_ACQUIRE_BOUND` acquiring its
+/// initial connection. Only then does the lease-bounded
+/// claim/delivery/acknowledge cycle start. These are three sequential stages,
+/// not alternatives, so their worst cases add. The prior formula registered
+/// only `interval.max(lease)`. That understated the true worst case by up to
+/// `SHARD_ACQUIRE_BOUND`, plus whichever of `interval` or `lease` was not the
+/// max. `scanner_liveness` grants `2 x` the registered interval before paging.
+/// That grace could then be shorter than one legitimately slow tick.
 ///
 /// Pass `shard` to attribute this instance to one shard in the liveness
 /// snapshot, mirroring
@@ -4270,20 +4245,19 @@ pub fn spawn_audit_export_checker_for_shard(
             }
 
             // Read the config ONCE. Use this same snapshot for both the
-            // registration decision below and the tick itself (Codex review
-            // on PR #1520, follow-up P2). Two independent reads could
-            // observe different configs across a mid-tick runtime swap,
-            // registering this tick's tolerance against a lease it is not
-            // actually using.
+            // registration decision below and the tick itself (PR #1520).
+            // Two independent reads could observe different configs across a
+            // mid-tick runtime swap. That registers this tick's tolerance
+            // against a lease it is not actually using.
             let config_snapshot = read_global_audit_export_config();
 
             // The registered threshold must track the CURRENTLY configured
-            // lease, not just the one in effect at spawn time (Codex review
-            // on PR #1520 P2). A second runtime can publish a longer lease
-            // at any point (`fence_against_sink_swap`'s doc comment).
-            // A stale, too-tight threshold would misclassify a healthy
-            // delivery under the new lease as `Stale` or `Wedged`. Cheap to
-            // check every tick; only re-registers on an actual change.
+            // lease, not just the one in effect at spawn time (PR #1520). A
+            // second runtime can publish a longer lease at any point
+            // (`fence_against_sink_swap`'s doc comment). A stale, too-tight
+            // threshold would misclassify a healthy delivery under the new
+            // lease as `Stale` or `Wedged`. The check is cheap. It re-registers
+            // only on an actual change.
             let desired_interval =
                 audit_export_liveness_interval(interval, config_snapshot.as_deref());
             if desired_interval != registered_interval {
@@ -4420,8 +4394,8 @@ mod tests {
     }
 
     // Redrive byte-identity (AC6): re-exporting the same (shard, seq) records
-    // must produce exactly the same bytes, or the receiver's dedup on
-    // (shard, seq) would be checking a different payload than it stored.
+    // must produce exactly the same bytes. Otherwise the receiver's dedup on
+    // (shard, seq) would check a different payload than it stored.
     #[test]
     fn serialize_batch_is_byte_identical_across_calls() {
         let first = serialize_batch(&[rec(7), rec(8)]).expect("serializes");
@@ -4429,8 +4403,8 @@ mod tests {
         assert_eq!(first, second, "re-export must be byte-identical");
     }
 
-    // A SIEM maps this to a fixed schema, so an absent optional field must
-    // still appear as an explicit `null` rather than vanishing from the object.
+    // A SIEM maps this to a fixed schema. So an absent optional field must
+    // still appear as an explicit `null`, not vanish from the object.
     #[test]
     fn absent_optional_fields_serialize_as_explicit_null() {
         let body = serialize_batch(&[rec(1)]).expect("serializes");
@@ -4617,9 +4591,9 @@ mod tests {
         }
     }
 
-    // There is deliberately no dead-letter arm: unlike a completion callback
-    // (#605), an audit record may never be dropped after N attempts — the
-    // export is the compliance artifact. Retry forever, capped.
+    // There is no dead-letter arm. Unlike a completion callback (#605), an
+    // audit record may never be dropped after N attempts, because the export
+    // is the compliance artifact. Retry forever, capped.
     #[test]
     fn repeated_failures_keep_backing_off_and_never_give_up() {
         let now = Utc::now();
@@ -4790,10 +4764,9 @@ mod tests {
         );
         assert_eq!(delivery_state(None, 0, past, now, None), "IDLE");
 
-        // Retirement overrides every other reading of the row: those columns
-        // are a frozen snapshot, and reporting BACKOFF or RETRYING from them
-        // would say records are pending that nothing owes and retention may
-        // purge.
+        // Retirement overrides every other reading of the row. Those columns
+        // are a frozen snapshot. BACKOFF or RETRYING from them would report
+        // records as pending that nothing owes and retention may purge.
         for (lease, failures, attempt) in [
             (Some(future), 0, past),
             (Some(past), 3, future),
@@ -4877,8 +4850,8 @@ mod tests {
 
     // ── `split_reserve` shrinks both post-delivery bounds together ───────────
     //
-    // Codex review on PR #1520, follow-up P1: a capped reserve must not let
-    // the checkout alone consume it, leaving the acknowledgement no margin.
+    // PR #1520: a capped reserve must not let the checkout alone consume it,
+    // leaving the acknowledgement no margin.
 
     #[test]
     #[cfg(feature = "db")]
@@ -5019,12 +4992,11 @@ mod tests {
     }
 
     /// Delivery is bounded by what REMAINS of the claim's lease, not the full
-    /// lease (issue #953). A sink that answers just
-    /// inside the full lease but outside the remainder must be timed out here,
-    /// because the database lease has expired and another exporter may already
-    /// have reclaimed the shard and bumped the epoch — an acknowledgement from
-    /// this attempt would be refused, and at consistently near-lease latency
-    /// the cursor would never advance.
+    /// lease (issue #953). A sink that answers inside the full lease but
+    /// outside the remainder must time out here. The database lease has
+    /// expired, and another exporter may already have reclaimed the shard and
+    /// bumped the epoch. An acknowledgement from this attempt would be
+    /// refused. At near-lease latency the cursor would never advance.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn delivery_is_bounded_by_the_remaining_lease_not_the_whole_one() {
@@ -5177,9 +5149,9 @@ mod tests {
     /// delivered would leave the newly configured SIEM without them (issue
     /// #953).
     ///
-    /// Fully deterministic — the decision is a pure function of its arguments,
-    /// so this touches no process-wide state and cannot race the 33 other tests
-    /// in this binary that write `GLOBAL_AUDIT_EXPORT_CONFIG`.
+    /// Fully deterministic: the decision is a pure function of its arguments.
+    /// So this touches no process-wide state. It cannot race the 33 other
+    /// tests in this binary that write `GLOBAL_AUDIT_EXPORT_CONFIG`.
     #[cfg(feature = "db")]
     #[test]
     fn a_sink_swapped_mid_flight_holds_the_cursor() {

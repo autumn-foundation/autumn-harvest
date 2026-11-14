@@ -8,10 +8,10 @@
 )]
 //! Last-completion-result carryover tests — issue #488.
 //!
-//! Verifies that a scheduled workflow can read the output of the previous
-//! successful run via `ctx.last_completion_result()` and `ctx.last_error()`,
-//! that the value is frozen deterministically in the `WorkflowStarted` event,
-//! and that skipped / manual starts never advance carryover.
+//! A scheduled workflow reads the output of the previous successful run via
+//! `ctx.last_completion_result()` and `ctx.last_error()`. The value is frozen
+//! deterministically in the `WorkflowStarted` event. Skipped and manual starts
+//! never advance carryover.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -524,7 +524,6 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     // Wait for run 3 to complete (2nd COMPLETED overall)
     wait_for_state(&url, wf_name, "COMPLETED", 2).await;
 
-    // Load run 3's output.
     let mut check = AsyncPgConnection::establish(&url).await.unwrap();
     let run3_outputs: Vec<serde_json::Value> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -599,17 +598,11 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
 /// any stale or reset value.
 #[tokio::test]
 async fn skip_policy_does_not_advance_carryover() {
-    // This tests that OverlapPolicy::Skip dropping a fire does not corrupt carryover.
-    // Effectively: run 1 completes {value:1}, one slot is skipped (max_active_runs=1
-    // with run 1 still running), run 2 fires next tick and sees {value:1}.
-    // We can verify skip indirectly: two ticks with max_active_runs=1 while run 1
-    // is still running → second slot is skipped → run 2 later fires and still
-    // sees the correct cursor from run 1 (not None, not reset).
+    // OverlapPolicy::Skip dropping a fire must not corrupt carryover. A slot
+    // skipped while run 1 still runs (max_active_runs=1) does not advance the
+    // cursor. Run 2 sees run 1's cursor, not None and not a reset value.
     //
-    // Full overlap-skip scenario is exercised by a simpler assertion: the
-    // carryover integration test above already confirms the scheduler-side path.
-    // This test focuses on the "skipped slot count does not advance cursor"
-    // invariant via the recovery_aware_handler.
+    // The carryover integration test above covers the full scheduler-side path.
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "carryover_skip_wf";
     let pool = make_pool(&url);

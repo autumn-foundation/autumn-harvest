@@ -29,9 +29,9 @@ pub type ActivityMockFn = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sy
 
 /// An attempt-aware synchronous mock function for an activity (issue #541).
 ///
-/// Receives the activity input and the 1-based worker retry attempt number,
-/// enabling per-attempt behavior (e.g. fail attempts 1-2, succeed on 3)
-/// without needing external mutable state in the test.
+/// Receives the activity input and the 1-based worker retry attempt number.
+/// So a test can vary behavior per attempt (e.g. fail attempts 1-2, succeed
+/// on 3) without external mutable state.
 pub type ActivityMockFnWithAttempt = Box<dyn Fn(Value, u32) -> Result<Value, String> + Send + Sync>;
 
 /// A registered activity mock: either attempt-oblivious or attempt-aware.
@@ -53,8 +53,8 @@ impl ActivityMock {
 ///
 /// The simulator runs the workflow function iteratively. When the workflow
 /// suspends (e.g., requests an activity execution), the simulator intercepts
-/// the command, executes a registered mock (or returns `Value::Null` by default),
-/// appends the corresponding events to the history, and resumes the workflow.
+/// the command. It runs a registered mock (or returns `Value::Null` by
+/// default), appends the matching events and resumes the workflow.
 pub struct WorkflowSimulator {
     handler: WorkflowHandlerFn,
     state: SharedState,
@@ -70,15 +70,15 @@ pub struct WorkflowSimulator {
     activity_info_retry_policies: HashMap<String, RetryPolicy>,
     child_workflow_mocks: HashMap<String, ActivityMockFn>,
     /// Signals queued for delivery, in true cross-name queued order (mirrors
-    /// `WorkflowTestEnv::queued_signals`). A single `Vec` — rather than a
-    /// per-name `HashMap<String, VecDeque<_>>` — is required so the task-prep
-    /// ingest (drained into history before each handler dispatch, mirroring
-    /// production `worker::ingest_due_timers_and_signals`/`load_pending_signals`)
-    /// preserves the order signals were enqueued across different names.
+    /// `WorkflowTestEnv::queued_signals`). It must be a single `Vec`, not a
+    /// per-name `HashMap<String, VecDeque<_>>`. The task-prep ingest drains it
+    /// into history before each handler dispatch, like production
+    /// `worker::ingest_due_timers_and_signals`/`load_pending_signals`. A single
+    /// `Vec` keeps the enqueue order across different names.
     signals_to_send: Vec<(String, Value)>,
-    /// Mutex keys (issue #691) whose grant the simulator WITHHOLDS: an
+    /// Mutex keys (issue #691) whose grant the simulator WITHHOLDS. An
     /// `AcquireMutex` for a key in this set records nothing and makes no
-    /// progress (modelling a lock held by another contender). Mirrors
+    /// progress. That models a lock held by another contender. Mirrors
     /// `WorkflowTestEnv::mutex_contended`; set via
     /// [`with_mutex_contended`](Self::with_mutex_contended).
     mutex_contended: HashSet<String>,
@@ -101,7 +101,7 @@ impl WorkflowSimulator {
     }
 
     /// Mark a mutex `key` (issue #691) as already held, so the simulator
-    /// WITHHOLDS the grant: an `ctx.mutex(key).acquire()` for this key records
+    /// WITHHOLDS the grant. A `ctx.mutex(key).acquire()` for this key records
     /// no `MutexGranted` and makes no progress. Mirrors
     /// [`WorkflowTestEnv::with_mutex_contended`](crate::testing::WorkflowTestEnv::with_mutex_contended).
     #[must_use]
@@ -120,11 +120,11 @@ impl WorkflowSimulator {
     /// Register a mock implementation for an activity by name.
     ///
     /// When the workflow schedules this activity, the mock is called
-    /// synchronously with the activity input. If the activity's resolved
-    /// [`RetryPolicy`] allows further attempts and the mock returns `Err`,
-    /// the simulator re-invokes the same mock for the next attempt — see
-    /// [`mock_activity_with_attempt`](Self::mock_activity_with_attempt) for a
-    /// mock that can observe which attempt it is being called for.
+    /// synchronously with the activity input. If the mock returns `Err` and
+    /// the activity's resolved [`RetryPolicy`] allows more attempts, the
+    /// simulator calls the same mock again.
+    /// [`mock_activity_with_attempt`](Self::mock_activity_with_attempt)
+    /// registers a mock that sees its attempt number.
     #[must_use]
     pub fn mock_activity<F>(mut self, name: &str, mock: F) -> Self
     where
@@ -138,9 +138,9 @@ impl WorkflowSimulator {
     /// Register an attempt-aware mock implementation for an activity by name
     /// (issue #541 AC7).
     ///
-    /// The mock receives the 1-based worker retry attempt number alongside
-    /// the input, so tests can express "fail attempts 1-2, succeed on 3"
-    /// directly in the closure body instead of via external mutable state.
+    /// The mock receives the 1-based worker retry attempt number with the
+    /// input. So a test can express "fail attempts 1-2, succeed on 3" in the
+    /// closure body, without external mutable state.
     #[must_use]
     pub fn mock_activity_with_attempt<F>(mut self, name: &str, mock: F) -> Self
     where
@@ -179,9 +179,9 @@ impl WorkflowSimulator {
     /// Resolve the effective retry policy for a `ScheduleActivity` command:
     /// the call-site override (from `execute_activity_with_opts`) wins,
     /// then the explicit per-mock override, then the `ActivityInfo` default.
-    /// `None` means no policy is configured at all — the live worker's
+    /// `None` means no policy is configured at all. Then the live worker's
     /// `queue::EnqueueParams::new()` default of 3 attempts (flat 1s delay)
-    /// applies, not a single attempt; see the `max_attempts` comment at the
+    /// applies, not a single attempt. See the `max_attempts` comment at the
     /// `ScheduleActivity` call site.
     fn resolve_retry_policy(
         &self,
@@ -229,17 +229,15 @@ impl WorkflowSimulator {
         }];
 
         loop {
-            // Task-prep ingest (issue #775, Codex P2): mirror production's
-            // `worker::ingest_due_timers_and_signals`, which appends every
-            // pending signal into history *before* the workflow handler runs for
-            // this task pickup — NOT gated on the workflow emitting a
-            // `WaitForSignal`. Draining all currently-queued signals here (in
-            // queued order) makes a workflow that *starts* by non-blockingly
-            // draining/polling a pending signal (`drain_signals_raw` /
-            // `try_receive_signal`, with no prior blocking `wait_for_signal`)
-            // observe it, matching production. Signals are queued up front via
-            // `send_signal`, so this drains on the first iteration and is a no-op
-            // on every resume cycle thereafter.
+            // Task-prep ingest (issue #775): mirror production's
+            // `worker::ingest_due_timers_and_signals`. It appends every pending
+            // signal into history *before* the handler runs for this task
+            // pickup. It is NOT gated on a `WaitForSignal`. The drain here runs
+            // in queued order. A workflow can *start* with a non-blocking drain
+            // or poll (`drain_signals_raw` / `try_receive_signal`, no prior
+            // blocking `wait_for_signal`). The drain lets it see the signal.
+            // Signals are queued up front via `send_signal`. So this drains on
+            // the first iteration and is a no-op on each resume cycle after it.
             for (name, payload) in self.signals_to_send.drain(..) {
                 history.push(WorkflowEvent::SignalReceived {
                     signal_name: name,
@@ -259,13 +257,13 @@ impl WorkflowSimulator {
 
             match outcome {
                 WorkflowOutcome::Completed { output, .. } => {
-                    // Cancellable/renewable timer bookkeeping (issue #768): a
-                    // workflow that arms/cancels a timer and then COMPLETES in the
-                    // same task emits `ArmTimer`/`CancelTimer` as pending commands
-                    // on this sealing cycle (never as a suspension). Record the
-                    // timer lifecycle events before the terminal marker so the
-                    // simulated history matches the worker's terminal-cycle persist
-                    // (mirrors `WorkflowTestEnv::process_terminal_commands`).
+                    // Cancellable/renewable timer bookkeeping (issue #768). A
+                    // workflow can arm or cancel a timer and then COMPLETE in the
+                    // same task. It then emits `ArmTimer`/`CancelTimer` as pending
+                    // commands on this sealing cycle, never as a suspension. Record
+                    // the timer events before the terminal marker. The history
+                    // then matches the worker's terminal-cycle persist (mirrors
+                    // `WorkflowTestEnv::process_terminal_commands`).
                     Self::record_terminal_timer_commands(&pending, &mut history);
                     history.push(WorkflowEvent::WorkflowCompleted {
                         output: output.clone(),
@@ -276,10 +274,10 @@ impl WorkflowSimulator {
                     };
                 }
                 WorkflowOutcome::Failed { error, .. } => {
-                    // Decode the typed workflow-failure envelope (issue #767) so
-                    // the recorded `WorkflowFailed` event carries the typed
-                    // `error_type`/`details`/`non_retryable` fields and
-                    // `final_output` is the human message, mirroring the worker.
+                    // Decode the typed workflow-failure envelope (issue #767), as
+                    // the worker does. The `WorkflowFailed` event then carries the
+                    // typed `error_type`/`details`/`non_retryable` fields, and
+                    // `final_output` is the human message.
                     // A legacy `Err(String)` decodes to all-`None` typed fields
                     // with `message == error`, preserving legacy semantics.
                     Self::record_terminal_timer_commands(&pending, &mut history);
@@ -342,19 +340,20 @@ impl WorkflowSimulator {
         let mut advanced = false;
 
         // Whether this batch also carries a genuine non-timer suspension
-        // (activity/signal/child-workflow/classic timer). The real worker records
-        // an `ArmTimer` and leaves the workflow parked on that other wait — it only
-        // reschedules the armed cancellable timer to fire on the bookkeeping-only
-        // `await_fire` (`for_await: true`) path. When a competing suspension is
-        // present the simulator must NOT auto-fire the armed timer, or it would
-        // synthesise impossible history such as `[TimerStarted, ActivityScheduled,
-        // TimerFired, ActivityCompleted]` (mirrors `WorkflowTestEnv`, Codex P2
-        // issue #768). A later bookkeeping-only cycle fires it.
+        // (activity/signal/child-workflow/classic timer). The real worker
+        // records an `ArmTimer` and leaves the workflow parked on that other
+        // wait. It fires the armed cancellable timer only on the
+        // bookkeeping-only `await_fire` (`for_await: true`) path. So with a
+        // competing suspension the simulator must NOT auto-fire the armed timer.
+        // Otherwise it would synthesise impossible history such as
+        // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`
+        // (mirrors `WorkflowTestEnv`, issue #768). A later bookkeeping-only
+        // cycle fires it.
         let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
 
-        // Timer ids whose `TimerFired` was already recorded in THIS batch, so a
-        // second `for_await: true` re-arm for the same id (e.g. two `await_fire`
-        // siblings on one handle) is an idempotent no-op.
+        // Timer ids whose `TimerFired` THIS batch already recorded. A second
+        // `for_await: true` re-arm for the same id is then a no-op (e.g. two
+        // `await_fire` siblings on one handle).
         let mut fired_this_batch: Vec<crate::types::TimerId> = Vec::new();
 
         for cmd in commands {
@@ -380,12 +379,11 @@ impl WorkflowSimulator {
 
                     let retry_policy = self.resolve_retry_policy(&name, retry_policy_override);
                     // Mirrors the live worker's regular (queue-dispatched)
-                    // activity default: `queue::EnqueueParams::new()` sets
-                    // `max_attempts = 3` and is only lowered/raised when a
-                    // retry policy actually resolves (`worker.rs`'s
-                    // `effective_retry` gate); with no policy at all,
-                    // `next_retry_delay` retries up to that default with a
-                    // flat 1s delay instead of giving up after one attempt.
+                    // activity default. `queue::EnqueueParams::new()` sets
+                    // `max_attempts = 3`. Only a resolved retry policy changes
+                    // it (`worker.rs`'s `effective_retry` gate). With no policy,
+                    // `next_retry_delay` retries up to that default with a flat
+                    // 1s delay, not just one attempt.
                     let max_attempts = retry_policy.as_ref().map_or(3, |p| p.max_attempts.max(1));
                     let mock = self.activity_mocks.get(&name);
 
@@ -415,24 +413,23 @@ impl WorkflowSimulator {
                                 let terminal = attempt >= max_attempts || non_retryable_by_policy;
 
                                 // Non-terminal attempts get a synthetic
-                                // activity_id distinct from the real one:
-                                // production never persists an event for a
-                                // requeued retry, and `HistoryMatcher::
+                                // activity_id, distinct from the real one.
+                                // Production never persists an event for a
+                                // requeued retry. `HistoryMatcher::
                                 // scan_activity_terminal` returns the *first*
-                                // `ActivityFailed` matching `activity_id`, so
-                                // reusing the real id would shadow the
-                                // eventual terminal event. A distinct id is
-                                // silently skipped by that scan (unrelated-
-                                // activity event) — purely observational
-                                // (issue #541 AC1/AC2), never affecting
-                                // control flow. Caveat: a history containing
-                                // these events must not be fed into id-keyed
-                                // tooling that expects every `ActivityFailed`
-                                // to have a matching `ActivityScheduled` (e.g.
-                                // `test_generator.rs`'s mock generator, or
-                                // `analyzer.rs`'s `ExcessiveRetriesRule`,
-                                // which would misreport the activity name for
-                                // these events).
+                                // `ActivityFailed` that matches `activity_id`.
+                                // So reusing the real id would shadow the
+                                // eventual terminal event. That scan skips a
+                                // distinct id as an unrelated-activity event.
+                                // These events are observational only (issue
+                                // #541 AC1/AC2) and never affect control flow.
+                                // Caveat: do not feed such a history into
+                                // id-keyed tooling that expects a matching
+                                // `ActivityScheduled` for each
+                                // `ActivityFailed`. Examples are
+                                // `test_generator.rs`'s mock generator and
+                                // `analyzer.rs`'s `ExcessiveRetriesRule`. The
+                                // latter misreports the activity name here.
                                 let event_id = if terminal {
                                     activity_id
                                 } else {
@@ -493,11 +490,11 @@ impl WorkflowSimulator {
                             });
                         }
                         Err(err) => {
-                            // Decode the typed child-failure envelope (issue #767)
-                            // for parity with the worker's child-terminal decode:
-                            // a mock returning a `WorkflowFailure` envelope yields
-                            // a typed `ChildWorkflowFailed` event, while a plain
-                            // `Err(String)` decodes to all-`None` typed fields.
+                            // Decode the typed child-failure envelope (issue #767),
+                            // like the worker's child-terminal decode. A mock that
+                            // returns a `WorkflowFailure` envelope yields a typed
+                            // `ChildWorkflowFailed` event. A plain `Err(String)`
+                            // decodes to all-`None` typed fields.
                             let decoded = crate::failure::decode_workflow_failure(&err);
                             history.push(WorkflowEvent::child_workflow_failed_typed(
                                 child_id, &decoded,
@@ -520,10 +517,10 @@ impl WorkflowSimulator {
                     children,
                     timers: _,
                 } => {
-                    // Mirrors WorkflowTestEnv's handling (testing.rs): a still-open
-                    // losing branch gets a synthetic terminal so no future iteration
-                    // loops on an in-progress match; timers carry no history footprint
-                    // in the simulator (no `harvest_timers` table to clean up).
+                    // Mirrors WorkflowTestEnv's handling (testing.rs). A still-open
+                    // losing branch gets a synthetic terminal, so no later iteration
+                    // loops on an in-progress match. Timers leave no history in the
+                    // simulator (no `harvest_timers` table to clean up).
                     for activity_id in activities {
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id,
@@ -574,9 +571,9 @@ impl WorkflowSimulator {
                     }
                 }
                 // Cancellable timer cancel (issue #768): record `TimerCancelled`.
-                // No `TimerFired` is deferred in the simulator's eager model, so a
-                // cancel simply records its event — the cancelled branch is taken
-                // deterministically on the next replay cycle.
+                // The simulator's eager model defers no `TimerFired`. So a cancel
+                // only records its event. The next replay cycle takes the
+                // cancelled branch deterministically.
                 WorkflowCommand::CancelTimer { timer_id } => {
                     history.push(WorkflowEvent::TimerCancelled { timer_id });
                     advanced = true;
@@ -603,11 +600,11 @@ impl WorkflowSimulator {
                 }
                 // Durable mutex (issue #691), mirroring
                 // `WorkflowTestEnv::process_command`. Acquire is a SOLO
-                // suspension: withhold the grant for a contended key (no event,
-                // no progress → parked), otherwise auto-grant by recording a
-                // `MutexGranted` with a monotonic `lock_seq` (count of prior
-                // grants + 1) and the run's `WorkflowStarted` clock. Release is
-                // event-less bookkeeping (no progress).
+                // suspension. For a contended key, withhold the grant: no
+                // event, no progress, so the run parks. Otherwise auto-grant:
+                // record a `MutexGranted` with a monotonic `lock_seq` (count of
+                // prior grants + 1) and the run's `WorkflowStarted` clock.
+                // Release is event-less bookkeeping (no progress).
                 WorkflowCommand::AcquireMutex { key, .. }
                     if !self.mutex_contended.contains(&key) =>
                 {
@@ -637,20 +634,19 @@ impl WorkflowSimulator {
                     advanced = true;
                 }
                 _ => {
-                    // `ReleaseMutex` (issue #691) is an event-less no-op here —
-                    // the harness has no lock table, so nothing is recorded and
-                    // no progress is made; it falls into this arm.
+                    // `ReleaseMutex` (issue #691) is an event-less no-op here.
+                    // The harness has no lock table, so it records nothing and
+                    // makes no progress.
                     //
-                    // `WaitForSignal` is a no-op here: signals are ingested into
-                    // history at task-prep (see the pre-dispatch drain in `run`,
-                    // issue #775 Codex P2, mirroring production's
-                    // `worker::ingest_due_timers_and_signals`), so an available
-                    // signal resolves the wait synchronously and the command is
-                    // never emitted. A `WaitForSignal` reaching here means the
-                    // awaited signal was never queued (blocked) — no progress. The
-                    // old WaitForSignal-gated batch promotion is removed (it would
-                    // double-append signals already ingested at task-prep, and it
-                    // never fired for a drain-first workflow that emits no wait).
+                    // `WaitForSignal` is a no-op here. Task-prep ingests signals
+                    // into history (the pre-dispatch drain in `run`, issue #775,
+                    // mirroring production's `worker::ingest_due_timers_and_signals`).
+                    // So an available signal resolves the wait synchronously and
+                    // the command is never emitted. A `WaitForSignal` here means
+                    // the awaited signal was never queued (blocked): no progress.
+                    // There is no WaitForSignal-gated batch promotion. It would
+                    // double-append signals that task-prep already ingested. It
+                    // also never fired for a drain-first workflow with no wait.
                     // Complete/Fail are handled on the next loop iteration.
                 }
             }
@@ -658,12 +654,11 @@ impl WorkflowSimulator {
         advanced
     }
 
-    /// Whether a command is a genuine non-timer suspension that would keep the
-    /// workflow parked on an external event — as opposed to author-controlled
-    /// cancellable-timer bookkeeping (`ArmTimer`/`CancelTimer`). Used to gate
-    /// cancellable-timer auto-firing so it only fires on the bookkeeping-only
-    /// `await_fire` path, matching the real worker and `WorkflowTestEnv`
-    /// (Codex P2, issue #768).
+    /// Whether a command is a genuine non-timer suspension that parks the
+    /// workflow on an external event. Author-controlled cancellable-timer
+    /// bookkeeping (`ArmTimer`/`CancelTimer`) is not one. This gate makes a
+    /// cancellable timer auto-fire only on the bookkeeping-only `await_fire`
+    /// path, like the real worker and `WorkflowTestEnv` (issue #768).
     const fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
         matches!(
             cmd,
@@ -700,9 +695,9 @@ impl WorkflowSimulator {
     }
 
     /// Record the timer lifecycle events for `ArmTimer`/`CancelTimer` bookkeeping
-    /// commands emitted on a TERMINAL (sealing) cycle — a workflow that
-    /// arms/cancels a timer and then completes/fails/continues in the same task
-    /// (issue #768). A sealing run never awaits, so any arm is a fresh arm
+    /// commands on a TERMINAL (sealing) cycle (issue #768). That is a workflow
+    /// that arms or cancels a timer, then completes, fails or continues in the
+    /// same task. A sealing run never awaits, so any arm is a fresh arm
     /// (`for_await: false`) that records `TimerStarted` (deduped); a `for_await:
     /// true` re-arm cannot reach a terminal cycle. Cancel records `TimerCancelled`.
     /// No fire is recorded — the run is sealing. Mirrors
@@ -911,7 +906,7 @@ mod tests {
         assert_eq!(final_output, serde_json::json!(["a", "b"]));
     }
 
-    /// Drain-first (issue #775, Codex P2): the workflow's FIRST action is a
+    /// Drain-first (issue #775): the workflow's FIRST action is a
     /// non-blocking `drain_signals_raw`, with NO prior blocking `wait_for_signal`.
     /// Production ingests pending signals at task-prep before the handler runs,
     /// so the simulator must too. Before the task-prep ingest fix — when signals
@@ -940,7 +935,7 @@ mod tests {
         assert_eq!(final_output, serde_json::json!(["a", "b", "c"]));
     }
 
-    /// try_receive-first (issue #775, Codex P2): FIRST action is a non-blocking
+    /// try_receive-first (issue #775): FIRST action is a non-blocking
     /// `try_wait_for_signal` with signals pre-queued and NO prior blocking wait.
     fn dummy_workflow_try_receive_first_no_wait(
         ctx: &crate::context::WorkflowContext,
@@ -1051,11 +1046,10 @@ mod tests {
         })
     }
 
-    /// AC1 + AC2: a mock that fails on attempt 1 but succeeds on attempt 2 is
-    /// re-invoked by the simulator; the workflow observes the eventual
-    /// success, and the recorded history contains an `ActivityFailed` event
-    /// with the correct (non-hardcoded) attempt number before the terminal
-    /// `ActivityCompleted`.
+    /// AC1 + AC2: the simulator calls a mock again after it fails on attempt 1,
+    /// and it succeeds on attempt 2. The workflow sees the success. The history
+    /// holds an `ActivityFailed` event with the real attempt number before the
+    /// terminal `ActivityCompleted`.
     #[tokio::test]
     async fn test_simulator_retries_then_succeeds() {
         let calls = Arc::new(AtomicU32::new(0));
@@ -1150,13 +1144,13 @@ mod tests {
         );
     }
 
-    /// Regression test (code review, issue #541): when NO retry policy
-    /// resolves at all (no `with_activity_info`, no `with_retry_policy`, no
-    /// call-site override), the simulator must match the live worker's
-    /// regular-activity default of 3 attempts — `queue::EnqueueParams::new()`
-    /// defaults `max_attempts` to 3, and `next_retry_delay` retries up to
-    /// that default with a flat 1s delay when no policy is configured — not
-    /// give up after a single attempt.
+    /// Regression test (issue #541): when NO retry policy resolves (no
+    /// `with_activity_info`, no `with_retry_policy`, no call-site override),
+    /// the simulator must not give up after one attempt. It must match the
+    /// live worker's regular-activity default of 3 attempts.
+    /// `queue::EnqueueParams::new()` defaults `max_attempts` to 3. With no
+    /// policy, `next_retry_delay` retries up to that default with a flat 1s
+    /// delay.
     #[tokio::test]
     async fn test_simulator_default_no_policy_matches_production_three_attempts() {
         let calls = Arc::new(AtomicU32::new(0));
@@ -1412,10 +1406,10 @@ mod tests {
         })
     }
 
-    /// FIX C (issue #767): a typed `WorkflowFailure` returned by the workflow is
-    /// decoded — the recorded `WorkflowFailed` event carries the typed
-    /// `error_type`/`details`/`non_retryable` fields and `final_output` is the
-    /// human message, not the wire envelope JSON (mirroring the worker).
+    /// Issue #767: the simulator decodes a typed `WorkflowFailure` returned by
+    /// the workflow, as the worker does. The `WorkflowFailed` event carries the
+    /// typed `error_type`/`details`/`non_retryable` fields. `final_output` is
+    /// the human message, not the wire envelope JSON.
     #[tokio::test]
     async fn test_simulator_decodes_typed_workflow_failure() {
         let sim = WorkflowSimulator::new(typed_failing_workflow);
@@ -1473,7 +1467,7 @@ mod tests {
         })
     }
 
-    /// FIX C (issue #767): a child-workflow mock returning a typed
+    /// Issue #767: a child-workflow mock returning a typed
     /// `WorkflowFailure` envelope yields a typed `ChildWorkflowFailed` event
     /// (parity with the worker's child-terminal decode).
     #[tokio::test]
@@ -1575,9 +1569,9 @@ mod tests {
         );
     }
 
-    /// Arm a cancellable timer, cancel it, then COMPLETE in the same task — the
-    /// simulated history must include both `TimerStarted` and `TimerCancelled`
-    /// (recorded from the terminal-cycle pending commands) and no `TimerFired`.
+    /// Arm a cancellable timer, cancel it, then COMPLETE in the same task. The
+    /// history must hold `TimerStarted` and `TimerCancelled`, recorded from the
+    /// terminal-cycle pending commands, and no `TimerFired`.
     fn arm_cancel_then_complete_workflow(
         ctx: &crate::context::WorkflowContext,
         _input: Value,

@@ -1,20 +1,20 @@
 //! Admission gate primitive for incident-response operators (issue #377).
 //!
-//! An admission gate halts new workflow starts fleet-wide or for a scoped
-//! subset of work (by workflow name, queue, shard, or owner) while letting
-//! in-flight executions drain naturally. Gates persist in Postgres and survive
-//! plugin restart; the plugin loads active gates before its worker pool starts
-//! so there is no admission window between boot and re-apply.
+//! An admission gate halts new workflow starts, fleet-wide or for a scoped
+//! subset of work (by workflow name, queue, shard, or owner). In-flight
+//! executions drain naturally. Gates persist in Postgres and survive plugin
+//! restart. The plugin loads active gates before its worker pool starts, so
+//! there is no admission window between boot and re-apply.
 //!
 //! ## Start-producer contract (issue #618)
 //!
 //! The admission gate is **authoritative** across every in-process workflow
-//! start producer: each producer either consults the gate before starting, or
-//! is explicitly **exempt-by-design** and increments the observable
-//! `harvest.admission.bypassed{producer}` counter so the exemption is never
-//! silent. The full contract is enumerated by [`producer_contract`] and
-//! surfaced at `GET /admin/gates` (`producers` block) so operators can discover
-//! it without reading source.
+//! start producer. Each producer either consults the gate before it starts, or
+//! is explicitly **exempt-by-design**. An exempt producer increments the
+//! `harvest.admission.bypassed{producer}` counter, so the exemption is never
+//! silent. [`producer_contract`] lists the full contract. `GET /admin/gates`
+//! shows it in its `producers` block, so operators can find it without reading
+//! source.
 //!
 //! | Producer | Status | How |
 //! |----------|--------|-----|
@@ -32,22 +32,22 @@
 //!
 //! **Out of scope — in-flight continuation, not new admission.** The gate governs
 //! *new* workflow starts. It intentionally does NOT block continuation of work
-//! already admitted: workflow-level retry (issue #523), continue-as-new, child /
+//! already admitted. Workflow-level retry (issue #523), continue-as-new, child /
 //! detached-child spawn, and reset forks all start executions without a gate
-//! check because they extend an already-accepted run rather than admit a new
-//! one. `WorkflowHandleClient::start_or_load` — the *older*, non-transactional
-//! in-process start method — is likewise ungated today; this is a separate,
-//! pre-existing gap distinct from `start_workflow_transactional` (issue #763,
-//! `Gated` — see the table above). See
+//! check. They extend an already-accepted run rather than admit a new one.
+//! `WorkflowHandleClient::start_or_load`, the *older* non-transactional
+//! in-process start method, is also ungated today. That is a separate,
+//! pre-existing gap, distinct from `start_workflow_transactional` (issue #763,
+//! `Gated`; see the table above). See
 //! `docs/operations/admission-gate-producers.md`.
 //!
 //! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
-//! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
-//! `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`), populated by the
-//! plugin at boot with the same `Arc` the management API uses. `HarvestEmbedding`
-//! publishes it the same way. When the static is unset (a hand-built
-//! standalone mount, or the brief boot window) the core gate check is skipped
-//! — byte-identical to pre-#618 behaviour.
+//! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static. This
+//! mirrors `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`. The plugin
+//! populates it at boot with the same `Arc` the management API uses.
+//! `HarvestEmbedding` publishes it the same way. The static is unset in a
+//! hand-built standalone mount, or in the brief boot window. The core gate
+//! check is then skipped, byte-identical to pre-#618 behaviour.
 //!
 //! ## Standalone router note
 //!
@@ -99,8 +99,6 @@ use std::fmt;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 /// Maximum number of simultaneously active gates.
 ///
 /// Reaching this limit returns [`GateCreateError::TooManyGates`] rather than
@@ -110,8 +108,6 @@ use uuid::Uuid;
 /// 100 is intentionally generous for incident-response use; normal production
 /// usage is 1–5 gates at a time.
 pub const MAX_ACTIVE_GATES: usize = 100;
-
-// ── GateScope ─────────────────────────────────────────────────────────────────
 
 /// The scope over which an admission gate blocks new workflow starts.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -185,8 +181,6 @@ impl fmt::Display for GateScope {
     }
 }
 
-// ── AdmissionGateId ───────────────────────────────────────────────────────────
-
 /// Newtype wrapper for the admission gate UUID primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionGateId(pub Uuid);
@@ -202,8 +196,6 @@ impl From<Uuid> for AdmissionGateId {
         Self(u)
     }
 }
-
-// ── AdmissionGate ─────────────────────────────────────────────────────────────
 
 /// An in-memory representation of a persisted admission gate.
 ///
@@ -260,8 +252,6 @@ impl AdmissionGate {
     }
 }
 
-// ── check_admission ───────────────────────────────────────────────────────────
-
 /// Returns the first active gate that matches the given admission parameters,
 /// or `None` if admission is allowed.
 ///
@@ -291,8 +281,6 @@ pub fn check_admission<'a>(
         .find(|g| g.is_active_at(now) && g.matches(workflow_name, queue_name, shard_id, owner))
 }
 
-// ── GateCreateError ───────────────────────────────────────────────────────────
-
 /// Error returned when a gate cannot be created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateCreateError {
@@ -316,16 +304,13 @@ impl fmt::Display for GateCreateError {
 
 impl std::error::Error for GateCreateError {}
 
-// ── AdmissionGateCache ────────────────────────────────────────────────────────
-
 #[derive(Debug)]
 /// In-process cache for active admission gates.
 ///
 /// Populated at plugin boot and refreshed every ≤1 second by a background
-/// task. `check()` **fails closed** when the cache has not yet been
-/// successfully populated — i.e. it returns a synthetic "blocked" result —
-/// so a DB error during startup cannot create an admission window for
-/// persisted gates.
+/// task. `check()` **fails closed** until the first successful population: it
+/// returns a synthetic "blocked" result. So a DB error during startup cannot
+/// create an admission window for persisted gates.
 pub struct AdmissionGateCache {
     gates: std::sync::RwLock<Vec<AdmissionGate>>,
     /// Set to `true` after the first successful `refresh()`.
@@ -348,9 +333,9 @@ impl AdmissionGateCache {
     /// Create an initialized, empty cache (fail-open).
     ///
     /// Suitable for standalone API routers and test setups that do not load
-    /// gates from a database. The plugin uses this path too — it immediately
-    /// calls [`refresh`](Self::refresh) with gates loaded from Postgres before
-    /// workers start accepting work, so the brief open window is harmless.
+    /// gates from a database. The plugin uses this path too. It calls
+    /// [`refresh`](Self::refresh) with gates from Postgres before workers accept
+    /// work, so the brief open window is harmless.
     #[must_use]
     pub fn new() -> Self {
         let cache = Self::default();
@@ -365,8 +350,8 @@ impl AdmissionGateCache {
     /// Create an uninitialized (fail-closed) cache.
     ///
     /// `check()` returns a synthetic block until the first successful
-    /// [`refresh`](Self::refresh), preventing new workflow starts from slipping
-    /// through a startup DB error when persisted gates are present.
+    /// [`refresh`](Self::refresh). So new workflow starts cannot slip through a
+    /// startup DB error when persisted gates are present.
     ///
     /// Used internally by the plugin boot path, which calls `refresh()` before
     /// the worker pool starts accepting work.
@@ -378,9 +363,9 @@ impl AdmissionGateCache {
     /// Revert the cache to fail-closed (uninitialized) mode.
     ///
     /// After this call `check()` returns a synthetic block until the next
-    /// `refresh()`. Used by the plugin to arm the fail-closed semantic after
-    /// construction so the window between HTTP server bind and the boot-time
-    /// gate load is safe.
+    /// `refresh()`. The plugin calls it after construction to arm fail-closed.
+    /// That makes the window between HTTP server bind and the boot-time gate
+    /// load safe.
     pub fn set_fail_closed(&self) {
         self.initialized
             .store(false, std::sync::atomic::Ordering::Release);
@@ -396,23 +381,23 @@ impl AdmissionGateCache {
         }
     }
 
-    /// Write-through: insert (replacing any entry with the same id) `gate` into the
-    /// cached snapshot under the write lock, independent of any background refresh
-    /// (issue #618, F-round16).
+    /// Write-through: insert `gate` into the cached snapshot, replacing any
+    /// entry with the same id (issue #618).
     ///
-    /// The management create handler persists the gate to the DB **first**, then
-    /// calls this so the in-memory snapshot reflects the just-persisted gate even if
-    /// the follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
-    /// Without this, a failed post-create refresh left the snapshot stale-open and a
-    /// completion-trigger start (which consults [`check_cached`](Self::check_cached)
-    /// and does **not** retry after a synthetic fail-closed block) would durably
-    /// MISS the new gate.
+    /// It runs under the write lock, independent of any background refresh. The
+    /// management create handler persists the gate to the DB **first**, then
+    /// calls this. The in-memory snapshot then shows the new gate even if the
+    /// follow-up [`load_active_gates`](db::load_active_gates) refresh fails.
+    /// Without this, a failed post-create refresh left the snapshot stale-open.
+    /// A completion-trigger start reads [`check_cached`](Self::check_cached) and
+    /// does **not** retry after a synthetic fail-closed block. So it would
+    /// durably MISS the new gate.
     ///
-    /// Replacing by id is idempotent against a concurrent background refresh that may
-    /// have already picked the new gate up (the create persists to the DB before this
-    /// call, so the refresh cannot lose it). Does **not** touch the `initialized`
-    /// flag: applying a *known* delta means the snapshot is not blind, so the handler
-    /// no longer arms fail-closed on a post-mutation refresh failure.
+    /// Replacing by id is idempotent against a concurrent background refresh
+    /// that already picked the new gate up. The create persists to the DB before
+    /// this call, so the refresh cannot lose it. Does **not** touch the
+    /// `initialized` flag. A *known* delta means the snapshot is not blind, so
+    /// the handler no longer arms fail-closed on a post-mutation refresh failure.
     pub fn apply_created(&self, gate: AdmissionGate) {
         if let Ok(mut guard) = self.gates.write() {
             let id = gate.id.0;
@@ -421,17 +406,18 @@ impl AdmissionGateCache {
         }
     }
 
-    /// Write-through: remove any cached gate whose id equals `gate_id` from the
-    /// snapshot under the write lock, independent of any background refresh (issue
-    /// #618, F-round16).
+    /// Write-through: remove any cached gate whose id equals `gate_id` (issue
+    /// #618).
     ///
-    /// The management lift handler soft-deletes the gate in the DB **first**, then
-    /// calls this so a just-lifted gate stops matching on this replica even if the
-    /// follow-up full [`load_active_gates`](db::load_active_gates) refresh fails.
-    /// Without this, a failed post-lift refresh left the lifted gate in the snapshot
-    /// and a completion-trigger start would keep dropping targets as
-    /// `admission_blocked` against a gate the operator already lifted. No-op when the
-    /// id is absent (idempotent). Does **not** touch the `initialized` flag.
+    /// It runs under the write lock, independent of any background refresh. The
+    /// management lift handler soft-deletes the gate in the DB **first**, then
+    /// calls this. A just-lifted gate then stops matching on this replica even
+    /// if the follow-up [`load_active_gates`](db::load_active_gates) refresh
+    /// fails. Without this, a failed post-lift refresh left the lifted gate in
+    /// the snapshot. A completion-trigger start would keep dropping targets as
+    /// `admission_blocked` against a gate the operator already lifted. No-op
+    /// when the id is absent (idempotent). Does **not** touch the `initialized`
+    /// flag.
     pub fn apply_lifted(&self, gate_id: Uuid) {
         if let Ok(mut guard) = self.gates.write() {
             guard.retain(|g| g.id.0 != gate_id);
@@ -469,20 +455,21 @@ impl AdmissionGateCache {
     }
 
     /// Match against the **last-known cached gates snapshot**, ignoring the
-    /// fail-closed / initialized flag (issue #618, Codex P1).
+    /// fail-closed / initialized flag (issue #618).
     ///
-    /// Unlike [`check`](Self::check) — which returns the synthetic
-    /// [`sentinel_gate_id`] block for every start while the cache is
-    /// fail-closed/uninitialized — this returns only a **real** matching gate
-    /// (never the sentinel), or `None` when no cached gate matches (including an
-    /// empty snapshot during the boot window).
+    /// [`check`](Self::check) returns the synthetic [`sentinel_gate_id`] block
+    /// for every start while the cache is fail-closed or uninitialized. This
+    /// method returns only a **real** matching gate, never the sentinel. It
+    /// returns `None` when no cached gate matches, an empty boot-window snapshot
+    /// included.
     ///
-    /// `set_fail_closed()` retains the gates snapshot, so a gate loaded before a
-    /// transient gate-DB read error is still honoured here. Used by the
-    /// completion-trigger path: a completion-trigger start is in-flight
-    /// continuation of already-committed work and cannot retry, so it honours
-    /// only the gates the cache last knew about (block+count on a match, proceed
-    /// otherwise) rather than the API path's block-everything-under-fail-closed.
+    /// `set_fail_closed()` retains the gates snapshot. So a gate loaded before a
+    /// transient gate-DB read error is still honoured here. The
+    /// completion-trigger path uses this method. A completion-trigger start is
+    /// in-flight continuation of already-committed work and cannot retry. So it
+    /// honours only the gates the cache last knew about: block and count on a
+    /// match, proceed otherwise. The API path instead blocks everything under
+    /// fail-closed.
     #[must_use]
     pub fn check_cached(
         &self,
@@ -515,11 +502,10 @@ impl AdmissionGateCache {
 /// fail-closed.
 ///
 /// The cache is fail-closed while uninitialized, or after `set_fail_closed()` on
-/// a transient gate-DB read error. Callers can distinguish this sentinel from a
-/// real operator gate (issue #618, F3): a completion-trigger start blocked by
-/// the sentinel is in-flight continuation and should PROCEED rather than be
-/// dropped, whereas a real gate (`id != sentinel_gate_id()`) blocks + drops +
-/// counts.
+/// a transient gate-DB read error. Callers can tell this sentinel from a real
+/// operator gate (issue #618). A completion-trigger start that the sentinel
+/// blocks is in-flight continuation, so it should PROCEED, not be dropped. A
+/// real gate (`id != sentinel_gate_id()`) blocks, drops and counts.
 #[must_use]
 pub const fn sentinel_gate_id() -> Uuid {
     Uuid::nil()
@@ -530,26 +516,26 @@ pub const fn sentinel_gate_id() -> Uuid {
 /// How a start path consults the admission gate when enforcement is moved into
 /// the core start primitive (issue #618, PR #1014).
 ///
-/// The gate is evaluated inside `start_or_load_workflow_execution_collect` at the
-/// point — under a `FOR UPDATE` lock on any prior run — where it decides it will
-/// CREATE a new execution (a fresh admission). The mode selects which cache read
-/// the primitive performs.
+/// `start_or_load_workflow_execution_collect` evaluates the gate where it
+/// decides to CREATE a new execution (a fresh admission). At that point it holds
+/// a `FOR UPDATE` lock on any prior run. The mode selects which cache read the
+/// primitive performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateMode {
     /// Fresh admissions (API start, batch, keyed-#808): fail-closed, retryable.
     ///
-    /// Consults [`AdmissionGateCache::check`], which returns the synthetic
-    /// sentinel block for every start while the cache is uninitialized /
-    /// fail-closed — so a transient startup / gate-DB read error cannot bypass a
-    /// persisted incident gate. A blocked caller retries.
+    /// Consults [`AdmissionGateCache::check`]. It returns the synthetic sentinel
+    /// block for every start while the cache is uninitialized or fail-closed. So
+    /// a transient startup or gate-DB read error cannot bypass a persisted
+    /// incident gate. A blocked caller retries.
     Check,
     /// In-flight continuation / delivery (webhook delegate, completion-trigger
     /// relay): consults [`AdmissionGateCache::check_cached`].
     ///
-    /// Honours only the last-known cached gates snapshot — blocks a REAL matching
-    /// gate but NEVER the fail-closed sentinel — so already-committed
-    /// continuation work is not permanently dropped by a boot/DB blip it cannot
-    /// retry past.
+    /// Honours only the last-known cached gates snapshot. It blocks a REAL
+    /// matching gate but NEVER the fail-closed sentinel. So a boot or DB blip
+    /// cannot permanently drop already-committed continuation work that cannot
+    /// retry.
     CheckCached,
 }
 
@@ -637,34 +623,42 @@ pub enum ProducerGateStatus {
     /// The producer checks an active gate synchronously and blocks a matching
     /// start.
     Gated,
-    /// A split producer: **gated at HTTP admission time** (the initial request
-    /// checks the gate before the start is durably deferred), and its later
-    /// **scanner fire is exempt-with-bypass-counter** — the deferred fire relays
-    /// a start already admitted through the gate, so gating it again would drop
-    /// already-accepted work. Each scanner fire increments
-    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] so the exemption is
-    /// observable.
-    GatedAtAdmission,
-    /// The producer relays already-accepted work and is exempt by design; each
-    /// relayed start increments [`crate::telemetry::METRIC_ADMISSION_BYPASSED`]
+    /// A split producer: **gated at HTTP admission time**, with a later
+    /// **scanner fire that is exempt-with-bypass-counter**.
+    ///
+    /// The initial request checks the gate before the start is durably
+    /// deferred. The deferred fire relays a start that the gate already
+    /// admitted, so a second gate check would drop already-accepted work. Each
+    /// scanner fire increments [`crate::telemetry::METRIC_ADMISSION_BYPASSED`],
     /// so the exemption is observable.
+    GatedAtAdmission,
+    /// The producer relays already-accepted work and is exempt by design.
+    ///
+    /// Each relayed start increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`], so the exemption is
+    /// observable.
     ExemptByDesign,
     /// **Gated authoritatively at relay/fire time** on the target shard, where
-    /// the real target queue is always known. The producer re-checks the gate on
-    /// the resolved queue immediately before starting a deferred/relayed start
-    /// (`check_cached`): a matching gate blocks + increments
-    /// [`crate::telemetry::METRIC_ADMISSION_BLOCKED`], and the producer then
-    /// disposes of the blocked start **per its own contract** — the
-    /// completion-trigger cross-shard outbox **drops** the row (its source
-    /// terminal decision has already fired, so a permanently-gated relay must not
-    /// accumulate), while the throttle scanner **re-defers** the row (its `202`
-    /// promise is "nothing lost", so the held start fires once the gate opens or
-    /// its `schedule_to_start` deadline passes; issue #1053). When no gate matches
-    /// the relay/fire starts and increments
-    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`] (relay of pre-committed /
-    /// already-accepted work). The source-side/HTTP inline check is only a
-    /// best-effort fast path — the relay/fire-time check is authoritative
-    /// (halt-beats-pace). See each producer's `rationale` for its disposition.
+    /// the real target queue is always known.
+    ///
+    /// The producer re-checks the gate (`check_cached`) on the resolved queue
+    /// just before a deferred or relayed start. A matching gate blocks and
+    /// increments [`crate::telemetry::METRIC_ADMISSION_BLOCKED`]. The producer
+    /// then disposes of the blocked start **per its own contract**:
+    ///
+    /// - The completion-trigger cross-shard outbox **drops** the row. Its source
+    ///   terminal decision already fired, so a permanently-gated relay must not
+    ///   accumulate.
+    /// - The throttle scanner **re-defers** the row. Its `202` promise is
+    ///   "nothing lost". So the held start fires once the gate opens or its
+    ///   `schedule_to_start` deadline passes (issue #1053).
+    ///
+    /// When no gate matches, the relay/fire starts and increments
+    /// [`crate::telemetry::METRIC_ADMISSION_BYPASSED`]. That counts relay of
+    /// pre-committed or already-accepted work. The source-side/HTTP inline check
+    /// is only a best-effort fast path. The relay/fire-time check is
+    /// authoritative (halt-beats-pace). See each producer's `rationale` for its
+    /// disposition.
     GatedAtRelay,
 }
 
@@ -793,29 +787,30 @@ pub fn producer_contract() -> Vec<ProducerContractEntry> {
 
 /// Process-global handle to the shared [`AdmissionGateCache`].
 ///
-/// Populated by the plugin at boot with the same `Arc` the management API and
-/// the background refresh loop use, so the core completion-trigger start path
-/// observes gate creates/lifts without threading the cache through every
+/// The plugin populates it at boot with the same `Arc` that the management API
+/// and the background refresh loop use. So the core completion-trigger start
+/// path sees gate creates and lifts without the cache threaded through every
 /// call site. Mirrors `completion_trigger::GLOBAL_WORKFLOW_METADATA` and
 /// `completion_callback::GLOBAL_CALLBACK_CONFIG`.
 ///
 /// `None` (the default, and standalone integrations that never set it) means
-/// the core gate check is skipped — byte-identical to pre-#618 behaviour.
+/// the core gate check is skipped, byte-identical to pre-#618 behaviour.
 pub static GLOBAL_ADMISSION_GATE_CACHE: std::sync::RwLock<Option<Arc<AdmissionGateCache>>> =
     std::sync::RwLock::new(None);
 
 /// Install (or clear, with `None`) the process-global admission gate cache.
 ///
-/// Called by the plugin at boot with the shared cache `Arc`, and cleared with
-/// `None` in `stop_harvest_runtime` so a stopped plugin's cache (whose refresh
-/// loop is frozen) never leaks into a sibling plugin's completion triggers.
+/// The plugin calls it at boot with the shared cache `Arc`.
+/// `stop_harvest_runtime` clears it with `None`. A stopped plugin's refresh
+/// loop is frozen, so its cache must never leak into a sibling plugin's
+/// completion triggers.
 ///
-/// If a *different* non-`None` cache is already installed, a `tracing::warn!` is
-/// emitted before replacing it — two live `HarvestPlugin` builds in one process
-/// (parallel tests, multi-tenant) would otherwise silently share one plugin's
-/// gate state. Mirrors `completion_callback`'s `GLOBAL_CALLBACK_CONFIG` guard.
-/// Recovers a poisoned lock (`into_inner`) rather than silently no-op'ing, so a
-/// prior panic while holding the write lock cannot wedge the global.
+/// If a *different* non-`None` cache is already installed, a `tracing::warn!`
+/// fires before the replacement. Otherwise two live `HarvestPlugin` builds in
+/// one process (parallel tests, multi-tenant) would silently share one
+/// plugin's gate state. Mirrors `completion_callback`'s `GLOBAL_CALLBACK_CONFIG`
+/// guard. Recovers a poisoned lock (`into_inner`) rather than silently
+/// no-op'ing. So a prior panic under the write lock cannot wedge the global.
 pub fn set_global_admission_gate_cache(cache: Option<Arc<AdmissionGateCache>>) {
     let mut guard = GLOBAL_ADMISSION_GATE_CACHE
         .write()
@@ -846,15 +841,15 @@ pub fn global_admission_gate_cache() -> Option<Arc<AdmissionGateCache>> {
 
 /// Process-global metrics recorder for admission-gate block counting (issue #618).
 ///
-/// Published by the plugin at boot alongside [`GLOBAL_ADMISSION_GATE_CACHE`]
-/// (the same `Arc<dyn MetricsRecorder>` the workers/scanners use). The
-/// completion-trigger block path (`evaluate_triggers_for_execution`) falls back
-/// to this recorder when its caller passes `metrics: None` — which the
-/// cancel / terminate / parent-close-cascade paths in `execution.rs` all do — so
-/// a completion-trigger start blocked by an active gate is counted on
-/// `harvest.admission.blocked` regardless of how the source reached terminal.
-/// `None` (standalone integrations, or before boot) means the fallback is
-/// skipped and behaviour is byte-identical to a caller-supplied `None`.
+/// The plugin publishes it at boot beside [`GLOBAL_ADMISSION_GATE_CACHE`]. It
+/// is the same `Arc<dyn MetricsRecorder>` that the workers and scanners use.
+/// The completion-trigger block path (`evaluate_triggers_for_execution`) falls
+/// back to this recorder when its caller passes `metrics: None`. The cancel,
+/// terminate and parent-close-cascade paths in `execution.rs` all do that. So
+/// `harvest.admission.blocked` counts a completion-trigger start that an active
+/// gate blocks, however the source reached terminal. `None` (standalone
+/// integrations, or before boot) skips the fallback. Behaviour is then
+/// byte-identical to a caller-supplied `None`.
 pub static GLOBAL_ADMISSION_METRICS: std::sync::RwLock<
     Option<Arc<dyn crate::telemetry::MetricsRecorder>>,
 > = std::sync::RwLock::new(None);
@@ -884,9 +879,8 @@ pub fn global_admission_metrics() -> Option<Arc<dyn crate::telemetry::MetricsRec
 
 /// The result of [`resolve_metrics_with_global_fallback`].
 ///
-/// Owns the process-global `Arc`, when it was the one resolved, so the
-/// reference [`Self::as_dyn`] hands back stays valid for as long as this
-/// value is kept alive.
+/// Owns the process-global `Arc` when that is the one resolved. So the
+/// reference from [`Self::as_dyn`] stays valid while this value lives.
 pub enum ResolvedMetrics<'a> {
     /// The caller supplied a recorder directly.
     Caller(&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)),
@@ -901,12 +895,10 @@ impl ResolvedMetrics<'_> {
     #[must_use]
     pub fn as_dyn(&self) -> Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)> {
         match self {
-            // A tuple-free `match` still needs the explicit `+ Send + Sync`
-            // coercion at each arm: `dyn MetricsRecorder` alone (without the
-            // trait's own `Send + Sync` supertraits re-asserted at the
-            // reference site) does not unify with the annotated return type,
-            // even though every concrete implementor must already be
-            // `Send + Sync` (the trait declares them as supertraits).
+            // Each arm needs the explicit `+ Send + Sync` coercion. A bare
+            // `dyn MetricsRecorder` reference does not unify with the annotated
+            // return type. That is so even though the trait declares
+            // `Send + Sync` as supertraits.
             Self::Caller(m) => Some(*m),
             Self::Global(g) => Some(g.as_ref()),
             Self::Absent => None,
@@ -918,15 +910,15 @@ impl ResolvedMetrics<'_> {
 /// process-global recorder ([`global_admission_metrics`]) when the caller
 /// passed `None`.
 ///
-/// Centralizes a fallback needed at every terminal chokepoint that has no
-/// caller-supplied recorder in scope — the cancel / terminate /
-/// parent-close-cascade paths in `execution.rs` all call
-/// `completion_trigger::evaluate_triggers_for_execution_collecting` (and,
-/// transitively, `concurrency::supersede_running_for_key`) with
-/// `metrics: None`. Without this fallback, a signal recorded at one of those
-/// chokepoints (an admission-gate block, issue #618 F-round5; a nested-
-/// admission residual, issue #1197 item 2) would be dropped-and-recorded but
-/// never counted.
+/// Every terminal chokepoint with no caller-supplied recorder in scope needs
+/// this fallback. The cancel, terminate and parent-close-cascade paths in
+/// `execution.rs` all call
+/// `completion_trigger::evaluate_triggers_for_execution_collecting` with
+/// `metrics: None`. Through it they also reach
+/// `concurrency::supersede_running_for_key` with `metrics: None`. Without this
+/// fallback, a signal recorded at one of those chokepoints would be
+/// dropped-and-recorded but never counted. Examples are an admission-gate block
+/// (issue #618) and a nested-admission residual (issue #1197 item 2).
 #[must_use]
 pub fn resolve_metrics_with_global_fallback(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
@@ -1024,7 +1016,6 @@ pub mod db {
             ));
         }
 
-        // Capture owned copies so they can be moved into the transaction closure.
         let scope_kind = scope.kind_str();
         let scope_value_owned = scope.value_str();
         let reason_owned = reason.to_owned();
@@ -1307,18 +1298,16 @@ mod tests {
 
     #[test]
     fn check_cached_honours_snapshot_under_fail_closed() {
-        // issue #618 (Codex P1): a real gate loaded into the snapshot then
-        // fail-closed must still MATCH via check_cached (never the sentinel),
-        // while `check()` returns the block-everything sentinel.
+        // Issue #618: a real gate loaded into the snapshot must still MATCH via
+        // check_cached after fail-closed, never as the sentinel. `check()`
+        // returns the block-everything sentinel.
         let cache = AdmissionGateCache::new();
         cache.refresh(vec![fleet_gate("cached-incident")]);
         cache.set_fail_closed();
 
-        // check() fails closed → synthetic sentinel block.
         let (sentinel_id, _r, _s) = cache.check("wf", "q", 0, None).expect("fail-closed blocks");
         assert_eq!(sentinel_id, sentinel_gate_id());
 
-        // check_cached() returns the REAL matched gate (not the sentinel).
         let (real_id, reason, scope_kind) = cache
             .check_cached("wf", "q", 0, None)
             .expect("cached gate matches under fail-closed");
@@ -1333,23 +1322,23 @@ mod tests {
         // completion-trigger start PROCEEDS rather than being dropped.
         let cache = AdmissionGateCache::new_fail_closed();
         assert!(cache.check_cached("wf", "q", 0, None).is_none());
-        // And an initialized-but-empty cache also matches nothing.
         let open = AdmissionGateCache::new();
         assert!(open.check_cached("wf", "q", 0, None).is_none());
     }
 
     #[test]
     fn apply_created_makes_a_new_gate_matchable_even_under_fail_closed() {
-        // issue #618 (F-round16): write-through the just-persisted gate so a
-        // completion-trigger start (which consults check_cached and does NOT retry
-        // after a synthetic fail-closed block) never MISSES a just-created gate,
-        // even if the follow-up full refresh fails and the cache is fail-closed.
+        // Issue #618: the write-through of a just-persisted gate. A
+        // completion-trigger start consults check_cached and does NOT retry after
+        // a synthetic fail-closed block. So it must never MISS a just-created
+        // gate, even after a failed follow-up refresh leaves the cache
+        // fail-closed.
         let cache = AdmissionGateCache::new();
-        // Simulate the pre-write-through state: an open/empty snapshot that a failed
-        // post-create refresh would leave stale.
+        // Simulate the pre-write-through state: an open, empty snapshot that a
+        // failed post-create refresh leaves stale.
         cache.set_fail_closed();
-        // BEFORE the delta: the new gate is invisible — this is the bug the
-        // write-through closes (a stale-open snapshot misses the new gate).
+        // BEFORE the delta, the stale-open snapshot misses the new gate. The
+        // write-through closes that bug.
         assert!(
             cache.check_cached("wf", "q", 0, None).is_none(),
             "precondition: an un-written-through snapshot misses the new gate"
@@ -1357,8 +1346,8 @@ mod tests {
 
         cache.apply_created(fleet_gate("new-incident"));
 
-        // AFTER the delta: check_cached matches the REAL gate (never the sentinel),
-        // regardless of the fail-closed flag.
+        // AFTER the delta, check_cached matches the REAL gate, never the sentinel,
+        // whatever the fail-closed flag.
         let (real_id, reason, scope_kind) = cache
             .check_cached("wf", "q", 0, None)
             .expect("write-through gate matches under fail-closed");
@@ -1369,15 +1358,15 @@ mod tests {
 
     #[test]
     fn apply_lifted_stops_a_gate_matching_even_under_fail_closed() {
-        // issue #618 (F-round16): write-through the lift so a just-lifted gate stops
-        // blocking on this replica even if the follow-up refresh fails (fail-closed).
+        // Issue #618: the write-through of a lift. A just-lifted gate stops
+        // blocking on this replica even if the follow-up refresh fails.
         let g = fleet_gate("lift-me");
         let gid = g.id.0;
         let cache = AdmissionGateCache::new();
         cache.refresh(vec![g]);
         cache.set_fail_closed();
-        // BEFORE the delta: the stale snapshot still contains the lifted gate, so
-        // check_cached keeps matching it (the durable false-block bug).
+        // BEFORE the delta, the stale snapshot still holds the lifted gate. So
+        // check_cached keeps matching it: the durable false-block bug.
         assert!(
             cache.check_cached("wf", "q", 0, None).is_some(),
             "precondition: an un-written-through snapshot still honours the lifted gate"
@@ -1393,12 +1382,12 @@ mod tests {
 
     #[test]
     fn apply_lifted_without_fail_closed_stops_check_blocking_the_lifted_target() {
-        // issue #618 (F-round16): the new handler applies the lift delta and does NOT
-        // arm fail-closed on a refresh failure. So check() (the API path) reads the
-        // delta-applied, still-initialized snapshot and does NOT synthetically block
-        // the target the operator just unblocked. (Contrast the old behavior: a
-        // set_fail_closed() here would make check() return the block-everything
-        // sentinel, re-blocking the just-lifted target until the next refresh.)
+        // Issue #618: the handler applies the lift delta and does NOT arm
+        // fail-closed on a refresh failure. So check() (the API path) reads the
+        // delta-applied, still-initialized snapshot. It does NOT synthetically
+        // block the target the operator just unblocked. The old handler called
+        // set_fail_closed() here. Then check() returned the block-everything
+        // sentinel and re-blocked the just-lifted target until the next refresh.
         let g = fleet_gate("lift-me");
         let gid = g.id.0;
         let cache = AdmissionGateCache::new();
@@ -1499,11 +1488,11 @@ mod tests {
             .find(|e| e.producer == "completion_trigger")
             .expect("completion_trigger entry");
         assert_eq!(ct.status, ProducerGateStatus::Gated);
-        // Deferred-fire producers gated at HTTP admission, scanner fire
-        // exempt-with-bypass-counter (issue #618, F2). Throttle is NO LONGER in
-        // this set — it flipped to GatedAtRelay (fire-time gate, re-defer) in
-        // issue #1053; debounce + event_batch remain GatedAtAdmission (#1053
-        // scopes only throttle).
+        // Deferred-fire producers are gated at HTTP admission, and their scanner
+        // fire is exempt-with-bypass-counter (issue #618). Throttle is NO LONGER
+        // in this set. Issue #1053 moved it to GatedAtRelay (fire-time gate,
+        // re-defer). Debounce and event_batch stay GatedAtAdmission, because
+        // #1053 scopes only throttle.
         for split in ["debounce", "event_batch"] {
             let e = contract
                 .iter()
@@ -1517,7 +1506,7 @@ mod tests {
             assert_ne!(e.rationale, "");
         }
         // The cross-shard completion-trigger relay is gated authoritatively at
-        // relay time (issue #618, F-round7).
+        // relay time (issue #618).
         let cto = contract
             .iter()
             .find(|e| e.producer == "completion_trigger_outbox")
@@ -1533,9 +1522,9 @@ mod tests {
         assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
         assert_ne!(throttle.rationale, "");
         // The transactional in-process start (issue #763) is gated via
-        // `check_cached`, not exempt — see `start_workflow_transactional`'s
-        // doc comment for why `check_cached` (not `check`) is the right choice
-        // for a producer reachable without a running plugin.
+        // `check_cached`, not exempt. `start_workflow_transactional`'s doc
+        // comment explains why a producer reachable without a running plugin
+        // uses `check_cached`, not `check`.
         let transactional = contract
             .iter()
             .find(|e| e.producer == "transactional")
@@ -1546,8 +1535,8 @@ mod tests {
 
     #[test]
     fn sentinel_gate_id_matches_fail_closed_check() {
-        // The fail-closed sentinel a fresh cache returns must equal the documented
-        // sentinel (issue #618, F3) so callers can distinguish it from a real gate.
+        // The fail-closed sentinel of a fresh cache must equal the documented
+        // sentinel (issue #618). Callers then can tell it from a real gate.
         let cache = AdmissionGateCache::new_fail_closed();
         let (gate_id, _reason, _scope) = cache
             .check("wf", "q", 0, None)
@@ -1560,8 +1549,8 @@ mod tests {
         assert_eq!(sentinel_gate_id(), Uuid::nil());
     }
 
-    // Serialises the two tests that mutate the process-global gate cache so they
-    // do not race under the default parallel test runner (issue #618 review).
+    // Serialises the two tests that mutate the process-global gate cache, so they
+    // do not race under the default parallel test runner (issue #618).
     static GLOBAL_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1591,9 +1580,9 @@ mod tests {
         let _g = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // issue #618 (F5): a divergent re-publish replaces (last-write-wins; the
-        // warn is a side effect), and clearing with None fully removes the handle
-        // (teardown semantics mirrored by stop_harvest_runtime).
+        // Issue #618: a divergent re-publish replaces the handle
+        // (last-write-wins; the warn is a side effect). Clearing with None fully
+        // removes the handle, as stop_harvest_runtime does at teardown.
         let a = std::sync::Arc::new(AdmissionGateCache::new());
         let b = std::sync::Arc::new(AdmissionGateCache::new());
         set_global_admission_gate_cache(Some(std::sync::Arc::clone(&a)));
@@ -1603,13 +1592,11 @@ mod tests {
             &global_admission_gate_cache().expect("installed"),
             &a
         ));
-        // A divergent re-publish replaces it.
         set_global_admission_gate_cache(Some(std::sync::Arc::clone(&b)));
         assert!(std::sync::Arc::ptr_eq(
             &global_admission_gate_cache().expect("installed"),
             &b
         ));
-        // Clearing removes it entirely.
         set_global_admission_gate_cache(None);
         assert!(global_admission_gate_cache().is_none());
     }

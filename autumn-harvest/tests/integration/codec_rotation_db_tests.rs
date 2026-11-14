@@ -8,8 +8,8 @@
 //!
 //! - **AC1** (`kid` in the envelope; kid-less rows resolve to the legacy key
 //!   id) — [`a_kidless_pre_upgrade_row_is_swept_onto_the_active_key`] proves the
-//!   stored-bytes half end to end; the envelope shape itself is pinned by
-//!   `payload_codec.rs`'s own unit tests.
+//!   stored-bytes half end to end. The unit tests in `payload_codec.rs` pin the
+//!   envelope shape.
 //! - **AC2** (a flip takes effect for all new writes, no restart window) —
 //!   [`new_writes_land_under_the_new_key_immediately_after_a_flip`].
 //! - **AC3** (decode resolves any registered key; mixed histories replay) —
@@ -51,7 +51,7 @@
 //!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`],
 //!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`],
 //!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`], and
-//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`] (Codex review).
+//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`].
 //!
 //! # Issue #1244: the two structural fleet-wide preconditions
 //!
@@ -68,9 +68,9 @@
 //! - **Bounded staleness** —
 //!   [`refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process`].
 //!
-//! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets its own
-//! throwaway database, because the rotation census is shard-wide by design),
-//! otherwise against a per-test Postgres container.
+//! Runs against `HARVEST_TEST_DATABASE_URL` when set, otherwise against a
+//! per-test Postgres container. Each test gets its own throwaway database,
+//! because the rotation census is shard-wide by design.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -124,8 +124,8 @@ async fn commit_as_erasure(conn: &mut AsyncPgConnection, row_id: i64, data: &Val
 
 // ── codecs ───────────────────────────────────────────────────────────────────
 
-/// Two instances differ only in key material — exactly the shape rotation has
-/// to cope with, and exactly why a key id cannot live in `codec_id`.
+/// Two instances differ only in key material. Rotation must cope with that
+/// shape, so a key id cannot live in `codec_id`.
 #[derive(Debug)]
 struct XorCodec(u8);
 
@@ -161,8 +161,8 @@ impl MetricsRecorder for CountingMetrics {
 
 /// A migrated Postgres that no other test shares.
 ///
-/// The rotation census counts every `harvest_events` row on the shard — that is
-/// the point of it — so these tests cannot share a database with anything else.
+/// The rotation census counts every `harvest_events` row on the shard. So these
+/// tests cannot share a database with anything else.
 async fn setup_isolated_db() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest_codec_rot_{}", Uuid::new_v4().simple());
@@ -445,7 +445,6 @@ async fn a_kidless_pre_upgrade_row_is_swept_onto_the_active_key() {
         "the fixture really is a kid-less pre-upgrade row"
     );
 
-    // Rotate onto k2 and sweep.
     codecs
         .register_key("k2", Arc::new(XorCodec(0x22)))
         .expect("register k2");
@@ -627,15 +626,13 @@ async fn a_zero_batch_size_disables_the_sweep() {
 
 #[tokio::test]
 async fn a_converted_shard_stops_rewriting_its_cursor_every_tick() {
-    // On a fully-converted shard the batch query returns
-    // nothing, the pass is already stamped complete, and the computed cursor is
-    // byte-identical to the stored one -- but the sweep upserted it anyway on
-    // every scanner tick. For a deployment that simply keeps a keyed codec
-    // configured that is unbounded WAL and dead tuples per shard, and an
-    // `updated_at` that reads as freshly active while no work is happening.
+    // On a fully-converted shard the batch query returns nothing. The pass is
+    // already stamped complete, and the computed cursor equals the stored one.
+    // The sweep still upserted it on every scanner tick. A deployment that
+    // keeps a keyed codec configured then gets unbounded WAL and dead tuples
+    // per shard. Its `updated_at` also reads as active while no work happens.
     //
-    // `updated_at` is the observable: it moves only when the row is actually
-    // written, so it is the thing to pin.
+    // `updated_at` moves only when the row is written, so the test pins it.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let codecs = two_key_registry();
@@ -1189,12 +1186,12 @@ async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() 
 
 #[tokio::test]
 async fn a_stale_read_can_never_overwrite_a_committed_erasure() {
-    // The compare-and-swap guard itself, exercised directly. This is the
-    // interleaving the batch-oriented sweep entry point cannot express: the
-    // sweep reads a row, a PII erasure (#495) tombstones it and COMMITS, and
-    // only then does the sweep try to write its re-encrypted copy back.
-    // Without the CAS that write would resurrect payload data the erasure had
-    // just destroyed — the P1 this design exists to foreclose.
+    // The compare-and-swap guard itself, exercised directly. The batch sweep
+    // entry point cannot express this interleaving. The sweep reads a row. A
+    // PII erasure (#495) tombstones it and COMMITS. Only then does the sweep
+    // try to write its re-encrypted copy back. Without the CAS, that write
+    // resurrects payload data that the erasure just destroyed. The CAS exists
+    // to prevent exactly that.
     use autumn_harvest::codec_rotation::{compare_and_swap_event, reencrypt_event_payload_fields};
     use autumn_harvest::schema::harvest_events;
 
@@ -2193,10 +2190,10 @@ async fn the_sweep_records_the_reencrypted_metric() {
 
 #[tokio::test]
 async fn a_near_envelope_is_neither_counted_nor_swept() {
-    // The census SQL mirrors `codec_envelope_parts` exactly: a four-key object
+    // The census SQL mirrors `codec_envelope_parts` exactly. A four-key object
     // whose fourth key is not a string `kid` is not an envelope, in Postgres
-    // just as in Rust. If the two drifted, the retirement gate would either
-    // block forever or open early.
+    // and in Rust. If the two drifted, the retirement gate would either block
+    // forever or open early.
     use autumn_harvest::schema::harvest_events;
 
     let (url, _c) = setup_isolated_db().await;
@@ -2260,8 +2257,8 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
 }
 
 /// The SQL census must agree with Rust that a four-key **version 1** value is
-/// plaintext, not an envelope — otherwise it would count business data that the
-/// sweep can never convert and block retirement forever.
+/// plaintext, not an envelope. Otherwise it counts business data that the sweep
+/// can never convert, and blocks retirement forever.
 #[tokio::test]
 async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
     use autumn_harvest::schema::harvest_events;
@@ -2525,10 +2522,10 @@ async fn a_registry_with_no_keyed_codecs_sweeps_nothing_and_writes_no_cursor() {
 
 /// A rotation that is later ROLLED BACK must rescan the shard.
 ///
-/// The cursor deliberately carries the target key id as a column rather than as
-/// part of its key: resuming a rolled-back-to key's own already-completed pass
-/// would skip every row written under the key being rolled back FROM, and leave
-/// that key permanently unretirable.
+/// The cursor carries the target key id as a column, not as part of its key.
+/// Resuming the completed pass of the rolled-back-to key would skip every row
+/// written under the key being rolled back FROM. That key would then stay
+/// unretirable forever.
 #[tokio::test]
 async fn rolling_back_to_a_previous_key_rescans_the_shard() {
     let (url, _c) = setup_isolated_db().await;
@@ -2586,12 +2583,12 @@ async fn rolling_back_to_a_previous_key_rescans_the_shard() {
 
 /// A row the pass could not convert must not be abandoned behind the cursor.
 ///
-/// The failure this guards is a two-phase rollout that activates the new key
-/// before every process has the outgoing key registered: without the
-/// unresolved-row accounting the pass would log each undecodable row, march the
-/// cursor to the end of the shard, stamp itself complete, and leave those rows
-/// on the retired key forever — with a manual `DELETE` on the cursor table as
-/// the only recovery.
+/// The failure is a two-phase rollout that activates the new key before every
+/// process has the outgoing key registered. Without the unresolved-row
+/// accounting, the pass logs each undecodable row and moves the cursor to the
+/// end of the shard. It then stamps itself complete and leaves those rows on
+/// the retired key forever. A manual `DELETE` on the cursor table is then the
+/// only recovery.
 #[tokio::test]
 async fn an_unconvertible_row_is_retried_once_its_key_comes_back() {
     let (url, _c) = setup_isolated_db().await;
@@ -2701,8 +2698,8 @@ async fn retirement_fails_closed_when_a_shards_census_errors() {
     assert!(codecs.codec_for_key("k1").is_some());
 }
 
-/// Retirement must refuse a shard list that omits a shard this process can see:
-/// an omitted shard is never censused, so `Ok` for it would be vacuous.
+/// Retirement must refuse a shard list that omits a shard this process can see.
+/// An omitted shard is never censused, so `Ok` for it would be vacuous.
 #[tokio::test]
 async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
     let (url, _c) = setup_isolated_db().await;
@@ -2764,10 +2761,10 @@ async fn a_failing_sweep_does_not_strand_the_later_timeout_residents() {
     // optional; mutex reclamation is neither, and a new feature must not be
     // able to break an old one by failing.
     //
-    // Breaking the cursor table's SCHEMA (rather than dropping it) is what
-    // makes this test target the sweep alone: `cursor_table_present` still
-    // reports true, so the sweep proceeds and fails on the column, while every
-    // other resident of the pass is untouched.
+    // The test breaks the SCHEMA of the cursor table instead of dropping it.
+    // That targets the sweep alone. `cursor_table_present` still reports true,
+    // so the sweep proceeds and fails on the column. Every other resident of
+    // the pass is untouched.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let codecs = two_key_registry();
@@ -2857,10 +2854,9 @@ async fn the_sweep_runs_as_a_resident_of_the_timeout_scanner() {
 /// A `kid` read back out of STORAGE is untrusted input.
 ///
 /// On a deployment with no non-identity codec, a caller's workflow input is
-/// stored verbatim — so envelope-shaped input carrying an arbitrary `kid` would
-/// otherwise inject an attacker-chosen, unbounded key into the rotation census
-/// and keep `rows_remaining` permanently non-zero, denying the retirement
-/// procedure outright.
+/// stored verbatim. Envelope-shaped input with an arbitrary `kid` could then
+/// inject an attacker-chosen, unbounded key into the rotation census. That
+/// keeps `rows_remaining` non-zero forever and blocks the retirement procedure.
 #[tokio::test]
 async fn a_crafted_key_id_in_stored_input_is_not_counted() {
     use autumn_harvest::schema::harvest_events;
@@ -2924,14 +2920,13 @@ async fn a_crafted_key_id_in_stored_input_is_not_counted() {
 
 /// Every shard in one fan-out must classify against the **same** active key.
 ///
-/// `GET /admin/codec/rotation` reads each shard on its own connection, so a
-/// `set_active_key` landing mid-fan-out would otherwise have some shards
-/// classify their rows against the outgoing key (counting them as converted)
-/// and later shards against the incoming one (counting them as remaining) --
-/// with the response advertising whichever key was active when the aggregate
-/// was assembled. `rows_remaining_total: 0` under the *new* key, while rows
-/// under the old key are still out there, is exactly the reading the runbook
-/// tells an operator to treat as "safe to retire".
+/// `GET /admin/codec/rotation` reads each shard on its own connection. A
+/// `set_active_key` mid-fan-out could make some shards classify their rows
+/// against the outgoing key, as converted. Later shards then classify against
+/// the incoming key, as remaining. The response advertises the key that was
+/// active when the aggregate was assembled. It can show
+/// `rows_remaining_total: 0` under the *new* key while old-key rows remain.
+/// The runbook tells an operator to treat that reading as "safe to retire".
 ///
 /// This pins the mechanism the endpoint relies on: classification is against a
 /// caller-supplied key, so the caller can pin one for the whole fan-out.
@@ -2964,8 +2959,8 @@ async fn shard_progress_classifies_against_the_pinned_key_not_the_live_one() {
         "against the live key, the k1 row is outstanding"
     );
 
-    // Pinned to k1 -- the key that was active when an earlier shard in the same
-    // fan-out was read -- the very same row classifies as already converted.
+    // Pinned to k1, the key that was active for an earlier shard in the same
+    // fan-out, the same row classifies as already converted.
     let pinned = load_shard_rotation_progress_against(&mut conn, 0, &codecs, "k1")
         .await
         .expect("pinned progress");
@@ -3021,21 +3016,21 @@ async fn insert_event_at_id(
 /// A row that commits *below* the cursor must still be converted.
 ///
 /// `harvest_events.id` is a `BIGSERIAL`, so an INSERT allocates its id before it
-/// commits. A sweep running concurrently can scan past an id that is not yet
-/// visible, mark the pass complete, and leave that row behind the cursor once it
-/// does commit -- where `WHERE id > resume_from` never looks again.
+/// commits. A concurrent sweep can scan past an id that is not yet visible and
+/// mark the pass complete. Once that row commits, it is behind the cursor, where
+/// `WHERE id > resume_from` never looks again.
 ///
 /// The existing reset covers rows a pass *saw and failed to convert*
 /// (`unresolved_rows`). It cannot cover a row the pass never saw: nothing
 /// counted it, so the pass looked clean and recorded `completed_at`.
 ///
-/// The consequence is a deadlock of the procedure rather than data loss: the
-/// census keeps reporting the outgoing key, `retire_codec_key` keeps refusing,
-/// and rotation can never finish without someone resetting the cursor by hand.
+/// The consequence is a deadlock of the procedure, not data loss. The census
+/// keeps reporting the outgoing key, and `retire_codec_key` keeps refusing.
+/// Rotation cannot finish until someone resets the cursor by hand.
 ///
-/// This builds the end state directly -- a committed old-key row below a
-/// completed cursor -- rather than racing an uncommitted INSERT against the
-/// sweep, which would be timing-dependent and flaky in both directions.
+/// This builds the end state directly: a committed old-key row below a
+/// completed cursor. Racing an uncommitted INSERT against the sweep would be
+/// timing-dependent and flaky in both directions.
 #[tokio::test]
 async fn a_row_committing_below_the_cursor_is_still_converted() {
     let (url, _c) = setup_isolated_db().await;
@@ -3120,16 +3115,16 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
 /// A cursor belonging to a *different* key must not be reported as the active
 /// key's.
 ///
-/// `ShardRotationProgress::cursor` is documented as the resume cursor for the
-/// active key's pass, and the sweep already honours that: it filters a stored
-/// cursor by `active_key_id` before resuming, precisely so a rollback cannot
-/// resume a pass the rolled-back-to key finished long ago.
+/// `ShardRotationProgress::cursor` is the resume cursor for the pass of the
+/// active key. The sweep filters a stored cursor by `active_key_id` before it
+/// resumes. So a rollback cannot resume a pass that the rolled-back-to key
+/// finished long ago.
 ///
 /// The reporting path did not apply the same filter. Between a key flip and
-/// that shard's next sweep tick, `GET /admin/codec/rotation` would hand back
-/// the *previous* key's completed cursor beside the new `active_key_id` --
-/// which reads as "the new rotation is already done" to anyone consuming the
-/// endpoint, including the operator the runbook sends there.
+/// the next sweep tick of that shard, `GET /admin/codec/rotation` returned the
+/// completed cursor of the *previous* key beside the new `active_key_id`. Any
+/// consumer reads that as "the new rotation is already done". That includes
+/// the operator whom the runbook sends there.
 #[tokio::test]
 async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
     let (url, _c) = setup_isolated_db().await;
@@ -3179,14 +3174,14 @@ async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
 /// A converged shard keeps receiving new events. They arrive already under the
 /// active key, so there is nothing to convert -- but the sweep still reads and
 /// deserializes them. If the cursor does not advance past them, the next tick
-/// re-reads the same rows, and the one after that re-reads them plus whatever
-/// arrived since, until the batch limit or the five-minute revalidation clock
-/// finally moves it. On a continuously active shard at a 500 ms tick that is
-/// read amplification bounded only by `batch_limit`.
+/// re-reads the same rows. Each later tick re-reads them plus all new arrivals.
+/// That stops only when the batch limit or the five-minute revalidation clock
+/// moves the cursor. On an active shard at a 500 ms tick, only `batch_limit`
+/// bounds that read amplification.
 ///
-/// `highest_id` is the right value in both cases by construction: it is the max
-/// id examined, and falls back to the resume point when the batch was empty --
-/// so using it costs nothing in the steady state and fixes the active one.
+/// `highest_id` is correct in both cases by construction. It is the max id
+/// examined, and it falls back to the resume point when the batch is empty.
+/// So it costs nothing in the steady state and fixes the active one.
 #[tokio::test]
 async fn a_completed_cursor_advances_over_rows_it_has_examined() {
     let (url, _c) = setup_isolated_db().await;

@@ -1,15 +1,16 @@
 //! Local-Postgres end-to-end evidence for the admission-gate producer contract
-//! (issue #618): `GET /admin/gates` producer block (AC5), the outbox exempt-by-
-//! design bypass counter (AC3/AC4), and the success metric — with a `Fleet`
-//! gate raised, every in-process producer either BLOCKS and counts the block
-//! (API, completion trigger), or bypasses and counts the bypass (outbox, the
-//! cross-shard completion-trigger relay, and the debounce / throttle /
-//! event-batch deferred-fire scanners). Zero un-counted admissions.
+//! (issue #618). It covers the `GET /admin/gates` producer block (AC5) and the
+//! outbox exempt-by-design bypass counter (AC3/AC4). It also covers the
+//! success metric: zero un-counted admissions under a `Fleet` gate. Each
+//! in-process producer either BLOCKS and counts the block (API, completion
+//! trigger). Or it bypasses and counts the bypass (outbox, the cross-shard
+//! completion-trigger relay, and the debounce / throttle / event-batch
+//! deferred-fire scanners).
 //!
 //! The primary coverage lives in the core `admission_gate_authoritative_tests`
-//! (testcontainers) plus the pure unit tests. This file drives the identical
-//! app router + real outbox relay against an operator-supplied
-//! `HARVEST_TEST_DATABASE_URL` so it runs in a sandbox that has Postgres but no
+//! (testcontainers) plus the pure unit tests. This file drives the same app
+//! router and real outbox relay against an operator-supplied
+//! `HARVEST_TEST_DATABASE_URL`. So it runs in a sandbox with Postgres but no
 //! Docker daemon (the #679/#597 local-PG precedent). No-op unless the env var
 //! is set. Serialised: the admission gate cache and shard router are
 //! process-global.
@@ -127,8 +128,8 @@ fn wf_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
-/// A workflow carrying a start throttle (issue #607) so a fresh start reserves a
-/// token and falls through to the gated plain start path (issue #618, PR #1014).
+/// A workflow with a start throttle (issue #607). A fresh start reserves a
+/// token, then falls through to the gated plain start path (issue #618, PR #1014).
 fn wf_info_throttled(name: &'static str) -> WorkflowInfo {
     let mut info = wf_info(name);
     info.throttle = Some(autumn_harvest::throttle::ThrottlePolicy {
@@ -330,7 +331,7 @@ async fn admin_gates_exposes_producer_contract() {
         Some("gated")
     );
     // Deferred-fire producers gated at HTTP admission, scanner fire
-    // exempt-with-bypass-counter (issue #618, F2). Throttle is NO LONGER here —
+    // exempt-with-bypass-counter (issue #618). Throttle is NO LONGER here —
     // it flipped to gated_at_relay (fire-time gate, re-defer) in issue #1053;
     // debounce + event_batch remain gated_at_admission (#1053 scopes only
     // throttle).
@@ -342,16 +343,16 @@ async fn admin_gates_exposes_producer_contract() {
         );
     }
     // The cross-shard completion-trigger relay is gated authoritatively at relay
-    // time on the target shard (issue #618, F-round7).
+    // time on the target shard (issue #618).
     assert_eq!(
         by_name("completion_trigger_outbox")
             .get("status")
             .and_then(Value::as_str),
         Some("gated_at_relay")
     );
-    // Throttle is gated authoritatively at fire time (issue #1053): the deferred
-    // scanner fire re-checks the gate on the workflow's real queue and, when a
-    // gate matches, BLOCKS + RE-DEFERS the row (nothing dropped).
+    // Throttle is gated authoritatively at fire time (issue #1053). The deferred
+    // fire re-checks the gate on the workflow's real queue. On a match it
+    // BLOCKS + RE-DEFERS the row (nothing dropped).
     assert_eq!(
         by_name("throttle").get("status").and_then(Value::as_str),
         Some("gated_at_relay"),
@@ -444,17 +445,18 @@ async fn outbox_relay_is_exempt_and_counts_the_bypass() {
     );
 }
 
-/// F-round8 (issue #618): the workflow-start outbox bypass is counted EXACTLY
-/// ONCE per committed start, gated on the app outbox row being durably marked
-/// delivered — not on the Harvest start succeeding. This test drives the
-/// observable half of that guarantee: a single relay counts once and marks the
-/// row delivered, and a SECOND flush (the delivered row is now ineligible) never
-/// re-counts. The start-ok/mark-Err retry path — where the OLD code counted at
-/// start time and would count AGAIN on the retry (`start_or_load` returning the
-/// same existing execution) — is closed by moving the count strictly AFTER the
-/// `?`-guarded `mark_outbox_row_delivered`; a genuine mark-DB-error cannot be
-/// injected through the public flush path, so that specific window is covered by
-/// the count's placement (verified by reading) rather than a fault-injection test.
+/// Issue #618: the workflow-start outbox bypass counts EXACTLY ONCE per
+/// committed start. The count waits for the durable delivered mark on the app
+/// outbox row, not for the Harvest start. This test drives the observable half.
+/// A single relay counts once and marks the row delivered. A SECOND flush
+/// finds the row ineligible and never re-counts.
+///
+/// The other half is the start-ok/mark-Err retry path. The OLD code counted at
+/// start time, so a retry counted AGAIN (`start_or_load` returned the same
+/// execution). The fix counts strictly AFTER the `?`-guarded
+/// `mark_outbox_row_delivered`. The public flush path cannot inject a mark-DB
+/// error. So the count's placement (verified by reading) covers that window,
+/// not a fault-injection test.
 #[tokio::test]
 async fn outbox_bypass_counted_exactly_once_across_reflush() {
     let Some(url) = db_url() else {
@@ -533,9 +535,9 @@ async fn outbox_bypass_counted_exactly_once_across_reflush() {
 
 /// AC2: a scoped gate blocks a start that matches its scope and lets a
 /// non-matching start proceed. The inbound webhook receiver (issue #344)
-/// delegates `Starts` / `SignalsWithStart` straight to `api::start_workflow` /
-/// `signal_with_start_workflow` (see `webhook_receiver::handle_webhook`), so the
-/// webhook-delegate producer is gated by exactly this start-route check.
+/// delegates `Starts` / `SignalsWithStart` to `api::start_workflow` /
+/// `signal_with_start_workflow` (see `webhook_receiver::handle_webhook`).
+/// So this start-route check gates the webhook-delegate producer.
 #[tokio::test]
 async fn scoped_gate_blocks_matching_start_and_passes_non_matching() {
     let Some(url) = db_url() else {
@@ -606,9 +608,9 @@ async fn scoped_gate_blocks_matching_start_and_passes_non_matching() {
     );
 }
 
-/// Success metric: with a `Fleet` gate active, every in-process producer this
-/// PR touches (API start, completion trigger, outbox) is EITHER blocked and
-/// counted, OR bypassed and counted — zero un-counted admissions.
+/// Success metric: zero un-counted admissions under an active `Fleet` gate.
+/// Each in-process producer this PR touches (API start, completion trigger,
+/// outbox) is EITHER blocked and counted, OR bypassed and counted.
 #[tokio::test]
 async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let Some(url) = db_url() else {
@@ -761,9 +763,9 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     assert_eq!(delivered, 1);
 
     // ── Producer 4: completion-trigger CROSS-SHARD relay — BLOCKED + counted. ──
-    // The relay materializes a *new* pre-committed start on the target shard, so
-    // (Finding B, F-round7) it is gated AUTHORITATIVELY at relay time: under this
-    // Fleet gate the scanner drops the row + records admission_blocked instead of
+    // The relay materializes a *new* pre-committed start on the target shard.
+    // So the gate applies AUTHORITATIVELY at relay time. Under this Fleet gate
+    // the scanner drops the row + records admission_blocked instead of
     // starting the target. It still "processes" the row (returns 1), but as a BLOCK.
     let sharded = ShardedDbPool::single(pool.clone());
     diesel::sql_query(
@@ -810,9 +812,9 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     assert_eq!(deb, 1, "debounce scanner fires despite the gate");
 
     // ── Producer 6: throttle scanner — GatedAtRelay, BLOCKED + counted. ──
-    // Since issue #1053 throttle honors the gate at fire time: even with a token
-    // available, under the Fleet gate the deferred fire BLOCKS + RE-DEFERS the
-    // row (nothing dropped, token refunded) and counts a block, not a bypass.
+    // Since issue #1053 throttle honors the gate at fire time. Under the Fleet
+    // gate the deferred fire BLOCKS + RE-DEFERS the row, even with a token free.
+    // Nothing drops, the token is refunded, and it counts a block, not a bypass.
     let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-thr");
     diesel::sql_query(
         "INSERT INTO harvest_rate_limit_buckets
@@ -863,12 +865,11 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let blocked = metrics.blocked();
     let mut bypassed = metrics.bypassed();
     bypassed.sort();
-    // Four producers were blocked-and-counted: the API start, the completion
-    // trigger (evaluate-time), the completion-trigger cross-shard relay
-    // (relay-time, Finding B), and — since issue #1053 — the throttle scanner
+    // Four producers were blocked and counted: the API start, the completion
+    // trigger (evaluate-time), and the completion-trigger cross-shard relay
+    // (relay-time). Since issue #1053 the throttle scanner is the fourth
     // (fire-time, GatedAtRelay; re-defers its row). Block-vs-bypass never
-    // double-counts: each of these was counted as a block exactly once and never
-    // bypassed.
+    // double-counts: each counted one block and no bypass.
     assert!(
         blocked.len() >= 4,
         "API start + completion trigger + CT cross-shard relay + throttle (fire-time) must all be counted as blocks: {blocked:?}"
@@ -887,9 +888,9 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
         bypassed, expected,
         "every exempt producer that started a target under an active gate must count a bypass"
     );
-    // Three exempt producers each started their own target; the API start, the
+    // Three exempt producers each started their own target. The API start, the
     // completion trigger, the CT cross-shard relay, and the throttle scanner
-    // (issue #1053) were all blocked.
+    // (issue #1053) were blocked.
     assert_eq!(
         target_exec_count(&mut conn).await,
         3,
@@ -898,8 +899,8 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
 }
 
 /// Seed a prior `ag_target_wf` execution with an explicit `workflow_id` and a
-/// terminal-or-live `state`, so the HTTP start route's gate-skip pre-check has a
-/// concrete prior to reason about. Returns the seeded prior's execution id.
+/// terminal-or-live `state`. The gate-skip pre-check of the HTTP start route
+/// then has a concrete prior. Returns the seeded prior's execution id.
 async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, state: &str) -> Uuid {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
@@ -1201,9 +1202,9 @@ async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
         .unwrap();
     }
 
-    // Spawn the HTTP start (ADFO). Under the fix it queues on the prior's FOR
-    // UPDATE lock inside `gate_checked_start_or_load`; pre-fix its unlocked
-    // pre-read reads the committed RUNNING state and skips the gate.
+    // Spawn the HTTP start (ADFO). Under the fix it queues on the prior's
+    // FOR UPDATE lock inside `gate_checked_start_or_load`. Pre-fix, its
+    // unlocked pre-read sees the committed RUNNING state and skips the gate.
     let app_clone = app.clone();
     let start_task = tokio::spawn(async move {
         let body =
@@ -1257,9 +1258,9 @@ async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
 }
 
 /// issue #618 (PR #1014): a fresh REQUEST-SCOPED-IDEMPOTENCY (#808) start under an
-/// active gate must be BLOCKED (503) and counted — the gate is enforced inside the
-/// `_idempotent` reservation transaction (`Some(GateMode::Check)`), rolling the
-/// reservation back so a retry can start fresh. Pre-fix (gate arg `None`): the
+/// active gate must be BLOCKED (503) and counted. The `_idempotent` reservation
+/// transaction enforces the gate (`Some(GateMode::Check)`). A block rolls the
+/// reservation back, so a retry can start fresh. Pre-fix (gate arg `None`): the
 /// keyed start slipped the gate uncounted (201/created).
 #[tokio::test]
 async fn keyed_start_blocked_by_gate_is_counted_and_rolls_back_reservation() {
@@ -1323,9 +1324,9 @@ async fn keyed_start_blocked_by_gate_is_counted_and_rolls_back_reservation() {
     assert_eq!(claims, 0, "blocked keyed start rolled back its reservation");
 }
 
-/// issue #618 (PR #1014): a fresh THROTTLED (#607) start under an active gate — the
-/// throttle RESERVES a token, then falls through to the gated plain start path,
-/// which BLOCKS it (503), counts the block once, and REFUNDS the reserved token.
+/// issue #618 (PR #1014): a fresh THROTTLED (#607) start under an active gate.
+/// The throttle RESERVES a token, then falls through to the gated plain start
+/// path. That path BLOCKS it (503), counts the block once, and REFUNDS the token.
 /// Pre-fix (gate arg `None`): the throttle-reserved start slipped the gate (201).
 #[tokio::test]
 async fn throttle_reserved_start_blocked_by_gate_refunds_token_and_counts() {
@@ -1379,14 +1380,14 @@ async fn throttle_reserved_start_blocked_by_gate_refunds_token_and_counts() {
     );
 }
 
-/// issue #618 (PR #1014) — THE BATCH TOCTOU FINDING: a batch item whose prior
-/// SEALS (to TERMINATED) between Phase 1's unlocked, policy-blind gate pre-check
-/// (which sees the still-RUNNING committed prior and skips the gate as an
-/// "idempotent retry") and Phase 2's start. Under the fix Phase 2 passes
-/// `Some(GateMode::Check)`, so `_collect` takes the `FOR UPDATE` lock, observes
-/// TERMINATED, creates a fresh replacement, and BLOCKS it — counted once, no
-/// replacement. Pre-fix (Phase 2 gate arg `None`): the fresh replacement slipped
-/// the gate uncounted (item Started, 2 rows).
+/// issue #618 (PR #1014) — the batch TOCTOU: a batch item's prior SEALS (to
+/// TERMINATED) between Phase 1's gate pre-check and Phase 2's start. The
+/// pre-check is unlocked and policy-blind. It sees the still-RUNNING prior and
+/// skips the gate as an "idempotent retry". Under the fix Phase 2 passes
+/// `Some(GateMode::Check)`. So `_collect` takes the `FOR UPDATE` lock and
+/// observes TERMINATED. It creates a fresh replacement and BLOCKS it: one
+/// count, no replacement. Pre-fix (Phase 2 gate arg `None`): the fresh
+/// replacement slipped the gate uncounted (item Started, 2 rows).
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn batch_item_blocks_a_prior_that_seals_between_phase1_and_phase2() {
     let Some(url) = db_url() else {

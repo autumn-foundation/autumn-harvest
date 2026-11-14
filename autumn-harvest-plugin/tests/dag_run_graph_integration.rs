@@ -324,14 +324,13 @@ fn skip_marker(task_index: usize, activity_name: &str) -> WorkflowEvent {
     }
 }
 
-/// A `dag_skip:{task_index}` marker whose `details` is an opaque codec envelope,
-/// exactly as it is persisted on a deployment with a non-identity `PayloadCodec`
-/// (`details` is a payload field, wrapped by `transform_event_data` on write).
-/// The default identity codec stores this verbatim, so seeding it reproduces a
-/// codec-deployment's on-disk state without configuring a real codec. The read
-/// path does not decode, so the recorded task/upstream fingerprint is opaque
-/// here — classification must fall back to the marker name/index (issue #690
-/// review, Codex CLAIM D).
+/// A `dag_skip:{task_index}` marker whose `details` is an opaque codec envelope.
+/// A deployment with a non-identity `PayloadCodec` persists it this way:
+/// `transform_event_data` wraps the `details` payload field on write. The
+/// identity codec stores this verbatim. So the seed reproduces a codec
+/// deployment's on-disk state without a real codec.
+/// The read path does not decode, so the task/upstream fingerprint is opaque.
+/// Classification must fall back to the marker name/index (issue #690).
 fn skip_marker_codec_envelope(task_index: usize) -> WorkflowEvent {
     WorkflowEvent::MarkerRecorded {
         name: format!("dag_skip:{task_index}"),
@@ -753,11 +752,10 @@ async fn dag_run_graph_skipped_node_and_pending_downstream() {
 
 #[tokio::test]
 async fn dag_run_graph_skip_marker_with_opaque_codec_details_is_still_skipped() {
-    // Issue #690 review (Codex CLAIM D): on a non-identity-codec deployment the
-    // dag_skip marker's `details` is stored as an opaque envelope, so its
-    // recorded task/upstream fingerprint is unreadable at this (non-decoding)
-    // read path. The condition-skipped node must still be reported `skipped`
-    // (falling back to the always-clear marker name/index), not `pending`.
+    // Issue #690: a non-identity codec stores the dag_skip marker's `details`
+    // as an opaque envelope. This non-decoding read path cannot read its
+    // task/upstream fingerprint. The condition-skipped node must still be
+    // reported `skipped` from the marker name/index, not `pending`.
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -796,9 +794,9 @@ async fn dag_run_graph_excludes_a_codec_encoded_compensation_dispatch() {
     // opaque envelope and returned false. A never-executed forward node was then
     // reported with the old compensation's status/timings/attempts.
     //
-    // Cross-version drift: history was produced by an older definition whose
-    // unwind dispatched a compensator named `step_b`; the CURRENT
-    // `graph_linear_dag` declares `step_b` as an ordinary forward node.
+    // Cross-version drift: an older definition's unwind dispatched a
+    // compensator named `step_b`. The CURRENT `graph_linear_dag` declares
+    // `step_b` as an ordinary forward node.
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app_with_codec(&pool);
@@ -878,7 +876,7 @@ async fn dag_run_graph_still_reads_a_codec_encoded_forward_dispatch() {
     );
 }
 
-// ── (j) retried node: attempts counted from ActivityStarted (Codex CLAIM A) ──
+// ── (j) retried node: attempts counted from ActivityStarted ──
 
 #[tokio::test]
 async fn dag_run_graph_retried_node_reports_latest_attempt() {
@@ -889,12 +887,11 @@ async fn dag_run_graph_retried_node_reports_latest_attempt() {
 
     // Realistic engine output for an activity-level retry: step_c is scheduled
     // ONCE and the engine appends a fresh ActivityStarted on each claim. The
-    // first attempt fails *retryably* (which appends NO ActivityFailed —
-    // queue::requeue_for_retry re-pends the same task row and appends no event),
-    // then the second attempt (claim) succeeds. So the node has one
-    // ActivityScheduled and two ActivityStarted events, and `attempts` must be
-    // counted from ActivityStarted (the pre-fix code counted ActivityScheduled
-    // and would report attempts: 1 here).
+    // first attempt fails *retryably* and appends NO ActivityFailed.
+    // `queue::requeue_for_retry` re-pends the same task row with no event.
+    // The second claim succeeds. So the node has one ActivityScheduled and two
+    // ActivityStarted events. `attempts` must count ActivityStarted. The
+    // pre-fix code counted ActivityScheduled and reported attempts: 1.
     let (ia, ib, ic) = (
         ActivityExecId::new(),
         ActivityExecId::new(),
@@ -942,7 +939,7 @@ async fn dag_run_graph_retried_node_reports_latest_attempt() {
     assert!(c_node.get("error_type").is_none() || c_node["error_type"].is_null());
 }
 
-// ── (l) skip marker with a stale task fingerprint is ignored (Codex CLAIM B) ──
+// ── (l) skip marker with a stale task fingerprint is ignored ──
 
 #[tokio::test]
 async fn dag_run_graph_skip_marker_with_mismatched_task_is_ignored() {
@@ -952,9 +949,9 @@ async fn dag_run_graph_skip_marker_with_mismatched_task_is_ignored() {
     let mut conn = establish(&url).await;
 
     // graph_linear_dag: step_a (idx 0) -> step_b (idx 1) -> step_c (idx 2).
-    // A dag_skip:1 marker was recorded for a node named "was_renamed" (the DAG
-    // was reordered/renamed after this run), so it no longer identifies the
-    // "step_b" now at index 1 — the graph must NOT mislabel step_b as skipped.
+    // A dag_skip:1 marker names the node "was_renamed", because the DAG was
+    // reordered or renamed after this run. It no longer identifies "step_b"
+    // at index 1, so the graph must NOT mislabel step_b as skipped.
     let ia = ActivityExecId::new();
     let events = vec![
         sched("step_a", ia),

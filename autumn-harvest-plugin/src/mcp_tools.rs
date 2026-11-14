@@ -1,24 +1,26 @@
 //! MCP tool exposure for `#[workflow(mcp)]` workflows (issue #597).
 //!
-//! Maps each mcp-flagged workflow onto a correlated set of MCP tools served by
-//! autumn-web's MCP layer (autumn#1117/#1118): `start_{wf}` (returns a durable
-//! handle immediately), `{wf}_status` (reads state/progress by handle),
-//! `signal_{wf}` (delivers a signal by handle), `{wf}_watch` (streaming
-//! progress over MCP `notifications/progress`), plus one synchronous
-//! `{wf}_update_{name}` tool per `#[update(workflow = "…", mcp)]` handler.
+//! Maps each mcp-flagged workflow onto a set of MCP tools served by
+//! autumn-web's MCP layer (autumn#1117/#1118):
+//!
+//! - `start_{wf}` returns a durable handle immediately.
+//! - `{wf}_status` reads state and progress by handle.
+//! - `signal_{wf}` delivers a signal by handle.
+//! - `{wf}_watch` streams progress over MCP `notifications/progress`.
+//! - `{wf}_update_{name}` is one synchronous tool per
+//!   `#[update(workflow = "…", mcp)]` handler.
 //!
 //! Architecture: autumn-web derives MCP tools **only** from typed routes
-//! registered via `AppBuilder::routes(...)` — the harvest management API
-//! (mounted via `nest()`) is invisible to the tool catalog. This module
+//! registered via `AppBuilder::routes(...)`. The tool catalog does not see
+//! the harvest management API, which is mounted via `nest()`. This module
 //! therefore generates dedicated per-workflow [`autumn_web::Route`] values at
 //! `Plugin::build()` time, split into three layers:
 //!
 //! 1. a **pure descriptor layer** ([`collect_descriptors`],
 //!    [`tool_route_specs`]) that is unit-testable without axum or a database;
 //! 2. a **global schema map** feeding autumn-web's `ApiDoc.register_schemas`
-//!    hook, so each `start_{wf}` tool's `inputSchema` is derived from the
-//!    workflow's published `WorkflowInfo::input_schema` (issue #373) — no
-//!    second, hand-maintained schema;
+//!    hook. Each `start_{wf}` tool's `inputSchema` comes from the workflow's
+//!    published `WorkflowInfo::input_schema` (issue #373), not a second schema;
 //! 3. a **route/handler layer** ([`build_mcp_tool_routes`]) whose thin axum
 //!    handlers delegate to the same start/signal/update primitives the
 //!    management API uses.
@@ -79,11 +81,10 @@ pub struct McpWorkflowDescriptor {
     pub updates: Vec<McpUpdateDescriptor>,
     /// `true` when this workflow is the auto-registered shadow `WorkflowInfo`
     /// of a unified DAG (`#[dag(mcp)]` / `DagInfo::with_mcp()`), as opposed
-    /// to an ordinary `#[workflow(mcp)]` workflow. Changes two things in the
-    /// generated tool set: `start_{wf}` routes through the DAG trigger
-    /// contract (admission gates, `max_active_runs`) instead of generic
-    /// workflow start, and `signal_{wf}` is omitted **unless the DAG consumes
-    /// signals** (see [`Self::consumes_signals`]).
+    /// to an ordinary `#[workflow(mcp)]` workflow. Then `start_{wf}` routes
+    /// through the DAG trigger contract (admission gates, `max_active_runs`),
+    /// not generic workflow start. Also, `signal_{wf}` is omitted **unless the
+    /// DAG consumes signals** (see [`Self::consumes_signals`]).
     pub is_dag: bool,
     /// `true` when this DAG contains at least one signal-gate node (issue
     /// #746) — sourced from [`DagInfo::consumes_signals`]. Only meaningful
@@ -118,12 +119,12 @@ impl ToolKind {
     /// run, with `terminate_if_running` destructive-start semantics),
     /// `Signal`, and `Update` are mutations; `Status`/`Watch` are reads.
     ///
-    /// Used by the read-only operator role (issue #776, F1) to gate the
-    /// generated MCP tool routes — which are registered app-level, outside the
-    /// nested management router the `enforce_read_only_class` layer wraps — so
-    /// a read-only principal cannot start/signal/update a workflow through an
-    /// MCP tool (via the tool's direct HTTP path OR the `/mcp` JSON-RPC
-    /// envelope, which re-dispatches through the same route).
+    /// The read-only operator role (issue #776) uses it to gate the generated
+    /// MCP tool routes. They are registered app-level, outside the nested
+    /// router that the `enforce_read_only_class` layer wraps. So a read-only
+    /// principal cannot start, signal or update a workflow through an MCP tool.
+    /// That holds for the direct HTTP path and the `/mcp` JSON-RPC envelope,
+    /// which re-dispatches through the same route.
     #[must_use]
     pub const fn is_mutation(self) -> bool {
         matches!(
@@ -181,48 +182,37 @@ pub fn update_input_schema_component(workflow: &str, update: &str) -> String {
 
 /// Select the mcp-flagged workflows and attach their mcp-flagged updates.
 ///
-/// Pure: no I/O, no state. Workflows are returned sorted by name; updates
-/// whose `workflow` does not match any mcp-enabled workflow are ignored
-/// (they may belong to a non-exposed workflow, which is not an error).
+/// Pure: no I/O, no state. Workflows are returned sorted by name. An update
+/// whose `workflow` matches no mcp-enabled workflow is ignored. It can belong
+/// to a non-exposed workflow, which is not an error.
 ///
-/// `dags` (e.g. from `HarvestBuilder::dag_infos()`) is scanned to determine
-/// which `WorkflowInfo` entries in `workflows` are actually a unified DAG's
-/// auto-registered shadow companion, setting [`McpWorkflowDescriptor::is_dag`]
-/// accordingly -- a unified DAG's `builder.dags()` call auto-registers that
-/// shadow `WorkflowInfo` into the same `workflows` slice this function scans,
-/// so `is_dag` is the only signal distinguishing it from an ordinary workflow.
-/// A DAG descriptor never gets updates attached (unified DAGs have no update
-/// handlers).
+/// `dags` (e.g. from `HarvestBuilder::dag_infos()`) sets
+/// [`McpWorkflowDescriptor::is_dag`]. A unified DAG's `builder.dags()` call
+/// auto-registers a shadow `WorkflowInfo` into the same `workflows` slice.
+/// `is_dag` is the only signal that tells it from an ordinary workflow. A DAG
+/// descriptor never gets updates, because unified DAGs have no update handlers.
 ///
-/// **Only DAGs with `workflow_handler.is_some()` count as a DAG name**
-/// (code-review fix): a classic (pre-unified) `DagInfo` has `workflow_handler:
-/// None`, so `DagInfo::as_workflow_info()` returns `None` for it and it is
-/// never added to `workflows` at all -- treating its name as a DAG name
-/// anyway would wrongly mark an unrelated, independently-registered
-/// `#[workflow(mcp)]` workflow that happens to share that name as `is_dag`,
-/// routing its start tool through the DAG trigger contract for a DAG it has
-/// nothing to do with and silently dropping its legitimate signal tool. This
-/// collision is *not* caught by `HarvestBuilder`'s own
-/// `validate_dag_workflow_name_collisions`, which only cross-checks
-/// `auto_registered_dag_workflows` (itself populated only for DAGs with a
-/// shadow `WorkflowInfo`) -- so filtering here is the only guard.
+/// **Only DAGs with `workflow_handler.is_some()` count as a DAG name.** A
+/// classic (pre-unified) `DagInfo` has `workflow_handler: None`. Its
+/// `DagInfo::as_workflow_info()` returns `None`, so it never enters
+/// `workflows`. Treating its name as a DAG name would mark an unrelated
+/// `#[workflow(mcp)]` workflow of the same name as `is_dag`. Its start tool
+/// would then route through the DAG trigger contract, and its signal tool
+/// would be dropped. `HarvestBuilder`'s `validate_dag_workflow_name_collisions`
+/// does *not* catch this collision. It only cross-checks
+/// `auto_registered_dag_workflows`, which holds only DAGs with a shadow
+/// `WorkflowInfo`. So this filter is the only guard.
 ///
 /// **Duplicate workflow-name resolution matches the runtime exactly.**
 /// `HandlerRegistry::with_state_and_telemetry` collapses the builder's
 /// `Vec<WorkflowInfo>` into a `HashMap<String, WorkflowInfo>` via
-/// `.collect()`, so when the same workflow name is registered more than
-/// once, the *last* registration in the vec is the one `start_workflow`
-/// actually executes against. An earlier version of this function filtered
-/// to `mcp`-flagged entries and kept the *first* same-named descriptor
-/// (first-wins) -- so `.workflows([foo.with_mcp(), foo])` (a second,
-/// non-`mcp` `foo` registered afterward) would still expose MCP tools for
-/// `foo` using the *first* entry's schema/description, even though the
-/// runtime's last-wins `HashMap` resolves `foo` to the second, non-`mcp`
-/// `WorkflowInfo` -- a tool surface advertising a workflow the runtime would
-/// not actually execute that way. Fixed by resolving the same last-wins
-/// `HashMap` collapse *before* filtering by `mcp`, so tool exposure and
-/// schema derivation always read the exact `WorkflowInfo` the runtime will
-/// execute.
+/// `.collect()`. So `start_workflow` executes the *last* registration of a
+/// repeated name. A first-wins filter on `mcp` entries would break this.
+/// `.workflows([foo.with_mcp(), foo])` would expose `foo` with the first
+/// entry's schema, but the runtime executes the second, non-`mcp` entry. So
+/// this function applies the same last-wins collapse *before* it filters by
+/// `mcp`. Tool exposure and schema derivation then read the `WorkflowInfo`
+/// that the runtime executes.
 #[must_use]
 pub fn collect_descriptors(
     workflows: &[WorkflowInfo],
@@ -271,9 +261,8 @@ fn collect_descriptors_by(
         .collect();
     let mut name_counts: HashMap<&str, u32> = HashMap::new();
     let mut effective: HashMap<&str, &WorkflowInfo> = HashMap::new();
-    // Index of the registration `effective` currently points to for this
-    // name -- i.e. the LAST occurrence seen so far, kept in lockstep with
-    // `effective` (same insert-per-iteration, same last-wins overwrite).
+    // Index of the registration that `effective` holds for this name: the
+    // LAST occurrence so far. It is updated in lockstep with `effective`.
     let mut effective_index: HashMap<&str, usize> = HashMap::new();
     for (idx, w) in workflows.iter().enumerate() {
         *name_counts.entry(w.name).or_insert(0) += 1;
@@ -299,36 +288,30 @@ fn collect_descriptors_by(
     // operation-id collision check below is documented and tested as
     // "first-registered wins". When a name is registered more than once, the
     // registration that matters is the one that `effective` (and thus the
-    // runtime) uses. An earlier, superseded registration of that name is history, not
-    // a real claim on "registered first." Example: `[invoice_status(non-mcp),
+    // runtime) uses. A superseded registration of that name makes no claim
+    // on "registered first." Example: `[invoice_status(non-mcp),
     // start_invoice(mcp), invoice_status(mcp)]`. The *effective* registration
     // of `invoice_status` is the third entry. It comes after the only (and
     // thus effective) registration of `start_invoice`. Ordering by first
     // mention processes `invoice_status` first, because its superseded mention
     // is earliest. That incorrectly lets it win the `start_invoice_status`
-    // collision over `start_invoice`, which is the one actually "first" among
-    // registrations that matter. Sorting by `effective_index` (populated in
-    // lockstep with `effective` above) fixes this. The earlier no-duplicates
-    // regression fix (registration order beats alphabetical order) stays
-    // intact, because the two coincide whenever no name repeats. The final
-    // returned `Vec` is still sorted by name below, independent of processing
-    // order.
+    // collision over `start_invoice`. Among the registrations that matter,
+    // `start_invoice` is first. Sorting by `effective_index` fixes this.
+    // Registration order still beats alphabetical order, because the two
+    // orders coincide whenever no name repeats. The returned `Vec` is still
+    // sorted by name below.
     let mut names: Vec<&str> = effective.keys().copied().collect();
     names.sort_by_key(|name| effective_index[name]);
 
     // Duplicate `(workflow, update_name)` resolution matches the runtime
-    // exactly, mirroring the workflow-name fix above: `admit_update` /
-    // `update_with_start_workflow_execution` resolve the update handler to
-    // validate/admit against via `registry.update_handlers.iter().find(|h|
-    // h.workflow == workflow_name && h.name == update_name)` -- Rust's
-    // `Iterator::find` is first-wins. An earlier version of this function
-    // filtered to `mcp`-flagged entries *before* dedup and kept the first
-    // *mcp-flagged* one -- so if the true first registration for a
-    // `(workflow, name)` pair was not `mcp`-flagged but a later duplicate
-    // was, the generated tool advertised the later registration's
-    // schema/description while the runtime validates/admits against the
-    // earlier, non-mcp one. Fixed by resolving first-wins across the whole
-    // unfiltered list *before* filtering by `mcp`.
+    // exactly, like the workflow-name rule above. `admit_update` and
+    // `update_with_start_workflow_execution` find the handler via
+    // `registry.update_handlers.iter().find(|h| h.workflow == workflow_name
+    // && h.name == update_name)`. `Iterator::find` is first-wins. A filter on
+    // `mcp` before dedup would break this. The first registration of a pair
+    // can lack `mcp` while a later duplicate has it. The tool would then show
+    // the later schema, but the runtime admits against the earlier one. So
+    // first-wins runs across the unfiltered list *before* the `mcp` filter.
     let mut update_key_counts: HashMap<(&str, &str), u32> = HashMap::new();
     let mut effective_updates: HashMap<(&str, &str), &UpdateHandlerInfo> = HashMap::new();
     for u in updates {
@@ -358,14 +341,11 @@ fn collect_descriptors_by(
         .map(|name| effective[name])
         .filter(|w| w.mcp)
     {
-        // A debounced or batched start defers admission (the scanner fires
-        // it later) and returns 202 Accepted with no execution_id yet -- but
-        // every generated tool (start_{wf} included) promises a durable
-        // handle immediately, and status_{wf}/signal_{wf}/{wf}_watch/updates
-        // all require one. Excluding the workflow here (rather than
-        // surfacing a broken start_{wf} tool that sometimes has no handle to
-        // give back) keeps the "the handle is the correlation token"
-        // contract true for every exposed workflow.
+        // A debounced or batched start defers admission to the scanner. It
+        // returns 202 Accepted with no execution_id yet. But start_{wf}
+        // promises a durable handle immediately, and every other tool needs
+        // one. Excluding the workflow keeps "the handle is the correlation
+        // token" true for every exposed workflow.
         if info.debounce.is_some() || info.batch.is_some() {
             tracing::warn!(
                 workflow = info.name,
@@ -376,10 +356,7 @@ fn collect_descriptors_by(
             continue;
         }
         let is_dag = dag_names.contains(info.name);
-        // Unified DAGs have no update handlers -- skip attachment entirely
-        // rather than filtering an always-empty result, mirroring how the
-        // debounce/batch exclusion above short-circuits on a structural
-        // property of the workflow rather than filtering empty collections.
+        // Unified DAGs have no update handlers.
         let mut wf_updates: Vec<McpUpdateDescriptor> = if is_dag {
             Vec::new()
         } else {
@@ -402,17 +379,14 @@ fn collect_descriptors_by(
             is_dag,
             consumes_signals: signal_dag_names.contains(info.name),
         };
-        // Two differently-named workflows (or a workflow and a sibling's
-        // update) can still generate the SAME operation id -- e.g. workflow
-        // "invoice_status" -> start_invoice_status (its start tool) collides
-        // with workflow "start_invoice" -> start_invoice_status (its status
-        // tool). autumn-web's tool derivation keeps only the first
-        // registration and silently drops later duplicates, so an unchecked
-        // collision would make one flagged workflow quietly lose a tool from
-        // tools/list/tools/call while its direct HTTP route still exists.
-        // Exclude the colliding workflow entirely (first-seen wins, matching
-        // the duplicate-registration precedent above) rather than ship a
-        // partial tool set.
+        // Two differently-named workflows, or a workflow and a sibling's
+        // update, can generate the SAME operation id. Example: the start tool
+        // of "invoice_status" and the status tool of "start_invoice" are both
+        // start_invoice_status. autumn-web's tool derivation keeps only the
+        // first registration and drops later duplicates. An unchecked
+        // collision would hide a tool from tools/list and tools/call, while
+        // its direct HTTP route still exists. So the colliding workflow is
+        // excluded entirely, first-seen wins, not shipped with a partial set.
         if let Some(colliding_id) = operation_ids(&candidate)
             .into_iter()
             .find(|id| seen_operation_ids.contains(id))
@@ -433,14 +407,12 @@ fn collect_descriptors_by(
     descriptors
 }
 
-/// The full set of MCP operation ids one workflow descriptor's tool set
-/// (start/status/signal/watch plus one per attached update) would register.
-/// Operation ids are independent of the mount prefix, so this can be
-/// computed directly from a [`McpWorkflowDescriptor`] without building the
-/// full [`ToolRouteSpec`] list. Kept in sync by hand with the `operation_id`
-/// fields [`tool_route_specs`] assigns below — used by
-/// [`collect_descriptors`]'s cross-workflow name-collision check, which runs
-/// before a descriptor's specs ever get built.
+/// The MCP operation ids that one workflow descriptor's tool set registers.
+///
+/// Operation ids do not depend on the mount prefix, so no [`ToolRouteSpec`]
+/// list is built. Keep it in sync by hand with the `operation_id` fields that
+/// [`tool_route_specs`] assigns. [`collect_descriptors`] uses it for its
+/// name-collision check, before any specs are built.
 fn tool_operation_ids(descriptor: &McpWorkflowDescriptor) -> Vec<String> {
     let wf = &descriptor.name;
     let mut ids = vec![format!("start_{wf}"), format!("{wf}_status")];
@@ -630,8 +602,8 @@ pub fn tools_prefix(api_path: Option<&str>, prefix_override: Option<&str>) -> St
 //
 // autumn-web resolves `SchemaEntry::Ref` component names against the schemas
 // registered during spec generation. `ApiDoc.register_schemas` is a plain fn
-// pointer (no closures), so per-workflow schemas — only known at plugin build
-// time — are staged in a process-global map that the static hook drains.
+// pointer with no closure. Per-workflow schemas are known only at plugin build
+// time. So a process-global map stages them, and the static hook drains it.
 // Mirrors the `GLOBAL_WORKFLOW_METADATA` precedent in `autumn_harvest::worker`.
 
 static MCP_SCHEMAS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, serde_json::Value>>> =
@@ -653,14 +625,14 @@ fn register_harvest_mcp_schemas(registry: &mut autumn_web::openapi::SchemaRegist
 }
 
 /// Permissive schema used when a workflow (or update) publishes no
-/// `input_schema`. Deliberately carries **no** `"type"` constraint: per
-/// `docs/architecture.md`'s "Multi-param dispatch packs into JSON array"
-/// convention, an
-/// unpublished workflow's actual expected input can be a JSON object
-/// (single struct param), an array (multi-param, positional), or a bare
-/// scalar (single non-object param) — asserting `"type": "object"` here
-/// would make a validating MCP client reject perfectly valid array/scalar
-/// input before it ever reaches `start_tool`'s own schema check. Mirrors
+/// `input_schema`.
+///
+/// It carries **no** `"type"` constraint. See the "Multi-param dispatch packs
+/// into JSON array" convention in `docs/architecture.md`. An unpublished
+/// workflow can expect a JSON object (single struct param), an array
+/// (multi-param, positional) or a bare scalar (single non-object param). With
+/// `"type": "object"`, a validating MCP client would reject valid array or
+/// scalar input before `start_tool`'s own schema check. Mirrors
 /// [`SIGNAL_PAYLOAD_SCHEMA`], the existing "arbitrary JSON" fallback.
 fn permissive_object_schema(description: &str) -> serde_json::Value {
     serde_json::json!({ "description": description })
@@ -783,7 +755,7 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
 ///
 /// `MCP_SCHEMAS` has no per-`HarvestPlugin`-instance scoping. It cannot
 /// have one: autumn-web's `ApiDoc::register_schemas` hook is a bare fn
-/// pointer with no captured state (see the module doc above `MCP_SCHEMAS`).
+/// pointer with no captured state (see the section comment above `MCP_SCHEMAS`).
 /// Two `HarvestPlugin::mcp_tools()` builds in one process (parallel tests,
 /// or a multi-tenant embedder) can register a same-named workflow with
 /// different schemas. The schema of the later build still wins. Only an
@@ -818,18 +790,18 @@ fn leak(s: String) -> &'static str {
 
 /// Build the typed autumn-web routes for every descriptor's tool set.
 ///
-/// Each route carries an `ApiDoc` with `mcp_tool: true` (and `mcp_stream` for
-/// watch) so autumn-web's `mount_mcp` projects it into the tool catalog; the
-/// handlers delegate to the same primitives the management API uses, reading
-/// runtime state from the given [`HarvestApiState`] (fail-closed 503 before
-/// `on_startup` installs the runtime).
+/// Each route carries an `ApiDoc` with `mcp_tool: true`, and watch also sets
+/// `mcp_stream`. So autumn-web's `mount_mcp` projects it into the tool catalog.
+/// The handlers delegate to the same primitives as the management API. They
+/// read runtime state from the given [`HarvestApiState`]. Before `on_startup`
+/// installs the runtime, they fail closed with 503.
 ///
-/// When `role_auth_enabled` (issue #776, F1), every mutating tool route
-/// ([`ToolKind::is_mutation`]) additionally gets the
-/// [`crate::api::enforce_read_only_mcp_mutation`] gate so a read-only principal
-/// receives `403` on it — closing the write bypass that would otherwise exist
-/// because these routes are registered app-level, outside the
-/// `enforce_read_only_class` layer on the nested management router.
+/// When `role_auth_enabled` (issue #776), every mutating tool route
+/// ([`ToolKind::is_mutation`]) also gets the
+/// [`crate::api::enforce_read_only_mcp_mutation`] gate. A read-only principal
+/// then receives `403` on it. These routes are registered app-level, outside
+/// the `enforce_read_only_class` layer on the nested management router.
+/// Without the gate, that would leave a write bypass.
 #[must_use]
 pub fn build_mcp_tool_routes(
     prefix: &str,
@@ -853,9 +825,6 @@ pub fn build_mcp_tool_routes(
 }
 
 /// Build the `OpenAPI` descriptor for one generated MCP tool route.
-///
-/// Split out of [`build_tool_route`] purely to keep that function under the
-/// `clippy::too_many_lines` threshold; it has no other caller.
 fn build_tool_api_doc(
     spec: &ToolRouteSpec,
     path: &'static str,
@@ -998,15 +967,15 @@ pub(crate) fn layer_tool_route(
     tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
     role_auth_enabled: bool,
 ) -> axum::routing::MethodRouter<autumn_web::AppState> {
-    // Issue #776 (F1): under the read-only operator role, a mutating tool must
+    // Issue #776: under the read-only operator role, a mutating tool must
     // 403 a read-only principal. These routes are app-level (outside the
     // `enforce_read_only_class` layer on the nested management router), so they
-    // carry their own class gate. Applied FIRST (inner) so the auth middleware
-    // below wraps it (outer) and populates the `Session` extension *before*
-    // this gate reads it — exactly the layer order the management router uses
-    // (`enforce_read_only_class` inner, embedder auth outer). One gate on the
+    // carry their own class gate. It is applied FIRST (inner). The auth
+    // middleware below wraps it (outer) and sets the `Session` extension
+    // *before* this gate reads it. The management router uses the same order:
+    // `enforce_read_only_class` inner, embedder auth outer. One gate on the
     // route closes both invocation paths: the direct HTTP path AND the `/mcp`
-    // JSON-RPC `tools/call` envelope, which re-dispatches through this same
+    // JSON-RPC `tools/call` envelope. That envelope re-dispatches through this
     // route with the caller's forwarded credential.
     let handler = if role_auth_enabled && is_mutation {
         handler.layer(axum::middleware::from_fn(
@@ -1034,12 +1003,11 @@ pub(crate) fn layer_tool_route(
         crate::tenant::refuse_tenant_bound_mcp_tool,
     ));
     // Issue #597 hardening: these routes are registered via
-    // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
-    // the harvest management API's own auth layer (which only wraps the
-    // nested router) or autumn-web's `secure_mcp` (which only gates the
-    // `/mcp` envelope, not a typed route's own HTTP path). Apply the same
-    // layer `HarvestPlugin::api_with_auth` configured directly to this
-    // route's handler so it requires the same credential either way.
+    // `AppBuilder::routes(...)`, not `nest()`. So the management API's auth
+    // layer, which wraps only the nested router, never sees them. Neither does
+    // autumn-web's `secure_mcp`, which gates only the `/mcp` envelope. So the
+    // layer from `HarvestPlugin::api_with_auth` wraps this handler directly.
+    // The route then requires the same credential either way.
     match tool_middleware {
         Some(mw) => mw(handler),
         None => handler,
@@ -1087,16 +1055,14 @@ async fn load_owned_execution(
 /// `start_{wf}` — delegate straight to the management API's start handler
 /// with only the input set (server-generated `workflow_id`).
 ///
-/// Input-schema validation is intentionally *not* duplicated here: the
-/// delegated `start_workflow` already validates against the workflow's
-/// published `WorkflowInfo::input_schema` (issue #373), sourced from the
-/// live runtime registry rather than a schema snapshot closure-captured at
-/// `Plugin::build()` time, and — unlike an earlier version of this
-/// function — writes the audit record for a rejected request. Duplicating
-/// the check here bought no earlier failure (the validation itself is
-/// pure/in-memory either way) at the cost of two independent sources of
-/// truth for the same schema and a rejected MCP-originated attempt leaving
-/// no audit trail.
+/// Input-schema validation is intentionally *not* duplicated here. The
+/// delegated `start_workflow` validates against the workflow's published
+/// `WorkflowInfo::input_schema` (issue #373). It reads the live runtime
+/// registry, not a schema snapshot captured at `Plugin::build()` time. It
+/// also writes the audit record for a rejected request. A second check here
+/// fails no earlier, because both checks are pure and in-memory. It would add
+/// a second source of truth for the schema. A rejected MCP attempt would also
+/// leave no audit trail.
 pub(crate) async fn start_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
@@ -1129,23 +1095,19 @@ pub(crate) async fn start_tool(
 /// the generic `start_workflow` path.
 ///
 /// A unified DAG's shadow `WorkflowInfo` would let `start_workflow` admit a
-/// run directly, but doing so would bypass DAG-specific admission gates
-/// (issue #377) and `max_active_runs`/paused enforcement that
-/// `trigger_dag_run_inner` -> `trigger_unified_dag` applies before starting a
-/// new execution -- silently letting an MCP-originated call spawn more
-/// concurrent DAG runs than the DAG's own operator-configured policy allows.
-/// Routing through the same inner implementation keeps the MCP tool's
-/// admission semantics identical to the HTTP trigger route.
+/// run directly. That would bypass the DAG admission gates (issue #377). It
+/// would also bypass the `max_active_runs` and paused checks that
+/// `trigger_dag_run_inner` -> `trigger_unified_dag` applies. An MCP call could
+/// then start more concurrent DAG runs than the operator policy allows. The
+/// shared inner implementation keeps admission identical to the HTTP route.
 ///
-/// Passes its own `route` label (rather than reusing `trigger_dag_run`'s
-/// `"POST /dags/{dag_name}/trigger"` string, code-review fix) so the audit
-/// trail attributes the trigger to the MCP tool it actually came through,
-/// instead of misreporting every MCP-originated DAG start as the classic
-/// HTTP route.
+/// It passes its own `route` label, not `trigger_dag_run`'s
+/// `"POST /dags/{dag_name}/trigger"` string. So the audit trail names the MCP
+/// tool that the trigger came through, not the classic HTTP route.
 ///
-/// The request body, if any, is forwarded as the DAG's `conf` (matching
-/// `DagTriggerRequest`'s `{"conf": ...}` shape); a `null`/absent body means
-/// no `conf` override, mirroring the HTTP route's own default.
+/// The request body, if any, becomes the DAG's `conf`, as in the
+/// `{"conf": ...}` shape of `DagTriggerRequest`. A `null` or absent body means
+/// no `conf` override, which is the HTTP route's own default.
 async fn start_dag_tool(
     api_state: crate::api::HarvestApiState,
     dag_name: &'static str,
@@ -1201,11 +1163,11 @@ impl McpStatusResponse {
 
 /// `{wf}_status` — read the durable execution row.
 ///
-/// A `FAILED` or `CONTINUED_AS_NEW` row is resolved through the same
-/// retry/continue-as-new chain-following the `/result` HTTP endpoint uses
-/// (issue #527), so a continued-as-new run's status reflects its eventual
-/// successor's real state/output/error instead of a dead-end sentinel with
-/// null output. Other states need no extra lookup.
+/// A `FAILED` or `CONTINUED_AS_NEW` row follows the retry and continue-as-new
+/// chain, as the `/result` HTTP endpoint does (issue #527). So a
+/// continued-as-new run reports its successor's real state, output and error.
+/// It does not report a dead-end sentinel with null output. Other states need
+/// no extra lookup.
 async fn status_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
@@ -1232,9 +1194,10 @@ async fn status_tool(
 }
 
 /// Follow the retry/continue-as-new chain when `execution` is a dead-end
-/// (`FAILED` or `CONTINUED_AS_NEW`) row; returns `execution` unchanged
-/// otherwise, avoiding a redundant reload for the common terminal/running
-/// case (`load_owned_execution` already loaded it once).
+/// (`FAILED` or `CONTINUED_AS_NEW`) row.
+///
+/// Other rows return unchanged. `load_owned_execution` already loaded them,
+/// so a second reload is not necessary.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_if_chained(
     api_state: &crate::api::HarvestApiState,
@@ -1283,11 +1246,10 @@ async fn signal_tool(
         Ok(execution) => execution,
         Err(response) => return response,
     };
-    // Resolve to the live successor if the caller's durable handle names a
-    // predecessor that has since continued-as-new: the underlying signal
-    // path rejects a terminal execution, so signalling with the stale
-    // predecessor id would fail even though status_/watch_ already follow
-    // the chain and report the run as live.
+    // The handle can name a predecessor that has since continued-as-new. The
+    // signal path rejects a terminal execution, so the stale id would fail.
+    // But status_ and watch_ follow the chain and report the run as live. So
+    // resolve to the live successor first.
     let execution = match resolve_if_chained(&api_state, execution).await {
         Ok(execution) => execution,
         Err(response) => return response,
@@ -1328,9 +1290,8 @@ async fn update_tool(
         Ok(execution) => execution,
         Err(response) => return response,
     };
-    // Same continue-as-new chain resolution as signal_tool: admitting an
-    // update against a sealed predecessor id would fail even though the
-    // workflow is still live under its successor.
+    // Same chain resolution as signal_tool. An update against a sealed
+    // predecessor id would fail, although the successor is still live.
     let execution = match resolve_if_chained(&api_state, execution).await {
         Ok(execution) => execution,
         Err(response) => return response,
@@ -1360,10 +1321,10 @@ async fn update_tool(
 /// Modeled on the management API's `stream_execution_events` (listener
 /// connected *before* the snapshot read so no event is missed; bounded
 /// channel; pooled connection released while idle). A `FAILED`-with-retry or
-/// `CONTINUED_AS_NEW` row is resolved through the same chain-following
-/// `{wf}_status` uses (issue #527), both at subscribe time and whenever a
-/// continue-as-new happens mid-watch, so the terminal frame always reflects
-/// the eventual successor's real outcome instead of a dead-end sentinel.
+/// `CONTINUED_AS_NEW` row follows the same chain as `{wf}_status` (issue
+/// #527). That happens at subscribe time and at each mid-watch
+/// continue-as-new. So the terminal frame reports the successor's real
+/// outcome, not a dead-end sentinel.
 #[allow(clippy::too_many_lines)]
 async fn watch_tool(
     api_state: crate::api::HarvestApiState,
@@ -1401,7 +1362,7 @@ async fn watch_tool(
     // LISTEN before the snapshot read: an event committed between the two is
     // caught by the first notification instead of being lost. Continue-as-new
     // successors always live on the same shard, so one listener connection
-    // covers the whole chain even if we later jump to a successor's exec_id.
+    // covers the whole chain, also after a jump to a successor's exec_id.
     //
     // Resolved through the forwarding pointer, not `exec_id.shard()` (issue
     // #1317). A rebalanced execution's origin shard is not where
@@ -1463,7 +1424,6 @@ async fn watch_tool(
                 .data(serde_json::json!({ "progress": n, "message": message }).to_string())
         };
 
-        // Already terminal: emit the result frame and close.
         if crate::api::is_terminal_state(&execution.state) {
             let _ = tx.send(Ok(result_frame(&execution))).await;
             return;
@@ -1483,7 +1443,7 @@ async fn watch_tool(
         let mut listener_shard = shard;
         let mut exec_id = exec_id;
         loop {
-            // Shard-residence rebind (issue #1317 review, P2 follow-up).
+            // Shard-residence rebind (issue #1317).
             // The doc comment above guarantees a continue-as-new successor
             // stays on the same shard, so tracking `exec_id` alone covers
             // that case. It says nothing about a shard-rebalance migration,
@@ -1519,10 +1479,9 @@ async fn watch_tool(
                 }
                 Ok(WorkflowEventWaitOutcome::TimedOut) => false,
                 Ok(WorkflowEventWaitOutcome::ChannelClosed) | Err(_) => {
-                    // The listener connection is gone: the caller would
-                    // otherwise see the stream end with no terminal signal
-                    // and no error, indistinguishable from "workflow still
-                    // running, nothing to report yet". Say so explicitly.
+                    // The listener connection is gone. A silent stream end
+                    // would look like "workflow still running, nothing to
+                    // report yet". So say so explicitly.
                     let _ = tx
                         .send(Ok(Event::default().event("error").data(
                             serde_json::json!({
@@ -1535,11 +1494,10 @@ async fn watch_tool(
                     break;
                 }
             };
-            // A client that dropped the SSE connection during a quiet
-            // (TimedOut, no notification) stretch would otherwise never be
-            // detected here — `tx.send` is only reached below when there is
-            // a frame to emit — leaking this task and its DB polling until
-            // the watched execution eventually terminates.
+            // `tx.send` below runs only when there is a frame to emit. So a
+            // client that drops during a quiet (TimedOut) stretch goes
+            // unnoticed. This task and its DB polling would then leak until
+            // the watched execution terminates.
             if tx.is_closed() {
                 break;
             }
@@ -1551,9 +1509,8 @@ async fn watch_tool(
                 },
                 Err(_) => continue,
             };
-            // Chain resolution hiccup (e.g. a transient DB error): treat as
-            // no update this tick and retry on the next wakeup rather than
-            // tearing down the stream.
+            // A chain resolution error (e.g. a transient DB error) counts as
+            // no update this tick. The next wakeup retries; the stream stays.
             let Ok(refreshed) = resolve_if_chained(&api_clone, refreshed).await else {
                 continue;
             };
@@ -1669,9 +1626,9 @@ mod tests {
             builder: |dag| {
                 let _ = dag.signal_gate("approval");
             },
-            // `execution_timeout`/`sla` (issue #743) are supplied by the
-            // `..dag_info(name, true)` base below -- `..base` must be the
-            // last item in a struct literal, so they are NOT re-listed here.
+            // `execution_timeout`/`sla` (issue #743) come from the
+            // `..dag_info(name, true)` base below. `..base` must be the last
+            // item in a struct literal, so they are NOT re-listed here.
             ..dag_info(name, true)
         }
     }
@@ -1709,10 +1666,10 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597, PR #908): a debounced or
-    /// batched start defers admission and can return 202 Accepted with no
-    /// `execution_id`, breaking every generated tool's "durable handle
-    /// immediately" contract. Such workflows must never be exposed.
+    /// Regression test (issue #597, PR #908). A debounced or batched start
+    /// defers admission and can return 202 Accepted with no `execution_id`.
+    /// That breaks the "durable handle immediately" contract of every tool.
+    /// Such workflows must never be exposed.
     #[test]
     fn collect_descriptors_excludes_debounced_and_batched_workflows() {
         let debounced =
@@ -1739,15 +1696,13 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597, PR #908): two differently
-    /// named workflows can still generate the same MCP operation id --
-    /// `invoice_status`'s start tool (`start_invoice_status`) collides with
-    /// `start_invoice`'s status tool (also `start_invoice_status`).
+    /// Regression test (issue #597, PR #908). Two differently named workflows
+    /// can generate the same MCP operation id. `invoice_status`'s start tool
+    /// (`start_invoice_status`) collides with `start_invoice`'s status tool.
     /// autumn-web's tool derivation keeps only the first registration and
-    /// silently drops the rest, so an unchecked collision would make one
-    /// exposed workflow quietly lose a tool. The first-seen workflow must be
-    /// kept in full; the colliding one must be excluded entirely (not
-    /// partially exposed with a missing tool).
+    /// drops the rest. So an unchecked collision would hide a tool of one
+    /// exposed workflow. The first-seen workflow must be kept in full. The
+    /// colliding one must be excluded entirely, not exposed with a missing tool.
     #[test]
     fn collect_descriptors_excludes_workflows_with_colliding_generated_tool_names() {
         let descriptors = collect_descriptors(
@@ -1764,8 +1719,8 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597, PR #908): the collision
-    /// tie-break must follow *registration* order, not alphabetical order.
+    /// Regression test (issue #597, PR #908): the collision tie-break must
+    /// follow *registration* order, not alphabetical order.
     /// Registering `start_invoice` (which sorts *after* `invoice_status`
     /// alphabetically) FIRST must keep `start_invoice`, not silently flip
     /// the winner to whichever name sorts first.
@@ -1786,16 +1741,16 @@ mod tests {
         );
     }
 
-    /// Code-review regression test for the collision-order fix (issue #597,
-    /// PR #908). When a name is registered more than once, the registration
-    /// that determines "registered first" for collision purposes must be the
+    /// Regression test for the collision order (issue #597, PR #908). When a
+    /// name is registered more than once, the registration that determines
+    /// "registered first" for collision purposes must be the
     /// *effective* (last, runtime-executed) registration. It must not be the
     /// first, possibly-superseded mention of the name.
     /// `invoice_status`'s effective registration (the third entry) comes
-    /// after `start_invoice`'s only registration (the second entry), so
-    /// `start_invoice` must win the `start_invoice_status` collision even
-    /// though `invoice_status` was *mentioned* first (as a since-superseded,
-    /// non-mcp registration).
+    /// after `start_invoice`'s only registration (the second entry). So
+    /// `start_invoice` must win the `start_invoice_status` collision. That
+    /// holds although `invoice_status` was *mentioned* first, as a
+    /// superseded, non-mcp registration.
     #[test]
     fn collect_descriptors_collision_order_uses_effective_registration_not_first_mention() {
         let descriptors = collect_descriptors(
@@ -1824,7 +1779,7 @@ mod tests {
     #[test]
     fn collect_descriptors_excludes_workflows_whose_update_id_collides() {
         // Workflow "a" with an update named "watch" generates the operation
-        // id "a_update_watch"; workflow "a_update" generates the same id for
+        // id "a_update_watch". Workflow "a_update" generates the same id for
         // its own watch tool ("{wf}_watch" = "a_update_watch").
         let descriptors = collect_descriptors(
             &[wf("a", true), wf("a_update", true)],
@@ -1841,13 +1796,12 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597, PR #908): duplicate
-    /// workflow-name resolution must match `HandlerRegistry`'s runtime
+    /// Regression test (issue #597, PR #908): duplicate workflow-name
+    /// resolution must match `HandlerRegistry`'s runtime
     /// `HashMap<String, WorkflowInfo>` last-wins collapse. A workflow
-    /// registered first with `mcp` and again afterward *without* `mcp` must
-    /// NOT be exposed -- the runtime executes the later, non-mcp
-    /// registration, so exposing tools derived from the first would
-    /// advertise a workflow the runtime does not actually run that way.
+    /// registered first with `mcp` and again *without* `mcp` must NOT be
+    /// exposed. The runtime executes the later, non-mcp registration. Tools
+    /// from the first would advertise a workflow that the runtime does not run.
     #[test]
     fn collect_descriptors_resolves_duplicate_names_last_wins_like_the_runtime_hashmap() {
         let descriptors = collect_descriptors(&[wf("foo", true), wf("foo", false)], &[], &[]);
@@ -1859,8 +1813,8 @@ mod tests {
     }
 
     /// The reverse direction: a workflow registered first without `mcp`,
-    /// then again with `mcp` (and a schema) -- the last registration wins at
-    /// runtime, so tools must be exposed using its schema/description.
+    /// then again with `mcp` and a schema. The last registration wins at
+    /// runtime, so the tools must use its schema and description.
     #[test]
     fn collect_descriptors_duplicate_last_registration_with_mcp_and_schema_is_exposed() {
         let descriptors = collect_descriptors(
@@ -1939,15 +1893,13 @@ mod tests {
         assert_eq!(updates, vec!["approve", "zz"], "sorted, deduped");
     }
 
-    /// Code-review regression test (issue #597, PR #908): duplicate
+    /// Regression test (issue #597, PR #908): duplicate
     /// `(workflow, update_name)` resolution must match the runtime's own
     /// `admit_update`/`update_with_start` lookup, which is first-wins
-    /// (`Iterator::find`). A first registration that is NOT `mcp`-flagged,
-    /// followed by a duplicate `(workflow, name)` registration that IS
-    /// `mcp`-flagged, must NOT be exposed -- the runtime validates/admits
-    /// against the first (non-mcp) registration, so exposing a tool derived
-    /// from the second would advertise an update the runtime does not
-    /// actually run that way.
+    /// (`Iterator::find`). The first registration here is NOT `mcp`-flagged,
+    /// and a later duplicate IS. That update must NOT be exposed. The runtime
+    /// admits against the first, non-mcp registration. A tool from the second
+    /// would advertise an update that the runtime does not run.
     #[test]
     fn collect_descriptors_update_resolves_duplicates_first_wins_like_the_runtime_find() {
         let first_non_mcp = UpdateHandlerInfo {
@@ -2216,9 +2168,9 @@ mod tests {
         assert!(!workflow.is_dag);
     }
 
-    /// Issue #746: a DAG that consumes signals (has ≥1 signal-gate node)
-    /// regains its `signal_{dag}` MCP tool so an agent can unblock a gate,
-    /// while an activity-only DAG still suppresses it.
+    /// Issue #746: a DAG with at least one signal-gate node regains its
+    /// `signal_{dag}` MCP tool, so an agent can unblock a gate. An
+    /// activity-only DAG still suppresses it.
     #[test]
     fn collect_descriptors_signal_capable_dag_keeps_its_signal_tool() {
         let descriptors = collect_descriptors(
@@ -2287,16 +2239,12 @@ mod tests {
         );
     }
 
-    /// Code-review regression test: a classic (pre-unified) DAG --
-    /// `workflow_handler: None`, never lowered onto a shadow `WorkflowInfo` --
-    /// must NOT cause an unrelated, independently-registered
-    /// `#[workflow(mcp)]` workflow of the same name to be mistagged `is_dag`.
-    /// An earlier version of `collect_descriptors` accepted a pre-derived
-    /// `dag_names: &HashSet<&str>` built from *every* registered `DagInfo`
-    /// (including classic ones with no shadow `WorkflowInfo`), which this
-    /// scenario would wrongly mark as a DAG -- routing its start tool
-    /// through `trigger_dag_run` for a DAG that has nothing to do with it,
-    /// and silently dropping its legitimate signal tool.
+    /// Regression test: a classic (pre-unified) DAG has `workflow_handler:
+    /// None` and no shadow `WorkflowInfo`. It must NOT mark an unrelated
+    /// `#[workflow(mcp)]` workflow of the same name as `is_dag`. A DAG-name
+    /// set built from *every* registered `DagInfo` would do that. The
+    /// workflow's start tool would then route through `trigger_dag_run`, and
+    /// its signal tool would be dropped.
     #[test]
     fn collect_descriptors_classic_dag_does_not_mistag_a_same_named_workflow() {
         let descriptors = collect_descriptors(
@@ -2339,10 +2287,10 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597): the fallback schema must
-    /// not assert `"type": "object"` — a multi-param (array-input) or
-    /// scalar-input workflow with no published schema would otherwise
-    /// advertise an `inputSchema` that rejects its own valid input.
+    /// Regression test (issue #597): the fallback schema must not assert
+    /// `"type": "object"`. Otherwise a multi-param (array-input) or
+    /// scalar-input workflow with no published schema would advertise an
+    /// `inputSchema` that rejects its own valid input.
     #[test]
     fn permissive_object_schema_carries_no_type_constraint() {
         let schema = permissive_object_schema("some description");
@@ -2353,18 +2301,15 @@ mod tests {
         assert_eq!(schema["description"], "some description");
     }
 
-    /// Code-review regression test (issue #597): `record_schemas` is called
-    /// repeatedly (once per `Plugin::build()`); re-recording the same
-    /// workflow with identical content must stay a no-op (idempotent), and
-    /// re-recording with *different* content must still resolve to the
-    /// latest call's schema (documented last-write-wins, not a panic or a
-    /// stuck stale entry).
+    /// Regression test (issue #597): `record_schemas` runs once per
+    /// `Plugin::build()`. Re-recording a workflow with identical content must
+    /// stay a no-op. Re-recording with *different* content must resolve to
+    /// the latest schema (last-write-wins), with no panic or stale entry.
     ///
-    /// Uses a workflow name not shared with any other test in this module:
-    /// `MCP_SCHEMAS` is a process-global map and `cargo test` runs tests in
-    /// parallel by default, so asserting on a shared name's content (e.g.
-    /// the file's common `"order_flow"` fixture, used by several other
-    /// tests here) would be a genuine cross-test race.
+    /// It uses a workflow name that no other test in this module shares.
+    /// `MCP_SCHEMAS` is a process-global map, and `cargo test` runs tests in
+    /// parallel. A shared name such as the common `"order_flow"` fixture
+    /// would cause a cross-test race.
     #[test]
     fn record_schemas_is_idempotent_and_last_write_wins_on_divergence() {
         let first = collect_descriptors(&[wf("review_fix_schema_probe", true)], &[], &[]);
@@ -2390,12 +2335,11 @@ mod tests {
         );
     }
 
-    /// Regression test for the auth-bypass finding from the #597 code
-    /// review: MCP tool routes are registered via `AppBuilder::routes(...)`,
-    /// not `nest()`, so without an explicit applier they never pass through
-    /// `HarvestPlugin::api_with_auth`'s middleware. This proves
-    /// `build_mcp_tool_routes`'s `tool_middleware` parameter, when supplied,
-    /// actually wraps every generated route's handler.
+    /// Regression test for the auth bypass of issue #597. MCP tool routes are
+    /// registered via `AppBuilder::routes(...)`, not `nest()`. Without an
+    /// explicit applier, `HarvestPlugin::api_with_auth`'s middleware never
+    /// sees them. This proves that a supplied `tool_middleware` wraps every
+    /// generated route's handler.
     #[tokio::test]
     async fn mcp_tool_routes_apply_the_configured_middleware() {
         use axum::response::IntoResponse as _;
@@ -2441,11 +2385,10 @@ mod tests {
         resp.assert_status(401);
     }
 
-    /// Without a configured middleware (`None`, matching every existing
-    /// test above), a request must still reach the real handler — i.e. this
-    /// module's hardening does not accidentally start gating requests when
-    /// the embedder never opted into `api_with_auth`. The issue #1802 gate
-    /// is a separate check, so this test opens it.
+    /// Without a configured middleware (`None`), a request must still reach
+    /// the real handler. This pins that the module's hardening does not gate
+    /// requests when the embedder never opted into `api_with_auth`. The issue #1802 gate is a
+    /// separate check, so this test opens it.
     #[tokio::test]
     async fn mcp_tool_routes_are_unwrapped_when_no_middleware_is_configured() {
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
@@ -2464,10 +2407,9 @@ mod tests {
             .json(&serde_json::json!({}))
             .send()
             .await;
-        // No middleware to reject the request with 401; it reaches the real
-        // handler, which fails closed with a "harvest runtime is not
-        // started" 400 (no runtime is installed in this no-DB test) —
-        // proving the request was NOT rejected at the (absent) auth layer.
+        // No middleware rejects the request with 401. The real handler fails
+        // closed with a "harvest runtime is not started" 400, because this
+        // no-DB test installs no runtime. So no auth layer rejected it.
         let resp = resp.assert_status(400);
         assert!(
             resp.text().contains("harvest runtime is not started"),

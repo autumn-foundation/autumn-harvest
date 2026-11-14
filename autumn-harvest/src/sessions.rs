@@ -11,11 +11,11 @@
 //!   session-slot semaphore registry, and the broken-session scanner folded
 //!   into `timeout::enforce_timeouts_once`.
 //!
-//! A worker session pins a *sequence of activities* — not a single unit of
-//! work — to one physical worker so they can share machine-local state (a
-//! downloaded file, a warmed cache, GPU memory). See the "Fan-out vs worker
-//! sessions vs local activity vs claim-check" decision matrix in the crate
-//! docs for when to reach for a session instead.
+//! A worker session pins a *sequence of activities*, not a single unit of
+//! work, to one physical worker. The activities can then share machine-local
+//! state (a downloaded file, a warmed cache, GPU memory). See the "Fan-out vs
+//! worker sessions vs local activity vs claim-check" decision matrix in the
+//! crate docs for when to reach for a session instead.
 
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ use crate::loom_sync::{Arc, Mutex};
 /// Sticky-lease duration applied to a session member activity's task row
 /// (`harvest_task_queue.sticky_timeout`).
 ///
-/// Purely a bookkeeping value to satisfy the `sticky_worker_id IS NULL <=>
-/// sticky_until IS NULL` check constraint: the hard-pin claim gate (`AND
-/// (session_id IS NULL OR sticky_worker_id = $1)`) never consults
-/// `sticky_until` for a session-tagged row, so this never causes a
+/// Purely a bookkeeping value for the `sticky_worker_id IS NULL <=>
+/// sticky_until IS NULL` check constraint. The hard-pin claim gate (`AND
+/// (session_id IS NULL OR sticky_worker_id = $1)`) never reads
+/// `sticky_until` for a session-tagged row. So this never causes a
 /// mid-session failover the way an ordinary sticky lease would. Generously
 /// long so operator-facing views of `sticky_until` never read as "about to
 /// expire" for a legitimately still-open session.
@@ -104,14 +104,13 @@ pub enum BrokenSessionReason {
     HostWorkerLostHeartbeat,
     /// The host worker's status transitioned to `Draining` or `Stopped`.
     HostWorkerDraining,
-    /// The session's owning workflow execution already reached a terminal
-    /// state (completed, failed, cancelled, timed out, terminated, or
-    /// continued-as-new) without ever calling `Session::complete()` -- e.g.
-    /// a member activity error propagated via `?`, or an operator
-    /// cancelled/terminated the workflow mid-pipeline. The workflow can
-    /// never dispatch another member activity or a release for this
-    /// session, so waiting out the full lease would only delay reclaiming
-    /// the slot for no benefit.
+    /// The owning workflow execution reached a terminal state without a call
+    /// to `Session::complete()`. Terminal means completed, failed, cancelled,
+    /// timed out, terminated or continued-as-new. Examples: a member activity
+    /// error propagated via `?`, or an operator cancel or terminate
+    /// mid-pipeline. The workflow can never dispatch another member activity
+    /// or a release. So waiting out the full lease only delays the slot
+    /// reclaim.
     OwningWorkflowTerminal,
     /// The session's lease (`expires_at`) elapsed — e.g. a wedged workflow
     /// that never called `Session::complete()`.
@@ -133,11 +132,10 @@ impl std::fmt::Display for BrokenSessionReason {
 
 /// Pure decision: should an `ACTIVE` session be marked `BROKEN`?
 ///
-/// Checked in priority order — a dead host is reported before a merely
-/// draining one; a terminal owning workflow is reported next (it can never
-/// legitimately use or release this session again, regardless of host
-/// health or lease); an expired lease is checked last, and only once none
-/// of the above apply. Returns `None` when none of the conditions hold.
+/// Checked in priority order. A dead host comes before a merely draining
+/// one. A terminal owning workflow comes next: it can never use or release
+/// this session again, whatever the host health or lease. An expired lease
+/// comes last. Returns `None` when no condition holds.
 #[must_use]
 #[allow(clippy::fn_params_excessive_bools)]
 pub const fn broken_session_reason(
@@ -175,17 +173,17 @@ pub fn lease_expired(
 /// Randomized backoff for the session-acquire activity's reschedule after
 /// losing an in-process semaphore race.
 ///
-/// The SQL ineligible-activities gate (`queue::claim_task`'s `$6` param) that
-/// keeps a slot-full worker from claiming the acquire task is a best-effort
-/// optimization only: a task carrying `required_capabilities` is exempt from
-/// that gate, so a session-acquire task can still land on a full worker,
-/// which loses the in-process semaphore race and must reschedule. A fixed
-/// backoff would let two racing acquires hot-loop in lockstep against the
-/// same full worker; randomizing within `[min, max]` desyncs them.
+/// The SQL ineligible-activities gate (`queue::claim_task`'s `$6` param)
+/// keeps a slot-full worker from claiming the acquire task. It is a
+/// best-effort optimization only. A task with `required_capabilities` skips
+/// that gate. So a session-acquire task can still land on a full worker,
+/// lose the in-process semaphore race and reschedule. A fixed backoff lets
+/// two racing acquires hot-loop in lockstep against the same full worker.
+/// Randomizing within `[min, max]` desyncs them.
 ///
-/// `rng_fraction` is an explicit `[0.0, 1.0]` input (clamped) rather than
-/// sampled internally, keeping this function pure and deterministically
-/// testable — the caller supplies real randomness (e.g. `rand::random()`).
+/// `rng_fraction` is an explicit `[0.0, 1.0]` input (clamped), not sampled
+/// here. That keeps this function pure and deterministically testable. The
+/// caller supplies real randomness (e.g. `rand::random()`).
 #[must_use]
 pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) -> Duration {
     let min_ms = u64::try_from(min.as_millis()).unwrap_or(u64::MAX);
@@ -212,29 +210,30 @@ pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) ->
 /// worker (issue #606).
 ///
 /// A plain `HashSet<SessionId>` guarded by a `Mutex`, not a
-/// `tokio::sync::Semaphore` + `OwnedSemaphorePermit` map: a session's
-/// acquire and release happen in *different* task-dispatch invocations
-/// (potentially different tokio tasks, arbitrarily far apart in time), so
-/// there is no async-fn scope to hold an owned permit against. Storing a
-/// `HashMap<SessionId, OwnedSemaphorePermit>` directly as a `Worker` field
-/// hits the exact `clippy::significant_drop_tightening` trap already
-/// documented for `crate::slot_tuner::TunedSlotRuntime` (issue #548) -- but
-/// worse, since unlike that type (constructed and consumed within one
-/// function), a session registry must live for the worker's entire
-/// lifetime as a real struct field, so the lint fires on every single test
-/// in the crate that merely constructs a `Worker`. `SessionId` is a plain
-/// `Copy` newtype with no custom `Drop`, so a `HashSet<SessionId>` has no
-/// significant drop and sidesteps the trap entirely -- while, unlike a bare
-/// counter, still tracking *which* sessions are held. That identity is
-/// required for [`reconcile_local_sessions`] to correct the leak a bare
-/// counter cannot: the broken-session scanner (`enforce_broken_sessions`)
-/// runs from a plain DB connection with no reference to any specific
-/// worker's registry, so it can never release a slot itself when it
-/// reclaims a session hosted by a *different* (possibly still-healthy)
-/// worker process. Each worker instead periodically reconciles its own
-/// registry against `harvest_sessions` and drops any entry that left
-/// `ACTIVE` through any path -- scanner reclaim, or a release whose
-/// `record_session_completed` call failed after committing.
+/// `tokio::sync::Semaphore` + `OwnedSemaphorePermit` map. A session's
+/// acquire and release happen in *different* task-dispatch invocations,
+/// possibly on different tokio tasks and far apart in time. So no async-fn
+/// scope can hold an owned permit.
+///
+/// A `HashMap<SessionId, OwnedSemaphorePermit>` as a `Worker` field hits the
+/// `clippy::significant_drop_tightening` trap documented for
+/// `crate::slot_tuner::TunedSlotRuntime` (issue #548). Here it is worse.
+/// That type lives inside one function. A session registry is a struct
+/// field for the whole worker lifetime. So the lint fires on every test
+/// that constructs a `Worker`.
+///
+/// `SessionId` is a plain `Copy` newtype with no custom `Drop`. So a
+/// `HashSet<SessionId>` has no significant drop and avoids the trap. Unlike
+/// a bare counter, it still tracks *which* sessions are held.
+/// [`reconcile_local_sessions`] needs that identity to correct a leak that a
+/// bare counter cannot. The broken-session scanner (`enforce_broken_sessions`)
+/// runs on a plain DB connection with no reference to a worker's registry.
+/// So it cannot release a slot when it reclaims a session that a
+/// *different*, possibly healthy, worker hosts. Instead, each worker
+/// periodically reconciles its own registry against `harvest_sessions`. It
+/// drops each entry that left `ACTIVE` through any path. Those paths are a
+/// scanner reclaim, or a release whose `record_session_completed` call
+/// failed after the commit.
 pub type SessionSlotRegistry = Arc<Mutex<std::collections::HashSet<crate::types::SessionId>>>;
 
 /// Build a new, empty session-slot registry.
@@ -303,10 +302,10 @@ pub fn session_slot_count(registry: &SessionSlotRegistry) -> i32 {
 /// Reconcile this worker's local session-slot registry against durable state
 /// (issue #606).
 ///
-/// Drops any locally-held `session_id` whose `harvest_sessions` row has left
-/// `ACTIVE` through a path this worker's own release call never observed --
-/// the broken-session scanner reclaiming it (host died/drained/lease-expired,
-/// possibly detected by a *different* worker's timeout-checker loop), or a
+/// Drops each locally-held `session_id` whose `harvest_sessions` row left
+/// `ACTIVE` through a path that this worker's own release call never saw.
+/// One path is a scanner reclaim (host died, drained or lease expired),
+/// possibly from a *different* worker's timeout-checker loop. The other is a
 /// `Session::complete()` dispatch whose `record_session_completed` call
 /// errored after the row had already committed COMPLETED on a retry.
 ///
@@ -362,9 +361,9 @@ pub async fn reconcile_local_sessions(
 /// Spawn a background task that periodically reconciles this worker's local
 /// session-slot registry against `harvest_sessions` (issue #606).
 ///
-/// Releases any slot the registry believes is still held but whose row has
-/// left `ACTIVE` -- see [`reconcile_local_sessions`] for why a worker cannot
-/// rely solely on its own release paths. Mirrors
+/// Releases each slot that the registry still holds but whose row has left
+/// `ACTIVE`. [`reconcile_local_sessions`] says why a worker cannot rely on
+/// its own release paths alone. Mirrors
 /// [`crate::poison_pill::spawn_poison_pill_reclaimer`]'s loop shape. Stops
 /// when `cancel` is triggered.
 #[cfg(feature = "db")]
@@ -453,8 +452,8 @@ pub fn spawn_session_slot_reconciler(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAcquireRecordOutcome {
     /// The session is (still) `ACTIVE`. `host_worker_id` is the durably
-    /// recorded host -- `host_worker_id` on a fresh insert, or a *different*
-    /// worker's id if this call lost the race to an earlier attempt.
+    /// recorded host. On a fresh insert it is the caller's `host_worker_id`.
+    /// It is a *different* worker's id if this call lost to an earlier attempt.
     Active {
         /// The durably-recorded host worker id.
         host_worker_id: String,
@@ -473,31 +472,31 @@ pub enum SessionAcquireRecordOutcome {
 /// Record a newly acquired session (issue #606), idempotently.
 ///
 /// Called by the worker's session-acquire interception after it wins the
-/// in-process semaphore race. Uses `ON CONFLICT (id) DO NOTHING` and reads
-/// the row back rather than a plain insert: a session-acquire task can be
-/// claimed and (partially) processed more than once for the same
-/// `session_id` -- e.g. the poison-pill reclaimer requeues the task row
-/// after its original worker crashes between committing this insert and
-/// completing the task -- and a second, honest attempt on a *different*
-/// worker must not error out on a duplicate-key violation or silently
-/// overwrite the first winner's `host_worker_id`.
+/// in-process semaphore race. It uses `ON CONFLICT (id) DO NOTHING` and
+/// reads the row back, not a plain insert. A session-acquire task can be
+/// claimed and partially processed more than once for one `session_id`.
+/// For example, the original worker crashes after this insert commits but
+/// before the task completes, and the poison-pill reclaimer requeues the
+/// task row. A second, honest attempt on a *different* worker must not fail
+/// on a duplicate key. It must not silently overwrite the first winner's
+/// `host_worker_id` either.
 ///
 /// **The read-back also re-checks `state`.** In the crash window above, the
-/// broken-session scanner can mark the row `BROKEN` (the original host lost
-/// its heartbeat) *before* the poison-pill reclaimer requeues the stuck
-/// acquire task -- a retried acquire on a different worker must not resolve
-/// the session as successfully acquired against a host it already knows is
-/// dead; that would hard-pin every later member activity to an
-/// unreachable worker with no further scanner coverage (the scanner's
-/// candidate query only ever selects `state = 'ACTIVE'` rows, so a session
-/// already `BROKEN` is never revisited). Returns
-/// [`SessionAcquireRecordOutcome::NotActive`] in that case so the caller can
-/// fail the acquire activity with a typed `SessionBroken` failure instead.
+/// broken-session scanner can mark the row `BROKEN` because the original
+/// host lost its heartbeat. That can happen *before* the poison-pill
+/// reclaimer requeues the stuck acquire task. A retried acquire on a
+/// different worker must not then resolve the session against a host known
+/// to be dead. That would hard-pin every later member activity to an
+/// unreachable worker with no further scanner coverage. The scanner's
+/// candidate query selects only `state = 'ACTIVE'` rows, so it never
+/// revisits a `BROKEN` session. So this returns
+/// [`SessionAcquireRecordOutcome::NotActive`] in that case. The caller then
+/// fails the acquire activity with a typed `SessionBroken` failure.
 ///
 /// Callers must compare an [`SessionAcquireRecordOutcome::Active`] host
-/// against their own worker id and release any local slot reservation they
-/// are not actually entitled to when they differ (see
-/// `handle_session_acquire` in `worker.rs`).
+/// against their own worker id. When they differ, the caller releases the
+/// local slot reservation it does not own (see `handle_session_acquire` in
+/// `worker.rs`).
 ///
 /// # Errors
 ///
@@ -590,10 +589,10 @@ pub async fn record_session_completed(
 /// legitimately active pipeline is then not reclaimed by the `expires_at <
 /// NOW()` check of the broken-session scanner. Without the push, a member
 /// activity that takes longer than one [`SESSION_MEMBER_STICKY_TIMEOUT`]
-/// window to finish would trip that check. Idempotent-shaped: only an `ACTIVE` row is refreshed —
-/// a session already `BROKEN`/`COMPLETED` is left alone (there is nothing to
-/// extend, and refreshing a `BROKEN` row's lease could otherwise race the
-/// scanner into believing a just-reclaimed session is still alive).
+/// window to finish would trip that check. Idempotent-shaped: only an
+/// `ACTIVE` row is refreshed. A `BROKEN` or `COMPLETED` session is left
+/// alone, because there is nothing to extend. A refresh of a `BROKEN` row's
+/// lease could also make the scanner treat a just-reclaimed session as alive.
 ///
 /// # Errors
 ///
@@ -633,12 +632,12 @@ pub async fn refresh_session_lease(
 /// stale heartbeat, a `Draining`/`Stopped` status, or an elapsed lease
 /// (`expires_at < NOW()`).
 ///
-/// A broad, best-effort scan -- [`enforce_broken_sessions`] re-verifies each
-/// candidate (without a row lock, since `harvest_sessions` carries no
-/// meaningful concurrent-writer other than this scanner and
-/// `record_session_completed`, both idempotent-shaped via the `state =
-/// 'ACTIVE'` guard) before acting, mirroring the poison-pill reclaimer's
-/// broad-scan-then-reverify shape (issue #367).
+/// A broad, best-effort scan. [`enforce_broken_sessions`] re-verifies each
+/// candidate before it acts, like the poison-pill reclaimer's
+/// broad-scan-then-reverify shape (issue #367). The re-check takes no row
+/// lock. The only concurrent writers of `harvest_sessions` are this scanner
+/// and `record_session_completed`. Both are idempotent-shaped through the
+/// `state = 'ACTIVE'` guard.
 ///
 /// `$1` is the worker-stale threshold in seconds (BIGINT), matching
 /// [`crate::poison_pill::orphaned_running_tasks_query`]'s convention.
@@ -659,11 +658,10 @@ pub const fn broken_session_candidates_query() -> &'static str {
        )"
 }
 
-/// Re-resolve why a candidate session's host is broken, re-reading
-/// `harvest_workers` fresh (guards against acting on a stale broad-scan
-/// snapshot, e.g. the host resurrected its heartbeat between the scan and
-/// this check). Returns `None` when the session is no longer actually
-/// broken.
+/// Re-resolve why a candidate session's host is broken from a fresh read of
+/// `harvest_workers`. This guards against a stale broad-scan snapshot, e.g.
+/// a host heartbeat that resumed between the scan and this check. Returns
+/// `None` when the session is no longer broken.
 #[cfg(feature = "db")]
 async fn resolve_broken_reason(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -697,12 +695,12 @@ async fn resolve_broken_reason(
         }
     };
 
-    // The owning workflow may have reached a terminal state without ever
-    // calling `Session::complete()` -- a member activity error propagated
-    // via `?`, or an operator cancelled/terminated the workflow mid-pipeline
-    // (issue #929 review). Such a workflow can never dispatch another
-    // member activity or a release for this session, so there is no reason
-    // to wait out the full lease before reclaiming the slot.
+    // The owning workflow may be terminal without a call to
+    // `Session::complete()`. Examples: a member activity error propagated
+    // via `?`, or an operator cancel or terminate mid-pipeline (issue #929
+    // review). Such a workflow can never dispatch another member activity or
+    // a release. So there is no reason to wait out the full lease before the
+    // reclaim.
     let owning_workflow_state: Option<String> = e::harvest_workflow_executions
         .find(session.workflow_exec_id)
         .select(e::state)
@@ -716,16 +714,14 @@ async fn resolve_broken_reason(
 
     let lease_expired_naive = lease_expired(chrono::Utc::now(), session.expires_at);
 
-    // A naive lease-expiry check alone would misclassify a healthy pipeline
-    // whose member activity legitimately runs longer than
-    // `SESSION_MEMBER_STICKY_TIMEOUT` (24h) as broken, since the lease is
-    // currently only refreshed on member *completion*
+    // A lease-expiry check alone would call a healthy pipeline broken when a
+    // member activity runs longer than `SESSION_MEMBER_STICKY_TIMEOUT` (24h).
+    // The lease is refreshed only on member *completion*
     // (`refresh_session_lease`, called from `finalize_activity_completion`),
-    // never while a member is still executing. A currently-`RUNNING` member
-    // task is independent proof the pipeline is still making real progress,
-    // so only report `LeaseExpired` when no member task is in flight --
-    // this never masks a genuinely dead/draining host, since that check
-    // takes priority in `broken_session_reason` regardless of this flag.
+    // never while a member runs. A `RUNNING` member task proves real
+    // progress. So report `LeaseExpired` only when no member task is in
+    // flight. This never masks a dead or draining host, because that check
+    // takes priority in `broken_session_reason`.
     let expired = if lease_expired_naive {
         use crate::schema::harvest_task_queue::dsl as q;
         let has_running_member: bool = diesel::select(diesel::dsl::exists(
@@ -752,18 +748,16 @@ async fn resolve_broken_reason(
 /// Mark one session `BROKEN` and fail every `PENDING`/`RUNNING` member
 /// activity task pinned to it (issue #606).
 ///
-/// Runs in a single transaction (session row + member task rows always
-/// share one shard by construction): re-checks the session is still
-/// `ACTIVE` before acting (idempotent against a concurrent
-/// `record_session_completed` late-release racing this scan), transitions
-/// it to `BROKEN`, then for each affected member task appends an
-/// `ActivityFailed { error_type: "SessionBroken", non_retryable: true }`
-/// event (reusing the existing event variant -- no new `WorkflowEvent`),
-/// fails the task row, and wakes the workflow so it observes the failure on
-/// its very next decision cycle. `non_retryable` is required: a
-/// hard-pinned member task can never fail over to a different host, so a
-/// retryable failure would simply re-pend forever against the same dead
-/// host.
+/// Runs in one transaction. The session row and its member task rows always
+/// share one shard by construction. It re-checks that the session is still
+/// `ACTIVE`, so a concurrent late `record_session_completed` is harmless.
+/// It then moves the session to `BROKEN`. For each affected member task, it
+/// appends an `ActivityFailed { error_type: "SessionBroken", non_retryable:
+/// true }` event, an existing variant. It fails the task row and wakes the
+/// workflow, which sees the failure on its next decision cycle.
+/// `non_retryable` is required. A hard-pinned member task can never fail
+/// over to a different host. So a retryable failure re-pends forever
+/// against the same dead host.
 ///
 /// Returns the number of member tasks failed.
 #[cfg(feature = "db")]
@@ -922,8 +916,6 @@ pub async fn enforce_broken_sessions(
 mod tests {
     use super::*;
 
-    // ── session_acquire_eligible ─────────────────────────────────────────
-
     #[test]
     fn session_acquire_eligible_disabled_when_max_is_zero() {
         assert_eq!(
@@ -976,8 +968,6 @@ mod tests {
         assert!(!AcquireEligibility::SessionsDisabled.is_eligible());
         assert!(!AcquireEligibility::AtCapacity.is_eligible());
     }
-
-    // ── broken_session_reason ────────────────────────────────────────────
 
     #[test]
     fn broken_session_reason_none_when_healthy_and_leased() {
@@ -1061,8 +1051,6 @@ mod tests {
         );
     }
 
-    // ── lease_expired ────────────────────────────────────────────────────
-
     #[test]
     fn lease_expired_true_when_now_past_expiry() {
         let expires_at = chrono::Utc::now();
@@ -1081,8 +1069,6 @@ mod tests {
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
         assert!(!lease_expired(chrono::Utc::now(), expires_at));
     }
-
-    // ── acquire_retry_backoff ────────────────────────────────────────────
 
     #[test]
     fn acquire_retry_backoff_at_zero_fraction_returns_min() {
@@ -1123,8 +1109,6 @@ mod tests {
         let d = acquire_retry_backoff(0.5, Duration::from_millis(500), Duration::from_millis(100));
         assert_eq!(d, Duration::from_millis(500));
     }
-
-    // ── session slot registry ────────────────────────────────────────────
 
     #[test]
     fn new_session_slot_registry_starts_empty() {
@@ -1225,8 +1209,6 @@ mod tests {
         release_session_slot(&registry, first);
         assert!(try_acquire_session_slot(&registry, 1, second));
     }
-
-    // ── broken_session_candidates_query ──────────────────────────────────
 
     #[cfg(feature = "db")]
     #[test]

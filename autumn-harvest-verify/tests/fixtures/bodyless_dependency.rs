@@ -1,23 +1,23 @@
 //! Fixture: a body-less callee from a dependency that was never asked for MIR.
-//! It must NOT be trusted just because a type at the
-//! call site is std-rooted.
+//! It must NOT be trusted just because a type at the call site is std-rooted.
 //!
 //! Compiled standalone (no workspace deps) with, from this directory:
-//!   rustc --crate-type lib --edition 2024 --crate-name bodyless_dep_stub \
-//!         -o libbodyless_dep_stub.rlib bodyless_dep_stub.rs
-//!   rustc --crate-type lib --edition 2024 --emit=mir \
-//!         --extern bodyless_dep_stub=libbodyless_dep_stub.rlib \
-//!         -o bodyless_dependency.mir bodyless_dependency.rs
 //!
-//! The stub is deliberately compiled WITHOUT `--emit=mir`: `now_ish` therefore
-//! has no body in the analyzed set, exactly like a dependency outside the
-//! `--package` scope. It prints as `bodyless_dep_stub::now_ish` (rooted, so the
-//! `external-crate-body` boundary already fires on the path) and, once aliased
+//!     rustc --crate-type lib --edition 2024 --crate-name bodyless_dep_stub \
+//!           -o libbodyless_dep_stub.rlib bodyless_dep_stub.rs
+//!     rustc --crate-type lib --edition 2024 --emit=mir \
+//!           --extern bodyless_dep_stub=libbodyless_dep_stub.rlib \
+//!           -o bodyless_dependency.mir bodyless_dependency.rs
+//!
+//! The stub is deliberately compiled WITHOUT `--emit=mir`. So `now_ish` has no
+//! body in the analyzed set, like a dependency outside the `--package` scope.
+//! It prints as `bodyless_dep_stub::now_ish`, which is rooted, so the
+//! `external-crate-body` boundary already fires on the path. Once aliased
 //! through a `use`, the destination type `std::string::String` is the ONLY
-//! std-rooted text at the site — which is what used to buy it trust.
+//! std-rooted text at the site. That text is what used to buy it trust.
 //!
 //! The std control cases (`String::len`, `Vec::push`, `format`) are body-less
-//! too and must stay trusted, or every workflow in the workspace goes `unknown`.
+//! too. They must stay trusted, or every workflow in the workspace goes `unknown`.
 #![allow(dead_code, unused_variables)]
 
 pub struct WorkflowContext;

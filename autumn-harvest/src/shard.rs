@@ -2,9 +2,9 @@
 //!
 //! Autumn-Harvest can spread workflow state across several independent
 //! Postgres databases. Each workflow execution lives entirely on a single
-//! shard — the event log, task queue rows, timers, signals, and dead-letter
-//! entries for an execution all join back to the same database — so per-
-//! workflow ACID guarantees are preserved without cross-shard transactions.
+//! shard. Its event log, task queue rows, timers, signals and dead-letter
+//! entries all join back to the same database. So per-workflow ACID
+//! guarantees hold without cross-shard transactions.
 //!
 //! This module provides the two primitives used to wire that design into the
 //! runtime:
@@ -40,15 +40,14 @@ use crate::worker::DbPool;
 ///
 /// The default, [`ShardPlacement::Auto`], is today's rendezvous routing and is
 /// byte-for-byte unchanged. The other two variants are *explicit placement
-/// policy* for deployments with a data-residency or tenant-isolation
-/// obligation, where "whichever shard the hash picked" is not an acceptable
-/// answer.
+/// policy* for a data-residency or tenant-isolation obligation. There,
+/// "whichever shard the hash picked" is not an acceptable answer.
 ///
-/// Placement is decided **before** the execution id is minted, so the chosen
-/// shard is baked into the `ExecutionId` bytes and every later lookup — plus
-/// every child workflow, continue-as-new successor, retry, and reset fork,
-/// which all inherit `exec_id.shard()` — stays on the pinned shard. No event
-/// is written and no migration is involved.
+/// Placement is decided **before** the execution id is minted. So the chosen
+/// shard is baked into the `ExecutionId` bytes, and every later lookup stays
+/// on the pinned shard. So does every child workflow, continue-as-new
+/// successor, retry and reset fork, because each inherits `exec_id.shard()`.
+/// No event is written and no migration is involved.
 ///
 /// ## Examples
 ///
@@ -115,12 +114,12 @@ impl ShardPlacement {
 ///
 /// # Disclosure
 ///
-/// [`Display`](std::fmt::Display) renders the **operator** view and enumerates
-/// the valid shard set / declared residency keys, which is what you want in a
-/// log line or a Rust-API caller's error. Do **not** return it verbatim to an
-/// untrusted HTTP caller — residency keys are frequently tenant- or
-/// region-identifying, so echoing the declared set lets one probe enumerate
-/// your shard topology, live drain state, and other tenants' keys. Use
+/// [`Display`](std::fmt::Display) renders the **operator** view. It lists
+/// the valid shard set and the declared residency keys, for a log line or a
+/// Rust-API caller's error. Do **not** return it verbatim to an untrusted
+/// HTTP caller. Residency keys often identify a tenant or a region. So an
+/// echo of the declared set lets one probe enumerate the shard topology, live
+/// drain state and other tenants' keys. Use
 /// [`ShardPlacementError::client_message`] on any caller-facing boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -170,11 +169,11 @@ pub enum ShardPlacementError {
 impl ShardPlacementError {
     /// The **caller-facing** rendering, safe to return over HTTP.
     ///
-    /// Names the value the caller got wrong and what to do about it, but never
-    /// enumerates the deployment's shard set, live drain state, or the declared
-    /// residency keys — see the type-level "Disclosure" note. A caller does not
-    /// need the valid set to correct their own request; an operator reads the
-    /// full [`Display`](std::fmt::Display) form from the log and the audit row.
+    /// Names the value the caller got wrong and what to do about it. It never
+    /// lists the deployment's shard set, live drain state or declared residency
+    /// keys (see the type-level "Disclosure" note). A caller does not need the
+    /// valid set to correct the request. An operator reads the full
+    /// [`Display`](std::fmt::Display) form from the log and the audit row.
     #[must_use]
     pub fn client_message(&self) -> String {
         match self {
@@ -206,9 +205,9 @@ pub const MAX_ENCODABLE_SHARD: i32 = 0xFFFE;
 ///
 /// [`ShardId::new`] is an unbounded `const fn`, so an out-of-range value is
 /// constructible even though its own docs call `0..=0xFFFE` the valid range.
-/// Anything outside that range is silently truncated by the encoder, which would
-/// route later id-based lookups to a different shard than the one the row was
-/// written to — so placement rejects it up front.
+/// The encoder silently truncates anything outside that range. Later
+/// id-based lookups would then reach a different shard than the one that
+/// holds the row. So placement rejects it up front.
 #[must_use]
 pub const fn is_encodable_shard(shard: ShardId) -> bool {
     let raw = shard.as_i32();
@@ -225,9 +224,9 @@ fn format_shards(shards: &[ShardId]) -> String {
 /// The router carries two lists:
 ///
 /// * `readable_shards`: the superset of shards the deployment can load from.
-///   Rendezvous-hashing is performed over this set so the hash is stable
-///   across deployments where the writable set is being widened or narrowed
-///   (e.g. adding a new shard for new workflows only).
+///   Rendezvous hashing runs over this set. So the hash stays stable while
+///   the writable set widens or narrows (e.g. a new shard for new workflows
+///   only).
 /// * `writable_shards`: the subset that accepts *new* workflows. When the
 ///   initial rendezvous pick lands outside this subset the router re-hashes
 ///   among the writable subset.
@@ -252,9 +251,9 @@ pub struct ShardRouter {
     /// Empty by default. Populated via [`ShardRouter::with_shard_forwards`]
     /// once a shard's residents have all been rebalanced off it and the shard
     /// itself has been removed from `readable_shards`. Without it, an
-    /// `ExecutionId` minted on the retired shard would fall back to the default
-    /// shard and silently resolve to the wrong run — the one failure mode a
-    /// decommission must never produce.
+    /// `ExecutionId` minted on the retired shard falls back to the default
+    /// shard and silently resolves to the wrong run. A decommission must never
+    /// produce that failure.
     shard_forwards: BTreeMap<ShardId, ShardId>,
     /// Shards reserved for pinned work, one per tenant cell (issue #1837).
     ///
@@ -265,9 +264,9 @@ pub struct ShardRouter {
 
 /// Every placement-affecting field of a [`ShardRouter`], borrowed together.
 ///
-/// Returned by [`ShardRouter::parts`] so a projection that must not silently
-/// miss a field can destructure it exhaustively (no `..`) and get a compile
-/// error when a new placement input is added.
+/// Returned by [`ShardRouter::parts`]. A projection that must not silently
+/// miss a field destructures it exhaustively (no `..`). A new placement input
+/// then causes a compile error.
 #[derive(Debug, Clone)]
 pub struct ShardRouterParts<'a> {
     /// The superset of shards the deployment can load from.
@@ -323,54 +322,53 @@ impl ShardRouter {
     /// Attach an operator-declared residency key → shard mapping (issue #697).
     ///
     /// This is the *placement policy* for data-residency and tenant-isolation
-    /// deployments: the operator — who alone knows which physical database sits
-    /// in which jurisdiction — declares `"eu" -> ShardId(1)`, and application
-    /// code then starts workflows with the semantic key rather than a shard
+    /// deployments. Only the operator knows which physical database sits in
+    /// which jurisdiction. The operator declares `"eu" -> ShardId(1)`, and
+    /// application code starts workflows with the semantic key, not a shard
     /// number. Renumbering shards is a config change, not a redeploy.
     ///
-    /// The mapping is deliberately **declared, not derived**. A hash (rendezvous
-    /// or otherwise) cannot know which database is physically in the EU, and
-    /// moves roughly `1/N` of its keys whenever a shard is added — so a hashed
-    /// residency key could silently migrate a tenant's placement mid-contract.
-    /// A declared map is stable by construction across process restarts and
-    /// across any widening of the readable/writable sets.
+    /// The mapping is deliberately **declared, not derived**. A hash
+    /// (rendezvous or otherwise) cannot know which database is in the EU. It
+    /// also moves about `1/N` of its keys whenever a shard is added. So a
+    /// hashed residency key could silently move a tenant mid-contract. A
+    /// declared map is stable by construction across restarts and across any
+    /// widening of the readable/writable sets.
     ///
-    /// Keys are trimmed on insert, matching how a request's `residency_key` is
-    /// trimmed before lookup — so a declared `" eu "` is reachable as `"eu"`
-    /// rather than becoming a permanently dead entry.
+    /// Keys are trimmed on insert, as a request's `residency_key` is trimmed
+    /// before lookup. So a declared `" eu "` is reachable as `"eu"` and is not
+    /// a permanently dead entry.
     ///
     /// Calling this twice replaces the previous map.
     ///
-    /// A declared target that is readable but currently drained out of
-    /// `writable_shards` is **not** a panic — draining a residency shard is a
-    /// legitimate transient state and crash-looping the fleet over it would be
-    /// worse than the outage it signals. It logs a warning instead, because
-    /// every start under that key will be refused until the shard is restored
-    /// or the key remapped.
+    /// A declared target that is readable but drained out of
+    /// `writable_shards` is **not** a panic. Draining a residency shard is a
+    /// legitimate transient state. A fleet crash loop over it would be worse
+    /// than the outage it signals. So it logs a warning, because every start
+    /// under that key is refused until the shard is restored or the key
+    /// remapped.
     ///
     /// # Panics
     ///
-    /// Panics if a key is blank, maps to a shard outside `readable_shards`, or
-    /// two keys normalize to the same trimmed key with *conflicting* shards
-    /// (e.g. `("eu", 1)` and `(" eu ", 2)`) — which target survived would depend
-    /// on the source's iteration order, and from an unordered source could
-    /// differ across restarts. A duplicate that maps to the *same* shard is
-    /// harmless and accepted. This mirrors [`ShardRouter::new`]'s existing panic
-    /// contract so a misconfigured residency map fails at boot rather than at
+    /// Panics if a key is blank or maps to a shard outside `readable_shards`.
+    /// Also panics if two keys normalize to the same trimmed key with
+    /// *conflicting* shards (e.g. `("eu", 1)` and `(" eu ", 2)`). The surviving
+    /// target would depend on the source's iteration order. From an unordered
+    /// source it could differ across restarts. A duplicate that maps to the
+    /// *same* shard is harmless and accepted. This mirrors the panic contract
+    /// of [`ShardRouter::new`], so a bad residency map fails at boot, not at
     /// the first residency-pinned start.
     #[must_use]
     pub fn with_residency_map(
         mut self,
         entries: impl IntoIterator<Item = (String, ShardId)>,
     ) -> Self {
-        // Insert one at a time rather than `.collect()`ing: two RAW keys that
-        // normalize to the same trimmed key (`"eu"` and `" eu "`) would silently
-        // overwrite one another, and from an UNORDERED source (a `HashMap`)
-        // *which* target survives can differ across process restarts — breaking
-        // the stable-mapping guarantee that is the entire point of a declared
-        // map, and potentially moving work between jurisdictions on a restart.
-        // Fail construction instead, consistent with the blank-key and
-        // shard-outside-the-readable-set panics below.
+        // Insert one at a time, not with `.collect()`. Two RAW keys that
+        // normalize to the same trimmed key (`"eu"` and `" eu "`) would
+        // silently overwrite one another. From an UNORDERED source (a
+        // `HashMap`), the surviving target can differ across restarts. That
+        // breaks the stable mapping that is the point of a declared map. It
+        // can move work between jurisdictions on a restart. So construction
+        // fails instead, like the blank-key and readable-set panics below.
         let mut map: BTreeMap<String, ShardId> = BTreeMap::new();
         for (raw, shard) in entries {
             let key = raw.trim().to_string();
@@ -392,12 +390,12 @@ impl ShardRouter {
                 self.readable_shards.contains(shard),
                 "residency key '{key}' maps to shard {shard}, which is not in the readable set"
             );
-            // Readable but drained: the router boots, yet EVERY start under this
-            // key will be refused with `ShardNotWritable` until the shard is
-            // restored to `writable_shards` or the key is remapped. That is the
-            // likelier operational mistake (draining a shard is routine;
-            // removing one from `readable_shards` is rare), so surface it at
-            // boot rather than leaving it to be discovered from production 400s.
+            // Readable but drained: the router boots, yet EVERY start under
+            // this key is refused with `ShardNotWritable`. That lasts until the
+            // shard is back in `writable_shards` or the key is remapped. That
+            // is the likelier mistake: draining a shard is routine, and removing
+            // one from `readable_shards` is rare. So surface it at boot, not
+            // through production 400s.
             if !self.writable_shards.contains(shard) {
                 tracing::warn!(
                     residency_key = %key,
@@ -424,13 +422,13 @@ impl ShardRouter {
     ///
     /// Shard rebalancing seals a migrated execution's source row with a
     /// forwarding pointer, which is enough for as long as the source shard is
-    /// still readable. A fully *decommissioned* shard is not, and its
-    /// `ExecutionId`s would otherwise fall through
-    /// [`ShardRouter::shard_for_execution`]'s unknown-shard branch to the
-    /// default shard — resolving to the wrong database, silently. This map is
-    /// the decommission story: once every resident has been migrated off shard
-    /// A to shard B and A has been removed from `readable_shards`, declare
-    /// `A → B` and every id minted on A keeps resolving.
+    /// still readable. A fully *decommissioned* shard is not. Its
+    /// `ExecutionId`s would fall through the unknown-shard branch of
+    /// [`ShardRouter::shard_for_execution`] to the default shard. They would
+    /// silently resolve to the wrong database. This map is the decommission
+    /// story. First migrate every resident off shard A to shard B. Then remove
+    /// A from `readable_shards` and declare `A → B`. Every id minted on A then
+    /// keeps resolving.
     ///
     /// ```rust
     /// # use autumn_harvest::shard::ShardRouter;
@@ -446,15 +444,17 @@ impl ShardRouter {
     /// # Panics
     ///
     /// Like [`ShardRouter::with_residency_map`], a misconfigured map fails at
-    /// boot rather than at the first misrouted lookup. Panics when a source
-    /// shard forwards to itself, when a source shard is still in
-    /// `readable_shards` (forwarding a *live* shard would shadow its own rows),
-    /// when a target is not readable, or when one source is declared twice with
-    /// conflicting targets.
+    /// boot rather than at the first misrouted lookup. It panics when:
     ///
-    /// Chains and cycles need no separate rule: a forward's source must be
-    /// outside `readable_shards` and its target inside it, so no shard can be
-    /// both, and resolution is therefore a single hop by construction.
+    /// * a source shard forwards to itself;
+    /// * a source shard is still in `readable_shards` (forwarding a *live*
+    ///   shard would shadow its own rows);
+    /// * a target is not readable;
+    /// * one source is declared twice with conflicting targets.
+    ///
+    /// Chains and cycles need no separate rule. A forward's source must be
+    /// outside `readable_shards` and its target inside it. So no shard can be
+    /// both, and resolution is a single hop by construction.
     #[must_use]
     pub fn with_shard_forwards(
         mut self,
@@ -483,9 +483,9 @@ impl ShardRouter {
             );
             // A chain needs no separate check: the two assertions above already
             // make one impossible. A forward's SOURCE must be outside
-            // `readable_shards` and its TARGET must be inside it, so no shard
-            // can be both, and `shard_for_execution`'s single hop is therefore
-            // exhaustive by construction rather than by a hop counter.
+            // `readable_shards` and its TARGET must be inside it. So no shard
+            // can be both. The single hop of `shard_for_execution` is then
+            // exhaustive by construction, not by a hop counter.
         }
         self.shard_forwards = map;
         self
@@ -604,10 +604,10 @@ impl ShardRouter {
     /// [`crate::effective_config::ShardTopologyView::from_router`] destructures
     /// the returned [`ShardRouterParts`] with **no** `..`, so adding a field
     /// here is a compile error until the operator-facing config snapshot
-    /// surfaces it. That guard exists because `residency_map` — which decides
-    /// which *jurisdiction* a pinned workflow lands in — was added to this
-    /// router (issue #697) and silently missing from the snapshot until a
-    /// review caught it.
+    /// surfaces it. That guard exists because of `residency_map`, which decides
+    /// the *jurisdiction* of a pinned workflow. Issue #697 added it to this
+    /// router, and it was silently missing from the snapshot until a review
+    /// caught it.
     ///
     /// Add a field here whenever a new `ShardRouter` field influences
     /// placement; a purely internal cache or memo does not belong.
@@ -643,10 +643,10 @@ impl ShardRouter {
     /// is byte-for-byte identical to the pre-#697 code path. The explicit
     /// variants validate first and never fall back to the default shard.
     ///
-    /// Because the resolved shard is encoded into the `ExecutionId` the caller
-    /// then mints, residency is transitive: children, continue-as-new
-    /// successors, workflow-level retries, and reset forks all inherit
-    /// `exec_id.shard()` and therefore stay on the pinned database.
+    /// The caller encodes the resolved shard into the `ExecutionId` it mints.
+    /// So residency is transitive. Children, continue-as-new successors,
+    /// workflow-level retries and reset forks all inherit `exec_id.shard()`.
+    /// So they stay on the pinned database.
     ///
     /// # Errors
     ///
@@ -664,16 +664,16 @@ impl ShardRouter {
     /// Resolve a [`ShardPlacement`] to the shard an execution for it *would*
     /// live on, **without** enforcing writability.
     ///
-    /// Use this when the resolved shard is only being used to *look something
-    /// up* — an idempotency-key dedup probe, an operator read — rather than to
-    /// place new work. Writability is a fresh-start-only concern: refusing to
-    /// even *read* from a shard the operator happens to be draining would, for
-    /// example, turn an at-least-once retry of an already-committed keyed start
-    /// into a spurious `400` instead of the `200` no-op it must return.
+    /// Use this when the resolved shard only serves to *look something up*,
+    /// such as an idempotency-key dedup probe or an operator read. Do not use
+    /// it to place new work. Writability concerns only a fresh start. A refusal
+    /// to *read* from a shard that is being drained has a cost. For example, an
+    /// at-least-once retry of an already-committed keyed start then gets a
+    /// spurious `400`, not the `200` no-op it must return.
     ///
-    /// Every other validation still applies — an unknown shard or an undeclared
-    /// residency key is still an error, never a silent fall back to the default
-    /// shard.
+    /// Every other validation still applies. An unknown shard or an undeclared
+    /// residency key is still an error, never a silent fall back to the
+    /// default shard.
     ///
     /// # Errors
     ///
@@ -711,9 +711,9 @@ impl ShardRouter {
                     }
                 })?;
                 // Defence in depth: `with_residency_map` already rejects targets
-                // outside the readable set, but a router mutated by other means
-                // (or a shard drained after the map was declared) must still
-                // fail loud rather than place residency-bound work incorrectly.
+                // outside the readable set. A router mutated by other means, or a
+                // shard drained after the map was declared, must still fail loud.
+                // It must not misplace residency-bound work.
                 self.validate_pinned_shard(shard, require_writable)
             }
         }
@@ -730,20 +730,19 @@ impl ShardRouter {
         require_writable: bool,
     ) -> Result<ShardId, ShardPlacementError> {
         // A shard number outside `0..=0xFFFE` is not representable in an
-        // `ExecutionId`: `ExecutionId::new_for_shard` writes `shard & 0xFFFF`
-        // into the UUID's first two bytes, so `65536` would encode as `0` and
-        // `-1` as the `0xFFFF` sentinel. `ShardId::new` is an unbounded
-        // `const fn`, so a router CAN be configured with such a value; accepting
-        // the pin would write the row to the requested pool while every later
-        // id-based lookup routed to the truncated shard, leaving a pinned
-        // workflow inaccessible or visible through the wrong database. Reject it
-        // before the set membership checks — the value is unusable regardless of
-        // how the deployment is configured.
+        // `ExecutionId`. `ExecutionId::new_for_shard` writes `shard & 0xFFFF`
+        // into the UUID's first two bytes. So `65536` encodes as `0`, and `-1`
+        // as the `0xFFFF` sentinel. `ShardId::new` is an unbounded `const fn`,
+        // so a router CAN hold such a value. An accepted pin would write the row
+        // to the requested pool. Every later id-based lookup would route to the
+        // truncated shard. The pinned workflow would be unreachable, or visible
+        // through the wrong database. Reject it before the set membership
+        // checks, because the value is unusable in any deployment.
         //
-        // `is_unencoded` (`0xFFFF`) is inside this rejected range: the sentinel
+        // `is_unencoded` (`0xFFFF`) is inside this rejected range. The sentinel
         // is a routing marker ("resolve to the deployment default"), never a
-        // shard number, and accepting it would silently place pinned work on the
-        // default shard — the exact failure this feature removes.
+        // shard number. Accepting it would silently place pinned work on the
+        // default shard, which is the exact failure this feature removes.
         if !is_encodable_shard(shard) {
             return Err(ShardPlacementError::UnknownShard {
                 requested: shard,
@@ -789,7 +788,7 @@ impl ShardRouter {
 
     /// Does this router currently accept *new* workflows on `shard`?
     ///
-    /// A shard that is readable but not writable is being drained: existing
+    /// A shard that is readable but not writable is being drained. Existing
     /// work there is still served, but new work must not be placed on it.
     #[must_use]
     pub fn is_writable(&self, shard: ShardId) -> bool {
@@ -805,9 +804,9 @@ impl ShardRouter {
     /// Rendezvous-pick a *writable* shard for a brand new workflow, keyed on
     /// two arbitrary string tokens.
     ///
-    /// The initial pick is taken over the full readable set (so the hash is
-    /// stable while the writable set is widened/narrowed) and, when it lands
-    /// outside the writable subset, re-hashed among the writable shards.
+    /// The initial pick runs over the full readable set, so the hash stays
+    /// stable while the writable set widens or narrows. When it lands outside
+    /// the writable subset, it is re-hashed among the writable shards.
     ///
     /// A reserved shard (issue #1837) counts as outside the subset. The
     /// re-hash then runs over the unreserved writable shards only.
@@ -838,10 +837,9 @@ impl ShardRouter {
 
     /// Pick a shard for a brand new workflow using rendezvous hashing.
     ///
-    /// The input is `(workflow_name, workflow_id)` which uniquely identifies
-    /// the logical workflow independent of its execution UUID — the same
-    /// `(name, id)` therefore always hashes to the same shard, making outbox
-    /// retries idempotent.
+    /// The input is `(workflow_name, workflow_id)`. It identifies the logical
+    /// workflow independent of its execution UUID. So the same `(name, id)`
+    /// always hashes to the same shard, which makes outbox retries idempotent.
     #[must_use]
     pub fn pick_for_new_workflow(&self, workflow_name: &str, workflow_id: &str) -> ShardId {
         self.pick_writable(workflow_name, workflow_id)
@@ -850,14 +848,13 @@ impl ShardRouter {
     /// Pick a shard for a new workflow started via a request-scoped
     /// `idempotency_key` (issue #808).
     ///
-    /// Unlike [`Self::pick_for_new_workflow`], which routes by `(workflow_name,
-    /// workflow_id)`, this routes by `(workflow_name, idempotency_key)` so two
-    /// same-key retries — whose `workflow_id` may be independently
-    /// auto-generated per request — deterministically co-locate on the *same*
-    /// shard, hit the same `harvest_start_idempotency` claim row, and
-    /// deduplicate. Routing by `workflow_id` would scatter same-key retries
-    /// across shards in a multi-shard deployment (one claim row per shard →
-    /// one execution per shard), defeating dedup.
+    /// [`Self::pick_for_new_workflow`] routes by `(workflow_name, workflow_id)`.
+    /// This routes by `(workflow_name, idempotency_key)`. Two same-key retries
+    /// may each auto-generate their own `workflow_id`. They still co-locate on
+    /// the *same* shard, hit the same `harvest_start_idempotency` claim row,
+    /// and deduplicate. Routing by `workflow_id` would scatter same-key retries
+    /// across shards in a multi-shard deployment. That gives one claim row and
+    /// one execution per shard, which defeats dedup.
     ///
     /// The same writable-subset redirect as [`Self::pick_for_new_workflow`]
     /// applies (a keyed start still creates a brand-new workflow, so it must
@@ -865,21 +862,21 @@ impl ShardRouter {
     ///
     /// The caller (`api.rs`) only routes here when the `workflow_id` was
     /// auto-generated; an explicit `workflow_id` routes by `workflow_id`
-    /// instead. That split is the resolution of the P1↔P2 routing tension —
-    /// routing *all* keyed starts by the key would break the reuse-policy
-    /// matrix for explicit-`workflow_id` starts (see the routing comment in
-    /// `api.rs` and `docs/getting-started/06-idempotency.md`).
+    /// instead. That split resolves the tension between key dedup and the
+    /// reuse policy. Routing *all* keyed starts by the key would break the
+    /// reuse-policy matrix for explicit-`workflow_id` starts (see the routing
+    /// comment in `api.rs` and `docs/getting-started/06-idempotency.md`).
     ///
-    /// KNOWN LIMITATION (Codex #808 P2): because this reuses `pick_writable`
-    /// verbatim, keyed dedup inherits the *exact* shard-drain behavior of
-    /// `(workflow_name, workflow_id)` uniqueness. If a key first claims a run on
-    /// shard 0 and shard 0 is later removed from the writable set (drained to
-    /// read-only) while still readable, a same-key retry rehashes via the
-    /// writable-subset redirect to a *different* writable shard, probes/reserves
-    /// a different shard-local `harvest_start_idempotency` row, and can create a
-    /// second execution within the retention window. Issue #808 scopes dedup to
-    /// be shard-local, exactly as `(name, workflow_id)` uniqueness already is —
-    /// so this matches (and is bounded by) that existing guarantee. See the
+    /// KNOWN LIMITATION (issue #808): this reuses `pick_writable` verbatim.
+    /// So keyed dedup inherits the *exact* shard-drain behavior of
+    /// `(workflow_name, workflow_id)` uniqueness. Suppose a key first claims a
+    /// run on shard 0. Later shard 0 is drained to read-only but stays
+    /// readable. A same-key retry then rehashes via the writable-subset
+    /// redirect to a *different* writable shard. It probes and reserves a
+    /// different shard-local `harvest_start_idempotency` row. It can create a
+    /// second execution within the retention window. Issue #808 scopes dedup
+    /// to be shard-local, exactly as `(name, workflow_id)` uniqueness already
+    /// is. So this matches, and is bounded by, that existing guarantee. See the
     /// "Known limitation" note in `docs/getting-started/06-idempotency.md`.
     #[must_use]
     pub fn pick_for_idempotency_key(&self, workflow_name: &str, idempotency_key: &str) -> ShardId {
@@ -941,30 +938,30 @@ impl ShardRouter {
 
 /// Resolves the shard that owns `target` (issue #751).
 ///
-/// For [`ExternalTarget::ExecutionId`] this is O(1) and always authoritative
-/// — the shard is encoded in the id itself, exactly like every other
+/// For [`ExternalTarget::ExecutionId`] this is O(1) and always authoritative.
+/// The shard is encoded in the id itself, as for every other
 /// `ExecutionId`-keyed lookup in the engine.
 ///
-/// For [`ExternalTarget::WorkflowId`] there is no execution id yet to decode,
-/// so the shard is derived by rendezvous-hashing `(workflow_name,
-/// workflow_id)` via [`ShardRouter::pick_for_new_workflow`] — the SAME hash a
-/// fresh start of that business key would land on **under the default
-/// [`ShardPlacement::Auto`] placement**. Every execution in a given
-/// `(workflow_name, workflow_id)` chain (including every continue-as-new
-/// successor, which is minted with [`ExecutionId::new_for_shard`] pinned to
-/// its predecessor's shard) then lives on this same shard, so resolving a
-/// `WorkflowId` target's owning shard needs no directory lookup for the
-/// overwhelming majority of workflows.
+/// For [`ExternalTarget::WorkflowId`] there is no execution id to decode yet.
+/// So the shard comes from rendezvous-hashing `(workflow_name, workflow_id)`
+/// via [`ShardRouter::pick_for_new_workflow`]. That is the SAME hash a fresh
+/// start of that business key uses **under the default
+/// [`ShardPlacement::Auto`] placement**. Every execution in a
+/// `(workflow_name, workflow_id)` chain lives on this same shard. That
+/// includes each continue-as-new successor, which
+/// [`ExecutionId::new_for_shard`] pins to its predecessor's shard. So for
+/// nearly all workflows, the owning shard of a `WorkflowId` target needs no
+/// directory lookup.
 ///
 /// # This is a placement *prediction*, not a location (issue #1146)
 ///
-/// For a `WorkflowId` target the returned shard answers "where would a fresh
-/// start of this business key be placed?" — **not** "where does this business
-/// key live?". The two differ whenever a workflow was started with an explicit
-/// pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`, issue #697),
-/// which can place it on a shard the pure hash never produces, and whenever a
-/// shard has been drained out of `writable_shards` since the workflow was
-/// placed, which moves where the same key re-hashes.
+/// For a `WorkflowId` target, the returned shard says where a fresh start of
+/// this business key would be placed. It does **not** say where this
+/// business key lives. The two differ in two cases. One is a start with an
+/// explicit pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`, issue #697),
+/// which can pick a shard the pure hash never produces. The other is a shard
+/// drained out of `writable_shards` after the placement, which moves where
+/// the same key re-hashes.
 ///
 /// Its remaining callers are `worker::reject_cross_shard_continue_as_new` and
 /// the deprecated [`ShardedDbPool::exact_pool_for_target`]. Both use it as a
@@ -983,20 +980,20 @@ impl ShardRouter {
 /// hashed shard may now proceed. A residency-pinned run (issue #697) whose key
 /// hashes elsewhere is no longer refused for that reason alone.
 ///
-/// To find where an existing business key actually **lives** — which is what a
-/// `workflow_id`-addressed signal/cancel delivery needs — use
+/// A `workflow_id`-addressed signal/cancel delivery needs to know where an
+/// existing business key actually **lives**. For that, use
 /// [`crate::external_target_location::resolve_location_by_workflow_id`],
 /// which observes every expected shard instead of predicting one. Delivery
 /// stopped using this function for that in issue #1146.
 ///
 /// Returns `None` only when `target` is a `WorkflowId` and the process-global
 /// shard router has not been initialized (a boot-window / non-plugin-embedder
-/// edge case). Both remaining callers treat that as "no divergence is knowable,
-/// so do not refuse", which is also correct by construction: a deployment
-/// without a router is single-shard, and a single shard cannot diverge from
-/// itself. The delivery paths no longer consult this function at all, so the
-/// pre-#1146 "assume same shard as the caller, attempt inline" fallback this
-/// paragraph used to describe no longer exists.
+/// edge case). Both remaining callers read that as "no divergence is
+/// knowable, so do not refuse". That is also correct by construction. A
+/// deployment without a router is single-shard, and a single shard cannot
+/// diverge from itself. The delivery paths no longer call this function. So
+/// the pre-#1146 "assume same shard as the caller, attempt inline" fallback
+/// no longer exists.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn external_target_owning_shard(target: &ExternalTarget) -> Option<ShardId> {
@@ -1254,7 +1251,7 @@ fn canonical_dsn_key(dsn: &str) -> String {
 
 /// Strips a Unix-socket path's harmless syntactic redundancy: a `.`
 /// component, and an empty component from a doubled or trailing `/`
-/// (Codex review, PR #1504). `/run/postgresql` and `/run/./postgresql`
+/// (PR #1504). `/run/postgresql` and `/run/./postgresql`
 /// name the identical socket directory on every POSIX filesystem, with
 /// no lookup needed to know that.
 ///
@@ -1629,8 +1626,8 @@ pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
 
 /// Install a `ShardRouter` into the global registry.
 ///
-/// This should only be called once during runtime initialization (e.g. by
-/// the `HarvestRunner` or `HarvestApiRuntime`) to avoid race conditions and
+/// Call this only once, during runtime initialization (e.g. by the
+/// `HarvestRunner` or `HarvestApiRuntime`). That avoids race conditions and
 /// overwrites from temporary constructors in tests.
 #[cfg(feature = "db")]
 pub fn install_global_router(router: ShardRouter) {
@@ -1642,13 +1639,13 @@ pub fn install_global_router(router: ShardRouter) {
 /// Install a `ShardedDbPool` into the global registry.
 ///
 /// `ShardedDbPool::single` and `from_map` already self-install at
-/// construction, so the global normally reflects whichever pool was built
-/// **last** — which is not necessarily the pool the runtime went on to select.
-/// A runtime that resolves a pool by precedence (see
-/// `runner::resolve_runtime_storage_pool`) must therefore re-install its
-/// choice, or every consumer of the global — the by-id fan-out, the inline
-/// gate, completion triggers, the timeout sweeps — reads a pool the runtime is
-/// not using (issue #1146 review).
+/// construction. So the global normally holds the pool built **last**. That
+/// is not always the pool the runtime then selects. A runtime that resolves
+/// a pool by precedence (see `runner::resolve_runtime_storage_pool`) must
+/// therefore re-install its choice. Otherwise every consumer of the global
+/// reads a pool the runtime is not using (issue #1146 review). The consumers
+/// are the by-id fan-out, the inline gate, completion triggers and the
+/// timeout sweeps.
 ///
 /// Same caveat as [`install_global_router`]: this is runtime-initialization
 /// API, not something to call from a temporary constructor.
@@ -1782,9 +1779,9 @@ impl ShardedDbPool {
     ///
     /// # Panics
     ///
-    /// Panics only if the pool was constructed by bypassing the public API
-    /// and the default shard entry has been removed; [`ShardedDbPool::single`]
-    /// and [`ShardedDbPool::from_map`] guarantee a default entry exists.
+    /// Panics only if the pool bypassed the public API at construction and
+    /// lost its default shard entry. [`ShardedDbPool::single`] and
+    /// [`ShardedDbPool::from_map`] guarantee a default entry exists.
     #[must_use]
     #[expect(clippy::expect_used, reason = "the constructors keep a default pool")]
     pub fn pool_for(&self, shard: ShardId) -> &DbPool {
@@ -1803,13 +1800,13 @@ impl ShardedDbPool {
     /// The shard an `ExecutionId` routes to, after any router-declared
     /// retired-shard forward (issue #964).
     ///
-    /// This is the **entry point** for an id, not necessarily where the run
-    /// currently lives: an execution rebalanced off a still-readable shard is
-    /// found by following the durable forwarding pointer on its sealed source
-    /// row, which needs a database and therefore lives in
+    /// This is the **entry point** for an id, not always where the run lives
+    /// now. An execution rebalanced off a still-readable shard is found through
+    /// the durable forwarding pointer on its sealed source row. That needs a
+    /// database, so it lives in
     /// [`crate::shard_rebalance::resolve_execution_shard`]. This function is the
-    /// synchronous part — the one that costs nothing on the hot path and is
-    /// correct for every execution that never moved.
+    /// synchronous part. It costs nothing on the hot path and is correct for
+    /// every execution that never moved.
     #[must_use]
     pub fn routed_shard_for_execution(&self, exec_id: ExecutionId) -> ShardId {
         let shard = exec_id.shard();
@@ -1817,11 +1814,11 @@ impl ShardedDbPool {
             return self.default_shard;
         }
         // Consult the router for a declared retired-shard forward ONLY. Nothing
-        // else about the router is applied here: an id whose shard the router
-        // does not forward must keep resolving byte-for-byte as it did before
-        // issue #964, including the cases where the pool map and the router's
-        // readable set legitimately disagree (mid a shard-add rollout, or in a
-        // test that installs a pool without a router).
+        // else about the router applies here. An id whose shard the router does
+        // not forward must resolve byte-for-byte as it did before issue #964.
+        // That holds also where the pool map and the router's readable set
+        // legitimately disagree. Examples are a shard-add rollout, or a test
+        // that installs a pool without a router.
         if let Ok(guard) = GLOBAL_SHARD_ROUTER.read()
             && let Some(successor) = guard.as_ref().and_then(|r| r.shard_forwards.get(&shard))
         {
@@ -1834,17 +1831,16 @@ impl ShardedDbPool {
     /// removed from every node, and its ids forwarded to a successor.
     ///
     /// A retired shard is not "a shard I happen to have no pool for right now".
-    /// The two look identical from the pool map and must not be treated alike:
-    /// a missing pool mid a shard-add rollout is a transient gap where the data
-    /// is very much still there, while a retired shard is one an operator has
-    /// asserted is gone. `ShardRouter::with_shard_forwards` refuses to declare a
-    /// forward for a shard that is still readable, which is what makes the
-    /// declaration mean something.
+    /// The two look identical from the pool map but must not be treated alike.
+    /// A missing pool mid a shard-add rollout is a transient gap, and the data
+    /// is still there. A retired shard is one an operator has asserted is gone.
+    /// `ShardRouter::with_shard_forwards` refuses a forward for a shard that is
+    /// still readable. That is what makes the declaration mean something.
     ///
-    /// The distinction matters wherever code must reach data on a shard rather
-    /// than merely route to it — cross-residence payload erasure above all,
-    /// which fails closed on an unreachable residence and would otherwise be
-    /// permanently unable to erase any run that ever lived on a retired shard.
+    /// The distinction matters wherever code must reach data on a shard, not
+    /// merely route to it. Cross-residence payload erasure matters most. It
+    /// fails closed on an unreachable residence. Without this check it could
+    /// never erase a run that ever lived on a retired shard.
     #[must_use]
     pub fn shard_is_retired(shard: ShardId) -> bool {
         GLOBAL_SHARD_ROUTER
@@ -1861,10 +1857,10 @@ impl ShardedDbPool {
     /// Build a multi-shard pool from `(shard, DSN)` pairs.
     ///
     /// The paved path for operator tooling that must reach several shard
-    /// databases directly rather than through the management API — `harvest
-    /// shard rebalance` (issue #964) is the first such command, and a rebalance
-    /// is inherently two-database. Lives here rather than in the CLI so the
-    /// pool's shape (and its `max_size`) stays a property of the engine.
+    /// databases directly, not through the management API. `harvest shard
+    /// rebalance` (issue #964) is the first such command, and a rebalance is
+    /// inherently two-database. It lives here, not in the CLI, so the pool's
+    /// shape (and its `max_size`) stays a property of the engine.
     ///
     /// # Errors
     ///
@@ -1944,13 +1940,13 @@ impl ShardedDbPool {
     ///
     /// # Deprecated (issue #1146)
     ///
-    /// Asking which *pool* holds a target is always a "where does this live?"
-    /// question, and for a `WorkflowId` target the rendezvous hash answers a
-    /// different one — "where would a fresh start go?" (see
-    /// [`external_target_owning_shard`]). A workflow pinned by an explicit
-    /// [`ShardPlacement`], or one left behind by a shard drained out of
-    /// `writable_shards`, resolves here to a pool it is not in, and the caller
-    /// concludes the target does not exist.
+    /// Which *pool* holds a target is always a "where does this live?"
+    /// question. For a `WorkflowId` target the rendezvous hash answers a
+    /// different one: "where would a fresh start go?" (see
+    /// [`external_target_owning_shard`]). Some workflows resolve here to a pool
+    /// they are not in. One is pinned by an explicit [`ShardPlacement`].
+    /// Another stayed behind on a shard drained out of `writable_shards`. The
+    /// caller then concludes the target does not exist.
     ///
     /// Use [`crate::external_target_location::resolve_location_by_workflow_id`]
     /// and then [`Self::exact_pool_for`] on the shard it reports. Retained,
@@ -2246,11 +2242,10 @@ mod tests {
 
     #[test]
     fn pick_for_idempotency_key_ignores_workflow_id_entirely() {
-        // Routing must depend only on (name, key), never on workflow_id: a
-        // same-key retry whose workflow_id was auto-generated per request must
-        // still land on the same shard. The method takes no workflow_id, so
-        // this is guaranteed by construction — assert two independent calls
-        // (as two separate requests would make) agree.
+        // Routing must depend only on (name, key), never on workflow_id. A
+        // same-key retry with a per-request workflow_id must land on the same
+        // shard. The method takes no workflow_id, so construction guarantees
+        // this. Assert that two independent calls, as two requests make, agree.
         let router = router_with(&[0, 1, 2, 3, 4]);
         let first = router.pick_for_idempotency_key("wf", "same-key");
         let second = router.pick_for_idempotency_key("wf", "same-key");
@@ -2376,9 +2371,9 @@ mod tests {
 
     #[test]
     fn explicit_shard_that_is_readable_but_drained_is_rejected() {
-        // A shard drained out of `writable_shards` is deliberately not
-        // accepting new work; pinning new work onto it must fail loud rather
-        // than contradict the operator's drain.
+        // A shard drained out of `writable_shards` deliberately accepts no new
+        // work. A pin of new work onto it must fail loud, not contradict the
+        // operator's drain.
         let router = ShardRouter::new(
             vec![ShardId::new(0), ShardId::new(1)],
             vec![ShardId::new(0)],
@@ -2406,12 +2401,13 @@ mod tests {
         );
     }
 
-    /// Codex P1 (issue #697 review): `ShardId::new` is an unbounded `const fn`,
-    /// but `ExecutionId::new_for_shard` masks the value to 16 bits. A pin to a
-    /// shard outside `0..=0xFFFE` would write the row to the requested pool
-    /// while every id-based lookup routed to the TRUNCATED shard, leaving the
-    /// workflow inaccessible or visible through the wrong database. Rejected
-    /// even when the router is (mis)configured to consider it readable+writable.
+    /// Issue #697: `ShardId::new` is an unbounded `const fn`, but
+    /// `ExecutionId::new_for_shard` masks the value to 16 bits. A pin to a
+    /// shard outside `0..=0xFFFE` would write the row to the requested pool.
+    /// Every id-based lookup would route to the TRUNCATED shard. The workflow
+    /// would be unreachable, or visible through the wrong database. It is
+    /// rejected even when the router is (mis)configured to call it
+    /// readable+writable.
     #[test]
     fn shard_outside_the_encodable_range_is_rejected_even_when_configured() {
         for raw in [0x1_0000, 0x1_0001, i32::MAX, -1, i32::MIN] {
@@ -2446,9 +2442,9 @@ mod tests {
 
         // Everything it REJECTS is unsafe to pin, for one of two reasons.
         //
-        // (a) The value does not fit in the two shard bytes, so
-        //     `ExecutionId::new_for_shard` silently truncates it (`& 0xFFFF`)
-        //     and the id reads back as a DIFFERENT shard -- the exact
+        // (a) The value does not fit in the two shard bytes. So
+        //     `ExecutionId::new_for_shard` silently truncates it (`& 0xFFFF`),
+        //     and the id reads back as a DIFFERENT shard. That is the exact
         //     cross-jurisdiction hazard the predicate exists to prevent.
         for raw in [-1, 0x1_0000, 0x1_0001] {
             let shard = ShardId::new(raw);
@@ -2460,11 +2456,11 @@ mod tests {
             );
         }
 
-        // (b) `0xFFFE + 1 == 0xFFFF` DOES round-trip byte-for-byte -- it is not
-        //     truncated -- but it is `ShardId::UNENCODED`, the reserved "no
-        //     shard encoded, fall back to the default shard" sentinel. Pinning
-        //     to it would mint ids the router resolves to the DEFAULT shard,
-        //     so it is rejected for a different reason than (a).
+        // (b) `0xFFFE + 1 == 0xFFFF` DOES round-trip byte-for-byte, untruncated.
+        //     But it is `ShardId::UNENCODED`, the reserved "no shard encoded,
+        //     fall back to the default shard" sentinel. A pin to it would mint
+        //     ids the router resolves to the DEFAULT shard. So it is rejected
+        //     for a different reason than (a).
         let sentinel = ShardId::new(0xFFFF);
         assert!(sentinel.is_unencoded());
         assert!(
@@ -2478,11 +2474,11 @@ mod tests {
         );
     }
 
-    /// Codex P1 (issue #697 review): two RAW keys that normalize to the same
-    /// trimmed key with CONFLICTING shards would silently discard one mapping,
-    /// and from an unordered source which one survives could vary across
-    /// restarts — breaking the stable-mapping guarantee that is the whole point
-    /// of a declared map, and potentially moving work between jurisdictions.
+    /// Issue #697: two RAW keys that normalize to the same trimmed key with
+    /// CONFLICTING shards would silently discard one mapping. From an unordered
+    /// source, the survivor could vary across restarts. That breaks the stable
+    /// mapping that is the point of a declared map. It can also move work
+    /// between jurisdictions.
     #[test]
     #[should_panic(expected = "declared more than once")]
     fn conflicting_residency_keys_that_collide_after_trimming_panic() {
@@ -2958,7 +2954,7 @@ mod tests {
 
     // A Unix-socket path's `.` component and doubled `/` are harmless
     // syntactic redundancy the OS ignores. `/run/postgresql` and
-    // `/run/./postgresql` name the same socket (Codex review, PR #1504).
+    // `/run/./postgresql` name the same socket (PR #1504).
     #[cfg(feature = "db")]
     #[test]
     fn from_dsns_groups_shards_sharing_one_socket_path_written_differently() {
@@ -3346,7 +3342,7 @@ mod tests {
         );
     }
 
-    // A Codex review finding on this fix: `pg_split_opts` tests
+    // PR #1504: `pg_split_opts` tests
     // whitespace with `isspace()`, a byte-at-a-time ASCII test, not
     // Unicode's `White_Space` property. A no-break space (U+00A0) is
     // whitespace to Rust's `char::is_whitespace` but not to `PostgreSQL`,
@@ -3872,12 +3868,12 @@ mod tests {
 
 /// Where a **child** workflow should be placed (issue #956).
 ///
-/// Children are pinned to the parent's shard by default and that default is
-/// permanent: [`ChildPlacement::ParentShard`] is byte-for-byte today's
-/// behaviour, resolves without consulting the router at all, and is what every
-/// existing `spawn_child_workflow*` call gets. The other variants are an
-/// **opt-in, per-spawn** policy for the child-heavy orchestrator workloads that
-/// otherwise concentrate a whole fan-out's storage and dispatch load on one
+/// Children are pinned to the parent's shard by default, and that default is
+/// permanent. [`ChildPlacement::ParentShard`] is byte-for-byte today's
+/// behaviour. It resolves without the router, and every existing
+/// `spawn_child_workflow*` call gets it. The other variants are an **opt-in,
+/// per-spawn** policy for child-heavy orchestrator workloads. Without it,
+/// such a workload puts a whole fan-out's storage and dispatch load on one
 /// database.
 ///
 /// # Choosing a variant
@@ -3915,9 +3911,9 @@ pub enum ChildPlacement {
     ParentShard,
     /// Spread children across `writable_shards` by rendezvous hash.
     ///
-    /// Uses the same [`ShardRouter::pick_for_new_workflow`] a top-level start
-    /// uses, keyed on a deterministic per-parent placement key (see
-    /// [`child_placement_key`]) so a decision cycle retried after a crash
+    /// Uses the same [`ShardRouter::pick_for_new_workflow`] as a top-level
+    /// start. The key is a deterministic per-parent placement key (see
+    /// [`child_placement_key`]). So a decision cycle retried after a crash
     /// re-derives the identical shard.
     Distributed,
     /// Pin the child to a concrete shard.
@@ -3945,8 +3941,8 @@ impl ChildPlacement {
 
 /// The deterministic rendezvous key for the `seq`-th child of `parent`.
 ///
-/// Restart stability is the whole point: a top-level start hashes a caller-
-/// supplied `workflow_id`, which is stable by construction, but a child's
+/// Restart stability is the whole point. A top-level start hashes a
+/// caller-supplied `workflow_id`, which is stable by construction. A child's
 /// `ExecutionId` is minted fresh on every dispatch. Hashing the *minted id*
 /// would re-roll the shard whenever a decision cycle is retried after a crash.
 /// Hashing `(parent, seq)` instead re-derives the identical shard, giving
@@ -3969,9 +3965,9 @@ pub fn child_placement_key(parent: ExecutionId, seq: u32) -> String {
 ///
 /// Pure: the router is passed in rather than read from
 /// [`GLOBAL_SHARD_ROUTER`], so every branch is unit-testable without a process
-/// global. [`ChildPlacement::ParentShard`] short-circuits before `router` is
-/// even inspected, which is why `router` is an `Option` — the default path must
-/// work in a deployment that never installs one.
+/// global. [`ChildPlacement::ParentShard`] returns before it reads `router`.
+/// That is why `router` is an `Option`: the default path must work in a
+/// deployment that never installs one.
 ///
 /// # Where a *drained* shard is rejected — and why not here
 ///
@@ -3983,23 +3979,22 @@ pub fn child_placement_key(parent: ExecutionId, seq: u32) -> String {
 /// A shard that is merely **drained** (readable but out of `writable_shards`)
 /// is a *transient* operational state, and it is deliberately **not** rejected
 /// here. This function runs inside the workflow handler, and the handler ABI
-/// erases the error type — a workflow's `?` turns any `HarvestError` into a
+/// erases the error type. A workflow's `?` turns any `HarvestError` into a
 /// `String`, which the executor maps to a terminal `WorkflowOutcome::Failed`.
-/// The worker's typed `ShardUnavailable` recovery would never see it, so
-/// rejecting a drain here would *permanently* fail every workflow that spawned a
-/// placed child during a maintenance window — the opposite of the documented
-/// bounded retry.
+/// The worker's typed `ShardUnavailable` recovery would never see it. So a
+/// drain rejected here would *permanently* fail every workflow that spawned a
+/// placed child during a maintenance window. That is the opposite of the
+/// documented bounded retry.
 ///
-/// Writability is therefore enforced one layer down, by
-/// `cross_shard_child::preflight_target_shard`, which runs inside the parent's
-/// **persist** transaction where `ShardUnavailable` is recognised and requeued
-/// with a bounded backoff. Nothing is recorded in the meantime: the resolved id
-/// only reaches history if that persist succeeds, and the persist is exactly
-/// what rejects it.
+/// So one layer down, `cross_shard_child::preflight_target_shard` enforces
+/// writability. It runs inside the parent's **persist** transaction. There,
+/// `ShardUnavailable` is recognised and requeued with a bounded backoff.
+/// Nothing is recorded in the meantime. The resolved id reaches history only
+/// if that persist succeeds, and the persist is exactly what rejects it.
 ///
-/// This is not a fallback. The shard this returns is the shard the caller asked
-/// for (or the rendezvous pick); it is never quietly swapped for the parent's
-/// shard or the default shard, which is the failure mode AC8 exists to remove.
+/// This is not a fallback. This returns the shard the caller asked for, or
+/// the rendezvous pick. It never quietly swaps in the parent's shard or the
+/// default shard. AC8 exists to remove that failure mode.
 ///
 /// # Errors
 ///
@@ -4033,13 +4028,13 @@ pub fn resolve_child_placement(
             //
             // Allowed, because the alternatives are worse. Failing the spawn
             // would be terminal (the handler ABI erases the error type — see the
-            // note above). Requeuing it would *deadlock the drain itself*: a
-            // drained shard is one that should let its in-flight work finish,
-            // and a parent cannot finish while the children it is awaiting are
-            // refused. And "the parent's shard" is not an arbitrary consolation
-            // prize here — with zero writable shards it is where an *unplaced*
-            // child would go, and where the parent already lives, so no
-            // cross-shard placement contract is broken: none was made.
+            // note above). Requeuing it would *deadlock the drain itself*. A
+            // drained shard should let its in-flight work finish. A parent
+            // cannot finish while the children it awaits are refused. And "the
+            // parent's shard" is not an arbitrary consolation prize here. With
+            // zero writable shards, an *unplaced* child would go there, and the
+            // parent already lives there. So no cross-shard placement contract
+            // is broken: none was made.
             //
             // MUST be `parent_shard`, never `default_shard()` (issue #1263 item
             // 15). The two coincide only when the parent happens to already live
@@ -4055,7 +4050,7 @@ pub fn resolve_child_placement(
             //
             // Traced, because AC8's requirement is that a fallback never happens
             // "without trace". A `warn!` naming the workflow and the shard is
-            // that trace; the operator draining the fleet can see exactly which
+            // that trace. The operator who drains the fleet sees exactly which
             // placed spawns degenerated while the window was open.
             if router.writable_shards().is_empty() {
                 tracing::warn!(
@@ -4075,9 +4070,9 @@ pub fn resolve_child_placement(
     match router.resolve_placement(&requested, workflow_name, placement_key) {
         Ok(shard) => Ok(shard),
         // A drained shard is a *transient* operational state — a rebalance, a
-        // maintenance window. Resolve it to the shard the caller named and let
-        // the persist-boundary preflight reject it retryably; see this
-        // function's "Where a drained shard is rejected" note. Everything else
+        // maintenance window. Resolve it to the shard the caller named. The
+        // persist-boundary preflight then rejects it retryably (see this
+        // function's "Where a drained shard is rejected" note). Everything else
         // is static misconfiguration and stays a terminal `Config` error.
         Err(ShardPlacementError::ShardNotWritable { requested, .. }) => Ok(requested),
         Err(other) => Err(crate::error::HarvestError::Config(other.to_string())),
@@ -4087,9 +4082,9 @@ pub fn resolve_child_placement(
 /// Lifecycle status of one cross-shard child outbox row (issue #956).
 ///
 /// Persisted as the row's `status` TEXT column. Deliberately a two-state
-/// machine: everything after `Started` is decided by *observed* facts (the
-/// child's state on the target shard, the parent's state here), never by a
-/// status the relay has to remember to advance.
+/// machine. *Observed* facts decide everything after `Started`: the child's
+/// state on the target shard and the parent's state here. No status that the
+/// relay must remember to advance decides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrossShardChildStatus {
     /// The parent committed the spawn; the child does not exist on the target
@@ -4136,16 +4131,16 @@ pub struct CrossShardChildObservation<'a> {
     /// when this sweep could not read it.
     ///
     /// The three-state shape is load-bearing. A failed batch read must NOT be
-    /// collapsed into "terminal": `Retire` deletes the row outright, with no
-    /// second look at the parent, so one transient read error would permanently
-    /// lose the wake of every awaited cross-shard child in the batch — and would
-    /// cascade-cancel detached children whose parents are alive and well.
-    /// `None` means "not known to be closed", and no destructive action is
-    /// decided from it.
+    /// collapsed into "terminal". `Retire` deletes the row outright, with no
+    /// second look at the parent. So one transient read error would
+    /// permanently lose the wake of every awaited cross-shard child in the
+    /// batch. It would also cascade-cancel detached children whose parents are
+    /// alive and well. `None` means "not known to be closed", and no
+    /// destructive action is decided from it.
     ///
-    /// A `Some(true)` from a *successful* read whose result simply lacks the
-    /// parent's id is correct: the row is genuinely gone (retention collection,
-    /// erase), and there is nobody left to wake.
+    /// A *successful* read whose result lacks the parent's id gives
+    /// `Some(true)`, and that is correct. The row is genuinely gone (retention
+    /// collection, erase), and there is nobody left to wake.
     pub parent_terminal: Option<bool>,
     /// The child's `state` column on the target shard, or `None` when the child
     /// row is not visible yet (not created, or the shard was unreadable).
@@ -4176,14 +4171,14 @@ pub enum CrossShardChildAction {
 /// Factored out of the scanner so every branch is exhaustively unit-testable
 /// with no database. The ordering is load-bearing:
 ///
-/// 1. A row that has not started yet always starts first — a cancel or a closed
-///    parent still needs a child row to act on, and the parent's history already
+/// 1. A row that has not started yet always starts first. A cancel or a closed
+///    parent still needs a child row to act on. The parent's history already
 ///    records `ChildWorkflowStarted`.
 /// 2. A pending cancel beats everything else, so a race-loser or over-deadline
 ///    child stops burning work at the first opportunity.
-/// 3. A terminal child beats a closed parent: delivery re-checks the parent
-///    under `FOR UPDATE` and degrades to a plain row-delete when it has sealed,
-///    whereas retiring first would drop a wake the parent could still consume.
+/// 3. A terminal child beats a closed parent. Delivery re-checks the parent
+///    under `FOR UPDATE` and degrades to a plain row-delete when it has
+///    sealed. Retiring first would drop a wake the parent could still consume.
 /// 4. An **unknown** parent (`parent_terminal: None` — this sweep could not read
 ///    it) decides nothing destructive. Only `Some(true)` retires or cascades.
 #[must_use]
@@ -4211,9 +4206,9 @@ pub fn next_cross_shard_child_action(
                 // outlive a cancelled or terminated parent. Nobody is left to
                 // wake, so stop tracking it rather than polling forever.
                 //
-                // `Some(true)` and not a bare truthiness check: an unread parent
-                // must never reach this arm, because retiring here is
-                // irreversible and silently drops the child's terminal wake.
+                // `Some(true)`, not a bare truthiness check. An unread parent
+                // must never reach this arm. Retiring here is irreversible and
+                // silently drops the child's terminal wake.
                 CrossShardChildAction::Retire
             } else {
                 CrossShardChildAction::Wait
@@ -4224,9 +4219,9 @@ pub fn next_cross_shard_child_action(
         |policy| {
             // `Abandon` is owed nothing at all once the child exists: no terminal
             // to deliver, and by definition no cascade. Retiring immediately
-            // matters at scale — an abandoned child may be long-lived or never
-            // terminate, and keeping its row would grow the table and the poll
-            // set without bound across repeated detached fan-outs. The row's job
+            // matters at scale. An abandoned child may be long-lived or never
+            // terminate. Its kept row would grow the table and the poll set
+            // without bound across repeated detached fan-outs. The row's job
             // (getting the child created on the target shard) is done.
             if policy == ParentClosePolicy::Abandon || child_terminal {
                 CrossShardChildAction::Retire
@@ -4244,9 +4239,9 @@ pub fn next_cross_shard_child_action(
 /// Is `state` one of the engine's terminal execution states?
 ///
 /// Delegates to [`crate::erase::is_terminal_state`] rather than restating the
-/// list. A local copy had already drifted — it omitted `CONTINUED_AS_NEW`, so a
-/// child sealing that way would have been polled as non-terminal forever, the
-/// parent parked forever and the outbox row leaked. `erase` carries no
+/// list. A local copy had already drifted: it omitted `CONTINUED_AS_NEW`. A
+/// child that sealed that way would have been polled as non-terminal forever.
+/// The parent would park forever and the outbox row would leak. `erase` carries no
 /// `db`-feature gate, so there is no reason to keep a second list.
 fn is_terminal_execution_state(state: &str) -> bool {
     crate::erase::is_terminal_state(state)

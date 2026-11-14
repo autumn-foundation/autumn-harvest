@@ -5,19 +5,20 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::ext::IdentExt as _;
 
-/// Compile-time validator for the runtime `task_duration()` string format
-/// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
-/// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
-/// trailing garbage. Mirrors (but does not call) the runtime parser in
-/// `autumn-harvest/src/lib.rs::task_duration` so an invalid duration string
-/// is rejected at compile time rather than silently accepted by the macro
-/// and failing only when the workflow/DAG actually starts.
+/// Compile-time validator for the runtime `task_duration()` string format.
 ///
-/// Shared by every attribute-macro argument parser that accepts a duration
-/// string (`#[workflow(...)]`'s `start_to_close`/`heartbeat_timeout`/
-/// `schedule_to_start`/`execution_timeout`, `#[dag(...)]`'s
-/// `execution_timeout`/`sla`, ...) so the validation rule lives in exactly
-/// one place.
+/// Valid strings are `"30s"`, `"5m"`, `"1h"`, `"1h30m"` and similar. Each part
+/// is digits followed by one of `s`/`m`/`h`/`d`, optionally space-separated.
+/// No overflow and no trailing garbage is allowed. This mirrors, but does not
+/// call, the runtime parser in `autumn-harvest/src/lib.rs::task_duration`.
+/// So the macro rejects an invalid duration string at compile time. Otherwise
+/// it would fail only when the workflow or DAG starts.
+///
+/// Every attribute-macro argument parser that accepts a duration string uses
+/// it, so the validation rule lives in exactly one place. Examples are
+/// `#[workflow(...)]`'s `start_to_close`/`heartbeat_timeout`/
+/// `schedule_to_start`/`execution_timeout` and `#[dag(...)]`'s
+/// `execution_timeout`/`sla`.
 pub fn is_valid_task_duration(s: &str) -> bool {
     task_duration_secs(s).is_some_and(|secs| secs != 0)
 }

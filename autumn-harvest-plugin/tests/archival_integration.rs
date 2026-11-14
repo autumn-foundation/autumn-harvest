@@ -1,7 +1,7 @@
-// The registered `#[workflow]` fixture below has underscore-prefixed params
-// that the macro-generated dispatch shim uses, and no `.await` in its body —
-// matching the allow convention in the sibling workflow-defining test files
-// (mcp_tools_http_tests, webhook_receiver_http_tests).
+// The `#[workflow]` fixture below has underscore-prefixed params that the
+// generated dispatch shim uses, and no `.await` in its body. The allow
+// matches the sibling workflow test files (mcp_tools_http_tests,
+// webhook_receiver_http_tests).
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 use std::sync::Arc;
@@ -290,7 +290,6 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
         assert_eq!(guard[0].workflow_name, "retention_fixture");
     }
 
-    // Clear calls for next run.
     calls.lock().unwrap().clear();
 
     // Now insert a second workflow execution.
@@ -303,7 +302,6 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
     )
     .await;
 
-    // Set archiver to fail.
     should_fail.store(true, Ordering::SeqCst);
 
     // 2. Run retention again. The archiver should return an error, and the execution must NOT be deleted.
@@ -323,14 +321,13 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
     runner.stop().await;
 }
 
-/// Issue #737 (AC7, second clause): the #345 archival hook must still fire for
-/// every deleted row regardless of which retention policy selected it — in
-/// particular a row deleted because of a *per-workflow-type override* (not the
-/// global `max_age`). Global is 30 days; the `retention_fixture` type is
-/// overridden to 7 days; the seeded row completed 10 days ago. Without the
-/// override 10 days < 30-day global would keep it, so its deletion is
-/// attributable solely to the override — and the archiver must have been
-/// invoked with that row before it was deleted.
+/// Issue #737 (AC7, second clause): the #345 archival hook must fire for
+/// every deleted row, whatever retention policy selected it. This test
+/// covers a row deleted by a *per-workflow-type override*, not the
+/// global `max_age`. Global is 30 days; the `retention_fixture` type is
+/// overridden to 7 days; the seeded row completed 10 days ago. The 30-day
+/// global alone keeps it, so only the override deletes it. The archiver
+/// must receive that row before the delete.
 #[tokio::test]
 #[allow(clippy::significant_drop_tightening)]
 async fn archival_hook_fires_for_override_deleted_row() {
@@ -531,7 +528,6 @@ async fn archival_hook_times_out_and_preserves_execution() {
     api_state.set_admin_auth_boundary(true);
     let app = harvest_api_router(api_state);
 
-    // Trigger retention
     let (run_now_status, run_now_json) =
         post_json(&app, "/admin/retention/run-now", json!({})).await;
     assert_eq!(run_now_status, StatusCode::OK);
@@ -720,16 +716,13 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
     runner.stop().await;
 }
 
-/// Issue #921 review (Codex P2, follow-up): a `harvest_completion_deliveries`
-/// row that resolves to `DELIVERED` *after* its owning execution has already
-/// been collected by an earlier retention pass would otherwise never be
-/// revisited -- retention only ever iterates over still-live executions, so
-/// an orphaned `DELIVERED` row (its `workflow_exec_id` naming no execution
-/// at all) would carry its frozen result/error PII with no retention bound.
-/// A dedicated per-tick reclaim step deletes exactly these orphaned
-/// `DELIVERED` rows; a still-open orphaned `FAILED` row (awaiting redrive)
-/// and a `DELIVERED` row whose owner is a live, non-candidate execution must
-/// both survive untouched.
+/// Issue #921: a `harvest_completion_deliveries` row can resolve to
+/// `DELIVERED` *after* retention collected its execution. Retention iterates
+/// only live executions, so it never revisits that orphaned row. The row
+/// would then keep its frozen result/error PII with no retention bound.
+/// A per-tick reclaim step deletes exactly these orphaned `DELIVERED` rows.
+/// An open orphaned `FAILED` row (awaiting redrive) must survive. So must a
+/// `DELIVERED` row whose owner is a live, non-candidate execution.
 fn orphan_reclaim_delivery_fixture(
     id: uuid::Uuid,
     workflow_exec_id: uuid::Uuid,

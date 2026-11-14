@@ -10,16 +10,15 @@
 //!   queue. `BUSYGROUP` errors are tolerated so multiple workers racing to
 //!   create the group on cold-start do not break startup.
 //! - **At-least-once delivery**: XACK is only called from `complete`, `fail`,
-//!   and `requeue_for_retry`. If a worker crashes mid-execution the entry
-//!   stays on the consumer group's pending entries list (PEL) and becomes
-//!   eligible for [`RedisTaskQueue::recover_pending`] reclamation after the
-//!   visibility timeout elapses.
+//!   and `requeue_for_retry`. If a worker crashes mid-execution, the entry
+//!   stays on the consumer group's pending entries list (PEL). After the
+//!   visibility timeout, [`RedisTaskQueue::recover_pending`] can reclaim it.
 //! - **Delayed scheduling**: tasks whose `scheduled_at > NOW` are not added to
-//!   the stream directly. Instead the stable `task_id` is added to a per-queue
-//!   sorted set (`{prefix}:scheduled:{name}`) with score = unix milliseconds,
-//!   and the envelope payload is stored alongside in a hash
-//!   (`{prefix}:scheduled:{name}:payloads`). A periodic [`RedisTaskQueue::promote_due`] call
-//!   moves due entries onto the stream atomically via a small Lua script.
+//!   the stream directly. Their stable `task_id` goes into a per-queue sorted
+//!   set (`{prefix}:scheduled:{name}`), scored in unix milliseconds. The
+//!   envelope payload goes into a hash (`{prefix}:scheduled:{name}:payloads`).
+//!   A periodic [`RedisTaskQueue::promote_due`] call moves due entries onto the
+//!   stream atomically with a small Lua script.
 //! - **Visibility timeout**: enforced by [`RedisTaskQueue::recover_pending`],
 //!   which calls XPENDING on each queue and XCLAIMs entries that have been
 //!   idle longer than the configured threshold. Workers should run this on a
@@ -236,9 +235,9 @@ impl RedisTaskQueue {
     ///
     /// Returns [`RedisAdapterError::Redis`] on any Redis-side failure.
     pub async fn promote_due(&self, queue_name: &str) -> RedisAdapterResult<usize> {
-        // Ensure the consumer group exists before the Lua script XADDs entries
-        // -- otherwise the group would be created against an empty stream
-        // *after* the new entries land, leaving them below its read position.
+        // Ensure the consumer group exists before the Lua script XADDs entries.
+        // A group created after the entries land starts above them, so it
+        // never reads them.
         self.ensure_group(queue_name).await?;
         let now_ms = Utc::now().timestamp_millis();
         let mut conn = self.conn.clone();
@@ -269,11 +268,10 @@ impl RedisTaskQueue {
     /// Reclaim entries that have been idle in the consumer group's PEL longer
     /// than `visibility_timeout`.
     ///
-    /// Returns the number of entries reclaimed across all queues. Reclaimed
-    /// entries are `XCLAIM`ed to a sentinel consumer name (`__recovered__`)
-    /// so their payload becomes readable, then re-XADDed as fresh stream
-    /// entries -- this is the only way to make work in the consumer group's
-    /// PEL deliverable again to a peer through `XREADGROUP >`.
+    /// Returns the number of entries reclaimed across all queues. Each entry
+    /// is `XCLAIM`ed to a sentinel consumer (`__recovered__`) to read its
+    /// payload, then re-XADDed as a fresh stream entry. Only that makes PEL
+    /// work deliverable again to a peer through `XREADGROUP >`.
     ///
     /// Workers should call this on a timer slower than `visibility_timeout`
     /// to bound the worst-case redelivery latency for crashed peers.
@@ -320,11 +318,10 @@ impl RedisTaskQueue {
             return Ok(0);
         }
 
-        // XCLAIM transfers the entries to a sentinel recovery consumer so we
-        // can read their payloads. We then re-enqueue each payload as a brand
-        // new stream entry and XACK+XDEL the originals -- this is the only
-        // way to make the work deliverable again via `XREADGROUP >`, which
-        // explicitly excludes PEL entries.
+        // XCLAIM moves the entries to a sentinel consumer to read their
+        // payloads. Each payload is then re-enqueued as a new stream entry, and
+        // the original gets XACK+XDEL. `XREADGROUP >` excludes PEL entries, so
+        // no other path makes the work deliverable again.
         let claimed: StreamClaimReply = conn
             .xclaim(
                 &key,
@@ -449,12 +446,9 @@ impl RedisTaskQueue {
         worker_id: &str,
     ) -> RedisAdapterResult<Option<ClaimedTask>> {
         for queue in queues {
-            // Make sure any due delayed tasks are on the stream before we ask
-            // for them. `promote_due` itself calls `ensure_group` first. It
-            // must, so the group exists before its Lua script's XADDs land.
-            // A second `ensure_group` call here would be a redundant round
-            // trip to Redis on every single claim attempt. The consumer group
-            // is idempotently ensured exactly once, in the call below.
+            // Put due delayed tasks on the stream before the read.
+            // `promote_due` already calls `ensure_group` before its Lua XADDs,
+            // so a second call here would add one Redis round trip per claim.
             let _ = self.promote_due(queue).await?;
 
             let mut conn = self.conn.clone();
@@ -615,10 +609,9 @@ pub fn is_busygroup(err: &RedisError) -> bool {
 /// - `KEYS[3]`: the per-queue claimable stream.
 /// - `ARGV[1]`: current timestamp in unix milliseconds.
 ///
-/// Behavior: drains every member of the sorted set whose score is `<=` the
-/// supplied timestamp, looks the matching payload up in the hash, XADDs it to
-/// the stream, and removes both index entries. Returns the number of members
-/// promoted.
+/// Behavior: for each sorted-set member with a score `<=` the timestamp, the
+/// script XADDs its payload from the hash to the stream. It then removes both
+/// index entries. Returns the number of members promoted.
 pub const PROMOTE_LUA: &str = r"
 local zset = KEYS[1]
 local payloads = KEYS[2]

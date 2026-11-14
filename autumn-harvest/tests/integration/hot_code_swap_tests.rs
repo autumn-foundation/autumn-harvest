@@ -6,25 +6,24 @@
 //!
 //! The suite is organised by the deliverable it evidences:
 //!
-//! * **ABI + verification** — the decide-loop wire format, content addressing,
-//!   and the checksum/signature gate a worker applies before it will load
-//!   bytes a registry handed it (AC2's "verify" step).
-//! * **Registry** — load / get / unload, the duplicate-registration rejection
-//!   that keeps two modules from claiming one workflow name outside build-id
-//!   governance (AC5), and the unload-with-live-holder hazard (AC5).
+//! * **ABI + verification** — the decide-loop wire format and content
+//!   addressing. Also the checksum/signature gate a worker applies before it
+//!   loads bytes from a registry (AC2's "verify" step).
+//! * **Registry** — load / get / unload. The duplicate-registration rejection
+//!   keeps two modules from claiming one workflow name outside build-id
+//!   governance (AC5). Also the unload-with-live-holder hazard (AC5).
 //! * **Trampoline** — a WASM-hosted workflow driven to completion through the
-//!   ordinary `WorkflowHandlerFn` seam, including the routing rule that a
-//!   module is chosen by the *execution's* assigned build, never by the
-//!   worker's own `ctx.build_id()`.
+//!   ordinary `WorkflowHandlerFn` seam. The *execution's* assigned build
+//!   chooses the module, never the worker's own `ctx.build_id()`.
 //! * **Replay fidelity** — the AC4 proof: a module-hosted history is
 //!   byte-identical to the statically-linked one, and each replays clean under
 //!   the other's hosting.
 //! * **Safety bounds** — step cap, fuel/epoch bound, trap containment.
 //! * **Registry storage + hot swap** (DB) — publish/fetch/verify/sync against
-//!   Postgres, then the AC3 end-to-end demonstration: v2 published under a new
-//!   build id with no restart, `set_build_ramp` moving new starts onto it while
-//!   a v1-assigned in-flight execution stays on v1, and `clear_build_ramp`
-//!   rolling back.
+//!   Postgres, then the AC3 end-to-end demonstration. v2 is published under a
+//!   new build id with no restart. `set_build_ramp` moves new starts onto it,
+//!   while a v1-assigned in-flight execution stays on v1. `clear_build_ramp`
+//!   rolls back.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -167,8 +166,8 @@ fn pipeline_v2_bytes() -> Vec<u8> {
 /// The statically-linked twin of `pipeline_v1.wat`.
 ///
 /// Same command stream, same queue, same terminal output. The AC4 proof rests
-/// on this being *logically* the same workflow hosted a different way — so the
-/// histories must be byte-identical and each must replay clean under the
+/// on this being *logically* the same workflow, hosted a different way. So the
+/// histories must be byte-identical, and each must replay clean under the
 /// other's hosting.
 fn native_pipeline_v1(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
     Box::pin(async move {
@@ -194,9 +193,11 @@ fn native_pipeline_v2(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
     })
 }
 
-/// A frozen clock anchor, so two independent runs of the same logic produce the
-/// same `WorkflowStarted` timestamp and the byte-identity comparison below is
-/// comparing the code's behaviour rather than the wall clock.
+/// A frozen clock anchor for the byte-identity comparisons.
+///
+/// Two independent runs of the same logic then produce the same
+/// `WorkflowStarted` timestamp. So the comparison checks the code, not the
+/// wall clock.
 fn anchor() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-07-08T00:00:00Z")
         .expect("valid anchor")
@@ -207,10 +208,9 @@ fn env() -> WorkflowTestEnv {
     WorkflowTestEnv::new()
         .with_workflow_name("pipeline")
         // A real queue name, because the trampoline refuses to schedule onto
-        // the empty one: no worker polls it, so the activity would sit until
-        // schedule-to-start expired instead of failing fast. The harness
-        // defaults `ctx.queue_name()` to `""`, which is only ever a test
-        // artefact.
+        // the empty one. No worker polls it, so the activity would sit until
+        // schedule-to-start expired. The harness defaults `ctx.queue_name()`
+        // to `""`, which is only ever a test artefact.
         .with_queue_name("default")
         .with_frozen_anchor(anchor())
         .mock_activity("charge", |_| Ok(json!({"ok": true})))
@@ -249,12 +249,12 @@ fn decide_request_serialises_step_first_so_a_wat_guest_can_read_it() {
         }],
     };
     // Deliberately the HOST's own encoder, not a local `serde_json::to_vec`.
-    // An earlier cut of this guard serialised the struct directly while the host
-    // handed the guest a `serde_json::Value` round trip — whose object is a
-    // `BTreeMap`, so the real bytes reached the guest alphabetically ordered
-    // (`abi_version` first) and every guest read a step of `'r' - '0'`. The
-    // guard passed and every guest silently completed at step 0. Asserting on
-    // `encode_decide_request` is what makes this test non-vacuous.
+    // An earlier cut of this guard serialised the struct directly. The host
+    // handed the guest a `serde_json::Value` round trip, whose object is a
+    // `BTreeMap`. So the real bytes reached the guest alphabetically ordered
+    // (`abi_version` first), and every guest read a step of `'r' - '0'`. The
+    // guard passed, and every guest silently completed at step 0. Asserting on
+    // `encode_decide_request` makes this test non-vacuous.
     let bytes = encode_decide_request(&request).expect("serialise");
     assert_eq!(
         &bytes[..9],
@@ -449,12 +449,11 @@ fn verification_accepts_a_good_signature() {
 
 #[test]
 fn a_signed_module_cannot_be_rebound_under_another_build_id() {
-    // The downgrade attack the binding signature exists to stop. An attacker
-    // with INSERT on the registry — but no key — copies a legitimately signed
-    // row and re-publishes those exact bytes, with that exact signature, under
-    // whichever build id the ramp currently points at. Signing the content hash
-    // alone would let this through: the bytes really were approved, just not
-    // *as this build*.
+    // The binding signature stops this downgrade attack. An attacker has
+    // INSERT on the registry but no key. They copy a legitimately signed row.
+    // They re-publish its exact bytes and signature under the build id the
+    // ramp points at. A signature over the content hash alone lets this
+    // through: the bytes were approved, but not *as this build*.
     let bytes = pipeline_v1_bytes();
     let hash = compute_module_hash(&bytes);
     let legitimate = sign("wf-v1", "pipeline", &bytes);
@@ -493,9 +492,9 @@ fn a_signed_module_cannot_be_rebound_under_another_workflow_name() {
 
 #[test]
 fn a_signature_is_ignored_when_no_key_is_configured() {
-    // A deployment that has not configured a signing key is not made *less*
-    // safe by a module carrying a signature it cannot check: content addressing
-    // still applies, the signature is simply not load-bearing.
+    // A module with a signature does not make a deployment with no signing key
+    // *less* safe. Content addressing still applies. The signature is simply
+    // not load-bearing.
     let bytes = pipeline_v1_bytes();
     let hash = compute_module_hash(&bytes);
     let signature = sign("wf-v1", "pipeline", &bytes);
@@ -512,9 +511,9 @@ fn a_signature_is_ignored_when_no_key_is_configured() {
 
 #[test]
 fn an_uppercase_hex_signature_is_the_same_signature() {
-    // Operational foot-gun, not a vulnerability: hex case carries no meaning,
-    // so a tag that round-tripped through something that upcased it must still
-    // verify rather than reading as a forgery.
+    // Operational foot-gun, not a vulnerability. Hex case carries no meaning.
+    // So a tag that something upcased must still verify, not read as a
+    // forgery.
     let bytes = pipeline_v1_bytes();
     let hash = compute_module_hash(&bytes);
     let signature = sign("wf-v1", "pipeline", &bytes).to_uppercase();
@@ -642,10 +641,10 @@ fn republishing_identical_bytes_under_one_build_id_is_idempotent() {
 
 #[test]
 fn unloading_a_build_drops_its_modules_but_not_a_live_holder() {
-    // AC5's unload hazard. In the WASM hosting the answer is structural: a
-    // caller that already resolved the module holds an `Arc`, so unload
-    // removes the *binding* while the code stays alive for the in-flight
-    // invocation. (The dylib answer is a use-after-free; see the report.)
+    // AC5's unload hazard. In the WASM hosting the answer is structural. A
+    // caller that already resolved the module holds an `Arc`. So unload removes
+    // the *binding*, and the code stays alive for the in-flight invocation.
+    // The dylib answer is a use-after-free; see the report.
     let registry = registry_with(&[
         ("wf-v1", "pipeline", pipeline_v1_bytes()),
         ("wf-v2", "pipeline", pipeline_v2_bytes()),
@@ -881,10 +880,10 @@ async fn the_v2_module_runs_the_extra_step() {
 #[tokio::test]
 async fn the_module_is_chosen_by_the_executions_build_not_by_the_workers_build_id() {
     // The routing rule that makes hot swap safe. `ctx.build_id()` is the
-    // WORKER's configured build (issue #798 fixed that semantics deliberately),
-    // so routing modules on it would hand a v1-assigned in-flight execution to
-    // v2 code the moment the worker was relabelled. The host binds the
-    // EXECUTION's assigned build instead.
+    // WORKER's configured build, a semantics issue #798 fixed deliberately.
+    // Routing modules on it would hand a v1-assigned in-flight execution to v2
+    // code once the worker was relabelled. The host binds the EXECUTION's
+    // assigned build instead.
     let registry = registry_with(&[
         ("wf-v1", "pipeline", pipeline_v1_bytes()),
         ("wf-v2", "pipeline", pipeline_v2_bytes()),
@@ -952,12 +951,12 @@ async fn an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run(
     //
     // `native_pipeline_v1` propagates an activity failure with `?`, so the run
     // fails. The trampoline instead appends the failure to `resolved` and
-    // re-enters the guest, because the guest — not the host — owns the decision
-    // about what a failed step means. `pipeline_v1.wat` does not inspect
-    // `resolved`, so it completes anyway.
+    // re-enters the guest. The guest, not the host, decides what a failed step
+    // means. `pipeline_v1.wat` does not inspect `resolved`, so it completes
+    // anyway.
     //
-    // This is deliberate: a host that failed the run on the guest's behalf would
-    // make saga/compensation logic inexpressible in a module. A guest that wants
+    // This is deliberate. A host that failed the run for the guest would make
+    // saga/compensation logic inexpressible in a module. A guest that wants
     // propagation returns `DecideResponse::Fail`.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let failing = WorkflowTestEnv::new()
@@ -977,9 +976,9 @@ async fn an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run(
         "the guest saw the failure and chose to continue; the host must not          override that"
     );
 
-    // The statically-linked twin, on the same history, propagates instead —
-    // which is why the byte-identity claim in this file is scoped to the
-    // success path the guests and their twins actually share.
+    // The statically-linked twin, on the same history, propagates instead. So
+    // the byte-identity claim in this file covers only the success path that
+    // the guests and their twins share.
     let native = WorkflowTestEnv::new()
         .with_workflow_name("pipeline")
         .with_queue_name("default")
@@ -1001,13 +1000,13 @@ async fn an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run(
 ///
 /// `WorkflowEvent` is adjacently tagged (`{"type": ..., "data": {...}}`), so
 /// everything interesting lives under `data`. The single normalisation is
-/// `activity_id`: `WorkflowContext::next_activity_id` mints a fresh UUID per
-/// live dispatch, so it differs between two runs of the *same statically-linked
-/// handler* just as much as between a hosted and a native one. Every other field
-/// — the event type, its order, the activity name, its input, its queue, the
-/// result payloads, the timestamps (pinned by `with_frozen_anchor`) — is
-/// compared verbatim, which is what makes this a byte-identity claim rather
-/// than a shape check.
+/// `activity_id`. `WorkflowContext::next_activity_id` mints a fresh UUID per
+/// live dispatch. So it differs between two runs of the *same
+/// statically-linked handler*, as between a hosted and a native one. Every
+/// other field is compared verbatim: the event type, its order, the activity
+/// name, its input, its queue and the result payloads. So are the timestamps,
+/// which `with_frozen_anchor` pins. That makes this a byte-identity claim, not
+/// a shape check.
 fn normalise(events: &[WorkflowEvent]) -> Vec<Value> {
     events
         .iter()
@@ -1063,9 +1062,9 @@ async fn a_module_hosted_history_replays_clean_under_statically_linked_code() {
 
 #[tokio::test]
 async fn a_statically_linked_history_replays_clean_under_module_hosting() {
-    // The reverse direction, which is the one an operator actually depends on
-    // during a swap: histories recorded by the old *binary* must replay under
-    // the new *module*.
+    // The reverse direction, which an operator depends on during a swap.
+    // Histories recorded by the old *binary* must replay under the new
+    // *module*.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let native = env().run(native_pipeline_v1, json!({"order": 7})).await;
 
@@ -1192,9 +1191,9 @@ async fn a_guest_that_never_completes_is_stopped_by_the_decide_step_cap() {
     );
 
     // ... and it must stop BEFORE running the activity it could not consume.
-    // A cap that let the last permitted step schedule a real activity would
-    // move money, send mail or ship a package and *then* fail the run for not
-    // terminating, having paid for a side effect it can never use.
+    // Otherwise the last permitted step could schedule a real activity. It
+    // would move money, send mail or ship a package. *Then* the cap would fail
+    // the run, after a side effect it can never use.
     assert!(
         scheduled < autumn_harvest::hot_swap::MAX_DECIDE_STEPS,
         "the ceiling must be checked before scheduling, got {scheduled} activities against a \
@@ -1206,10 +1205,10 @@ async fn a_guest_that_never_completes_is_stopped_by_the_decide_step_cap() {
 #[tokio::test]
 async fn a_guest_may_not_schedule_an_activity_the_host_did_not_allow() {
     // `Await` is the guest's one host-side capability, and deny-all
-    // `WasmCapabilities` does not constrain it: the sandbox governs what the
-    // guest may *import*, not what the host will do on its behalf. Without an
-    // allowlist a module can schedule any activity the worker knows, read its
-    // output, and hand it back out — exfiltration through the front door.
+    // `WasmCapabilities` does not constrain it. The sandbox governs what the
+    // guest may *import*, not what the host does for it. Without an allowlist,
+    // a module can schedule any activity the worker knows. It can read the
+    // output and hand it back out: exfiltration through the front door.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v1").allowing_activities(["notify"]),
@@ -1599,10 +1598,10 @@ async fn retiring_a_build_hides_its_modules_from_every_read_path() {
 
 #[tokio::test]
 async fn a_retired_build_id_still_cannot_be_repointed_at_different_code() {
-    // Retirement is soft precisely so it cannot launder the immutability
-    // guarantee. A hard DELETE would free the primary key and let `wf-v1` be
-    // republished with new bytes — and an execution still parked on a long
-    // timer under `wf-v1` would resume on logic it never started under.
+    // Retirement is soft so it cannot launder the immutability guarantee. A
+    // hard DELETE would free the primary key and let `wf-v1` be republished
+    // with new bytes. An execution parked on a long timer under `wf-v1` would
+    // then resume on logic it never started under.
     let (mut conn, _c) = db().await;
     publish_workflow_module(
         &mut conn,
@@ -1636,10 +1635,10 @@ async fn a_retired_build_id_still_cannot_be_repointed_at_different_code() {
 
 #[tokio::test]
 async fn syncing_a_build_with_no_modules_is_an_error_not_a_silent_success() {
-    // A typo'd build id, a not-yet-published build, and — in a sharded
-    // deployment — a publish that landed on another shard's database all look
-    // identical here. A silent `Ok(vec![])` defers the symptom to executions
-    // failing one by one for want of a module, long after the cause is visible.
+    // Three cases look identical here: a mistyped build id, a build not yet
+    // published, and a publish on another shard's database. A silent
+    // `Ok(vec![])` defers the symptom. Executions then fail one by one for
+    // want of a module, long after the cause is visible.
     let (mut conn, _c) = db().await;
     let registry = Arc::new(ModuleRegistry::new());
     let err = sync_build_into_registry(&mut conn, &registry, "wf-never-published", None)
@@ -1653,11 +1652,11 @@ async fn syncing_a_build_with_no_modules_is_an_error_not_a_silent_success() {
 
 #[tokio::test]
 async fn a_failing_module_leaves_the_whole_build_unbound() {
-    // The fail-closed property that matters, and the one a per-module loop
-    // cannot give: a build whose *second* module fails verification must not
-    // leave the first bound. A worker advertising a build it can only
-    // half-serve claims executions for the workflow it has and destroys every
-    // execution for the one it does not.
+    // The fail-closed property that a per-module loop cannot give. A build
+    // whose *second* module fails verification must not leave the first bound.
+    // A worker that advertises a build it can only half-serve claims
+    // executions for the workflow it has. It destroys every execution for the
+    // one it does not have.
     let (mut conn, _c) = db().await;
     publish_workflow_module(
         &mut conn,
@@ -1845,10 +1844,11 @@ async fn an_unsigned_republish_does_not_erase_an_existing_signature() {
 
 // ── the AC3 end-to-end demonstration ──────────────────────────────────────────
 
-/// Publish v2 under a new build id while the process is running, ramp new
-/// starts onto it with the **shipped** `set_build_ramp` API, prove a
-/// v1-assigned in-flight execution still runs v1 code, then roll back by
-/// repointing the policy — all without restarting the host.
+/// Publish v2, ramp onto it, and roll back, all without a host restart.
+///
+/// v2 is published under a new build id while the process runs. The
+/// **shipped** `set_build_ramp` API ramps new starts onto it. A v1-assigned
+/// in-flight execution still runs v1 code. Repointing the policy rolls back.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -1987,9 +1987,9 @@ async fn hot_swap_ramp_and_rollback_without_a_restart() {
 
 #[tokio::test]
 async fn a_partial_ramp_splits_new_starts_across_both_hosted_modules() {
-    // The ramp is a pure function of the execution id, so a 50% ramp must send
-    // roughly half of new starts to each module — and each must run the code
-    // its build id names.
+    // The ramp is a pure function of the execution id. So a 50% ramp must send
+    // roughly half of new starts to each module. Each must run the code its
+    // build id names.
     let (mut conn, _c) = db().await;
     let registry = Arc::new(ModuleRegistry::new());
     publish_workflow_module(
@@ -2051,9 +2051,10 @@ async fn a_partial_ramp_splits_new_starts_across_both_hosted_modules() {
 
 // ── the AC3 demonstration, inside one real worker process ─────────────────────
 
-/// Everything the AC3 demonstration above proves, but driven through a **real
-/// `Worker`** claiming real tasks off the real queue — so "one worker process"
-/// is literal rather than a figure of speech.
+/// The AC3 demonstration above, driven through a **real `Worker`**.
+///
+/// The worker claims real tasks off the real queue, so "one worker process" is
+/// literal.
 ///
 /// The worker is started once, at the top, and never restarted or reconfigured.
 /// Every subsequent step (publishing v2, syncing it into the live registry,
@@ -2123,9 +2124,10 @@ mod one_worker_process {
         }
     }
 
-    /// A `WorkflowInfo` whose body comes from a runtime module: its handler is
-    /// the statically-linked trampoline, and nothing else about the registration
-    /// differs from a `#[workflow]`-generated one.
+    /// A `WorkflowInfo` whose body comes from a runtime module.
+    ///
+    /// Its handler is the statically-linked trampoline. Nothing else differs
+    /// from a `#[workflow]`-generated registration.
     fn module_hosted_workflow(name: &'static str) -> WorkflowInfo {
         WorkflowInfo {
             quota: None,
@@ -2433,8 +2435,9 @@ mod one_worker_process {
         assert_eq!(v2_scheduled, ["charge", "notify"]);
 
         // ── (c') a v1-assigned execution started AFTER the swap still runs v1 ─
-        // This is the in-flight guarantee: the build id is fixed at start time,
-        // so the code it denotes must be too.
+        //
+        // The in-flight guarantee: the build id is fixed at start time, so the
+        // code it denotes must be too.
         let straggler = seed(&mut conn, queue, "wf-v1", json!({"order": 3})).await;
         let straggler = wait_completed(&url, straggler, Duration::from_secs(30)).await;
         assert_eq!(
@@ -2483,13 +2486,12 @@ mod one_worker_process {
 
 #[tokio::test]
 async fn the_activity_allowlist_survives_the_worker_dispatch_seam() {
-    // P1. `HandlerRegistry` stored only the `ModuleRegistry`, so the dispatch
-    // seam built a fresh `ModuleHost::new` per task — whose `allowed_activities`
-    // is `None`. Every restriction an operator configured through
-    // `allowing_activities` was therefore discarded on the one path that
-    // matters, and production guests could schedule any activity the worker
-    // knew. The registry now stores the whole policy; this pins that the
-    // allowlist is what dispatch reads back.
+    // `HandlerRegistry` stored only the `ModuleRegistry`. So the dispatch seam
+    // built a fresh `ModuleHost::new` per task, whose `allowed_activities` is
+    // `None`. Each operator restriction set with `allowing_activities` was
+    // lost on the one path that matters. Production guests could schedule any
+    // activity the worker knew. The registry now stores the whole policy. This
+    // pins that dispatch reads the allowlist back.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let configured = ModuleHost::new(Arc::clone(&registry))
         .allowing_activities(["refund"])
@@ -2530,13 +2532,13 @@ async fn the_activity_allowlist_survives_the_worker_dispatch_seam() {
 
 #[tokio::test]
 async fn a_pinned_module_survives_an_unload_that_races_the_dispatch() {
-    // P1. The worker seam resolves the module before dispatch so a miss is a
-    // typed capability miss rather than a terminal failure. It then dropped the
-    // `Arc` and let the trampoline look the binding up a *second* time — so an
-    // `unload_build` landing between the two turned a passed capability check
-    // into `Err(String)`, i.e. exactly the terminal `WorkflowFailed` the
-    // pre-check exists to avoid, and contradicted the safety analysis's claim
-    // that unloading is safe for in-flight invocations.
+    // The worker seam resolves the module before dispatch, so a miss is a
+    // typed capability miss, not a terminal failure. It then dropped the `Arc`,
+    // and the trampoline looked the binding up a *second* time. An
+    // `unload_build` between the two turned a passed capability check into
+    // `Err(String)`. That is the terminal `WorkflowFailed` the pre-check exists
+    // to avoid. It also contradicted the safety analysis's claim that
+    // unloading is safe for in-flight invocations.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     let pinned = registry
         .get("wf-v1", "pipeline")
@@ -2626,10 +2628,10 @@ async fn decisions_are_reused_across_separate_workflow_tasks() {
     // prove nothing: a broken per-task cache inserts on every step too.
     //
     // The substance: an ordinary activity ENDS the workflow task. Only local
-    // activities re-drive in place, so a hosted workflow resumes in a NEW
-    // `process_workflow_task` call, and a cache installed per task is reset on
-    // every durable cycle — leaving the O(n^2) exactly where it was. The cache
-    // therefore lives on the registry, for the worker process.
+    // activities re-drive in place. So a hosted workflow resumes in a NEW
+    // `process_workflow_task` call. A cache installed per task resets on every
+    // durable cycle and leaves the O(n^2) where it was. So the cache lives on
+    // the registry, for the worker process.
     let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
 
     // Two independent drives, as two separate tasks would be.
@@ -2702,12 +2704,10 @@ fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
     //
     // Guarded structurally rather than functionally. Reproducing it needs a
     // guest expensive enough to exhaust the cumulative fuel budget, which is
-    // not a test anyone should wait for. The invariant is that the cost is
-    // charged and the
-    // budget checked in exactly ONE place, on the path both branches join, and
-    // *before* the response is acted on — an over-budget `Await` acted on
-    // optimistically schedules a real activity the run then fails immediately
-    // after.
+    // too slow for a test. The invariant: the cost is charged and the budget
+    // checked in exactly ONE place, on the path both branches join. That check
+    // comes *before* the response is acted on. An over-budget `Await` acted on
+    // optimistically schedules a real activity, and the run then fails.
     let src = include_str!("../../src/hot_swap.rs");
     let start = src
         .find("pub fn module_workflow_handler(")
@@ -2800,12 +2800,11 @@ fn the_decide_loop_still_bounds_real_wall_clock_occupancy() {
 
 #[tokio::test]
 async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
-    // A `DecideRequest` carries no build id — the guest has no business knowing
-    // its own version — so v1 and v2 of one workflow see byte-identical input at
-    // step 0. Keying the cache on the request alone would let v1's decision be
-    // served to v2, silently defeating the swap the spike exists to
-    // demonstrate. The key digests the request TOGETHER WITH
-    // `(build_id, module_hash)`.
+    // A `DecideRequest` carries no build id, because the guest must not know
+    // its own version. So v1 and v2 of one workflow see byte-identical input
+    // at step 0. A cache keyed on the request alone would serve v1's decision
+    // to v2. That silently defeats the swap the spike demonstrates. The key
+    // digests the request TOGETHER WITH `(build_id, module_hash)`.
     //
     // The cache is process-wide, so both builds genuinely share one map rather
     // than merely sharing a host.
@@ -2941,9 +2940,9 @@ fn the_decision_cache_evicts_oldest_first() {
 
 #[test]
 fn the_decision_cache_key_separates_build_workflow_and_request() {
-    // Length-prefixed, so no two distinct triples share a preimage — otherwise
-    // `("ab", "c", ..)` and `("a", "bc", ..)` would collide and one build could
-    // be served another's answer through the back door.
+    // Length-prefixed, so no two distinct triples share a preimage. Otherwise
+    // `("ab", "c", ..)` and `("a", "bc", ..)` would collide. One build could
+    // then get another's answer through the back door.
     let a = DecisionCache::key("ab", "c", b"x");
     let b = DecisionCache::key("a", "bc", b"x");
     assert_ne!(a, b, "the key must not be a naive concatenation");
@@ -2968,11 +2967,11 @@ fn the_decision_cache_key_separates_build_workflow_and_request() {
 
 #[test]
 fn a_load_batch_may_not_bind_two_modules_to_one_key() {
-    // P2. Both `prepare` calls succeed and the commit-time duplicate check
-    // compared each entry only against the ALREADY-BOUND map — which knows
-    // nothing about the batch — so with nothing bound beforehand the insert loop
-    // let the last entry silently overwrite the first, bypassing the immutable-
-    // binding guarantee `load_modules` exists to enforce.
+    // Both `prepare` calls succeed. The commit-time duplicate check compared
+    // each entry only against the ALREADY-BOUND map, which knows nothing about
+    // the batch. With nothing bound beforehand, the last entry silently
+    // overwrote the first. That bypassed the immutable-binding guarantee that
+    // `load_modules` enforces.
     let registry = Arc::new(ModuleRegistry::new());
     let v1 = pipeline_v1_bytes();
     let v2 = pipeline_v2_bytes();
@@ -3006,10 +3005,10 @@ fn a_load_batch_may_not_bind_two_modules_to_one_key() {
 
 #[test]
 fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
-    // P2. The README's `DecideRequest` example carried an `abi_version` field
-    // the host has never transmitted (the ABI version is a host-side constant,
-    // deliberately not on the wire), so a guest written from the example could
-    // require or branch on a field it would never receive.
+    // The README's `DecideRequest` example carried an `abi_version` field the
+    // host never transmits. The ABI version is a host-side constant,
+    // deliberately not on the wire. A guest written from the example could
+    // require or branch on a field it never receives.
     let readme = include_str!("../../examples/workflow-modules/README.md");
     let example = readme
         .lines()
@@ -3063,12 +3062,11 @@ fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
         "the ABI version is a host-side constant and is never sent"
     );
 
-    // The failure outcome's shape must be documented as
-    // the host actually sends it. An example showing only `kind` and `error`
-    // would make a guest with a strict schema reject every failed-activity
-    // request, and would push a guest that does parse it onto `error` — a
-    // diagnostic string that differs between the inline and replayed delivery
-    // paths, so branching on it behaves differently on replay than it did live.
+    // The failure outcome's shape must be documented as the host sends it. An
+    // example with only `kind` and `error` would make a strict-schema guest
+    // reject every failed-activity request. A guest that parses it would
+    // branch on `error`. That diagnostic string differs between the inline
+    // and replayed delivery paths. So such a branch differs on replay.
     let err_examples: Vec<&str> = readme
         .lines()
         .filter(|line| line.starts_with(r#"{"kind":"err""#))

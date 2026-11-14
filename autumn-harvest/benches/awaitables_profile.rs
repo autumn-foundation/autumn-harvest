@@ -1,13 +1,13 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `autumn_harvest::awaitables::project_awaitables` — the pure,
-//! read-only projection behind every "what is this execution parked on right
-//! now?" management-API endpoint (issue #615): `/workflows/{id}/awaitables`,
-//! and the awaitables sub-report folded into `/workflows/{id}/diagnose` and
-//! `/workflows/{id}/replay-diagnosis`. Wall-clock timing is not admissible
-//! evidence on this (shared-vCPU) machine. Every number this harness
-//! produces is evidence of a deterministic instruction count
-//! (`valgrind --tool=callgrind`) or of an allocation count/bytes figure
-//! (`valgrind --tool=dhat`).
+//! Deterministic instruction/allocation-count profiling harness for
+//! `autumn_harvest::awaitables::project_awaitables`.
+//!
+//! It is the pure, read-only projection behind every "what is this execution
+//! parked on right now?" management-API endpoint (issue #615). That is
+//! `/workflows/{id}/awaitables`, plus the awaitables sub-report in
+//! `/workflows/{id}/diagnose` and `/workflows/{id}/replay-diagnosis`.
+//! Wall-clock timing is not admissible evidence on this shared-vCPU machine.
+//! Each number is a deterministic instruction count (`valgrind --tool=callgrind`)
+//! or an allocation count/bytes figure (`valgrind --tool=dhat`).
 //!
 //! dhat counts are bit-for-bit reproducible on any machine. Callgrind counts
 //! are not quite: this fixture's ids (`ActivityExecId::new()` and friends)
@@ -21,27 +21,27 @@
 //! # Workload
 //!
 //! `autumn-harvest-plugin/src/api.rs`'s awaitables handler loads the FULL
-//! event history for the target execution (`rows`, uncapped) and calls
+//! event history for the target execution (`rows`, uncapped). It calls
 //! `project_awaitables(&rows, wait_set, AWAITABLE_CATEGORY_CAP)` exactly
-//! once per request. `project_awaitables` always runs `build_history_index`
-//! — a single O(n) pass over every row — regardless of wait-set source, then
-//! projects either the drained replay command buffer
-//! (`WaitSetInput::Replayed`, the common "handler registered, replay
-//! succeeded, workflow suspended" happy path used by
-//! `QueryReplayOutcome::Suspended`) or a best-effort history-only scan
-//! (`WaitSetInput::HistoryOnly`, the degraded-replay fallback).
+//! once per request. `project_awaitables` always runs `build_history_index`,
+//! a single O(n) pass over every row, whatever the wait-set source. It then
+//! projects one of two inputs:
+//!
+//! - `WaitSetInput::Replayed`: the drained replay command buffer. This is the
+//!   common happy path of `QueryReplayOutcome::Suspended`.
+//! - `WaitSetInput::HistoryOnly`: a best-effort history-only scan, the
+//!   degraded-replay fallback.
 //!
 //! This harness reproduces the realistic shape the module's own docs single
-//! out: a long-running, wide-fan-out workflow near completion — most of its
+//! out: a long-running, wide-fan-out workflow near completion. Most of its
 //! scheduled work (activities, local activities, external handoffs, timers,
-//! children) already closed out, a handful still genuinely open. That is
-//! exactly the traffic an operator's `/awaitables` request is for. A
-//! workflow that has run long enough to accumulate a large history is also
-//! the one worth asking "what is it still waiting on?" about. Both
-//! `WaitSetInput` modes are exercised every rep, mirroring how the same
-//! fixed history is diagnosed from both angles in production (a `/diagnose`
-//! call folds in an awaitables-shaped sub-check; the plugin degrades to
-//! history-only whenever replay is unavailable).
+//! children) is closed, and a handful is still open. An operator's
+//! `/awaitables` request targets this traffic. A workflow with a large history
+//! is also the one worth asking "what is it still waiting on?" about.
+//! Each rep exercises both `WaitSetInput` modes. Production diagnoses the same
+//! history from both angles. A `/diagnose` call folds in an awaitables-shaped
+//! sub-check, and the plugin degrades to history-only when replay is
+//! unavailable.
 //!
 //! # Running
 //!
@@ -55,10 +55,9 @@
 //! ```
 //!
 //! `AWAITABLES_PROFILE_N` (default `400`) sets the number of regular
-//! activities scheduled per simulated execution (the other categories scale
-//! off it). `AWAITABLES_PROFILE_REPS` (default `1_500`) sets how many times
-//! the (fixed) history is projected in each mode — i.e. how many simulated
-//! `/awaitables`-shaped requests are served.
+//! activities per simulated execution. The other categories scale off it.
+//! `AWAITABLES_PROFILE_REPS` (default `1_500`) sets how many times each mode
+//! projects the fixed history, that is, how many simulated requests run.
 //!
 //! # Baseline
 //!
@@ -114,12 +113,13 @@ const ACTIVITY_NAMES: [&str; 4] = [
 ];
 const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
 
-/// Builds the fixed, realistic history + drained-command wait-set this
-/// harness projects repeatedly: `n` regular activities (9 of every 10
-/// closed), plus proportionally scaled local activities, external handoffs,
-/// timers, and children in the same 9:1 closed:open ratio — a long-running
-/// fan-out workflow near completion with a genuine handful of things still
-/// open, exactly the shape an operator's diagnostic request targets.
+/// Builds the fixed history and drained-command wait-set that this harness
+/// projects repeatedly.
+///
+/// It holds `n` regular activities (9 of every 10 closed), plus scaled local
+/// activities, external handoffs, timers, and children at the same 9:1
+/// closed:open ratio. That is a fan-out workflow near completion with a few
+/// things still open, the shape an operator's diagnostic request targets.
 #[allow(clippy::too_many_lines, reason = "one straight-line event list")]
 fn build_workload(
     n: usize,
@@ -357,21 +357,19 @@ fn main() {
         "fixture bug: history-only projection found no open awaitables"
     );
 
-    // BTreeMap, not HashMap: this tally is read inside the measured loop
-    // below, and HashMap's default RandomState hasher is seeded per-process
-    // -- its instructions would leak into the profiled instruction count and
-    // make two "identical" runs diverge. BTreeMap is Ord-keyed (no hashing
-    // at all), so it costs nothing extra and keeps the profile reproducible
-    // bit-for-bit.
+    // BTreeMap, not HashMap: the measured loop below reads this tally.
+    // HashMap's default RandomState hasher is seeded per process. Its
+    // instructions would leak into the profiled count and make two
+    // "identical" runs diverge. BTreeMap is Ord-keyed with no hashing, so it
+    // keeps the profile reproducible bit-for-bit.
     let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     let mut total_awaitables: u64 = 0;
 
     for _ in 0..reps {
-        // Mirrors the real handler: the replayed (happy-path) projection and
-        // the history-only (degraded-fallback) projection are both real
-        // production call shapes over the SAME loaded history, so both are
-        // measured every rep.
+        // Mirrors the real handler. The replayed projection and the
+        // history-only projection are both production call shapes over the
+        // SAME loaded history, so each rep measures both.
         let replayed = project_awaitables(
             std::hint::black_box(&rows),
             WaitSetInput::Replayed {

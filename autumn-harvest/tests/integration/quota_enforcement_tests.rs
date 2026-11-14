@@ -3,50 +3,50 @@
 //! # AC coverage map
 //!
 //! - **AC1** (dot-path key resolver reuse, no second resolver) — every test
-//!   below resolves its tenant key via a plain `"tenant_id"` expression,
-//!   exercised through the SAME [`autumn_harvest::quota::resolve_quota_key`]
-//!   (a one-line delegate to [`autumn_harvest::concurrency::resolve_concurrency_key`])
-//!   the admission path itself calls; no test constructs a key any other way.
+//!   below resolves its tenant key via a plain `"tenant_id"` expression. It
+//!   goes through the SAME [`autumn_harvest::quota::resolve_quota_key`] that
+//!   the admission path calls. That function is a one-line delegate to
+//!   [`autumn_harvest::concurrency::resolve_concurrency_key`]. No test
+//!   constructs a key any other way.
 //! - **AC2** (≥3 independent optional caps) —
 //!   [`active_executions_cap_admits_exactly_n_then_rejects_the_next`] (money
 //!   test), [`history_bytes_cap_rejects_once_exceeded`],
-//!   [`dead_letters_cap_rejects_once_reached`], and
+//!   [`dead_letters_cap_rejects_once_reached`] and
 //!   [`policy_with_no_caps_declared_is_a_noop`] each exercise ONE resource in
-//!   isolation from the other two (a policy declaring only that resource's
-//!   `with_max_*`), proving the three caps are independent, not a single
-//!   combined budget.
+//!   isolation. Each policy declares only that resource's `with_max_*`. So
+//!   the three caps are independent, not a single combined budget.
 //! - **AC3** (enforcement at admission, before `WorkflowStarted`, on every
 //!   registry-aware start path) — the direct-admission tests below drive the
-//!   real [`start_or_load_workflow_execution`] entry point; the
-//!   `continue_as_new_*` tests drive a genuine worker end to end, proving the
-//!   SAME `quota_key` resolution that governs a fresh start also governs an
-//!   in-flight continuation's successor row. Batch-start, schedule
-//!   tick/backfill, and debounce/throttle scanner-fire coverage is tracked
-//!   separately (issue #946 Task 7) — every one of those paths funnels
-//!   through the identical `start_or_load_workflow_execution_collect` choke
-//!   point this file exercises directly, so enforcement there is structural,
-//!   not per-call-site.
+//!   real [`start_or_load_workflow_execution`] entry point. The
+//!   `continue_as_new_*` tests drive a genuine worker end to end. They prove
+//!   that the SAME `quota_key` resolution that governs a fresh start also
+//!   governs the successor row of an in-flight continuation. Issue #946
+//!   Task 7 tracks the coverage of batch-start, schedule tick/backfill and
+//!   debounce/throttle scanner fires. Each of those paths funnels through the
+//!   `start_or_load_workflow_execution_collect` choke point that this file
+//!   exercises directly. So enforcement there is structural, not
+//!   per-call-site.
 //! - **AC4** (typed error, never silent, never a `500`) — every rejection
 //!   test destructures the exact
 //!   [`autumn_harvest::error::HarvestError::QuotaExceeded`] shape
-//!   (`workflow_name`/`key`/`resource`/`limit`/`current`), and
-//!   [`rejected_start_creates_no_execution_or_task_row`] proves the
-//!   rejection rolls back atomically — no phantom execution or task row
+//!   (`workflow_name`/`key`/`resource`/`limit`/`current`).
+//!   [`rejected_start_creates_no_execution_or_task_row`] proves that the
+//!   rejection rolls back atomically. No phantom execution or task row
 //!   survives a rejected attempt.
 //! - **AC7** ("cheap by construction… never a full-table scan per
-//!   admission") — exercised transitively (every admission attempt here
-//!   drives the real, single-round-trip `QUOTA_USAGE_SQL` query); the query
-//!   shape itself is asserted directly in `quota.rs`'s own unit tests.
+//!   admission") — exercised transitively. Every admission attempt here
+//!   drives the real, single-round-trip `QUOTA_USAGE_SQL` query. The unit
+//!   tests in `quota.rs` assert the query shape itself.
 //! - **AC8** (shard-local scope) — out of scope for a single-shard suite;
 //!   documented in `docs/sharding.md`.
 //! - **AC9** (no-policy workflow byte-for-byte unchanged, zero default
 //!   overhead) — [`no_policy_workflow_is_unaffected`].
 //!
-//! Deliberately **not** covered here, per issue #946's own scope split: the
-//! HTTP `429` mapping, the `harvest.quota.rejected` metric, and
-//! `GET /admin/quotas` (Task 6, plugin-layer); the literal 10,000-start
-//! success-metric load test and the batch/schedule/debounce/throttle
-//! path-by-path coverage sweep (Task 7).
+//! Issue #946 splits its own scope, so this file deliberately does **not**
+//! cover two groups. Task 6 (plugin layer) covers the HTTP `429` mapping,
+//! the `harvest.quota.rejected` metric and `GET /admin/quotas`. Task 7
+//! covers the literal 10,000-start success-metric load test. It also covers
+//! the path-by-path coverage sweep of batch, schedule, debounce and throttle.
 
 #![cfg(feature = "db")]
 #![allow(
@@ -156,9 +156,10 @@ pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     TEST_SERIAL.lock().await
 }
 
-/// RAII installer for [`GLOBAL_WORKFLOW_METADATA`]: installs the given map,
-/// and restores whatever was there before on drop — including on a mid-test
-/// panic, unlike a bare manual take/restore pair.
+/// RAII installer for [`GLOBAL_WORKFLOW_METADATA`].
+///
+/// It installs the given map and restores the previous one on drop. Unlike a
+/// bare manual take/restore pair, it also restores on a mid-test panic.
 ///
 /// It does not lock [`TEST_SERIAL`] itself. The calling test already holds
 /// that lock through [`serial`], and a `tokio` mutex is not re-entrant.
@@ -196,9 +197,10 @@ impl Drop for MetadataGuard {
 }
 
 /// Build a [`StartWorkflowParams`] with every non-essential field at its
-/// production default, mirroring `cross_type_continue_as_new_tests.rs`'s
-/// `start_root` literal exactly (so this stays a faithful production shape,
-/// not a hand-trimmed one).
+/// production default.
+///
+/// It mirrors the `start_root` literal of `cross_type_continue_as_new_tests.rs`
+/// exactly. So this stays a faithful production shape, not a hand-trimmed one.
 pub fn params<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,
@@ -252,10 +254,11 @@ pub fn params<'a>(
     }
 }
 
-/// Attempt a start through the real production entry point. Returns the
-/// pre-generated candidate `exec_id` alongside the outcome so a REJECTED
-/// attempt can still be checked for "no row exists under this id" (the
-/// `Err` variant itself carries no `exec_id`).
+/// Attempt a start through the real production entry point.
+///
+/// Returns the pre-generated candidate `exec_id` with the outcome. So a
+/// REJECTED attempt can still be checked for "no row exists under this id".
+/// The `Err` variant itself carries no `exec_id`.
 pub async fn try_start(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -385,11 +388,12 @@ pub async fn active_count(
     .await
 }
 
-/// Read a single execution row's persisted `state` column -- used by the
-/// `replace_execution` (issue #946 P1) regression tests below to prove a
-/// REJECTED replace rolls back the whole transaction, including the seal of
-/// the row being replaced (it must still read its pre-replace state, never
-/// left half-sealed).
+/// Read the persisted `state` column of a single execution row.
+///
+/// The `replace_execution` regression tests below (issue #946) use it. They
+/// prove that a REJECTED replace rolls back the whole transaction. That
+/// includes the seal of the replaced row. It must still read its
+/// pre-replace state, never half-sealed.
 pub async fn row_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {
@@ -499,9 +503,11 @@ pub fn assert_quota_exceeded(
 // ---------------------------------------------------------------------------
 
 /// The money test: a `max_active_executions = 5` policy admits exactly 5
-/// concurrent starts for one key, and the 6th is rejected with the exact
-/// typed error -- the small-N analogue of the issue's "10,000 starts capped
-/// at exactly 100" success metric (the full-scale load test is Task 7).
+/// concurrent starts for one key.
+///
+/// The 6th is rejected with the exact typed error. This is the small-N
+/// analogue of the issue's "10,000 starts capped at exactly 100" success
+/// metric. The full-scale load test is Task 7.
 #[tokio::test]
 async fn active_executions_cap_admits_exactly_n_then_rejects_the_next() {
     let _serial = serial().await;
@@ -643,8 +649,8 @@ async fn no_policy_workflow_is_unaffected() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    // No `GLOBAL_WORKFLOW_METADATA` entry at all for this type -- the
-    // process-global map may be `None`, or `Some` without this key; either
+    // No `GLOBAL_WORKFLOW_METADATA` entry at all for this type. The
+    // process-global map may be `None`, or `Some` without this key. Either
     // way `quota_policy` resolves to `None` and enforcement is skipped.
     let wf = leaked("quota_no_policy");
     for _ in 0..20 {
@@ -691,9 +697,9 @@ async fn unresolvable_key_fails_open() {
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
     let _guard = MetadataGuard::install_one(wf, policy);
 
-    // The input has no `tenant_id` field at all -- `resolve_quota_key`
-    // returns `None`, so enforcement is skipped for every one of these
-    // starts regardless of the declared cap of 1.
+    // The input has no `tenant_id` field at all. So `resolve_quota_key`
+    // returns `None`, and enforcement is skipped for every one of these
+    // starts despite the declared cap of 1.
     for _ in 0..5 {
         start_ok(&mut conn, wf, serde_json::json!({"other_field": 1})).await;
     }
@@ -876,10 +882,10 @@ async fn history_bytes_cap_rejects_once_exceeded() {
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_history_bytes");
-    // A tiny cap: the very first execution's own `WorkflowStarted` event
-    // already exceeds 1 byte, so the SECOND start for the same key must be
-    // rejected on `HistoryBytes` alone (active_executions/dead_letters are
-    // uncapped for this policy).
+    // A tiny cap: the first execution's own `WorkflowStarted` event already
+    // exceeds 1 byte. So the SECOND start for the same key must be rejected
+    // on `HistoryBytes` alone. This policy leaves active_executions and
+    // dead_letters uncapped.
     let policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
     let _guard = MetadataGuard::install_one(wf, policy);
 
@@ -910,10 +916,10 @@ async fn dead_letters_cap_rejects_once_reached() {
     let policy = QuotaPolicy::new("tenant_id").with_max_dead_letters(3);
     let _guard = MetadataGuard::install_one(wf, policy);
 
-    // A seed execution to hang the DLQ rows off of -- `dead_letter()`
-    // resolves `workflow_name`/`quota_key` from this exec_id's OWN row, so
-    // the seed must be of the SAME workflow type and the SAME resolved key
-    // as the admission attempt below.
+    // A seed execution to hang the DLQ rows off. The `dead_letter()` call
+    // resolves `workflow_name`/`quota_key` from this exec_id's OWN row. So
+    // the seed must have the SAME workflow type and the SAME resolved key as
+    // the admission attempt below.
     let seed_id = start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
 
     for i in 0..3 {
@@ -1120,9 +1126,11 @@ async fn drive_transition(
     transition
 }
 
-/// Start a root execution through the real start path (not the direct
-/// `try_start`/`params` helpers above, since the worker needs a genuinely
-/// dispatchable task -- `quota_key` resolution is identical either way).
+/// Start a root execution through the real start path.
+///
+/// The worker needs a genuinely dispatchable task, so the direct
+/// `try_start`/`params` helpers above do not fit. The `quota_key` resolution
+/// is identical either way.
 pub async fn start_root(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -1159,13 +1167,13 @@ async fn continue_as_new_same_type_propagates_quota_key() {
     )
     .await;
 
-    // No `GLOBAL_WORKFLOW_METADATA` entry is installed at all for this run
-    // -- `start_root` above therefore stamps `quota_key = NULL`. Stamp a
-    // key directly on the predecessor's row (mirroring how
+    // No `GLOBAL_WORKFLOW_METADATA` entry is installed at all for this run.
+    // So `start_root` above stamps `quota_key = NULL`. Stamp a key directly
+    // on the predecessor's row instead. This mirrors how
     // `same_type_continue_as_new_is_unchanged` stamps a per-start override
-    // the type never declared) to prove the same-type path carries
-    // whatever is ALREADY on the row verbatim, regardless of any live
-    // policy.
+    // that the type never declared. It proves that the same-type path
+    // carries whatever is ALREADY on the row verbatim, regardless of any
+    // live policy.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set(SetExt(
             harvest_workflow_executions_ext::quota_key.eq(Some("acme")),
@@ -1191,11 +1199,13 @@ async fn continue_as_new_same_type_propagates_quota_key() {
 }
 
 /// Cross-type `continue_as_new_as_type`: `quota_key` is RE-RESOLVED against
-/// the TARGET type's own declared policy and the new input, exercising the
-/// `worker.rs` fix that reads `registry` directly (mirroring
-/// `resolve_workflow_concurrency`) rather than the process-global
-/// `GLOBAL_WORKFLOW_METADATA` mirror, which this test's `registry()` helper
-/// never populates (it uses the raw `HandlerRegistry::new` constructor).
+/// the TARGET type's own declared policy and the new input.
+///
+/// This exercises the `worker.rs` fix that reads `registry` directly, as
+/// `resolve_workflow_concurrency` does. It does not read the process-global
+/// `GLOBAL_WORKFLOW_METADATA` mirror. This test's `registry()` helper never
+/// populates that mirror, since it uses the raw `HandlerRegistry::new`
+/// constructor.
 #[tokio::test]
 async fn continue_as_new_cross_type_re_resolves_quota_key() {
     let _serial = serial().await;
@@ -1223,10 +1233,10 @@ async fn continue_as_new_cross_type_re_resolves_quota_key() {
         .await
         .expect("stamp predecessor quota_key");
 
-    // Phase 2 declares its OWN quota policy directly on the `WorkflowInfo`
-    // (not via `GLOBAL_WORKFLOW_METADATA`, which this registry never
-    // populates) over the successor's own input shape: `{"phase": "two"}`
-    // has no `tenant_id`, so resolve against a field that IS present.
+    // Phase 2 declares its OWN quota policy directly on the `WorkflowInfo`,
+    // not via `GLOBAL_WORKFLOW_METADATA`, which this registry never
+    // populates. The successor's own input `{"phase": "two"}` has no
+    // `tenant_id`. So the policy resolves against a field that IS present.
     let mut target = wf_info(phase2, phase_two);
     target.quota = Some(QuotaPolicy::new("phase").with_max_active_executions(9));
 
@@ -1299,9 +1309,9 @@ pub fn detached_quota_parent<'a>(
             .as_str()
             .expect("input.child_type must be present")
             .to_string();
-        // Leaked once per invocation is fine -- this handler only runs once
-        // per test (a detached spawn is a fire-and-forget command, not a
-        // suspend point the workflow re-enters).
+        // Leaking once per invocation is fine. This handler runs only once
+        // per test: a detached spawn is a fire-and-forget command, not a
+        // suspend point that the workflow re-enters.
         let child_type: &'static str = Box::leak(child_type.into_boxed_str());
         ctx.spawn_child_workflow_detached_raw(
             child_type,
@@ -1321,13 +1331,14 @@ pub fn detached_quota_child<'a>(
 }
 
 /// A detached child spawn (issue #347) whose target type's quota is at cap
-/// must not terminally fail the PARENT -- that would seal a healthy
-/// execution over an UNRELATED tenant's capacity signal. Instead the
-/// parent's own workflow task is parked and woken (`worker.rs`'s
-/// `recover_from_child_quota_exceeded`). A later poll then re-drives the
-/// identical decision cycle. Once the blocking execution frees its slot,
-/// the retry succeeds. The detached child is then created with the resolved
-/// `quota_key` stamped on its own row. That is the exact
+/// must not terminally fail the PARENT.
+///
+/// That would seal a healthy execution over an UNRELATED tenant's capacity
+/// signal. Instead the parent's own workflow task is parked and woken
+/// (`worker.rs`'s `recover_from_child_quota_exceeded`). A later poll then
+/// re-drives the identical decision cycle. Once the blocking execution frees
+/// its slot, the retry succeeds. The detached child is then created with the
+/// resolved `quota_key` stamped on its own row. That is the exact
 /// `create_detached_child_executions` code path (issue #946).
 #[tokio::test]
 async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
@@ -1343,14 +1354,14 @@ async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     child_info.quota = Some(child_quota_policy);
 
     // Occupy the ONE `max_active_executions` slot for key "acme" with a
-    // blocker execution of the SAME target type, started directly (not via
-    // the parent) so the quota is already saturated before the parent ever
-    // runs. `start_root` drives the BARE admission path
-    // (`start_or_load_workflow_execution`), which resolves its quota policy
-    // from the process-global `GLOBAL_WORKFLOW_METADATA` mirror -- NOT from
-    // any `HandlerRegistry` -- so the blocker's `quota_key` is only stamped
-    // correctly while this guard is installed (mirrors the pre-existing
-    // `concurrent_runaway_tenant_is_capped_...` test's established pattern).
+    // blocker execution of the SAME target type. It starts directly, not via
+    // the parent, so the quota is saturated before the parent ever runs.
+    // The `start_root` helper drives the BARE admission path
+    // (`start_or_load_workflow_execution`). That path resolves its quota
+    // policy from the process-global `GLOBAL_WORKFLOW_METADATA` mirror, NOT
+    // from any `HandlerRegistry`. So the blocker's `quota_key` is stamped
+    // correctly only while this guard is installed. The pre-existing
+    // `concurrent_runaway_tenant_is_capped_...` test uses the same pattern.
     let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
@@ -1361,12 +1372,12 @@ async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     .await;
     drop(blocker_guard);
 
-    // The blocker's own `harvest_task_queue` row must never be claimed by the
-    // worker below (which necessarily has `detached_quota_child`'s handler
-    // registered, so it CAN run the blocker to completion) -- that would free
-    // the quota slot almost instantly and defeat the whole test. Delete it so
-    // the blocker stays stuck `RUNNING` until `mark_terminal` explicitly
-    // seals it further down.
+    // The worker below must never claim the blocker's own
+    // `harvest_task_queue` row. That worker has the handler of
+    // `detached_quota_child` registered, so it CAN run the blocker to
+    // completion. That would free the quota slot almost at once and defeat
+    // the whole test. Delete the row so the blocker stays stuck `RUNNING`
+    // until `mark_terminal` explicitly seals it further down.
     diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
         .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
         .execute(&mut conn)
@@ -1389,12 +1400,13 @@ async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
     // While the blocker still holds the quota slot, the parent's spawn
-    // attempt is rejected with `QuotaExceeded`, caught by
-    // `recover_from_child_quota_exceeded`, and the parent's own workflow
-    // task is parked (never terminally failed) so a later poll retries. The
-    // worker polls every 25ms (`runtime_config`'s test default), so a 600ms
-    // window is dozens of retry cycles -- ample time to observe the
-    // negative assertions below without any explicit "parked" detection.
+    // attempt is rejected with `QuotaExceeded`. The
+    // `recover_from_child_quota_exceeded` helper catches it. The parent's own
+    // workflow task is parked, never terminally failed, so a later poll
+    // retries. The worker polls every 25ms (the test default of
+    // `runtime_config`). So a 600ms window is dozens of retry cycles. That is
+    // ample time for the negative assertions below, with no explicit
+    // "parked" detection.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     let child_row_count_sql =
@@ -1412,7 +1424,7 @@ async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
         "no detached child row should exist while the target quota is at cap"
     );
 
-    // Free the quota slot: the blocker execution goes terminal, so the next
+    // Free the quota slot. The blocker execution goes terminal, so the next
     // reclaim of the parent's parked task succeeds.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
@@ -1468,18 +1480,18 @@ fn detached_quota_mixed_parent<'a>(
         )
         .map_err(|e| e.to_string())?;
         // Unlike `detached_quota_parent` above, this handler does NOT return
-        // immediately after the (synchronous, non-suspending) detached-spawn
-        // command -- it also durably suspends on a timer in the SAME decision
-        // cycle. The pending-commands buffer for this cycle therefore carries
-        // BOTH a `SpawnDetachedChildWorkflow` command and a `StartTimer`
-        // command: a MIXED suspension batch, persisted via
-        // `handle_suspended_workflow`'s `persist_started_timer` branch (which
-        // itself calls `DetachedSpawnPersistence::persist` for the co-batched
-        // detached spawn) rather than the terminal-with-commands path the
-        // sibling test above exercises. A `QuotaExceeded` surfacing from
-        // THAT call is caught by `recover_from_child_quota_exceeded`'s OTHER
-        // call site -- `handle_suspended_workflow`'s dispatch tail (issue
-        // #946).
+        // right after the synchronous, non-suspending detached-spawn command.
+        // It also durably suspends on a timer in the SAME decision cycle. So
+        // this cycle's pending-commands buffer carries BOTH a
+        // `SpawnDetachedChildWorkflow` command and a `StartTimer` command.
+        // That MIXED suspension batch persists through the
+        // `persist_started_timer` branch of `handle_suspended_workflow`. The
+        // sibling test above exercises the terminal-with-commands path
+        // instead. The `persist_started_timer` branch itself calls
+        // `DetachedSpawnPersistence::persist` for the co-batched detached
+        // spawn. A `QuotaExceeded` from THAT call reaches the OTHER call site
+        // of `recover_from_child_quota_exceeded`: the dispatch tail of
+        // `handle_suspended_workflow` (issue #946).
         ctx.timer("mixed-batch-tick", 1)
             .await
             .map_err(|e| e.to_string())?;
@@ -1488,15 +1500,16 @@ fn detached_quota_mixed_parent<'a>(
 }
 
 /// A detached child spawn that shares a decision cycle with another
-/// suspending command (a mixed batch -- a detached spawn followed by an
-/// awaited durable timer before the workflow itself suspends) is persisted
-/// via `handle_suspended_workflow`'s dispatch tail, a DIFFERENT
+/// suspending command must ALSO park and wake the parent at cap.
+///
+/// In this mixed batch, a detached spawn precedes an awaited durable timer,
+/// and then the workflow suspends. The batch persists via the dispatch tail
+/// of `handle_suspended_workflow`. That is a DIFFERENT
 /// `recover_from_child_quota_exceeded` call site from the
-/// terminal-with-commands one
+/// terminal-with-commands one that
 /// [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
 /// exercises above. When the detached child's target quota is at cap, this
-/// path must ALSO park + wake the parent rather than terminally failing it
-/// (issue #946).
+/// path must not terminally fail the parent (issue #946).
 #[tokio::test]
 async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_then_succeeds() {
     let _serial = serial().await;
@@ -1542,10 +1555,10 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
     // While the blocker still holds the quota slot, the parent's mixed-batch
-    // spawn attempt is rejected with `QuotaExceeded`, caught by
-    // `recover_from_child_quota_exceeded`'s `handle_suspended_workflow`
-    // dispatch-tail call site, and the parent's own workflow task is parked
-    // (never terminally failed) so a later poll retries.
+    // spawn attempt is rejected with `QuotaExceeded`. The dispatch-tail call
+    // site of `recover_from_child_quota_exceeded` in
+    // `handle_suspended_workflow` catches it. The parent's own workflow task
+    // is parked, never terminally failed, so a later poll retries.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     let child_row_count_sql =
@@ -1563,8 +1576,8 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
         "no detached child row should exist while the target quota is at cap"
     );
 
-    // Free the quota slot: the blocker execution goes terminal, so the next
-    // reclaim of the parent's parked task succeeds and re-drives the SAME
+    // Free the quota slot. The blocker execution goes terminal, so the next
+    // reclaim of the parent's parked task succeeds. It re-drives the SAME
     // mixed-batch decision cycle from the unchanged recorded history.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
@@ -1587,22 +1600,26 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
 // `enforce_quota_admission`. So the `history_bytes` SUM of `load_quota_usage`
 // counted that just-appended event against the very admission deciding
 // whether to allow it. That off-by-one could wrongly REJECT a child spawn
-// that should have succeeded (usage BEFORE this admission was truly zero). Fixed by reordering each site to insert-the-row -> enforce-quota ->
-// THEN append the event, matching the plain start path's established
-// ordering (`start_or_load_workflow_execution_collect`: `enforce_quota_
-// admission` runs before `WorkflowStarted` is appended). A
-// `max_history_bytes(1)` cap makes this deterministic: ANY single
-// `WorkflowStarted`/`ChildWorkflowStarted` event's `pg_column_size` is
-// comfortably over 1 byte, so the pre-fix ordering rejects the spawn on
-// EVERY attempt (the parent never completes, hanging the test until
-// `wait_for_execution_state`'s 10s bound trips) while the fix admits it on
-// the first attempt (zero prior usage for a never-before-seen key, no
-// blocker execution needed).
+// that should have succeeded (usage BEFORE this admission was truly zero).
+// The fix reorders each site to insert-the-row -> enforce-quota -> THEN
+// append the event. That matches the established order of the plain start
+// path: in `start_or_load_workflow_execution_collect`,
+// `enforce_quota_admission` runs before `WorkflowStarted` is appended.
+//
+// A `max_history_bytes(1)` cap makes this deterministic. The
+// `pg_column_size` of ANY single `WorkflowStarted`/`ChildWorkflowStarted`
+// event is comfortably over 1 byte. So the pre-fix order rejects the spawn
+// on EVERY attempt. The parent never completes, and the test hangs until
+// the 10s bound of `wait_for_execution_state` trips. The fix admits it on
+// the first attempt: a never-before-seen key has zero prior usage, and no
+// blocker execution is needed.
 // ---------------------------------------------------------------------------
 
 /// A detached child spawn (`create_detached_child_executions`) must not be
-/// wrongly rejected by its OWN just-appended `WorkflowStarted` event
-/// counting toward the `history_bytes` admission it is itself part of.
+/// wrongly rejected by its OWN just-appended `WorkflowStarted` event.
+///
+/// That event must not count toward the `history_bytes` admission that the
+/// spawn is part of.
 #[tokio::test]
 async fn detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
     let _serial = serial().await;
@@ -1823,11 +1840,12 @@ fn awaited_quota_child<'a>(
 
 /// An awaited child spawn (`persist_all_started_child_workflows`) whose
 /// target type's quota is at cap must not terminally fail the PARENT.
-/// Mirrors [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
-/// exactly, but exercises the DIFFERENT dispatch function that handles a
-/// `StartChildWorkflow` suspension batch (the local `match` arm inline in
-/// `persist_all_started_child_workflows`, not the shared
-/// `recover_from_child_quota_exceeded` helper).
+///
+/// It mirrors [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
+/// exactly. But it exercises the DIFFERENT dispatch function that handles a
+/// `StartChildWorkflow` suspension batch. That is the local `match` arm
+/// inline in `persist_all_started_child_workflows`, not the shared
+/// `recover_from_child_quota_exceeded` helper.
 #[tokio::test]
 async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     let _serial = serial().await;
@@ -1842,9 +1860,9 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     child_info.quota = Some(child_quota_policy);
 
     // Occupy the ONE `max_active_executions` slot for key "acme" with a
-    // blocker of the SAME target type -- see the detached-spawn test above
-    // for why the `MetadataGuard` install and the task-row deletion are both
-    // required for a correct blocker.
+    // blocker of the SAME target type. The detached-spawn test above explains
+    // why a correct blocker needs both the `MetadataGuard` install and the
+    // task-row deletion.
     let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
@@ -1881,10 +1899,10 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
 
     // While the blocker still holds the quota slot, the parent's spawn
     // attempt inside `persist_all_started_child_workflows` is rejected with
-    // `QuotaExceeded`, and the WHOLE transaction (including the parent's own
-    // `ChildWorkflowStarted` append) rolls back -- so the parent never even
-    // reaches a parked-on-child-completion state; it stays exactly where it
-    // started, with the decision cycle retried on every subsequent poll.
+    // `QuotaExceeded`. The WHOLE transaction rolls back, including the
+    // parent's own `ChildWorkflowStarted` append. So the parent never even
+    // reaches a parked-on-child-completion state. It stays exactly where it
+    // started, and every subsequent poll retries the decision cycle.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     let child_row_count_sql =
@@ -2292,10 +2310,10 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
     // While the blocker holds the quota slot, `insert_awaited_child_execution`
-    // rejects with `QuotaExceeded` inside `persist_child_timeout_race`'s
-    // transaction; the whole transaction (child row, timer row, parent event
-    // appends) rolls back and the parent's task is parked, never terminally
-    // failed.
+    // rejects with `QuotaExceeded` inside the transaction of
+    // `persist_child_timeout_race`. The whole transaction rolls back: child
+    // row, timer row and parent event appends. The parent's task is parked,
+    // never terminally failed.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     let child_row_count_sql =
@@ -2724,23 +2742,25 @@ async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
 // covers above).
 // ---------------------------------------------------------------------------
 
-/// Issue #946's success metric: "tenant A submits [a burst of] starts against
-/// `max_active_executions=N` while tenant B operates normally: tenant A
-/// capped at exactly N active executions with 100% of overflow starts
-/// receiving typed 429 [here: the typed `QuotaExceeded` `Err` the HTTP layer
-/// maps to 429]; tenant B's start... success rate unchanged".
+/// Issue #946's success metric: tenant A bursts starts against
+/// `max_active_executions=N` while tenant B operates normally.
 ///
-/// Scaled down from the issue's literal 10,000/100 for CI runtime (the
-/// admission-time behaviour under concurrency does not change with scale —
-/// the SQL-level advisory lock + indexed count this test exercises is the
-/// same code path regardless of burst size), but driven with GENUINE
-/// concurrency: every attempt races against every other attempt on its own
-/// connection via `tokio::spawn`, not a sequential loop.
+/// Tenant A is capped at exactly N active executions. 100% of its overflow
+/// starts receive a typed 429. Here that is the typed `QuotaExceeded` `Err`
+/// that the HTTP layer maps to 429. The start success rate of tenant B stays
+/// unchanged.
+///
+/// The test scales the issue's literal 10,000/100 down for CI runtime.
+/// Admission behaviour under concurrency does not change with scale. The
+/// SQL-level advisory lock and indexed count that this test exercises are
+/// the same code path at any burst size. But the test drives GENUINE
+/// concurrency: every attempt races every other attempt on its own
+/// connection via `tokio::spawn`, not in a sequential loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-// `tenant_a_*`/`tenant_b_*` are deliberately parallel-named (the whole point
-// of the test is a side-by-side comparison of the two tenants' outcomes) --
-// renaming them to satisfy clippy's Levenshtein-distance heuristic would
-// make the assertions below harder to read, not clearer.
+// `tenant_a_*`/`tenant_b_*` are parallel-named on purpose. The test is a
+// side-by-side comparison of the two tenants' outcomes. Renaming them to
+// satisfy the Levenshtein-distance heuristic of clippy would make the
+// assertions below harder to read, not clearer.
 #[allow(clippy::similar_names)]
 async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected() {
     let _serial = serial().await;
@@ -2775,9 +2795,9 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
         }));
     }
     // Tenant B: a small, well-behaved concurrent burst on a DIFFERENT quota
-    // key of the SAME workflow type, interleaved with tenant A's storm so it
-    // genuinely races against the saturated key rather than running before
-    // or after it.
+    // key of the SAME workflow type. It interleaves with tenant A's storm.
+    // So it genuinely races the saturated key rather than running before or
+    // after it.
     for _ in 0..TENANT_B_ATTEMPTS {
         let url = url.clone();
         tasks.push(tokio::spawn(async move {
@@ -2825,10 +2845,10 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
                     assert_eq!(key, "runaway-tenant");
                     tenant_a_rejected += 1;
                 } else {
-                    // Tenant B never has a policy of its own key saturated —
-                    // if it were ever rejected it would prove cross-tenant
-                    // bleed, which the assertions below independently rule
-                    // out via `tenant_b_ok == TENANT_B_ATTEMPTS`.
+                    // Tenant B never has its own key's policy saturated. A
+                    // rejection here would prove cross-tenant bleed. The
+                    // assertions below rule that out independently via
+                    // `tenant_b_ok == TENANT_B_ATTEMPTS`.
                     tenant_b_rejected += 1;
                 }
             }
@@ -2837,8 +2857,8 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
     }
 
     // 100% of tenant A's overflow burst was either admitted (up to the cap)
-    // or received the typed rejection — never anything else, never silently
-    // dropped or a generic 500-class error.
+    // or received the typed rejection. Nothing was silently dropped or got a
+    // generic 500-class error.
     assert_eq!(
         tenant_a_ok + tenant_a_rejected,
         OVERFLOW_ATTEMPTS,
@@ -2856,11 +2876,11 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
         "every overflow start beyond the cap must receive the typed 429-mapped rejection"
     );
 
-    // Tenant B's success rate is completely unaffected by tenant A's
-    // concurrent saturation — the isolation the issue's success metric
-    // requires (a different key on the same workflow type, not merely a
-    // different workflow type, so this proves key-level isolation under
-    // real contention, not just type-level isolation).
+    // Tenant A's concurrent saturation leaves tenant B's success rate
+    // completely unaffected. The issue's success metric requires this
+    // isolation. Tenant B uses a different key on the same workflow type, not
+    // merely a different workflow type. So this proves key-level isolation
+    // under real contention, not just type-level isolation.
     assert_eq!(
         tenant_b_ok, TENANT_B_ATTEMPTS,
         "tenant B (a different quota key) must see a 100% success rate \
@@ -2868,9 +2888,9 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
     );
     assert_eq!(tenant_b_rejected, 0);
 
-    // The persisted state agrees with the in-flight admission decisions —
-    // "capped, not merely slowed" (mirrors the sequential test's own
-    // invariant, now proven to hold under genuine concurrent contention).
+    // The persisted state agrees with the in-flight admission decisions:
+    // "capped, not merely slowed". This is the sequential test's own
+    // invariant, now proven under genuine concurrent contention.
     assert_eq!(
         active_count(&mut conn, wf, "runaway-tenant").await,
         i64::try_from(CAP).expect("CAP fits in i64")
@@ -2882,24 +2902,25 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
 }
 
 // ---------------------------------------------------------------------------
-// P1 regression -- `replace_execution` is a SECOND row-creation branch
-// inside `start_or_load_workflow_execution_collect`'s transaction (reached
-// by `AllowDuplicateFailedOnly`/`TerminateIfRunning`/a conflict-driven
-// `Terminate`), and it originally bypassed quota enforcement entirely.
+// Issue #946 regression: `replace_execution` is a SECOND row-creation branch
+// inside the transaction of `start_or_load_workflow_execution_collect`.
+// `AllowDuplicateFailedOnly`, `TerminateIfRunning` or a conflict-driven
+// `Terminate` reach it. It originally bypassed quota enforcement entirely.
 // Every test above exercises only the `on_conflict_do_nothing()`
-// fresh-insert branch (via `AllowDuplicate`, the default reuse policy) --
-// none of them would have caught this. Each test below targets exactly one
-// of the three `replace_execution` call sites and would have FAILED before
-// the fix (the replace silently succeeded instead of being rejected).
+// fresh-insert branch (via `AllowDuplicate`, the default reuse policy).
+// None of them would have caught this. Each test below targets exactly one
+// of the three `replace_execution` call sites. Each would have FAILED
+// before the fix: the replace silently succeeded instead of being rejected.
 // ---------------------------------------------------------------------------
 
-/// Site 2 (`AllowDuplicateFailedOnly` over a FAILED prior): resurrecting a
-/// terminal row into a fresh ACTIVE execution is a pure net **+1** to the
-/// key's active population (the terminal prior contributed zero before the
-/// replace, so nothing offsets the new row) -- looped across N distinct
-/// `workflow_id`s, each with its own already-failed prior, this is the
-/// concrete "accumulate unbounded active executions well past the declared
-/// cap" vector review agent 1 identified.
+/// Site 2: `AllowDuplicateFailedOnly` over a FAILED prior.
+///
+/// Resurrecting a terminal row into a fresh ACTIVE execution is a pure net
+/// **+1** to the key's active population. The terminal prior contributed
+/// zero before the replace, so nothing offsets the new row. Loop this across
+/// N distinct `workflow_id`s, each with its own already-failed prior. That
+/// is the concrete vector to "accumulate unbounded active executions well
+/// past the declared cap".
 #[tokio::test]
 async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurrection() {
     let _serial = serial().await;
@@ -2921,9 +2942,9 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
     mark_terminal(&mut conn, exec_id, "FAILED").await;
 
     // 2. NOW install a quota policy whose cap is ALREADY saturated by an
-    //    unrelated, distinct-`workflow_id` execution -- so any further
-    //    active admission for key "t1" (including a resurrection of the
-    //    just-failed row above) must be rejected.
+    //    unrelated execution with a distinct `workflow_id`. So any further
+    //    active admission for key "t1" must be rejected. That includes a
+    //    resurrection of the just-failed row above.
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
     let _guard = MetadataGuard::install_one(wf, policy);
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
@@ -2959,10 +2980,11 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 }
 
-/// Site 3 (`TerminateIfRunning` over a genuinely TERMINAL prior, e.g.
-/// COMPLETED): the identical bypass shape as Site 2 above, reached through
-/// the OTHER reuse policy that routes a terminal-existing row into
-/// `replace_execution`.
+/// Site 3: `TerminateIfRunning` over a genuinely TERMINAL prior, e.g.
+/// COMPLETED.
+///
+/// This is the identical bypass shape as Site 2 above. Here the OTHER reuse
+/// policy routes a terminal existing row into `replace_execution`.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_prior() {
     let _serial = serial().await;
@@ -3012,15 +3034,17 @@ async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_p
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 }
 
-/// Site 1 (`ActiveConflictBehavior::Terminate`, existing RUNNING/PAUSED):
-/// unlike Sites 2/3, replacing an ALREADY-active row is a quota-**neutral**
-/// swap for the SAME key (the old row's -1 offsets the new row's +1) -- so
-/// the real bypass here is not about looping against one stable
-/// `workflow_id`, but about the request's resolved key CHANGING between the
-/// original start and the `TerminateIfRunning` replace call. Before the P1
-/// fix this let a caller grow an ALREADY-SATURATED key's population by
-/// retargeting an unrelated, still-running execution at it via
-/// `TerminateIfRunning`, with zero quota check anywhere in the path.
+/// Site 1: `ActiveConflictBehavior::Terminate` over an existing
+/// RUNNING/PAUSED row.
+///
+/// Unlike Sites 2/3, replacing an ALREADY-active row is a quota-**neutral**
+/// swap for the SAME key: the old row's -1 offsets the new row's +1. So the
+/// real bypass here is not a loop against one stable `workflow_id`. It is
+/// the request's resolved key CHANGING between the original start and the
+/// `TerminateIfRunning` replace call. Before the fix, a caller could grow an
+/// ALREADY-SATURATED key's population this way. It retargeted an unrelated,
+/// still-running execution at that key via `TerminateIfRunning`. No quota
+/// check ran anywhere in the path.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolved_key() {
     let _serial = serial().await;
@@ -3085,21 +3109,23 @@ async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolv
         |c| c == 1,
     );
 
-    // The rejection rolled back atomically: no phantom row for the failed
-    // attempt, E is STILL RUNNING under its original key (never sealed --
-    // the whole `replace_execution` call, including the seal step, rolled
-    // back together with the failed quota check), and both keys' active
-    // populations are untouched.
+    // The rejection rolled back atomically. No phantom row exists for the
+    // failed attempt. E is STILL RUNNING under its original key and was
+    // never sealed. The whole `replace_execution` call, seal step included,
+    // rolled back with the failed quota check. Both keys' active populations
+    // are untouched.
     assert_no_execution_row(&mut conn, exec_id_e2).await;
     assert_eq!(row_state(&mut conn, exec_id_e).await, "RUNNING");
     assert_eq!(active_count(&mut conn, wf, "victim-tenant").await, 1);
     assert_eq!(active_count(&mut conn, wf, "attacker-tenant").await, 1);
 }
 
-/// The fix must not over-reject: a `replace_execution` admission still
-/// succeeds normally when the resolved key is well under its cap (Site 2),
-/// and a quota-**neutral** same-key refresh (Site 1) succeeds even when the
-/// key is already exactly at its cap, since it is a net-zero swap.
+/// The fix must not over-reject.
+///
+/// A `replace_execution` admission still succeeds normally when the resolved
+/// key is well under its cap (Site 2). A quota-**neutral** same-key refresh
+/// (Site 1) succeeds even when the key is already exactly at its cap, since
+/// it is a net-zero swap.
 #[tokio::test]
 async fn replace_execution_paths_still_succeed_when_not_over_cap() {
     let _serial = serial().await;
@@ -3130,9 +3156,9 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
         .expect("a replace well under cap must still succeed -- the fix must not over-reject");
     assert_eq!(active_count(&mut conn, wf, "roomy").await, 1);
 
-    // TerminateIfRunning over a RUNNING existing, bringing the key to
-    // EXACTLY its cap first, then a same-key refresh at the cap boundary
-    // (net-zero on active count) must still succeed.
+    // TerminateIfRunning over a RUNNING existing row. First bring the key to
+    // EXACTLY its cap. Then a same-key refresh at the cap boundary must still
+    // succeed, since it is net-zero on the active count.
     let wid2 = format!("wid-{}", Uuid::new_v4().simple());
     let (_exec2, o2) = try_start(
         &mut conn,
@@ -3160,19 +3186,18 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
 /// through the pre-check-cancel shortcut. After it, the path is the atomic
 /// `inline_cancel` + `replace_execution` fallthrough.
 ///
-/// Before the fix, `enforce_quota_before_terminate_pre_check` only ever
-/// subtracted the existing row's own contribution from
-/// `usage.active_executions`, never from `usage.history_bytes` -- so a
-/// same-key refresh under a tight `max_history_bytes` cap would be WRONGLY
-/// REJECTED the moment the row being replaced had accumulated ANY history of
-/// its own, even though that row is about to be sealed out of existence and
-/// contributes nothing to the key's population going forward. The fix
-/// (routing quota-governed keys through the atomic `inline_cancel` +
-/// `replace_execution` path instead) closes this for free: that path seals
-/// the existing row to CANCELLED *before* `enforce_quota_admission` runs, so
-/// the row is excluded from EVERY resource `QUOTA_USAGE_SQL`'s `active` CTE
-/// scopes by state -- `active_executions` and `history_bytes` alike -- with
-/// no special-cased exemption logic required for either.
+/// Before the fix, `enforce_quota_before_terminate_pre_check` subtracted the
+/// existing row's own contribution from `usage.active_executions` only,
+/// never from `usage.history_bytes`. So a same-key refresh under a tight
+/// `max_history_bytes` cap would be WRONGLY REJECTED once the replaced row
+/// had ANY history of its own. Yet that row is about to be sealed out of
+/// existence and adds nothing to the key's population going forward. The
+/// fix routes quota-governed keys through the atomic `inline_cancel` +
+/// `replace_execution` path instead, which closes this for free. That path
+/// seals the existing row to CANCELLED *before* `enforce_quota_admission`
+/// runs. So the `active` CTE of `QUOTA_USAGE_SQL` excludes the row from
+/// EVERY resource it scopes by state, `active_executions` and
+/// `history_bytes` alike. Neither needs special-cased exemption logic.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_history_bytes() {
     let _serial = serial().await;
@@ -3181,9 +3206,9 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
     let wf = leaked("quota_replace_tir_history_bytes");
 
     // A 1-byte cap: any single row's own `WorkflowStarted` event already
-    // exceeds it (mirrors `history_bytes_cap_rejects_once_exceeded`'s
-    // pattern), so this key is only ever "under cap" while it has zero
-    // RUNNING/PAUSED rows of its own.
+    // exceeds it, as in `history_bytes_cap_rejects_once_exceeded`. So this
+    // key is "under cap" only while it has zero RUNNING/PAUSED rows of its
+    // own.
     let policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
     let _guard = MetadataGuard::install_one(wf, policy);
 
@@ -3198,10 +3223,10 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
     outcome.expect("the FIRST start for a key must succeed: usage is zero before it exists");
     assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
 
-    // Sanity check the trap is real: a FRESH, unrelated `workflow_id` under
-    // the SAME key is rejected on `history_bytes` alone, proving the cap is
-    // genuinely breached by the first row's own recorded history (so the
-    // same-key replace below is not vacuously "under cap the whole time").
+    // Sanity check that the trap is real. A FRESH, unrelated `workflow_id`
+    // under the SAME key is rejected on `history_bytes` alone. So the first
+    // row's own recorded history genuinely breaches the cap. The same-key
+    // replace below is then not vacuously "under cap the whole time".
     let (_unrelated_exec, unrelated_outcome) = try_start(
         &mut conn,
         wf,
@@ -3242,14 +3267,14 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
          replaced -- and its own history -- must be excluded from the \
          history_bytes check, not just active_executions",
     );
-    // `inline_cancel` appends a `WorkflowCancelled` event and sets CANCELLED
-    // first, but `replace_execution` then unconditionally seals the SAME
-    // row to CONTINUED_AS_NEW (its own doc comment: "existing is already
-    // sealed above (CONTINUED_AS_NEW) by the time this runs") -- the final
-    // observable state of the atomic `inline_cancel` + `replace_execution`
-    // sequence, pre-existing and unrelated to this fix. Either state
-    // excludes the row from `state IN ('RUNNING', 'PAUSED')`, which is all
-    // that matters for the quota exemption this test proves.
+    // The `inline_cancel` step appends a `WorkflowCancelled` event and sets
+    // CANCELLED first. Then `replace_execution` unconditionally seals the
+    // SAME row to CONTINUED_AS_NEW. Its own doc comment says: "existing is
+    // already sealed above (CONTINUED_AS_NEW) by the time this runs". That
+    // is the final observable state of the atomic `inline_cancel` +
+    // `replace_execution` sequence, pre-existing and unrelated to this fix.
+    // Either state excludes the row from `state IN ('RUNNING', 'PAUSED')`.
+    // That is all that matters for the quota exemption this test proves.
     assert_eq!(row_state(&mut conn, exec_id).await, "CONTINUED_AS_NEW");
     assert_eq!(row_state(&mut conn, exec_id2).await, "RUNNING");
     assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
@@ -3257,21 +3282,22 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
 
 /// A workflow-level retry (issue #523) continuation must NOT be silently
 /// dropped by a per-tenant quota that has since filled up (issue #946).
-/// `start_or_load_workflow_execution_collect` already
-/// exempts a retry continuation from the admission gate (`gate: None`) and
-/// from concurrency-supersede (`concurrency_on_conflict: Defer`) with an
-/// explicit "in-flight continuation, not a fresh admission" rationale --
-/// quota enforcement must follow the same rule, or a legitimate retry with
-/// attempts remaining can be permanently, silently skipped the moment the
-/// tenant's quota happens to be at cap, defeating the workflow's configured
-/// retry policy with no error surfaced anywhere (`worker.rs`'s retry driver
-/// only `tracing::warn!`s and gives up on any `Err`).
 ///
-/// This test also proves the exemption is scoped correctly: a genuinely
-/// FRESH start for the SAME over-cap key is still rejected -- the retry
-/// exemption is not a blanket bypass -- and the retry's row is still
-/// correctly tagged with `quota_key` for future usage accounting, even
-/// though this one admission was not checked against it.
+/// The `start_or_load_workflow_execution_collect` function already exempts a
+/// retry continuation from the admission gate (`gate: None`). It also
+/// exempts it from concurrency-supersede (`concurrency_on_conflict: Defer`).
+/// The explicit rationale is "in-flight continuation, not a fresh
+/// admission". Quota enforcement must follow the same rule. Otherwise a
+/// legitimate retry with attempts remaining can be permanently, silently
+/// skipped once the tenant's quota is at cap. That defeats the workflow's
+/// configured retry policy with no error surfaced anywhere. The retry
+/// driver in `worker.rs` only `tracing::warn!`s and gives up on any `Err`.
+///
+/// This test also proves that the exemption is scoped correctly. A genuinely
+/// FRESH start for the SAME over-cap key is still rejected, so the retry
+/// exemption is not a blanket bypass. The retry's row is still tagged with
+/// `quota_key` for future usage accounting. Only this one admission skips
+/// the check against it.
 #[tokio::test]
 async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuation() {
     let _serial = serial().await;
@@ -3309,9 +3335,9 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
     );
 
     // A workflow-level retry continuation for the SAME over-cap tenant key
-    // must succeed despite the cap: `retry_of_exec_id` is `Some` at exactly
-    // one call site in the whole engine -- the retry driver in `worker.rs`
-    // -- so setting it here is a faithful stand-in for a real retry.
+    // must succeed despite the cap. Only one call site in the whole engine
+    // sets `retry_of_exec_id` to `Some`: the retry driver in `worker.rs`. So
+    // setting it here is a faithful stand-in for a real retry.
     let retry_exec_id = ExecutionId::new();
     let retry_workflow_id = format!("wid-retry-{}", Uuid::new_v4().simple());
     let mut retry_params = params(wf, &retry_workflow_id, retry_exec_id, input);
@@ -3326,9 +3352,9 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
         )
     });
 
-    // The retry's own row is still correctly tagged for FUTURE usage
-    // accounting -- only this one admission was exempt from enforcement,
-    // not from the key resolution/tagging itself.
+    // The retry's own row is still tagged for FUTURE usage accounting. Only
+    // this one admission was exempt from enforcement, not the key
+    // resolution and tagging.
     let retry_row = load_execution(&mut conn, retry_exec_id).await;
     assert_eq!(
         retry_row.quota_key.as_deref(),
@@ -3336,9 +3362,9 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
         "a retry-exempt admission must still stamp quota_key for later accounting"
     );
 
-    // The key's active population is now 2 (the original + the retry),
-    // genuinely over the declared cap of 1 -- the exemption let the cap be
-    // exceeded for this in-flight continuation, exactly as intended.
+    // The key's active population is now 2 (the original + the retry). That
+    // is genuinely over the declared cap of 1. The exemption let this
+    // in-flight continuation exceed the cap, exactly as intended.
     assert_eq!(active_count(&mut conn, wf, "acme").await, 2);
 }
 
@@ -3347,19 +3373,20 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
 // before indexing them")
 // ---------------------------------------------------------------------------
 //
-// `key_expr` is an author-declared, trusted dot-path, but the VALUE it
-// resolves to comes straight from caller-controlled workflow input, and is
-// otherwise unbounded before it reaches the INDEXED `quota_key` column on
-// `harvest_workflow_executions`. An oversized resolved key must be rejected
-// cleanly at admission time -- before any DB write -- rather than risk a raw
-// Postgres "index row size exceeds maximum for index" error surfacing as an
-// unhandled `500`.
+// `key_expr` is an author-declared, trusted dot-path. But the VALUE it
+// resolves to comes straight from caller-controlled workflow input. Nothing
+// else bounds it before it reaches the INDEXED `quota_key` column on
+// `harvest_workflow_executions`. So admission must reject an oversized
+// resolved key cleanly, before any DB write. Otherwise a raw Postgres "index
+// row size exceeds maximum for index" error could surface as an unhandled
+// `500`.
 
 /// The money test: a resolved key longer than [`MAX_QUOTA_KEY_BYTES`] is
-/// rejected with a typed [`HarvestError::PayloadTooLarge`] (never an
-/// uncontrolled database error), and the rejection rolls back atomically --
-/// no phantom execution or task-queue row survives it, exactly like a
-/// resource-cap rejection (AC4).
+/// rejected with a typed [`HarvestError::PayloadTooLarge`].
+///
+/// It is never an uncontrolled database error. The rejection rolls back
+/// atomically, exactly like a resource-cap rejection (AC4). No phantom
+/// execution or task-queue row survives it.
 #[tokio::test]
 async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
     let _serial = serial().await;
@@ -3409,9 +3436,11 @@ async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
 }
 
 /// The bound itself must be admissible end to end through the real admission
-/// path (not just the pure `quota_key_over_cap` helper, which `quota.rs`'s
-/// own unit tests already cover in isolation) -- only a key STRICTLY over
-/// [`MAX_QUOTA_KEY_BYTES`] is rejected.
+/// path.
+///
+/// The unit tests in `quota.rs` already cover the pure `quota_key_over_cap`
+/// helper in isolation. Only a key STRICTLY over [`MAX_QUOTA_KEY_BYTES`] is
+/// rejected.
 #[tokio::test]
 async fn quota_key_exactly_at_the_length_bound_is_admitted() {
     let _serial = serial().await;
@@ -3437,14 +3466,14 @@ async fn quota_key_exactly_at_the_length_bound_is_admitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946 — "Validate cross-type continuation
-// quota keys before insertion". Mirrors
-// `oversized_resolved_quota_key_is_rejected_before_any_db_write` above, but
-// for the CROSS-TYPE `continue_as_new_as_type` path
-// (`persist_workflow_continue_as_new`'s successor-key bound check), which
+// Issue #946 — "Validate cross-type continuation quota keys before
+// insertion". This mirrors
+// `oversized_resolved_quota_key_is_rejected_before_any_db_write` above for
+// the CROSS-TYPE `continue_as_new_as_type` path. That path is the
+// successor-key bound check of `persist_workflow_continue_as_new`. It
 // resolves the key against the TARGET type's own declared policy and the
-// FRESH successor input rather than the fresh-admission path this file's
-// other oversized-key test drives directly.
+// FRESH successor input. The other oversized-key test in this file drives
+// the fresh-admission path directly instead.
 // ---------------------------------------------------------------------------
 
 fn oversized_key_phase_one<'a>(
@@ -3471,14 +3500,17 @@ fn oversized_key_phase_one<'a>(
     })
 }
 
-/// A cross-type continuation whose successor quota key -- resolved against
-/// the TARGET type's own declared policy and the FRESH successor input --
-/// exceeds [`MAX_QUOTA_KEY_BYTES`] must be rejected before the successor row
-/// is ever inserted, terminally failing the PREDECESSOR with the exact typed
-/// <code>[HarvestError::PayloadTooLarge]{kind: QuotaKey, ..}</code> shape -- never a
-/// silent truncation/aliasing, and never a raw Postgres index-size error
-/// surfacing as an unhandled worker crash. Worker-driven end to end, mirroring
-/// `continue_as_new_cross_type_re_resolves_quota_key`'s harness pattern.
+/// A cross-type continuation with an oversized successor quota key must be
+/// rejected before the successor row is ever inserted.
+///
+/// The key resolves against the TARGET type's own declared policy and the
+/// FRESH successor input, and exceeds [`MAX_QUOTA_KEY_BYTES`]. The
+/// PREDECESSOR then fails terminally with the exact typed
+/// <code>[HarvestError::PayloadTooLarge]{kind: QuotaKey, ..}</code> shape.
+/// It is never a silent truncation/aliasing. It is never a raw Postgres
+/// index-size error that surfaces as an unhandled worker crash. The test is
+/// worker-driven end to end, like the harness of
+/// `continue_as_new_cross_type_re_resolves_quota_key`.
 #[tokio::test]
 async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
     let _serial = serial().await;
@@ -3502,9 +3534,9 @@ async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
     )
     .await;
 
-    // A generous resource cap on the TARGET type -- the rejection below must
-    // be attributable to the KEY LENGTH bound, not any active-executions
-    // count (mirrors `oversized_resolved_quota_key_is_rejected_before_any_db_write`).
+    // A generous resource cap on the TARGET type. The rejection below must
+    // come from the KEY LENGTH bound, not any active-executions count. This
+    // mirrors `oversized_resolved_quota_key_is_rejected_before_any_db_write`.
     let mut target = wf_info(phase2, phase_two);
     target.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(1000));
 
@@ -3715,27 +3747,27 @@ fn quota_trigger_target<'a>(
     Box::pin(async move { Ok(serde_json::json!("target_done")) })
 }
 
-/// A completion trigger firing on the SAME shard as its source, whose TARGET
-/// workflow type's per-tenant quota is exhausted, must not roll back the
-/// source's own terminal commit. `evaluate_triggers_for_execution`'s
-/// `QuotaExceeded` arm falls back to the SAME durable outbox +
-/// `DeferredTriggerStart` retry machinery the cross-shard branch already
-/// uses (`target_shard == source_shard` here), rather than returning `Err`
-/// and letting it propagate out of the whole terminal-sealing transaction.
+/// A same-shard completion trigger whose TARGET type's per-tenant quota is
+/// exhausted must not roll back the source's own terminal commit.
+///
+/// The `QuotaExceeded` arm of `evaluate_triggers_for_execution` falls back to
+/// the SAME durable outbox + `DeferredTriggerStart` retry machinery that the
+/// cross-shard branch already uses (`target_shard == source_shard` here). It
+/// does not return `Err` and let it propagate out of the whole
+/// terminal-sealing transaction.
 #[tokio::test]
 async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    // `evaluate_triggers_for_execution` (issue #605's completion-trigger
-    // machinery) resolves shard routing via the process-global
-    // `GLOBAL_SHARD_ROUTER`/`GLOBAL_SHARDED_POOL` statics -- unlike the
-    // direct `start_or_load_workflow_execution`/child-spawn paths this
-    // file's other tests exercise, which need no router at all. Install a
-    // clean single-shard topology so `target_shard == source_shard` and the
-    // SAME-SHARD inline-start branch (the one carrying this test's P1 #1
-    // fix under test) is what actually runs, mirroring the convention in
+    // `evaluate_triggers_for_execution` (the completion-trigger machinery of
+    // issue #605) resolves shard routing via the process-global
+    // `GLOBAL_SHARD_ROUTER`/`GLOBAL_SHARDED_POOL` statics. The direct
+    // `start_or_load_workflow_execution` and child-spawn paths of the other
+    // tests need no router at all. Install a clean single-shard topology so
+    // `target_shard == source_shard`. Then the SAME-SHARD inline-start branch
+    // runs, which carries the fix under test. This mirrors the convention in
     // `workflow_id_targeted_tests.rs`/`transactional_start_tests.rs`.
     autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
     let sharded_pool = autumn_harvest::shard::ShardedDbPool::single(build_test_pool(&url));
@@ -3747,21 +3779,21 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     let mut target_info = wf_info(target_wf, quota_trigger_target);
     target_info.quota = Some(target_quota_policy);
 
-    // `evaluate_triggers_for_execution` (like every other worker-driven admit
-    // path -- awaited/detached/timeout-race child spawn) resolves the
-    // target's declared quota policy from `GLOBAL_WORKFLOW_METADATA`, but
-    // that global is UNCONDITIONALLY REBUILT from the registry's own
-    // `WorkflowInfo.quota` fields the moment `HandlerRegistry::with_state*`
-    // runs (`worker.rs`, mirroring how it also seeds `concurrency`/`sla`/
-    // `retry_policy`) -- so a `MetadataGuard` held across `build_runtime_worker`
-    // below would be silently clobbered the instant the worker's registry is
-    // constructed. The guard is therefore used ONLY to seed the blocker's own
-    // admission via `start_root` (the bare/fresh path, which reads the SAME
-    // global directly with no registry in the loop) and dropped immediately
-    // after, exactly like the passing
+    // `evaluate_triggers_for_execution` resolves the target's declared quota
+    // policy from `GLOBAL_WORKFLOW_METADATA`, like every other worker-driven
+    // admit path (awaited, detached and timeout-race child spawns). But
+    // `HandlerRegistry::with_state*` UNCONDITIONALLY REBUILDS that global from
+    // the registry's own `WorkflowInfo.quota` fields. See `worker.rs`, which
+    // seeds `concurrency`/`sla`/`retry_policy` the same way. So a
+    // `MetadataGuard` held across `build_runtime_worker` below would be
+    // silently clobbered the instant the worker's registry is constructed.
+    // The guard therefore ONLY seeds the blocker's own admission via
+    // `start_root`. That bare, fresh path reads the SAME global directly,
+    // with no registry in the loop. The guard is dropped right after, exactly
+    // like the passing
     // `awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds`
-    // test above; `target_info.quota` is what makes the trigger's own
-    // admission see the policy once the worker is running.
+    // test above. Once the worker runs, `target_info.quota` is what makes the
+    // trigger's own admission see the policy.
     let guard = MetadataGuard::install_one(target_wf, target_quota_policy);
 
     // Occupy the ONE `max_active_executions` slot for key "acme", then
@@ -3837,11 +3869,11 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
     // The money assertion: the source reaches COMPLETED even though its
-    // trigger's target is at quota cap. Pre-fix, `Err(QuotaExceeded)`
-    // propagating out of `evaluate_triggers_for_execution` rolled back the
-    // WHOLE persist transaction -- including the source's own
-    // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
-    // error ever recorded.
+    // trigger's target is at quota cap. Before the fix, `Err(QuotaExceeded)`
+    // propagated out of `evaluate_triggers_for_execution`. That rolled back
+    // the WHOLE persist transaction, including the source's own
+    // `WorkflowCompleted` append. The source stayed stuck RUNNING forever,
+    // with no error ever recorded.
     //
     // One decision cycle resolves the target quota, writes the outbox row and
     // completes the source. The 30 s bound absorbs a loaded CI runner.
@@ -3890,10 +3922,10 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
         "no target execution should exist while the target's quota is at cap"
     );
 
-    // Free the quota slot -- the outbox sweep (`enforce_completion_triggers_outbox`,
-    // folded into the worker's background timeout-checker loop, ticking every
-    // `poll_interval`) should now retry the deferred row and successfully
-    // start the target.
+    // Free the quota slot. The outbox sweep should now retry the deferred row
+    // and start the target. That sweep is `enforce_completion_triggers_outbox`,
+    // folded into the background timeout-checker loop of the worker, which
+    // ticks every `poll_interval`.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
     // A wider bound than the usual 10s default (issue #1685's Semaphore
@@ -4236,7 +4268,7 @@ async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
     .await;
 
     // Bracket the write with DB-clock reads taken just before and just
-    // after (Codex review on this PR). The actual `clock_timestamp()`
+    // after (issue #1392). The actual `clock_timestamp()`
     // write happens somewhere inside this call, at a point this test never
     // observes directly. A single `db_clock_now()` sampled only afterward
     // would be a fixed race instead. Any scheduling delay between the
@@ -4349,7 +4381,7 @@ async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
         .id;
 
     // Bracket the write with DB-clock reads taken just before and just
-    // after (Codex review on this PR). See
+    // after (issue #1392). See
     // `assert_next_attempt_at_matches_backoff_on_db_clock`'s doc comment
     // for why a single post-hoc clock probe races a loaded test run.
     let before = queue::db_clock_now(&mut conn)

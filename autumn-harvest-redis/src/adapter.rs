@@ -1,12 +1,11 @@
 //! The [`TaskQueueAdapter`] trait and the value types that flow through it.
 //!
 //! The trait captures the operations that any backend-agnostic Harvest worker
-//! performs on a task queue. The Postgres-backed implementation in the
-//! `autumn-harvest` core crate is a non-trivial refactor away from the
-//! function-shaped API used by `worker.rs` today, so the trait currently has
-//! one production implementation: [`crate::RedisTaskQueue`]. Worker integration
-//! is documented in the crate-level `README` and is intended as the next step
-//! after this scaffolding lands.
+//! performs on a task queue. A Postgres implementation in the `autumn-harvest`
+//! core crate needs a refactor of the function-shaped API that `worker.rs`
+//! uses today. So the trait has one production implementation:
+//! [`crate::RedisTaskQueue`]. The crate-level `README` documents worker
+//! integration, which is the next step.
 //!
 //! Returning [`ClaimedTask`] instead of a bare `TaskEnvelope` keeps the
 //! ack-handle (Redis stream entry id, in our case) opaque to the worker. The
@@ -22,9 +21,9 @@ use crate::error::RedisAdapterResult;
 
 /// A task returned by [`TaskQueueAdapter::claim`].
 ///
-/// The `entry_id` is opaque to the caller -- it identifies the underlying
-/// stream entry (or row, in a SQL backend) so the adapter can later XACK or
-/// XCLAIM the same entry on `complete`/`fail`/`record_heartbeat`.
+/// The `entry_id` is opaque to the caller. It identifies the stream entry (or
+/// row, in a SQL backend), so the adapter can later XACK or XCLAIM that entry
+/// on `complete`/`fail`/`record_heartbeat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedTask {
     /// Backend-specific entry handle. For Redis Streams this is the
@@ -53,10 +52,9 @@ pub type AdapterFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output
 
 /// Backend-agnostic task queue interface.
 ///
-/// Implementors must provide at-least-once delivery: a task that has been
-/// claimed but not subsequently acknowledged via [`Self::complete`],
-/// [`Self::fail`], or [`Self::requeue_for_retry`] before its visibility
-/// timeout expires must become claimable again.
+/// Implementors must provide at-least-once delivery. A claimed task must
+/// become claimable again if its visibility timeout expires before
+/// [`Self::complete`], [`Self::fail`] or [`Self::requeue_for_retry`] acknowledges it.
 ///
 /// Implement it with `#[async_trait]` on the `impl` block and `async fn`
 /// methods. The method signatures here are the ones that `#[async_trait]`
@@ -65,9 +63,9 @@ pub type AdapterFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output
 pub trait TaskQueueAdapter: Send + Sync {
     /// Add a new task to the queue.
     ///
-    /// Returns the producer-assigned `task_id`. If `params.scheduled_at` is in
-    /// the future, the task is parked in a delayed set until it becomes due
-    /// rather than appearing immediately on the claimable stream.
+    /// Returns the producer-assigned `task_id`. A task with a future
+    /// `params.scheduled_at` waits in a delayed set until it is due, and only
+    /// then goes on the claimable stream.
     fn enqueue<'life0, 'async_trait>(
         &'life0 self,
         params: EnqueueParams,

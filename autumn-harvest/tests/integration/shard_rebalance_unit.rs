@@ -5,22 +5,22 @@
 //!
 //! Three surfaces are covered here:
 //!
-//! 1. **The quiescence predicate** (`shard_rebalance::assess_quiescence`) — the
+//! 1. **The quiescence predicate** (`shard_rebalance::assess_quiescence`): the
 //!    single decision that says whether an execution may move at all. It is a
-//!    pure function over an explicitly-gathered observation precisely so every
-//!    blocker is exhaustively testable without Postgres; the first draft of it
-//!    ("no task rows at all") would have refused to migrate every timer-parked
-//!    workflow, i.e. the entire population the feature exists to move.
-//! 2. **The phase machine** (`shard_rebalance::next_migration_action`) — what a
-//!    resume sweep does with a migration row it finds after a crash, for every
-//!    phase. This is the kill-point contract in pure form.
-//! 3. **Forward-chain resolution** (`shard_rebalance::resolve_forward_chain`) —
-//!    the bounded A→B→C hop following that makes a pre-migration `ExecutionId`
-//!    keep resolving.
+//!    pure function over an explicitly gathered observation, so every blocker
+//!    is exhaustively testable without Postgres. Its first draft ("no task
+//!    rows at all") would have refused to migrate every timer-parked workflow.
+//!    That is the entire population the feature exists to move.
+//! 2. **The phase machine** (`shard_rebalance::next_migration_action`): what a
+//!    resume sweep does, for every phase, with a migration row it finds after
+//!    a crash. This is the kill-point contract in pure form.
+//! 3. **Forward-chain resolution** (`shard_rebalance::resolve_forward_chain`):
+//!    the bounded A→B→C hop following that keeps a pre-migration `ExecutionId`
+//!    resolving.
 //!
-//! The multi-shard *runtime* coverage (real copies onto a second database, real
-//! cutover, real kill points) lives in `shard_rebalance_db_tests.rs`, which
-//! needs Postgres.
+//! `shard_rebalance_db_tests.rs` holds the multi-shard *runtime* coverage: real
+//! copies onto a second database, real cutover, real kill points. It needs
+//! Postgres.
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::shard_rebalance::{
@@ -60,12 +60,12 @@ fn timer_parked() -> QuiescenceObservation {
 /// The other common long-lived shape: parked on a signal, with no timer at all.
 ///
 /// Structurally identical to [`timer_parked`] as far as the predicate is
-/// concerned — both leave exactly one workflow task row in a parked shape — and
-/// that identity is the point. The observation deliberately does **not** record
-/// *which* park it is, because the migration treats them the same: the row is
-/// copied verbatim either way. The DB suite
-/// (`a_signal_parked_execution_migrates_with_its_parked_task_row`) is what pins
-/// the two physically-different row shapes.
+/// concerned. Both leave exactly one workflow task row in a parked shape, and
+/// that identity is the point. The observation deliberately does **not**
+/// record *which* park it is. The migration treats them the same: it copies
+/// the row verbatim either way. The DB suite
+/// (`a_signal_parked_execution_migrates_with_its_parked_task_row`) pins the two
+/// physically different row shapes.
 fn signal_parked() -> QuiescenceObservation {
     timer_parked()
 }
@@ -82,7 +82,7 @@ fn blockers(obs: &QuiescenceObservation) -> Vec<QuiescenceBlocker> {
 #[test]
 fn a_timer_parked_execution_is_migratable() {
     // The load-bearing case. An execution waiting on a timer keeps its workflow
-    // task row in the *parked* shape (`RUNNING`, no worker, no start time), so a
+    // task row in the *parked* shape (`RUNNING`, no worker, no start time). A
     // naive "no task rows" predicate would refuse exactly the population this
     // feature exists to move.
     assert_eq!(assess_quiescence(&timer_parked()), Quiescence::Eligible);
@@ -227,10 +227,10 @@ fn holding_a_durable_mutex_blocks_migration() {
 
 #[test]
 fn being_queued_for_a_durable_mutex_blocks_migration() {
-    // The sharper of the two: a waiter looks perfectly parked — no task in
-    // flight, nothing claimed — but its grant is delivered by waking it on
-    // THIS shard. Migrate it and the grant lands on a sealed row: a lost wake,
-    // which is the exact failure the quiescence bar exists to prevent.
+    // The sharper of the two. A waiter looks perfectly parked: no task in
+    // flight, nothing claimed. But its grant is delivered by waking it on THIS
+    // shard. Migrate it and the grant lands on a sealed row. That is a lost
+    // wake, the exact failure the quiescence bar exists to prevent.
     let obs = QuiescenceObservation {
         queued_mutex_waiters: 1,
         ..timer_parked()
@@ -285,11 +285,11 @@ fn every_non_running_state_blocks_migration() {
 
 #[test]
 fn a_paused_execution_is_not_migratable_and_says_so() {
-    // `PAUSED` is a STATE, not a column — the first draft of this design note
-    // had it the other way round. The predicate admits `RUNNING` only, so a
-    // paused root is skipped with a named reason rather than silently moved
-    // under a half-supported code path (the copy and the cutover both key on
-    // `RUNNING`, and activation would have to carry the original state through).
+    // `PAUSED` is a STATE, not a column. The first draft of this design note
+    // had it the other way round. The predicate admits `RUNNING` only. So it
+    // skips a paused root with a named reason, rather than silently moving it
+    // under a half-supported code path. The copy and the cutover both key on
+    // `RUNNING`, and activation would have to carry the original state through.
     // The decommission runbook lists the remedy: resume, migrate, re-pause.
     let obs = QuiescenceObservation {
         state: "PAUSED".to_string(),
@@ -488,10 +488,10 @@ fn an_over_long_chain_fails_closed_rather_than_looping() {
 
 #[test]
 fn the_hop_bound_is_small_enough_to_bound_a_routing_call() {
-    // Not a restatement of the literal: the property that matters is that the
-    // bound is small enough that following it is cheap on a routing path, and
-    // at least long enough for the chains a real deployment produces (a run
-    // migrated twice before the collapse catches up needs 2).
+    // Not a restatement of the literal. The bound must be small enough that
+    // following it is cheap on a routing path. It must also cover the chains a
+    // real deployment produces: a run migrated twice before the collapse
+    // catches up needs 2.
     assert!(
         (2..=8).contains(&MAX_FORWARD_HOPS),
         "the hop bound must leave room for a real chain without making a \
@@ -504,11 +504,11 @@ fn the_hop_bound_is_small_enough_to_bound_a_routing_call() {
 use autumn_harvest::ShardRouter;
 
 fn successor_router() -> ShardRouter {
-    // Shard 0 has been drained and REMOVED from the readable set; shard 2 is
-    // its successor. The successor is deliberately NOT the default shard (1):
-    // with `default == successor` every assertion below would also pass for a
-    // `with_shard_forwards` that did nothing at all, since the unknown-shard
-    // fallback already answers the default.
+    // Shard 0 is drained and REMOVED from the readable set. Shard 2 is its
+    // successor. The successor is deliberately NOT the default shard (1). With
+    // `default == successor`, every assertion below would also pass for a
+    // `with_shard_forwards` that did nothing, since the unknown-shard fallback
+    // already answers the default.
     ShardRouter::new(
         vec![ShardId::new(1), ShardId::new(2)],
         vec![ShardId::new(1), ShardId::new(2)],
@@ -581,10 +581,9 @@ fn the_forward_map_is_empty_by_default() {
 
 #[test]
 fn the_forward_map_is_surfaced_in_the_router_parts_projection() {
-    // `parts()` is the coverage guard the admin config snapshot destructures
-    // exhaustively, so a placement-affecting field that is missing here is a
-    // compile error rather than a silently unobservable divergence between
-    // replicas.
+    // The admin config snapshot destructures `parts()` exhaustively as its
+    // coverage guard. So a placement-affecting field missing here is a compile
+    // error, not a silently unobservable divergence between replicas.
     let router = successor_router();
     let parts = router.parts();
     assert_eq!(parts.shard_forwards.len(), 1);
@@ -632,12 +631,11 @@ fn forwarding_to_an_unreadable_shard_panics_at_construction() {
 #[test]
 #[should_panic(expected = "is still in the readable set")]
 fn a_chain_of_router_forwards_is_structurally_impossible() {
-    // A chain needs no dedicated rule, and asserting one would be dead code: a
-    // forward's SOURCE must be outside `readable_shards` while its TARGET must
-    // be inside it, so the middle shard of a chain would have to be both. The
-    // readable-set assertion is what actually rejects it, and that is exactly
-    // why `shard_for_execution`'s single hop is exhaustive by construction
-    // rather than by a hop counter.
+    // A chain needs no dedicated rule, and asserting one would be dead code. A
+    // forward's SOURCE must be outside `readable_shards` and its TARGET inside
+    // it. So the middle shard of a chain would have to be both. The
+    // readable-set assertion rejects it. That is why the single hop of
+    // `shard_for_execution` is exhaustive by construction, not by a hop counter.
     let _ = ShardRouter::new(
         vec![ShardId::new(1), ShardId::new(2)],
         vec![ShardId::new(2)],
@@ -678,7 +676,7 @@ fn an_unencoded_execution_id_still_resolves_to_the_default_shard() {
 //
 // Verification compares a fingerprint of the source's history against the
 // target's. A fingerprint that returned a constant would pass every migration
-// and every test that merely compares it to itself, so these pin that it
+// and every test that merely compares it to itself. So these tests pin that it
 // *separates* histories that replay to different next-command states.
 
 use chrono::Utc;
@@ -752,9 +750,9 @@ fn the_fingerprint_separates_a_truncated_history() {
 #[test]
 fn the_fingerprint_separates_signal_multiplicity() {
     // Two deliveries of the SAME signal name replay to a different
-    // next-command state than one, and the cursor half of the fingerprint is
-    // what has to notice: the event list alone would differ too, but this pins
-    // that the unconsumed-signal counts are part of what is hashed.
+    // next-command state than one. The cursor half of the fingerprint has to
+    // notice. The event list alone would differ too, but this pins that the
+    // unconsumed-signal counts are part of the hash.
     let one = vec![started(json!({})), signal("go")];
     let two = vec![started(json!({})), signal("go"), signal("go")];
     assert_ne!(history_fingerprint(&one), history_fingerprint(&two));
@@ -773,12 +771,12 @@ fn the_fingerprint_separates_an_empty_history_from_a_started_one() {
 #[test]
 fn a_schedule_attributed_execution_is_blocked_from_migrating() {
     // A schedule row does not move with its runs, and its overlap enforcement
-    // is shard-local: the tick counts RUNNING/PAUSED executions on its OWN
-    // shard for `max_active_runs`, and CancelOther/TerminateOther cancel priors
+    // is shard-local. The tick counts RUNNING/PAUSED executions on its OWN
+    // shard for `max_active_runs`. CancelOther/TerminateOther cancel priors
     // with the same shard-local query. After a migration the local row reads
-    // MIGRATED, so the scheduler stops counting the still-running copy and
-    // stops cancelling it — it silently exceeds its own cap, or starts a run
-    // without terminating the prior it was told to replace.
+    // MIGRATED. So the scheduler stops counting the still-running copy and
+    // stops cancelling it. The schedule then silently exceeds its own cap, or
+    // starts a run without terminating the prior it was told to replace.
     let obs = QuiescenceObservation {
         schedule_attributed: true,
         ..timer_parked()

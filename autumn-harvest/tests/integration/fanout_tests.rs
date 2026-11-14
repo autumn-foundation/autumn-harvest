@@ -1592,7 +1592,7 @@ where
     panic!("windowed fan-out resume drive did not terminate within 1000 cycles");
 }
 
-/// FINDING 1 (determinism-critical): a fan-out whose window is **increased**
+/// Determinism-critical: a fan-out whose window is **increased**
 /// across a partial suspension must **resume the already-scheduled in-flight
 /// prefix as a homogeneous batch**. It never regroups an in-flight slot with
 /// never-scheduled fresh slots into a mixed
@@ -1730,9 +1730,10 @@ async fn windowed_fan_out_resumes_under_increased_window() {
     );
 }
 
-/// FINDING 1 (decrease direction): a fan-out re-driven under a **decreased**
-/// window must still resume the ENTIRE already-scheduled in-flight prefix, up
-/// to the old, larger window, as one homogeneous all-`WaitForActivity` batch.
+/// Decrease direction: a fan-out re-driven under a **decreased** window must
+/// still resume the ENTIRE already-scheduled in-flight prefix. That prefix
+/// reaches the old, larger window. It resumes as one homogeneous
+/// all-`WaitForActivity` batch.
 /// Dispatched work cannot be un-dispatched, so the resume batch waits on all of
 /// it. Recorded under `W1=4` (all 4 scheduled, all in-flight);
 /// re-driven under `W2=2`.

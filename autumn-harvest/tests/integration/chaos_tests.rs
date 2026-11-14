@@ -2,17 +2,17 @@
 //! Deterministic chaos / fault-injection reproducers and convergence sweep
 //! (issue #940).
 //!
-//! Each of the four historical race classes is reproduced here as a *seeded /
-//! scripted* fault at a named injection point (`autumn_harvest::chaos::points`),
-//! driven against a real Postgres. Every reproducer FAILS on the pre-fix engine
-//! shape and PASSES on the current one; the RED procedure is documented inline
-//! next to each so a reviewer can reproduce the failing shape in one edit.
+//! Each of the four historical race classes has a *seeded / scripted* fault
+//! here, at a named injection point (`autumn_harvest::chaos::points`). Each
+//! runs against a real Postgres. Every reproducer FAILS on the pre-fix engine
+//! shape and PASSES on the current one. Each documents its RED procedure
+//! inline, so a reviewer can reproduce the failing shape in one edit.
 //!
 //! The convergence sweep ([`chaos_seeded_convergence_sweep`]) runs a bounded
-//! workload under `ChaosPlan::seeded(seed)` for each of N documented seeds and
-//! asserts the engine still reaches the convergence invariant: every workflow
-//! terminal-or-parked, no task stranded `RUNNING` with a dead worker, no
-//! `ExternalSignalRequested` without an eventual terminal (issue #940 AC5).
+//! workload under `ChaosPlan::seeded(seed)` for each of N documented seeds.
+//! It asserts the convergence invariant (issue #940 AC5). Every workflow is
+//! terminal or parked. No task is stranded `RUNNING` with a dead worker. No
+//! `ExternalSignalRequested` lacks an eventual terminal.
 //!
 //! ## Determinism / replay (AC3)
 //!
@@ -90,10 +90,12 @@ async fn chaos_noop(
     Ok(serde_json::json!("ok"))
 }
 
-/// Sends one external signal to the `target` execution named in its input, then
-/// completes — the caller that reaches `persist_external_signal_inline` and so
-/// the `OUTBOX_INLINE_AFTER_REQUESTED` window (issue #492 / AC4). The target is
-/// passed as an `ExecutionId` string in `input["target"]`.
+/// Sends one external signal to the `target` execution in its input, then
+/// completes.
+///
+/// It reaches `persist_external_signal_inline`, and so the
+/// `OUTBOX_INLINE_AFTER_REQUESTED` window (issue #492 / AC4). The target is
+/// an `ExecutionId` string in `input["target"]`.
 #[workflow]
 async fn chaos_signal_external(
     ctx: &WorkflowContext,
@@ -113,22 +115,21 @@ async fn chaos_signal_external(
 // ── DB setup ────────────────────────────────────────────────────────────────
 
 /// Serialises entire chaos-test bodies against each other on a *shared*
-/// database. Acquired at the top of every chaos test (inside [`chaos_db`],
-/// before the scrub) and held — via the returned guard — for the test's whole
-/// lifetime.
+/// database. Every chaos test takes it first, inside [`chaos_db`] before the
+/// scrub. The returned guard holds it for the test's whole lifetime.
 ///
-/// Without this, the `HARVEST_TEST_DATABASE_URL` path run with the integration
-/// binary's default (parallel) test threads is nondeterministic: [`scrub`]'s
-/// global `TRUNCATE` happens *before* the harness's own `SERIAL` mutex is
-/// acquired (that lock only guards armed plans, from `arm()` onward), and the
-/// session-lease test never arms at all — so one test's scrub could erase
-/// another test's live workflows mid-run. This lock is a strict superset of the
-/// harness `SERIAL`: it also covers the pre-arm scrub and the non-arming tests,
-/// so the documented shared-DB invocation is deterministic regardless of
-/// `--test-threads`. On the testcontainers path each test owns its database, so
-/// the only effect there is a harmless whole-suite serialisation (and CI already
-/// runs `--test-threads=1`). Acquisition order is always this lock first, then
-/// the harness `SERIAL` inside `arm()`, so the two can never deadlock.
+/// Without it, the `HARVEST_TEST_DATABASE_URL` path is nondeterministic under
+/// the default parallel test threads. [`scrub`]'s global `TRUNCATE` runs
+/// *before* the harness's own `SERIAL` mutex is taken. That lock only guards
+/// armed plans, from `arm()` onward. The session-lease test never arms at
+/// all. So one test's scrub could erase another test's live workflows mid-run.
+/// This lock is a strict superset of the harness `SERIAL`. It also covers the
+/// pre-arm scrub and the non-arming tests. So the documented shared-DB
+/// invocation is deterministic for any `--test-threads`. On the
+/// testcontainers path each test owns its database. There the only effect is
+/// a harmless whole-suite serialisation, and CI already runs
+/// `--test-threads=1`. This lock always comes first, then the harness
+/// `SERIAL` inside `arm()`, so the two can never deadlock.
 static DB_BODY_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A whole-test-body isolation guard, a live DB URL, and (when spun locally) the
@@ -136,17 +137,17 @@ static DB_BODY_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 ///
 /// Honours `HARVEST_TEST_DATABASE_URL` (assumed already migrated) for fast
 /// local RED/GREEN iteration; otherwise spins a fresh migrated Postgres 16
-/// container (the CI path). Acquires [`DB_BODY_SERIAL`] *first* so the scrub —
-/// and the whole test body, via the returned `_body` guard — runs with exclusive
-/// access to a shared DB; the env DB is then scrubbed so each run starts clean.
+/// container (the CI path). Acquires [`DB_BODY_SERIAL`] *first*. So the scrub,
+/// and the whole test body via the returned `_body` guard, has exclusive
+/// access to a shared DB. The scrub makes each run start clean.
 async fn chaos_db() -> (
     tokio::sync::MutexGuard<'static, ()>,
     String,
     Option<ContainerAsync<Postgres>>,
 ) {
-    // Held for the caller's whole body (bound as `_body`): serialises shared-DB
-    // access across chaos tests, so a concurrent test's scrub cannot erase this
-    // test's live workflows. Must be acquired before the scrub below.
+    // The caller holds this as `_body` for its whole body. A concurrent test's
+    // scrub then cannot erase this test's live workflows. Take it before the
+    // scrub below.
     let body = DB_BODY_SERIAL.lock().await;
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let mut conn = AsyncPgConnection::establish(&url)
@@ -414,20 +415,21 @@ async fn signals_for(conn: &mut AsyncPgConnection, target: ExecutionId) -> i64 {
 // ── Reproducer 1 — issue #601 lost-wake (`wake_requested`) window ────────────
 
 /// A wake that lands while the task is still claimed (mid-cycle) must not be
-/// lost. HOLD the park at `QUEUE_PARK_BEFORE_UPDATE` (the row is still `RUNNING`
-/// with its `worker_id`), fire a concurrent `wake_workflow_task` — whose primary
-/// re-pend matches zero rows and must fall back to `wake_requested = TRUE` —
-/// then release: the park atomically reads-and-clears `wake_requested` and
-/// reports it, so the caller re-pends instead of stranding the task parked.
+/// lost. HOLD the park at `QUEUE_PARK_BEFORE_UPDATE`, where the row is still
+/// `RUNNING` with its `worker_id`. Fire a concurrent `wake_workflow_task`. Its
+/// primary re-pend matches zero rows, so it must fall back to
+/// `wake_requested = TRUE`. Then release. The park atomically reads and clears
+/// `wake_requested` and reports it. So the caller re-pends instead of
+/// stranding the task parked.
 ///
-/// RED procedure: revert `queue::park_workflow_task_inner`'s `candidate` CTE to
-/// stop reading `wake_requested` (return `false`), or drop
-/// `wake_workflow_task`'s fallback UPDATE — the assert `had_wake_requested`
-/// then fails, and the task stays parked with the wake lost.
+/// RED procedure: make the `candidate` CTE of
+/// `queue::park_workflow_task_inner` stop reading `wake_requested` (return
+/// `false`). Or drop the fallback UPDATE of `wake_workflow_task`. The
+/// `had_wake_requested` assert then fails, and the task stays parked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// `guard` intentionally lives to end-of-scope: it keeps the harness armed and
-// holds the process-wide chaos serialization lock for the whole test body, and
-// its `diagnostics()`/`hits()` are read by the trailing asserts.
+// `guard` lives to end-of-scope on purpose. It keeps the harness armed and
+// holds the process-wide chaos serialization lock for the whole test body.
+// The trailing asserts read its `diagnostics()`/`hits()`.
 #[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
     let (_body, url, _c) = chaos_db().await;
@@ -500,11 +502,10 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
         guard.diagnostics()
     );
 
-    // Convergence: the caller re-pends *because* `had_wake_requested` came back
-    // true — faithfully modelling the worker's park path, which ORs the returned
-    // flag into its re-wake decision rather than re-pending unconditionally. On
-    // the pre-fix shape the flag would be false and this branch would be skipped,
-    // leaving the task stranded parked (the RED shape).
+    // Convergence: the caller re-pends *because* `had_wake_requested` is true.
+    // This models the worker's park path, which ORs the returned flag into its
+    // re-wake decision. On the pre-fix shape the flag is false, this branch is
+    // skipped, and the task stays stranded parked (the RED shape).
     if had_wake_requested {
         autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id)
             .await
@@ -574,8 +575,8 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     .expect("claim")
     .expect("workflow task claimable");
 
-    // Drive the cycle with a KILL at the persist point → crash, owned conn drop
-    // → server rollback → row stranded RUNNING with the dead worker.
+    // KILL at the persist point → crash → owned conn drop → server rollback.
+    // The row stays stranded RUNNING with the dead worker.
     let guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
     let outcome = chaos_drive_one_workflow_task(
         &tla_trace::actor_url(&url, task.id, "c367-crash-worker", task.attempt),
@@ -799,18 +800,18 @@ async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
 /// A same-shard external signal appends `ExternalSignalRequested` and its
 /// `ExternalSignalDelivered` terminal inside ONE transaction
 /// (`persist_external_signal_inline`, the #492 fix). HOLD at
-/// `OUTBOX_INLINE_AFTER_REQUESTED` — the `Requested` event is written but the
-/// txn is uncommitted — and run the background outbox on a separate connection:
-/// under READ COMMITTED it cannot observe the half-written request, so it
+/// `OUTBOX_INLINE_AFTER_REQUESTED`, where the `Requested` event is written but
+/// the txn is uncommitted. Run the background outbox on a separate connection.
+/// Under READ COMMITTED it cannot observe the half-written request. So it
 /// delivers nothing (returns 0) and the signal lands exactly once. Exercises the
 /// ERROR-free HOLD/DELAY window (AC1(b)/AC1(d) shape) and the #492 fix (AC4).
 ///
 /// RED procedure: remove the `conn.transaction(...)` wrapper in
 /// `persist_external_signal_inline` so `ExternalSignalRequested` commits in its
 /// own statement before the terminal. During the hold the outbox then sees a
-/// committed `Requested`-without-terminal on a `RUNNING` execution and delivers
-/// it a SECOND time — two `harvest_signals` rows for the target and a second
-/// `ExternalSignalDelivered` — and the `== 1` / `outbox == 0` asserts fail.
+/// committed `Requested` with no terminal on a `RUNNING` execution. It delivers
+/// it a SECOND time: two `harvest_signals` rows for the target and a second
+/// `ExternalSignalDelivered`. The `== 1` / `outbox == 0` asserts then fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 // linear reproducer: setup, hold, outbox probe, release, exactly-once asserts.
@@ -965,18 +966,19 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
 
 // ── Reproducer 4 — issue #350 schedule fire claim expiring mid-fire ──────────
 
-/// A scheduler replica that crashes after winning the HA claim but before firing
-/// must leave the slot fire-able by a healthy peer *exactly once*, and no peer
-/// may double-fire while the claim is still live. KILL at `SCHED_AFTER_CLAIM`
-/// (the claim UPDATE has committed in autocommit, the fire has not) via a spawned
-/// `tick_once` → `JoinError`; the live claim then blocks a peer tick, and only
-/// after the 30 s claim TTL expires does a peer fire the slot once (AC4).
+/// A scheduler replica can crash after it wins the HA claim but before it
+/// fires. A healthy peer must then fire the slot *exactly once*. No peer may
+/// double-fire while the claim is still live. A spawned `tick_once` KILLs at
+/// `SCHED_AFTER_CLAIM` → `JoinError`. There the claim UPDATE has committed in
+/// autocommit, and the fire has not. The live claim then blocks a peer tick.
+/// Only after the 30 s claim TTL expires does a peer fire the slot once (AC4).
 ///
 /// RED procedure: remove the HA claim guard in
 /// `claim_and_fire_workflow_schedule` (fire unconditionally, ignore
-/// `fire_claim_token`/`fire_claimed_until`). The live-claim peer tick then fires
-/// a SECOND time while the first fire is still in flight — the `exec_count == 0`
-/// (live-claim) or final `== 1` (single fire) assertion fails with 2 executions.
+/// `fire_claim_token`/`fire_claimed_until`). The live-claim peer tick then
+/// fires a SECOND time while the first fire is still in flight. The
+/// `exec_count == 0` (live-claim) or final `== 1` (single fire) assertion
+/// fails with 2 executions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
@@ -1101,25 +1103,25 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
 
 // ── Reproducer 4b — issue #350 post-start crash (SCHED_AFTER_START_BEFORE_ADVANCE) ──
 
-/// The #350 double-fire window *after* the start commits. A replica that crashes
-/// after firing this tick's scheduled start — but before advancing
-/// `next_run_at`/`last_run_at` — leaves the slot still "due" with an execution
-/// already created. Recovery must NOT create a *second* execution: the dedupe
-/// (the deterministic `sched:{id}:{name}:{slot}` workflow id) attaches the
-/// peer's re-fire to the run the crashed replica already started, so the slot
-/// yields **exactly one** execution (AC4).
+/// The #350 double-fire window *after* the start commits. A replica can crash
+/// after it fires this tick's scheduled start, but before it advances
+/// `next_run_at`/`last_run_at`. The slot is then still "due" with an execution
+/// already created. Recovery must NOT create a *second* execution. The dedupe
+/// key is the deterministic `sched:{id}:{name}:{slot}` workflow id. It attaches
+/// the peer's re-fire to the run the crashed replica already started. So the
+/// slot yields **exactly one** execution (AC4).
 ///
-/// This complements `chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`
-/// (which KILLs at `SCHED_AFTER_CLAIM`, *before* any start, so its crash fires
-/// nothing) by arming the sibling `SCHED_AFTER_START_BEFORE_ADVANCE` point: the
-/// crash lands *after* one start committed (`exec_count == 1` right after the
-/// `JoinError`), directly exercising the post-start window that point exists to
-/// model — and, by construction, only reachable because a start committed
-/// (`dispatched > 0`).
+/// This complements `chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`.
+/// That test KILLs at `SCHED_AFTER_CLAIM`, *before* any start, so its crash
+/// fires nothing. This test arms the sibling `SCHED_AFTER_START_BEFORE_ADVANCE`
+/// point. The crash lands *after* one start committed (`exec_count == 1` right
+/// after the `JoinError`). So it exercises the post-start window that point
+/// models. By construction, the point is reachable only after a start
+/// committed (`dispatched > 0`).
 ///
 /// RED procedure: break the per-slot dedupe so the expired-claim peer re-fire
-/// creates a fresh run — e.g. change the scheduled start's reuse policy away from
-/// the sched-id idempotent path (return `outcome.created() == true` on the
+/// creates a fresh run. For example, move the scheduled start's reuse policy
+/// off the sched-id idempotent path (return `outcome.created() == true` on the
 /// re-fire). The final `exec_count == 1` assertion then fails with 2 executions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
@@ -1137,9 +1139,9 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     let history = Recorder::<FireInput, FireOutput>::new();
     let key = sched_id.to_string();
 
-    // Crash AFTER the start commits, BEFORE next_run_at advances. Only reachable
-    // because a start committed this tick (the `dispatched > 0` gate); the tick is
-    // spawned so the panic surfaces as a JoinError instead of aborting the test.
+    // Crash AFTER the start commits, BEFORE next_run_at advances. The point is
+    // reachable only after a start committed this tick (the `dispatched > 0`
+    // gate). The spawned tick turns the panic into a JoinError, not an abort.
     let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_START_BEFORE_ADVANCE)).await;
     let crashed_fire = history.invoke(0, &*key, FireInput::Fire);
     let crash = tokio::spawn(tick_once(
@@ -1167,9 +1169,9 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     history.bound_open_infos();
     record_read(&history, &url, &key, wf, FireInput::Read).await;
 
-    // The crash committed exactly one start (the point fires AFTER the start), but
-    // did NOT advance the schedule — so the claim is still held and the slot is
-    // still due. This is the post-start window `SCHED_AFTER_CLAIM` cannot reach.
+    // The crash committed exactly one start, because the point fires AFTER the
+    // start. It did NOT advance the schedule. So the claim is still held and the
+    // slot is still due. `SCHED_AFTER_CLAIM` cannot reach this post-start window.
     {
         let mut conn = connect(&url).await;
         assert_eq!(
@@ -1245,38 +1247,39 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
 
 /// AC1(d) names four lease/heartbeat surfaces to expire early:
 ///
-/// - **schedule fire claim** — [`chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`]
-///   crashes the claiming replica mid-fire, then deterministically expires the
-///   dead claim (a test-side `UPDATE harvest_schedules SET fire_claimed_until`
-///   into the past) and asserts a healthy peer re-fires exactly once.
+/// - **schedule fire claim** —
+///   [`chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`] crashes
+///   the claiming replica mid-fire. It then expires the dead claim with a
+///   test-side `UPDATE harvest_schedules SET fire_claimed_until` into the past.
+///   It asserts that a healthy peer re-fires exactly once.
 /// - **worker liveness heartbeat** — [`chaos_repro_367_crash_orphan_is_reclaimed`]
 ///   leaves a `RUNNING` task owned by a worker with no live `harvest_workers`
 ///   heartbeat, and asserts `reclaim_orphaned_tasks` reclaims it.
 /// - **session lease** — *this test* (below).
-/// - **delivery in-flight lease** — the identical technique: a `harvest_completion_deliveries`
-///   row left `INFLIGHT` with `next_attempt_at` in the past is re-claimed by the
-///   delivery scanner's `state IN ('PENDING','INFLIGHT') AND next_attempt_at <= NOW()`
-///   candidate CTE (`completion_callback::claim_due_deliveries`). It is not
-///   reproduced as a dedicated chaos test here because the delivery scanner
-///   performs real HTTP POSTs (a network dependency out of scope for a
-///   deterministic, offline chaos reproducer).
+/// - **delivery in-flight lease** — the same technique. A
+///   `harvest_completion_deliveries` row left `INFLIGHT` with
+///   `next_attempt_at` in the past is re-claimed by the delivery scanner. Its
+///   candidate CTE (`completion_callback::claim_due_deliveries`) selects
+///   `state IN ('PENDING','INFLIGHT') AND next_attempt_at <= NOW()`. No
+///   dedicated chaos test covers it, because the scanner performs real HTTP
+///   POSTs. That network dependency is out of scope for an offline reproducer.
 ///
-/// This test demonstrates the early-lease-expiry capability for the **session
-/// lease** deterministically and offline: an `ACTIVE` `harvest_sessions` row
-/// whose host worker is provably live (fresh heartbeat, `Active` status) and
-/// whose owning workflow is non-terminal, but whose `expires_at` is in the past,
-/// is reclaimed by `enforce_broken_sessions` as `BROKEN` with the `LeaseExpired`
-/// reason — isolating the lease-expiry path from the (higher-priority)
-/// dead-host / draining / terminal-workflow reasons.
+/// This test expires the **session lease** early, deterministically and
+/// offline. An `ACTIVE` `harvest_sessions` row has a provably live host worker
+/// (fresh heartbeat, `Active` status) and a non-terminal owning workflow. Its
+/// `expires_at` is in the past. `enforce_broken_sessions` reclaims it as
+/// `BROKEN` with the `LeaseExpired` reason. This isolates the lease-expiry
+/// path from the higher-priority dead-host, draining and terminal-workflow
+/// reasons.
 ///
-/// By design this lease-expiry surface is exercised *without* the point-injection
-/// framework (`chaos::points` / `arm` / `ChaosPlan`): "expire a lease early" is a
-/// durable DB-column edit (`expires_at` into the past), not a mid-execution
-/// interception, so a direct row `UPDATE` is the faithful, deterministic way to
-/// model it — the same approach the schedule-fire-claim reproducer takes for its
-/// `fire_claimed_until` lease. The injection framework covers the `KILL` /
-/// `ERROR` / `DROP_NOTIFY` / `DELAY` surfaces (AC1 a–c); the lease surfaces
-/// (AC1 d) are modelled by expiring the durable lease column directly.
+/// This surface does not use the point-injection framework (`chaos::points` /
+/// `arm` / `ChaosPlan`), by design. "Expire a lease early" is a durable
+/// DB-column edit (`expires_at` into the past), not a mid-execution
+/// interception. So a direct row `UPDATE` models it faithfully and
+/// deterministically. The schedule-fire-claim reproducer does the same for its
+/// `fire_claimed_until` lease. The injection framework covers the `KILL`,
+/// `ERROR`, `DROP_NOTIFY` and `DELAY` surfaces (AC1 a–c). The lease surfaces
+/// (AC1 d) expire the durable lease column directly.
 ///
 /// RED procedure: revert the `s.expires_at < NOW()` disjunct in
 /// `sessions::broken_session_candidates_query()` (or `lease_expired` in
@@ -1341,9 +1344,8 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
         "session must insert ACTIVE before the scanner runs; got {outcome:?}"
     );
 
-    // Run the broken-session scanner with a generous worker-staleness window
-    // (120 s) so the fresh host heartbeat is NOT stale — the only broken reason
-    // that can apply is the expired lease.
+    // A generous worker-staleness window (120 s) keeps the fresh host heartbeat
+    // from going stale. So the expired lease is the only broken reason left.
     let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(
         &mut conn,
         120,
@@ -1352,20 +1354,19 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
     .await
     .expect("enforce_broken_sessions");
     // `enforce_broken_sessions` returns the count of member *tasks* failed, not
-    // the count of sessions reclaimed. This session is intentionally memberless
-    // (it seeds no `harvest_task_queue` rows) to isolate the pure lease-expiry
-    // path, so the correct return is 0 even though the session row IS
-    // transitioned to `BROKEN` below. Asserting the documented member-task
-    // semantics here is itself a regression guard against that contract drifting.
+    // the count of sessions reclaimed. This session has no members on purpose:
+    // it seeds no `harvest_task_queue` rows, to isolate the lease-expiry path.
+    // So the correct return is 0, though the row moves to `BROKEN` below. This
+    // assert also guards the documented member-task contract.
     assert_eq!(
         member_tasks_failed, 0,
         "a memberless reclaimed session fails zero member tasks",
     );
 
     // The AC1(d) evidence: the ACTIVE→BROKEN transition attributed to the
-    // expired lease. The row was proven ACTIVE above (the `record_session_acquired`
-    // outcome), and the scanner is the only thing that ran since, so this
-    // transition is caused solely by the early lease expiry.
+    // expired lease. The `record_session_acquired` outcome proved the row
+    // ACTIVE above. Only the scanner ran since. So the early lease expiry alone
+    // causes this transition.
     let (state, reason): (String, Option<String>) =
         diesel::sql_query("SELECT state, broken_reason FROM harvest_sessions WHERE id = $1")
             .bind::<diesel::sql_types::Uuid, _>(session_id.as_uuid())
@@ -1392,52 +1393,50 @@ struct SessionStateRow {
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
 /// The point whose KILL actually *strands an orphan* the recovery loop must
-/// clean up. The sweep drives single-cycle `chaos_noop` workflows, so both
-/// worker persist points are hit — but only a KILL at
-/// `WORKER_PERSIST_BEFORE_COMMIT` (before the decision-cycle commit, while the
-/// claim's `state='RUNNING'` is already durable) leaves a `RUNNING` row with a
-/// dead worker: exactly the #367 recovery path the convergence invariant
-/// exercises. A KILL at `WORKER_AFTER_OUTER_COMMIT` is post-commit (the
-/// execution is already `COMPLETED`), and a `Delay` merely perturbs timing —
-/// both are *convergence-benign* and would let the sweep assert convergence for
-/// an effectively un-faulted run. So the non-vacuity predicate demands this
-/// disruptive fault specifically, not just "any activation" (issue #940, review
-/// P2-1). The other five catalogue points are each covered precisely by a
-/// dedicated reproducer above; a parking/external-signal/scheduler workload
-/// cannot be folded into this sweep because a seeded plan never selects `Hold`
-/// and delivers no signals, so a parked workflow would never reach `COMPLETED`.
+/// clean up. The sweep drives single-cycle `chaos_noop` workflows, so it hits
+/// both worker persist points. Only a KILL at `WORKER_PERSIST_BEFORE_COMMIT`
+/// leaves a `RUNNING` row with a dead worker. That KILL lands before the
+/// decision-cycle commit, while the claim's `state='RUNNING'` is already
+/// durable. This is the #367 recovery path the convergence invariant
+/// exercises. A KILL at `WORKER_AFTER_OUTER_COMMIT` is post-commit, so the
+/// execution is already `COMPLETED`. A `Delay` only perturbs timing. Both are
+/// *convergence-benign*: the sweep would assert convergence for an un-faulted
+/// run. So the non-vacuity predicate demands this disruptive fault, not just
+/// "any activation" (issue #940). A dedicated reproducer above covers each of
+/// the other five catalogue points. This sweep cannot take a parking,
+/// external-signal or scheduler workload. A seeded plan never selects `Hold`
+/// and delivers no signals, so a parked workflow never reaches `COMPLETED`.
 const WORKLOAD_ORPHAN_POINT: ChaosPoint = WORKER_PERSIST_BEFORE_COMMIT;
 
 /// How many default seeds to run (AC5 requires N ≥ 5).
 const DEFAULT_SWEEP_SEED_COUNT: usize = 7;
 
-/// A seed is non-vacuous for this sweep iff its seeded plan arms a **KILL** at
-/// [`WORKLOAD_ORPHAN_POINT`] — a disruptive pre-commit crash, not a
+/// A seed is non-vacuous for this sweep iff its plan arms a **KILL** at
+/// [`WORKLOAD_ORPHAN_POINT`]. That is a disruptive pre-commit crash, not a
 /// convergence-benign `Delay` or a post-commit kill. Seeded triggers are always
-/// `OnHit(1..=3)` and the 6-workflow workload produces one hit on that point per
-/// drive (≥ 6 hits total), so the armed KILL is guaranteed to fire exactly once
-/// and strand exactly one orphan — making this a sound, guaranteed predicate for
-/// the pre-recovery orphan assertion in the sweep.
+/// `OnHit(1..=3)`. The 6-workflow workload hits that point once per drive
+/// (≥ 6 hits total). So the armed KILL fires exactly once and strands exactly
+/// one orphan. That makes this a sound predicate for the sweep's pre-recovery
+/// orphan assertion.
 fn seed_strands_an_orphan(seed: u64) -> bool {
     ChaosPlan::seeded(seed).kills_at(WORKLOAD_ORPHAN_POINT)
 }
 
 /// The seed set for the sweep. Every default seed strands an orphan against the
-/// workload; the sweep asserts a real orphan exists pre-recovery (and that a
-/// fault fired) per seed, so a convergence-benign seed fails loudly rather than
-/// passing convergence for a healthy run.
+/// workload. Per seed, the sweep asserts that a real orphan exists
+/// pre-recovery and that a fault fired. So a convergence-benign seed fails
+/// loudly instead of passing convergence for a healthy run.
 ///
 /// - **Default (the CI path):** the first [`DEFAULT_SWEEP_SEED_COUNT`] seeds
-///   (from 1 upward) that [`seed_strands_an_orphan`] against the workload —
-///   **computed**, not hardcoded, so it is non-vacuous *by construction* (no
-///   magic numbers that could silently go vacuous if the seeded logic or the
-///   catalogue changes) and ≥ 5 by construction (AC5). Fully deterministic and
-///   reproducible (AC3).
+///   (from 1 upward) that [`seed_strands_an_orphan`] against the workload.
+///   The set is **computed**, not hardcoded. So it is non-vacuous and ≥ 5
+///   *by construction* (AC5). No magic number can go vacuous when the seeded
+///   logic or the catalogue changes. Fully deterministic and reproducible (AC3).
 /// - **Explicit override (`CHAOS_SEEDS="8"`, replay):** trusted verbatim, any
-///   count. AC3 wants one-command single-seed replay, so the ≥ 5 floor is *not*
-///   imposed on an operator-chosen override — the per-seed anti-vacuity assert in
-///   the sweep still protects correctness, and a single failing seed printed by a
-///   CI failure can be replayed directly.
+///   count. AC3 wants one-command single-seed replay. So an operator-chosen
+///   override has *no* ≥ 5 floor. The per-seed anti-vacuity assert still
+///   protects correctness. A single failing seed from a CI failure replays
+///   directly.
 fn sweep_seeds() -> Vec<u64> {
     if let Some(seeds) = env_override_seeds() {
         return seeds;
@@ -1471,11 +1470,11 @@ fn default_sweep_seeds() -> Vec<u64> {
         .collect()
 }
 
-/// AC5 (default path) is guaranteed *by construction*, not by a magic list: the
-/// computed default is at least 5 distinct seeds, and each strands an orphan
-/// against the sweep's workload (so the per-seed pre-recovery orphan assert in
-/// [`chaos_seeded_convergence_sweep`] can never fail vacuously for the default
-/// set). No DB needed — this is a pure property of the deterministic seeded
+/// AC5 (default path) holds *by construction*, not by a magic list. The
+/// computed default is at least 5 distinct seeds. Each strands an orphan
+/// against the sweep's workload. So the per-seed pre-recovery orphan assert in
+/// [`chaos_seeded_convergence_sweep`] never fails vacuously for the default
+/// set. No DB needed: this is a pure property of the deterministic seeded
 /// logic.
 #[test]
 fn default_sweep_seeds_are_at_least_five_and_strand_an_orphan() {
@@ -1499,10 +1498,10 @@ fn default_sweep_seeds_are_at_least_five_and_strand_an_orphan() {
     }
 }
 
-/// For each seed: arm a randomised plan, drive a bounded workload of
-/// single-cycle workflows (KILLs caught as `JoinError`), disarm, run the
-/// recovery loop (reclaim orphans + re-drive), and assert the convergence
-/// invariant — every workflow terminal, no task stranded `RUNNING` with a dead
+/// For each seed: arm a randomised plan and drive a bounded workload of
+/// single-cycle workflows (KILLs caught as `JoinError`). Disarm, then run the
+/// recovery loop (reclaim orphans + re-drive). Assert the convergence
+/// invariant: every workflow terminal, no task stranded `RUNNING` with a dead
 /// worker, no dangling `ExternalSignalRequested`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
@@ -1518,11 +1517,10 @@ async fn chaos_seeded_convergence_sweep() {
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
 
     for seed in sweep_seeds() {
-        // Whether this seed is *guaranteed* to strand a pre-commit orphan (true
-        // for every computed default seed; possibly false for an arbitrary
-        // operator override). When true we additionally assert an orphan really
-        // existed pre-recovery — the direct proof that the recovery loop had
-        // real work, not just that a directive fired (review P2-1).
+        // Whether this seed is *guaranteed* to strand a pre-commit orphan. It is
+        // true for every computed default seed, and maybe false for an operator
+        // override. When true, also assert a real pre-recovery orphan. That
+        // proves the recovery loop had real work, not just that a directive fired.
         let expects_orphan = seed_strands_an_orphan(seed);
 
         // Fresh DB slate per seed so the invariant probe is unambiguous.
@@ -1531,7 +1529,6 @@ async fn chaos_seeded_convergence_sweep() {
             scrub(&mut conn).await;
         }
 
-        // Start the workload.
         let mut execs = Vec::new();
         {
             let mut conn = connect(&url).await;
@@ -1579,7 +1576,7 @@ async fn chaos_seeded_convergence_sweep() {
         let diag = guard.diagnostics();
         drop(guard);
 
-        // Anti-vacuity (P2): `ChaosPlan::seeded` is a pure function of the seed,
+        // Anti-vacuity: `ChaosPlan::seeded` is a pure function of the seed,
         // so `fired` is deterministic per seed — this can never flake. A seed
         // that drives zero honored faults would let the convergence invariant
         // below pass for a healthy, un-faulted run ("passes for the wrong
@@ -1590,12 +1587,11 @@ async fn chaos_seeded_convergence_sweep() {
              convergence invariant would pass vacuously; {diag}"
         );
 
-        // Stronger, direct anti-vacuity for an orphan-stranding seed: a
-        // pre-commit KILL must have left a `RUNNING` row owned by a
-        // never-registered (dead) worker *before* the recovery loop runs. This
-        // proves the recovery loop below has real work — not just that some
-        // (possibly convergence-benign) directive fired — so the final
-        // `stranded == 0` post-recovery assert genuinely exercises reclaim.
+        // Stronger anti-vacuity for an orphan-stranding seed. A pre-commit KILL
+        // must leave a `RUNNING` row owned by a never-registered (dead) worker
+        // *before* the recovery loop runs. This proves the loop has real work,
+        // not just that some convergence-benign directive fired. So the final
+        // `stranded == 0` assert really exercises reclaim.
         if expects_orphan {
             let mut conn = connect(&url).await;
             let stranded_pre = stranded_running_with_dead_worker(&mut conn).await;

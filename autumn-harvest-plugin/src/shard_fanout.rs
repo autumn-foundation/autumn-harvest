@@ -1,11 +1,10 @@
 //! Shared helpers for cross-shard fan-out read operations.
 //!
-//! Several management-API read models (`version_usage`, `workflow_reachability`,
-//! `schedule_runs`, `workflow_count`) fan out the same query across every
-//! configured shard, collect results, and fold unreachable shards into a
-//! `partial`/`unavailable` status. This module centralises the common
-//! scaffolding so each read model only has to implement its own per-shard query
-//! and accumulator logic.
+//! Several management-API read models fan out one query across every
+//! configured shard. Examples are `version_usage`, `workflow_reachability`,
+//! `schedule_runs` and `workflow_count`. They fold unreachable shards into a
+//! `partial`/`unavailable` status. This module holds that common scaffolding.
+//! Each read model implements only its own per-shard query and accumulator.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,7 +20,7 @@ use crate::api::{HarvestApiRuntime, HarvestApiState, PoolConn, acquire_conn};
 /// Outcome of a single-shard query: either a successful row set or an error.
 #[derive(Debug)]
 pub struct ShardObservation<R> {
-    /// Shard identifier.
+    /// The shard that was queried.
     pub shard_id: i32,
     /// Rows returned by the query (empty when `error.is_some()`).
     pub rows: Vec<R>,
@@ -32,18 +31,15 @@ pub struct ShardObservation<R> {
 /// Resolve `pool` to a live connection for `shard_id`, or the
 /// [`ShardObservation`] error a fan-out read should record for this shard.
 ///
-/// Every per-shard fan-out query starts the same way: a shard the router has
-/// no pool for is `"has no configured storage pool"`; a pool that fails to
-/// hand out a connection is `"could not be acquired"`. Centralising that
-/// prelude here means a new fan-out read model implements only its own query
-/// against the returned connection, not this guard by hand — it was
-/// hand-copied into eight read models before this extraction.
+/// A shard the router has no pool for is `"has no configured storage pool"`.
+/// A pool that fails to hand out a connection is `"could not be acquired"`.
+/// A new fan-out read model implements only its own query against the
+/// returned connection, not this guard.
 ///
 /// # Errors
 ///
-/// Returns the [`ShardObservation`] the caller should record for this shard
-/// when no pool is configured for it, or when a connection could not be
-/// acquired from the pool.
+/// Returns the [`ShardObservation`] to record for this shard. That happens
+/// when no pool is configured for it, or when no connection can be acquired.
 pub async fn acquire_shard_conn<R>(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -66,16 +62,9 @@ pub async fn acquire_shard_conn<R>(
 
 /// Fold a per-shard query's [`HarvestResult`] into a [`ShardObservation`].
 ///
-/// A successful query becomes `error: None` with its rows attached; a failed
+/// A successful query becomes `error: None` with its rows attached. A failed
 /// one becomes an empty-rows observation whose `error` carries the failure's
-/// `Display` text. Every fan-out read model built this mapping by hand,
-/// right after its own call to [`acquire_shard_conn`]. `usage`,
-/// `workflow_count`, `version_usage`, `version_gate_retirement` and
-/// `workflow_reachability` all hand-copied the identical `match
-/// query(...).await { Ok(rows) => ..., Err(e) => ... }` shape (issues #164
-/// through #596). `acquire_shard_conn` (#1315) already centralised the
-/// connection guard that precedes this. This folds in the result-mapping
-/// half that guard's extraction left behind.
+/// `Display` text. Call it right after [`acquire_shard_conn`].
 #[must_use]
 pub fn observe_shard_result<R>(
     shard_id: i32,
@@ -152,13 +141,11 @@ pub fn expected_shards_for(
     runtime: Option<&HarvestApiRuntime>,
     pools: &BTreeMap<i32, DbPool>,
 ) -> BTreeSet<i32> {
-    // Delegates to the canonical core rule (issue #1146). The engine's own
-    // by-business-key resolution
-    // (`external_target_location::resolve_location_by_workflow_id`) fans out
-    // over exactly this set, and a management-API read that inspected a
-    // different set of shards than the engine would answer differently about
-    // the same key. Keeping one definition removes that drift by construction,
-    // the way `select_resolved_run` already does for the ranking.
+    // Delegates to the canonical core rule (issue #1146). The engine resolves
+    // a business key over exactly this set
+    // (`external_target_location::resolve_location_by_workflow_id`). A read
+    // that inspected a different set could answer differently about the same
+    // key. One definition removes that drift by construction.
     let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
     let router_parts = runtime.map(|runtime| {
         let router = runtime.router();
@@ -183,51 +170,46 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
 ///
 /// An **empty** `shard_assignments` array is a special case, not "assigned to
 /// nothing". Since issue #961 an empty `WorkerConfig::shard_assignments` is the
-/// *auto* sentinel, resolved by `Worker::new` to every shard in the process's
-/// pool (or `[ShardId::new(0)]` when there is none) -- so a `Worker::new`-built
-/// worker never registers an empty array. Pre-#961 rows can still carry one,
-/// and a worker started via the raw `Worker::run` legacy single-shard path
-/// with no explicit assignment still registers with a literal `[]` -- even
-/// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
-/// pool }` in `autumn-harvest/src/worker.rs`) falls back to the caller's
-/// default `pool` argument and actually claims work against whatever database
-/// that pool points at ("legacy behavior, byte-for-byte unchanged"). That is
-/// also the SAME pool `run_with_listener` uses to call `register_in_fleet`, so
-/// an empty-array worker's registry row is written into that exact database.
+/// *auto* sentinel. `Worker::new` resolves it to every shard in the process's
+/// pool, or `[ShardId::new(0)]` when there is none. So a `Worker::new`-built
+/// worker never registers an empty array.
 ///
-/// Every caller of this function loads `worker` from a connection already
-/// scoped to one shard's own database (`observe_shard` in both
-/// `queue_coverage.rs` and `shard_health.rs`), so an empty-array worker found
-/// there is unconditionally covering `shard_id`, whatever numeric value the
-/// deployment's single/default shard happens to carry (`ShardRouter::new`
-/// accepts an arbitrary `default_shard`, not just `0` -- see
-/// `ShardRouter::single()` vs. the general constructor). Hardcoding
-/// `shard_id == 0` here would falsely report a healthy legacy worker as
-/// uncovered on any deployment whose single shard is not literally numbered
-/// `0`. Without this normalization, a healthy legacy single-shard worker
-/// is reported as covering no shard. Every queue it polls is then falsely
-/// flagged.
+/// Pre-#961 rows can still carry one. A worker started via the raw
+/// `Worker::run` legacy single-shard path with no explicit assignment also
+/// registers with a literal `[]`. Its poll loop (`claim_pool = match
+/// shard_targets.as_slice() { [] => pool }` in `autumn-harvest/src/worker.rs`)
+/// falls back to the caller's default `pool` argument. It claims work against
+/// whatever database that pool points at. `run_with_listener` calls
+/// `register_in_fleet` on that SAME pool. So the registry row of an
+/// empty-array worker is in that exact database.
+///
+/// Every caller loads `worker` from a connection scoped to one shard's own
+/// database (`observe_shard` in `queue_coverage.rs` and `shard_health.rs`).
+/// So an empty-array worker found there always covers `shard_id`. That holds
+/// whatever number the single/default shard carries. `ShardRouter::new`
+/// accepts an arbitrary `default_shard`, not just `0`. Hardcoding
+/// `shard_id == 0` would report a healthy legacy worker as uncovered when the
+/// single shard is not numbered `0`. Without this normalization, a healthy
+/// legacy single-shard worker covers no shard. Every queue it polls is then
+/// falsely flagged.
 ///
 /// Shared by `queue_coverage.rs::worker_covers_queue` (issue #774) and
 /// `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover` (issue
-/// #522; the empty-array gap here was issue #1150, discovered as a
-/// duplicate of the identical bug pattern while implementing #774) so the
-/// two shard-membership predicates cannot drift again.
+/// #522), so the two predicates cannot drift again. The empty-array gap here
+/// was issue #1150.
 #[must_use]
 pub fn worker_covers_shard(worker: &WorkerRow, shard_id: i32) -> bool {
     // Delegates to the canonical core predicate (issue #1150 / #961). It lives
-    // in `autumn_harvest::workers` because core has consumers of its own --
-    // `apply_worker_filters` -- that cannot reach into this crate, and every
-    // independent re-implementation of this rule has so far drifted.
+    // in `autumn_harvest::workers` because core consumers such as
+    // `apply_worker_filters` cannot reach into this crate. Every independent
+    // re-implementation of this rule has so far drifted.
     autumn_harvest::workers::shard_assignments_cover(&worker.worker.shard_assignments, shard_id)
 }
 
 /// Cross-shard completeness of a fanned-out read.
 ///
-/// Shared by every read model in this module family (`workflow_reachability`,
-/// `schedule_runs`, `workflow_count`) so a policy change (e.g. a future
-/// "degraded" tier) is made in exactly one place instead of drifting across
-/// independent copies.
+/// Every read model in this module family shares it. So a policy change,
+/// such as a future "degraded" tier, is made in exactly one place.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanoutStatus {
@@ -253,29 +235,25 @@ impl FanoutStatus {
     }
 }
 
-// The "top-N + other" bounded-cardinality rollup used by `workflow_count` and
-// `dlq::merge_dlq_aggregates` lives in `autumn_harvest::dlq::rollup_top_n`
-// (core crate) rather than here: this plugin crate depends on the core
-// `autumn-harvest` crate, not the reverse, and `dlq.rs`'s own merge function
-// needs the same helper.
+// The "top-N + other" rollup lives in `autumn_harvest::dlq::rollup_top_n`,
+// not here. The core `dlq.rs` merge needs it too, and core cannot depend on
+// this plugin crate.
 
 /// A shard that could not be queried for a fan-out read.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnavailableShard {
-    /// Shard identifier.
+    /// The shard that could not be queried.
     pub shard_id: i32,
-    /// Reason the shard could not be queried.
+    /// Why the shard could not be queried.
     pub reason: String,
 }
 
 /// Count inspected shards and collect unavailable ones (sorted by
 /// `shard_id`), from a fan-out's per-shard observations.
 ///
-/// Shared by every read model whose error handling depends only on
-/// `ShardObservation<R>.shard_id`/`.error` (not `R` itself) — currently
-/// `usage` and `workflow_count`. `workflow_reachability`'s shard-inspection
-/// summary has a different shape (a combined status enum folding two
-/// counts) and is intentionally not forced into this helper.
+/// It serves read models whose error handling reads only
+/// `ShardObservation<R>.shard_id`/`.error`, not `R`. `workflow_reachability`
+/// folds two counts into one status, so it does not use this helper.
 #[must_use]
 pub fn summarize_shard_errors<R>(
     observations: &[ShardObservation<R>],
@@ -297,18 +275,17 @@ pub fn summarize_shard_errors<R>(
 /// The union of a fan-out's reachable-shard rows plus a completeness verdict
 /// (issue #756).
 ///
-/// This is the shared merge shape for the *list-style* cross-shard read
-/// endpoints (`GET /workflows`, `GET /workers`, `GET /admin/schedules`,
-/// `GET /dead-letters`, …) that turn an unreachable shard into a `partial`
-/// degradation rather than a whole-request `500`. Each caller flattens its
-/// per-shard [`ShardObservation`]s through [`collect_fanout_rows`], then
-/// applies its own sort/truncate/cursor over `rows` and decides whether to
-/// serialize a bare array (happy path — every shard inspected) or a degraded
-/// envelope naming `unavailable_shards`.
+/// It is the merge shape for the *list-style* cross-shard read endpoints,
+/// such as `GET /workflows` and `GET /dead-letters`. They turn an unreachable
+/// shard into a `partial` result, not a whole-request `500`.
 ///
-/// Unlike `workflow_count`'s grouped merge, this helper does *not* sort or cap
-/// `rows` — the ordering and pagination contract differs per endpoint and is
-/// applied by the caller after the union.
+/// Each caller flattens its [`ShardObservation`]s through
+/// [`collect_fanout_rows`]. It then sorts, truncates and pages `rows` itself.
+/// It serializes a bare array when every shard was inspected. Otherwise it
+/// serializes an envelope that names `unavailable_shards`.
+///
+/// This type does *not* sort or cap `rows`. The ordering and pagination
+/// contract differs per endpoint.
 #[derive(Debug)]
 pub struct FanoutRows<R> {
     /// The union of rows from every reachable shard, in per-shard order (the
@@ -327,10 +304,10 @@ impl<R> FanoutRows<R> {
     /// which a bare-array endpoint keeps its legacy response shape (issue
     /// #756, AC3).
     ///
-    /// Keyed on `status == Complete`, NOT on `unavailable_shards.is_empty()`:
-    /// the two diverge in the `Unavailable`-with-empty-`unavailable_shards`
-    /// case (no expected shard could even be resolved), which is decidedly not
-    /// a happy path and must not be reported complete.
+    /// Keyed on `status == Complete`, NOT on `unavailable_shards.is_empty()`.
+    /// The two diverge when the status is `Unavailable` and
+    /// `unavailable_shards` is empty, because no expected shard resolved.
+    /// That is not a happy path and must not report complete.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         matches!(self.status, FanoutStatus::Complete)
@@ -340,12 +317,10 @@ impl<R> FanoutRows<R> {
 /// Flatten per-shard observations into the union of reachable rows plus a
 /// completeness verdict (pure, no DB).
 ///
-/// A shard whose observation carries an `error` contributes no rows and is
-/// folded into `unavailable_shards`; a reachable shard's rows are appended in
-/// shard-iteration order. `status` is `complete` only when every shard was
-/// inspected, `partial` when at least one was inspected and at least one was
-/// unavailable, and `unavailable` when none could be inspected — the call
-/// therefore never fails wholesale on a single unreachable shard.
+/// A shard whose observation carries an `error` contributes no rows. It goes
+/// into `unavailable_shards`. Reachable rows are appended in shard order.
+/// [`FanoutStatus::from_counts`] sets `status`, so one unreachable shard never
+/// fails the whole call.
 #[must_use]
 pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutRows<R> {
     let (inspected, unavailable_shards) = summarize_shard_errors(&observations);
@@ -369,8 +344,6 @@ mod tests {
 
     use super::*;
     use crate::api::HarvestRetentionRuntime;
-
-    // ── expected_shards_for (issue #1229 review) ────────────────────────────
 
     /// A `DbPool` that never connects. Standing in for a real pool is enough
     /// here -- these tests only check which shard ids `expected_shards_for`
@@ -430,11 +403,6 @@ mod tests {
         assert_eq!(expected, BTreeSet::from([0]));
     }
 
-    // ── acquire_shard_conn (characterizes the prelude previously hand-copied
-    //    into canary.rs, status_summary.rs, usage.rs, workflow_count.rs,
-    //    workflow_reachability.rs, queue_coverage.rs, version_gate_retirement.rs
-    //    and version_usage.rs) ───────────────────────────────────────────────
-
     #[tokio::test]
     async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
         let result: Result<PoolConn, ShardObservation<i64>> = acquire_shard_conn(7, None).await;
@@ -473,11 +441,6 @@ mod tests {
             Some("database connection for shard 3 could not be acquired")
         );
     }
-
-    // ── observe_shard_result (characterizes the Ok/Err-to-ShardObservation
-    //    mapping previously hand-copied into usage.rs, workflow_count.rs,
-    //    version_usage.rs, version_gate_retirement.rs and
-    //    workflow_reachability.rs) ─────────────────────────────────────────
 
     #[test]
     fn observe_shard_result_ok_attaches_rows_with_no_error() {
@@ -551,8 +514,6 @@ mod tests {
         assert_eq!(inspected, 2);
         assert!(unavailable.is_empty());
     }
-
-    // ── collect_fanout_rows (issue #756) ─────────────────────────────────
 
     #[test]
     fn collect_fanout_rows_all_reachable_is_complete_and_unions_rows() {

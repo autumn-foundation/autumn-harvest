@@ -1,8 +1,8 @@
 //! Integration tests for the batch operations API (issue #102).
 //!
 //! Covers the durable wiring end to end: submit → list → get → executor
-//! drains, mid-batch crash resume, Terminate-on-non-running, and the issue's
-//! 1k-workflow / 30s success metric.
+//! drains. Also covers mid-batch crash resume, Terminate-on-non-running, and
+//! the issue's 1k-workflow / 30s success metric.
 
 #![allow(clippy::similar_names, clippy::redundant_clone)]
 
@@ -54,12 +54,11 @@ fn replace_db_name(url: &str, db: &str) -> String {
 
 /// Provision a pristine, migrated Postgres database for one test.
 ///
-/// When `HARVEST_TEST_DATABASE_URL` is set it is treated as an admin base URL:
-/// a fresh, uniquely-named database is created on that server and migrated, so
-/// the exact-count assertions are never contaminated by a sibling test on a
-/// shared server. Otherwise a throwaway testcontainers Postgres is booted
-/// (requires Docker) and the fresh database is created on it. The returned
-/// container (when present) keeps the server alive for the test's duration.
+/// A set `HARVEST_TEST_DATABASE_URL` is an admin base URL. The test creates
+/// and migrates a fresh, uniquely-named database on that server. So a sibling
+/// test on a shared server never contaminates the exact-count assertions.
+/// Otherwise a throwaway testcontainers Postgres boots (requires Docker).
+/// The returned container, when present, keeps the server alive.
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         (url, None)
@@ -109,10 +108,9 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with_router(pool, ShardRouter::default())
 }
 
-/// Like [`build_app`] but with a caller-supplied [`ShardRouter`], so a test can
-/// advertise a shard the single-shard storage pool has no pool for yet
-/// (mid a shard-add rollout) and exercise the poolless-router-known-shard
-/// partial-degradation path (issue #769 review).
+/// Like [`build_app`] but with a caller-supplied [`ShardRouter`]. A test can
+/// then advertise a shard with no pool yet, as in a shard-add rollout. That
+/// exercises the poolless-router-known-shard partial path (issue #769).
 fn build_app_with_router(pool: &DbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -508,10 +506,10 @@ async fn batch_drains_thousand_workflows_within_time_budget() {
 // Issue #102: "A job survives plugin restart and resumes from
 // `completed + failed` cursor."
 //
-// Direct-process-kill is awkward in a single test process, so this simulates
-// the post-crash state: the executor wrote `Running, completed=K` against the
-// row and cancelled K of the matched workflows before the host went away. A
-// fresh executor tick should pick up the remaining N-K and end the job at
+// A process kill is awkward in a single test process, so this simulates
+// the post-crash state. The executor wrote `Running, completed=K` and
+// cancelled K matched workflows before the host went away. A fresh tick
+// should pick up the remaining N-K and end at
 // `total=N, completed=N, failed=0`.
 #[tokio::test]
 async fn batch_resumes_from_partial_progress_cursor() {
@@ -679,11 +677,11 @@ async fn batch_terminate_finalizes_non_running_workflows() {
     );
 }
 
-// Issue #102 success metric: "p99 task-queue claim latency for unrelated
-// workflows must not regress by more than 10% during a 10k-target batch run."
-// This is a scaled-down smoke test: while a 200-target batch tick is in
-// flight, an unrelated GET /workflows must complete within a tight bound.
-// Detects accidental table-locking or pool-exhaustion regressions.
+// Issue #102 success metric: p99 task-queue claim latency for unrelated workflows must
+// not regress over 10% during a 10k-target batch run. This scaled-down smoke
+// test runs a 200-target batch tick. Meanwhile an unrelated GET /workflows
+// must complete within a tight bound. It detects table-locking or
+// pool-exhaustion regressions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_does_not_block_unrelated_workflow_reads() {
     let (url, _container) = setup_database().await;
@@ -714,10 +712,9 @@ async fn batch_does_not_block_unrelated_workflow_reads() {
         .await
     });
 
-    // Probe an unrelated read while the batch is draining. The probe must
-    // complete in well under 5s — the executor holds no long-lived locks
-    // and uses bounded fan-out, so per-call latency should be DB-roundtrip
-    // bounded.
+    // Probe an unrelated read while the batch drains. The probe must finish
+    // well under 5s. The executor holds no long-lived locks and uses bounded
+    // fan-out, so a DB round trip bounds each call.
     let probe_started = std::time::Instant::now();
     let (status, body) = get_json(&app, "/workflows?workflow_name=billing").await;
     let probe_elapsed = probe_started.elapsed();
@@ -786,13 +783,12 @@ async fn batch_executor_lease_prevents_double_dispatch() {
 
 // Issue #102 Signal-resume correctness: Signal targets stay RUNNING after
 // dispatch, so the resume cursor cannot be a counter offset over a re-queried
-// list. If workflows that were already signaled naturally complete during the
-// recovery window, the new RUNNING set shrinks and an offset cursor would
-// silently skip workflows that were never signaled. This test seeds that
-// exact race: it backs the executor row with `processed_ids = first 4 UUIDs`
-// (those were "signaled and later naturally completed"), then deletes those 4
-// rows from the workflow table (so they no longer match the RUNNING filter),
-// and confirms the resume tick dispatches the remaining 6 by identity.
+// list. Signaled workflows can complete during the recovery window. The
+// RUNNING set then shrinks, and an offset cursor skips unsignaled workflows.
+// This test seeds that race. The executor row holds
+// `processed_ids = first 4 UUIDs`, which were signaled and then completed.
+// The test deletes those 4 rows, so they no longer match the RUNNING filter.
+// The resume tick must dispatch the remaining 6 by identity.
 #[tokio::test]
 async fn batch_signal_resume_excludes_processed_ids_not_offset() {
     use autumn_harvest::schema::harvest_signals;
@@ -856,10 +852,10 @@ async fn batch_signal_resume_excludes_processed_ids_not_offset() {
         .await
         .unwrap();
 
-    // The remaining 6 RUNNING workflows must each have received a signal,
-    // and total/completed must reflect identity-based exclusion: 4 from the
-    // prior tick + 6 dispatched here = 10. An offset cursor would have
-    // skipped 4 workflows from the now-shrunken list of 6 and dispatched 2.
+    // Each of the 6 RUNNING workflows must have received a signal.
+    // total/completed must show identity-based exclusion: 4 from the prior
+    // tick + 6 here = 10. An offset cursor would skip 4 of the shrunken list
+    // of 6 and dispatch 2.
     let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
     assert_eq!(body["status"], "Completed", "after resume tick: {body}");
     assert_eq!(body["total"], 10);
@@ -886,8 +882,8 @@ async fn batch_signal_resume_excludes_processed_ids_not_offset() {
 // ---------------------------------------------------------------------------
 // #769 — dry-run preview for batch operations.
 //
-// These are RED (issue #769 is unimplemented): today `SubmitBatchOperationRequest`
-// has no `deny_unknown_fields`, so a `dry_run` field is silently ignored and the
+// These are RED (issue #769 is unimplemented). `SubmitBatchOperationRequest`
+// has no `deny_unknown_fields`, so it silently ignores a `dry_run` field. The
 // request runs as a REAL submit -> 202 + a job row. The assertions below pin the
 // desired 200 + preview body + zero-writes behavior and therefore fail on trunk.
 // (Testcontainers-based; compile-checked only in sandboxes without Docker, run
@@ -1431,7 +1427,7 @@ async fn dry_run_echoes_search_attrs_filter() {
 }
 
 /// #769 (Signal relaxation): a `dry_run` `Signal` WITHOUT `signal_name` returns
-/// 200 with the exact blast radius and enqueues ZERO signals — the preview
+/// 200 with the exact blast radius and enqueues ZERO signals. The preview
 /// reports blast radius, not signal validity.
 #[tokio::test]
 async fn dry_run_signal_without_signal_name_returns_200() {
@@ -1486,15 +1482,14 @@ async fn dry_run_signal_without_signal_name_returns_200() {
     );
 }
 
-/// #769 review (Codex P2): a shard the router advertises via
-/// `readable_shards` for which THIS process has no pool yet (mid a shard-add
-/// rollout) must be folded into `unavailable_shards` → `status = "partial"`,
-/// NOT silently omitted (which would let `status` read `complete` while a
-/// known shard was never queried). The single-shard storage pool holds only
-/// shard 0; the router advertises shard 1 as readable (writable stays shard 0,
-/// i.e. shard 1 is read-only mid-rollout). This is distinct from a *down*
-/// shard (a pool pointing at a broken DB): here there is no pool at all, so the
-/// `acquire_conn` error path never runs — only the poolless-resolution path.
+/// #769: the router can advertise a shard in `readable_shards` that THIS
+/// process has no pool for yet, mid a shard-add rollout. That shard must go
+/// into `unavailable_shards` → `status = "partial"`. Silent omission would
+/// read `complete` while a known shard was never queried. The storage pool
+/// holds only shard 0. The router advertises shard 1 as readable (writable
+/// stays shard 0, i.e. shard 1 is read-only mid-rollout). A *down* shard
+/// has a pool that points at a broken DB. Here there is no pool at all. So
+/// only the poolless-resolution path runs, not the `acquire_conn` error path.
 #[tokio::test]
 async fn dry_run_router_known_poolless_shard_is_partial() {
     let (url, _container) = setup_database().await;

@@ -98,10 +98,10 @@ diesel::table! {
         /// first run's start and carried verbatim across every continue-as-new.
         /// NULL = no chain cap configured (legacy behaviour).
         chain_execution_timeout -> Nullable<Interval>,
-        /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin
-        /// start as `started_at + chain_execution_timeout` and copied VERBATIM
-        /// into every continue-as-new successor (never recomputed as now + cap),
-        /// so a runaway loop cannot escape the cap by continuing-as-new.
+        /// Absolute UTC chain deadline (issue #617). The chain-origin start sets
+        /// it to `started_at + chain_execution_timeout`. Each continue-as-new
+        /// successor copies it VERBATIM and never recomputes it as now + cap.
+        /// So a runaway loop cannot escape the cap by continuing-as-new.
         /// NULL = no chain cap. Not shifted by pause/resume (absolute wall-clock).
         chain_deadline_at -> Nullable<Timestamptz>,
         memo -> Nullable<Jsonb>,
@@ -132,8 +132,8 @@ diesel::table! {
         workflow_attempt -> Int4,
         /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
         workflow_retry_policy -> Nullable<Jsonb>,
-        /// Dispatch origin of this execution (issue #534): `scheduled` / `backfill` /
-        /// `manual_trigger` for schedule-attributed runs, NULL for all non-scheduled runs
+        /// Dispatch origin of this execution (issue #534). `scheduled` / `backfill` /
+        /// `manual_trigger` for schedule-attributed runs. NULL for all other runs
         /// (manual start, signal-with-start, child workflows, etc.). Metadata only —
         /// never affects replay or carryover.
         origin -> Nullable<Text>,
@@ -154,7 +154,7 @@ diesel::table! {
         first_exec_id -> Nullable<Uuid>,
         /// Wall-clock the per-execution legal hold was placed (issue #747).
         /// NULL = no hold. A hold is ACTIVE when this is non-NULL and
-        /// `legal_hold_until` is NULL or in the future; an active hold exempts
+        /// `legal_hold_until` is NULL or in the future. An active hold exempts
         /// this execution's history from retention deletion and PII erasure.
         legal_hold_set_at -> Nullable<Timestamptz>,
         /// Operator-supplied justification for the legal hold (issue #747).
@@ -178,8 +178,8 @@ diesel::table! {
         /// `PATCH /workflows/{id}/triage`. NULL = no note. Metadata only --
         /// never read on replay, never appends a `WorkflowEvent`.
         triage_note -> Nullable<Text>,
-        /// Resolved per-tenant quota key (issue #946). Set at INSERT time from
-        /// `QuotaPolicy::key_expr` resolved against the start input; NULL when
+        /// Resolved per-tenant quota key (issue #946). INSERT sets it from
+        /// `QuotaPolicy::key_expr`, resolved against the start input. NULL when
         /// the workflow type has no declared `QuotaPolicy` or the key could not
         /// be resolved from the input. Never read on replay -- purely an
         /// admission-time bookkeeping column backing the quota usage counts.
@@ -339,17 +339,16 @@ diesel::table! {
         created_at -> Nullable<Timestamptz>,
         /// Worker session this activity belongs to (issue #606). NULL for an
         /// ordinary activity. When set, the claim query hard-pins this row to
-        /// `sticky_worker_id` -- unlike ordinary sticky routing, it never
-        /// fails over to another worker even after the lease (`sticky_until`)
-        /// expires, since the session's local state only exists on that one
-        /// worker.
+        /// `sticky_worker_id`. Unlike ordinary sticky routing, it never fails
+        /// over, even after the lease (`sticky_until`) expires. The session's
+        /// local state exists only on that one worker.
         session_id -> Nullable<Uuid>,
         /// Consecutive claims by workers with no handler registered for this
-        /// task's type (issue #804). Incremented by
-        /// `queue::release_task_for_capability_miss` when a worker releases a
-        /// task it cannot run so a capable peer can claim it; reset to 0 by
-        /// every path that proves the claiming worker WAS capable. Bounds the
-        /// bounce: at `WorkerConfig::capability_miss_max_redeliveries` the task
+        /// task's type (issue #804). `queue::release_task_for_capability_miss`
+        /// increments it when a worker releases a task it cannot run, so a
+        /// capable peer can claim it. Every path that proves the claiming
+        /// worker WAS capable resets it to 0. Bounds the bounce: at
+        /// `WorkerConfig::capability_miss_max_redeliveries` the task
         /// escalates to the terminal-failure path with a `no_capable_worker:`
         /// reason. Deliberately separate from `attempt` (retry budget) and
         /// `crash_strikes` (poison-pill quarantine).
@@ -393,11 +392,12 @@ diesel::table! {
         /// Structured capability requirements JSONB payload (issue #382).
         required_capabilities -> Nullable<Jsonb>,
         /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
-        /// hardening). Set by `wake_workflow_task` when its primary re-pend UPDATE
-        /// matches zero rows because the row is currently claimed and mid-processing
-        /// (`state = 'RUNNING'`, `worker_id IS NOT NULL`) -- the wake would otherwise
-        /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
-        /// racing a same-cycle wake immediately re-pends instead of parking.
+        /// hardening). `wake_workflow_task` sets it when its primary re-pend
+        /// UPDATE matches zero rows. That happens while the row is claimed and
+        /// mid-processing (`state = 'RUNNING'`, `worker_id IS NOT NULL`).
+        /// Without the flag the wake is silently dropped. `park_workflow_task`
+        /// reads and clears it, so a park racing a same-cycle wake re-pends
+        /// instead of parking.
         wake_requested -> Bool,
         /// Issue #804: WHICH handler the two counters above are about, as
         /// `{kind}:{name}`. The counters describe one frontier. The single
@@ -945,9 +945,9 @@ diesel::table! {
         /// TTL'd operator override (issue #945). `NULL` = no override burst
         /// declared; falls back to `burst` while an override is active.
         override_burst -> Nullable<Double>,
-        /// The override is active while this is set and in the future; once
-        /// it elapses every consumer reverts to the declared baseline with no
-        /// operator action or background sweeper needed (issue #945).
+        /// The override is active while this is set and in the future. Once
+        /// it elapses, every consumer reverts to the declared baseline with no
+        /// operator action or background sweeper (issue #945).
         override_expires_at -> Nullable<Timestamptz>,
         /// When `queue::ensure_rate_limit_bucket` last (re-)registered this
         /// bucket (issue #1127). Part of the idle-bucket GC's idleness clock,
@@ -1301,14 +1301,13 @@ diesel::table! {
         /// capture is disabled.
         error         -> Nullable<Text>,
         /// Parent execution UUID for a child-workflow summary, else NULL
-        /// (issue #752). Links a demoted child summary to its parent so the
-        /// #495 PII-erase cascade can reach it after both the child's and the
-        /// parent's execution rows are gone.
+        /// (issue #752). It links a demoted child summary to its parent. So the
+        /// #495 PII-erase cascade reaches it after both execution rows are gone.
         parent_id     -> Nullable<Uuid>,
         summarized_at -> Timestamptz,
-        /// The demoted execution's residence history (issue #964), carried over
-        /// verbatim so a cross-residence payload erasure can still reach the
-        /// sealed source copies after the execution row itself is collected.
+        /// The demoted execution's residence history (issue #964), copied
+        /// verbatim. A cross-residence payload erasure then still reaches the
+        /// sealed source copies after the execution row is collected.
         /// NULL for a run that never moved.
         migrated_from_shards -> Nullable<Jsonb>,
     }
@@ -1318,9 +1317,9 @@ diesel::table! {
     use diesel::sql_types::*;
 
     /// Content-addressed storage for sandboxed WebAssembly activity modules
-    /// (issue #965). Composite primary key `(hash, activity_name)` so identical
-    /// bytes can bind to two activity names independently; a partial unique
-    /// index (`WHERE active`) enforces at most one active version per name.
+    /// (issue #965). The composite primary key `(hash, activity_name)` lets
+    /// identical bytes bind to two activity names independently. A partial
+    /// unique index (`WHERE active`) allows at most one active version per name.
     harvest_wasm_modules (hash, activity_name) {
         hash          -> Text,
         activity_name -> Text,
@@ -1431,10 +1430,10 @@ diesel::table! {
     /// Durable resume cursor for the lazy payload-codec re-encryption sweep
     /// (issue #948).
     ///
-    /// One row per shard, with the target key stored as a COLUMN: any change of
-    /// active key — including a rollback to a key that already completed a pass
-    /// — must restart the scan, which keying the row on the key id could not
-    /// express.
+    /// One row per shard, with the target key stored as a COLUMN. Any change
+    /// of active key must restart the scan. That includes a rollback to a key
+    /// that already completed a pass. A row keyed on the key id could not
+    /// express that.
     harvest_codec_rotation_cursor (shard_id) {
         shard_id -> Int4,
         active_key_id -> Text,
@@ -1467,9 +1466,9 @@ diesel::table! {
 
     /// Durable per-execution shard-migration record (issue #964).
     ///
-    /// Lives on the **source** shard -- the one that stays authoritative right
-    /// up to the cutover commit -- so a crash at any point leaves a record on
-    /// the database that still owns the run. `resume_incomplete_migrations`
+    /// Lives on the **source** shard, which stays authoritative up to the
+    /// cutover commit. So a crash at any point leaves a record on the
+    /// database that still owns the run. `resume_incomplete_migrations`
     /// drives it forward; the phase machine that decides what to do with a row
     /// found mid-flight is pure and lives in `shard_rebalance`.
     harvest_shard_migrations (execution_id) {
@@ -1484,17 +1483,17 @@ diesel::table! {
         verified_fingerprint -> Nullable<Text>,
         /// The source history's high-water mark at the instant verification
         /// passed. The cutover seals only while the source's live counts still
-        /// equal these, so a run that woke, ran a decision cycle and re-parked
-        /// between verification and cutover is refused rather than cut over to
-        /// a copy that no longer contains its latest events.
+        /// equal these. A run can wake, run a decision cycle and re-park
+        /// between verification and cutover. The cutover then refuses it. It
+        /// does not cut over to a copy that lacks the latest events.
         verified_event_count -> Nullable<Int8>,
         verified_max_event_id -> Nullable<Int4>,
         abort_reason -> Nullable<Text>,
         /// The source's parked workflow task row, captured verbatim at stage
-        /// time and re-inserted on the target at activation. Held here rather
-        /// than staged on the target because the claim query does not filter on
-        /// execution state, so a task row next to a staged `MIGRATING`
-        /// execution would be claimable -- live on two shards at once.
+        /// time and re-inserted on the target at activation. It is held here,
+        /// not staged on the target, because the claim query does not filter on
+        /// execution state. A task row next to a staged `MIGRATING` execution
+        /// would be claimable -- live on two shards at once.
         staged_task -> Nullable<Jsonb>,
         attempts -> Int4,
         last_error -> Nullable<Text>,

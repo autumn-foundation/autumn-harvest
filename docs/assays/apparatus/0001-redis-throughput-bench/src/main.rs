@@ -4,9 +4,9 @@
 //
 // Measures sustained enqueue -> claim -> complete round trips/sec through
 // RedisTaskQueue, at a swept worker-concurrency count, against a local Redis.
-// All workers share one queue name (the pre-registered condition), each with
-// its own consumer identity, so the number reflects real consumer-group
-// contention on a shared stream rather than N independent streams.
+// All workers share one queue name, the pre-registered condition. Each worker
+// has its own consumer identity. So the number reflects consumer-group
+// contention on one shared stream, not N independent streams.
 
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,16 +18,15 @@ use tokio::sync::Barrier;
 
 const QUEUE_NAME: &str = "bench-shared";
 
-/// A fresh key prefix per scenario invocation, so a rerun (or the next cell
-/// in the same sweep) never inherits another run's leftover stream, consumer
-/// group, or un-acked entries. A fixed prefix reused across cells or runs
-/// would let stale state from one measurement bleed into the next -- e.g. a
-/// steady-state cell that hits its deadline with an enqueued-but-unclaimed
-/// entry still sitting on the stream would hand the next cell (or the
-/// backlog-drain scenario) a "seed exactly N" precondition that was not
-/// actually true. Mirrors the crate's own integration tests
-/// (`format!("test_{}", uuid::Uuid::new_v4().simple())`), without adding a
-/// `uuid` dependency to this throwaway apparatus.
+/// Returns a fresh key prefix per scenario invocation. A rerun or the next
+/// cell never inherits a leftover stream, consumer group or un-acked entry.
+/// With a fixed prefix, stale state bleeds from one measurement into the
+/// next. For example, a steady-state cell can hit its deadline with an
+/// unclaimed entry on the stream. The next cell, or the backlog-drain
+/// scenario, then sees a false "seed exactly N" precondition. Mirrors the
+/// crate's own integration tests
+/// (`format!("test_{}", uuid::Uuid::new_v4().simple())`), without a `uuid`
+/// dependency.
 fn unique_prefix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -45,10 +44,9 @@ async fn run_worker(
     duration: Duration,
     counter: Arc<AtomicU64>,
 ) {
-    // All workers connect and reach this point before any of them starts
-    // enqueuing, so the measured window and the concurrency it reports are
-    // the same window for every worker -- no worker is running solo while
-    // later ones are still connecting.
+    // All workers connect before any worker enqueues. So every worker
+    // measures the same window, and no worker runs solo while later ones
+    // still connect.
     start_gate.wait().await;
     let deadline = Instant::now() + duration;
 
@@ -118,26 +116,24 @@ async fn sweep_one(concurrency: usize, duration: Duration, redis_url: &str) -> f
     total as f64 / duration.as_secs_f64()
 }
 
-/// Drain a pre-seeded, static backlog with claim-only workers -- no worker
-/// enqueues anything once the seed is in place. This is closer to
-/// `docs/performance.md`'s methodology than the steady-state loop above (which
-/// keeps the queue near-empty by construction), but it is still NOT a matched
-/// reproduction of that harness: `claim_bench_support.rs` spreads its backlog
-/// across 4 queues and caps claims at `backlog / MAX_DRAIN_FRACTION` (= 5) so
-/// the backlog stays at 80-100% of its seeded depth throughout the run, while
-/// this function uses one queue and drains it to zero. See assay #1's report,
-/// "post-review correction #2", for why that gap is not patched here: getting
-/// a true match means reusing or porting that harness's scenario shape, not
-/// another one-off reimplementation. Numbers from this function are reported
-/// as exploratory and are never compared to the Postgres control by a ratio.
+/// Drain a pre-seeded, static backlog with claim-only workers. No worker
+/// enqueues once the seed is in place. This is closer to
+/// `docs/performance.md`'s methodology than the steady-state loop, which
+/// keeps the queue near-empty. It is still NOT a matched reproduction of
+/// that harness. `claim_bench_support.rs` spreads its backlog across 4
+/// queues and caps claims at `backlog / MAX_DRAIN_FRACTION` (= 5). Its
+/// backlog stays at 80-100% of the seeded depth. This function uses one
+/// queue and drains it to zero. Assay #1's report, "post-review correction
+/// #2", says why this gap stays: a true match must reuse or port that
+/// harness's scenario shape. The numbers are exploratory and are never
+/// compared to the Postgres control by a ratio.
 /// Returns this worker's own (start, end) instants. `Barrier` does not
-/// guarantee the order in which released tasks resume, so for a scenario
-/// this short (~80ms observed), a timestamp taken by `main` after *its own*
-/// `wait()` returns can lag behind a worker that already resumed and started
-/// claiming -- inflating the reported rate by shrinking the denominator. Each
-/// worker times itself instead; the caller folds all of them into
-/// `min(start)..max(end)`, the same window-folding approach
-/// `docs/performance.md`'s own harness uses.
+/// guarantee the order in which released tasks resume. This scenario is short
+/// (~80ms observed). So a timestamp that `main` takes after *its own*
+/// `wait()` can lag a worker that already resumed and claims. That lag shrinks the
+/// denominator and inflates the rate. Each worker times itself instead. The
+/// caller folds all windows into `min(start)..max(end)`, as the harness of
+/// `docs/performance.md` does.
 async fn run_drain_worker(
     queue: RedisTaskQueue,
     worker_id: String,
@@ -246,12 +242,11 @@ async fn main() {
         println!("{concurrency},{ops_per_sec:.2}");
     }
 
-    // Exploratory only -- NOT a matched reproduction of docs/performance.md's
-    // harness (see run_drain_worker's doc comment and assay #1's report,
-    // "post-review correction #2"): that harness spreads its backlog across
-    // 4 queues and claims only backlog/5 of it, holding depth at 80-100%;
-    // this drains one queue to zero. No ratio against the Postgres control
-    // should be derived from this number.
+    // Exploratory only. This is NOT a matched reproduction of the harness of
+    // docs/performance.md (see run_drain_worker and assay #1's report,
+    // "post-review correction #2"). That harness spreads its backlog across
+    // 4 queues and claims only backlog/5, so depth holds at 80-100%. This
+    // drains one queue to zero. Derive no ratio against the Postgres control.
     let (claims_per_sec, drained) =
         backlog_drain_scenario(1_000, 8, Duration::from_secs(60), &redis_url).await;
     println!(

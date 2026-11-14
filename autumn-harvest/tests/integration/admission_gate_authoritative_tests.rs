@@ -6,16 +6,16 @@
 //! instance and asserts that a completion-trigger-initiated start is:
 //!
 //! - BLOCKED when a matching admission gate is active (Fleet, or a scoped
-//!   gate that matches), recording the same `record_admission_blocked` outcome
-//!   a direct API start records, dropping the start (no target execution) and
-//!   writing an exactly-once resolved-skip fires row with
-//!   `outcome = 'admission_blocked'` — never rolling back the source terminal;
+//!   gate that matches). It records the same `record_admission_blocked`
+//!   outcome as a direct API start. It drops the start (no target execution).
+//!   It writes an exactly-once resolved-skip fires row with
+//!   `outcome = 'admission_blocked'`. It never rolls back the source terminal.
 //! - STARTED normally when no gate cache is installed (byte-identical to
 //!   pre-#618), and when a scoped gate does NOT match.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (the process-global gate cache and shard router force
-//! single-threaded execution; each test scrubs first). Otherwise a fresh
+//! against it directly. The process-global gate cache and shard router force
+//! single-threaded execution, and each test scrubs first. Otherwise a fresh
 //! testcontainers Postgres is booted with the full migration bundle.
 
 use std::collections::BTreeMap;
@@ -50,9 +50,9 @@ use uuid::Uuid;
 
 /// Serialises the process-global gate cache + shard router across tests.
 ///
-/// `pub(crate)` so sibling scanner suites that now consult the same
-/// process-global gate cache at fire time (e.g. `throttle_tests`, issue #1053)
-/// can hold this guard while firing, preventing a gate armed by a concurrent
+/// `pub(crate)` so sibling scanner suites can hold this guard while firing.
+/// They consult the same process-global gate cache at fire time (e.g.
+/// `throttle_tests`, issue #1053). The guard stops a gate armed by a concurrent
 /// gate test from spuriously blocking (or being stomped by) their fires.
 // `pub(crate)` is required (a sibling test module references it via
 // `crate::admission_gate_authoritative_tests::TEST_SERIAL`); clippy's
@@ -61,24 +61,22 @@ use uuid::Uuid;
 pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 // The test DB is seeded from `autumn_harvest::test_init_sql()` — the
-// build.rs-generated full migration bundle (identical to `diesel migration run`),
-// regenerated automatically from the whole `migrations/` directory. There is
-// nothing to hand-maintain or regenerate here: every table/column
-// `start_or_load_workflow_execution` and the completion-trigger path read is
-// present by construction, so the schema is drift-proof (a hand-picked subset
-// would silently rot as the start path gains column reads — e.g. issue #618, where
-// `harvest_build_policies` from build_routing AND `legal_hold_set_at` from a much
-// later migration were both missing from an earlier subset). The applied superset
-// never over-constrains a test.
+// build.rs-generated full migration bundle (identical to `diesel migration run`).
+// Every table and column that `start_or_load_workflow_execution` and the
+// completion-trigger path read is present by construction. So the schema is
+// drift-proof. A hand-picked subset would silently rot as the start path gains
+// column reads. In issue #618 an earlier subset missed both
+// `harvest_build_policies` and a much later `legal_hold_set_at`. The applied
+// superset never over-constrains a test.
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Per-workflow schedule columns the cross-shard test's fresh DBs need. These are
-/// already present in the full migration bundle (the `harvest_schedules`/`schedule_id`
-/// migrations add `workflow_name`/`queue_name`), so the `ADD COLUMN IF NOT EXISTS`
-/// clauses are idempotent no-ops kept for defensive clarity; `resolve_target_queue`
-/// selects `queue_name WHERE workflow_name`.
+/// Per-workflow schedule columns the cross-shard test's fresh DBs need.
+///
+/// The full migration bundle already adds `workflow_name`/`queue_name`. So the
+/// `ADD COLUMN IF NOT EXISTS` clauses are idempotent no-ops kept for defensive
+/// clarity. `resolve_target_queue` selects `queue_name WHERE workflow_name`.
 const SCHED_COLS: &str = "ALTER TABLE harvest_schedules ALTER COLUMN dag_name DROP NOT NULL; \
      ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS workflow_name TEXT; \
      ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS queue_name TEXT;";
@@ -311,9 +309,10 @@ async fn target_exec_count_named(conn: &mut AsyncPgConnection, workflow_name: &s
     .n
 }
 
-/// issue #1053 helper — read a rate-limit bucket's current token balance so the
-/// fire-time-gate tests can assert a BLOCKED deferred throttle fire REFUNDED the
-/// token it reserved before the start (nothing admitted → nothing spent).
+/// Reads a rate-limit bucket's current token balance (issue #1053).
+///
+/// A BLOCKED deferred throttle fire must REFUND the token it reserved before the
+/// start: nothing admitted, nothing spent.
 async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
     #[derive(diesel::QueryableByName)]
     struct TokensRow {
@@ -328,9 +327,9 @@ async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
         .tokens
 }
 
-/// issue #1053 helper — count pending `harvest_start_throttle` rows for a
-/// specific `workflow_id`, so a test can assert a BLOCKED deferred fire LEFT the
-/// row (re-deferred, not deleted).
+/// Counts pending `harvest_start_throttle` rows for a `workflow_id` (issue
+/// #1053). A BLOCKED deferred fire must LEAVE the row (re-deferred, not
+/// deleted).
 async fn throttle_rows_for(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
     diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_id = $1")
         .bind::<Text, _>(workflow_id)
@@ -340,9 +339,9 @@ async fn throttle_rows_for(conn: &mut AsyncPgConnection, workflow_id: &str) -> i
         .n
 }
 
-/// issue #1053 (review B-G1) helper — read the `deferred_at` of a pending
-/// `harvest_start_throttle` row so a test can assert a gate-blocked fire BUMPED it
-/// forward (the re-defer backoff that rotates a gated row behind un-gated keys).
+/// Reads the `deferred_at` of a pending `harvest_start_throttle` row (issue
+/// #1053). A gate-blocked fire must BUMP it forward. That re-defer backoff
+/// rotates a gated row behind un-gated keys.
 async fn throttle_deferred_at_for(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -360,12 +359,13 @@ async fn throttle_deferred_at_for(
         .deferred_at
 }
 
-/// issue #1053 helper — directly seed a prior `ag_target_wf` execution row
-/// (shard 0 — the single-shard `ShardRouter::default()` used here) in a given
-/// terminal/active `state`. Mirrors the plugin suite's `seed_execution`; used by
-/// the (b) force-terminate residual test to plant a TERMINATED prior (a sealed
-/// state excluded by the active-uniqueness partial index, so a fresh CREATE with
-/// the same `workflow_id` is allowed and must therefore face the fire-time gate).
+/// Seeds a prior `ag_target_wf` execution row in a given `state` (issue #1053).
+///
+/// The row goes on shard 0, the single-shard `ShardRouter::default()` used here.
+/// Mirrors the plugin suite's `seed_execution`. The force-terminate residual
+/// test plants a TERMINATED prior with it. The active-uniqueness partial index
+/// excludes that sealed state. So a fresh CREATE with the same `workflow_id` is
+/// allowed and must face the fire-time gate.
 async fn seed_target_execution_state(conn: &mut AsyncPgConnection, workflow_id: &str, state: &str) {
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
@@ -417,9 +417,9 @@ fn scoped_cache(scope: GateScope) -> Arc<AdmissionGateCache> {
     cache
 }
 
-/// AC1: a Fleet gate blocks a completion-trigger start (same block outcome as a
-/// direct API start), records an exactly-once `admission_blocked` fires row, and
-/// never rolls back the source terminal.
+/// AC1: a Fleet gate blocks a completion-trigger start, with the same outcome as
+/// a direct API start. It records an exactly-once `admission_blocked` fires row
+/// and never rolls back the source terminal.
 #[tokio::test]
 async fn completion_trigger_blocked_by_fleet_gate() {
     let _guard = TEST_SERIAL
@@ -435,7 +435,6 @@ async fn completion_trigger_blocked_by_fleet_gate() {
     insert_trigger(&mut conn, trigger_id).await;
     let source_exec_id = start_completed_source(&mut conn, "ag-src-fleet").await;
 
-    // Raise a Fleet gate.
     let cache = fleet_cache("incident-618");
     set_global_admission_gate_cache(Some(Arc::clone(&cache)));
 
@@ -488,13 +487,13 @@ async fn completion_trigger_blocked_by_fleet_gate() {
     assert_eq!(src_state[0].outcome.as_deref(), Some("COMPLETED"));
 }
 
-/// Finding B (F-round5): a completion-trigger start blocked by a gate on a
-/// terminal path that passes `metrics: None` (cancel / terminate /
-/// parent-close-cascade in `execution.rs`) is STILL counted on
-/// `harvest.admission.blocked`, via the process-global recorder fallback the
-/// plugin publishes at boot. Without the fallback, `evaluate_triggers_for_execution`
-/// with `metrics: None` drops-and-records the block but never counts it — a hole
-/// in the "zero un-counted blocks" bar. Here the source is CANCELLED and the
+/// Some terminal paths pass `metrics: None` (cancel / terminate /
+/// parent-close-cascade in `execution.rs`). A completion-trigger start blocked
+/// by a gate on such a path is STILL counted on `harvest.admission.blocked`.
+/// The count comes from the process-global recorder fallback that the plugin
+/// publishes at boot. Without it, `evaluate_triggers_for_execution` with
+/// `metrics: None` drops and records the block but never counts it. That is a
+/// hole in the "zero un-counted blocks" bar. Here the source is CANCELLED and the
 /// recorder is supplied ONLY via the global, never as the `metrics` param.
 #[tokio::test]
 async fn completion_trigger_block_counted_via_global_recorder_on_cancel_path() {
@@ -527,7 +526,6 @@ async fn completion_trigger_block_counted_via_global_recorder_on_cancel_path() {
         .await
         .expect("cancel source");
 
-    // Raise a Fleet gate.
     let cache = fleet_cache("cancel-incident-618");
     set_global_admission_gate_cache(Some(Arc::clone(&cache)));
 
@@ -627,12 +625,12 @@ async fn completion_trigger_starts_when_no_gate_cache() {
     assert_eq!(fires[0].outcome, None, "a real fire records NULL outcome");
 }
 
-/// F3: a fail-closed / uninitialized gate cache with NO cached gate matching the
-/// start must NOT drop a completion-trigger start. It is in-flight continuation
-/// of already-committed work, so evaluate PROCEEDS: the target starts, no
-/// `admission_blocked` count, and the fires row is a real fire (NULL outcome),
-/// not a block. (The companion `..._with_cached_gate_blocks` covers the case
-/// where a real gate IS in the last-known snapshot.)
+/// A fail-closed / uninitialized gate cache with NO cached gate matching the
+/// start must NOT drop a completion-trigger start. It continues already-committed
+/// work, so evaluate PROCEEDS. The target starts with no `admission_blocked`
+/// count. The fires row is a real fire (NULL outcome), not a block. (The
+/// companion `..._with_cached_gate_blocks` covers the case where a real gate IS
+/// in the last-known snapshot.)
 #[tokio::test]
 async fn completion_trigger_fail_closed_no_cached_gate_proceeds() {
     let _guard = TEST_SERIAL
@@ -689,11 +687,11 @@ async fn completion_trigger_fail_closed_no_cached_gate_proceeds() {
     );
 }
 
-/// Codex P1 (issue #618): under fail-closed, a REAL gate already loaded into the
-/// last-known cached snapshot MUST still block a matching completion-trigger
-/// start (block + drop + count) — otherwise completion triggers would bypass an
-/// active gate uncounted during exactly the incident the gate exists for, while
-/// direct API starts still block. `set_fail_closed()` leaves the snapshot
+/// Issue #618: under fail-closed, a REAL gate already in the last-known cached
+/// snapshot MUST still block a matching completion-trigger start (block + drop +
+/// count). Otherwise completion triggers would bypass an active gate uncounted.
+/// That happens during the incident the gate exists for, while direct API
+/// starts still block. `set_fail_closed()` leaves the snapshot
 /// intact, so the cached gate is available to match against.
 #[tokio::test]
 async fn completion_trigger_fail_closed_with_cached_gate_blocks() {
@@ -749,10 +747,10 @@ async fn completion_trigger_fail_closed_with_cached_gate_blocks() {
     assert_eq!(fires[0].outcome.as_deref(), Some("admission_blocked"));
 }
 
-/// F4: re-evaluating the SAME (source, trigger) with the gate still active must
+/// Re-evaluating the SAME (source, trigger) with the gate still active must
 /// NOT double-count `record_admission_blocked`. The fires row stays exactly-once
-/// (ON CONFLICT DO NOTHING); the second evaluate records a `deduped` outcome
-/// instead of a second block, mirroring the sibling `condition_unmet` path.
+/// (ON CONFLICT DO NOTHING). The second evaluate records a `deduped` outcome, not
+/// a second block. This mirrors the sibling `condition_unmet` path.
 #[tokio::test]
 async fn completion_trigger_block_is_not_double_counted_on_reentry() {
     let _guard = TEST_SERIAL
@@ -823,16 +821,16 @@ async fn completion_trigger_block_is_not_double_counted_on_reentry() {
     );
 }
 
-/// F1/F6: the deferred-fire producers relay a start admitted BEFORE a gate was
+/// The deferred-fire producers relay a start admitted BEFORE a gate was
 /// raised. `debounce` and `event_batch` remain `GatedAtAdmission` — with a Fleet
 /// gate active each still fires (starts the target) AND increments
 /// `harvest.admission.bypassed{producer}` so no admission is un-counted. Since
-/// issue #1053 `throttle` is `GatedAtRelay`: under an active gate it BLOCKS at
-/// fire time (re-defers the row, refunds the token, starts nothing) and counts a
-/// `harvest.admission.blocked` — like the completion-trigger cross-shard relay
-/// (which drops its row instead of re-deferring). This is the falsifiable "zero
-/// un-counted admissions" bar for the scanner producers, running Docker-backed
-/// in CI.
+/// issue #1053 `throttle` is `GatedAtRelay`. Under an active gate it BLOCKS at
+/// fire time: it re-defers the row, refunds the token and starts nothing. It
+/// counts a `harvest.admission.blocked`, like the completion-trigger
+/// cross-shard relay. That relay drops its row instead of re-deferring. This is
+/// the falsifiable "zero un-counted admissions" bar for the scanner producers,
+/// running Docker-backed in CI.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn deferred_scanner_fires_are_counted_as_bypass() {
@@ -846,12 +844,11 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     install_global_router(ShardRouter::default());
 
     // Raise a Fleet gate. The pure deferred-fire scanners (debounce, throttle,
-    // event-batch) are exempt — their start was already admitted before the gate,
-    // so each fire is counted as a bypass. The completion-trigger CROSS-SHARD
-    // relay is the exception (Finding B, F-round7): it materializes a *new*
-    // pre-committed start on the target shard, so it is gated AUTHORITATIVELY at
-    // relay time — under this Fleet gate it BLOCKS (drops the row, records
-    // admission_blocked) rather than bypassing.
+    // event-batch) are exempt. Their start was admitted before the gate, so each
+    // fire counts as a bypass. The completion-trigger CROSS-SHARD relay is the
+    // exception. It materializes a *new* pre-committed start on the target
+    // shard, so it is gated AUTHORITATIVELY at relay time. Under this Fleet gate
+    // it BLOCKS (drops the row, records admission_blocked) rather than bypassing.
     let cache = fleet_cache("scanner-incident");
     set_global_admission_gate_cache(Some(Arc::clone(&cache)));
 
@@ -882,10 +879,10 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
     )
     .await
     .unwrap();
-    // Finding B (F-round7): the CT cross-shard relay is now gated AUTHORITATIVELY
-    // at relay time, so under the Fleet gate it BLOCKS (drops the row + records
-    // admission_blocked) rather than bypassing. It still "processes" the row (it
-    // was dropped), so processed_count is 1 — but it is a BLOCK, not a bypass.
+    // The CT cross-shard relay is gated AUTHORITATIVELY at relay time. Under the
+    // Fleet gate it BLOCKS (drops the row + records admission_blocked) rather
+    // than bypassing. It still "processes" the dropped row, so processed_count
+    // is 1. But it is a BLOCK, not a bypass.
     assert_eq!(
         relayed, 1,
         "CT cross-shard relay processes the row (blocked + dropped) under the gate"
@@ -934,9 +931,9 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
         autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
             .await
             .unwrap();
-    // issue #1053: throttle is now GatedAtRelay — under the Fleet gate the
-    // deferred fire BLOCKS + RE-DEFERS (leaves the row, refunds the token,
-    // starts nothing) instead of firing gate-exempt.
+    // Issue #1053: throttle is GatedAtRelay. Under the Fleet gate the deferred
+    // fire BLOCKS + RE-DEFERS instead of firing gate-exempt. It leaves the row,
+    // refunds the token and starts nothing.
     assert_eq!(thr, 0, "throttle scanner blocks + re-defers under the gate");
     assert_eq!(
         throttle_rows_for(&mut conn, "thr-scan").await,
@@ -1004,16 +1001,18 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
 }
 
 /// issue #1053 (MONEY): the throttle scanner honours the admission gate at FIRE
-/// time. Under a CLOSED gate a deferred throttle start must BLOCK + RE-DEFER —
-/// leave the `harvest_start_throttle` row (do NOT delete), refund the token it
-/// reserved before the start, create NO execution, and count the block exactly
-/// once on the passed recorder. Once the gate OPENS, the held start FIRES
-/// exactly once (row deleted, execution created, a `throttle` bypass counted).
+/// time. Under a CLOSED gate a deferred throttle start must BLOCK + RE-DEFER. It
+/// leaves the `harvest_start_throttle` row (no delete). It refunds the token it
+/// reserved before the start. It creates NO execution. It counts the block
+/// exactly once on the passed recorder. Once the gate OPENS, the held start
+/// FIRES exactly once (row deleted, execution created, a `throttle` bypass
+/// counted).
 ///
-/// This is the falsifiable RED for the core mechanism: against unchanged code
-/// the throttle scanner is gate-exempt by construction (`_collect(.., None, None)`),
-/// so Phase A FIRES despite the gate (`n == 1`, row deleted, execution created,
-/// token spent, no block counted) and the `assert_eq!(n, 0)` fails.
+/// This is the falsifiable RED for the core mechanism. Against unchanged code
+/// the throttle scanner is gate-exempt by construction (`_collect(.., None, None)`).
+/// So Phase A FIRES despite the gate, and the `assert_eq!(n, 0)` fails. That
+/// fire sets `n == 1`, deletes the row, creates an execution, spends the token
+/// and counts no block.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
@@ -1054,8 +1053,8 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
     let metrics = CapturingMetrics::default();
     let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
 
-    // Capture the row's original (past) `deferred_at` so Phase A can prove the
-    // gate-block re-defer BUMPED it forward (review B-G1 backoff).
+    // Capture the row's original (past) `deferred_at`. Phase A proves the
+    // gate-block re-defer BUMPED it forward.
     let deferred_before = throttle_deferred_at_for(&mut conn, "thr-redefer").await;
 
     // ── Phase A: gate CLOSED — block + re-defer ──
@@ -1069,8 +1068,8 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
         1,
         "the blocked row is LEFT (re-deferred), not deleted"
     );
-    // review B-G1: the gate-blocked row's `deferred_at` is bumped forward by
-    // GATE_REDEFER_BACKOFF, rotating it behind un-gated keys in the fire ordering.
+    // GATE_REDEFER_BACKOFF bumps the gate-blocked row's `deferred_at` forward. That
+    // rotates it behind un-gated keys in the fire ordering.
     let deferred_after = throttle_deferred_at_for(&mut conn, "thr-redefer").await;
     assert!(
         deferred_after > deferred_before,
@@ -1106,10 +1105,10 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
     );
 
     // ── Phase B: gate OPEN — the held start fires ──
-    // The re-defer backoff pushed `deferred_at` into the future; make the row
-    // due again before driving the open-gate fire (defensive: the candidate
-    // SELECT has no `deferred_at <= NOW()` floor today, so it would fire anyway,
-    // but resetting keeps the assertion robust if a floor is ever added).
+    // The re-defer backoff pushed `deferred_at` into the future, so make the row
+    // due again. This is defensive. The candidate SELECT has no
+    // `deferred_at <= NOW()` floor today, so the row would fire anyway. The
+    // reset keeps the assertion robust if a floor is ever added.
     diesel::sql_query(
         "UPDATE harvest_start_throttle SET deferred_at = NOW() - INTERVAL '1 second' \
          WHERE workflow_id = 'thr-redefer'",
@@ -1224,9 +1223,9 @@ async fn throttle_row_deferred_before_gate_is_held_when_gate_arms_before_fire() 
 /// deferred fire faces the fire-time gate — force-terminate is merely what turns
 /// a would-be attach into a would-be CREATE.
 ///
-/// RED against unchanged code: TERMINATED is excluded from the active-uniqueness
-/// partial index, so the gate-exempt scanner CREATEs a fresh replacement
-/// (`n == 1`, a 2nd `ag_target_wf` row), failing `assert_eq!(n, 0)`.
+/// RED against unchanged code: the active-uniqueness partial index excludes
+/// TERMINATED. So the gate-exempt scanner CREATEs a fresh replacement (`n == 1`,
+/// a 2nd `ag_target_wf` row), and `assert_eq!(n, 0)` fails.
 #[tokio::test]
 async fn throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate() {
     let _guard = TEST_SERIAL
@@ -1299,17 +1298,16 @@ async fn throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate() {
     );
 }
 
-/// issue #1053 (review B-G1 regression pin): a queue-scoped gate must NOT starve
-/// throttle starts on OTHER (un-gated) queues. A gate-blocked throttle row's
-/// `deferred_at` is bumped forward (the re-defer backoff), so it rotates behind
-/// un-gated rows in the `ORDER BY deferred_at ASC` fire ordering; an un-gated row
-/// on a different queue FIRES in the same tick while the gated row is HELD and
-/// backed off.
+/// Issue #1053 regression pin: a queue-scoped gate must NOT starve throttle
+/// starts on OTHER (un-gated) queues. The re-defer backoff bumps a gate-blocked
+/// throttle row's `deferred_at` forward. So it rotates behind un-gated rows in
+/// the `ORDER BY deferred_at ASC` fire ordering. An un-gated row on a different
+/// queue FIRES in the same tick while the gated row is HELD and backed off.
 ///
 /// The gate is scoped `GateScope::Queue("gated-q")`, matching only the gated
-/// row's queue. The un-gated row targets `open-q` (gate does not match) and must
-/// fire even though the gated row is OLDER (would otherwise be selected first and,
-/// without the backoff, keep monopolizing the fire batch across ticks).
+/// row's queue. The un-gated row targets `open-q` (gate does not match). It must
+/// fire even though the gated row is OLDER. The older row is selected first.
+/// Without the backoff it would keep monopolizing the fire batch across ticks.
 #[tokio::test]
 async fn throttle_gate_backoff_does_not_starve_ungated_keys() {
     let _guard = TEST_SERIAL
@@ -1411,11 +1409,11 @@ async fn throttle_gate_backoff_does_not_starve_ungated_keys() {
     );
 }
 
-/// issue #1053 (review B-G2 / FIX-2 contract pin): a throttle row held under a
-/// CLOSED gate that reaches its own `schedule_to_start` deadline is DROPPED as
-/// stale (issue #607 AC-c) — NOT held forever by the re-defer. The gate does not
-/// exempt a start from its own staleness bound; the AC-c expiry check runs before
-/// the gate is ever consulted, so an expired row drops regardless of the gate.
+/// Issue #1053 contract pin: a throttle row held under a CLOSED gate that
+/// reaches its own `schedule_to_start` deadline is DROPPED as stale (issue #607
+/// AC-c). The re-defer does NOT hold it forever. The gate does not exempt a
+/// start from its own staleness bound. The AC-c expiry check runs before the
+/// gate is consulted, so an expired row drops regardless of the gate.
 #[tokio::test]
 async fn throttle_gated_row_past_schedule_to_start_deadline_is_dropped_not_held() {
     let _guard = TEST_SERIAL
@@ -1487,12 +1485,11 @@ async fn throttle_gated_row_past_schedule_to_start_deadline_is_dropped_not_held(
     );
 }
 
-/// F-round17 (Finding A): the event-batch IMMEDIATE (max_size-reached) flush starts
-/// the workflow synchronously in the request path, so it must count an
-/// `event_batch` bypass exactly like the scanner's deferred fire. A deferred
-/// (not-yet-full) admission counts nothing until its flush, and an
-/// immediately-flushed batch is never also fired (or counted) by the scanner —
-/// exactly-once, immediate XOR scanner.
+/// The event-batch IMMEDIATE (max_size-reached) flush starts the workflow
+/// synchronously in the request path. So it must count an `event_batch` bypass
+/// exactly like the scanner's deferred fire. A deferred (not-yet-full)
+/// admission counts nothing until its flush. The scanner never also fires (or
+/// counts) an immediately-flushed batch: exactly-once, immediate XOR scanner.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn immediate_max_size_flush_counts_bypass_exactly_once() {
@@ -1595,12 +1592,11 @@ async fn immediate_max_size_flush_counts_bypass_exactly_once() {
     set_global_admission_gate_cache(None);
 }
 
-/// F-round17 (Finding B): the scheduler is a *gated* producer. A due schedule
-/// blocked by an active gate must appear in `harvest.admission.blocked` (via
-/// `record_admission_blocked`) in addition to the schedule-domain
-/// `record_schedule_skipped(..., "admission_blocked")` signal — so a scheduled
-/// start blocked during an incident is not missing from the "zero-uncounted gated
-/// producer" contract.
+/// The scheduler is a *gated* producer. A due schedule blocked by an active gate
+/// must appear in `harvest.admission.blocked` (via `record_admission_blocked`).
+/// The schedule-domain `record_schedule_skipped(..., "admission_blocked")`
+/// signal is not enough on its own. So a scheduled start blocked during an
+/// incident is not missing from the "zero-uncounted gated producer" contract.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn scheduled_start_blocked_by_gate_records_admission_blocked() {
@@ -1783,20 +1779,20 @@ async fn completion_trigger_scoped_gate_matches_and_misses() {
     assert_eq!(metrics.blocked()[0].0, "workflow_name");
 }
 
-/// F1 (Codex re-review, issue #618): a persisted admission gate loaded at
-/// startup via the REAL `load_active_gates` boot-load path — the one the plugin
-/// now runs BEFORE spawning workers/scanners — must block a completion trigger
-/// that fires in the boot window. This exercises the boot-load → cache →
-/// trigger-block chain end-to-end (persist a gate row, load it with the exact
-/// boot-load call, refresh + publish the cache, evaluate a matching trigger).
+/// Issue #618: a persisted admission gate loaded at startup must block a
+/// completion trigger that fires in the boot window. The gate loads via the
+/// REAL `load_active_gates` boot-load path, which the plugin runs BEFORE it
+/// spawns workers and scanners. This exercises the boot-load → cache →
+/// trigger-block chain end-to-end. It persists a gate row, loads it with the
+/// exact boot-load call, refreshes and publishes the cache, and evaluates a
+/// matching trigger.
 ///
-/// The plugin boot ORDERING itself (`load_active_gates` + `refresh` BEFORE
-/// `HarvestRunner::start`) is verified by code reading: `start_harvest_runtime`
-/// is a private `async fn` that needs a fully-spawned runner, so a true
-/// startup-race test is impractical. This test proves the behavioural guarantee
-/// that reordering exists to provide — a persisted gate, once loaded into the
-/// cache, blocks a completion trigger rather than being bypassed against an
-/// empty snapshot.
+/// Code reading verifies the plugin boot ORDERING itself:
+/// `load_active_gates` and `refresh` run BEFORE `HarvestRunner::start`.
+/// `start_harvest_runtime` is a private `async fn` that needs a fully-spawned
+/// runner. So a true startup-race test is impractical. This test proves the
+/// guarantee that the ordering provides. A persisted gate, once in the cache,
+/// blocks a completion trigger. It is not bypassed against an empty snapshot.
 #[tokio::test]
 async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
     let _guard = TEST_SERIAL
@@ -1878,24 +1874,25 @@ async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
     assert_eq!(fires[0].outcome.as_deref(), Some("admission_blocked"));
 }
 
-/// F2 (Codex re-review, issue #618): for a CROSS-SHARD completion trigger
-/// (target hashing to shard 0, source on a nonzero shard, no explicit trigger
-/// queue), the inline admission-gate check must resolve the target queue on the
-/// TARGET shard — the same queue the outbox relay uses at fire time — NOT on the
-/// source transaction connection. This focuses on the exact function the fix
-/// introduces, `resolve_cross_shard_target_queue`, and proves it resolves the
-/// queue on the target shard where the pre-fix `resolve_target_queue(source_conn,
-/// …, shard 0)` path resolved it on the WRONG (source) connection and missed it.
+/// Issue #618: take a CROSS-SHARD completion trigger. Its target hashes to
+/// shard 0, its source is on a nonzero shard, and it has no explicit trigger
+/// queue. The inline admission-gate check must resolve the target queue on the
+/// TARGET shard, NOT on the source transaction connection. The outbox relay
+/// uses that same target-shard queue at fire time. This focuses on
+/// `resolve_cross_shard_target_queue`, the exact function the fix introduces.
+/// It proves the function resolves the queue on the target shard. The pre-fix
+/// `resolve_target_queue(source_conn, …, shard 0)` path resolved it on the
+/// WRONG (source) connection and missed it.
 ///
 /// Genuine two-database multi-shard setup: shard 0 (target) owns the schedule
-/// mapping `ag_target_wf -> ag_priority_q`; shard 1 (source) has NO such
-/// schedule. It focuses on `harvest_schedules` (no workflow start), so it RUNS
-/// against a real cluster (local Postgres or testcontainers) via two fresh
+/// mapping `ag_target_wf -> ag_priority_q`. Shard 1 (source) has NO such
+/// schedule. It focuses on `harvest_schedules` (no workflow start). So it RUNS
+/// against a real cluster (local Postgres or testcontainers). It uses two fresh
 /// databases seeded from the full migration bundle. The full evaluate → gate →
-/// block chain for a cross-shard target additionally needs
-/// `start_or_load_workflow_execution`; that path is covered by the same-shard
-/// block tests above (all now backed by the full start-path migration bundle,
-/// which includes `harvest_build_policies`).
+/// block chain for a cross-shard target also needs
+/// `start_or_load_workflow_execution`. The same-shard block tests above cover
+/// that path. They all use the full start-path migration bundle, which includes
+/// `harvest_build_policies`.
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
@@ -1973,10 +1970,11 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     .await;
 
     // PRE-FIX behaviour, for contrast: `resolve_target_queue(source_conn, …,
-    // shard 0)` treats shard 0 as directly queryable on the connection it holds —
-    // the SOURCE connection (shard 1), which has no ag_target_wf schedule — so it
-    // misses it. The fixed cross-shard resolver never takes a source connection,
-    // so this wrong-shard read is now structurally impossible from it.
+    // shard 0)` treats shard 0 as directly queryable on the connection it holds.
+    // That is the SOURCE connection (shard 1), which has no ag_target_wf
+    // schedule. So it misses it. The fixed cross-shard resolver never takes a
+    // source connection, so this wrong-shard read is now structurally impossible
+    // from it.
     let buggy = autumn_harvest::completion_trigger::resolve_target_queue(
         &mut src_conn,
         "ag_target_wf",
@@ -1984,12 +1982,12 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     )
     .await;
 
-    // FALLBACK path (F2): the target-shard (0) pool is
-    // UNAVAILABLE. Seed shard 1 (source) with a WRONG queue for ag_target_wf and
-    // install a sharded pool that maps ONLY shard 1 — so `exact_pool_for(0)` is
-    // None and the resolver takes the fallback. It must return the shard-
-    // independent default queue, NEVER the source shard's `ag_source_wrong_q`
-    // (which would prove it wrongly queried the source connection's schedules).
+    // FALLBACK path: the target-shard (0) pool is UNAVAILABLE. Seed shard 1
+    // (source) with a WRONG queue for ag_target_wf. Install a sharded pool that
+    // maps ONLY shard 1, so `exact_pool_for(0)` is None and the resolver takes
+    // the fallback. It must return the shard-independent default queue. It must
+    // NEVER return the source shard's `ag_source_wrong_q`. That would prove it
+    // wrongly queried the source connection's schedules.
     diesel::sql_query(
         "INSERT INTO harvest_schedules (id, workflow_name, queue_name, schedule_expr) \
          VALUES (gen_random_uuid(), 'ag_target_wf', 'ag_source_wrong_q', '@daily')",
@@ -2038,7 +2036,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
         "the pre-fix source-connection resolution must NOT find the target queue \
          (it queries the source shard's schedules, missing the gate)"
     );
-    // F2: with the target-shard pool unavailable, the fallback must NOT read
+    // With the target-shard pool unavailable, the fallback must NOT read
     // the source shard's schedules. So it returns neither the source's wrong
     // queue nor the (unreachable) target's queue.
     assert_ne!(
@@ -2056,18 +2054,19 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     );
 }
 
-/// Finding (F-round6): the IMMEDIATE cross-shard completion-trigger relay via
+/// The IMMEDIATE cross-shard completion-trigger relay via
 /// `DeferredTriggerStart::spawn()` — the common successful path — must count the
 /// `completion_trigger_outbox` bypass, not just the later scanner. A counter only
 /// in `enforce_completion_triggers_outbox` leaves the exempt start UNCOUNTED when
 /// a gate is raised after the source commit but before the immediate relay.
-/// The count is emitted via the process-global recorder (spawn has no
-/// metrics param), gated on the outbox-row delete actually removing the row, so
-/// the scanner can never re-process and re-count the same relay (exactly-once).
+/// The count goes via the process-global recorder, because spawn has no metrics
+/// param. It is gated on the outbox-row delete actually removing the row. So the
+/// scanner can never re-process and re-count the same relay (exactly-once).
 ///
 /// Genuine two-database multi-shard test: source shard 0 owns the outbox row,
 /// target shard 1 receives the start. Runs against a real cluster via two fresh
-/// full-schema databases; `spawn()` is fire-and-forget, so we poll for the count.
+/// full-schema databases. `spawn()` is fire-and-forget, so the test polls for
+/// the count.
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
@@ -2167,8 +2166,8 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     };
     deferred.spawn();
 
-    // Poll for the spawned task to finish (count is gated on the delete, so a
-    // non-empty bypassed list means the start + delete + count all completed).
+    // Poll for the spawned task to finish. The count is gated on the delete, so
+    // a non-empty bypassed list means the start, delete and count all completed.
     let mut settled = false;
     for _ in 0..200 {
         if !recorder.bypassed().is_empty() {
@@ -2249,14 +2248,14 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     );
 }
 
-/// Finding B (F-round7): the cross-shard relay must gate AUTHORITATIVELY at relay
-/// time on the REAL target queue. A schedule sets `queue_name = 'real-q'` for
-/// `ag_target_wf` on the default shard (where the relay resolves a nonzero
-/// target's queue), the `DeferredTriggerStart` carries NO explicit queue (so the
-/// relay resolves `'real-q'`), and an active `Queue('real-q')` gate exists. The
-/// immediate `spawn()` relay must BLOCK: target NOT started, `admission_blocked`
-/// counted once, outbox row DROPPED, and the scanner afterward relays 0 (no
-/// double-processing). Against pre-F-round7 code the relay had no gate check and
+/// The cross-shard relay must gate AUTHORITATIVELY at relay time on the REAL
+/// target queue. A schedule sets `queue_name = 'real-q'` for `ag_target_wf` on
+/// the default shard, where the relay resolves a nonzero target's queue. The
+/// `DeferredTriggerStart` carries NO explicit queue, so the relay resolves
+/// `'real-q'`. An active `Queue('real-q')` gate exists. The immediate `spawn()`
+/// relay must BLOCK: target NOT started, `admission_blocked` counted once,
+/// outbox row DROPPED, and the scanner afterward relays 0 (no
+/// double-processing). Against pre-fix code the relay had no gate check and
 /// started on `'real-q'` uncounted, so this fails first.
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
@@ -2317,8 +2316,8 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
 
     // SOURCE shard: the outbox row (NULL queue → relay resolves 'real-q') PLUS the
     // fires row inserted at inline evaluate time with outcome NULL (= "fired"). The
-    // relay-time block must UPDATE this fires row to 'admission_blocked' so the
-    // durable audit does not wrongly report a successful fire (issue #618, F-round10).
+    // relay-time block must UPDATE this fires row to 'admission_blocked'. Then the
+    // durable audit does not wrongly report a successful fire (issue #618).
     let outbox_id = Uuid::new_v4();
     let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
     let trigger_key_id = Uuid::new_v4();
@@ -2420,9 +2419,9 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
             .await
             .expect("count outbox")
             .n;
-    // The fires row's outcome must have been flipped to 'admission_blocked' by the
-    // relay-time block (issue #618, F-round10) — atomically with dropping the outbox
-    // row. It was inserted with NULL (= fired); a NULL here would be a wrong audit.
+    // The relay-time block must flip the fires row's outcome to
+    // 'admission_blocked' (issue #618). It does so atomically with dropping the
+    // outbox row. It was inserted with NULL (= fired); a NULL here would be a wrong audit.
     let fires_outcome: Option<String> = diesel::sql_query(
         "SELECT outcome FROM harvest_completion_trigger_fires
          WHERE source_exec_id = $1 AND trigger_id = $2",
@@ -2487,13 +2486,12 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
     );
 }
 
-/// Issue #618, F-round10: the SCANNER relay-block path
-/// (`enforce_completion_triggers_outbox`) must, like the immediate `spawn()` path,
-/// flip the existing fires row from NULL (= fired) to `admission_blocked` when it
-/// drops the outbox row under an active gate — atomically with the delete — so the
-/// durable audit never reports a fired target that was actually dropped. Confirmed
-/// red first: before F-round10 the scanner deleted the outbox row but left the
-/// fires row NULL.
+/// Issue #618: the SCANNER relay-block path (`enforce_completion_triggers_outbox`)
+/// must act like the immediate `spawn()` path. It drops the outbox row under an
+/// active gate. Atomically with that delete, it flips the existing fires row from
+/// NULL (= fired) to `admission_blocked`. So the durable audit never
+/// reports a fired target that was actually dropped. Confirmed red first: before
+/// the fix the scanner deleted the outbox row but left the fires row NULL.
 #[tokio::test]
 async fn scanner_relay_block_marks_fires_row_admission_blocked() {
     let _guard = TEST_SERIAL
@@ -2517,8 +2515,9 @@ async fn scanner_relay_block_marks_fires_row_admission_blocked() {
     insert_trigger(&mut conn, trigger_id).await;
     let src_exec_id = ExecutionId::new_for_shard(ShardId::new(0)).as_uuid();
 
-    // Inline evaluate wrote both rows on the source shard: the fires row (outcome
-    // NULL = fired) and the outbox row keyed by the same (source_exec_id, trigger_id).
+    // Inline evaluate wrote both rows on the source shard. They are the fires row
+    // (outcome NULL = fired) and the outbox row, both keyed by the same
+    // (source_exec_id, trigger_id).
     diesel::sql_query(
         "INSERT INTO harvest_completion_trigger_fires
             (source_exec_id, trigger_id, fired_at, outcome)
@@ -2603,24 +2602,23 @@ async fn scanner_relay_block_marks_fires_row_admission_blocked() {
     );
 }
 
-/// Issue #618, F-round13: an existence race mirroring F-round12, for the
-/// completion-trigger cross-shard relay. A STALE outbox row — the immediate
-/// `spawn()` relay started the target on the target shard but then failed to
-/// delete the source outbox row — is retried by the scanner. If an admission gate
-/// is raised in the meantime, the pre-F-round13 relay-time block branch would drop
-/// the row, mark the fires row `admission_blocked`, and count a block WITHOUT
-/// checking that the target ALREADY exists — reporting a successfully-started
-/// target as dropped by the gate.
+/// Issue #618: an existence race for the completion-trigger cross-shard relay.
+/// The scanner retries a STALE outbox row. The immediate `spawn()` relay started
+/// the target on the target shard, but then failed to delete the source outbox
+/// row. Say an admission gate is raised in the meantime. The pre-fix relay-time
+/// block branch would drop the row and mark the fires row `admission_blocked`.
+/// It would count a block WITHOUT checking that the target ALREADY exists. So
+/// it reported a successfully-started target as dropped by the gate.
 ///
-/// After F-round13 the relay routes through `gate_checked_start_or_load`, which
-/// locks the target's existence on the target shard: the locked-live target →
+/// The relay now routes through `gate_checked_start_or_load`. It locks the
+/// target's existence on the target shard: the locked-live target →
 /// `Started { created: false }` → DELIVERED (delete outbox + count bypass), NOT
 /// blocked. The fires row stays NULL (a real fire), no block is counted, and no
 /// second target run is created.
 ///
 /// Two-DB multi-shard (source shard 0 owns the outbox row; target shard 1 owns the
-/// already-started run). Confirmed red first: against pre-F-round13 code the
-/// scanner blocks the stale row (target reported dropped) instead of delivering it.
+/// already-started run). Confirmed red first: against pre-fix code the scanner
+/// blocks the stale row (target reported dropped) instead of delivering it.
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
@@ -2666,8 +2664,8 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
     pools.insert(ShardId::new(1), tgt_pool.clone());
     let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
 
-    // The target ALREADY exists on shard 1 (a live RUNNING run) — as if the
-    // immediate relay started it but failed to delete the source outbox row.
+    // The target ALREADY exists on shard 1 (a live RUNNING run). The immediate
+    // relay started it but failed to delete the source outbox row.
     {
         let mut tgt_conn = tgt_pool.get().await.unwrap();
         start_or_load_workflow_execution(
@@ -2761,9 +2759,9 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
 
     let recorder = Arc::new(CapturingMetrics::default());
     let scanner_metrics: &(dyn MetricsRecorder + Send + Sync) = &*recorder;
-    // The scanner reads the outbox on the SOURCE shard's connection and filters by
-    // `target_shard IN assignments`; the stale row targets shard 1, so the worker
-    // assignments must include shard 1 for it to be picked up.
+    // The scanner reads the outbox on the SOURCE shard and filters by
+    // `target_shard IN assignments`. The stale row targets shard 1, so the
+    // assignments must include shard 1.
     let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut src_pool.get().await.unwrap(),
         scanner_metrics,
@@ -2854,11 +2852,11 @@ struct SealedCaseOutcome {
     fires_outcome: Option<String>,
 }
 
-/// Drive the cross-shard completion-trigger scanner against a stale outbox row
-/// whose deterministic target `W` was pre-created and then transitioned to
-/// `seal_state` (a state the active-only existence lock excludes). Optionally
-/// raise a fleet gate that WOULD block a fresh start. Creates + tears down a fresh
-/// source/target DB pair. F-round15.
+/// Drive the cross-shard completion-trigger scanner against a stale outbox row.
+/// Its deterministic target `W` was pre-created and then moved to `seal_state`,
+/// which the active-only existence lock excludes. Optionally raise a fleet gate
+/// that WOULD block a fresh start. Creates + tears down a fresh source/target DB
+/// pair.
 #[allow(clippy::too_many_lines)]
 async fn run_stale_sealed_delivered_case(
     base_url: &str,
@@ -2901,9 +2899,9 @@ async fn run_stale_sealed_delivered_case(
     pools.insert(ShardId::new(1), tgt_pool.clone());
     let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
 
-    // Pre-create the target run on shard 1 (as if the immediate relay started it),
-    // then SEAL it — the state the active-only existence lock excludes, simulating a
-    // target that finished before the stale row was retried.
+    // Pre-create the target run on shard 1, as if the immediate relay started it.
+    // Then SEAL it, a state the active-only existence lock excludes. This
+    // simulates a target that finished before the stale row was retried.
     {
         let mut tgt_conn = tgt_pool.get().await.unwrap();
         start_or_load_workflow_execution(
@@ -3068,10 +3066,10 @@ async fn run_stale_sealed_delivered_case(
     }
 }
 
-/// F-round15: a stale cross-shard outbox row is a ONE-SHOT delivery marker. If its
-/// deterministic target already ran and has since SEALED
-/// (`TERMINATED`/`CONTINUED_AS_NEW`), the fire was already DELIVERED — the scanner
-/// must treat it as delivered, NOT as a fresh (gated) admission. A relay routed
+/// A stale cross-shard outbox row is a ONE-SHOT delivery marker. Its
+/// deterministic target may have run and since SEALED
+/// (`TERMINATED`/`CONTINUED_AS_NEW`). Then the fire was already DELIVERED. The
+/// scanner must treat it as delivered, NOT as a fresh (gated) admission. A relay routed
 /// only through `gate_checked_start_or_load` cannot see a sealed target, because
 /// that existence lock is active-only. Under a matching gate it BLOCKS (marking
 /// the fires row `admission_blocked`). With no gate, `start_or_load` creates a
@@ -3079,9 +3077,9 @@ async fn run_stale_sealed_delivered_case(
 /// existence check in `relay_gate_checked_start` closes this.
 ///
 /// Two-DB multi-shard, three cases: `TERMINATED` + active gate, `TERMINATED` + no
-/// gate, `CONTINUED_AS_NEW` + active gate. Confirmed red first: against the
-/// pre-F-round15 code the gate cases mark the fires row `admission_blocked`/count a
-/// block, and the no-gate case creates a second target run (`target_count == 2`).
+/// gate, `CONTINUED_AS_NEW` + active gate. Confirmed red first against pre-fix
+/// code. The gate cases mark the fires row `admission_blocked` and count a block.
+/// The no-gate case creates a second target run (`target_count == 2`).
 #[tokio::test]
 #[allow(clippy::similar_names)]
 async fn scanner_delivers_a_stale_row_whose_target_has_sealed() {
@@ -3118,9 +3116,9 @@ async fn scanner_delivers_a_stale_row_whose_target_has_sealed() {
         "TERMINATED+gate: the fires row stays a real fire (NULL), never 'admission_blocked'"
     );
 
-    // Case 2: TERMINATED target with NO gate → delivered, no second run (the RED
-    // signal here is a SECOND target run created by start_or_load on a released
-    // sealed key).
+    // Case 2: TERMINATED target with NO gate → delivered, no second run. The RED
+    // signal is a SECOND target run that start_or_load creates on a released
+    // sealed key.
     let terminated_nogate = run_stale_sealed_delivered_case(&base_url, "TERMINATED", false).await;
     assert_eq!(
         terminated_nogate.relayed, 1,
@@ -3169,9 +3167,9 @@ async fn scanner_delivers_a_stale_row_whose_target_has_sealed() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// F-round12: gate_checked_start_or_load — close the webhook idempotent-retry
-// TOCTOU (an existing run sealing between an unlocked existence check and the
-// start would let a fresh replacement slip an active gate uncounted).
+// gate_checked_start_or_load closes the webhook idempotent-retry TOCTOU. An
+// existing run can seal between an unlocked existence check and the start. A
+// fresh replacement would then slip an active gate uncounted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Start a `webhook_delivery` run (RUNNING) with the given deterministic id.
@@ -3341,16 +3339,17 @@ async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
 
 /// The TOCTOU an unlocked existence check leaves open. A run is LIVE when the
 /// delegate is invoked but SEALS (TERMINATED) before the start decision
-/// commits. `gate_checked_start_or_load` locks the run through the decision, so it
-/// observes the SEALED state and BLOCKS the fresh replacement under the active gate
-/// — never a silent uncounted admission.
+/// commits. `gate_checked_start_or_load` locks the run through the decision. So
+/// it observes the SEALED state and BLOCKS the fresh replacement under the active
+/// gate. It is never a silent uncounted admission.
 ///
 /// Choreography (the repo's `hold_execution_row_lock` pattern): a holder connection
-/// takes `FOR UPDATE` on the RUNNING run (a terminate about to seal it). We spawn
-/// `gate_checked_start_or_load`; its own `FOR UPDATE` existence load queues BEHIND
-/// the holder. The holder then seals the row and commits, releasing the lock; the
-/// spawned start's locked load now observes TERMINATED (excluded from the active
-/// filter) → `locked_live = false` → the gate applies → BLOCK, no fresh start.
+/// takes `FOR UPDATE` on the RUNNING run (a terminate about to seal it). The test
+/// spawns `gate_checked_start_or_load`. Its own `FOR UPDATE` existence load queues
+/// BEHIND the holder. The holder then seals the row and commits, releasing the
+/// lock. The spawned start's locked load then observes TERMINATED, which the
+/// active filter excludes. So `locked_live = false` → the gate applies → BLOCK,
+/// no fresh start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
     let _guard = TEST_SERIAL
@@ -3437,14 +3436,15 @@ async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// F-round18: gate REPLACEMENT starts, do not treat them as idempotent attaches.
+// Gate REPLACEMENT starts, do not treat them as idempotent attaches.
 // `gate_checked_start_or_load` must apply the gate whenever `start_or_load` will
-// CREATE a new execution (a fresh admission) — including a REPLACEMENT over a
+// CREATE a new execution (a fresh admission). That includes a REPLACEMENT over a
 // non-sealed prior (AllowDuplicateFailedOnly over FAILED/CANCELLED; any
-// TerminateIfRunning) — and skip it only for a genuine ATTACH (AllowDuplicate to a
-// live OR terminal prior). The prior-round `try_load_active_execution_for_update`
-// returned `Some` for these replacement priors and (as `locked_live`) wrongly
-// skipped the gate, leaking a fresh execution past an active gate uncounted.
+// TerminateIfRunning). It skips the gate only for a genuine ATTACH
+// (AllowDuplicate to a live OR terminal prior). The earlier
+// `try_load_active_execution_for_update` returned `Some` for these replacement
+// priors. As `locked_live` it wrongly skipped the gate. A fresh execution then
+// leaked past an active gate uncounted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn ag_target_params(
@@ -3608,13 +3608,13 @@ async fn gate_blocks_terminate_if_running_replacement_of_a_live_prior() {
 }
 
 /// `AllowDuplicate` + a terminal (COMPLETED) prior → ATTACH (returns the existing
-/// terminal run, created == false; NO new admission). Unlike the `SignalWithStart`
-/// matrix, the standalone `start_or_load` path this primitive calls does NOT
-/// escalate a terminal-prior attach to a fresh start — so the gate must be SKIPPED
-/// (gating an attach that admits nothing would wrongly block an idempotent retry and
-/// inflate the block counter). This pins the corrected reuse-matrix behaviour and
-/// guards against re-introducing a spurious block for the webhook delegate's own
-/// `AllowDuplicate` policy over a terminal prior.
+/// terminal run, created == false; NO new admission). The `SignalWithStart` matrix
+/// escalates a terminal-prior attach to a fresh start. The standalone
+/// `start_or_load` path this primitive calls does NOT. So the gate must be
+/// SKIPPED. Gating an attach that admits nothing would wrongly block an
+/// idempotent retry and inflate the block counter. This pins the corrected
+/// reuse-matrix behaviour. It guards against re-introducing a spurious block for
+/// the webhook delegate's own `AllowDuplicate` policy over a terminal prior.
 #[tokio::test]
 async fn gate_skips_allow_duplicate_attach_to_a_completed_prior() {
     let _guard = TEST_SERIAL
@@ -3800,26 +3800,26 @@ async fn gate_does_not_block_an_allow_duplicate_failed_only_attach_to_a_reconcil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// F-round19: the immediate spawn() relay and the scanner (and multi-replica
-// scanners) must be MUTUALLY EXCLUSIVE on a source outbox row. Without a claim
-// they could reach DIVERGENT decisions about the same row — one starts the target,
-// the other (under a just-raised gate, the first's target start not yet visible)
-// blocks it — durably recording an `admission_blocked` fire for a target that ran.
-// The fix claims the source row FOR UPDATE SKIP LOCKED, held across the whole relay.
+// The immediate spawn() relay and the scanner (and multi-replica scanners) must
+// be MUTUALLY EXCLUSIVE on a source outbox row. Without a claim they could reach
+// DIVERGENT decisions about the same row. One starts the target. The other blocks
+// it under a just-raised gate, before the first's target start is visible. That
+// durably records an `admission_blocked` fire for a target that ran. The fix
+// claims the source row FOR UPDATE SKIP LOCKED, held across the whole relay.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Deterministic race reproduction with the repo's lock-holding harness: a holder
-/// connection holds `FOR UPDATE` on the source outbox row (simulating the immediate
-/// relay having CLAIMED it and being mid-flight starting the target). Under a
-/// newly-raised Fleet gate, the scanner must SKIP the claimed row — NOT block it and
-/// NOT mark the fires row `admission_blocked`.
+/// Deterministic race reproduction with the repo's lock-holding harness. A holder
+/// connection holds `FOR UPDATE` on the source outbox row. It simulates the
+/// immediate relay that CLAIMED the row and is mid-flight starting the target.
+/// Under a newly-raised Fleet gate, the scanner must SKIP the claimed row. It
+/// must NOT block it and NOT mark the fires row `admission_blocked`.
 ///
-/// Pre-fix (RED): the scanner reads the row with a plain SELECT (no claim), decides
-/// `Blocked`, and its DELETE hangs on the holder's `FOR UPDATE` lock → the scanner
-/// never completes (the bounded timeout fires). Fixed (GREEN): the scanner's own
-/// `FOR UPDATE SKIP LOCKED` claim skips the held row immediately → completes, with no
-/// block counted, the fires row left NULL, and the outbox row still present (owned by
-/// the concurrent relay).
+/// Pre-fix (RED): the scanner reads the row with a plain SELECT (no claim) and
+/// decides `Blocked`. Its DELETE hangs on the holder's `FOR UPDATE` lock, so the
+/// scanner never completes (the bounded timeout fires). Fixed (GREEN): the
+/// scanner's own `FOR UPDATE SKIP LOCKED` claim skips the held row immediately.
+/// It completes with no block counted and the fires row left NULL. The outbox
+/// row is still present, owned by the concurrent relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 #[allow(clippy::too_many_lines)]
 async fn scanner_skips_a_source_row_claimed_by_a_concurrent_relay() {
@@ -3894,9 +3894,9 @@ async fn scanner_skips_a_source_row_claimed_by_a_concurrent_relay() {
     });
     let scan_result = tokio::time::timeout(std::time::Duration::from_secs(8), scan).await;
 
-    // Read state WHILE the holder still owns the row (a plain SELECT does not block on
-    // FOR UPDATE): the fixed scanner has skipped; the pre-fix scanner would be hung on
-    // its DELETE with the row still present and the fires row still NULL.
+    // Read state WHILE the holder still owns the row. A plain SELECT does not block
+    // on FOR UPDATE. The fixed scanner has skipped. The pre-fix scanner would hang
+    // on its DELETE, with the row present and the fires row still NULL.
     let fires_outcome: Option<String> = diesel::sql_query(
         "SELECT outcome FROM harvest_completion_trigger_fires
          WHERE source_exec_id = $1 AND trigger_id = $2",
@@ -3945,23 +3945,23 @@ async fn scanner_skips_a_source_row_claimed_by_a_concurrent_relay() {
     );
 }
 
-// ── issue #618 F2 (PR #1014 review): signal-/update-with-start gate the fresh
+// ── issue #618, PR #1014: signal-/update-with-start gate the fresh
 // create AUTHORITATIVELY under the primitive's lock ───────────────────────────
 //
 // Before this change the signal-/update-with-start HTTP routes gated only via an
-// UNLOCKED pre-check and passed `gate = None` into the core start — the exact
-// unlocked-pre-read pattern the plain `api` start route was moved OFF (it had a
-// residual seal-under-lock / gate-raised-mid-request TOCTOU). A fresh create that
+// UNLOCKED pre-check and passed `gate = None` into the core start. The plain
+// `api` start route was moved OFF that unlocked-pre-read pattern. It had a
+// residual seal-under-lock / gate-raised-mid-request TOCTOU. A fresh create that
 // slipped that window was an UN-COUNTED admission (no `admission_blocked`, no
-// bypass), violating the "zero un-counted admissions" AC. Threading
+// bypass). That violates the "zero un-counted admissions" AC. Threading
 // `Some(GateMode::Check)` into the core makes the fresh-create decision gated
 // under the same `FOR UPDATE` lock the plain start route uses.
 //
-// These tests exercise the core directly with `Some(GateMode::Check)`: before the
-// fix the `_with_metrics` fns did not accept a gate argument (compile-error red,
-// per the repo's #593 red→green precedent); after the fix a fresh create under an
-// active gate is BLOCKED + COUNTED and no execution row is created, while a fresh
-// create with no gate proceeds (positive control).
+// These tests exercise the core directly with `Some(GateMode::Check)`. Before
+// the fix the `_with_metrics` fns did not accept a gate argument. That is a
+// compile-error red, per the repo's #593 red→green precedent. After the fix a
+// fresh create under an active gate is BLOCKED + COUNTED, and no execution row
+// is created. A fresh create with no gate proceeds (positive control).
 
 fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartParams<'static> {
     SignalWithStartParams {
@@ -4137,10 +4137,10 @@ async fn signal_with_start_acquires_the_admission_lock_before_any_row_lock() {
     }
 }
 
-/// A FRESH signal-with-start create (no prior run) under an active Fleet gate is
-/// BLOCKED by the core's authoritative locked gate, records exactly one
-/// `record_admission_blocked`, and leaves NO execution row. Closes the
-/// un-counted-admission window a `gate = None` core left open (issue #618 F2).
+/// The core's authoritative locked gate BLOCKS a FRESH signal-with-start create
+/// (no prior run) under an active Fleet gate. It records exactly one
+/// `record_admission_blocked` and leaves NO execution row. Closes the
+/// un-counted-admission window a `gate = None` core left open (issue #618).
 #[tokio::test]
 async fn gate_blocks_fresh_signal_with_start_create() {
     let _guard = TEST_SERIAL
@@ -4222,8 +4222,8 @@ async fn signal_with_start_fresh_create_proceeds_without_gate() {
 }
 
 /// The update-with-start twin of `gate_blocks_fresh_signal_with_start_create`:
-/// a FRESH update-with-start create under an active gate is BLOCKED + COUNTED
-/// with no execution row (issue #618 F2, symmetric fix).
+/// a FRESH update-with-start create under an active gate is BLOCKED + COUNTED.
+/// It leaves no execution row (issue #618).
 #[tokio::test]
 async fn gate_blocks_fresh_update_with_start_create() {
     let _guard = TEST_SERIAL

@@ -1,48 +1,46 @@
 //! Built-in Prometheus scrape endpoint for `HarvestPlugin` (issue #355).
 //!
-//! [`HarvestMetricsRecorder`] is an in-process aggregator that implements
-//! both `autumn_harvest::telemetry::MetricsRecorder` (so the core engine can
-//! record samples into it) and `autumn_web::actuator::MetricsSource` (so
-//! autumn-web's already-shared `/actuator/prometheus` endpoint can render
-//! those samples alongside the app's own `autumn_http_*` families and any
-//! other plugin's metrics). [`HarvestMetricsRecorder::render_prometheus`]
-//! (issue #1611) renders the same aggregated state directly, for a
-//! standalone embedder with no `autumn_web::actuator` endpoint to feed —
-//! see `examples/standalone-runner`.
+//! [`HarvestMetricsRecorder`] is an in-process aggregator. It implements
+//! `autumn_harvest::telemetry::MetricsRecorder`, so the core engine records
+//! samples into it. It also implements `autumn_web::actuator::MetricsSource`,
+//! so the shared `/actuator/prometheus` endpoint renders those samples. They
+//! appear beside the app's own `autumn_http_*` families and other plugin
+//! metrics. [`HarvestMetricsRecorder::render_prometheus`] (issue #1611)
+//! renders the same state directly for a standalone embedder with no
+//! `autumn_web::actuator` endpoint. See `examples/standalone-runner`.
 //!
-//! This deliberately does **not** touch the global `metrics`-crate registry
-//! (unlike the `metrics-rs` adapter/escape hatch documented in
-//! `docs/telemetry.md`) — there is nothing to double-register, and no new
-//! dependency is pulled in. `HarvestPlugin::with_metrics_scrape()` wires one
-//! shared instance into both the core `HarvestBuilder::telemetry(..)` slot
-//! and `AppBuilder::metrics_source("harvest", ..)`.
+//! This does **not** touch the global `metrics`-crate registry, unlike the
+//! `metrics-rs` adapter in `docs/telemetry.md`. So nothing double-registers,
+//! and no new dependency comes in. `HarvestPlugin::with_metrics_scrape()`
+//! wires one shared instance into both the core
+//! `HarvestBuilder::telemetry(..)` slot and
+//! `AppBuilder::metrics_source("harvest", ..)`.
 //!
 //! This aggregates the nine ADR-0001 §7 catalogue metrics named in issue
-//! #355, plus `harvest.queue.oldest_pending_age`, `harvest.worker.slots_*`,
-//! `harvest.shard.stranded_pending`, and `harvest.schedule.overdue` (issue
-//! #696) — the engine's own background samplers already compute these under the
-//! same `MetricsRecorder::is_enabled()`
-//! gate (see `HarvestMetricsRecorder::is_enabled`, which reports `true`
-//! unconditionally so the nine required metrics are actually sampled), so
-//! leaving them unimplemented would mean the sampler's DB queries still ran
-//! on every tick with their results silently discarded. It also aggregates the
-//! four broker-connector families (issue #944), which are not sampler-adjacent
-//! but do back shipped dashboard panels — leaving those to the no-op default
-//! would make a dropped metric indistinguishable from an idle consumer. It
-//! also aggregates `harvest.api.rate_limited` from the plugin's own API rate
-//! limiter (issue #1827), and `harvest.build.ramp_aborted` from the build
-//! ramp guard (issue #1814).
+//! #355. It also aggregates `harvest.queue.oldest_pending_age`,
+//! `harvest.worker.slots_*`, `harvest.shard.stranded_pending` and
+//! `harvest.schedule.overdue` (issue #696). The engine's background samplers
+//! already compute these under the `MetricsRecorder::is_enabled()` gate.
+//! `HarvestMetricsRecorder::is_enabled` reports `true`, so the nine required
+//! metrics are sampled. Without these overrides, the sampler queries would
+//! still run on every tick and their results would be discarded.
 //!
-//! Every other `MetricsRecorder` method keeps the trait's no-op default — an embedder
-//! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
-//! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,
-//! and the rest of the starter alert pack in `docs/alerts/`) or OTLP export
-//! still reaches for the `metrics-rs` adapter escape hatch — this endpoint
-//! does **not** back the full starter alert pack.
+//! It also aggregates the four broker-connector families (issue #944). They
+//! are not sampler-adjacent, but shipped dashboard panels read them. With the
+//! no-op default, a dropped metric would look like an idle consumer. It also
+//! aggregates `harvest.api.rate_limited` from the plugin's API rate limiter
+//! (issue #1827). It also aggregates `harvest.build.ramp_aborted` from the
+//! build ramp guard (issue #1814).
+//!
+//! Every other `MetricsRecorder` method keeps the trait's no-op default. This
+//! endpoint does **not** back the full starter alert pack in `docs/alerts/`.
+//! An embedder who needs the full metric surface or OTLP export uses the
+//! `metrics-rs` adapter. Examples are `harvest.workflow.terminal`,
+//! `harvest.activity.attempts`/`.retries` and `harvest.schedule.fire_attempts`.
 //!
 //! A `MetricFamily` is only emitted once at least one sample has been
-//! recorded for it — there is no way to synthesize a meaningful zero-value
-//! default for a labeled series before its label values are known.
+//! recorded for it. A labeled series has no meaningful zero-value default
+//! before its label values are known.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -58,9 +56,11 @@ use autumn_harvest::telemetry::{
 use autumn_harvest::worker_outlier::OutlierDimension;
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
-/// Label values keyed to a stable position; label *names* are supplied by
-/// the caller at render time (see [`push_counter`]/[`push_gauge`]/[`push_histogram`]),
-/// since every call site always records labels in the same declared order.
+/// Label values keyed to a stable position.
+///
+/// The caller supplies label *names* at render time
+/// (see [`push_counter`]/[`push_gauge`]/[`push_histogram`]). That works
+/// because every call site records labels in the same declared order.
 type LabelValues = Vec<String>;
 
 #[derive(Default)]
@@ -107,13 +107,12 @@ impl Gauge {
     }
 }
 
-/// `(count, sum)` per label combination — the Prometheus histogram/summary
-/// decomposition without bucket boundaries. `autumn_web::actuator::MetricKind`
-/// only supports `Counter`/`Gauge` (no `Histogram` variant), so a duration
-/// metric is rendered as a `_count` and a `_sum` counter pair; a caller can
-/// still chart an average via `rate(x_sum[5m]) / rate(x_count[5m])`. Full
-/// bucketed histograms remain available via the `metrics-rs` adapter escape
-/// hatch documented in `docs/telemetry.md`.
+/// `(count, sum)` per label combination, a histogram without buckets.
+///
+/// `autumn_web::actuator::MetricKind` has no `Histogram` variant. So a
+/// duration metric renders as a `_count` and a `_sum` counter pair. A caller
+/// can chart an average via `rate(x_sum[5m]) / rate(x_count[5m])`. Bucketed
+/// histograms need the `metrics-rs` adapter in `docs/telemetry.md`.
 #[derive(Default)]
 struct Histogram(RwLock<HashMap<LabelValues, (u64, f64)>>);
 
@@ -159,35 +158,28 @@ struct Inner {
     schedule_runs: Counter,
     schedule_skipped: Counter,
     retention_deleted: Counter,
-    // These four back-fill metrics that the engine's own is_enabled()-gated
-    // background samplers already compute (queue-depth sampler's oldest-age
-    // query, the stranded-work scanner, the worker-slot sampler): once
-    // `.with_metrics_scrape()` flips `is_enabled()` to true, those samplers
-    // run regardless of whether this recorder was going to use the result.
-    // Implementing them turns already-paid-for sampler work into real
-    // series instead of a discarded read.
+    // The engine's is_enabled()-gated samplers already compute these. They
+    // are the queue-depth oldest-age query, the stranded-work scanner and the
+    // worker-slot sampler. `.with_metrics_scrape()` makes `is_enabled()` true,
+    // so those samplers run anyway. These fields keep their results as series.
     queue_oldest_pending_age: Gauge,
     worker_slots_in_use: Gauge,
     worker_slots_available: Gauge,
     worker_slot_target: Gauge,
     shard_stranded_pending: Gauge,
-    // The #961 companion to the gauge above: the undrained-shard alert that
-    // ships with `harvest.shard.stranded_pending` uses this counter to tell
-    // "no poller at all" from "poller present but backlogged". Without an
-    // override here the gauge would render but its discriminator would fall
-    // through to the trait no-op, leaving the shipped alert unable to make
-    // that distinction on the recommended built-in scrape endpoint.
+    // Issue #961: the undrained-shard alert on
+    // `harvest.shard.stranded_pending` reads this counter. It tells "no
+    // poller at all" from "poller present but backlogged". Without it, the
+    // built-in endpoint renders the gauge but not this discriminator.
     shard_dispatched: Counter,
-    // The #696 overdue-schedule sampler runs under the same is_enabled() gate;
-    // render its primary gauge here so the recommended built-in scrape path (not
-    // just the metrics-rs adapter) exposes `harvest_schedule_overdue`.
+    // Issue #696: the overdue-schedule sampler runs under the same
+    // is_enabled() gate. The built-in scrape path, not only the metrics-rs
+    // adapter, exposes its `harvest_schedule_overdue` gauge.
     schedule_overdue: Gauge,
-    // Broker connectors (issue #944). Not sampler-adjacent -- these are emitted
-    // straight from the connector receive loop -- but this recorder is
-    // per-metric hand-maintained, so leaving them to the trait no-op would make
-    // `.with_metrics_scrape()` silently discard every connector sample while
-    // the shipped dashboard panels stayed flat. An idle consumer and a dropped
-    // metric would then look identical.
+    // Broker connectors (issue #944). The connector receive loop emits these,
+    // not a sampler. This recorder is hand-maintained per metric. With the
+    // trait no-op, `.with_metrics_scrape()` would discard every connector
+    // sample. An idle consumer and a dropped metric would then look identical.
     connector_received: Counter,
     connector_dispatched: Counter,
     connector_poisoned: Counter,
@@ -224,19 +216,18 @@ struct Inner {
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
-/// (issue #355) — see the module docs above for exactly which metrics are
-/// covered.
+/// (issue #355).
 ///
-/// Implements both `MetricsRecorder` (recording side, installed via
-/// `HarvestBuilder::telemetry`) and `MetricsSource` (rendering side,
-/// registered via `AppBuilder::metrics_source`) over one shared
-/// `Arc<Inner>`, so `.clone()` is cheap and every clone observes the same
-/// underlying counters/gauges/histograms.
+/// The module docs list the covered metrics. `MetricsRecorder` is the
+/// recording side, installed via `HarvestBuilder::telemetry`. `MetricsSource`
+/// is the rendering side, registered via `AppBuilder::metrics_source`. Both
+/// share one `Arc<Inner>`, so `.clone()` is cheap and every clone observes
+/// the same state.
 #[derive(Clone, Default)]
 pub struct HarvestMetricsRecorder(Arc<Inner>);
 
 impl HarvestMetricsRecorder {
-    /// Create a fresh, empty aggregator.
+    /// Create an empty aggregator.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -328,11 +319,10 @@ fn format_sample_value(v: f64) -> String {
 }
 
 impl MetricsRecorder for HarvestMetricsRecorder {
-    // Must be `true` for the engine's own is_enabled()-gated background
-    // samplers (queue depth, DLQ depth, worker slots, stranded-work) to run
-    // at all -- the required nine catalogue metrics live behind those same
-    // samplers. Every metric those samplers compute is implemented below so
-    // none of that gated work goes to waste.
+    // The engine's is_enabled()-gated samplers run only when this is `true`.
+    // They cover queue depth, DLQ depth, worker slots and stranded work. The
+    // nine required catalogue metrics come from them. Each metric they compute
+    // is implemented below, so none of that gated work goes to waste.
     fn is_enabled(&self) -> bool {
         true
     }
@@ -596,10 +586,7 @@ impl MetricsRecorder for HarvestMetricsRecorder {
 
     fn record_schedule_overdue(&self, kind: &str, name: &str, overdue: bool) {
         // Last-write-wins gauge per (kind, name): 1.0 when the schedule is overdue
-        // relative to its own cadence, 0.0 when healthy (issue #696). The #696
-        // sampler already ran under the is_enabled() gate to compute this; without
-        // this override the value would fall through to the trait no-op and the
-        // primary overdue gauge would be absent from the built-in scrape endpoint.
+        // relative to its own cadence, 0.0 when healthy (issue #696).
         self.0.schedule_overdue.set(
             vec![kind.to_owned(), name.to_owned()],
             f64::from(u8::from(overdue)),
@@ -636,9 +623,8 @@ impl MetricsRecorder for HarvestMetricsRecorder {
 
     #[allow(clippy::cast_precision_loss)]
     fn record_connector_lag(&self, source: &str, lag: i64) {
-        // A level, not an accumulation: last-write-wins per source, so a
-        // partition draining to zero reads zero instead of the sum of every
-        // sample the poll loop ever took.
+        // A level, not an accumulation. Last-write-wins per source, so a
+        // drained partition reads zero, not the sum of every polled sample.
         self.0
             .connector_lag
             .set(vec![source.to_owned()], lag as f64);
@@ -1011,10 +997,9 @@ fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
 
 /// Broker-connector families (issue #944).
 ///
-/// Rendered here so the recommended `.with_metrics_scrape()` path exposes the
-/// same four families the `metrics-rs` adapter does — the shipped dashboard
-/// panels read these, and a missing family is indistinguishable from an idle
-/// consumer.
+/// The `.with_metrics_scrape()` path exposes the same four families as the
+/// `metrics-rs` adapter. Shipped dashboard panels read them. A missing family
+/// looks like an idle consumer.
 fn push_connector_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_counter(
         families,
@@ -1082,10 +1067,8 @@ impl MetricsSource for HarvestMetricsRecorder {
 }
 
 #[cfg(test)]
-// Every assertion compares an exactly-representable whole-number count/sum
-// (small integers, safe well below f64's 2^53 exact-integer bound) against a
-// literal -- intentional exact equality, not a precision-sensitive float
-// comparison.
+// Each assertion compares a small whole-number count or sum with a literal.
+// Such values are exact in f64, far below 2^53, so exact equality is safe.
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
@@ -1411,10 +1394,8 @@ mod tests {
         // Issue #961: the shipped undrained-shard alert reads
         // `harvest_shard_stranded_pending` (already rendered above) and uses
         // `harvest_shard_dispatched_total` to tell "no poller at all" from
-        // "poller present but backlogged". The built-in scrape recorder is
-        // per-metric hand-maintained, so without this override the alert's
-        // primary signal would be exported while its discriminator silently
-        // fell through to the trait no-op.
+        // "poller present but backlogged". This pins that the built-in
+        // endpoint renders that discriminator too.
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_shard_dispatched(1);
         recorder.record_shard_dispatched(1);
@@ -1613,9 +1594,9 @@ mod tests {
 
     #[test]
     fn connector_lag_is_a_last_write_wins_gauge() {
-        // Lag is a level, not an accumulation: a partition draining from 500 to
-        // 0 must read 0, and a wedged one must keep reporting its backlog
-        // rather than summing every sample the poll loop ever took.
+        // Lag is a level, not an accumulation. A partition draining from 500
+        // to 0 must read 0. A wedged one must keep reporting its backlog, not a
+        // sum of every polled sample.
         use autumn_harvest::telemetry::ConnectorOutcome;
 
         let recorder = HarvestMetricsRecorder::new();

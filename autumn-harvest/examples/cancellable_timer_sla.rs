@@ -56,8 +56,8 @@
 //! ## Composition note
 //!
 //! This slice ships the core primitive. It does not yet compose an armed handle
-//! with a signal wait in one `select!`-style call, such as an idle-timeout that
-//! resets on the next *signal*. Today, use `ctx.receive_signal_timeout` (issue
+//! with a signal wait in one `select!`-style call. An example is an
+//! idle-timeout that resets on the next *signal*. Today, use `ctx.receive_signal_timeout` (issue
 //! #476) for the signal-or-deadline shape. Or drive the reset from workflow
 //! logic as below.
 //!

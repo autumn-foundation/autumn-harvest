@@ -75,7 +75,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // First parameter must be ctx: &WorkflowContext.
     if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
@@ -84,7 +83,6 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Return type must be Result<T, E>.
     if !crate::attr_util::returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
             &func.sig.output,
@@ -234,8 +232,8 @@ fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> To
 // `query_macro` generates the typed-stub `#method_name` twice: once for the
 // same-module case (`path_tokens.is_empty()`) and once wrapped in a private
 // `mod` for the nested-module case. See `update.rs`'s
-// `same_module_vs_nested_module_parity_tests` for the sibling case (and a
-// real missed-fix defect this shape produced there, commit 896978eb). Query
+// `same_module_vs_nested_module_parity_tests` for the sibling case. That
+// shape produced a real missed-fix defect there (commit 896978eb). Query
 // handlers have no update-with-start analogue, so no missed-fix history
 // exists here yet. The same two-copy risk exists.
 #[cfg(test)]
@@ -243,7 +241,8 @@ mod same_module_vs_nested_module_parity_tests {
     use super::query_macro;
     use quote::quote;
 
-    /// See `update.rs`'s identically-named helper for why this is needed:
+    /// Removes doc attribute tokens, as `update.rs`'s identically-named helper does.
+    ///
     /// `quote!`'s fallback (`cargo test`) `Display` renders doc comments as
     /// raw string literals (`r"..."`) whose content can itself contain `]`.
     fn strip_docs(s: &str) -> String {

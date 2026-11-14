@@ -1,19 +1,19 @@
 //! Per-execution timeline read model (issue #739).
 //!
-//! A **read-only** projection of a workflow execution's recorded history into an
-//! ordered list of orchestration *steps* (activities, local activities, timers,
-//! child workflows, signal waits, side effects) plus a duration rollup. It is
-//! derived **purely** from `harvest_events` — no new events are appended, no
-//! state is recomputed, and the workflow function is never re-run. It answers
-//! the operator question "where did this run spend its time?".
+//! A **read-only** projection of the recorded history of an execution into an
+//! ordered list of orchestration *steps*, plus a duration rollup. A step is an
+//! activity, local activity, timer, child workflow, signal wait or side effect.
+//! It is derived **purely** from `harvest_events` — no new events are appended,
+//! no state is recomputed, and the workflow function is never re-run. It
+//! answers the operator question "where did this run spend its time?".
 //!
-//! The core of this module is the pure function [`derive_timeline`], which maps
-//! an ordered slice of `(row timestamp, WorkflowEvent)` pairs (plus the
-//! execution's start time and clock context) to a [`Timeline`] document. It is
-//! `db`-free and unit-tested against hand-built history fixtures; the `db`-gated
-//! loader [`crate::store::load_timestamped_history`] supplies the rows at
-//! runtime and the `autumn-harvest-plugin` management API serves the result over
-//! `GET /workflows/{id}/timeline`.
+//! The core of this module is the pure function [`derive_timeline`]. It maps an
+//! ordered slice of `(row timestamp, WorkflowEvent)` pairs to a [`Timeline`]
+//! document. It also takes the start time and clock context of the execution.
+//! It is `db`-free and unit-tested against hand-built history fixtures. At
+//! runtime, the `db`-gated loader [`crate::store::load_timestamped_history`]
+//! supplies the rows. The `autumn-harvest-plugin` management API serves the
+//! result over `GET /workflows/{id}/timeline`.
 //!
 //! ## Why timestamps live on the row, not the event
 //!
@@ -37,15 +37,15 @@
 //! | side_effect | — | `SideEffectRecorded` (point) | same event | never |
 //! | signal_wait | — | previous event's ts | `SignalReceived` | never |
 //!
-//! Timers are paired by **occurrence, not id**: a `timer_id` reused across
-//! loop iterations (`ctx.timer("poll", 60)` per iteration) produces one step per
-//! occurrence, each `TimerFired` (or, for a cancellable timer, `TimerCancelled`)
-//! closing the oldest still-open step for that id.
+//! Timers are paired by **occurrence, not id**. A loop can reuse a `timer_id`
+//! in each iteration (`ctx.timer("poll", 60)`). That produces one step per
+//! occurrence. Each `TimerFired` closes the oldest still-open step for that id.
+//! For a cancellable timer, a `TimerCancelled` does the same.
 //!
 //! External activities (issue #92) are represented **as `activity` steps** — the
 //! step-kind set is bounded and does not gain a seventh kind. A bare
 //! `LocalActivityFailed` **without** a following `LocalActivityExhausted` is a
-//! mid-retry crash: the local activity is still in progress (`Pending`), not
+//! mid-retry crash. The local activity is still in progress (`Pending`), not
 //! terminal — only `LocalActivityCompleted`/`LocalActivityExhausted` close it.
 //!
 //! ### `attempt` derivation
@@ -63,10 +63,10 @@
 //!
 //! ### signal_wait caveat
 //!
-//! A signal-wait step's duration is measured from the **immediately preceding**
-//! recorded history event to the signal's arrival; history records no explicit
-//! "started waiting" marker, so if the workflow was concurrently running other
-//! work this window may overlap it. A running execution parked on a
+//! A signal-wait step's duration runs from the **immediately preceding**
+//! recorded history event to the arrival of the signal. History records no
+//! explicit "started waiting" marker. So if the workflow ran other work
+//! concurrently, this window may overlap it. A running execution parked on a
 //! **never-arriving** signal produces **no** step (there is no pending-signal
 //! event to reconstruct from).
 //!
@@ -187,10 +187,10 @@ pub struct TimelineStep {
     ///
     /// **Caveat (retried activity):** the split is measured against the *last*
     /// attempt's `ActivityStarted`, but `scheduled_at` is the *original*
-    /// `ActivityScheduled`. So for a retried activity `wait_ms` spans all prior
-    /// attempts' execution and backoff, not only queue wait — treat it as an
-    /// **upper bound** on queue wait. (Sibling to the [`Self::attempt`]
-    /// lower-bound caveat.)
+    /// `ActivityScheduled`. So for a retried activity, `wait_ms` also spans the
+    /// execution and backoff of all prior attempts. Treat it as an **upper
+    /// bound** on queue wait. (Sibling to the [`Self::attempt`] lower-bound
+    /// caveat.)
     pub wait_ms: Option<i64>,
     /// Execution split (`ended_at - start_ts`); `Some` only when a start
     /// timestamp was recorded. `None` → only [`Self::total_ms`] is meaningful.
@@ -234,9 +234,11 @@ pub struct TimelineRollup {
     /// Sum of per-step busy contributions (started-activity exec split;
     /// external-activity / `local` / `child` / `side_effect` totals).
     pub busy_ms: i64,
-    /// Sum of per-step wait contributions (started-activity queue-wait split;
-    /// the whole total of a regular activity that never started — pending or a
-    /// schedule-to-start timeout — plus timer + signal totals).
+    /// Sum of per-step wait contributions.
+    ///
+    /// It counts the queue-wait split of a started activity, and timer and
+    /// signal totals. It also counts the whole total of a regular activity that
+    /// never started: a pending activity or a schedule-to-start timeout.
     pub wait_ms: i64,
     /// The single slowest step, or `None` when there are no steps.
     pub slowest_step: Option<SlowestStep>,
@@ -309,13 +311,15 @@ pub fn derive_timeline(
     }
 }
 
-/// Stable key for the `keyed` map in [`build_accs`]: one variant per
-/// namespace ([`WorkflowEvent`]'s `activity_id`/`child_id` fields are reused
-/// across regular activities, local activities, and child workflows, so the
-/// namespace tag must be part of the key, not just the id). `Copy`+`Hash`
-/// over a `Uuid` newtype rather than a formatted `String` — hashing a
-/// 16-byte value needs no allocation and no `SipHash` pass over a variable-
-/// length buffer, unlike the `format!("act:{id}")`-style key this replaces.
+/// Stable key for the `keyed` map in [`build_accs`], with one variant per
+/// namespace.
+///
+/// Regular activities, local activities and child workflows reuse the
+/// `activity_id`/`child_id` fields of [`WorkflowEvent`]. So the key holds the
+/// namespace tag, not only the id. It is `Copy`+`Hash` over a `Uuid` newtype,
+/// not a formatted `String`. Hashing a 16-byte value needs no allocation. It
+/// also needs no `SipHash` pass over a variable-length buffer, unlike the
+/// `format!("act:{id}")`-style key that this replaces.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AccKey {
     Activity(ActivityExecId),
@@ -359,8 +363,8 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
     // poll-loop reuses a constant `timer_id` (`ctx.timer("poll", 60)` per
     // iteration). Each `TimerStarted` opens a NEW step; each `TimerFired` closes
     // the OLDEST still-open step for that id (timers fire in start order). This
-    // FIFO of open acc indices per `timer_id` keeps N iterations as N steps
-    // instead of one collapsed step spanning every nap plus the inter-nap work.
+    // FIFO of open acc indices per `timer_id` keeps N iterations as N steps.
+    // Without it, one collapsed step spans every nap plus the work between.
     let mut timer_open: std::collections::HashMap<String, std::collections::VecDeque<usize>> =
         std::collections::HashMap::new();
 
@@ -423,19 +427,20 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             }
 
             // ── external activity (issue #92) ────────────────────────
-            // An external activity is dispatched via `ActivityAwaitingExternal`
-            // (not `ActivityScheduled`) and completed/failed via the management
-            // API, which appends `ActivityCompletedExternally`/
-            // `ActivityFailedExternally` (both terminal per the replay contract).
+            // An external activity is dispatched through
+            // `ActivityAwaitingExternal`, not `ActivityScheduled`. The
+            // management API completes or fails it. The API appends
+            // `ActivityCompletedExternally`/`ActivityFailedExternally`, both
+            // terminal per the replay contract.
             // There is no claim/start event, so — like a child workflow — the
             // wait/exec split is never available (`split_applicable = false`);
             // only `total_ms` is reported. Represented AS `StepKind::Activity`
             // (the step-kind set is bounded; external activities are activities).
-            // It shares the `Activity` key with the regular-activity
-            // terminal handlers above, so `ActivityCompletedExternally` (folded
-            // into the `ActivityCompleted` arm), `ActivityTimedOut` (a shared
-            // terminal), and the `ActivityFailedExternally` arm below all close it
-            // correctly.
+            // It shares the `Activity` key with the regular-activity terminal
+            // handlers above. So these all close it correctly:
+            // `ActivityCompletedExternally` (folded into the `ActivityCompleted`
+            // arm), `ActivityTimedOut` (a shared terminal) and the
+            // `ActivityFailedExternally` arm below.
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id, name, ..
             } => ensure_scheduled(
@@ -539,11 +544,11 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                     accs[idx].close(ts, StepOutcome::Fired);
                 }
             }
-            // A cancellable timer's `TimerCancelled` (issue #768: author
-            // `cancel_timer`/`reset`) closes the OLDEST still-open step for that
-            // id as Cancelled — mirroring `TimerFired`'s FIFO-by-id pairing — so a
-            // cancelled/reset timer becomes a closed step instead of dangling open
-            // forever and distorting the wall-clock/wait rollup.
+            // An author `cancel_timer`/`reset` records `TimerCancelled` (issue
+            // #768). It closes the OLDEST still-open step for that id as
+            // Cancelled, like the FIFO-by-id pairing of `TimerFired`. So a
+            // cancelled or reset timer becomes a closed step. It does not dangle
+            // open forever and distort the wall-clock/wait rollup.
             WorkflowEvent::TimerCancelled { timer_id } => {
                 if let Some(queue) = timer_open.get_mut(&timer_id.to_string())
                     && let Some(idx) = queue.pop_front()
@@ -636,21 +641,21 @@ fn compute_rollup(
                 busy_ms += e;
             }
             // Regular activity with NO recorded start = never claimed = the whole
-            // duration is pure queue-wait. A regular activity's split is present
-            // iff an `ActivityStarted` was recorded; its absence means the
-            // activity never demonstrably executed (Pending, or a
-            // schedule-to-start timeout that timed out while still queued). A
-            // completed activity always records an `ActivityStarted`, so it never
-            // hits this arm; a null-split terminal activity is therefore a
-            // schedule-to-start timeout or a defensive anomaly — "all queue-wait"
-            // is the correct/safe attribution for both.
+            // duration is pure queue-wait. A regular activity has a split iff an
+            // `ActivityStarted` was recorded. Without one, the activity never
+            // demonstrably executed. It is Pending, or a schedule-to-start
+            // timeout that fired while it was still queued. A completed activity
+            // always records an `ActivityStarted`, so it never hits this arm. A
+            // null-split terminal activity is therefore a schedule-to-start
+            // timeout or a defensive anomaly. "All queue-wait" is the correct and
+            // safe attribution for both.
             //
-            // `attempt.is_some()` discriminates a REGULAR activity from an
-            // EXTERNAL activity (both are `StepKind::Activity`): external
-            // activities are mapped with `retrying = false` → `attempt = None`,
-            // so they fall through to the busy bucket below (downstream work,
-            // like `child_workflow`). Keep this coupling in sync if external
-            // activities ever start reporting an `attempt`.
+            // `attempt.is_some()` tells a REGULAR activity from an EXTERNAL one;
+            // both are `StepKind::Activity`. External activities are mapped with
+            // `retrying = false` → `attempt = None`. So they fall through to the
+            // busy bucket below as downstream work, like `child_workflow`. Keep
+            // this coupling in sync if external activities ever report an
+            // `attempt`.
             (StepKind::Activity, None, None) if step.attempt.is_some() => wait_ms += step.total_ms,
             (StepKind::Timer | StepKind::SignalWait, _, _) => wait_ms += step.total_ms,
             _ => busy_ms += step.total_ms,
@@ -1528,10 +1533,11 @@ mod tests {
 
     #[test]
     fn local_activity_failed_mid_retry_is_pending() {
-        // A running execution (completed_at = None) whose local-activity history
-        // ends on a bare `LocalActivityFailed` (no `LocalActivityExhausted`) means
-        // the worker crashed between retries: the activity is STILL IN PROGRESS,
-        // not terminal. It must be Pending, ended_at None, total to now.
+        // A running execution (completed_at = None) has a local-activity
+        // history that ends on a bare `LocalActivityFailed`, with no
+        // `LocalActivityExhausted`. The worker crashed between retries, so the
+        // activity is STILL IN PROGRESS, not terminal. It must be Pending, with
+        // ended_at None and a total to now.
         let a1 = ActivityExecId::new();
         let rows = vec![
             started(0),
@@ -1738,9 +1744,9 @@ mod tests {
     #[test]
     fn cancelled_timer_closes_as_cancelled_not_left_pending() {
         // A `cancel_timer()`/`reset()` records `TimerStarted … TimerCancelled`
-        // with NO `TimerFired`. The timer step must CLOSE as Cancelled (with an
-        // ended_at) instead of dangling open — otherwise it stays Pending forever
-        // and distorts the timeline's wait/total rollup.
+        // with NO `TimerFired`. The timer step must CLOSE as Cancelled, with an
+        // ended_at. Otherwise it stays Pending forever and distorts the
+        // wait/total rollup of the timeline.
         let x = TimerId::new("x");
         let rows = vec![
             started(0),
@@ -2096,11 +2102,11 @@ mod tests {
     // ── #739 rollup attribution: null-split regular activity is queue-wait ──
     //
     // A regular activity's wait/exec split is present iff an `ActivityStarted`
-    // (claim/start) event was recorded. When it is absent the activity never
-    // demonstrably executed — it sat in the queue — so its whole duration is
-    // queue-wait and must land in `wait_ms`, not `busy_ms`. Misfiling it as busy
-    // reports an idle-queued run as active and points the operator at the wrong
-    // remediation (the whole point of the timeline read model).
+    // (claim/start) event was recorded. Without one, the activity never
+    // demonstrably executed: it sat in the queue. So its whole duration is
+    // queue-wait and must land in `wait_ms`, not `busy_ms`. Busy attribution
+    // would report an idle-queued run as active. It would point the operator
+    // at the wrong remediation, which defeats the timeline read model.
 
     #[test]
     fn pending_unstarted_activity_attributes_to_wait_not_busy() {

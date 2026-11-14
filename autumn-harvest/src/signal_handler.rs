@@ -3,26 +3,25 @@
 //! Mirrors [`UpdateRegistry`](crate::update::UpdateRegistry) /
 //! [`QueryRegistry`](crate::query::QueryRegistry) but for the signal
 //! primitive: a `SignalHandlerRegistry` stores synchronous, type-erased
-//! handlers keyed by signal name. Registration is idempotent — the first
-//! registration for a given name wins, so it is safe to call at the top of
+//! handlers keyed by signal name. Registration is idempotent: the first
+//! registration for a name wins. So it is safe to register at the top of
 //! every `#[workflow]` function on each replay cycle.
 //!
-//! Handlers are **fire-and-forget** by contract (issue #546 explicitly puts
-//! validators/rejection out of scope — that is the `update` primitive's job)
-//! and synchronous: they run inline on the workflow's replay/live cycle, so a
-//! mutation of author-captured state (e.g. `Arc<Mutex<T>>`) is visible to the
-//! rest of the workflow body within the same cycle. There is no suspension
-//! shape to reason about and no completion event to persist.
+//! Handlers are **fire-and-forget** by contract. Issue #546 puts
+//! validators and rejection out of scope; that is the `update` primitive's
+//! job. Handlers are also synchronous. They run inline on the replay/live
+//! cycle. So the rest of the workflow body sees a mutation of captured
+//! state (e.g. `Arc<Mutex<T>>`) in the same cycle. There is no
+//! suspension shape and no completion event to persist.
 //!
 //! Because there is no completion event, dispatch is **per-cycle, not
-//! once-ever**: a fresh `SignalHandlerRegistry` is built for every workflow
-//! replay/live cycle, so the same recorded `SignalReceived` event is
-//! redelivered on every subsequent cycle for the life of the execution, not
-//! just the first time it is seen. That is correct for reconstructing
-//! in-memory state (the captured `Arc<Mutex<T>>` is rebuilt fresh each cycle
-//! too), but not for a non-idempotent side effect performed directly inside a
-//! handler — see `WorkflowContext::register_signal_handler_raw`'s docs for
-//! the full guidance.
+//! once-ever**. Each replay/live cycle builds a fresh
+//! `SignalHandlerRegistry`. So each cycle redelivers the same recorded
+//! `SignalReceived` event for the life of the execution. That is correct
+//! for rebuilding in-memory state, because the captured `Arc<Mutex<T>>` is
+//! also fresh each cycle. It is not correct for a non-idempotent side effect
+//! inside a handler. See the docs of
+//! `WorkflowContext::register_signal_handler_raw` for the full guidance.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,10 +54,10 @@ impl SignalHandlerRegistry {
     /// won registration.
     ///
     /// If `name` is already registered, this is a no-op (first registration
-    /// wins) and the *existing* handler is returned rather than `handler`, so
-    /// a caller that immediately needs to dispatch through the resolved
-    /// handler (as `WorkflowContext::register_and_dispatch_signal_handler`
-    /// does) never has to re-acquire the registry lock and look it back up.
+    /// wins), and the *existing* handler is returned instead of `handler`. So
+    /// a caller that dispatches through the winner (as
+    /// `WorkflowContext::register_and_dispatch_signal_handler` does) never
+    /// takes the registry lock again to look it up.
     pub fn register(&mut self, name: &str, handler: BoxSignalHandler) -> BoxSignalHandler {
         self.handlers
             .entry(name.to_string())
@@ -88,13 +87,11 @@ impl SignalHandlerRegistry {
 ///
 /// Signals are fire-and-forget: a panicking handler's panic is logged here
 /// and this one delivery is dropped, rather than propagating past this call.
-/// This does **not** protect against a handler that panics while holding a
-/// lock on its own captured `std::sync::Mutex`: that mutex still poisons per
-/// ordinary Rust semantics regardless of this `catch_unwind`, and a *later*
-/// `.lock().unwrap()` on the same mutex elsewhere in the workflow body will
-/// still panic (uncaught) when it runs. Handler authors sharing a mutex with
-/// other workflow code should keep critical sections trivially short/
-/// infallible, or recover with
+/// This does **not** protect a handler that panics while it holds its own
+/// captured `std::sync::Mutex`. That mutex still poisons, as in ordinary
+/// Rust. A *later* `.lock().unwrap()` on it in the workflow body then
+/// panics, uncaught. Handler authors who share a mutex with other workflow
+/// code should keep critical sections short and infallible, or recover with
 /// `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`.
 pub fn invoke_signal_handler(handler: &BoxSignalHandler, signal_name: &str, payload: Value) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(payload)));

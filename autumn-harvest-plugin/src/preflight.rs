@@ -72,17 +72,16 @@ pub struct PreflightReport {
 
 /// Wall-clock budget for the database-dependent preflight checks as a group.
 ///
-/// Deliberately generous: these run several queries fanned across shards, and
-/// the budget exists to bound a *pathological* stall, not to police a slow but
-/// working database.
+/// The budget is deliberately generous. These checks fan several queries across
+/// shards. The budget bounds a *pathological* stall, not a slow but working
+/// database.
 ///
 /// Without it the whole endpoint can hang indefinitely. Every DB check begins
-/// with `pool.get().await`, and deadpool waits for a free connection with no
+/// with `pool.get().await`. Deadpool waits for a free connection with no
 /// timeout by default, so an exhausted pool blocks the request forever. That
-/// matters most for `scanner_liveness` (issue #797): pool exhaustion is a
-/// listed cause of a wedged control loop, so the one diagnostic that would
-/// name the stalled loop must not be suppressed by the very condition it is
-/// reporting on.
+/// matters most for `scanner_liveness` (issue #797). Pool exhaustion is a
+/// listed cause of a wedged control loop. So the one diagnostic that names the
+/// stalled loop must not be suppressed by the condition it reports on.
 const DB_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build a read-only deployment preflight report.
@@ -116,20 +115,17 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
     // Sampled AFTER the bounded await, unlike the checks above (issue #797).
     //
     // Scanner liveness is the one in-memory check whose answer *ages*: it is a
-    // function of wall-clock time since each loop's last tick. Sampling it
-    // before a wait that can legitimately consume the full DB_CHECK_BUDGET
-    // would let a loop cross its staleness threshold *during* that wait and
-    // still be reported healthy in a report whose `observed_at` is stamped
-    // afterwards -- so the first report an operator pulls would omit the very
-    // loop that just stalled. That is most likely under pool exhaustion, which
-    // is both a listed cause of a wedged loop and the reason the DB group is
-    // slow, so the two conditions co-occur precisely when the answer matters.
+    // function of wall-clock time since each loop's last tick. The DB group can
+    // legitimately take the full DB_CHECK_BUDGET. A sample taken before that
+    // wait misses a loop that crosses its staleness threshold *during* it. The
+    // report, stamped afterwards, then omits the loop that just stalled. Pool
+    // exhaustion makes this most likely. It is a listed cause of a wedged loop
+    // and also slows the DB group, so both co-occur when the answer matters.
     //
-    // This does not weaken the anti-suppression guarantee that put the check
-    // outside the DB group in the first place: `check_scanner_liveness` is
-    // synchronous and touches no pool, and `tokio::time::timeout` always
-    // returns within the budget, so this line is reached whether the DB checks
-    // completed, errored, or timed out.
+    // This keeps the anti-suppression guarantee that put the check outside the
+    // DB group. `check_scanner_liveness` is synchronous and touches no pool.
+    // `tokio::time::timeout` always returns within the budget. So this line is
+    // reached whether the DB checks completed, errored, or timed out.
     let scanner_liveness = check_scanner_liveness();
 
     let mut checks = Vec::new();
@@ -171,9 +167,9 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
 /// Stand-in emitted when the database-dependent checks exceed
 /// [`DB_CHECK_BUDGET`] as a group.
 ///
-/// Returning a `fail` check is strictly better than hanging: the report still
-/// reaches the operator carrying every in-memory verdict — including
-/// `scanner_liveness`, which is what names the stalled loop.
+/// A `fail` check is strictly better than a hang. The report still reaches
+/// the operator with every in-memory verdict, including `scanner_liveness`,
+/// which names the stalled loop.
 fn db_checks_timed_out() -> PreflightCheckResult {
     check(
         "db_checks",
@@ -513,9 +509,9 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // drop transaction (issue #2009).
     ("harvest_partition_exports", &["SELECT", "INSERT"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
-    // every poll, so a storage role missing `SELECT` on any one of them makes
-    // `claim_task` error and the worker claim *nothing* -- a missing grant
-    // becomes a total dispatch outage, not a degraded feature. No migration
+    // every poll. A storage role missing `SELECT` on any one makes `claim_task`
+    // error, and the worker claims *nothing*. So a missing grant is a total
+    // dispatch outage, not a degraded feature. No migration
     // issues `GRANT`s, so this probe is the only thing that catches it before
     // production. `INSERT` + `UPDATE` are paired because each pause table's
     // and `harvest_build_compat`'s writer is `INSERT ... ON CONFLICT DO
@@ -546,10 +542,10 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ),
     (
         // DELETE is required by the idle-bucket GC (issue #1127). Without it
-        // here, a least-privilege role passes preflight and then every janitor
-        // tick fails with `permission denied`, swallowed into a warn log with a
-        // zero count — indistinguishable from "nothing was eligible" while the
-        // table grows unbounded, which is the exact bug the GC exists to fix.
+        // here, a least-privilege role passes preflight. Then every janitor tick
+        // fails with `permission denied`, swallowed into a warn log with a zero
+        // count. That looks like "nothing was eligible" while the table grows
+        // unbounded, which is the exact bug the GC exists to fix.
         "harvest_rate_limit_buckets",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
@@ -856,8 +852,6 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
     }
 }
 
-/// Collect preflight failures for DAG task references to unregistered
-/// activities.
 fn dag_unregistered_activity_failures<'a>(
     dags: impl IntoIterator<Item = (&'a str, &'a [autumn_harvest::DagTask])>,
     is_registered_activity: impl Fn(&str) -> bool,
@@ -866,10 +860,9 @@ fn dag_unregistered_activity_failures<'a>(
     for (dag_name, tasks) in dags {
         for task in tasks {
             // A signal/timer gate (issue #746) stores its *signal* name in
-            // `activity_name` but dispatches no activity, so its identifier must
-            // not be validated against the activity catalog — otherwise a valid
-            // signal-gate DAG false-fails preflight before rollout. Mirror of the
-            // builder's `validate_dags_do_not_use_local_activities` gate skip.
+            // `activity_name` but dispatches no activity. Validating it against
+            // the activity catalog false-fails a valid signal-gate DAG. Mirror of
+            // the builder's `validate_dags_do_not_use_local_activities` gate skip.
             if task.signal.is_some() {
                 continue;
             }
@@ -880,10 +873,9 @@ fn dag_unregistered_activity_failures<'a>(
                 ));
             }
             // A node's compensator (issue #780) is dispatched through the same
-            // DAG activity-queue lowering on the terminal-failure unwind, so an
-            // unregistered compensator must be flagged BEFORE rollout —
-            // otherwise the miss only surfaces mid-unwind, exactly when the
-            // state is already dangling.
+            // DAG activity-queue lowering on the terminal-failure unwind. Flag an
+            // unregistered one BEFORE rollout. Otherwise the miss surfaces only
+            // mid-unwind, when the state is already dangling.
             if let Some(compensate) = &task.compensate
                 && !is_registered_activity(compensate)
             {
@@ -901,12 +893,12 @@ fn dag_unregistered_activity_failures<'a>(
 /// (issue #802).
 ///
 /// A workflow that never opted in carries `None` on both fields, and `None`
-/// yields an empty name list to walk — that is the zero-false-positive guarantee
-/// (AC4): an unopted-in workflow can never contribute a failure, regardless of
-/// what is registered. `Some(&[])` is distinct from `None` on the wire and at
-/// the macro layer, but resolves identically here: an explicit "this workflow
-/// depends on nothing" has nothing to check. The up-front `filter` is a
-/// short-circuit for the common all-legacy catalog, not the guarantee itself.
+/// yields an empty name list to walk. That is the zero-false-positive guarantee
+/// (AC4). An unopted-in workflow never contributes a failure, whatever is
+/// registered. `Some(&[])` differs from `None` on the wire and at the macro
+/// layer. Here both resolve the same: "depends on nothing" has nothing to check.
+/// The up-front `filter` is a short-circuit for the common all-legacy catalog,
+/// not the guarantee itself.
 ///
 /// Ordering is imposed here rather than inherited: `registry().workflows` is a
 /// `HashMap`, so without sorting the operator-facing `details.failures` list
@@ -932,8 +924,8 @@ fn workflow_unregistered_dependency_failures<'a>(
     for info in opted_in {
         let workflow = info.name;
         // Activities and children resolve against separate catalogs but are
-        // otherwise identical, so walk them through one loop keyed by the
-        // catalog predicate and the noun used in the operator-facing message.
+        // otherwise identical. One loop walks both, keyed by the catalog
+        // predicate and the noun in the operator-facing message.
         for (declared, kind, is_registered) in [
             (
                 info.declared_activities,
@@ -948,9 +940,9 @@ fn workflow_unregistered_dependency_failures<'a>(
         ] {
             for name in declared.unwrap_or_default() {
                 let failure = if name.trim().is_empty() {
-                    // The macro rejects a blank name at compile time, so this is
-                    // only reachable through the fluent builder — report it as
-                    // the authoring error it is, not as "unregistered ''".
+                    // The macro rejects a blank name at compile time, so only the
+                    // fluent builder reaches this. Report it as an authoring
+                    // error, not as "unregistered ''".
                     format!("workflow '{workflow}' declares an empty {kind} name")
                 } else if is_registered(name) {
                     continue;
@@ -972,9 +964,9 @@ fn workflow_unregistered_dependency_failures<'a>(
 ///
 /// The check aggregates three unrelated classes into one `details.failures`
 /// list, so any single fixed remediation string is wrong for at least one of
-/// them. Compose the remediation from the classes present instead — which
-/// matters more now that the CLI prints `remediation` beneath the table by
-/// default rather than leaving it buried in `--output json`.
+/// them. Compose the remediation from the classes present instead. The CLI
+/// prints `remediation` beneath the table by default, so a wrong one is no
+/// longer buried in `--output json`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CatalogFailureKinds {
     /// A `#[dag]` node names an activity that is not registered.
@@ -994,10 +986,9 @@ fn catalog_remediation(kinds: CatalogFailureKinds) -> Option<String> {
         parts.push("Register the named activity in activities![…] so the DAG can dispatch it.");
     }
     if kinds.unresolved_declared_dependency {
-        // Preflight does not read workflow bodies, so it cannot tell "you
-        // forgot to register the handler" (a runtime hazard) from "you left a
-        // stale declaration behind" (cosmetic). Name both — the fix is one line
-        // either way.
+        // Preflight does not read workflow bodies. So it cannot tell a missing
+        // handler registration (a runtime hazard) from a stale declaration
+        // (cosmetic). Name both: the fix is one line either way.
         parts.push(
             "Register the named handler in activities![…] / workflows![…], or — if the \
              workflow no longer references it — delete the stale entry from its declared \
@@ -1428,10 +1419,10 @@ fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> 
         // a deployment with no session-based workflow at all as requiring a
         // worker on `"default"`.
         // Synthetic liveness canary (issue #796): the built-in canary activity
-        // has `default_queue: None` but is always dispatched on the probe's
-        // *target* queue (carried in the workflow input), never on
-        // `default_queue`. Counting it here would inject a phantom `"default"`
-        // required queue, flipping a healthy non-default-queue deployment RED.
+        // has `default_queue: None`. It is always dispatched on the probe's
+        // *target* queue, carried in the workflow input. Counting it here would
+        // inject a phantom `"default"` required queue, flipping a healthy
+        // non-default-queue deployment RED.
         if !activity.is_local
             && !autumn_harvest::is_reserved_session_activity_name(activity.name)
             && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
@@ -1470,19 +1461,18 @@ fn worker_can_cover(worker: &WorkerRow, queue: &str, shard_id: i32) -> bool {
         .as_array()
         .is_some_and(|queues| queues.iter().any(|value| value.as_str() == Some(queue)));
     // Delegate the shard-membership half to the single shared predicate rather
-    // than keeping a third hand-rolled copy (issue #961 review, Codex P2).
+    // than keeping a third hand-rolled copy (issue #961).
     //
-    // This copy lacked the empty-array normalization the other two already
-    // carry, so a legacy worker registering `[]` -- "no shard identity; covers
-    // whatever database this is" -- was reported as covering nothing, falsely
-    // flagging every queue it actually polls. That is issue #1150's bug, third
-    // instance: `shard_fanout::worker_covers_shard`'s doc names
+    // This copy lacked the empty-array normalization the other two carry. A
+    // legacy worker registering `[]` means "no shard identity; covers whatever
+    // database this is". It was reported as covering nothing, which falsely
+    // flagged every queue it polls. That is the bug of issue #1150, third
+    // instance. The doc of `shard_fanout::worker_covers_shard` names
     // `queue_coverage.rs` and `shard_health.rs` as its callers "so the two
-    // shard-membership predicates cannot drift again", but this one was never
-    // routed through it. Both this function and `worker_covers_shard`'s other
-    // callers are fed by a connection already scoped to one shard's own
-    // database (`list_shard_workers` here, `observe_shard` there), so the
-    // premise the normalization relies on holds identically.
+    // shard-membership predicates cannot drift again". This one was never
+    // routed through it. Every caller is fed by a connection scoped to one
+    // shard's own database (`list_shard_workers` here, `observe_shard` there).
+    // So the premise of the normalization holds identically.
     has_queue && crate::shard_fanout::worker_covers_shard(worker, shard_id)
 }
 
@@ -1608,13 +1598,12 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     };
 
     // Issue #1284: in the `dev` profile with no declared boundary, a caller
-    // that presents no session cookie reaches every admin route
-    // unauthenticated — which is what makes the quickstart's own documented
-    // `harvest preflight` step work. That is deliberate, but it must never be
-    // silent: report it as data on the check that already describes the auth
-    // posture, so `harvest preflight --output json` and the compact table both
-    // carry it. Always present (never conditionally omitted) so a CI script can
-    // assert on the field rather than on its absence.
+    // with no session cookie reaches every admin route unauthenticated. That
+    // makes the documented quickstart `harvest preflight` step work. It is
+    // deliberate, but it must never be silent. Report it as data on the check
+    // that describes the auth posture. Then `harvest preflight --output json`
+    // and the compact table both carry it. The field is always present, so a
+    // CI script can assert on it rather than on its absence.
     let unauthenticated_access = is_dev && !has_boundary;
     // Issue #1802: report open mutating routes the same way. The opt-out can
     // open them outside `dev`, so this is not the same field as above.
@@ -1677,14 +1666,13 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
 /// (issue #797).
 ///
 /// Every loop registers itself at spawn time and ticks at the end of each
-/// iteration, so a loop that panicked, deadlocked, or stalled on a
-/// never-returning query stops advancing its timestamp while everything else
-/// in the process keeps working. A scanner that has not ticked within
+/// iteration. A loop that panicked, deadlocked, or stalled on a
+/// never-returning query stops advancing its timestamp. Everything else in the
+/// process keeps working. A scanner that has not ticked within
 /// `max(2 × poll_interval, 60s)` is `warn`; past twice that it is `fail`.
 ///
-/// Reads the in-process registry directly — deliberately **not** gated on a
-/// metrics recorder being configured, so the check works on a deployment with
-/// no telemetry pipeline at all.
+/// Reads the in-process registry directly. It is deliberately **not** gated on
+/// a metrics recorder, so the check works with no telemetry pipeline at all.
 fn check_scanner_liveness() -> PreflightCheckResult {
     scanner_liveness_check(&global_scanner_liveness().snapshot())
 }
@@ -1700,9 +1688,9 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     // field stays a stable, machine-readable list of bare scanner names.
     let mut stale_labels = Vec::new();
     // The standard `affected_shards` contract field: the shards of every stale
-    // instance. `check()` sorts and dedups it, and the CLI's SCOPE column reads
-    // exactly this field, so a per-shard wedge must land here and not only in
-    // the summary and details.
+    // instance. `check()` sorts and dedups it. The CLI's SCOPE column reads
+    // exactly this field, so a per-shard wedge must land here, not only in the
+    // summary and details.
     let mut affected_shards = Vec::new();
     let mut entries = Vec::with_capacity(statuses.len());
 
@@ -1718,19 +1706,18 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
         }
         if verdict != ScannerLivenessVerdict::Healthy {
             stale_scanners.push(status.scanner.as_str());
-            // Name the shard in the summary when the wedged instance is one of
-            // the per-shard loops (issue #797): a multi-shard worker runs N
-            // timeout checkers under one label, so "timeout is wedged" alone
-            // does not tell an operator which database is unprotected.
+            // Name the shard in the summary for a per-shard loop (issue #797).
+            // A multi-shard worker runs N timeout checkers under one label. So
+            // "timeout is wedged" alone does not name the unprotected database.
             stale_labels.push(status.shard.map_or_else(
                 || status.scanner.as_str().to_owned(),
                 |shard| format!("{} (shard {})", status.scanner.as_str(), shard.as_i32()),
             ));
-            // EVERY stale instance's shard, not just the worst one's: the
-            // worst-instance fold picks one owner for the verdict, so pushing
-            // only `status.shard` would report shard 1 while shard 2 was
-            // equally unprotected -- an understated blast radius on the exact
-            // surface an operator uses to decide what to restart.
+            // EVERY stale instance's shard, not just the worst one's. The
+            // worst-instance fold picks one owner for the verdict. Pushing only
+            // `status.shard` would report shard 1 while shard 2 was equally
+            // unprotected. That understates the blast radius on the surface an
+            // operator uses to decide what to restart.
             affected_shards.extend(status.stale_shards.iter().copied().map(ShardId::as_i32));
         }
         entries.push(json!({
@@ -1750,11 +1737,10 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     }
 
     let summary = if statuses.is_empty() {
-        // Two legitimate shapes reach here: an API-only replica that spawns no
-        // control loops, and a process that gracefully drained its worker
-        // while continuing to serve HTTP (a clean stop deregisters). Reporting
-        // seven phantom wedged scanners in either case would be pure alarm
-        // noise, so an empty registry passes with an explanation.
+        // Two legitimate shapes reach here. One is an API-only replica that
+        // spawns no control loops. The other drained its worker but still serves
+        // HTTP (a clean stop deregisters). Seven phantom wedged scanners would be
+        // pure alarm noise, so an empty registry passes with an explanation.
         "no background control loops are registered in this process".to_owned()
     } else if stale_scanners.is_empty() {
         format!(
@@ -1862,10 +1848,9 @@ mod tests {
 
     /// **Issue #1284.** The dev-profile management API is reachable
     /// unauthenticated, which is deliberate but must never be silent. The
-    /// posture is reported as a stable `unauthenticated_access` boolean on the
-    /// check that already describes the auth boundary, so a release script can
-    /// assert on the field rather than string-match a message. It is always
-    /// present — never conditionally omitted — for exactly that reason.
+    /// check that describes the auth boundary reports a stable
+    /// `unauthenticated_access` boolean. A release script asserts on that field
+    /// rather than string-match a message, so it is always present.
     #[test]
     fn admin_auth_boundary_reports_unauthenticated_dev_access() {
         let open = HarvestApiState::new();
@@ -1893,9 +1878,9 @@ mod tests {
             serde_json::json!(false)
         );
 
-        // Non-dev profiles never report unauthenticated access — they are
-        // fail-closed whether or not a boundary is declared, and a `fail`
-        // status there is the pre-existing signal.
+        // Non-dev profiles never report unauthenticated access. They are
+        // fail-closed with or without a declared boundary, and their `fail`
+        // status is the pre-existing signal.
         for profile in ["prod", "staging", "unknown"] {
             let state = HarvestApiState::new();
             state.set_deployment_profile(profile);
@@ -1975,7 +1960,6 @@ mod tests {
         );
     }
 
-    /// Build a `WorkerRow` with the given registered `shard_assignments`.
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
         let now = chrono::Utc::now();
@@ -2003,15 +1987,14 @@ mod tests {
         }
     }
 
-    /// **Issue #961 review (Codex P2).** Preflight's shard-membership check is
-    /// routed through the shared `shard_fanout::worker_covers_shard`, so a
-    /// legacy worker registering an empty `shard_assignments` is treated as
-    /// covering the shard whose database produced the row.
+    /// **Issue #961.** Preflight routes its shard-membership check through the
+    /// shared `shard_fanout::worker_covers_shard`. A legacy worker with an empty
+    /// `shard_assignments` then covers the shard whose database produced the row.
     ///
-    /// This was a third, drifted copy of the predicate: it lacked the
-    /// empty-array normalization `queue_coverage.rs` and `shard_health.rs`
-    /// already carry (issue #1150), so a healthy legacy worker was reported as
-    /// covering nothing and every queue it actually polls was falsely flagged.
+    /// This was a third, drifted copy of the predicate. It lacked the
+    /// empty-array normalization that `queue_coverage.rs` and `shard_health.rs`
+    /// carry (issue #1150). So a healthy legacy worker covered nothing, and
+    /// every queue it polls was falsely flagged.
     #[test]
     fn worker_can_cover_treats_an_empty_shard_assignment_as_covering() {
         let worker = worker_row_with_shard_assignments(&[], &["default"]);
@@ -2138,11 +2121,10 @@ mod tests {
         assert!(result.remediation.is_none());
     }
 
-    /// Issue #797, Codex review: a multi-shard worker runs one timeout checker
-    /// per assigned shard, all under one `Scanner` label, and the tick counter
-    /// carries no shard label — the dashboard and the alert notes both send
-    /// operators here precisely because this check is the only surface that can
-    /// localize a single-shard wedge. It has to actually say which shard.
+    /// Issue #797: a multi-shard worker runs one timeout checker per assigned
+    /// shard, all under one `Scanner` label. The tick counter carries no shard
+    /// label. The dashboard and the alert notes send operators here, because
+    /// only this check can localize a single-shard wedge. It must name the shard.
     #[test]
     fn scanner_liveness_names_the_shard_of_the_wedged_instance() {
         let result = scanner_liveness_check(&[status_on_shard(
@@ -2171,11 +2153,10 @@ mod tests {
 
     #[test]
     fn scanner_liveness_populates_the_affected_shards_contract_field() {
-        // `affected_shards` is the STANDARD localization field every preflight
-        // check shares, and the CLI's SCOPE column derives from it exclusively
-        // (it prints `-` for an empty vec). Putting the shard only in the
-        // summary and the nested details would leave `harvest preflight` and
-        // every machine consumer without it.
+        // `affected_shards` is the STANDARD localization field of every
+        // preflight check. The CLI's SCOPE column derives only from it (`-` for
+        // an empty vec). A shard only in the summary and the nested details
+        // leaves `harvest preflight` and every machine consumer without it.
         let result = scanner_liveness_check(&[
             status_on_shard(Scanner::Timeout, 30, 200, 4, Some(ShardId::new(1))),
             status_on_shard(Scanner::PoisonPill, 30, 300, 2, Some(ShardId::new(2))),
@@ -2207,18 +2188,18 @@ mod tests {
         );
     }
 
-    /// Issue #797, Codex review: `snapshot_as_of` folds the per-shard
-    /// instances of one scanner down to the **worst** owner so the verdict is
-    /// reproducible from the folded status. That fold is right for the
-    /// verdict and wrong for the blast radius — if two shards are wedged at
-    /// once, reporting only the worse one tells the operator to fix one
-    /// database while the other stays unprotected. `stale_shards` carries all
-    /// of them through, and `affected_shards` must surface all of them.
+    /// Issue #797: `snapshot_as_of` folds the per-shard instances of one
+    /// scanner down to the **worst** owner, so the folded status reproduces the
+    /// verdict. That fold is right for the verdict and wrong for the blast
+    /// radius. With two shards wedged at once, reporting only the worse one
+    /// sends the operator to one database while the other stays unprotected.
+    /// `stale_shards` carries all of them through, and `affected_shards` must
+    /// surface all of them.
     #[test]
     fn scanner_liveness_affected_shards_covers_every_stale_shard_not_just_the_worst() {
-        // One folded status for `timeout`, whose worst instance is shard 1 but
-        // whose shard 2 instance is also stale -- exactly what `snapshot_as_of`
-        // now produces for a two-shard worker with both loops wedged.
+        // One folded status for `timeout`: its worst instance is shard 1, and
+        // its shard 2 instance is also stale. `snapshot_as_of` produces this for
+        // a two-shard worker with both loops wedged.
         let result = scanner_liveness_check(&[status_with_stale_shards(
             Scanner::Timeout,
             30,
@@ -2287,15 +2268,15 @@ mod tests {
 
     #[test]
     fn db_check_timeout_stand_in_points_at_the_scanner_verdict() {
-        // The stand-in is what makes `scanner_liveness` observable when the
-        // pool is exhausted: without it the endpoint hangs on
-        // `pool.get().await` (deadpool waits with no timeout by default) and
-        // the report never reaches the operator at all.
+        // The stand-in makes `scanner_liveness` observable when the pool is
+        // exhausted. Without it the endpoint hangs on `pool.get().await`
+        // (deadpool waits with no timeout by default). The report then never
+        // reaches the operator.
         //
-        // Pool exhaustion is a listed cause of a wedged control loop, so the
+        // Pool exhaustion is a listed cause of a wedged control loop. So the
         // one diagnostic that names the stalled loop must not be suppressed by
-        // the very condition it is reporting on. The remediation therefore
-        // routes the reader to that entry in the same report.
+        // the condition it reports on. The remediation therefore routes the
+        // reader to that entry in the same report.
         let result = db_checks_timed_out();
 
         assert_eq!(result.status, PreflightStatus::Fail);
@@ -2313,17 +2294,17 @@ mod tests {
         );
     }
 
-    /// Scanner liveness is the one in-memory check whose answer *ages*, so it
-    /// must be sampled **after** the bounded DB group — otherwise a loop that
-    /// crosses its staleness threshold during a slow (up to `DB_CHECK_BUDGET`)
-    /// wait is reported healthy in a report stamped afterwards.
+    /// Scanner liveness is the one in-memory check whose answer *ages*. So it
+    /// must be sampled **after** the bounded DB group. Otherwise a loop that
+    /// goes stale during a slow wait (up to `DB_CHECK_BUDGET`) is reported
+    /// healthy in a report stamped afterwards.
     ///
-    /// Asserted against the source rather than by driving the clock: the
-    /// staleness floor is 60 s and the registry reads `std::time::Instant`,
-    /// which `tokio`'s paused clock does not virtualize, so a timing test
-    /// would have to sleep for real. This mirrors the anti-drift source scan
-    /// in `scanner_liveness_tests.rs`, and fails if the call is moved back
-    /// above the await.
+    /// The test reads the source rather than driving the clock. The staleness
+    /// floor is 60 s, and the registry reads `std::time::Instant`. The paused
+    /// `tokio` clock does not virtualize it, so a timing test would sleep for
+    /// real. This mirrors the anti-drift source scan in
+    /// `scanner_liveness_tests.rs`. It fails if the call moves back above the
+    /// await.
     #[test]
     fn scanner_liveness_is_sampled_after_the_bounded_db_group() {
         const SOURCE: &str = include_str!("preflight.rs");
@@ -2367,8 +2348,8 @@ mod tests {
             "the budget must bound a never-returning check"
         );
 
-        // And the check that has to survive it is a pure function of in-memory
-        // state — no pool, no await, so nothing the database does can stop it.
+        // The check that must survive it is a pure function of in-memory
+        // state. It has no pool and no await, so the database cannot stop it.
         let scanner = scanner_liveness_check(&[status(Scanner::Timeout, 30, 300, 7)]);
         assert_eq!(
             scanner.status,
@@ -2513,21 +2494,6 @@ mod tests {
         }
     }
 
-    /// Every table the hot claim path reads must be covered by the write
-    /// privilege probe.
-    ///
-    /// The claim CTE reads its gate tables **unconditionally on every poll**,
-    /// so a storage role missing `SELECT` on any one of them does not merely
-    /// degrade that feature -- `claim_task` errors and the worker claims
-    /// *nothing*, converting a missing grant into a total dispatch outage.
-    /// Preflight exists to catch exactly that before it reaches production,
-    /// and no migration issues `GRANT`s, so this list is the only thing
-    /// standing between a separately-granted storage role and that outage.
-    ///
-    /// Derived from `claim_task_query()` rather than hardcoded so that adding
-    /// a new gate table to the claim path *cannot* silently skip the probe:
-    /// this test fails until the table is registered here (issue #807 review,
-    /// Codex P1).
     /// Every applying partition sweep reads the export marker, and an
     /// exporting sweep writes it (issue #2009).
     #[test]
@@ -2555,6 +2521,19 @@ mod tests {
         assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
     }
 
+    /// Every table the hot claim path reads must be covered by the write
+    /// privilege probe.
+    ///
+    /// The claim CTE reads its gate tables **unconditionally on every poll**.
+    /// A storage role missing `SELECT` on any one of them does not merely
+    /// degrade that feature. `claim_task` errors and the worker claims
+    /// *nothing*, so a missing grant is a total dispatch outage. Preflight
+    /// exists to catch that before production. No migration issues `GRANT`s,
+    /// so this list is the only guard for a separately-granted storage role.
+    ///
+    /// The list derives from `claim_task_query()`, not a hardcoded list. So a
+    /// new gate table on the claim path *cannot* silently skip the probe. This
+    /// test fails until the table is registered here (issue #807).
     #[test]
     fn every_table_the_claim_path_reads_is_covered_by_the_privilege_probe() {
         let sql = autumn_harvest::queue::claim_task_query();
@@ -2654,8 +2633,8 @@ mod tests {
     #[test]
     fn catalog_check_skips_signal_gate_nodes() {
         // A signal/timer gate (issue #746) stores its *signal* name in
-        // `activity_name` but dispatches no activity, so preflight must not
-        // report the gate identifier as an unregistered activity.
+        // `activity_name` but dispatches no activity. Preflight must not report
+        // the gate identifier as an unregistered activity.
         let registered: HashSet<&str> = ["extract", "load"].into_iter().collect();
         let tasks = vec![
             activity_task("extract"),
@@ -2697,12 +2676,11 @@ mod tests {
         );
     }
 
-    // `catalog_consistency` aggregates three unrelated failure classes, so its
-    // remediation is composed from the classes actually collected rather than
-    // being one fixed string that is wrong for at least one of them. These pin
-    // that each class contributes its own fix and none is dropped — the CLI now
-    // prints `remediation` beneath the table by default, so a mismatched string
-    // sends an operator after the wrong thing in-band.
+    // `catalog_consistency` aggregates three unrelated failure classes. Its
+    // remediation is composed from the classes collected, not one fixed string
+    // that is wrong for at least one of them. These tests pin that each class
+    // contributes its own fix and none is dropped. The CLI prints `remediation`
+    // beneath the table by default, so a mismatched string misleads in-band.
     mod catalog_remediation_composition {
         use super::super::{CatalogFailureKinds, catalog_remediation};
 
@@ -2741,10 +2719,10 @@ mod tests {
 
         #[test]
         fn an_empty_default_queue_failure_keeps_its_own_remediation() {
-            // The regression this guards: narrowing the shared string to only
-            // name the issue #802 declared-dependency fix left this
-            // pre-existing class telling the operator to register a handler or
-            // delete a declaration, neither of which clears `queue = ""`.
+            // Guards a regression. The shared string once named only the issue
+            // #802 declared-dependency fix. This class then told the operator to
+            // register a handler or delete a declaration. Neither clears
+            // `queue = ""`.
             let only_queue = catalog_remediation(CatalogFailureKinds {
                 empty_default_queue: true,
                 ..CatalogFailureKinds::default()
@@ -2792,10 +2770,10 @@ mod tests {
         };
         use crate::api::HarvestApiState;
 
-        // A minimal real workflow — its `_info()` supplies a genuine
-        // `WorkflowHandlerFn` so tests mutate the two declaration fields on the
-        // real type instead of hand-rolling a 20-field literal (mirrors the
-        // sqlite crate's `feature_gate_tests::base_wf_info`).
+        // A minimal real workflow. Its `_info()` supplies a genuine
+        // `WorkflowHandlerFn`, so tests mutate the two declaration fields on the
+        // real type instead of a 20-field literal. Mirrors the sqlite crate's
+        // `feature_gate_tests::base_wf_info`.
         #[workflow]
         #[allow(clippy::unused_async)]
         async fn base_wf(_ctx: &WorkflowContext, input: ()) -> Result<(), String> {
@@ -2819,7 +2797,6 @@ mod tests {
             info
         }
 
-        /// The operator-facing `details.failures` list, as plain strings.
         fn failure_strings(result: &super::super::PreflightCheckResult) -> Vec<String> {
             result.details["failures"]
                 .as_array()
@@ -2911,10 +2888,10 @@ mod tests {
         fn intent_pin_an_explicitly_empty_declaration_resolves_trivially() {
             // INTENT PIN, not evidence: `Some(&[])` and `None` both yield zero
             // failures *by construction* here, so this cannot fail under any
-            // implementation of the helper. The load-bearing `Some(&[])` vs
-            // `None` distinction is proven where it is actually observable — at
-            // the macro layer by `workflow_empty_declaration_is_opt_in_not_absent`
-            // and on the wire by
+            // implementation of the helper. Two tests prove the load-bearing
+            // `Some(&[])` vs `None` distinction where it is observable. At the
+            // macro layer: `workflow_empty_declaration_is_opt_in_not_absent`. On
+            // the wire:
             // `registered_workflow_record_distinguishes_empty_declaration_from_absent`.
             let workflows = [wf("noop", Some(&[]), Some(&[]))];
             assert_eq!(
@@ -2925,10 +2902,10 @@ mod tests {
 
         #[test]
         fn two_workflows_missing_the_same_activity_are_each_reported() {
-            // Dedup is keyed on the whole failure STRING, not the bare name —
-            // keying on the name alone would silently swallow the second
-            // workflow's miss and under-report the blast radius of a forgotten
-            // registration, which is exactly what this check exists to size.
+            // Dedup is keyed on the whole failure STRING, not the bare name. A
+            // name key silently swallows the second workflow's miss. That
+            // under-reports the blast radius of a forgotten registration, which
+            // this check exists to size.
             let workflows = [
                 wf("alpha", Some(&["gone"]), None),
                 wf("beta", Some(&["gone"]), None),
@@ -3018,13 +2995,6 @@ mod tests {
             );
         }
 
-        // ── Success metric: 100% precision for opted-in, 0 false positives ────
-        //
-        // Asserting one example proves neither claim. This drives a mixed
-        // catalog and asserts the failure set EXACTLY: every genuine miss is
-        // reported (recall) and nothing else is (precision), with the
-        // non-opted-in rows present precisely so a regression that stopped
-        // skipping `None` would show up as extra entries.
         // ── AC2/AC3 wiring: the helper is actually reached by the check, and
         // its strings land in `details.failures` with the right verdict ───────
         //
@@ -3112,9 +3082,9 @@ mod tests {
         #[test]
         fn ac2_declared_dep_failures_coexist_with_preexisting_failures() {
             // The new failures must be APPENDED to the pre-existing ones, never
-            // replace them: `failures.extend(..)` written as `failures = ..`
-            // would silently drop every DAG / empty-default-queue failure the
-            // check already reports, and no other test would notice.
+            // replace them. `failures = ..` in place of `failures.extend(..)`
+            // silently drops every DAG and empty-default-queue failure. No other
+            // test would notice.
             let mut empty_queue_activity = activity_named("bad_queue_act");
             empty_queue_activity.default_queue = Some("");
             let state = api_state_with(
@@ -3143,11 +3113,10 @@ mod tests {
 
         #[test]
         fn ac3_mixed_catalog_failure_set_is_exact_through_the_real_check() {
-            // The success metric (100% precision, ZERO false positives) claimed
-            // of the pure helper, re-asserted through the operator-facing
-            // entry point over a real `HashMap`-backed registry — which is also
-            // the only place the name sort is exercised against genuinely
-            // nondeterministic iteration order.
+            // The success metric of the pure helper (100% precision, ZERO false
+            // positives), re-asserted through the operator-facing entry point.
+            // It uses a real `HashMap`-backed registry. Only here does the name
+            // sort meet genuinely nondeterministic iteration order.
             let state = api_state_with(
                 vec![
                     wf("complete", Some(&["act_ok"]), Some(&["wf_ok"])),
@@ -3193,6 +3162,12 @@ mod tests {
             );
         }
 
+        /// Success metric: 100% precision for opted-in, 0 false positives.
+        ///
+        /// One example proves neither claim. This test drives a mixed catalog
+        /// and asserts the failure set EXACTLY. Every genuine miss is reported
+        /// (recall), and nothing else is (precision). The non-opted-in rows
+        /// catch a regression that stops skipping `None` as extra entries.
         #[test]
         fn success_metric_exact_failure_set_over_a_mixed_catalog() {
             let workflows = [
@@ -3233,10 +3208,10 @@ mod tests {
         }
     }
 
-    /// T23 — a node's compensator is dispatched through the ordinary DAG
-    /// activity-queue lowering on the terminal-failure unwind, so preflight must
-    /// flag an UNREGISTERED compensator before rollout — otherwise the miss only
-    /// surfaces mid-unwind, exactly when the state is already dangling.
+    /// T23: a node's compensator is dispatched through the ordinary DAG
+    /// activity-queue lowering on the terminal-failure unwind. Preflight must
+    /// flag an UNREGISTERED compensator before rollout. Otherwise the miss
+    /// surfaces only mid-unwind, when the state is already dangling.
     #[test]
     fn preflight_flags_an_unregistered_compensator() {
         let registered: HashSet<&str> =

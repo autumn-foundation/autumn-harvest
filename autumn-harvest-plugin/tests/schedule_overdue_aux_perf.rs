@@ -1,35 +1,33 @@
 //! Ledger performance investigation: `GET /admin/schedules`.
 //!
 //! `load_schedule_overdue_aux_by_shard` (in `autumn-harvest-plugin/src/api.rs`)
-//! computes each schedule's overdue-suppression basis and calendar-adjusted
-//! fire time **one schedule row at a time**: for every schedule on the shard
-//! it called `scheduler::schedule_running_basis` -- a `COUNT(*)` on
-//! `harvest_workflow_executions` plus `throttle::pending_throttle_count_for_workflow`
-//! (itself a `to_regclass` existence check *and* a second count query, always,
-//! on every call) -- and, for calendar-bearing schedules,
-//! `scheduler::resolve_effective_fire_at`, which re-queries
-//! `calendar::load_exclusions_for_calendar` from scratch even when several
-//! schedules share the same calendar. Up to four round trips per schedule
-//! row, every one of them on every single `GET /admin/schedules` request --
-//! exactly the class of bug Harvest's own performance-agent playbook calls
-//! out: "workflow/activity bookkeeping queries that are individually trivial
+//! computed each schedule's overdue-suppression basis and calendar-adjusted
+//! fire time **one schedule row at a time**. Per schedule it called
+//! `scheduler::schedule_running_basis`: a `COUNT(*)` on
+//! `harvest_workflow_executions` plus `throttle::pending_throttle_count_for_workflow`.
+//! That throttle call always runs a `to_regclass` check *and* a second count.
+//! For calendar-bearing schedules it also called
+//! `scheduler::resolve_effective_fire_at`. That re-queries
+//! `calendar::load_exclusions_for_calendar` even when schedules share a
+//! calendar. So each schedule row cost up to four round trips on every
+//! `GET /admin/schedules` request. Harvest's performance-agent playbook names
+//! this class of bug: "workflow/activity bookkeeping queries that are individually trivial
 //! but collectively dominant... they will never show up in a buffer ranking,
 //! only in a `calls` ranking."
 //!
-//! The fix batches all three lookups per shard: one grouped `RUNNING`/`PAUSED`
-//! count query (`scheduler::schedule_running_basis_batch`), one grouped
-//! pending-throttle count query
-//! (`throttle::pending_throttle_counts_for_workflows`), and one grouped
-//! calendar-exclusions query keyed by *distinct* calendar name
-//! (`calendar::load_exclusions_for_calendars`) -- each covering every
-//! schedule row on the shard at once. The per-schedule decision itself
-//! (`scheduler::resolve_effective_fire_at_pure`) is unchanged, pure, DB-free
-//! logic; only how its inputs are fetched changed.
+//! The fix batches all three lookups per shard, each over every schedule row:
 //!
-//! This file is the harness + evidence generator for that investigation, plus
-//! two permanent equivalence regression tests comparing the batched
-//! functions' output against the original (unmodified, still-`pub`)
-//! per-schedule functions across the same fixture.
+//! - one grouped `RUNNING`/`PAUSED` count (`scheduler::schedule_running_basis_batch`),
+//! - one grouped pending-throttle count (`throttle::pending_throttle_counts_for_workflows`),
+//! - one calendar-exclusions query keyed by *distinct* calendar name
+//!   (`calendar::load_exclusions_for_calendars`).
+//!
+//! The per-schedule decision (`scheduler::resolve_effective_fire_at_pure`) is
+//! unchanged, pure, DB-free logic. Only the input fetch changed.
+//!
+//! This file is the harness and evidence generator for that investigation. It
+//! also holds two equivalence regression tests. They compare the batched
+//! functions with the original, still-`pub` per-schedule functions.
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
@@ -79,11 +77,9 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-/// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`
-/// (treated as an admin connection string, matching `claim_bench_support`'s
-/// and `workflow_children_traversal_perf.rs`'s own convention) so this
-/// harness's ~500-row fixture and `pg_stat_statements` capture cannot collide
-/// with -- or be polluted by -- any other test/run sharing the same server.
+/// Creates a fresh, uniquely-named, migrated database off `admin_url`, an admin
+/// connection string as in `claim_bench_support`. So the ~500-row fixture and
+/// the `pg_stat_statements` capture cannot collide with another run on the server.
 async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
@@ -163,22 +159,20 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 
 // ── Fixture generation ──────────────────────────────────────────────────────
 
-/// The fixed slot every calendar-bearing schedule's `next_run_at` is pinned
-/// to; every calendar's exclusion set includes this exact date, so
-/// `resolve_effective_fire_at`/`resolve_effective_fire_at_pure` actually
-/// rebase it (not a vacuous "calendar present but never excluded" no-op).
+/// The fixed `next_run_at` of each calendar-bearing schedule. Each calendar
+/// excludes this date, so `resolve_effective_fire_at`/`resolve_effective_fire_at_pure`
+/// actually rebase it. The calendar check is then not a vacuous no-op.
 const PINNED_CALENDAR_SLOT: &str = "2026-06-15T12:00:00+00:00";
 const CALENDAR_COUNT: i64 = 3;
 
-/// Seeds `n` schedules (each its own `workflow_name`), a shared pool of
-/// `CALENDAR_COUNT` calendars (every 10th schedule references one, cycling
-/// through them -- so several schedules share a calendar, which is exactly
-/// the case the batched calendar-exclusions query collapses from
-/// O(schedules-with-a-calendar) to O(distinct calendars)), `RUNNING`/`PAUSED`
-/// executions for every 4th schedule's workflow (a mix that trips
-/// `at_capacity` for some `max_active_runs` values and not others), and
-/// pending-throttle rows for every 7th schedule's workflow. Pure set-based
-/// SQL, not a per-row Rust loop.
+/// Seeds `n` schedules, each with its own `workflow_name`, plus:
+///
+/// - `CALENDAR_COUNT` shared calendars. Every 10th schedule cycles through
+///   them, so several schedules share a calendar. The batched query collapses
+///   that case from O(schedules with a calendar) to O(distinct calendars).
+/// - `RUNNING`/`PAUSED` executions for every 4th schedule's workflow. This mix
+///   trips `at_capacity` for some `max_active_runs` values only.
+/// - pending-throttle rows for every 7th schedule's workflow.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_calendars (id, name, built_in, created_at, updated_at)
@@ -300,17 +294,13 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 }
 
 /// Every statement recorded for this database since the last reset, in ONE
-/// query -- deliberately not split into a filtered "aux" query followed by a
-/// separate unfiltered "everything" query. `pg_stat_statements` tracks
-/// queries *against itself* like any other statement, so a first snapshot
-/// query would become a new row a second snapshot query could then pick up,
-/// inflating whatever total is computed from the later one (Codex review, PR
-/// #1314). Querying exactly once per label and deriving both the aux-lookup
-/// subset and the whole-request total from that single result set in Rust
-/// (see [`is_aux_lookup_statement`]) avoids that self-pollution entirely.
-/// `pg_stat_statements` itself is excluded from the snapshot for the same
-/// reason -- a row for this very `SELECT` would otherwise appear in its own
-/// results.
+/// query. It is deliberately not split into an "aux" query and an "everything"
+/// query. `pg_stat_statements` tracks queries *against itself* too. So a first
+/// snapshot query becomes a row that a second one picks up, and the later total
+/// grows (PR #1314). One query per label avoids that self-pollution. Rust
+/// derives the aux subset and the total from it (see [`is_aux_lookup_statement`]).
+/// The snapshot also excludes `pg_stat_statements` itself. Otherwise this
+/// `SELECT` would appear in its own results.
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -337,12 +327,10 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 /// cannot accidentally match an unrelated statement shape (e.g. the
 /// schedule-list's own `SELECT * FROM harvest_schedules`).
 ///
-/// `to_regclass` is matched on its own: `pg_stat_statements` normalizes the
-/// literal `'harvest_start_throttle'` argument in
-/// `pending_throttle_count_for_workflow`'s existence check into a `$N`
-/// placeholder in the stored query text (constant-jumbling), so the table
-/// name itself is not present in that row's `query` column even though the
-/// row belongs to this investigation.
+/// `to_regclass` is matched on its own. `pg_stat_statements` replaces the
+/// literal `'harvest_start_throttle'` argument of the existence check in
+/// `pending_throttle_count_for_workflow` with a `$N` placeholder
+/// (constant-jumbling). So the table name is not in that row's `query` column.
 fn is_aux_lookup_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     (q.contains("harvest_workflow_executions") && q.contains("workflow_name"))
@@ -399,9 +387,8 @@ async fn zz_capture_schedule_overdue_aux_perf_evidence() {
         "every seeded schedule must appear in the list"
     );
 
-    // ONE snapshot query for both views below -- see `snapshot_statements`'s
-    // doc comment for why a second query against `pg_stat_statements` here
-    // would pollute whatever total is computed from it.
+    // ONE snapshot query for both views. `snapshot_statements` says why a
+    // second query would pollute the total.
     let all_rows = snapshot_statements(&mut stats_conn, &db_name).await;
     let stats_rows: Vec<&StatRow> = all_rows
         .iter()
@@ -499,10 +486,8 @@ async fn zz_capture_schedule_overdue_aux_perf_evidence() {
 
 // ── Equivalence: batched functions vs. the original per-item functions ─────
 
-/// Loads every schedule row directly (bypassing the HTTP layer) so the
-/// equivalence tests below can compute both the "before" (per-item, looped)
-/// and "after" (batched) aux values against the identical fixture in the
-/// identical run.
+/// Loads every schedule row directly, without the HTTP layer. The equivalence
+/// tests compute the per-item and the batched aux values from it.
 async fn load_all_schedules(conn: &mut AsyncPgConnection) -> Vec<HarvestSchedule> {
     use autumn_harvest::schema::harvest_schedules;
     harvest_schedules::table
@@ -512,17 +497,15 @@ async fn load_all_schedules(conn: &mut AsyncPgConnection) -> Vec<HarvestSchedule
         .expect("load schedules")
 }
 
-/// Proves `schedule_running_basis_batch` is exactly equivalent to calling the
-/// original, unmodified `schedule_running_basis` once per schedule: same
-/// fixture, same connection, same run. A moderate-scale fixture (60
-/// schedules -- enough distinct names, running populations and throttle rows
-/// to be non-trivial) so this runs fast enough to stay in the default suite,
-/// unlike the 500-row evidence capture above.
+/// Proves `schedule_running_basis_batch` equals the original
+/// `schedule_running_basis` called once per schedule, on the same fixture and
+/// connection. The 60-schedule fixture is non-trivial but fast enough for the
+/// default suite.
 ///
-/// Keyed by schedule id rather than name (issue #1160): `schedule_running_basis`
-/// gained a `schedule_id`-scoped disjunct so a cross-type continue-as-new
-/// successor counts toward its schedule's `max_active_runs` too, so the batch
-/// form's result is no longer just a function of `name` alone.
+/// Keyed by schedule id, not name (issue #1160). `schedule_running_basis` has a
+/// `schedule_id`-scoped disjunct. A cross-type continue-as-new successor then
+/// counts toward its schedule's `max_active_runs`. So the result is no longer a
+/// function of `name` alone.
 #[tokio::test]
 async fn schedule_running_basis_batch_matches_per_schedule_loop() {
     const N: i64 = 60;
@@ -666,10 +649,9 @@ async fn schedule_running_basis_counts_a_cross_type_successor_additively() {
 }
 
 /// Proves `resolve_effective_fire_at_pure`, fed the batched
-/// `load_exclusions_for_calendars` result, is exactly equivalent to calling
-/// the original, unmodified `resolve_effective_fire_at` once per schedule --
-/// including the schedules with no calendar at all (both must agree on
-/// `None` without ever touching the exclusions map).
+/// `load_exclusions_for_calendars` result, equals the original
+/// `resolve_effective_fire_at` called once per schedule. That includes
+/// schedules with no calendar. Both must agree on `None` for them.
 #[tokio::test]
 async fn resolve_effective_fire_at_pure_matches_resolve_effective_fire_at() {
     const N: i64 = 60;

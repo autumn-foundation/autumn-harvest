@@ -160,9 +160,9 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-// A `conflict_policy = terminate_existing` request (with ANY reuse policy)
-// resolves to `Terminate` — it can cancel a live RUNNING/PAUSED prior — so it is
-// admin-gated exactly like `terminate_if_running` with the default conflict.
+// `conflict_policy = terminate_existing`, with ANY reuse policy, resolves to
+// `Terminate`. It can cancel a live RUNNING/PAUSED prior. So it is admin-gated
+// like `terminate_if_running` with the default conflict.
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_terminate_existing_conflict_is_blocked() {
     let app = unauthenticated_app();
@@ -176,12 +176,12 @@ async fn eris_unauthenticated_start_workflow_terminate_existing_conflict_is_bloc
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-// Narrowing proof (issue #685): the flagship non-admin idempotent-starter shape
+// Narrowing proof (issue #685): the non-admin idempotent-starter shape
 // `reuse = terminate_if_running` + `conflict = use_existing` resolves to
-// `Attach` (return the existing handle) and provably CANNOT cancel a live run,
-// so it must NOT be admin-gated — it is allowed through the auth gate (and then
-// fails later for an unrelated boot-window reason, exactly like every other
-// "allowed through" eris start case, so we assert only "not blocked by auth").
+// `Attach`. It returns the existing handle and CANNOT cancel a live run. So it
+// is NOT admin-gated. It passes the auth gate, then fails for an unrelated
+// boot-window reason. Like each other "allowed through" case, the test asserts
+// only "not blocked by auth".
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_use_existing_is_allowed() {
     let app = unauthenticated_app();
@@ -197,8 +197,8 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_use_exist
 }
 
 // Narrowing proof: `reuse = terminate_if_running` + `conflict = fail` resolves to
-// `Fail` (`Err(AlreadyExists)` over a live prior) — it touches no live work — so
-// it is likewise NOT admin-gated.
+// `Fail` (`Err(AlreadyExists)` over a live prior). It touches no live work, so
+// it is NOT admin-gated either.
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_fail_is_allowed() {
     let app = unauthenticated_app();
@@ -230,19 +230,18 @@ async fn eris_unauthenticated_start_workflow_use_existing_conflict_is_allowed() 
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
 
-// issue #685 review (Codex P2): the early cancel-capable admin gate must NOT
-// pre-empt a request that carries an idempotency key. The #808 committed-replay
-// claim is keyed on `(workflow_name, idempotency_key)` ALONE — independent of the
-// reuse/conflict policy and the caller's auth — so an ADMIN may legitimately have
-// committed a keyed `terminate_if_running` start that a later NON-admin retry
-// (same key) must replay as a `200`, not a `401`. A keyed cancel-capable request
-// therefore defers past the early gate to the downstream path. In this no-DB
-// harness the downstream path fails-closed at the runtime-not-started check (a
-// non-`401` status), which is exactly the "no longer early-`401`'d" proof: the
-// UNKEYED `terminate_if_running` case above asserts `401`, this KEYED case must
-// NOT. (A genuinely-fresh keyed `Terminate` by a non-admin is still `401`'d
-// downstream by the authoritative gate, which runs AFTER the committed-replay
-// probe — that requires a DB and is covered by the #808 integration tests.)
+// Issue #685: the early cancel-capable admin gate must NOT pre-empt a request
+// with an idempotency key. The #808 committed-replay claim is keyed on
+// `(workflow_name, idempotency_key)` ALONE. It ignores the reuse/conflict
+// policy and the caller's auth. So an ADMIN can commit a keyed
+// `terminate_if_running` start. A later NON-admin retry with the same key must
+// replay it as a `200`, not a `401`. So a keyed cancel-capable request defers
+// past the early gate. In this no-DB harness, the downstream path fails closed
+// at the runtime-not-started check, with a non-`401` status. The UNKEYED case
+// above asserts `401`; this KEYED case must NOT. A fresh keyed `Terminate` by a
+// non-admin still gets `401` from the authoritative gate downstream. That gate
+// runs AFTER the committed-replay probe. The #808 integration tests cover it
+// with a DB.
 #[tokio::test]
 async fn eris_keyed_terminate_if_running_defers_past_early_gate() {
     let app = unauthenticated_app();
@@ -384,14 +383,13 @@ async fn eris_unauthenticated_queue_resume_is_blocked() {
 }
 
 /// Issue #807: pausing dispatch for an activity TYPE is a fleet-wide kill
-/// switch for that downstream — the most surgical, and therefore the most
-/// reachable-for, of the hold controls. It must be admin-gated and audited,
-/// never reachable unauthenticated.
+/// switch for that downstream. It is the most surgical hold control, so
+/// operators reach for it most. It must be admin-gated and audited.
 ///
-/// The body is deliberately optional on this route (containment must not wait
-/// on paperwork), which makes it the easiest of the mutations to fire
-/// accidentally — a bare POST is a valid hold — so the gate matters more here,
-/// not less. Both cases below send a body-free POST for exactly that reason.
+/// The body is deliberately optional, because containment must not wait on
+/// paperwork. A bare POST is a valid hold, so this mutation is the easiest to
+/// fire by accident. The gate matters more here. Both cases send a body-free
+/// POST for that reason.
 #[tokio::test]
 async fn eris_unauthenticated_activity_pause_is_blocked() {
     let app = unauthenticated_app();
@@ -412,12 +410,11 @@ async fn eris_unauthenticated_activity_resume_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Issue #807: unlike the queue-pause sibling, whose paused-queue list is an
-/// ungated read, BOTH activity reads are admin-gated — they surface
-/// operator-authored hold reasons (free text written mid-incident) and the full
-/// shape of the registered activity catalogue, which is a map of the fleet's
-/// downstream dependencies. Pinned so the gate cannot be dropped by someone
-/// pattern-matching on the queue sibling.
+/// Issue #807: the paused-queue list is an ungated read, but BOTH activity
+/// reads are admin-gated. They show operator-authored hold reasons, free text
+/// written mid-incident. They also show the registered activity catalogue, a map
+/// of the fleet's downstream dependencies. The pin stops someone who copies the
+/// queue sibling from dropping the gate.
 #[tokio::test]
 async fn eris_unauthenticated_activity_list_is_blocked() {
     let app = unauthenticated_app();
@@ -434,9 +431,9 @@ async fn eris_unauthenticated_activity_get_is_blocked() {
 
 #[tokio::test]
 async fn eris_unauthenticated_workflow_logs_is_blocked() {
-    // Durable per-execution author log lines (issue #790): admin-only read —
-    // a log message is free-form author text that routinely carries business
-    // detail, so it takes the /awaitables posture, not the execution-row one.
+    // Durable per-execution author log lines (issue #790) are an admin-only
+    // read. A log message is free-form author text that often carries business
+    // detail. So it takes the /awaitables posture, not the execution-row one.
     let app = unauthenticated_app();
     let res = app
         .oneshot(get("/workflows/00000000-0000-0000-0000-000000000001/logs"))
@@ -1115,14 +1112,12 @@ async fn eris_require_auth_blocks_trigger_schedule() {
 
 // ── TTL'd runtime pacing overrides (issue #945) — admin-gated ────────────────
 //
-// All five pacing-override routes (2 rate-limit, 2 start-throttle, plus the
-// read-only start-throttle-override lookup) carry `require_admin` at the
-// route-registration site (`api.rs`'s `harvest_api_router`). Mirroring every
-// other admin route in this file, an unauthenticated request never even
-// reaches that per-route gate — `RequireAuth`, wrapping the whole router,
-// already rejects it with 401 first. This proves the pacing-override routes
-// are wired into the SAME auth chain as every other admin-gated route, not
-// silently left unauthenticated.
+// All five pacing-override routes carry `require_admin` in `api.rs`'s
+// `harvest_api_router`: 2 rate-limit, 2 start-throttle, and the read-only
+// start-throttle-override lookup. An unauthenticated request never reaches that
+// gate. `RequireAuth` wraps the whole router and rejects it with 401 first.
+// These tests prove the routes are in the SAME auth chain as each other
+// admin-gated route.
 
 #[tokio::test]
 async fn eris_require_auth_blocks_set_rate_limit_override() {
@@ -1182,14 +1177,14 @@ async fn eris_require_auth_blocks_get_start_throttle_override() {
 
 // ── Read-only operator role (issue #776) ──────────────────────────────────────
 //
-// Headline success-metric test (AC1/AC2, no DB): a synthetic router mounts a
-// trivial 200-OK handler at EVERY autumn_harvest::audit::CLASSIFIED_ROUTES
-// (method, path), wraps it in the read-only class-enforcement layer, and drives
-// it with a read-only Session. Every Mutating route → 403; every
-// ReadOnly/PublicSafe route → 200 (reaches the trivial handler). The success
-// metric — "0 of N mutation routes reachable, N of N read routes reachable" —
-// is asserted explicitly. Using URI-path matching (not MatchedPath) makes a
-// top-level synthetic router faithful to nested production.
+// Headline success-metric test (AC1/AC2, no DB). A synthetic router mounts a
+// 200-OK handler at EVERY (method, path) of
+// `autumn_harvest::audit::CLASSIFIED_ROUTES`. The read-only class-enforcement
+// layer wraps it, and a read-only Session drives it. Every Mutating route →
+// 403; every ReadOnly/PublicSafe route → 200. The test asserts the metric "0 of
+// N mutation routes reachable, N of N read routes reachable". The layer matches
+// the URI path, not `MatchedPath`. So a top-level synthetic router is faithful
+// to nested production.
 
 use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
 use autumn_harvest_plugin::api::enforce_read_only_class;
@@ -1351,9 +1346,9 @@ async fn eris_readonly_principal_reaches_all_reads_and_no_mutations() {
 
 #[tokio::test]
 async fn eris_readonly_post_for_body_read_routes_are_reachable() {
-    // The two ReadOnly routes that use POST (query, retire) and the POST
-    // preview must be reachable (200) by a read-only principal — enforcement is
-    // keyed on the class table, never the HTTP verb.
+    // A read-only principal reaches (200) the two ReadOnly POST routes (query,
+    // retire) and the POST preview. Enforcement uses the class table, never the
+    // HTTP verb.
     let app = synthetic_enforced_router();
     for concrete in [
         "/workflows/zzztestparam0/query/zzztestparam1",
@@ -1378,9 +1373,9 @@ async fn eris_readonly_post_for_body_read_routes_are_reachable() {
 
 #[tokio::test]
 async fn eris_unmarked_and_admin_principals_are_not_verb_restricted() {
-    // AC6-adjacent: a principal with no read-only marker (or an admin) is never
-    // denied by the class layer, even on Mutating routes — the read-only
-    // restriction is opt-in per-principal.
+    // AC6-adjacent: the class layer never denies a principal with no read-only
+    // marker, or an admin, even on Mutating routes. The read-only restriction is
+    // opt-in per principal.
     let app = synthetic_enforced_router();
     let mutating = "/workflows/zzztestparam0/cancel";
 
@@ -1415,21 +1410,23 @@ async fn eris_unmarked_and_admin_principals_are_not_verb_restricted() {
     assert_eq!(admin, StatusCode::OK, "admin reaches handler");
 }
 
-// H2 (issue #776): the headline synthetic test proves the class layer's verb
-// decision, but not the *production wiring* the whole feature rests on — the
-// enforce layer sitting INSIDE the `/api/harvest` nest (so it sees the
-// mount-stripped path), and the `admin_auth_boundary=true` reconciliation that
-// lets a read-only principal reach the ~15 `require_admin`-carrying ReadOnly
-// routes (and the SSE stream's in-handler admin check). This test reproduces
-// that wiring against the REAL `harvest_api_router` and drives full
-// `/api/harvest/...` paths through the nest.
+// Issue #776: the headline synthetic test proves the class layer's verb
+// decision. It does not prove the *production wiring* of the feature:
+//
+// - the enforce layer sits INSIDE the `/api/harvest` nest, so it sees the
+//   mount-stripped path;
+// - `admin_auth_boundary=true` lets a read-only principal reach the ~15
+//   `require_admin` ReadOnly routes and the SSE stream's in-handler check.
+//
+// This test reproduces that wiring with the REAL `harvest_api_router`. It drives
+// full `/api/harvest/...` paths through the nest.
 
 use autumn_web::reexports::axum::middleware::Next;
 
-/// Reproduce the `api_with_role_auth` production mount: the real
-/// `harvest_api_router` with `admin_auth_boundary=true`, the class layer
-/// installed (when `with_enforce`), an embedder auth middleware that tags the
-/// Session `role`, and the whole thing nested under `/api/harvest`.
+/// Reproduce the `api_with_role_auth` production mount. The real
+/// `harvest_api_router` runs with `admin_auth_boundary=true` and, when
+/// `with_enforce`, the class layer. An embedder auth middleware tags the Session
+/// `role`. The whole router nests under `/api/harvest`.
 fn role_auth_nested_app(role: &'static str, with_enforce: bool) -> Router {
     let api_state = HarvestApiState::new();
     // `api_with_role_auth` → `api_with_auth` sets `admin_auth_boundary=true`,
@@ -1440,9 +1437,9 @@ fn role_auth_nested_app(role: &'static str, with_enforce: bool) -> Router {
     if with_enforce {
         router = router.layer(from_fn(enforce_read_only_class));
     }
-    // Embedder auth middleware: authenticate + tag the Session. Applied LAST so
-    // it is the outermost layer (runs first) and populates the Session
-    // extension before the enforce layer reads it — the exact production order.
+    // Embedder auth middleware: authenticate + tag the Session. Applied LAST, so
+    // it runs first and sets the Session before the enforce layer reads it. That
+    // is the production order.
     router = router.layer(from_fn(
         move |mut req: Request<Body>, next: Next| async move {
             let mut d = HashMap::new();
@@ -1474,9 +1471,9 @@ async fn eris_readonly_role_auth_reaches_admin_reads_and_403s_mutations_through_
     let ro = role_auth_nested_app("harvest_readonly", true);
 
     // A read-only principal REACHES an admin-gated ReadOnly route through the
-    // nest (require_admin is a no-op under the boundary): NOT 401 (auth passed),
-    // NOT 403 (class layer allowed the read). A 5xx/400 from the handler
-    // (no runtime installed) proves the request reached it.
+    // nest, because `require_admin` is a no-op under the boundary. Not 401: auth
+    // passed. Not 403: the class layer allowed the read. A 5xx/400 from the
+    // handler (no runtime) proves the request reached it.
     for path in ["/api/harvest/admin/config", "/api/harvest/admin/status"] {
         let (status, _) = drive_nested(&ro, Method::GET, path).await;
         assert_ne!(
@@ -1491,12 +1488,11 @@ async fn eris_readonly_role_auth_reaches_admin_reads_and_403s_mutations_through_
         );
     }
 
-    // The SSE event stream (ReadOnly, admin-gated + an in-handler admin check)
-    // is reachable by a read-only principal. A valid uuid gets past the id
-    // parse to the in-handler admin gate, which passes under the boundary; the
-    // stream then fails closed on the missing runtime. Timeout-guarded so a
-    // (theoretical) DB connect cannot hang the test — a timeout still proves the
-    // request passed auth (a 401/403 returns immediately).
+    // A read-only principal reaches the SSE event stream (ReadOnly, admin-gated,
+    // with an in-handler admin check). A valid uuid passes the id parse. The
+    // in-handler gate passes under the boundary. The stream then fails closed on
+    // the missing runtime. The timeout stops a DB connect from hanging the test.
+    // A timeout still proves auth passed, because a 401/403 returns at once.
     let sse = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         drive_nested(
@@ -1519,9 +1515,9 @@ async fn eris_readonly_role_auth_reaches_admin_reads_and_403s_mutations_through_
         );
     }
 
-    // A read-only principal is 403'd on a real Mutating route THROUGH THE NEST —
-    // proving the layer sees the mount-stripped path and produces the
-    // distinguishable read-only-denial body.
+    // A read-only principal gets 403 on a real Mutating route THROUGH THE NEST.
+    // So the layer sees the mount-stripped path and gives the read-only-denial
+    // body.
     let (mstatus, mbody) =
         drive_nested(&ro, Method::POST, "/api/harvest/workflows/exec-1/cancel").await;
     assert_eq!(
@@ -1568,14 +1564,13 @@ async fn eris_role_auth_off_leaves_the_router_unchanged_through_the_nest() {
 
 #[tokio::test]
 async fn eris_readonly_denial_body_is_distinguishable() {
-    // AC7 observability: a denied mutation is a 403 with a distinguishable body
-    // marker, so a probing/misconfigured client is diagnosable. The layer also
-    // emits `tracing::warn!(method, path, "...denied mutation (403)")` on every
-    // denial (verified in `enforce_read_only_class`); that warn is deliberately
-    // NOT asserted here — capturing it in this parallel test binary is
-    // unreliable (`tracing` caches callsite interest globally, and sibling
-    // tests hit the same callsite with no subscriber active, poisoning it), so
-    // this stable body marker is the pinned distinguishability signal.
+    // AC7 observability: a denied mutation is a 403 with a distinct body marker.
+    // So a probing or misconfigured client is diagnosable. The layer also emits
+    // `tracing::warn!(method, path, "...denied mutation (403)")` on each denial
+    // (see `enforce_read_only_class`). The test deliberately does NOT assert
+    // that warn. `tracing` caches callsite interest globally. Sibling tests hit
+    // the callsite with no subscriber and poison it. So the stable body marker
+    // is the pinned signal.
     let app = synthetic_enforced_router();
     let mut req = Request::builder()
         .method(Method::POST)
@@ -1639,11 +1634,10 @@ async fn eris_readonly_denied_on_unclassified_ui_path_through_the_layer() {
 
 #[tokio::test]
 async fn eris_readonly_options_preflight_is_not_denied() {
-    // F3: OPTIONS is a preflight/metadata verb, never a mutation. A read-only
-    // principal's OPTIONS request (even to a Mutating route's path) must NOT be
-    // 403'd by the layer. (The synthetic router has no OPTIONS handler, so it
-    // routes to 405 — the point is that the layer let it THROUGH rather than
-    // fail-closing it to 403.)
+    // OPTIONS is a preflight/metadata verb, never a mutation. The layer must
+    // NOT give 403 to a read-only OPTIONS request, even on a Mutating path. The
+    // synthetic router has no OPTIONS handler, so it gives 405. That shows the
+    // layer let the request THROUGH.
     let app = synthetic_enforced_router();
     let status = status_for(
         &app,
@@ -1663,9 +1657,9 @@ async fn eris_readonly_options_preflight_is_not_denied() {
 //
 // No-DB tests of the token verification/scope layer wired via
 // `from_fn_with_state`. Pass-through paths (absent/non-`hvst_` bearer, OPTIONS)
-// never touch the pool, so they hold without a database; a claimed `hvst_`
-// bearer with no store available must NOT pass through (503), proving a claimed
-// token is never trusted unverified.
+// never touch the pool, so they hold without a database. A claimed `hvst_`
+// bearer with no store must NOT pass through (503). So an unverified token is
+// never trusted.
 
 use autumn_harvest_plugin::api_token::enforce_token_scope;
 use autumn_web::reexports::axum::middleware::from_fn_with_state;
@@ -1691,11 +1685,10 @@ fn get_bearer(uri: &str, bearer: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn token_layer_passes_through_absent_bearer() {
-    // AC7: no bearer → the token layer is a pass-through (embedder/session
-    // governs). A read route stays reachable. `/health` is used (not
-    // `/workflows`) because the no-pool test rig makes `/workflows` fail-closed
-    // to 503 downstream (issue #756), which is orthogonal to — and would mask —
-    // the token layer's pass-through behavior under test.
+    // AC7: with no bearer, the token layer passes through and the
+    // embedder/session governs. A read route stays reachable. The test uses
+    // `/health`, not `/workflows`. With no pool, `/workflows` fails closed to
+    // 503 downstream (issue #756). That would mask the pass-through.
     let app = token_layer_app();
     let res = app.oneshot(get("/health")).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
@@ -1735,9 +1728,9 @@ async fn token_layer_passes_through_options_preflight() {
 
 #[tokio::test]
 async fn token_layer_rejects_hvst_bearer_when_store_unavailable() {
-    // A claimed hvst_ token that cannot be verified (no pool installed) must NOT
-    // pass through — under the admin boundary that would be an auth bypass. It
-    // is rejected 503 (service unavailable), not silently trusted.
+    // A claimed `hvst_` token that cannot be verified (no pool) must NOT pass
+    // through. Under the admin boundary, a pass-through is an auth bypass. It
+    // gets 503.
     let app = token_layer_app();
     let res = app
         .oneshot(get_bearer("/workflows", "hvst_someclaimedtoken"))
@@ -1749,11 +1742,9 @@ async fn token_layer_rejects_hvst_bearer_when_store_unavailable() {
 #[tokio::test]
 async fn embedder_only_router_has_no_token_layer() {
     // AC7: the default router (no `enable_api_tokens`) is byte-identical to
-    // trunk. A hvst_-looking bearer is meaningless to it — it is passed through
-    // untouched (no token layer to interpret it), reaching the handler.
-    // `/health` is used (not `/workflows`) because the no-pool test rig makes
-    // `/workflows` fail-closed to 503 downstream (issue #756), independent of
-    // the token layer whose absence is what this test asserts.
+    // trunk. With no token layer, an `hvst_` bearer passes through untouched
+    // to the handler. The test uses `/health`, not `/workflows`. With no pool,
+    // `/workflows` fails closed to 503 downstream (issue #756).
     let app = unauthenticated_app();
     let res = app
         .oneshot(get_bearer("/health", "hvst_ignored_here"))
@@ -1764,20 +1755,19 @@ async fn embedder_only_router_has_no_token_layer() {
     assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
-/// Issue #944 review: the connector's derived idempotency keys must be
-/// unclaimable from outside.
+/// Issue #944: the connector's derived idempotency keys must be unclaimable
+/// from outside.
 ///
-/// A `SignalsWithStart` binding derives its key into the same
+/// A `SignalsWithStart` binding derives its key into the
 /// `(workflow_exec_id, idempotency_key)` scope on `harvest_signals` that this
-/// route writes, and derived keys are *predictable* — Kafka coordinates are
-/// `{topic}:{partition}:{offset}`. A caller who landed one first would make
-/// the broker's own delivery read as an idempotent replay and be acknowledged
-/// without ever dispatching its payload: silent loss.
+/// route writes. Derived keys are *predictable*: Kafka coordinates are
+/// `{topic}:{partition}:{offset}`. A caller who lands one first turns the
+/// broker's delivery into an idempotent replay. It is acknowledged but never
+/// dispatched: silent loss.
 ///
-/// Driven through the real router with no storage configured, which is exactly
-/// what proves the guard runs at the request boundary rather than somewhere
-/// behind a database read. The body is asserted, not just the status, so this
-/// cannot pass for an unrelated 400.
+/// The real router runs with no storage configured. That proves the guard runs
+/// at the request boundary, not behind a database read. The test asserts the
+/// body too, so an unrelated 400 cannot pass it.
 #[tokio::test]
 async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_route() {
     let app = unauthenticated_app();
@@ -1804,10 +1794,10 @@ async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_rout
     );
 }
 
-/// The guard must not over-reject: a key that merely resembles the reserved
-/// prefix cannot alias a derived one, so it has to get past the boundary.
-/// `CONN:` differs from `conn:` under the Postgres text comparison backing the
-/// uniqueness scope, so refusing it would reject a legitimate caller key.
+/// The guard must not over-reject. A key that only resembles the reserved
+/// prefix cannot alias a derived one, so it gets past the boundary. The
+/// uniqueness scope uses Postgres text comparison, where `CONN:` differs from
+/// `conn:`. So refusing it would reject a legitimate caller key.
 #[tokio::test]
 async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
     for key in ["CONN:x", "conn", "connector-key", "xconn:y"] {
@@ -1923,13 +1913,12 @@ async fn a_valid_promise_settlement_passes_the_request_boundary() {
 
 // ── Audit export to a SIEM sink (issue #953) ─────────────────────────────────
 //
-// Both routes must sit in the SAME auth chain as every other admin-gated
-// route. `GET /admin/audit-export` reports the completeness posture of the
-// privileged-action log, which is exactly what an attacker would want to read
-// before acting; `POST .../redrive` mutates a compliance cursor. Neither may
-// be reachable unauthenticated, and the assertion is on `401` specifically —
-// a `404`/`405` here would mean the route is not registered at all and the
-// test would be passing for the wrong reason.
+// Both routes must sit in the SAME auth chain as each other admin-gated route.
+// `GET /admin/audit-export` reports the completeness of the privileged-action
+// log, which an attacker wants to read before acting. `POST .../redrive`
+// mutates a compliance cursor. The assertion is on `401` specifically. A
+// `404`/`405` means the route is not registered, and the test passes for the
+// wrong reason.
 
 #[tokio::test]
 async fn eris_require_auth_blocks_audit_export_status() {
@@ -1989,21 +1978,20 @@ async fn eris_require_auth_blocks_audit_export_reactivate() {
 //   cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
 //
 // — is a bare `reqwest` GET with no cookie, no bearer token and no session. In
-// the `dev` profile it must reach `GET /admin/preflight` rather than 401, which
-// is what `set_deployment_profile`'s own contract has always promised ("`dev`
-// allows an unauthenticated local management API").
+// the `dev` profile it must reach `GET /admin/preflight`, not 401.
+// `set_deployment_profile` promises that ("`dev` allows an unauthenticated
+// local management API").
 //
 // Two request shapes both have to work, and they are NOT the same shape:
 //
-//   1. NO `Session` extension at all. This is what a standalone integration
-//      that mounts `harvest_api_router` directly (with no autumn-web session
-//      layer) produces — and what these tests produce by default.
-//   2. A FRESH, NON-COOKIE-BACKED `Session`. This is what the real quickstart
-//      app produces. autumn-web installs its session layer unconditionally, and
-//      that layer mints an empty session for a request that carries no valid
-//      cookie and inserts it into the extensions — so the quickstart's CLI call
-//      arrives as `Some(session)`, not `None`. A fix that only handles shape 1
-//      passes here and still 401s in the quickstart.
+//   1. NO `Session` extension at all. A standalone integration that mounts
+//      `harvest_api_router` with no autumn-web session layer produces this.
+//      These tests produce it by default.
+//   2. A FRESH, NON-COOKIE-BACKED `Session`. The real quickstart app produces
+//      this. autumn-web always installs its session layer. That layer mints an
+//      empty session for a request with no valid cookie. So the quickstart's
+//      CLI call arrives as `Some(session)`, not `None`. A fix for shape 1 only
+//      passes here and still gives 401 in the quickstart.
 //
 // The widening is bounded on three sides, each pinned below: `dev` only,
 // no-established-session only, and an embedder-declared boundary still wins.
@@ -2078,10 +2066,10 @@ async fn hermes_dev_profile_admits_second_admin_route_when_unauthenticated() {
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
 
-/// AC3: an ESTABLISHED (cookie-backed) session is still judged by the
-/// configured session key in `dev`. The widening is for callers who presented
-/// no credential at all — it does not delete `set_admin_auth_session_key`'s
-/// meaning for an embedder running its own auth middleware.
+/// AC3: in `dev`, the configured session key still judges an ESTABLISHED
+/// (cookie-backed) session. The widening is for callers with no credential.
+/// `set_admin_auth_session_key` keeps its meaning for an embedder's own auth
+/// middleware.
 #[tokio::test]
 async fn hermes_dev_profile_still_requires_configured_key_for_established_session() {
     let api_state = HarvestApiState::new();

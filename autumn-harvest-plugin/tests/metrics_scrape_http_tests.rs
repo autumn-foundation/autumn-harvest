@@ -7,16 +7,15 @@
 //! happens synchronously inside `Plugin::build` -- only the `on_startup`
 //! hook that installs the live Harvest runtime needs Postgres.
 //!
-//! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here for the same
-//! reason `mcp_tools_http_tests.rs` cannot use it -- `TestApp` replays
-//! plugin startup hooks and `start_harvest_runtime` requires a live
-//! Postgres. This suite reproduces exactly the metrics-source-registration
-//! half of `HarvestPlugin::build` through a tiny local `Plugin`, so the real
-//! autumn-web rendering pipeline (HELP/TYPE lines, label sorting/escaping,
-//! dedup-by-family-name) is exercised end to end without a database. The
-//! full plugin-wired flow (a live workflow run driving the same recorder
-//! through `HarvestBuilder::telemetry`) is covered by the runnable example
-//! `examples/metrics_scrape_quickstart.rs`.
+//! NOTE: `TestApp::plugin(HarvestPlugin)` does not work here, as in
+//! `mcp_tools_http_tests.rs`. `TestApp` replays plugin startup hooks, and
+//! `start_harvest_runtime` requires a live Postgres. This suite reproduces
+//! the metrics-source-registration half of `HarvestPlugin::build` through a
+//! tiny local `Plugin`. So the real autumn-web rendering pipeline (HELP/TYPE
+//! lines, label sorting/escaping, dedup-by-family-name) runs end to end
+//! without a database. The runnable example `examples/metrics_scrape_quickstart.rs`
+//! covers the full plugin-wired flow, where a live workflow run drives the
+//! same recorder through `HarvestBuilder::telemetry`.
 
 #![cfg(feature = "metrics")]
 
@@ -124,17 +123,16 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
         assert!(body.contains(expected), "missing `{expected}` in:\n{body}");
     }
 
-    // Cardinality rule (issue #355 AC2): no execution.id label ever appears
-    // -- the `MetricsRecorder` methods this recorder implements never
-    // accept one, so this also guards against a future accidental addition.
+    // Cardinality rule (issue #355 AC2): no execution.id label ever appears.
+    // The `MetricsRecorder` methods never accept one, so this also guards
+    // against a future accidental addition.
     assert!(
         !body.contains("execution.id") && !body.contains("execution_id"),
         "execution.id leaked into scrape:\n{body}"
     );
 
     // Harvest's samples coexist with the app's own built-in families on the
-    // one shared endpoint (issue #355: "one endpoint for autumn web apps
-    // and its plugins like harvest").
+    // one shared endpoint (issue #355).
     assert!(body.contains("autumn_http_requests_total"));
 }
 

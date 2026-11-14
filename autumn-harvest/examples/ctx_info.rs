@@ -4,13 +4,14 @@
 //! ## The problem
 //!
 //! A `#[workflow]` body can read its author-supplied business key
-//! (`ctx.workflow_id()`) and type (`ctx.workflow_type()`), but it could not read
-//! its system-generated `execution_id` — the exact identifier every operator
-//! tool keys on: the management-API path (`/api/harvest/workflows/{exec_id}/...`),
-//! the DLQ, reset/pause/cancel, and the ADR-0001 `execution.id` span attribute.
-//! So a workflow could log `workflow_id = "cart-42"`, but an operator paging from
-//! that log line had no run UUID to open the execution or build a correlated
-//! trace query, and authors could not mint run-scoped idempotency keys.
+//! (`ctx.workflow_id()`) and type (`ctx.workflow_type()`). But it could not read
+//! its system-generated `execution_id`. Every operator tool keys on that id: the
+//! management-API path (`/api/harvest/workflows/{exec_id}/...`), the DLQ,
+//! reset/pause/cancel, and the ADR-0001 `execution.id` span attribute.
+//! So a workflow could log `workflow_id = "cart-42"`. But an operator who paged
+//! from that log line had no run UUID to open the execution or build a
+//! correlated trace query. And authors could not mint run-scoped idempotency
+//! keys.
 //!
 //! ## The solution: `ctx.info()`
 //!
@@ -36,8 +37,8 @@
 //!
 //! - **Zero footprint** — calling `ctx.info()` appends no `harvest_events` and
 //!   emits no command (same leave-no-trace property as a query handler).
-//! - **Replay-safe** — every field is derived from already-recorded state (the
-//!   `WorkflowStarted` event and the execution row), so it returns byte-identical
+//! - **Replay-safe** — every field comes from already-recorded state: the
+//!   `WorkflowStarted` event and the execution row. So it returns byte-identical
 //!   values on every worker and every replay pass.
 //! - **No feature flag** — usable from any `#[workflow]` body.
 //! - **No new `WorkflowEvent` variant, no migration.**
@@ -113,10 +114,10 @@ fn main() {
     println!("  curl http://localhost:8080/api/harvest/workflows/{{exec_id}}");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must keep
-// building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for external consumers only with the
+// `testing` feature.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -124,9 +125,9 @@ mod tests {
     use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
     use serde_json::json;
 
-    /// The run reads its own `execution_id` into a charge idempotency key,
-    /// completes, and — because `ctx.info()` leaves no footprint — records only
-    /// the single activity's events; the recorded history replays deterministically.
+    /// The run reads its own `execution_id` into a charge idempotency key and
+    /// completes. `ctx.info()` leaves no footprint, so the run records only the
+    /// single activity's events. The recorded history replays deterministically.
     #[tokio::test]
     async fn place_order_uses_run_scoped_key_and_replays_deterministically() {
         let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -175,10 +176,10 @@ mod tests {
     }
 
     /// A run configured with a spawning parent surfaces it via
-    /// `ctx.info().parent_execution_id`; the workflow threads it into the
-    /// activity input for correlation, and it replays deterministically (the
-    /// `WorkflowTestEnv::with_parent_execution_id` value is carried through
-    /// `replay_check`).
+    /// `ctx.info().parent_execution_id`. The workflow threads it into the
+    /// activity input for correlation. It replays deterministically, because
+    /// `replay_check` carries the `WorkflowTestEnv::with_parent_execution_id`
+    /// value through.
     #[tokio::test]
     async fn parent_execution_id_is_visible_when_spawned_as_a_child() {
         let parent = ExecutionId::new();

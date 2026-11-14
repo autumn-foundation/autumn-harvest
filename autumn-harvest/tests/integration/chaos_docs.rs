@@ -3,15 +3,14 @@
 //!
 //! The doc's "point at an already-migrated local Postgres" example runs the
 //! chaos suite against a caller-supplied `HARVEST_TEST_DATABASE_URL`. Chaos
-//! tests serialise on a process-wide `DB_BODY_SERIAL` mutex and each test's
-//! `scrub()` step issues a global `TRUNCATE` against that database -- but no
-//! *other* integration-test module joins that mutex, so an unscoped
-//! `cargo test ... --test integration` (no module filter) risks a chaos
-//! test's `TRUNCATE` racing a concurrent, unrelated module's assertions
-//! against the same shared database. CI's own `.github/workflows/chaos.yml`
-//! invocation is already correctly scoped to `chaos_tests::`; these guards
-//! keep the *documentation's* worked example in permanent lockstep with it,
-//! rather than trusting a human proofread to notice the drift.
+//! tests serialise on a process-wide `DB_BODY_SERIAL` mutex. Each test's
+//! `scrub()` step issues a global `TRUNCATE` against that database. No
+//! *other* integration-test module joins that mutex. So an unscoped
+//! `cargo test ... --test integration` (no module filter) lets a chaos
+//! `TRUNCATE` race an unrelated module's assertions on the shared database.
+//! CI's own `.github/workflows/chaos.yml` invocation is scoped to
+//! `chaos_tests::`. These guards keep the doc's worked example in lockstep
+//! with it, so no human proofread has to catch the drift.
 
 use std::path::{Path, PathBuf};
 
@@ -72,17 +71,13 @@ fn bash_block_containing<'a>(doc: &'a str, needle: &str) -> &'a str {
 /// Drop every line whose trimmed content starts with `#` from a block of bash
 /// source.
 ///
-/// The doc's explanatory comment *about* the `chaos_tests::` filter contains
-/// the literal string `` chaos_tests:: `` (as prose: "Scope the run to
-/// `chaos_tests::`"), and separately the literal string
-/// `HARVEST_TEST_DATABASE_URL` (as prose: "the same `HARVEST_TEST_DATABASE_URL`
-/// database"). Checking a *whole* fenced block -- comments included -- for
-/// either token is therefore satisfiable by the prose alone: a regression
-/// that drops the filter from the actual command line, while leaving the
-/// comment describing what the command is *supposed* to do untouched, would
-/// pass an assertion that only inspects the raw block text. Stripping
-/// comment lines first makes every check below examine what the reader would
-/// actually copy-paste and run.
+/// The doc's comment *about* the `chaos_tests::` filter contains the literal
+/// `` chaos_tests:: `` as prose ("Scope the run to `chaos_tests::`"). It also
+/// contains `HARVEST_TEST_DATABASE_URL` as prose. So the prose alone can
+/// satisfy a check of a *whole* fenced block for either token. A regression
+/// could drop the filter from the command and keep the comment intact. A
+/// check of the raw block text would pass it. Stripping comment lines first
+/// makes every check examine what the reader copies and runs.
 fn strip_comment_lines(block: &str) -> String {
     block
         .lines()
@@ -94,10 +89,9 @@ fn strip_comment_lines(block: &str) -> String {
 /// Split already-comment-stripped command text into distinct commands, where
 /// one or more blank lines separate one command from the next.
 ///
-/// A backslash-continued multi-line invocation never contains a blank line
-/// internally (the shell would treat one as ending the command anyway), so
-/// splitting on blank-line runs cleanly separates the fenced block's several
-/// independent `cargo test ...` invocations from one another.
+/// A backslash-continued invocation never contains a blank line, because
+/// the shell ends the command there. So a split on blank lines separates
+/// the block's independent `cargo test ...` invocations.
 fn split_into_commands(command_only: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut current: Vec<&str> = Vec::new();
@@ -119,10 +113,9 @@ fn split_into_commands(command_only: &str) -> Vec<String> {
 
 /// The single command (from `split_into_commands`) containing `needle`.
 ///
-/// Panics naming what was searched for on zero or more-than-one matches --
-/// either would mean anchoring the check to the wrong (or an ambiguous)
-/// command, silently defeating the whole point of splitting per-command in
-/// the first place.
+/// Panics, naming the needle, on zero matches or on more than one. Either
+/// case anchors the check to a wrong or ambiguous command. That defeats
+/// the per-command split.
 fn command_containing<'a>(commands: &'a [String], needle: &str) -> &'a str {
     let matches: Vec<&str> = commands
         .iter()
@@ -156,11 +149,10 @@ fn split_into_commands_separates_on_blank_lines_and_keeps_continuations_joined()
 
 #[test]
 fn command_containing_anchors_to_the_specific_command_not_the_aggregate() {
-    // Reproduces the exact regression this helper exists to catch: a doc
-    // block with two commands, where the FIRST (unrelated) command happens
-    // to mention `chaos_tests::` while the SECOND (the one that actually
-    // matters here) does not. A whole-block/aggregated-text check would
-    // wrongly pass; anchoring to the specific command must fail.
+    // Reproduces the regression this helper catches. In a two-command block,
+    // the FIRST (unrelated) command mentions `chaos_tests::`. The SECOND
+    // command, which matters here, does not. A whole-block check wrongly
+    // passes. A check anchored to the specific command must fail.
     let commands = split_into_commands(
         "CHAOS_SEEDS=8 cargo test --test integration \\\n  chaos_tests::chaos_seeded_convergence_sweep\n\n\
          HARVEST_TEST_DATABASE_URL=postgres://x cargo test --test integration",
@@ -204,20 +196,16 @@ fn strip_comment_lines_removes_comments_but_keeps_commands() {
 fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     let doc = read_chaos_doc();
     let block = bash_block_containing(&doc, "HARVEST_TEST_DATABASE_URL");
-    // Comments stripped: checking the raw block would also pass if only the
-    // *comment describing* the filter survived while the command itself lost
-    // it -- this doc's own explanatory comment happens to contain the
-    // literal string `chaos_tests::` as prose, which would otherwise mask
-    // exactly the regression this test exists to catch.
+    // The doc's own comment contains `chaos_tests::` as prose. A check of
+    // the raw block passes if only that comment keeps the filter and the
+    // command loses it. So strip comments first.
     let command_only = strip_comment_lines(block);
     let commands = split_into_commands(&command_only);
-    // Anchor the check to the SPECIFIC command that runs against a
-    // caller-supplied database, not the whole fenced block's aggregated
-    // text. The block also contains an unrelated single-seed replay command;
-    // checking the aggregate would still pass if THAT command happened to
-    // mention `chaos_tests::` while the HARVEST_TEST_DATABASE_URL command
-    // itself lost its filter -- exactly the unsafe-unscoped-command
-    // regression this guard exists to catch.
+    // Anchor to the SPECIFIC command that runs against a caller-supplied
+    // database. The block also holds an unrelated single-seed replay command.
+    // A check of the whole block passes if THAT command mentions
+    // `chaos_tests::` and the HARVEST_TEST_DATABASE_URL command lost its
+    // filter.
     let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
 
     assert!(
@@ -233,11 +221,9 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
          full block:\n{block}"
     );
 
-    // The whole `integration` binary must never be recommended unscoped
-    // against a shared, caller-supplied database -- guard against a
-    // regression that drops the filter token while leaving the rest of the
-    // invocation's shape untouched (e.g. a rewrite that renames the binary
-    // flag but forgets to re-attach the module filter).
+    // The doc must never recommend the whole `integration` binary unscoped
+    // against a shared database. This catches a rewrite that renames the
+    // binary flag but drops the module filter.
     assert!(
         local_db_command.contains("--test integration"),
         "expected the HARVEST_TEST_DATABASE_URL command specifically to \
@@ -406,11 +392,11 @@ fn extract_filter_argument_reads_the_token_past_a_line_continuation() {
 #[test]
 #[should_panic(expected = "no filter argument follows")]
 fn extract_filter_argument_panics_on_a_bare_newline_with_no_continuation_backslash() {
-    // Codex finding on PR #1474: a bare newline ends a shell command. If
-    // the doc's example ever drops its continuation backslash, the real
-    // invocation runs unfiltered. This guard must not treat that dropped
-    // backslash as ordinary whitespace and quietly extract a filter that
-    // could never actually run.
+    // PR #1474: a bare newline ends a shell command. If the doc's example
+    // ever drops its continuation backslash, the real invocation runs
+    // unfiltered. This guard must not treat that dropped backslash as
+    // ordinary whitespace and quietly extract a filter that could never
+    // actually run.
     let command = "cargo test --features chaos --test integration \n  chaos_tests::";
     extract_filter_argument(command);
 }
@@ -418,21 +404,21 @@ fn extract_filter_argument_panics_on_a_bare_newline_with_no_continuation_backsla
 #[test]
 #[should_panic(expected = "command has no")]
 fn extract_filter_argument_requires_a_boundary_before_the_flag() {
-    // Codex finding on PR #1474: a missing space could glue the flag
-    // onto a preceding token, e.g. `test--test integration`. That is
-    // one malformed shell argument, not a real `--test` flag. The guard
-    // must not accept it just because a boundary follows the match.
+    // PR #1474: a missing space could glue the flag onto a preceding
+    // token, e.g. `test--test integration`. That is one malformed shell
+    // argument, not a real `--test` flag. The guard must not accept it
+    // just because a boundary follows the match.
     extract_filter_argument("cargo test--test integration chaos_tests::");
 }
 
 #[test]
 #[should_panic(expected = "command has no")]
 fn extract_filter_argument_rejects_a_lone_backslash_glued_to_the_flag() {
-    // Codex finding on PR #1474: if a doc continuation after `cargo
-    // test\` loses only its trailing newline, the source becomes `cargo
-    // test\--test integration ...`. Bash never treats a lone `\` as a
-    // separator, only `\` immediately followed by a newline. The guard
-    // must not accept the stray backslash as a boundary either.
+    // PR #1474: if a doc continuation after `cargo test\` loses only its
+    // trailing newline, the source becomes `cargo test\--test integration
+    // ...`. Bash never treats a lone `\` as a separator, only `\`
+    // immediately followed by a newline. The guard must not accept the
+    // stray backslash as a boundary either.
     extract_filter_argument("cargo test\\--test integration chaos_tests::");
 }
 
@@ -454,22 +440,22 @@ fn extract_filter_argument_panics_when_nothing_follows_the_flag() {
 #[test]
 #[should_panic(expected = "command has no")]
 fn extract_filter_argument_ignores_a_same_prefix_longer_target_name() {
-    // Codex finding on PR #1474: `--test integration` is a substring of
-    // `--test integration_tests`, a different, valid cargo target name.
-    // A plain `command.find` would match that prefix and misread
-    // `_tests` as the filter. The guard requires a token boundary, so no
-    // real `--test integration` flag is found here.
+    // PR #1474: `--test integration` is a substring of `--test
+    // integration_tests`, a different, valid cargo target name. A plain
+    // `command.find` would match that prefix and misread `_tests` as the
+    // filter. The guard requires a token boundary, so no real `--test
+    // integration` flag is found here.
     extract_filter_argument("cargo test --test integration_tests chaos_tests::");
 }
 
 #[test]
 #[should_panic(expected = "multiple")]
 fn extract_filter_argument_panics_on_multiple_flag_occurrences() {
-    // Codex finding on PR #1474: a run: script could echo the command
-    // before executing it. That gives two boundary-valid occurrences of
-    // the flag. Picking the first would risk comparing against a stale
-    // logged command, not the real one cargo runs. The guard must fail
-    // loudly on the ambiguity instead.
+    // PR #1474: a run: script could echo the command before executing it.
+    // That gives two boundary-valid occurrences of the flag. Picking the
+    // first would risk comparing against a stale logged command, not the
+    // real one cargo runs. The guard must fail loudly on the ambiguity
+    // instead.
     extract_filter_argument(
         "echo cargo test --test integration chaos_tests:: && cargo test --test integration chaos_tests::specific",
     );
@@ -478,11 +464,10 @@ fn extract_filter_argument_panics_on_multiple_flag_occurrences() {
 #[test]
 #[should_panic(expected = "command has no")]
 fn extract_filter_argument_rejects_a_lone_backslash_after_the_flag() {
-    // Codex finding on PR #1474: bash escapes the space after a lone
-    // `\`. `--test integration\ chaos_tests::specific` is ONE argument
-    // to cargo, not a flag followed by a filter. The guard must not
-    // treat that `\` as a boundary just because `skip_continuation_gap`
-    // never consumed it.
+    // PR #1474: bash escapes the space after a lone `\`. `--test
+    // integration\ chaos_tests::specific` is ONE argument to cargo, not a
+    // flag followed by a filter. The guard must not treat that `\` as a
+    // boundary just because `skip_continuation_gap` never consumed it.
     extract_filter_argument("cargo test --test integration\\ chaos_tests::specific");
 }
 
@@ -495,23 +480,23 @@ fn extract_filter_argument_panics_when_the_flag_is_absent() {
 #[test]
 #[should_panic(expected = "cargo option")]
 fn extract_filter_argument_panics_on_a_valueless_cargo_option_before_the_filter() {
-    // First Codex finding on PR #1474: `cargo test --help` documents
-    // `[OPTIONS] [TESTNAME]`. A short option, e.g. `-q`, is valid between
-    // `--test integration` and the filter. Fail loudly here rather than
-    // guess past it -- see the value-taking-option test below for why
-    // guessing cannot be made complete.
+    // PR #1474: `cargo test --help` documents `[OPTIONS] [TESTNAME]`. A
+    // short option, e.g. `-q`, is valid between `--test integration` and
+    // the filter. Fail loudly here rather than guess past it -- see the
+    // value-taking-option test below for why guessing cannot be made
+    // complete.
     extract_filter_argument("cargo test --test integration -q chaos_tests::specific");
 }
 
 #[test]
 #[should_panic(expected = "cargo option")]
 fn extract_filter_argument_panics_on_a_value_taking_cargo_option_before_the_filter() {
-    // Second Codex finding: `--color always` is a value-taking option in
-    // the same documented position. A version that skips single tokens
-    // starting with `-` would skip `--color`. It would then wrongly
-    // return `always` -- the option's VALUE -- as the filter.
-    // Enumerating which options take a value is a losing game. This
-    // guard refuses to play it -- it fails loudly on any option here.
+    // PR #1474: `--color always` is a value-taking option in the same
+    // documented position. A version that skips single tokens starting
+    // with `-` would skip `--color`. It would then wrongly return
+    // `always` -- the option's VALUE -- as the filter. Enumerating which
+    // options take a value is a losing game. This guard refuses to play
+    // it -- it fails loudly on any option here.
     extract_filter_argument("cargo test --test integration --color always chaos_tests::specific");
 }
 
@@ -555,9 +540,9 @@ fn extract_filter_argument_detects_a_doc_narrowed_filter_ci_still_calls_broad() 
     );
 }
 
-/// Ties the doc's example filter to CI's own filter, so the two can never
-/// silently diverge -- e.g. CI narrows to a smaller sub-filter while the doc
-/// keeps recommending the wider (now-stale) one it claims to mirror.
+/// Ties the doc's example filter to CI's own filter, so the two never drift.
+/// For example, CI narrows to a sub-filter while the doc keeps the wider,
+/// stale one it claims to mirror.
 ///
 /// Compares the exact filter *argument* extracted from each side, not a
 /// shared-prefix `contains` check -- see `extract_filter_argument`.
@@ -609,12 +594,12 @@ fn doc_example_filter_matches_chaos_workflow_filter() {
 
 #[test]
 fn doc_example_filter_matches_chaos_workflow_filter_tolerates_a_wrapped_ci_run_line() {
-    // Codex finding on PR #1474: an earlier version read only the single
-    // physical line containing `--test integration` out of the CI
-    // stanza. If chaos.yml ever wraps its filter onto a continuation
-    // line, that single line has no filter on it. The doc's own example
-    // already does this. The guard panicked even though the real
-    // filters still matched. Passing the whole stanza fixes this.
+    // PR #1474: an earlier version read only the single physical line
+    // containing `--test integration` out of the CI stanza. If chaos.yml
+    // ever wraps its filter onto a continuation line, that single line
+    // has no filter on it. The doc's own example already does this. The
+    // guard panicked even though the real filters still matched. Passing
+    // the whole stanza fixes this.
     let workflow = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration \\\n          chaos_tests::\n";
     let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
     assert_eq!(
@@ -651,13 +636,12 @@ fn doc_and_ci_extraction_pipeline_detects_divergence_end_to_end() {
 #[test]
 #[should_panic(expected = "chaos_tests module")]
 fn doc_and_ci_extraction_pipeline_rejects_a_shared_wrong_module_drift() {
-    // Codex finding on PR #1474: both sides could drift to the SAME
-    // wrong token. It only needs to contain `chaos_tests::` as a
-    // substring, e.g. `nonchaos_tests::`. The two extracted filters
-    // would then be equal to each other. Equality alone would pass,
-    // even though cargo matches zero real tests on either side.
-    // Reproduces the same module-prefix check
-    // `doc_example_filter_matches_chaos_workflow_filter` runs, on
+    // PR #1474: both sides could drift to the SAME wrong token. It only
+    // needs to contain `chaos_tests::` as a substring, e.g.
+    // `nonchaos_tests::`. The two extracted filters would then be equal
+    // to each other. Equality alone would pass, even though cargo matches
+    // zero real tests on either side. Reproduces the same module-prefix
+    // check `doc_example_filter_matches_chaos_workflow_filter` runs, on
     // synthetic text standing in for this drift.
     let workflow = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration nonchaos_tests:: -- --nocapture\n";
     let ci_stanza = workflow_step_stanza(workflow, "chaos_tests::").expect("stanza present");
@@ -687,13 +671,12 @@ fn doc_and_ci_extraction_pipeline_rejects_a_shared_wrong_module_drift() {
 /// step's `- ` marker, or the end of the block.
 ///
 /// Bounding at the *next* step rather than at `needle` is the load-bearing
-/// part. Slicing only up to the matched text sits inside the step's `run:`
-/// line, so a key written *after* `run:` (e.g. an `if:` placed on the line
-/// below, which is valid YAML with identical semantics to placing it above)
-/// is invisible to the check -- ported verbatim from
-/// `sqlite_feasibility_docs::workflow_step_stanza`, which exists precisely
-/// because that exact reordering once silently re-gated a doc guard while its
-/// own "is this unconditional?" test kept reporting success.
+/// part. A slice up to the matched text ends inside the step's `run:` line.
+/// A key written *after* `run:` is then invisible to the check. An `if:` on
+/// the line below is valid YAML with the same semantics as one above. This
+/// is ported verbatim from `sqlite_feasibility_docs::workflow_step_stanza`.
+/// That reordering once silently re-gated a doc guard there. Its own "is
+/// this unconditional?" test kept reporting success.
 ///
 /// Panics if a SECOND step also contains `needle`. A compile-only step
 /// could be scoped with the same filter text as the step that really
@@ -756,11 +739,11 @@ fn step_stanza_covers_keys_written_after_run() {
 #[test]
 #[should_panic(expected = "multiple")]
 fn workflow_step_stanza_panics_when_the_needle_appears_in_two_steps() {
-    // Codex finding on PR #1474: a compile-only step could be scoped
-    // with the same filter text as the step that actually executes it.
-    // For example, `--test integration chaos_tests:: --no-run`. Picking
-    // the FIRST stanza containing the needle would then silently anchor
-    // parity to the compile step, not the one CI really runs.
+    // PR #1474: a compile-only step could be scoped with the same filter
+    // text as the step that actually executes it. For example, `--test
+    // integration chaos_tests:: --no-run`. Picking the FIRST stanza
+    // containing the needle would then silently anchor parity to the
+    // compile step, not the one CI really runs.
     let block = "\n      - name: Compile chaos suite\n        run: cargo test --test integration chaos_tests:: --no-run\n\n      - name: Run chaos reproducers\n        run: cargo test --test integration chaos_tests::specific\n";
     workflow_step_stanza(block, "chaos_tests::");
 }
@@ -768,13 +751,12 @@ fn workflow_step_stanza_panics_when_the_needle_appears_in_two_steps() {
 #[test]
 #[should_panic(expected = "multiple")]
 fn workflow_step_stanza_treats_an_unnamed_step_as_its_own_boundary() {
-    // Codex finding on PR #1474: a step without `name:` is still a real
-    // step -- chaos.yml's own checkout/toolchain/cache steps have none.
-    // The old marker only recognized named steps, so an unnamed
-    // execution step's content stayed inside the PRECEDING named
-    // step's stanza. That silently bypassed the multiple-steps check
-    // above: the two occurrences looked like one, inside one (wrongly
-    // bounded) stanza.
+    // PR #1474: a step without `name:` is still a real step --
+    // chaos.yml's own checkout/toolchain/cache steps have none. The old
+    // marker only recognized named steps, so an unnamed execution step's
+    // content stayed inside the PRECEDING named step's stanza. That
+    // silently bypassed the multiple-steps check above: the two
+    // occurrences looked like one, inside one (wrongly bounded) stanza.
     let block = "\n      - name: Compile chaos suite\n        run: cargo test --test integration chaos_tests:: --no-run\n      - run: cargo test --test integration chaos_tests::specific\n";
     workflow_step_stanza(block, "chaos_tests::");
 }
@@ -831,9 +813,8 @@ fn run_command(stanza: &str) -> &str {
 
 #[test]
 fn run_command_skips_a_look_alike_filter_in_the_step_name() {
-    // Codex finding on PR #1474: a step name mentioning `--test
-    // integration chaos_tests::` as prose must not be mistaken for the
-    // real command.
+    // PR #1474: a step name mentioning `--test integration chaos_tests::`
+    // as prose must not be mistaken for the real command.
     let stanza = "\n      - name: Run --test integration chaos_tests:: suite\n        run: cargo test --features chaos --test integration chaos_tests::specific\n";
     assert_eq!(
         extract_filter_argument(run_command(stanza)),
@@ -844,24 +825,24 @@ fn run_command_skips_a_look_alike_filter_in_the_step_name() {
 #[test]
 #[should_panic(expected = "command has no")]
 fn run_command_excludes_a_sibling_key_after_run() {
-    // Codex finding on PR #1474: a sibling key after `run:` (here
-    // `env:`) is not part of the run value. That holds even if its text
-    // reads like a broader `--test integration` filter. The real run:
-    // command uses an unsupported target name here
-    // (`integration_tests`). It must fail loudly on that, not silently
-    // succeed by reading past it into the env: block.
+    // PR #1474: a sibling key after `run:` (here `env:`) is not part of
+    // the run value. That holds even if its text reads like a broader
+    // `--test integration` filter. The real run: command uses an
+    // unsupported target name here (`integration_tests`). It must fail
+    // loudly on that, not silently succeed by reading past it into the
+    // env: block.
     let stanza = "\n      - name: Run chaos reproducers\n        run: cargo test --features chaos --test integration_tests chaos_tests::specific\n        env:\n          NOTE: \"--test integration chaos_tests::\"\n";
     extract_filter_argument(run_command(stanza));
 }
 
 #[test]
 fn run_command_recognizes_the_inline_run_key_on_an_unnamed_step() {
-    // Codex finding on PR #1474: an unnamed step's `run:` key sits right
-    // after the list marker (`- run:`), not alone on its own line. The
-    // old check matched only a line starting with `run:`, so it never
-    // found this key and panicked instead of extracting the command.
-    // A sibling `env:` key below must still end the run value here,
-    // exactly as it does for a named step.
+    // PR #1474: an unnamed step's `run:` key sits right after the list
+    // marker (`- run:`), not alone on its own line. The old check matched
+    // only a line starting with `run:`, so it never found this key and
+    // panicked instead of extracting the command. A sibling `env:` key
+    // below must still end the run value here, exactly as it does for a
+    // named step.
     let stanza = "\n      - run: cargo test --features chaos --test integration chaos_tests::specific\n        env:\n          NOTE: \"--test integration chaos_tests::\"\n";
     assert_eq!(
         extract_filter_argument(run_command(stanza)),
@@ -869,15 +850,14 @@ fn run_command_recognizes_the_inline_run_key_on_an_unnamed_step() {
     );
 }
 
-/// This module's own guards must run on a docs-only PR, where the `test`
-/// matrix (gated on `changes.outputs.code`) is skipped entirely (`chaos.md`
-/// lives under `docs/`, so editing only it sets `code=false`). They must
-/// therefore be invoked from the ungated `lint` job, exactly like the
-/// `performance_docs` / `sqlite_feasibility_docs` precedents this module
-/// follows -- and, like both of those, must also be *unconditional* once
-/// there: a step re-gated behind an `if:` is functionally identical to no
-/// step at all on a docs-only PR, and only checking "does the step exist" /
-/// "is it in `lint`" would pass unchanged if one were added.
+/// This module's guards must run on a docs-only PR. Such a PR skips the
+/// `test` matrix, which is gated on `changes.outputs.code`. `chaos.md` lives
+/// under `docs/`, so an edit to it alone sets `code=false`. So the ungated
+/// `lint` job must invoke the guards, like the `performance_docs` and
+/// `sqlite_feasibility_docs` precedents. Like those, the step must also be
+/// *unconditional*. A step re-gated behind an `if:` is the same as no step
+/// on a docs-only PR. Checks for "does the step exist" and "is it in
+/// `lint`" would still pass with that `if:`.
 #[test]
 fn chaos_docs_guards_run_on_docs_only_changes() {
     const FILTER: &str = "--test integration chaos_docs::";

@@ -2,17 +2,17 @@
 //!
 //! ## Structure
 //!
-//! **Pure-logic tests (no DB required):** verify the public API surface —
+//! **Pure-logic tests (no DB required):** verify the public API surface:
 //! `StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`, metric constants,
-//! and the `MetricsRecorder` trait methods.  The integration section at the
-//! bottom uses a `CountingMetrics` recorder and `WorkflowCache` to simulate the
-//! cache hit/miss lifecycle without a database.
+//! and the `MetricsRecorder` trait methods. The integration section at the
+//! bottom uses a `CountingMetrics` recorder and `WorkflowCache`. It simulates
+//! the cache hit/miss lifecycle without a database.
 //!
 //! **DB integration tests (`db` feature, bottom of file):** validate the
-//! acceptance criteria from the Vantage spec at the Postgres level —
+//! acceptance criteria of the Vantage spec at the Postgres level. They cover
 //! the pin mechanism, exclusive claim within TTL, graceful fallback after
-//! expiry, and `park`/`wake` sticky lifecycle.  Written RED-first; they
-//! pass GREEN against the implementation in `queue.rs`.
+//! expiry, and the `park`/`wake` sticky lifecycle. The implementation lives in
+//! `queue.rs`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -166,7 +166,7 @@ fn no_op_metrics_implements_cache_miss_without_panic() {
 // Cache lifecycle integration tests (no DB required).
 //
 // These tests simulate the cache hit/miss lifecycle that the worker hot path
-// executes on every task cycle:
+// runs on every task cycle.
 //
 //   Task 1 (fresh execution):
 //     cache.get() → None → cold full-history load → record_miss
@@ -181,10 +181,10 @@ fn no_op_metrics_implements_cache_miss_without_panic() {
 //     workflow completes → cache.remove(exec_id)
 //
 // The "3-worker scenario" from the issue acceptance criteria is modelled as
-// three independent caches: only the cache that saw Task 1 produces a hit
-// on Task 2.  The other two caches each produce a miss, matching the
-// expected distribution (miss_count ≤ 1 on the owning worker; miss_count = 1
-// on all others).
+// three independent caches. Only the cache that saw Task 1 produces a hit on
+// Task 2. The other two caches each produce a miss. That matches the expected
+// distribution: miss_count ≤ 1 on the owning worker, miss_count = 1 on all
+// others.
 // ---------------------------------------------------------------------------
 
 /// Helper that models a single task cycle on one worker's local cache:
@@ -265,9 +265,9 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
 
 #[test]
 fn three_worker_scenario_only_owning_worker_gets_cache_hits() {
-    // Simulate a 3-worker fleet.  Each worker has its own independent cache.
-    // Execution is "sticky" to worker-0: it is the only one that retains the
-    // warm cache entry, so it is the only one that records hits on follow-up tasks.
+    // Simulate a 3-worker fleet. Each worker has its own independent cache.
+    // Execution is "sticky" to worker-0. Only worker-0 retains the warm cache
+    // entry, so only it records hits on follow-up tasks.
     let metrics_w0 = CountingMetrics::default();
     let metrics_w1 = CountingMetrics::default();
     let metrics_w2 = CountingMetrics::default();
@@ -328,7 +328,6 @@ fn cache_eviction_by_lru_pressure_causes_miss_on_next_task() {
 
     // A is still present (was MRU before the eviction).
     assert!(cache.get(&exec_a).is_some(), "exec_a should be in cache");
-    // C was just inserted.
     assert!(cache.get(&exec_c).is_some(), "exec_c should be in cache");
 
     // B follow-up: evicted → miss even though same worker.
@@ -548,10 +547,12 @@ mod db_tests {
 
     // ── AC#2 prerequisite — Non-sticky worker cannot claim during TTL ─────────
 
-    /// Within the TTL window, a worker that is NOT the sticky owner must not be
-    /// able to claim the pinned task.  This exclusivity is what makes sticky
-    /// routing useful: the owning worker (which holds the LRU cache) gets first
-    /// pick before any other worker can steal the work.
+    /// Within the TTL window, a worker that is NOT the sticky owner cannot
+    /// claim the pinned task.
+    ///
+    /// This exclusivity makes sticky routing useful. The owning worker, which
+    /// holds the LRU cache, gets first pick before any other worker can steal
+    /// the work.
     #[tokio::test]
     async fn non_sticky_worker_cannot_claim_task_within_ttl() {
         let (mut conn, _c) = setup().await;
@@ -584,10 +585,11 @@ mod db_tests {
 
     // ── AC#2 — Graceful fallback after sticky TTL expires ────────────────────
 
-    /// Once `sticky_until` elapses, ANY worker must be eligible to claim the
-    /// task.  This prevents a single point of failure: if the sticky worker
-    /// crashes or is slow, the task is not lost — another worker picks it up
-    /// after the grace period, at the cost of a full history reload.
+    /// Once `sticky_until` elapses, ANY worker is eligible to claim the task.
+    ///
+    /// This prevents a single point of failure. If the sticky worker crashes
+    /// or is slow, the task is not lost. Another worker picks it up after the
+    /// grace period, at the cost of a full history reload.
     #[tokio::test]
     async fn any_worker_can_claim_after_sticky_expires() {
         let (mut conn, _c) = setup().await;
@@ -636,10 +638,11 @@ mod db_tests {
 
     // ── AC#4 — park_workflow_task writes sticky affinity ─────────────────────
 
-    /// After a workflow suspends (parks), the task row must have the worker's
-    /// sticky affinity written to `sticky_worker_id` so that the next resume
-    /// cycle preferentially routes back to this worker (the one holding the
-    /// in-process LRU cache snapshot).
+    /// After a workflow suspends (parks), the task row carries the worker's
+    /// sticky affinity in `sticky_worker_id`.
+    ///
+    /// The next resume cycle then prefers this worker, which holds the
+    /// in-process LRU cache snapshot.
     #[tokio::test]
     async fn park_workflow_task_writes_sticky_affinity_to_db() {
         let (mut conn, _c) = setup().await;
@@ -651,7 +654,6 @@ mod db_tests {
 
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-        // Worker claims the task.
         queue::claim_task(
             &mut conn,
             &["default".to_string()],
@@ -790,14 +792,15 @@ mod db_tests {
 
     // ── AC#4 — Sticky task preferred over unpinned task for the owning worker ─
 
-    /// When a worker has both a sticky task (pinned to itself) and an unpinned
-    /// task available in the queue, it must claim the sticky task first.  This
-    /// is the AC#4 priority-ordering guarantee: SKIP LOCKED elects candidates,
-    /// then the `ORDER BY sticky_worker_id = $1 DESC` clause ensures the
-    /// owning worker always maximises cache locality when it has a choice.
+    /// A worker with both a sticky task (pinned to itself) and an unpinned task
+    /// in the queue claims the sticky task first.
     ///
-    /// Without this ordering, sticky routing would only improve locality when
-    /// no other work is pending — useless under any real load.
+    /// This is the AC#4 priority-ordering guarantee. SKIP LOCKED elects
+    /// candidates. Then the `ORDER BY sticky_worker_id = $1 DESC` clause makes
+    /// the owning worker always maximise cache locality when it has a choice.
+    ///
+    /// Without this ordering, sticky routing improves locality only when no
+    /// other work is pending. That is useless under any real load.
     #[tokio::test]
     async fn sticky_task_preferred_over_unpinned_task_for_owning_worker() {
         let (mut conn, _c) = setup().await;
@@ -855,25 +858,21 @@ mod db_tests {
         let (mut conn, _c) = setup().await;
         let exec_id = insert_execution(&mut conn).await;
 
-        // Enqueue with a sticky pin.
         let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
         params.workflow_exec_id = Some(exec_id.as_uuid());
         let params = params.with_sticky("worker-kappa", Duration::from_secs(60));
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-        // Verify pin is set.
         let before = read_sticky(&mut conn, task_id).await;
         assert!(
             before.sticky_worker_id.is_some(),
             "precondition: sticky_worker_id must be set before clearing"
         );
 
-        // Clear the pin.
         queue::set_task_sticky_affinity(&mut conn, task_id, None)
             .await
             .expect("set_task_sticky_affinity(None)");
 
-        // Verify pin is gone.
         let after = read_sticky(&mut conn, task_id).await;
         assert!(
             after.sticky_worker_id.is_none(),

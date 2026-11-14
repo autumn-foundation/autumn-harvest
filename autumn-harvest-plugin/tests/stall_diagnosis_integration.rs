@@ -6,8 +6,8 @@
 //!
 //! - AC1: 200 + `health` + discriminated `blocked_on` + `last_event_age_seconds`.
 //! - AC3: a pending activity on a queue with ZERO live worker heartbeats
-//!   resolves to `activity_no_worker { queue }` with `health = stalled` — the
-//!   issue's headline "100% of the time it holds" condition.
+//!   resolves to `activity_no_worker { queue }` with `health = stalled`. That
+//!   is the issue's headline "100% of the time it holds" condition.
 //! - AC4: a future durable timer resolves to `sleeping_timer { fires_at }` with
 //!   `health = healthy` REGARDLESS of how old the last event is.
 //! - AC5: an open circuit resolves to `activity_circuit_open`; a backing-off
@@ -16,17 +16,16 @@
 //! - AC6: a RUNNING execution with no pending work of any kind resolves to
 //!   `no_pending_work` with `health = stalled`.
 //! - AC7: a terminal execution returns `health = terminal` + `terminal_outcome`
-//!   and NO `blocked_on`; an unknown id returns 404; serving the report
-//!   performs zero writes and never advances a circuit breaker's phase.
+//!   and NO `blocked_on`. An unknown id returns 404. The report performs zero
+//!   writes and never advances a circuit breaker's phase.
 //! - AC2: the remaining `blocked_on` variants: `awaiting_signal`
 //!   (replay-derived), `pending_child`, `paused`, plus the fan-out worst-of
 //!   rule.
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which a fresh database is created and migrated) when set — no
-//! Docker required — else boots a fresh testcontainers Postgres. Docker is not
-//! available in every sandbox, so this suite is compile-checked there and run
-//! Docker-backed in CI (matching the #543/#544/#601 precedent).
+//! Dual-mode: with `HARVEST_TEST_DATABASE_URL` set, the suite creates and
+//! migrates a fresh database through that admin URL, with no Docker. Else it
+//! boots a fresh testcontainers Postgres. Some sandboxes have no Docker, so the
+//! suite only compiles there and runs in CI (the #543/#544/#601 precedent).
 
 #![allow(clippy::too_many_lines)]
 
@@ -213,9 +212,9 @@ fn fast_cooldown_breaker_activity() -> ActivityInfo {
     }
 }
 
-/// A plain activity with NO circuit breaker. Required for the rate-limit tests:
-/// a breaker-tracked activity enforces its rate limit at DISPATCH (issue #369),
-/// so its bucket is deliberately never consulted at claim time.
+/// A plain activity with NO circuit breaker, for the rate-limit tests. A
+/// breaker-tracked activity enforces its rate limit at DISPATCH (issue #369).
+/// So claim time never consults its bucket.
 fn plain_activity() -> ActivityInfo {
     ActivityInfo {
         name: "send_email",
@@ -225,10 +224,10 @@ fn plain_activity() -> ActivityInfo {
     }
 }
 
-/// An activity whose capability requirements live ONLY in the registry — the
-/// legacy/manual-enqueue shape, where the queue row carries no
-/// `required_capabilities` snapshot but `claim_task`'s ineligible-activities
-/// gate still enforces the registered `requires`.
+/// An activity whose capability requirements live ONLY in the registry. This is
+/// the legacy/manual-enqueue shape. The queue row has no `required_capabilities`
+/// snapshot, but `claim_task`'s ineligible-activities gate still enforces the
+/// registered `requires`.
 fn registry_gated_activity() -> ActivityInfo {
     ActivityInfo {
         name: "registry_gated",
@@ -302,17 +301,14 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool")
 }
 
-/// Build the API state, also handing back the registry so a test can reach the
-/// SAME shared circuit-breaker registry the endpoint reads (`runtime()` is
-/// crate-private, so the handle is threaded out here instead).
 /// The worker id this test process's API runtime advertises as its own
 /// co-located worker.
 ///
-/// The in-process circuit registry belongs to exactly this worker, so a test
-/// that expects an `activity_circuit_open` verdict must seed THIS id as the
-/// live poller -- that is what a real single-replica deployment looks like
-/// (the API and its worker share one process and one breaker registry). Seeding
-/// some other id models a *peer replica*, whose breaker this process cannot see.
+/// The in-process circuit registry belongs to exactly this worker. So a test
+/// that expects `activity_circuit_open` must seed THIS id as the live poller.
+/// That models a single-replica deployment, where the API and its worker share
+/// one process and one breaker registry. Another id models a *peer replica*,
+/// whose breaker this process cannot see.
 const LOCAL_WORKER_ID: &str = "diagnose-test";
 
 /// Like [`build_api_state_with_registry`], but the runtime advertises NO
@@ -344,6 +340,9 @@ fn build_api_state_without_local_worker(pool: &DbPool) -> (HarvestApiState, Arc<
     (api_state, registry)
 }
 
+/// Build the API state and return the registry too. A test then reaches the
+/// SAME circuit-breaker registry that the endpoint reads. `runtime()` is
+/// crate-private.
 fn build_api_state_with_registry(
     pool: &DbPool,
     admin_boundary: bool,
@@ -681,9 +680,9 @@ async fn ac3_pending_activity_with_no_live_worker_is_stalled_and_names_the_queue
     );
 }
 
-/// Control for AC3: the SAME shape with a live worker polling that queue is no
-/// longer `activity_no_worker` — so the verdict is driven by fleet coverage,
-/// not by the mere presence of a pending row.
+/// Control for AC3: with a live worker polling that queue, the SAME shape is
+/// not `activity_no_worker`. So fleet coverage drives the verdict, not a
+/// pending row alone.
 #[tokio::test]
 async fn ac3_control_live_worker_removes_the_no_worker_verdict() {
     let (url, _guard) = setup_database().await;
@@ -773,10 +772,10 @@ async fn ac4_future_timer_is_healthy_regardless_of_event_age() {
 // ── AC5: circuit open, and retry backoff ───────────────────────────────────
 
 /// A FORCE-opened circuit resolves to `activity_circuit_open` and outranks the
-/// retry verdict — and deliberately carries NO `cooldown_until`: `force_open`
-/// sets `forced_open`, so `snapshot_of` reports no probe deadline because no
-/// probe is admitted on any timer. Recovery needs an explicit `force-close`,
-/// and the absent field is what tells an operator that.
+/// retry verdict. It deliberately carries NO `cooldown_until`. `force_open`
+/// sets `forced_open`, and no timer admits a probe. So `snapshot_of` reports no
+/// probe deadline. Recovery needs an explicit `force-close`, and the absent
+/// field tells an operator that.
 #[tokio::test]
 async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
     let (url, _guard) = setup_database().await;
@@ -806,10 +805,10 @@ async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
         "NOW() + INTERVAL '10 minutes'",
     )
     .await;
-    // A live worker, so `activity_no_worker` cannot be what we are observing.
-    // It is THIS process's own worker (`LOCAL_WORKER_ID`), i.e. the single-
-    // replica shape: the breaker we forced open is the very one that would gate
-    // this task's dispatch, so the local snapshot is authoritative.
+    // A live worker, so the verdict cannot be `activity_no_worker`. It is THIS
+    // process's own worker (`LOCAL_WORKER_ID`): the single-replica shape. The
+    // forced-open breaker gates this task's dispatch, so the local snapshot is
+    // authoritative.
     seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
 
     let body = diagnose(&app, exec_id).await;
@@ -838,14 +837,13 @@ async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
 
 /// An ORGANICALLY tripped circuit (three failures inside the window, so
 /// `forced_open` is false) resolves to `activity_circuit_open` WITH a derived
-/// `cooldown_until` — the AC5 clause the forced-open fixture structurally cannot
-/// produce, and the only end-to-end exercise of the
-/// `time_until_probe_secs` -> `DateTime` derivation.
+/// `cooldown_until`. The forced-open fixture cannot produce that AC5 clause.
+/// This is the only end-to-end test of the `time_until_probe_secs` ->
+/// `DateTime` derivation.
 ///
 /// Issue #1193: an organic open self-heals on this cooldown timer with no
-/// operator action, but every dispatch fast-fails non-retryably until then, so
-/// its `health` is `degraded` — neither the operator-forced open's `stalled`
-/// nor a clean `healthy`.
+/// operator action. Until then, every dispatch fast-fails non-retryably. So its
+/// `health` is `degraded`, not the forced open's `stalled` and not `healthy`.
 #[tokio::test]
 async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     let (url, _guard) = setup_database().await;
@@ -1120,12 +1118,11 @@ async fn ac5_backing_off_task_reports_retrying_with_attempt_error_and_next_attem
 }
 
 /// A not-yet-due task with NO recorded error is a dispatcher deferral, not a
-/// retry. `queue::defer_rate_limited_task` pushes `scheduled_at` forward and
-/// decrements the claim-time attempt back down without recording a failure
-/// ("a rate-limit deferral is not an attempt"); the session-capacity (#606) and
-/// capability-miss (#804) paths reuse the same clean continuation. Reporting
-/// those as `activity_retrying` would send an operator hunting a failure that
-/// never happened.
+/// retry. `queue::defer_rate_limited_task` pushes `scheduled_at` forward. It
+/// takes the claim-time attempt back and records no failure ("a rate-limit
+/// deferral is not an attempt"). The session-capacity (#606) and capability-miss
+/// (#804) paths reuse that continuation. `activity_retrying` would send an
+/// operator hunting a failure that never happened.
 #[tokio::test]
 async fn ac2_not_due_task_without_an_error_reports_deferred_not_retrying() {
     let (url, _guard) = setup_database().await;
@@ -1431,9 +1428,8 @@ async fn ac2_paused_execution_reports_paused_with_actor_and_since() {
 }
 
 /// The fan-out worst-of rule: one wedged slot among many healthy ones must
-/// still surface the wedged one. A wide fan-out where 3 of 4 activities sit on
-/// a covered queue and 1 sits on an uncovered queue reports
-/// `activity_no_worker` naming the uncovered queue.
+/// still surface. Here 3 of 4 activities sit on a covered queue and 1 on an
+/// uncovered queue. The report is `activity_no_worker` for the uncovered queue.
 #[tokio::test]
 async fn ac2_fan_out_reports_the_worst_slot_not_the_healthy_majority() {
     let (url, _guard) = setup_database().await;
@@ -1545,10 +1541,10 @@ async fn ac2_saturated_rate_limit_bucket_reports_activity_rate_limited() {
 /// from a drained-but-refilling bucket.
 ///
 /// `claim_task`'s gate is `EXISTS(bucket >= 1.0)`, so a missing row is refused
-/// forever — nothing refills a row that does not exist. Reporting it healthy
-/// would be the exact false-negative this endpoint exists to prevent, and
-/// reporting it as ordinary saturation would put a permanent condition behind
-/// a `healthy` verdict whose summary promises automatic refill.
+/// forever. Nothing refills a row that does not exist. A healthy report is the
+/// false negative that this endpoint exists to prevent. Ordinary saturation is
+/// wrong too. It puts a permanent condition behind a `healthy` verdict whose
+/// summary promises an automatic refill.
 #[tokio::test]
 async fn ac2_missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation() {
     let (url, _guard) = setup_database().await;
@@ -1632,9 +1628,9 @@ async fn ac2_saturated_concurrency_key_reports_activity_concurrency_deferred() {
 
 /// Issue #807: an operator paused the ACTIVITY TYPE while its queue still has
 /// an eligible active worker. `claim_task`'s `paused_activities` anti-join
-/// rejects the row for as long as the pause stands, so without threading the
-/// pause into the facts this reads as `healthy_in_progress` — a confident wrong
-/// answer during exactly the triage this endpoint exists for.
+/// rejects the row while the pause stands. Without the pause in the facts, this
+/// reads as `healthy_in_progress`. That is a confident wrong answer during the
+/// triage this endpoint exists for.
 #[tokio::test]
 async fn ac2_paused_activity_type_reports_activity_paused() {
     let (url, _guard) = setup_database().await;
@@ -1659,8 +1655,8 @@ async fn ac2_paused_activity_type_reports_activity_paused() {
         "NOW() - INTERVAL '1 minute'",
     )
     .await;
-    // The queue is NOT paused and IS covered by a live active worker, so every
-    // other impediment is absent: only the activity pause can explain a stall.
+    // The queue is NOT paused and a live active worker covers it. So only the
+    // activity pause can explain a stall.
     seed_live_worker(&pool, "worker-email", "email").await;
     {
         let mut conn = pool.get().await.expect("pooled conn");
@@ -1803,8 +1799,8 @@ async fn ac2_orphaned_running_task_is_not_reported_healthy() {
 }
 
 /// An unfired durable timer long past its deadline is a lost-task wedge, not a
-/// healthy sleep: timers fire only when a worker claims the owning workflow
-/// task, so a missed deadline means that never happened.
+/// healthy sleep. Timers fire only when a worker claims the owning workflow
+/// task. So a missed deadline means that claim never happened.
 #[tokio::test]
 async fn ac2_overdue_unfired_timer_reports_timer_overdue() {
     let (url, _guard) = setup_database().await;
@@ -1839,13 +1835,13 @@ async fn ac2_overdue_unfired_timer_reports_timer_overdue() {
 /// A timer armed alongside an external handoff goes overdue as a matter of
 /// course, and that is NOT a stall.
 ///
-/// `persist_scheduled_external_activity` parks the workflow task on the handoff
-/// and deliberately discards the armed deadline (`_min_fires_at`), so the timer
-/// is only observed when the external completion wakes the run. A callback that
-/// takes longer than the grace window leaves a legitimately-overdue row behind;
-/// reporting it `timer_overdue`/`stalled` would send an operator chasing a
-/// non-problem. The parked task row is what proves the timer does not own the
-/// wake — see `stall_diagnosis::workflow_wake_was_missed`.
+/// `persist_scheduled_external_activity` parks the workflow task on the handoff.
+/// It deliberately discards the armed deadline (`_min_fires_at`). So the timer
+/// is seen only when the external completion wakes the run. A callback slower
+/// than the grace window leaves a legitimately overdue row. A
+/// `timer_overdue`/`stalled` report would send an operator chasing a
+/// non-problem. The parked task row proves the timer does not own the wake.
+/// See `stall_diagnosis::workflow_wake_was_missed`.
 #[tokio::test]
 async fn overdue_timer_alongside_a_parked_external_handoff_is_not_a_stall() {
     let (url, _guard) = setup_database().await;
@@ -1897,8 +1893,8 @@ async fn overdue_timer_alongside_a_parked_external_handoff_is_not_a_stall() {
 }
 
 /// The converse: when the workflow task's OWN wake was missed, the overdue
-/// timer is still the verdict, so the gate above does not blind the endpoint to
-/// a genuine wedge (the issue #476 signal-or-deadline rationale).
+/// timer is still the verdict. So the external-handoff gate does not hide a
+/// genuine wedge (the issue #476 signal-or-deadline rationale).
 #[tokio::test]
 async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
     let (url, _guard) = setup_database().await;
@@ -2388,10 +2384,9 @@ async fn overdue_timer_does_not_correlate_via_coincidental_proximity_alone() {
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
-/// A durable timer fires only when a worker claims the owning workflow task, so
-/// a run "sleeping" on a timer whose workflow queue nobody polls is not
-/// sleeping — it can never wake. The queue is the actionable cause, not the
-/// future deadline (PR #1188).
+/// A durable timer fires only when a worker claims the owning workflow task.
+/// A run "sleeping" on a timer whose workflow queue nobody polls can never
+/// wake. The queue is the actionable cause, not the future deadline (PR #1188).
 #[tokio::test]
 async fn sleeping_timer_on_a_dead_workflow_queue_reports_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -2431,8 +2426,8 @@ async fn sleeping_timer_on_a_dead_workflow_queue_reports_no_worker() {
 }
 
 /// The control: with a live poller on the workflow queue, the same shape is a
-/// genuine healthy sleep and the ordinary dispatch verdict must NOT mask the
-/// more specific timer answer.
+/// healthy sleep. The ordinary dispatch verdict must NOT mask the more specific
+/// timer answer.
 #[tokio::test]
 async fn sleeping_timer_with_a_live_workflow_queue_is_still_a_sleeping_timer() {
     let (url, _guard) = setup_database().await;
@@ -2579,15 +2574,14 @@ async fn ac2_contributing_reasons_union_across_a_fan_out() {
     );
 }
 
-/// The replay degrade path: an execution whose workflow type is not registered
-/// cannot have its wait set replayed, and the endpoint must still serve 200
-/// with the database-only verdict rather than failing the triage report.
+/// The replay degrade path: the wait set of an unregistered workflow type
+/// cannot replay. The endpoint must still serve 200 with the database-only
+/// verdict.
 ///
-/// `build_awaitables_report` has its OWN degrade path here and reports the
-/// precise `handler_not_registered` reason, which is passed through verbatim —
-/// strictly more actionable than this endpoint's own generic
-/// `wait_set_unavailable` (which covers the case where the replay itself
-/// errors) or `wait_set_timed_out` (where it exceeds the query timeout).
+/// `build_awaitables_report` has its OWN degrade path. It reports the precise
+/// `handler_not_registered` reason, which passes through verbatim. That is more
+/// actionable than the generic `wait_set_unavailable` (the replay errors) or
+/// `wait_set_timed_out` (the replay exceeds the query timeout).
 #[tokio::test]
 async fn ac2_replay_failure_degrades_to_history_only_and_still_serves_200() {
     let (url, _guard) = setup_database().await;
@@ -2609,9 +2603,9 @@ async fn ac2_replay_failure_degrades_to_history_only_and_still_serves_200() {
 // ── PR #1188: the run's own workflow task row ──────────────────────────────
 
 /// A workflow task held by a worker means the handler is executing RIGHT NOW.
-/// Canonically a long local activity (issue #98), which schedules no queue row
-/// at all — so before this the run fell through every category and reported the
-/// alarming `no_pending_work`/`stalled`.
+/// The usual case is a long local activity (issue #98), which schedules no
+/// queue row. Before this, the run fell through each category and reported
+/// `no_pending_work`/`stalled`.
 #[tokio::test]
 async fn claimed_workflow_task_reports_healthy_not_a_lost_task() {
     let (url, _guard) = setup_database().await;
@@ -2638,9 +2632,9 @@ async fn claimed_workflow_task_reports_healthy_not_a_lost_task() {
 // ── PR #1188: hard impediments outrank a stored claim ──────────────────────
 
 /// A crashed worker leaves its workflow task RUNNING with a non-null `worker_id`
-/// until the poison-pill reclaimer processes it (issue #367). With nothing
-/// polling the queue that stale claim never advances, so reporting "the handler
-/// is executing" would answer "fine" forever for a run that cannot move.
+/// until the poison-pill reclaimer processes it (issue #367). With no poller,
+/// that stale claim never advances. "The handler is executing" would then
+/// answer "fine" forever for a run that cannot move.
 #[tokio::test]
 async fn claimed_workflow_task_on_a_dead_queue_reports_workflow_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -2722,9 +2716,9 @@ async fn not_yet_due_workflow_task_with_a_live_worker_is_healthy() {
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
-/// A PENDING workflow task on a queue nothing polls: the decision cycle can
-/// never be claimed, so the run cannot advance even though nothing individual
-/// is wedged. The workflow-task analogue of AC3's flagship condition.
+/// A PENDING workflow task on a queue nothing polls. No worker can claim the
+/// decision cycle, so the run cannot advance, though no single item is wedged.
+/// The workflow-task analogue of AC3's flagship condition.
 #[tokio::test]
 async fn pending_workflow_task_with_no_live_worker_reports_workflow_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -2740,9 +2734,8 @@ async fn pending_workflow_task_with_no_live_worker_reports_workflow_no_worker() 
     assert_eq!(body["health"], "stalled", "body: {body}");
 }
 
-/// The control for the test above: register a live poller and the verdict
-/// becomes ordinary dispatch latency, proving the stall verdict is driven by
-/// coverage rather than by the mere presence of a PENDING row.
+/// The control: with a live poller, the verdict is ordinary dispatch latency.
+/// So coverage drives the stall verdict, not a PENDING row alone.
 #[tokio::test]
 async fn pending_workflow_task_with_a_live_worker_is_healthy() {
     let (url, _guard) = setup_database().await;
@@ -2759,8 +2752,8 @@ async fn pending_workflow_task_with_a_live_worker_is_healthy() {
 }
 
 /// A parked workflow task (`RUNNING` with a NULL worker) advances on a *wake*,
-/// not a claim, so a live worker proves nothing: this is exactly the lost-task
-/// shape and its verdict must be unchanged.
+/// not a claim. So a live worker proves nothing. This is the lost-task shape,
+/// and its verdict must not change.
 #[tokio::test]
 async fn parked_workflow_task_is_still_the_lost_task_verdict() {
     let (url, _guard) = setup_database().await;
@@ -2831,12 +2824,12 @@ async fn mark_nd_blocked(pool: &DbPool, exec_id: ExecutionId, reason: &str, coun
     .expect("stamp nd block");
 }
 
-/// The issue #603 nd-block leaves the execution `RUNNING` and re-pends its
-/// workflow task at a FUTURE `scheduled_at` (the capped-exponential backoff) --
-/// byte-identical to an ordinary deliberate deferral. Reading the task row
-/// alone therefore reports healthy dispatch for a run that is wedged until an
-/// operator rolls the divergent build back. The execution row's own
-/// `nd_blocked_at` is the authoritative signal and must win.
+/// The issue #603 nd-block leaves the execution `RUNNING`. It re-pends the
+/// workflow task at a FUTURE `scheduled_at` (the capped-exponential backoff).
+/// That is byte-identical to a deliberate deferral. So the task row alone
+/// reports healthy dispatch for a wedged run. It stays wedged until an operator
+/// rolls the divergent build back. The execution row's `nd_blocked_at` is the
+/// authoritative signal and must win.
 #[tokio::test]
 async fn nd_blocked_execution_reports_the_block_not_healthy_dispatch() {
     let (url, _guard) = setup_database().await;
@@ -2946,11 +2939,10 @@ async fn a_run_that_was_never_nd_blocked_keeps_its_ordinary_verdict() {
 }
 
 /// A DETACHED child (issue #347) keeps `parent_id` but carries a non-null
-/// `parent_close_policy` and NEVER wakes its parent — the engine's own
-/// discriminator (`worker.rs`'s `is_detached_child`). Counting it as a pending
-/// child would report a healthy `pending_child` wait for a parent that is not
-/// waiting on it at all, masking the awaited signal the parent is genuinely
-/// parked on for as long as the fire-and-forget child happens to run.
+/// `parent_close_policy`. It NEVER wakes its parent. That is the engine's own
+/// discriminator (`worker.rs`'s `is_detached_child`). As a pending child, it
+/// gives a healthy `pending_child` wait for a parent that does not wait on it.
+/// That masks the signal the parent is parked on, while the child runs.
 #[tokio::test]
 async fn detached_child_does_not_mask_the_signal_the_parent_is_parked_on() {
     let (url, _guard) = setup_database().await;
@@ -3175,9 +3167,9 @@ async fn session_pinned_task_whose_host_is_live_is_healthy() {
     assert_eq!(body["health"], "healthy", "{body}");
 }
 
-/// A `Draining` worker has already left its poll loop (`Worker::run` transitions
-/// only after `run_poll_loop` returns), so it claims no new task for the whole
-/// drain window even though queue coverage still counts it.
+/// A `Draining` worker has already left its poll loop. `Worker::run` changes
+/// state only after `run_poll_loop` returns. So it claims no new task during the
+/// drain window, though queue coverage still counts it.
 #[tokio::test]
 async fn draining_only_fleet_reports_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -3280,10 +3272,10 @@ async fn task_requiring_an_unsatisfied_capability_reports_no_worker() {
 }
 
 /// A legacy or manually enqueued row carries NO `required_capabilities`
-/// snapshot, but `claim_task`'s ineligible-activities gate ($6) still enforces
-/// the REGISTERED handler's `requires` — so reading the absent snapshot as
-/// "no requirements" would report healthy progress for a task no live worker
-/// can claim (an AC3 false negative).
+/// snapshot. `claim_task`'s ineligible-activities gate ($6) still enforces the
+/// REGISTERED handler's `requires`. Reading the absent snapshot as "no
+/// requirements" reports healthy progress for a task that no live worker can
+/// claim. That is an AC3 false negative.
 #[tokio::test]
 async fn unsnapshotted_task_is_gated_by_the_registered_requirements() {
     let (url, _guard) = setup_database().await;
@@ -3321,8 +3313,7 @@ async fn unsnapshotted_task_with_a_satisfying_worker_is_healthy() {
 }
 
 /// The second control: an un-snapshotted row whose activity declares NO
-/// `requires` is ungated, exactly as before — the backfill must not invent a
-/// requirement for an activity that has none.
+/// `requires` stays ungated. The backfill must not invent a requirement.
 #[tokio::test]
 async fn unsnapshotted_task_for_an_ungated_activity_is_unaffected() {
     let (url, _guard) = setup_database().await;
@@ -3361,8 +3352,8 @@ async fn task_requiring_a_satisfied_capability_is_healthy() {
 }
 
 /// A declared `harvest_build_compat` row makes a newer build eligible for an
-/// older build's work — the same rule `claim_task` applies, so it must not
-/// report a false stall.
+/// older build's work. `claim_task` applies the same rule, so the report must
+/// not show a false stall.
 #[tokio::test]
 async fn declared_build_compatibility_counts_as_coverage() {
     let (url, _guard) = setup_database().await;
@@ -3453,8 +3444,8 @@ async fn seed_held_activity_task(
 }
 
 /// A `RUNNING` activity whose claimant has begun a graceful shutdown is still
-/// legitimately progressing: `Worker::run` marks the worker `Draining` BEFORE
-/// awaiting `drain_in_flight`, so held work runs to completion.
+/// progressing. `Worker::run` marks the worker `Draining` BEFORE it awaits
+/// `drain_in_flight`, so held work runs to completion.
 ///
 /// Pre-fix this reported `activity_no_worker`/`stalled` for the entire drain
 /// window. The cause was that the Active-only claim eligibility rule also
@@ -3493,8 +3484,8 @@ async fn held_activity_on_a_draining_claimant_is_still_progressing() {
 }
 
 /// The complement: a `RUNNING` row whose claimant is GONE is still the flagship
-/// orphan stall, even when the queue itself has a live Active poller (a peer
-/// cannot pick up an already-claimed row; only the reclaimer heals it).
+/// orphan stall, even with a live Active poller on the queue. A peer cannot
+/// take an already-claimed row; only the reclaimer heals it.
 #[tokio::test]
 async fn held_activity_whose_claimant_is_gone_reports_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -3516,9 +3507,8 @@ async fn held_activity_whose_claimant_is_gone_reports_no_worker() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
     assert_eq!(body["health"], "stalled", "body: {body}");
-    // The mirror image: claim eligibility is TRUE here (the Active peer covers
-    // the queue), so a coverage-only answer would omit the one reason that
-    // actually holds.
+    // The mirror image: the Active peer covers the queue, so claim eligibility
+    // is TRUE. A coverage-only answer would omit the one reason that holds.
     assert!(
         body["contributing_reason_codes"]
             .as_array()
@@ -3556,11 +3546,10 @@ async fn held_workflow_task_with_a_draining_claimant_is_progressing() {
 
 /// A tripped breaker on THIS replica is not a fleet-wide block.
 ///
-/// The registry is in-process (`circuit_breaker.rs`) and every worker process
-/// builds its own, so when a peer replica also polls the queue its breaker may
-/// be closed and it can still dispatch the task. Reporting
-/// `activity_circuit_open`/`stalled` from one local snapshot would be a false
-/// positive on the flagship stall verdict.
+/// The registry is in-process (`circuit_breaker.rs`), and each worker process
+/// builds its own. A peer replica that also polls the queue can have a closed
+/// breaker and dispatch the task. `activity_circuit_open`/`stalled` from one
+/// local snapshot would be a false positive on the flagship stall verdict.
 #[tokio::test]
 async fn open_circuit_is_not_reported_when_a_peer_replica_could_also_dispatch() {
     let (url, _guard) = setup_database().await;
@@ -3605,9 +3594,9 @@ async fn open_circuit_is_not_reported_when_a_peer_replica_could_also_dispatch() 
         body["health"], "stalled",
         "and it must not be escalated to a stall: {body}"
     );
-    // The advisory reason codes must agree with the headline -- reporting
-    // `circuit_open` there while the verdict says otherwise is the same
-    // two-surfaces-disagree bug the held-row liveness split fixed.
+    // The advisory reason codes must agree with the headline. A `circuit_open`
+    // code under another verdict is the two-surfaces-disagree bug that the
+    // held-row liveness split fixed.
     assert!(
         !body["contributing_reason_codes"]
             .as_array()
@@ -3821,33 +3810,31 @@ async fn same_build_workers_are_still_gated_by_the_registry_fallback() {
 
 // ── issue #1190: build-scope the rate-limit bypass per eligible worker ─────
 //
-// `cb_tracked` (the circuit-breaker-tracked-activity set) is read from THIS
-// replica's in-process registry, exactly like the breaker phase itself. It is
-// a compile-time `#[activity(circuit_breaker = ...)]` declaration, so during a
-// rolling deploy an eligible peer on a DIFFERENT build may declare it
-// differently. Neither direction of that disagreement may be reported: the
-// endpoint's direction-of-safety rule -- an unknown-build worker is assumed
-// capable, never assumed blocked -- applies here exactly as it does to the
-// breaker phase in `local_circuit_snapshot_is_authoritative`.
+// `cb_tracked` (the circuit-breaker-tracked-activity set) comes from THIS
+// replica's in-process registry, like the breaker phase. It is a compile-time
+// `#[activity(circuit_breaker = ...)]` declaration. So during a rolling deploy,
+// an eligible peer on a DIFFERENT build may declare it differently. Neither
+// direction of that disagreement may be reported. The direction-of-safety rule
+// applies: an unknown-build worker is assumed capable, never blocked. The
+// breaker phase in `local_circuit_snapshot_is_authoritative` follows the same
+// rule.
 //
-// None of these tests seed `LOCAL_WORKER_ID` as a live worker row, so this
-// replica's own build resolves to `""` (unidentified) -- the same "no
-// co-located worker has registered yet" shape `local_build_id_from_workers`
-// already documents, and here it stands in for "the sole eligible worker
-// runs a build we cannot vouch for."
+// None of these tests seed `LOCAL_WORKER_ID` as a live worker row. So this
+// replica's own build resolves to `""` (unidentified). That is the "no
+// co-located worker has registered yet" shape of `local_build_id_from_workers`.
+// Here it stands for "the sole eligible worker runs an unverifiable build."
 
 /// AC1: locally tracked (breaker-tracked), but the sole eligible worker is on
 /// a different build. `rate_limit_gate_applies` short-circuits to `false` on
-/// `locally_tracked` alone -- there is no cross-process breaker registry to
-/// consult, so a build mismatch on this side cannot be turned into a positive
-/// detection of the peer's real rate-limit block, only prevented from being
-/// masked BY a build check that would otherwise wrongly vouch for the local
-/// fact. This test therefore pins that the wire behavior is UNCHANGED from
-/// before the fix (`healthy_in_progress`, never `activity_rate_limited`) --
-/// the accepted false-negative direction, same as a fleet-wide breaker
-/// outage. The real, distinguishing regression coverage for this fix is the
-/// unit test `rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build`
-/// plus the AC2 tests below, which DO flip on a revert.
+/// `locally_tracked` alone. No cross-process breaker registry exists. So a
+/// build mismatch here cannot become a positive detection of the peer's real
+/// rate-limit block. The fix only stops a build check from wrongly vouching
+/// for the local fact. So this test pins UNCHANGED wire behavior:
+/// `healthy_in_progress`, never `activity_rate_limited`. That is the accepted
+/// false-negative direction, like a fleet-wide breaker outage. The regression
+/// coverage for this fix is the unit test
+/// `rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build`
+/// and the AC2 tests below. Those DO flip on a revert.
 #[tokio::test]
 async fn ac1_locally_tracked_activity_does_not_apply_the_bypass_to_an_off_build_peer() {
     let (url, _guard) = setup_database().await;
@@ -3905,10 +3892,10 @@ async fn ac1_locally_tracked_activity_does_not_apply_the_bypass_to_an_off_build_
 }
 
 /// AC2: NOT locally tracked, but the sole eligible worker is on a different
-/// build. That peer's build may declare the breaker, in which case its real
-/// gate is dispatch-time -- consulting the bucket and reporting
-/// `activity_rate_limited` would be a false positive on the flagship stall
-/// verdict, the worse direction per the issue's own analysis.
+/// build. That peer's build may declare the breaker, so its real gate is
+/// dispatch-time. A bucket check that reports `activity_rate_limited` is then a
+/// false positive on the flagship stall verdict. The issue rates that the worse
+/// direction.
 #[tokio::test]
 async fn ac2_untracked_activity_does_not_consult_the_bucket_for_an_off_build_peer() {
     let (url, _guard) = setup_database().await;
@@ -3988,13 +3975,11 @@ async fn ac2_untracked_activity_does_not_report_a_missing_bucket_for_an_off_buil
 }
 
 /// AC2, the partial-agreement half: TWO eligible workers, one on this
-/// replica's own build and one on a different build. Unanimity, not mere
-/// overlap, is what `every_eligible_worker_is_on_the_local_build` requires
-/// (see its unit test), because the local tracked/untracked fact must
-/// describe EVERY worker that might actually claim the row -- a single
-/// off-build peer among several eligible workers is exactly as unaccountable
-/// as being the sole eligible worker. This exercises that end to end, not
-/// just at the pure-function level.
+/// replica's own build and one on a different build.
+/// `every_eligible_worker_is_on_the_local_build` requires unanimity, not
+/// overlap (see its unit test). The local tracked/untracked fact must describe
+/// EVERY worker that might claim the row. One off-build peer among several is
+/// as unaccountable as a sole off-build worker. This test checks it end to end.
 #[tokio::test]
 async fn ac2_mixed_build_eligible_workers_still_suppress_the_verdict() {
     let (url, _guard) = setup_database().await;
@@ -4037,14 +4022,13 @@ async fn ac2_mixed_build_eligible_workers_still_suppress_the_verdict() {
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
 }
 
-/// A row with NO eligible worker at all is a DIFFERENT
-/// question from a row whose eligible worker is off-build. With no candidate
-/// worker there is no peer to disagree with, so the untracked activity's
-/// rate-limit fact is exactly as reliable as it always was -- and
-/// `contributing_reason_codes` (a union of every impediment, not just the
-/// headline winner) must still carry `rate_limit_exhausted` even though
-/// `activity_no_worker` wins the headline verdict, mirroring how
-/// `concurrency_saturated` already stays represented in the same situation.
+/// A row with NO eligible worker is a DIFFERENT question from a row whose
+/// eligible worker is off-build. With no candidate worker, no peer can
+/// disagree. So the untracked activity's rate-limit fact stays reliable.
+/// `contributing_reason_codes` is a union of every impediment, not only the
+/// headline. So it must still carry `rate_limit_exhausted`, though
+/// `activity_no_worker` wins the headline. `concurrency_saturated` stays in
+/// the codes in the same situation.
 #[tokio::test]
 async fn ac2_missing_worker_does_not_erase_a_co_occurring_rate_limit_reason() {
     let (url, _guard) = setup_database().await;
@@ -4089,11 +4073,10 @@ async fn ac2_missing_worker_does_not_erase_a_co_occurring_rate_limit_reason() {
     );
 }
 
-/// AC3: a single-build fleet -- every live worker (including this replica's
-/// own co-located one) shares one real build id -- behaves exactly as before
-/// this fix. A breaker-tracked activity's bucket is still bypassed even
-/// though a build id IS configured, because build agreement, not build
-/// absence, is what the fix actually keys on.
+/// AC3: a single-build fleet behaves as before this fix. Every live worker,
+/// including this replica's co-located one, shares one real build id. A
+/// breaker-tracked activity's bucket is still bypassed though a build id IS
+/// configured. The fix keys on build agreement, not build absence.
 #[tokio::test]
 async fn ac3_single_build_fleet_still_bypasses_the_bucket_for_a_tracked_activity() {
     let (url, _guard) = setup_database().await;
@@ -4132,12 +4115,11 @@ async fn ac3_single_build_fleet_still_bypasses_the_bucket_for_a_tracked_activity
 }
 
 /// AC3, the other half: a single-build fleet still reports a genuine
-/// rate-limit block for an UNTRACKED activity -- the pre-existing
+/// rate-limit block for an UNTRACKED activity. The tests
 /// `ac2_saturated_rate_limit_bucket_reports_activity_rate_limited` and
-/// `ac2_missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation`
-/// tests already regression-pin the no-build-ids-at-all shape (every worker
-/// advertises `""`); this pins the shape where a build id IS configured and
-/// simply agrees everywhere.
+/// `ac2_missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation` pin
+/// the shape with no build ids, where each worker advertises `""`. This test
+/// pins a configured build id that agrees everywhere.
 #[tokio::test]
 async fn ac3_single_build_fleet_still_reports_rate_limit_for_an_untracked_activity() {
     let (url, _guard) = setup_database().await;

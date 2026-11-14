@@ -217,8 +217,8 @@ pub struct HarvestRedisConfig {
 /// startup (issue #700 AC4).
 ///
 /// An *orphaned* type has ≥1 non-terminal execution whose `#[workflow]` handler
-/// is no longer registered in this build — those runs would wedge in permanent
-/// replay failure. This action defaults to `Warn` (non-breaking): mixed fleets
+/// this build no longer registers. Those runs would wedge in permanent replay
+/// failure. This action defaults to `Warn` (non-breaking): mixed fleets
 /// mid-rollout must not crash-loop just because an old handler was removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

@@ -26,10 +26,6 @@ use crate::worker_outlier::{
     OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats, outlier_dimensions,
 };
 
-// ---------------------------------------------------------------------------
-// WorkerRegistration
-// ---------------------------------------------------------------------------
-
 /// Static fields that identify a worker process, used for initial registration
 /// and heartbeat self-healing.
 ///
@@ -69,10 +65,6 @@ use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use crate::worker::DbPool;
 
-// ---------------------------------------------------------------------------
-// WorkerStatus
-// ---------------------------------------------------------------------------
-
 /// Lifecycle status of a worker process.
 ///
 /// **Why does this exist?**
@@ -99,7 +91,7 @@ impl WorkerStatus {
         }
     }
 
-    /// Safely attempts to match an incoming string from an API request to a known `WorkerStatus` state.
+    /// Parse a status string from an API request. An unknown string gives `None`.
     #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -375,32 +367,31 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
 }
 
 /// Register a worker **and** clear the stale capability-miss evidence its id
-/// may still carry, atomically (issue #804, Codex rounds 26 and 28).
+/// may still carry, atomically (issue #804).
 ///
 /// The two writes must land together or not at all, for two independent
 /// reasons.
 ///
 /// **A published-but-uncleaned worker is affirmative fleet evidence against
-/// itself.** `register_worker` upserts on `worker_id`, so a pod restarting
-/// under the same configured id onto a build that *does* register the missing
-/// handler republishes itself as live. Capability-miss evidence stores bare
-/// ids, so until the invalidation lands, every task that id missed on its
-/// previous build still names it — and another claimant reading the registry
-/// sees the whole live fleet as already covered, derives
-/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`], and
-/// terminally fails a run at exactly the moment the fix arrived. Committing the
-/// registration while the invalidation fails is therefore strictly worse than
-/// not registering at all, and "log and continue" leaves precisely that state.
-/// Rolling back keeps the worker unpublished until the pair succeeds, and the
-/// heartbeat's missing-row self-heal retries it within one interval.
+/// itself.** `register_worker` upserts on `worker_id`. A pod can restart under
+/// the same configured id onto a build that *does* register the missing
+/// handler. It then republishes itself as live. Capability-miss evidence
+/// stores bare ids. Until the invalidation lands, every task that id missed on
+/// its previous build still names it. Another claimant that reads the registry
+/// then sees the whole live fleet as already covered. It derives
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
+/// terminally fails a run at exactly the moment the fix arrived. So a
+/// registration committed while the invalidation fails is strictly worse than
+/// no registration. "Log and continue" leaves precisely that state. Rolling
+/// back keeps the worker unpublished until the pair succeeds. The heartbeat's
+/// missing-row self-heal retries it within one interval.
 ///
 /// **Atomicity is also what makes a claimant's reads coherent.** A decision
 /// brackets its fleet read between two miss-state reads and requires them to
 /// agree (see `worker::miss_evidence_confidence`). That check is only sound if
-/// registration and invalidation are a single commit: split them, and a
-/// claimant can observe a world where the peer is already in the fleet but its
-/// evidence is not yet cleared — which reads as covered, agrees across both
-/// miss reads, and escalates.
+/// registration and invalidation are a single commit. Split them, and a
+/// claimant can see the peer in the fleet with its evidence not yet cleared.
+/// That reads as covered, agrees across both miss reads, and escalates.
 ///
 /// The same transaction drops the worker's task-stats row (issue #1815). A
 /// restarted process starts with an empty outcome window. Without the
@@ -2017,15 +2008,13 @@ pub async fn transition_status(
 /// Transition a worker row from `Active` to `Draining`, leaving rows that are
 /// already `Draining` or `Stopped` untouched.
 ///
-/// Used by the heartbeat task to repair shard rows that were still `Active`
-/// because the drain fan-out could not reach the shard (network partition or
-/// transient unavailability).  The `Active`-only guard ensures this never
-/// reverts a row that was already advanced by a concurrent path.
+/// The heartbeat task uses it to repair shard rows that stay `Active` because
+/// the drain fan-out missed the shard (partition or transient unavailability). The `Active`-only guard never reverts a row that a
+/// concurrent path already advanced.
 ///
-/// `drain_deadline` is written to `drain_deadline_at` in the same statement
-/// so that the deduplication layer (`dedup_workers_by_freshest`) sees the
-/// correct drain window even when this newly-repaired row becomes the freshest
-/// snapshot (issue #522 review).
+/// The same statement writes `drain_deadline` to `drain_deadline_at`. So the
+/// deduplication layer (`dedup_workers_by_freshest`) sees the correct drain
+/// window when this repaired row becomes the freshest snapshot (issue #522).
 ///
 /// # Errors
 ///
@@ -2053,19 +2042,19 @@ async fn transition_active_to_draining(
 /// Does a worker advertising `assignments` cover `shard_id`?
 ///
 /// **The canonical shard-membership predicate for the whole workspace.** It
-/// lives in core (rather than beside its first plugin caller) because
-/// `autumn-harvest` itself has consumers — `apply_worker_filters` below — that
-/// cannot reach into `autumn-harvest-plugin`, and every independent
-/// re-implementation of this rule has so far drifted.
+/// lives in core, not beside its first plugin caller. `autumn-harvest` itself
+/// has consumers, such as `apply_worker_filters` below, that cannot reach into
+/// `autumn-harvest-plugin`. Every independent re-implementation of this rule
+/// has so far drifted.
 ///
 /// The rule: an **empty** assignment array means *"covers whatever shard the
 /// row was read from"*, not *"covers nothing"*. A worker registers an empty
 /// array in two situations that are both legitimate coverage:
 ///
 /// * it is a legacy row written before per-shard assignments existed, and
-/// * since issue #961 it is a worker with **no sharded pool** — there is no
-///   shard identity to advertise, so the empty list is preserved rather than
-///   fabricating a `0` the process never established.
+/// * since issue #961 it is a worker with **no sharded pool**. It has no shard
+///   identity to advertise. So the empty list stays, and no `0` is fabricated
+///   that the process never established.
 ///
 /// Hardcoding `shard_id == 0` instead would falsely report such a worker
 /// uncovered on a non-zero-numbered single shard, since [`ShardRouter`] accepts
@@ -2120,9 +2109,9 @@ pub fn shard_assignments_cover_from_source(
 
 /// Apply queue, shard, health, and limit filters to an already-loaded worker list.
 ///
-/// The limit is intentionally applied **after** the in-process `retain` passes so
-/// that a SQL-level page size cannot silently exclude matching rows that appear
-/// beyond the first N rows of the unfiltered table.
+/// The limit applies **after** the in-process `retain` passes. A SQL-level page
+/// size could otherwise exclude matching rows beyond the first N rows of the
+/// unfiltered table.
 fn apply_worker_filters(mut results: Vec<WorkerRow>, filters: &WorkerFilters) -> Vec<WorkerRow> {
     if let Some(ref queue) = filters.queue {
         results.retain(|r| {
@@ -2133,10 +2122,10 @@ fn apply_worker_filters(mut results: Vec<WorkerRow>, filters: &WorkerFilters) ->
         });
     }
     if let Some(shard_val) = filters.shard_id {
-        // Issue #1150 / #961: route through the canonical predicate so a worker
-        // advertising the empty (auto / legacy) assignment shape is not dropped
-        // from `GET /workers?shard_id=N` while shard health, queue coverage and
-        // preflight all report it as covering that shard.
+        // Issue #1150 / #961: use the canonical predicate. A worker with the
+        // empty (auto / legacy) assignment shape then stays in
+        // `GET /workers?shard_id=N`. Shard health, queue coverage and preflight
+        // all report it as covering that shard.
         results.retain(|r| shard_assignments_cover(&r.worker.shard_assignments, shard_val));
     }
     if let Some(health_filter) = filters.health {
@@ -2298,32 +2287,33 @@ pub async fn fleet_health(
 ///
 /// The reclaimer judges a row it is entitled to judge, with a window derived
 /// from its own configured cadence. This query judges *peers*, whose cadence the
-/// caller does not know and cannot read — nothing in `harvest_workers` records
-/// it. Applying the caller's own `2 × worker_heartbeat_interval` here would let
-/// a worker heartbeating every second declare a live peer on the **default**
-/// five-second cadence dead, which the capability-miss path then reads as "no
-/// capable worker is live" and turns into a terminal failure. Callers therefore
-/// pass [`crate::worker::capability_miss_fleet_stale_secs`], which floors the
+/// caller does not know and cannot read. Nothing in `harvest_workers` records
+/// it. Say the caller applies its own `2 × worker_heartbeat_interval` here and
+/// heartbeats every second. It would then declare a live peer on the
+/// **default** five-second cadence dead. The capability-miss path reads that as
+/// "no capable worker is live" and turns it into a terminal failure. So callers
+/// pass [`crate::worker::capability_miss_fleet_stale_secs`]. It floors the
 /// window at a fleet-wide bound that covers any peer at the supported cadence.
 ///
-/// The error directions are what make one window unsafe for both: too *narrow*
-/// here fabricates an escalation, while too *wide* only delays one (the
-/// distinct-worker bound and the absolute ceiling still fire).
+/// The error directions make one window unsafe for both. Too *narrow* here
+/// fabricates an escalation. Too *wide* only delays one, because the
+/// distinct-worker bound and the absolute ceiling still fire.
 ///
 /// `status` is deliberately **not** filtered. A `Draining` worker still
-/// belongs in the live set: it is a worker the fleet may still be told to keep,
-/// and excluding it would let a capability-miss escalation conclude "no capable
-/// worker" while a capable drainer is a rollback away. A genuinely gone worker
-/// stops heartbeating and ages out of this query on its own, which is the
-/// self-healing behaviour the freshness window already provides.
+/// belongs in the live set, because the fleet may still be told to keep it.
+/// Excluding it would let a capability-miss escalation conclude "no capable
+/// worker" while a capable drainer is a rollback away. A gone worker stops
+/// heartbeating and ages out of this query on its own. The freshness window
+/// already provides that self-healing.
 /// `build_id` and `labels` come back too, because advertising the queue is
-/// only the *first* of `claim_task`'s gates. The task's own `required_build_id`
-/// (#171) and `required_capabilities` (#522) are checked against these in
-/// [`crate::worker::claim_eligible_workers`]; a worker that fails them can
-/// never claim, so counting it as a possible capable peer would withhold the
-/// redelivery budget forever. Those gates are **not** applied here because they
-/// depend on the task, not the queue — this query answers "who is live on this
-/// queue", and the caller narrows it to "who could claim *this task*".
+/// only the *first* of `claim_task`'s gates.
+/// [`crate::worker::claim_eligible_workers`] checks them against the task's own
+/// `required_build_id` (#171) and `required_capabilities` (#522). A worker that
+/// fails them can never claim. Counting it as a possible capable peer would
+/// withhold the redelivery budget forever. Those gates are **not** applied
+/// here, because they depend on the task, not the queue. This query answers
+/// "who is live on this queue". The caller narrows it to "who could claim
+/// *this task*".
 #[must_use]
 pub const fn live_workers_on_queue_query() -> &'static str {
     "SELECT worker_id, build_id, labels FROM harvest_workers \
@@ -2334,8 +2324,8 @@ pub const fn live_workers_on_queue_query() -> &'static str {
 /// A live worker's inputs to `claim_task`'s per-task eligibility gates
 /// (issue #804).
 ///
-/// Deliberately just the three columns those gates read, rather than a whole
-/// [`HarvestWorker`]: the capability-miss path runs on every miss, and the
+/// It holds just the three columns those gates read, not a whole
+/// [`HarvestWorker`]. The capability-miss path runs on every miss, and the
 /// fleet read is pure overhead on the way to a decision.
 #[derive(Debug, Clone, diesel::QueryableByName)]
 pub struct LiveWorker {
@@ -2367,16 +2357,16 @@ impl LiveWorker {
 
 /// Worker ids with a fresh heartbeat that advertise `queue_name` (issue #804).
 ///
-/// This is the *fleet* half of the capability-miss decision: the task's
-/// `capability_miss_workers` array says which workers have demonstrably no
-/// handler for it, and this says which workers could claim it at all. Only when
-/// the first covers the second is "no capable worker is live" an actual
-/// conclusion rather than an assumption drawn from a fixed redelivery budget.
+/// This is the *fleet* half of the capability-miss decision. The task's
+/// `capability_miss_workers` array says which workers have no handler for it.
+/// This says which workers could claim it at all. Only when the first covers
+/// the second is "no capable worker is live" a conclusion. Otherwise it is an
+/// assumption drawn from a fixed redelivery budget.
 ///
 /// Pass [`crate::worker::capability_miss_fleet_stale_secs`] for
-/// `worker_stale_secs`, never the bare [`crate::worker::worker_stale_secs`] —
-/// see [`live_workers_on_queue_query`] for why judging peers by the caller's own
-/// cadence turns a healthy fleet into a terminal failure.
+/// `worker_stale_secs`, never the bare [`crate::worker::worker_stale_secs`].
+/// [`live_workers_on_queue_query`] explains why. Judging peers by the caller's
+/// own cadence turns a healthy fleet into a terminal failure.
 ///
 /// # Errors
 ///
@@ -2692,9 +2682,8 @@ pub async fn read_worker_drain_deadline(
 /// Read the `drain_deadline_at` for a worker that is currently `Draining`.
 ///
 /// Returns `None` when the worker row does not exist, has no deadline set, or
-/// is in any other state (e.g. `Active` with a stale deadline left from a
-/// previous drain cycle that was interrupted before `register_worker` cleared
-/// it).
+/// is in any other state. An example is `Active` with a stale deadline from an
+/// interrupted drain cycle that `register_worker` has not yet cleared.
 ///
 /// # Errors
 ///
@@ -2808,9 +2797,8 @@ pub async fn request_drain(
             });
         }
     } else if outcome == DrainOutcome::AlreadyDraining && deadline_is_explicit {
-        // Worker is already Draining and the caller supplied an explicit deadline
-        // — refresh it so operators can extend or correct the window without
-        // re-triggering the status transition.
+        // Refresh an explicit deadline on a Draining worker. Operators can then
+        // extend or correct the window without a new status transition.
         diesel::update(harvest_workers::table.find(worker_id))
             .set(harvest_workers::drain_deadline_at.eq(deadline_at))
             .execute(conn)
@@ -2872,20 +2860,20 @@ pub async fn drain_preview(
 
 /// Remove a worker row whose registration could not be verified (issue #804).
 ///
-/// A row that survives a rolled-back registration is not merely out of date —
-/// it is *affirmative false evidence*. The capability-miss fleet read counts a
-/// live worker that appears in `capability_miss_workers` as one that has
-/// already missed the task, so a surviving row keeps a peer's
-/// `AllLiveWorkersMissed` conclusion alive for the whole 120 s liveness floor
-/// while this worker is unable to publish the build it is actually running.
-/// An **absent** row is neutral: the worker is simply not part of the fleet
-/// read, which is the truth while its registration is unverified.
+/// A row that survives a rolled-back registration is not merely out of date.
+/// It is *affirmative false evidence*. The capability-miss fleet read counts a
+/// live worker in `capability_miss_workers` as one that already missed the
+/// task. So a surviving row keeps a peer's `AllLiveWorkersMissed` conclusion
+/// alive for the whole 120 s liveness floor. Meanwhile this worker cannot
+/// publish the build it actually runs. An **absent** row is neutral. The
+/// worker is simply not part of the fleet read, which is the truth while its
+/// registration is unverified.
 ///
-/// Deliberately a single-table `DELETE`, so it can still succeed when the
-/// register+invalidate transaction cannot — the failure is usually in that
-/// transaction's `harvest_task_queue` half. It is best-effort: on failure the
-/// caller falls back to letting the row age out, and the next heartbeat
-/// retries both. `register_worker` re-inserts on the first successful retry.
+/// It is deliberately a single-table `DELETE`, so it can succeed when the
+/// register+invalidate transaction cannot. That failure is usually in the
+/// `harvest_task_queue` half. It is best-effort. On failure the caller lets
+/// the row age out, and the next heartbeat retries both. `register_worker`
+/// re-inserts on the first successful retry.
 async fn withdraw_unverified_worker_row(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
@@ -2915,16 +2903,16 @@ async fn withdraw_unverified_worker_row(
 /// evidence, so an incapable claimant can derive
 /// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
 /// terminally fail work this worker can run. And its own claims match
-/// `orphaned_running_tasks_query()` — `RUNNING` rows whose `worker_id` has no
-/// fresh heartbeat — so `reclaim_orphaned_tasks` burns a `crash_strikes`
-/// increment on each until `poison_pill_threshold` quarantines the task,
-/// manufacturing a #367 quarantine out of a capability problem.
+/// `orphaned_running_tasks_query()`: `RUNNING` rows whose `worker_id` has no
+/// fresh heartbeat. So `reclaim_orphaned_tasks` burns a `crash_strikes`
+/// increment on each until `poison_pill_threshold` quarantines the task. That
+/// makes a #367 quarantine out of a capability problem.
 ///
-/// Arming also routes the next tick through [`do_heartbeat_tick`]'s
-/// top-of-function retry, which is the same heal carrying the reused-`worker_id`
-/// protections (withdraw the unverified row; never refresh a row known to be
-/// wrong). The success arm clears the flag, because a worker that heals itself
-/// must be able to claim again without a restart.
+/// Arming also routes the next tick through the top-of-function retry of
+/// [`do_heartbeat_tick`]. That is the same heal with the reused-`worker_id`
+/// protections: withdraw the unverified row, and never refresh a row known to
+/// be wrong. The success arm clears the flag, because a worker that heals
+/// itself must be able to claim again without a restart.
 async fn heal_missing_worker_row(
     conn: &mut AsyncPgConnection,
     registration: &WorkerRegistration,
@@ -2968,10 +2956,9 @@ async fn heal_missing_worker_row(
 /// against itself.
 ///
 /// `register_worker_and_clear_stale_miss_evidence` upserts, so this is
-/// correct whether or not a row survives. The flag is cleared only on
-/// success, so a still-failing database is retried on the next tick rather
-/// than silently given up on; a worker that registered cleanly at startup
-/// never enters this branch and its tick is byte-for-byte unchanged.
+/// correct whether or not a row survives. Only success clears the flag, so
+/// the next tick retries a still-failing database. A worker that registered
+/// cleanly at startup never enters this branch, and its tick is unchanged.
 ///
 /// Returns `false` when the caller must skip the rest of this tick — the
 /// retry itself failed and withdrew the unverified row.
@@ -3007,20 +2994,20 @@ async fn retry_pending_startup_registration(
             // evidence, and it is exactly what can produce
             // `AllLiveWorkersMissed` and a terminal failure of a task this
             // worker can run. Publishing nothing is strictly more honest
-            // than republishing something known-false, so the unverified
+            // than republishing something known-false. So the unverified
             // row is left to age out of the liveness window until the
             // atomic pair succeeds.
             //
             // Accepted trade-off: a stale row also makes this worker's
             // in-flight rows look orphaned to the poison-pill reclaimer
-            // (#367), which re-queues them. That is recoverable —
-            // at-least-once is the documented activity contract — whereas
-            // the false `AllLiveWorkersMissed` is a terminal `WorkflowFailed`
-            // needing operator action, so issue #804's own preference
-            // ("prefer holding a task over terminally failing an
-            // execution") settles the ordering. Remote-drain detection is
-            // likewise skipped for this tick; a worker that cannot register
-            // is already invisible to the fleet.
+            // (#367), which re-queues them. That is recoverable, because
+            // at-least-once is the documented activity contract. The false
+            // `AllLiveWorkersMissed` is a terminal `WorkflowFailed` that
+            // needs operator action. Issue #804's own preference settles
+            // the ordering: "prefer holding a task over terminally failing
+            // an execution". Remote-drain detection is likewise skipped for
+            // this tick. A worker that cannot register is already invisible
+            // to the fleet.
             //
             // Ageing out is not fast enough on its own (issue #804). The
             // capability-miss fleet window is floored at 120 s. For that whole
@@ -3118,8 +3105,8 @@ pub async fn do_heartbeat_tick(
                 // the fan-out missed it (e.g. shard recovered after the drain was
                 // issued).  Guarded to Active rows only so it never reverts a row
                 // that already reached Draining or Stopped.
-                // Also write the current monotonic drain deadline (issue #522
-                // review). Then the dedup-by-freshest layer does not mask the
+                // Also write the current monotonic drain deadline (issue #522).
+                // Then the dedup-by-freshest layer does not mask the
                 // effective drain window when this row's heartbeat is the most
                 // recent one.
                 let current_deadline = drain_deadline_max.lock().ok().and_then(|g| *g);
@@ -3147,7 +3134,7 @@ pub async fn do_heartbeat_tick(
                 // this worker's status to Draining.  Cancel the worker's
                 // poll-loop token (not the heartbeat token) so the poll loop
                 // stops accepting new work while heartbeats continue until
-                // fully stopped (P1). The status comes from the heartbeat
+                // fully stopped. The status comes from the heartbeat
                 // write itself (issue #1879).
                 if status == WorkerStatus::Draining.as_str() {
                     tracing::info!(
@@ -3225,29 +3212,27 @@ pub fn spawn_worker_heartbeat(
     interval: Duration,
     cancel: CancellationToken,
     worker_shutdown: CancellationToken,
-    // Populated when a remote drain is detected: absolute Instant of the
-    // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
-    // so that extended deadlines are picked up by drain_in_flight.
+    // Set when a remote drain is detected: the absolute Instant of the
+    // operator-supplied drain_deadline_at. Each heartbeat tick refreshes it,
+    // so drain_in_flight picks up extended deadlines.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
     // Maximum `drain_deadline_at` value applied to `remote_drain_deadline` so far,
-    // shared across this worker's per-shard heartbeat tasks. Using the maximum
-    // (rather than a full set) prevents a shard whose row was never updated from
-    // the prior deadline from reverting the cell: stale shorter values are rejected
-    // while genuine extensions (newer, later values) always advance the cell.
+    // shared across this worker's per-shard heartbeat tasks. The maximum, not a
+    // full set, stops a shard with a stale row from reverting the cell. Stale
+    // shorter values are rejected. Genuine extensions always advance the cell.
     drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
-    // In-process worker-session registry (issue #606): sampled fresh each
-    // tick (mirroring `in_flight` above) so `harvest_workers.in_use_sessions`
-    // — previously always written as a literal `0` — reflects this worker's
-    // actual live session count.
+    // In-process worker-session registry (issue #606), sampled fresh each tick
+    // like `in_flight`. So `harvest_workers.in_use_sessions` reflects the live
+    // session count of this worker. It was previously always a literal `0`.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
     // Set by startup when the atomic register+invalidate pair failed and rolled
     // back (issue #804). The missing-row arm of the tick heals an absent row.
     // A reused `worker_id` is different. A configured stable id, such as a pod
     // name, leaves the PREVIOUS row alive. The heartbeat then updates that
     // row, and the pair is never retried. This worker would then poll
-    // indefinitely while the registry advertises the old build's
-    // `build_id`/queues and its id remains in `capability_miss_workers`,
-    // letting a peer read the live fleet as `AllLiveWorkersMissed` and
+    // indefinitely. The registry would advertise the old build's
+    // `build_id`/queues, and its id would stay in `capability_miss_workers`.
+    // A peer could then read the live fleet as `AllLiveWorkersMissed` and
     // terminally fail a task this worker can run.
     registration_pending: Arc<AtomicBool>,
     // Read fresh every tick, never cached with `labels_json` below (issue
@@ -3277,9 +3262,9 @@ pub fn spawn_worker_heartbeat(
             if crate::replication::shard_writes_held(held_gate) {
                 continue;
             }
-            // Loaded fresh each tick (issue #548 review): a tuned worker's
-            // dispatch target can change between heartbeats, so a value
-            // captured once at spawn time would drift from reality.
+            // Loaded fresh each tick (issue #548). The dispatch target of a
+            // tuned worker can change between heartbeats. A value captured at
+            // spawn time would drift from reality.
             //
             // UFCS is required here: `diesel_async::RunQueryDsl::load` is in
             // scope in this module and its blanket by-value-receiver impl
@@ -3374,27 +3359,21 @@ pub fn spawn_worker_heartbeat(
     })
 }
 
-/// Fetch `drain_deadline_at` from the DB and write it as an absolute
-/// `std::time::Instant` into the shared cell used by `drain_in_flight`.
-/// Called both on first drain detection and on every subsequent heartbeat
-/// tick while the worker is draining, so that an operator-extended deadline
-/// is reflected without a restart.
 /// Decide whether an observed `drain_deadline_at` should be applied to the
-/// shared effective-deadline cell, recording it as applied when so (issue #522
-/// review).
+/// shared effective-deadline cell, recording it as applied when so (issue #522).
 ///
 /// Returns `true` when `deadline` is strictly greater than the maximum deadline
-/// applied so far (or when no deadline has been applied yet), advancing `max` in
-/// the process.  Returns `false` for equal or earlier values, which are either
-/// idempotent re-observations of the current deadline or stale values from a
-/// shard row that was not updated when the operator last changed the deadline.
+/// applied so far, or when none is applied yet. It then advances `max`.
+/// Returns `false` for equal or earlier values. They are idempotent
+/// re-observations of the current deadline, or stale values from a shard row
+/// that missed the operator's last deadline change.
 ///
-/// Using the strict-max rule prevents a lagging shard from reverting the shared
-/// drain-deadline cell: if shard A was unreachable when the operator extended
-/// T1 → T2 and only A's row still holds T1, A's heartbeat will correctly reject
-/// T1 (T1 < T2 = current max).  Operator-driven shortening is not reflected in
-/// the in-process cell, but the local `shutdown_timeout` fallback still bounds
-/// the drain, and an operator who needs a hard stop can send SIGTERM.
+/// The strict-max rule stops a lagging shard from reverting the shared
+/// drain-deadline cell. Say shard A was unreachable when the operator extended
+/// T1 → T2, and only A's row still holds T1. A's heartbeat then rejects T1
+/// (T1 < T2 = current max). The in-process cell does not reflect an
+/// operator-driven shortening. The local `shutdown_timeout` fallback still
+/// bounds the drain, and an operator who needs a hard stop can send SIGTERM.
 fn classify_drain_deadline(max: &mut Option<DateTime<Utc>>, deadline: DateTime<Utc>) -> bool {
     if max.is_none_or(|m| deadline > m) {
         *max = Some(deadline);
@@ -3404,12 +3383,17 @@ fn classify_drain_deadline(max: &mut Option<DateTime<Utc>>, deadline: DateTime<U
     }
 }
 
+/// Fetch `drain_deadline_at` from the DB and write it as an absolute
+/// `std::time::Instant` into the shared cell used by `drain_in_flight`.
+/// It runs on first drain detection and on every later heartbeat tick while
+/// the worker drains. So an operator-extended deadline applies without a
+/// restart.
 async fn sync_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     // Maximum `drain_deadline_at` value applied to `cell` so far, shared across
-    // this worker's per-shard heartbeat tasks.  A new deadline is applied only
-    // when it is strictly greater than the current max (issue #522 review).
+    // this worker's per-shard heartbeat tasks. A new deadline is applied only
+    // when it is strictly greater than the current max (issue #522).
     max_applied: &Mutex<Option<DateTime<Utc>>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
@@ -5055,9 +5039,9 @@ mod tests {
         );
     }
 
-    /// The fleet lookup that gates the capability-miss redelivery budget
-    /// (issue #804) must keep using the SAME liveness predicate as the
-    /// poison-pill orphan reclaimer, and must scope to the task's own queue.
+    /// The fleet lookup gates the capability-miss redelivery budget (issue
+    /// #804). It must use the SAME liveness predicate as the poison-pill orphan
+    /// reclaimer, and must scope to the task's own queue.
     /// Two subsystems disagreeing about "is this worker alive" would let one
     /// escalate on a fleet the other still considers healthy.
     #[test]
@@ -5103,7 +5087,7 @@ mod tests {
         assert_eq!(WorkerStatus::from_str("active"), None); // case-sensitive
     }
 
-    // -- classify_drain_deadline (cross-shard merge, issue #522 review) --
+    // -- classify_drain_deadline (cross-shard merge, issue #522) --
 
     #[test]
     fn classify_drain_deadline_applies_initial_and_skips_same_value() {
@@ -5564,9 +5548,9 @@ mod tests {
         assert_eq!(ids[0].as_str().unwrap(), tid.to_string());
     }
 
-    // -- Worker session capacity surfaces via WorkerRow's #[serde(flatten)]
-    //    HarvestWorker (issue #606) -- no handler change needed for
-    //    GET /workers / GET /workers/{id} to expose these fields.
+    // -- Worker session capacity surfaces via the #[serde(flatten)]
+    //    HarvestWorker of WorkerRow (issue #606). GET /workers and
+    //    GET /workers/{id} expose these fields with no handler change.
 
     #[test]
     fn worker_row_flattens_session_capacity_fields() {

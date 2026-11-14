@@ -1,50 +1,44 @@
 //! Integration tests for the `history_bloat_min_events` operator early-warning
-//! discovery filter on `GET /workflows` (issue #704, AC1/AC2/AC7), plus a
-//! regression proof (issue #704 / PR #1139 review, P1) that the pre-existing,
-//! general-purpose `min_history_events` filter (issue #493) still composes
-//! freely with `state=`/pagination — the exact composition an earlier
-//! revision of this feature broke by reusing that query-parameter name for
-//! the (functionally incompatible) dedicated discovery path below.
+//! discovery filter on `GET /workflows` (issue #704, AC1/AC2/AC7).
 //!
-//! Verifies, against a real Postgres-backed HTTP router, that
-//! `history_bloat_min_events`:
-//! - returns only live (non-terminal) executions whose current recorded
-//!   history event count is `>= N`, sorted by history size descending (AC1);
-//! - includes each row's current `history_event_count` so callers can
+//! They also prove that the general-purpose `min_history_events` filter
+//! (issue #493) still composes with `state=` and pagination (PR #1139). An
+//! earlier revision broke that composition. It reused that parameter name for
+//! the incompatible dedicated discovery path below.
+//!
+//! Against a real Postgres-backed HTTP router, `history_bloat_min_events`:
+//! - returns only live (non-terminal) executions whose recorded history event
+//!   count is `>= N`, sorted by history size descending (AC1);
+//! - includes each row's current `history_event_count`, so callers can
 //!   rank/triage without a second call (AC2);
 //! - rejects an invalid (non-numeric / negative) value with a `400` JSON
 //!   error body, never a `500` or a silent empty match (AC7);
-//! - rejects composition with `cursor`/`page_size`/`order` pagination with a `400`
-//!   (the computed sort has no keyset cursor, so silently mis-ordering a
-//!   paginated response would be worse than a clear rejection);
+//! - rejects `cursor`/`page_size`/`order` pagination with a `400`. The
+//!   computed sort has no keyset cursor, and a silent mis-order is worse than
+//!   a clear rejection;
 //!
-//! and that `min_history_events` (issue #493, unchanged) is unaffected:
-//! - composes with `state=` (including terminal states, which
-//!   `history_bloat_min_events` always excludes);
-//! - composes with `page_size`/`order` pagination (the paginated object
-//!   response shape, not the `400` `history_bloat_min_events` produces for
-//!   the same params).
+//! and `min_history_events` (issue #493, unchanged):
+//! - composes with `state=`, terminal states included, which
+//!   `history_bloat_min_events` always excludes;
+//! - composes with `page_size`/`order` pagination and returns the paginated
+//!   object shape, not a `400`.
 //!
-//! Further PR #1139 review findings, each with a dedicated regression test at
-//! the end of this file:
-//! - finding #3: `failure_cause` (issue #506) must narrow the
-//!   `history_bloat_min_events` results, not be silently ignored;
-//! - finding #4: `no_progress_minutes` (issue #486, stalled-workflow
-//!   discovery) and `history_bloat_min_events` are mutually-exclusive
-//!   discovery paths and must be rejected with `400` when combined, rather
-//!   than letting one silently win;
-//! - finding B: `min_history_events` (issue #493) must still compose with
-//!   `history_bloat_min_events` when both are supplied at once. The two `>=`
-//!   thresholds are `AND`ed together (the stricter of the two), and neither
-//!   is silently dropped;
-//! - finding C: the per-shard candidate query is bounded to `filters.limit`
-//!   and ordered by history size descending, *before* any full execution row
-//!   is loaded. This holds even when a single shard alone has more matching
-//!   candidates than the global limit;
-//! - finding b: `history_event_count` must stay ABSENT on the legacy
-//!   `no_progress_minutes` (stalled-workflow) discovery path. That holds even
-//!   when the composed `min_history_events` filter is ALSO satisfied. The
-//!   field is exclusive to the dedicated `history_bloat_min_events` path.
+//! PR #1139 review findings, each with a regression test at the end of this
+//! file:
+//! - `failure_cause` (issue #506) narrows the `history_bloat_min_events`
+//!   results and is not ignored;
+//! - `no_progress_minutes` (issue #486, stalled-workflow discovery) and
+//!   `history_bloat_min_events` are mutually exclusive. Together they return
+//!   `400`, so neither one silently wins;
+//! - `min_history_events` (issue #493) still composes with
+//!   `history_bloat_min_events`. The two `>=` thresholds are `AND`ed (the
+//!   stricter wins), and neither is dropped;
+//! - the per-shard candidate query is bounded to `filters.limit` and ordered
+//!   by history size descending, *before* any full execution row is loaded.
+//!   This holds even when one shard has more candidates than the global limit;
+//! - `history_event_count` stays ABSENT on the legacy `no_progress_minutes`
+//!   (stalled-workflow) path, even when `min_history_events` also matches.
+//!   The field is exclusive to the `history_bloat_min_events` path.
 
 use std::collections::BTreeMap;
 
@@ -179,12 +173,11 @@ async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, V
     (status, json)
 }
 
-/// Seed a RUNNING workflow execution (a single `WorkflowStarted` event) and
-/// then pad its recorded history with `extra_events` additional raw rows so
-/// its total `history_event_count` is `1 + extra_events`. The padding rows'
-/// content is never deserialized/replayed by these HTTP-only tests -- only
-/// counted -- so a minimal, structurally-arbitrary `MarkerRecorded` payload
-/// is sufficient.
+/// Seed a RUNNING workflow execution and pad its history with `extra_events`
+/// raw rows, so its `history_event_count` is `1 + extra_events`.
+///
+/// These HTTP-only tests only count the padding rows and never replay them.
+/// So a minimal, arbitrary `MarkerRecorded` payload is enough.
 async fn seed_workflow_with_history_size(
     database_url: &str,
     shard: ShardId,
@@ -265,12 +258,13 @@ async fn seed_workflow_with_history_size(
     exec_id
 }
 
-/// Backdate every recorded event for an execution by `hours_ago` hours --
-/// mirrors `stalled_workflow_tests.rs::seed_stalled_workflow`'s backdating
-/// step, factored out here so it composes with `seed_workflow_with_history_size`
-/// (which seeds a specific *event count*, not a specific *staleness*).  Used
-/// to prove a row can satisfy BOTH `no_progress_minutes` (staleness) and
-/// `min_history_events` (count) at once (PR #1139, finding b).
+/// Backdate every recorded event for an execution by `hours_ago` hours.
+///
+/// This mirrors the backdating step of
+/// `stalled_workflow_tests.rs::seed_stalled_workflow`. It composes with
+/// `seed_workflow_with_history_size`, which seeds an event count, not a
+/// staleness. A row can then satisfy both `no_progress_minutes` and
+/// `min_history_events` at once (PR #1139).
 async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago: i64) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -289,9 +283,10 @@ async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago
     .expect("backdate events");
 }
 
-/// Force an execution's persisted state directly (bypassing a real worker) --
-/// used to prove a terminal execution is excluded from the discovery filter
-/// (AC1: "live (non-terminal)") regardless of how large its history is.
+/// Force an execution's persisted state directly, without a worker.
+///
+/// It proves that the discovery filter excludes a terminal execution of any
+/// history size (AC1: "live (non-terminal)").
 async fn force_execution_state(database_url: &str, exec_id: ExecutionId, state: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -304,10 +299,9 @@ async fn force_execution_state(database_url: &str, exec_id: ExecutionId, state: 
         .expect("force execution state");
 }
 
-/// Force an execution's `search_attrs` column directly (bypassing a real
-/// worker) -- mirrors `force_execution_state`'s pattern; used to seed the
-/// `failure_cause` composition regression test (PR #1139 review, finding #3)
-/// below.
+/// Force an execution's `search_attrs` column directly, without a worker.
+///
+/// It seeds the `failure_cause` composition regression test below (PR #1139).
 async fn force_search_attrs(database_url: &str, exec_id: ExecutionId, search_attrs: Value) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -402,10 +396,9 @@ async fn history_bloat_min_events_returns_live_executions_sorted_by_size_descend
     assert_eq!(history_event_count_of(medium_row), 5);
 }
 
-/// `history_bloat_min_events=0` is a well-defined boundary, not a "disabled"
-/// sentinel: it accepts every live execution regardless of history size
-/// (every recorded count is `>= 0`), and the value is `u64`-parseable so it
-/// is never confused with AC7's rejection path.
+/// `history_bloat_min_events=0` is a defined boundary, not a "disabled"
+/// sentinel. It accepts every live execution, because every count is `>= 0`.
+/// The value parses as `u64`, so it never takes the AC7 rejection path.
 #[tokio::test]
 async fn history_bloat_min_events_zero_returns_every_live_execution() {
     let (database_url, _container) = setup_database().await;
@@ -432,12 +425,12 @@ async fn history_bloat_min_events_zero_returns_every_live_execution() {
     assert_eq!(history_event_count_of(tiny_row), 1);
 }
 
-/// AC1's "live (non-terminal)" restriction applies regardless of state:
-/// `history_bloat_min_events` excludes every terminal state unconditionally
-/// -- unlike the general-purpose `min_history_events` filter (issue #493,
-/// see the `min_history_events_composes_with_state_including_terminal` test
-/// below), which has no such restriction and composes freely with an
-/// explicit `state=` filter, including a terminal one.
+/// `history_bloat_min_events` excludes every terminal state (AC1: "live
+/// (non-terminal)").
+///
+/// The general-purpose `min_history_events` filter (issue #493) has no such
+/// restriction. It composes with an explicit `state=`, terminal included (see
+/// `min_history_events_composes_with_state_including_terminal` below).
 #[tokio::test]
 async fn history_bloat_min_events_excludes_every_terminal_state() {
     let (database_url, _container) = setup_database().await;
@@ -501,9 +494,8 @@ async fn history_bloat_min_events_negative_value_returns_400() {
 // ─── AC1: pagination-combo rejection ───────────────────────────────────────
 
 /// `history_bloat_min_events` sorts by a computed value with no keyset
-/// cursor, so combining it with `cursor`/`page_size`/`order` pagination is
-/// rejected with a clear `400` rather than silently mis-ordering (or
-/// ignoring) the request.
+/// cursor. So `cursor`/`page_size`/`order` pagination gets a clear `400`,
+/// not a silent mis-order or a silently ignored parameter.
 #[tokio::test]
 async fn history_bloat_min_events_combined_with_page_size_returns_400() {
     let (database_url, _container) = setup_database().await;
@@ -528,12 +520,12 @@ async fn history_bloat_min_events_combined_with_order_returns_400() {
 
 // ─── AC1: cross-shard fan-out ───────────────────────────────────────────────
 
-/// AC1 says "fanned out across shards, sorted by history size descending" --
-/// exercised here against two *genuinely separate* Postgres databases (not
-/// just `build_history_bloat_fanout`'s pure in-memory merge/sort/truncate
-/// unit tests), proving the real HTTP path performs a global sort across
-/// shards rather than concatenating each shard's already-sorted page (which
-/// would silently misorder a large shard-1 row after a small shard-0 one).
+/// AC1 says "fanned out across shards, sorted by history size descending".
+///
+/// This runs against two separate Postgres databases, beyond the in-memory
+/// unit tests of `build_history_bloat_fanout`. It proves the HTTP path sorts
+/// globally across shards. Concatenating sorted shard pages would put a large
+/// shard-1 row after a small shard-0 one.
 #[tokio::test]
 async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
@@ -560,7 +552,7 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
         seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-shard1-small", 0).await; // total 1
 
     // A terminal row on shard 1, larger than everything else, must still be
-    // excluded even though it is on the "other" shard from the live rows.
+    // excluded, though it is on the other shard from the live rows.
     let shard1_terminal = seed_workflow_with_history_size(
         &shard1_url,
         ShardId::new(1),
@@ -619,17 +611,14 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
     assert_eq!(history_event_count_of(shard0_row), 6);
 }
 
-// ─── issue #493: `min_history_events` composition (PR #1139 review, P1) ────
+// ─── issue #493: `min_history_events` composition (PR #1139) ────
 //
-// A prior revision of the `history_bloat_min_events` feature above (issue
-// #704) reused the pre-existing `min_history_events` query-parameter name
-// (issue #493) for its own, functionally incompatible dedicated-discovery
-// trigger — silently breaking every caller who combined `min_history_events`
-// with `state=` or pagination (a semantic merge conflict caught in PR #1139
-// review, since git's line-level merge has no way to detect two independent
-// features colliding on the same identifier). These tests pin the restored,
-// composable behavior directly, so a future regression of this exact kind
-// fails CI rather than shipping silently again.
+// A prior revision of `history_bloat_min_events` (issue #704) reused the
+// `min_history_events` parameter name (issue #493) for its incompatible
+// dedicated-discovery trigger. That broke every caller who combined
+// `min_history_events` with `state=` or pagination. It was a semantic merge
+// conflict: a line-level git merge cannot see two features collide on one
+// identifier. These tests pin the composable behavior, so a repeat fails CI.
 
 /// `min_history_events` (issue #493) has no "live-only" restriction and
 /// composes with an explicit `state=` filter -- including a *terminal*
@@ -745,12 +734,12 @@ async fn min_history_events_composes_with_order_pagination() {
 
 // ─── PR #1139 review (finding #3): `failure_cause` composition ────────────
 
-/// `failure_cause` (issue #506 discovery filter) must compose with
-/// `history_bloat_min_events` and narrow its results -- before the fix,
-/// `load_history_bloat_workflows` silently ignored `failure_cause` entirely,
-/// so combining the two params returned every above-threshold row regardless
-/// of its recorded failure cause instead of narrowing to the ones the caller
-/// actually asked for.
+/// `failure_cause` (issue #506) must compose with `history_bloat_min_events`
+/// and narrow its results.
+///
+/// Before the fix, `load_history_bloat_workflows` ignored `failure_cause`.
+/// The two params together returned every above-threshold row, whatever its
+/// recorded failure cause.
 #[tokio::test]
 async fn history_bloat_min_events_composes_with_failure_cause() {
     let (database_url, _container) = setup_database().await;
@@ -799,13 +788,12 @@ async fn history_bloat_min_events_composes_with_failure_cause() {
 
 // ─── PR #1139 review (finding B, second round): min_history_events compose ─
 
-/// `min_history_events` (issue #493, the pre-existing general-purpose count
-/// filter) must compose with `history_bloat_min_events` when the caller
-/// supplies both at once, `AND`ing the two `>=` thresholds together -- before
-/// the fix, `load_history_bloat_workflows` silently dropped
-/// `min_history_events` entirely whenever `history_bloat_min_events` was also
-/// present, so the *lower* of the two thresholds always won regardless of
-/// which one the caller actually wanted enforced.
+/// `min_history_events` (issue #493) must compose with
+/// `history_bloat_min_events` and `AND` the two `>=` thresholds.
+///
+/// Before the fix, `load_history_bloat_workflows` dropped `min_history_events`
+/// whenever `history_bloat_min_events` was present. So the *lower* threshold
+/// always won.
 #[tokio::test]
 async fn history_bloat_min_events_composes_with_min_history_events() {
     let (database_url, _container) = setup_database().await;
@@ -816,9 +804,9 @@ async fn history_bloat_min_events_composes_with_min_history_events() {
         seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-mhe-too-small", 2)
             .await; // total 3
 
-    // At/above the lower (`history_bloat_min_events=4`) but below the higher
-    // (`min_history_events=6`) threshold -- before the fix this row was
-    // wrongly returned, since only the lower threshold was ever enforced.
+    // At or above the lower threshold (`history_bloat_min_events=4`) but below
+    // the higher one (`min_history_events=6`). Before the fix, this row was
+    // wrongly returned.
     let _between =
         seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-mhe-between", 4).await; // total 5
 
@@ -844,9 +832,9 @@ async fn history_bloat_min_events_composes_with_min_history_events() {
          because min_history_events was dropped; got {ids:?}"
     );
 
-    // Reverse the roles -- `history_bloat_min_events` supplies the stricter
-    // bound this time -- to prove composition is symmetric (an AND of both
-    // predicates, not "whichever param happens to be checked first wins").
+    // Reverse the roles: `history_bloat_min_events` is the stricter bound.
+    // Composition is symmetric, an AND of both predicates, not "first checked
+    // wins".
     let (status, body) = get_json(
         &app,
         "/workflows?history_bloat_min_events=6&min_history_events=4",
@@ -864,11 +852,11 @@ async fn history_bloat_min_events_composes_with_min_history_events() {
 
 // ─── PR #1139 review (finding #4): mutually-exclusive discovery paths ─────
 
-/// `no_progress_minutes` (stalled-workflow discovery, issue #486) and
-/// `history_bloat_min_events` (this feature) are two separate,
-/// mutually-exclusive discovery paths -- each sorts by a different computed
-/// value the other loader neither computes nor honors. Combining them must
-/// be rejected with a clear `400` rather than silently letting one win.
+/// `no_progress_minutes` (issue #486) and `history_bloat_min_events` are
+/// mutually exclusive discovery paths.
+///
+/// Each sorts by a computed value that the other loader does not compute. The
+/// combination gets a clear `400`, so neither one silently wins.
 #[tokio::test]
 async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400() {
     let (database_url, _container) = setup_database().await;
@@ -886,24 +874,24 @@ async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400(
     );
 }
 
-// ─── PR #1139 (finding b): no_progress_minutes must never ──
-// leak `history_event_count`, even when the pre-existing, general-purpose
-// `min_history_events` filter (issue #493) is ALSO supplied and satisfied.
+// ─── PR #1139: no_progress_minutes must never ──
+// leak `history_event_count`, even when `min_history_events` (issue #493) is
+// ALSO supplied and satisfied.
 //
-// `history_event_count` is documented (`docs/api-contract.json`) and
-// specified (`StalledWorkflowRow::history_event_count`'s doc comment) as
-// populated ONLY on the dedicated `history_bloat_min_events` discovery path
-// (`load_history_bloat_workflows`) -- never on the legacy `no_progress_minutes`
-// path (`load_stalled_workflows`), regardless of which OTHER filters compose
-// with it. An earlier revision ran an extra batch `COUNT(*)` query and
-// populated the field whenever `min_history_events` was ALSO set on the
-// `no_progress_minutes` path, silently changing the response shape for
-// existing `?no_progress_minutes=N&min_history_events=M` callers.
+// `docs/api-contract.json` and the doc of
+// `StalledWorkflowRow::history_event_count` say the field is set ONLY on the
+// `history_bloat_min_events` path (`load_history_bloat_workflows`). It is
+// never set on the legacy `no_progress_minutes` path
+// (`load_stalled_workflows`), whatever other filters compose with it. An
+// earlier revision ran an extra batch `COUNT(*)` and set the field when
+// `min_history_events` was also set on that path. That silently changed the
+// response for `?no_progress_minutes=N&min_history_events=M` callers.
 
-/// A row matching BOTH `no_progress_minutes` (stalled) AND the composed
-/// `min_history_events` count threshold must still omit `history_event_count`
-/// entirely from its JSON -- not `null`, ABSENT (the field is
-/// `#[serde(skip_serializing_if = "Option::is_none")]`).
+/// A row that matches both `no_progress_minutes` and the composed
+/// `min_history_events` threshold still omits `history_event_count`.
+///
+/// The field is ABSENT, not `null`, because of
+/// `#[serde(skip_serializing_if = "Option::is_none")]`.
 #[tokio::test]
 async fn no_progress_minutes_composed_with_min_history_events_never_leaks_history_event_count() {
     let (database_url, _container) = setup_database().await;
@@ -941,26 +929,23 @@ async fn no_progress_minutes_composed_with_min_history_events_never_leaks_histor
     );
 }
 
-// ─── PR #1139 review (finding C, second round): bounded per-shard load ────
+// ─── PR #1139: bounded per-shard load ────
 //
-// Before this fix, `load_history_bloat_workflows`'s per-shard candidate query
-// had no `LIMIT` at all -- it loaded every matching live row (full
-// `WorkflowExecution` structs, JSON payload columns included) and truncated
-// only *after* the cross-shard merge. These tests prove the fix -- ordering
-// by the current event count descending and applying `.limit(filters.limit)`
-// per shard, before any full row is loaded -- still produces the exact same,
-// correct top-K result: both within a single shard (proving the `ORDER BY`
-// direction is right, not just "whatever LIMIT happens to return") and across
-// shards where a single shard alone has *more* matching candidates than the
-// global limit (proving the per-shard bound uses the full `filters.limit`,
-// not some smaller divided value that would wrongly truncate a row the
-// global top-K still needs).
+// Before this fix, the per-shard candidate query of
+// `load_history_bloat_workflows` had no `LIMIT`. It loaded every matching live
+// row as a full `WorkflowExecution`, JSON payloads included. It truncated only
+// after the cross-shard merge. The fix orders by event count descending and
+// applies `.limit(filters.limit)` per shard, before any full row loads.
+//
+// These tests prove the fix still gives the correct top-K. Within one shard,
+// they prove the `ORDER BY` direction. Across shards, one shard has more
+// candidates than the global limit. That proves the per-shard bound is the
+// full `filters.limit`, not a smaller divided value that drops a needed row.
 
-/// A single shard with more above-threshold candidates than `limit`, seeded
-/// in an order that does NOT match the count-descending result order -- so
-/// only a genuinely-correct `ORDER BY (count) DESC LIMIT N` (not insertion
-/// order, primary-key order, or the reverse direction) can produce the
-/// expected top-2.
+/// A single shard with more above-threshold candidates than `limit`.
+///
+/// The seed order does NOT match the count-descending result order. So only a
+/// correct `ORDER BY (count) DESC LIMIT N` gives the expected top-2.
 #[tokio::test]
 async fn history_bloat_min_events_limit_orders_by_history_size_not_insertion_order() {
     let (database_url, _container) = setup_database().await;
@@ -990,11 +975,11 @@ async fn history_bloat_min_events_limit_orders_by_history_size_not_insertion_ord
 }
 
 /// Two shards, each with *more* above-threshold candidates than the global
-/// `limit`. The globally-second-largest row lives on the SAME shard as the
-/// globally-largest row (shard 0's local rank-2), so it must survive shard
-/// 0's own per-shard truncation to reach the final cross-shard merge -- proof
-/// that the per-shard bound is the full `filters.limit`, not some smaller
-/// value (e.g. `limit` divided across shards) that would wrongly drop it.
+/// `limit`.
+///
+/// The global second-largest row is on the SAME shard as the largest row. It
+/// must survive the truncation of shard 0 to reach the cross-shard merge. So
+/// the per-shard bound must be the full `filters.limit`, not a divided value.
 #[tokio::test]
 async fn history_bloat_min_events_limit_survives_per_shard_truncation_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
@@ -1002,18 +987,17 @@ async fn history_bloat_min_events_limit_survives_per_shard_truncation_across_sha
     let app = build_app_with_pool(pool);
 
     // Shard 0: four candidates, counts [14, 20, 16, 18], seeded out of order.
-    // Global top-3 needs BOTH x0-a (20, rank 1 globally) and x0-b (18, rank 3
-    // globally / rank 2 *on this shard*) -- x0-c/x0-d must be excluded.
+    // Global top-3 needs x0-a (20, global rank 1) and x0-b (18, global rank 3,
+    // shard rank 2). x0-c/x0-d are excluded.
     let _x0_d = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-d", 13).await; // total 14
     let _x0_a = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-a", 19).await; // total 20
     let _x0_c = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-c", 15).await; // total 16
     let _x0_b = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-b", 17).await; // total 18
 
     // Shard 1: four candidates, counts [13, 19, 15, 17], seeded out of order.
-    // Global top-3 needs ONLY x1-a (19, rank 2 globally) -- x1-b (17, rank 2
-    // *on this shard*) is globally rank 4 and must be excluded by the final
-    // cross-shard merge, even though it also survives its own shard's
-    // per-shard truncation (limit=3 keeps 3 of shard 1's 4 rows locally).
+    // Global top-3 needs ONLY x1-a (19, global rank 2). x1-b (17) is shard
+    // rank 2 but global rank 4. Its shard truncation keeps it (limit=3 keeps 3
+    // of 4), so the cross-shard merge must exclude it.
     let _x1_d = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-d", 12).await; // total 13
     let _x1_a = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-a", 18).await; // total 19
     let _x1_c = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-c", 14).await; // total 15
@@ -1043,23 +1027,17 @@ async fn history_bloat_min_events_limit_survives_per_shard_truncation_across_sha
 
 // ─── Bounded-EXISTS rewrite: exact-boundary / off-by-one equivalence ──────
 //
-// `apply_min_history_events_filter` (shared by both endpoints exercised
-// above) replaced an unbounded `(SELECT COUNT(*) FROM harvest_events WHERE
-// workflow_exec_id = id) >= min_events` with a bounded `EXISTS (... ORDER BY
-// event_id OFFSET min_events - 1 LIMIT 1)`. The two are asserted
-// boolean-equivalent for every `min_events` by construction (see that
-// function's doc comment for the full derivation and buffer-count
-// measurements), but the arithmetic that makes them equivalent -- `OFFSET
-// min_events - 1`, not `min_events` or `min_events - 2` -- is exactly the
-// kind of detail a careless rewrite gets wrong by one. The tests above cover
-// generous margins (thresholds several events away from the seeded totals);
-// these two pin the razor's edge directly: a workflow whose event count
-// EXACTLY equals `min_events` must still be included (an off-by-one toward
-// "exclusive" would wrongly drop it), and the identical workflow queried at
-// `min_events + 1` must be excluded (an off-by-one toward "too permissive"
-// would wrongly keep it) -- for both the smallest non-zero threshold (`1`,
-// exercising `OFFSET 0`) and an arbitrary interior one (`7`, exercising
-// `OFFSET 6`).
+// `apply_min_history_events_filter` serves both endpoints above. It replaced
+// an unbounded `(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id
+// = id) >= min_events` with a bounded `EXISTS (... ORDER BY event_id OFFSET
+// min_events - 1 LIMIT 1)`. Its doc comment derives that the two are
+// boolean-equivalent for every `min_events`. But `OFFSET min_events - 1` is
+// easy to get wrong by one.
+//
+// The tests above use generous margins. These two pin the exact edge. A
+// workflow whose count EXACTLY equals `min_events` is included. The same
+// workflow at `min_events + 1` is excluded. Both use the smallest non-zero
+// threshold (`1`, `OFFSET 0`) and an interior one (`7`, `OFFSET 6`).
 
 /// `min_history_events` (issue #493, the general-purpose `/workflows`
 /// filter): exact-count inclusion and adjacent-count exclusion, at both the

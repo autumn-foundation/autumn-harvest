@@ -1,13 +1,12 @@
 //! Per-tenant resource quotas on executions, history, and DLQ (issue #946).
 //!
 //! Harvest already bounds per-key **rate** ([`crate::throttle`], issue #607)
-//! and per-key **parallelism** ([`crate::concurrency`], issue #247), but
-//! nothing previously capped a tenant's aggregate *footprint* — how much a
-//! single misbehaving or malicious caller can accumulate in the system
-//! before anyone notices. A tenant submitting 10,000 workflow starts in a
-//! tight loop, each of which piles up history and eventually a dead letter,
-//! could consume unbounded storage and DLQ backlog with no engine-level
-//! circuit breaker.
+//! and per-key **parallelism** ([`crate::concurrency`], issue #247). Nothing
+//! capped the aggregate *footprint* of a tenant. That is how much one
+//! misbehaving or malicious caller can accumulate before anyone notices. Take
+//! a tenant that submits 10,000 workflow starts in a tight loop. Each start
+//! piles up history and eventually a dead letter. With no engine-level
+//! circuit breaker, storage and DLQ backlog grow without bound.
 //!
 //! `QuotaPolicy` closes that gap: a workflow type may declare up to three
 //! independent, optional caps on the *stock* a resolved tenant key has
@@ -33,24 +32,23 @@
 //! | [`crate::throttle::ThrottlePolicy`] (#607) | How fast? | admission rate |
 //! | [`QuotaPolicy`] (#946) | How much accumulated? | aggregate stock |
 //!
-//! A tenant could be well within a `limit = 10` concurrency cap and a
-//! `100/m` throttle and *still* accumulate 10,000 completed-but-not-yet-
-//! retention-collected executions, each with a sizeable history, if nothing
-//! bounds the aggregate. Quota is the third, orthogonal axis.
+//! A tenant can stay well within a `limit = 10` concurrency cap and a `100/m`
+//! throttle. Without an aggregate bound, it can *still* accumulate 10,000
+//! completed executions that retention has not yet collected, each with a
+//! sizeable history. Quota is the third, orthogonal axis.
 //!
 //! # Enforcement point
 //!
 //! Quota is checked entirely inside
-//! [`crate::execution::start_or_load_workflow_execution_collect`] — the one
-//! function nearly every registry-aware start path funnels through — rather
-//! than threading a new field through [`crate::execution::StartWorkflowParams`].
-//! The declared policy is resolved from a process-global mirror of each
-//! workflow type's [`crate::info::WorkflowInfo`]
-//! ([`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`], the same
-//! mechanism `concurrency`/`sla`/`retry_policy` already use to reach
-//! core-crate-internal code that has no access to the plugin's live handler
-//! registry), and the tenant key is resolved from the request's own input —
-//! so no new [`crate::execution::StartWorkflowParams`] field is required.
+//! [`crate::execution::start_or_load_workflow_execution_collect`]. Nearly every
+//! registry-aware start path funnels through that one function. So no new
+//! field goes through [`crate::execution::StartWorkflowParams`]. The declared
+//! policy comes from a process-global mirror of the
+//! [`crate::info::WorkflowInfo`] of each workflow type
+//! ([`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`]).
+//! `concurrency`/`sla`/`retry_policy` use the same mechanism. It reaches
+//! core-crate-internal code that has no access to the live handler registry
+//! of the plugin. The tenant key comes from the request's own input.
 //!
 //! # Sharding scope (issue #946 AC8)
 //!
@@ -125,17 +123,13 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 #[cfg(feature = "db")]
 use crate::error::{HarvestResult, database_error};
 
-// ---------------------------------------------------------------------------
-// QuotaResource
-// ---------------------------------------------------------------------------
-
 /// The aggregate resource dimension a [`QuotaPolicy`] caps (issue #946).
 ///
-/// Used in [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
-/// to identify which cap was exhausted, and as the sole label on the
-/// `harvest.quota.rejected{workflow, resource}` metric (issue #946 AC6 — the
-/// resolved tenant key is deliberately NOT a label; it is unbounded caller
-/// input).
+/// [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
+/// uses it to name the exhausted cap. It is also the sole label on the
+/// `harvest.quota.rejected{workflow, resource}` metric (issue #946 AC6). The
+/// resolved tenant key is deliberately NOT a label: it is unbounded caller
+/// input.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,10 +176,6 @@ impl std::fmt::Display for QuotaResource {
         f.write_str(self.as_str())
     }
 }
-
-// ---------------------------------------------------------------------------
-// QuotaPolicy
-// ---------------------------------------------------------------------------
 
 /// Declarative per-tenant resource quota (issue #946).
 ///
@@ -358,11 +348,10 @@ impl QuotaPolicy {
     /// `true` when at least one admission cap is declared.
     ///
     /// A [`QuotaPolicy`] with every cap `None` resolves a key but enforces
-    /// nothing; the enforcement layer treats it as a no-op rather than
-    /// rejecting every start (a caller who declares `QuotaPolicy::new(key)`
-    /// with no `with_*` call almost certainly forgot one, not intended a
-    /// silent hard-block — but the engine still must not misinterpret "no
-    /// caps" as "zero capacity").
+    /// nothing. The enforcement layer treats it as a no-op and does not reject
+    /// every start. A caller of `QuotaPolicy::new(key)` with no `with_*` call
+    /// almost certainly forgot one. A silent hard-block was not the intent.
+    /// The engine still must not read "no caps" as "zero capacity".
     #[must_use]
     pub const fn has_any_cap(&self) -> bool {
         self.max_active_executions.is_some()
@@ -497,42 +486,39 @@ pub fn resolve_quota_key(expr: &str, input: &serde_json::Value) -> Option<String
 
 /// Maximum length, in UTF-8 bytes, of a value returned by [`resolve_quota_key`].
 ///
-/// This is the size a value must fit before it is safe to store in the
-/// indexed `quota_key` column on `harvest_workflow_executions`/`harvest_dead_letters`
-/// (issue #946, Codex review — "bound resolved quota keys before indexing
-/// them"). `key_expr` is an author-declared, trusted dot-path, but the VALUE
-/// it resolves to comes straight from caller-controlled workflow input, so it
-/// is otherwise unbounded.
+/// A value must fit this size before it is safe to store in the indexed
+/// `quota_key` column. That column is on `harvest_workflow_executions` and
+/// `harvest_dead_letters` (issue #946: "bound resolved quota keys before
+/// indexing them"). `key_expr` is an author-declared, trusted dot-path. But
+/// its resolved VALUE comes straight from caller-controlled workflow input, so
+/// it has no other bound.
 ///
 /// Postgres caps a single B-tree index entry at roughly 2704 bytes for an
-/// 8&nbsp;kB page; 256 bytes is comfortably below that even once the
-/// composite `(workflow_name, quota_key, state)` index
-/// (`idx_harvest_we_quota_active`) accounts for the other columns, while
-/// still being far larger than any realistic tenant identifier (a UUID,
-/// email address, or account slug).
+/// 8&nbsp;kB page. 256 bytes is comfortably below that, even with the other
+/// columns of the composite `(workflow_name, quota_key, state)` index
+/// (`idx_harvest_we_quota_active`). It is still far larger than any realistic
+/// tenant identifier (a UUID, email address, or account slug).
 ///
-/// An over-cap key is **rejected** at admission time — see
-/// [`quota_key_over_cap`] — rather than truncated or hashed:
+/// Admission **rejects** an over-cap key (see [`quota_key_over_cap`]). It does
+/// not truncate or hash it:
 ///
-/// - Truncating would risk aliasing two distinct, unrelated tenant
-///   identifiers that merely share a long common prefix onto the SAME quota
-///   bucket. That is a genuine isolation break, and a caller who controls
-///   the resolved field could deliberately craft a key sharing another
-///   tenant's truncated prefix to exhaust that tenant's quota.
-/// - Hashing would make the stored `quota_key` illegible to operators
-///   reading `GET /admin/quotas` or an execution row for the overwhelmingly
-///   common case where the key is already in bounds, for no compensating
-///   correctness benefit over a clean, typed rejection.
+/// - Truncation can alias two unrelated tenant identifiers with a long common
+///   prefix onto the SAME quota bucket. That is a real isolation break. A
+///   caller who controls the resolved field can craft a key with the truncated
+///   prefix of another tenant, to exhaust the quota of that tenant.
+/// - A hash makes the stored `quota_key` illegible to operators who read
+///   `GET /admin/quotas` or an execution row. Almost every key is already in
+///   bounds. A hash gives no correctness benefit over a clean, typed rejection.
 pub const MAX_QUOTA_KEY_BYTES: u64 = 256;
 
 /// Check a value already resolved by [`resolve_quota_key`] against
 /// [`MAX_QUOTA_KEY_BYTES`]. Returns the observed byte length when the key
 /// exceeds the bound, `None` when it is within bounds.
 ///
-/// Pure and side-effect-free: the caller (`start_or_load_workflow_execution_collect`)
-/// constructs the actual [`crate::error::HarvestError::PayloadTooLarge`]
-/// rejection, since building one needs the requesting workflow's name — this
-/// module has no such context and stays independent of it.
+/// Pure and side-effect-free. The caller
+/// (`start_or_load_workflow_execution_collect`) builds the actual
+/// [`crate::error::HarvestError::PayloadTooLarge`] rejection. That needs the
+/// name of the requesting workflow, which this module does not have.
 ///
 /// # Examples
 ///
@@ -555,11 +541,11 @@ pub fn quota_key_over_cap(key: &str) -> Option<u64> {
 
 /// Current resource usage for one resolved `(workflow_name, quota_key)` pair.
 ///
-/// Deliberately a plain, DB-independent data type (unlike the
-/// `#[cfg(feature = "db")]`-gated query functions below) so [`check_quota`]
-/// is unit-testable without a database connection, mirroring
-/// [`crate::usage::UsageShardRow`]'s split between the wire-shaped struct and
-/// its `#[cfg(feature = "db")]` Diesel row.
+/// Deliberately a plain, DB-independent data type, unlike the
+/// `#[cfg(feature = "db")]`-gated query functions below. So [`check_quota`] is
+/// unit-testable without a database connection. [`crate::usage::UsageShardRow`]
+/// splits the wire-shaped struct from its `#[cfg(feature = "db")]` Diesel row
+/// the same way.
 ///
 /// Fields are `i64` (matching Postgres `COUNT(*)`/`SUM(...)` result types)
 /// rather than the policy's `u32`/`u64` caps; [`check_quota`] handles the
@@ -591,25 +577,23 @@ pub struct QuotaViolation {
 
 /// Compare live usage against a declared policy.
 ///
-/// Checked in a fixed, deterministic order — [`QuotaResource::ActiveExecutions`],
-/// then [`QuotaResource::HistoryBytes`], then [`QuotaResource::DeadLetters`] —
-/// so a caller violating more than one cap always sees the same reported
-/// resource across repeated attempts. Returns the *first* violated resource,
-/// or `None` when every declared cap has headroom.
+/// Checks in a fixed order: [`QuotaResource::ActiveExecutions`], then
+/// [`QuotaResource::HistoryBytes`], then [`QuotaResource::DeadLetters`]. So a
+/// caller over more than one cap always sees the same resource on each
+/// attempt. Returns the *first* violated resource, or `None` when every
+/// declared cap has headroom.
 ///
 /// A resource with no declared cap (`policy.max_* == None`) is never checked
 /// (issue #946 AC2's "independent optional caps"). A policy with
 /// [`QuotaPolicy::has_any_cap`] `false` always returns `None`.
 ///
-/// The comparison is `current >= limit` (not `current > limit`): admitting
-/// the `limit`-th execution brings usage *to* the cap, and the
-/// `(limit + 1)`-th admission attempt is rejected — so a `max_active_executions
-/// = 100` policy admits exactly 100 concurrent executions (issue #946's
-/// success metric).
+/// The comparison is `current >= limit`, not `current > limit`. The
+/// `limit`-th admission brings usage *to* the cap. The `(limit + 1)`-th
+/// attempt is rejected. So a `max_active_executions = 100` policy admits
+/// exactly 100 concurrent executions (the success metric of issue #946).
 ///
-/// A negative `usage` field (which should never occur from a genuine
-/// `COUNT(*)`/`SUM(...)` query, but is defensively handled rather than
-/// panicking) is clamped to `0` before comparison.
+/// A negative `usage` field is clamped to `0` before comparison. A real
+/// `COUNT(*)`/`SUM(...)` never yields one, but this does not panic on it.
 ///
 /// # Examples
 ///
@@ -685,37 +669,37 @@ struct QuotaUsageRow {
 ///
 /// `active` and `dl` each hit the partial indexes created by migration
 /// `20260725000000_harvest_workflow_quotas`
-/// (`idx_harvest_we_quota_active`/`idx_harvest_dl_quota`); `history` joins
-/// `harvest_events` on `workflow_exec_id`, intended to be served by the
-/// existing `(workflow_exec_id, event_id)` index — bounded to the rows
-/// belonging to the key's own active executions, never a scan of the whole
-/// event log.
+/// (`idx_harvest_we_quota_active`/`idx_harvest_dl_quota`). `history` joins
+/// `harvest_events` on `workflow_exec_id`. The intent is that the existing
+/// `(workflow_exec_id, event_id)` index serves it. It is bounded to the rows of
+/// the key's own active executions, never a scan of the whole event log.
 ///
-/// **AC7's "never a full-table scan" is a design intent, not a guarantee the
-/// query text enforces.** `WHERE e.workflow_exec_id IN (SELECT id FROM
-/// active)` lets the planner choose either an index-bounded Nested Loop *or*
-/// a Seq Scan of the entire `harvest_events` table, and it measurably picks
-/// the Seq Scan below roughly 300k total rows in the table (a plain,
-/// production-shaped early-life or heavily-retention-pruned deployment) —
-/// see the Ledger evidence in `docs/performance-quota-history-bytes.md`. This
-/// is not flagged as a bug: at that same size a query shape that *forces*
-/// the index-bounded plan measured **worse** (a per-row correlated
-/// `LATERAL`, tested and reverted — see the doc page's negative result), so
-/// the planner's own cost-based choice is already at least as good as the
-/// alternative tried. The real, unavoidable cost this query pays regardless
-/// of which plan runs: an exact `SUM(pg_column_size(...))` requires reading
-/// every contributing row, so cost scales with the target key's own
-/// accumulated active-execution history — for a tenant sitting near its
-/// configured `max_history_bytes` cap, that is tens of thousands of buffer
-/// touches on *every* admission, recomputed from scratch each time. See the
-/// doc page for the measured numbers and why a cheaper fix (an incrementally
-/// maintained running counter) is a human decision, not a query rewrite.
+/// **AC7's "never a full-table scan" is a design intent. The query text does
+/// not enforce it.** `WHERE e.workflow_exec_id IN (SELECT id FROM active)`
+/// lets the planner choose an index-bounded Nested Loop *or* a Seq Scan of the
+/// entire `harvest_events` table. It measurably picks the Seq Scan below
+/// roughly 300k total rows in the table. That is a plain, production-shaped
+/// early-life or heavily-retention-pruned deployment. See the Ledger evidence
+/// in `docs/performance-quota-history-bytes.md`. This is not a bug. At that
+/// size, a shape that *forces* the index-bounded plan measured **worse**. That
+/// shape was a per-row correlated `LATERAL`, tested and reverted; see the
+/// negative result on the doc page. So the cost-based choice of the planner is
+/// already at least as good as the alternative tried.
 ///
-/// `SUSPENDED` does not appear in the active-state filter: it is not a
-/// persisted state (the `harvest_workflow_executions.state` CHECK constraint
-/// forbids it — see [`crate::concurrency::active_runs_for_key`]'s identical
-/// note), so `RUNNING`/`PAUSED` is the complete non-terminal set despite
-/// issue #946 AC2's looser "RUNNING/SUSPENDED/PAUSED" wording.
+/// One cost is real and unavoidable, whichever plan runs. An exact
+/// `SUM(pg_column_size(...))` must read every contributing row. So cost scales
+/// with the accumulated active-execution history of the target key. A tenant
+/// near its `max_history_bytes` cap costs tens of thousands of buffer touches.
+/// That happens on *every* admission, recomputed from scratch each time. The
+/// doc page has the measured numbers. It also explains why a cheaper fix (an
+/// incrementally maintained running counter) is a human decision, not a query
+/// rewrite.
+///
+/// `SUSPENDED` does not appear in the active-state filter. It is not a
+/// persisted state: the `harvest_workflow_executions.state` CHECK constraint
+/// forbids it. [`crate::concurrency::active_runs_for_key`] has the same note.
+/// So `RUNNING`/`PAUSED` is the complete non-terminal set. The wording of
+/// issue #946 AC2 ("RUNNING/SUSPENDED/PAUSED") is looser.
 #[cfg(feature = "db")]
 const QUOTA_USAGE_SQL: &str = "\
     WITH active AS ( \
@@ -735,10 +719,10 @@ const QUOTA_USAGE_SQL: &str = "\
 
 /// The exact SQL text [`load_quota_usage`] executes.
 ///
-/// Exposed read-only for evidence-capture tests to `EXPLAIN` — mirrors
-/// [`crate::queue::claim_task_query`]'s identical purpose for the claim path,
-/// so a captured plan is provably the production statement rather than a
-/// hand-copied (and driftable) approximation of it.
+/// Exposed read-only so evidence-capture tests can `EXPLAIN` it.
+/// [`crate::queue::claim_task_query`] does the same for the claim path. So a
+/// captured plan is provably the production statement, not a hand-copied
+/// approximation that can drift.
 #[cfg(feature = "db")]
 #[must_use]
 pub const fn quota_usage_query() -> &'static str {
@@ -747,9 +731,9 @@ pub const fn quota_usage_query() -> &'static str {
 
 /// Load current usage for one `(workflow_name, quota_key)` pair.
 ///
-/// The admission-time primitive: called once per start attempt for a
-/// workflow type with a declared [`QuotaPolicy`], inside the same
-/// transaction as [`lock_quota_key`] to avoid a check-then-admit race under
+/// The admission-time primitive. It runs once per start attempt for a workflow
+/// type with a declared [`QuotaPolicy`]. It runs inside the same transaction
+/// as [`lock_quota_key`]. That avoids a check-then-admit race between
 /// concurrent starts for the same key.
 ///
 /// # Errors
@@ -883,16 +867,17 @@ struct QuotaKeyUsageRow {
     dead_letters: Option<i64>,
 }
 
-/// SQL for [`list_quota_usage`] — every distinct `(workflow_name, quota_key)`
-/// pair on this shard with a non-zero footprint in any of the three
-/// resources, grouped and merged in one query.
+/// SQL for [`list_quota_usage`], grouped and merged in one query.
 ///
-/// Mirrors [`crate::usage::usage_sql`]'s CTE-plus-`FULL OUTER JOIN` shape: an
-/// `active` CTE anchors the row set (a key with active executions always
-/// appears), `history`/`dl` are joined in, and a key with dead letters but no
-/// currently-active executions still surfaces via the `dl` side of the outer
-/// join — a tenant whose runs have all drained but whose failures are
-/// piling up must remain visible.
+/// It returns each distinct `(workflow_name, quota_key)` pair on this shard
+/// with a non-zero footprint in any of the three resources.
+///
+/// It mirrors the CTE-plus-`FULL OUTER JOIN` shape of
+/// [`crate::usage::usage_sql`]. An `active` CTE anchors the row set, so a key
+/// with active executions always appears. `history`/`dl` are joined in. A key
+/// with dead letters but no active executions still surfaces via the `dl` side
+/// of the outer join. A tenant whose runs have all drained, but whose failures
+/// pile up, must stay visible.
 #[cfg(feature = "db")]
 const QUOTA_LIST_SQL: &str = "\
     WITH active AS ( \
@@ -930,9 +915,9 @@ const QUOTA_LIST_SQL: &str = "\
 /// List current usage for every `(workflow_name, quota_key)` pair visible on
 /// this shard's database (issue #946 AC5).
 ///
-/// Called by the plugin's `GET /admin/quotas` handler once per shard, then
-/// merged across shards via `crate::shard_fanout` — this function has no
-/// knowledge of sharding itself and simply reads its own connection's shard.
+/// The `GET /admin/quotas` handler of the plugin calls it once per shard.
+/// `crate::shard_fanout` then merges the results across shards. This function
+/// knows nothing of sharding. It reads the shard of its own connection.
 ///
 /// # Errors
 ///
@@ -972,20 +957,19 @@ pub(crate) fn quota_lock_namespace(workflow_name: &str, quota_key: &str) -> Stri
 /// Serialize a quota check-then-admit sequence for one key behind a
 /// transaction-scoped advisory lock.
 ///
-/// Uses a distinctly-prefixed namespace (`"quota:{workflow_name}:{quota_key}"`)
-/// rather than the bare `concurrency_key`/mutex-key string, so a quota lock
-/// can never collide with [`crate::concurrency::lock_concurrency_key`]'s or
-/// the durable-mutex's (issue #691) advisory-lock namespace — all three share
-/// Postgres's single 64-bit one-argument advisory-lock space, and a
-/// distinguishing prefix is the only defense against an accidental
-/// cross-primitive collision on the *same* hashed value.
+/// Uses a distinctly-prefixed namespace (`"quota:{workflow_name}:{quota_key}"`),
+/// not the bare `concurrency_key`/mutex-key string. So a quota lock never
+/// collides with the advisory-lock namespace of
+/// [`crate::concurrency::lock_concurrency_key`] or the durable mutex (issue
+/// #691). All three share the single 64-bit one-argument advisory-lock space
+/// of Postgres. A distinguishing prefix is the only defense against an
+/// accidental cross-primitive collision on the *same* hashed value.
 ///
-/// Blocking (`pg_advisory_xact_lock`, not the `_try_` variant) is
-/// deliberate: unlike [`crate::concurrency::lock_concurrency_key`] (which
-/// must never block the claim-time dispatch path), quota enforcement runs
-/// once at admission time, and correctness (an exact cap, not an
-/// approximate one) matters more than avoiding a brief wait under
-/// contention on the same key.
+/// Blocking (`pg_advisory_xact_lock`, not the `_try_` variant) is deliberate.
+/// [`crate::concurrency::lock_concurrency_key`] must never block the
+/// claim-time dispatch path. Quota enforcement runs once at admission time.
+/// There, an exact cap matters more than a brief wait under contention on the
+/// same key.
 ///
 /// # Errors
 ///
@@ -1008,8 +992,6 @@ pub async fn lock_quota_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- QuotaResource --------------------------------------------------
 
     #[test]
     fn quota_resource_as_str_is_stable_and_bounded() {
@@ -1105,8 +1087,6 @@ mod tests {
             assert_eq!(round_tripped, resource);
         }
     }
-
-    // -- QuotaPolicy ------------------------------------------------------
 
     #[test]
     fn new_policy_has_no_caps() {
@@ -1287,8 +1267,6 @@ mod tests {
         assert!(!clear_only.sets_any(), "a null sets no cap");
     }
 
-    // -- resolve_quota_key --------------------------------------------------
-
     #[test]
     fn resolve_quota_key_strips_input_prefix() {
         let input = serde_json::json!({ "tenant_id": "acme" });
@@ -1332,8 +1310,6 @@ mod tests {
         }
     }
 
-    // -- quota_key_over_cap --------------------------------------------------
-
     #[test]
     fn quota_key_over_cap_within_bound_is_none() {
         assert_eq!(quota_key_over_cap("acme"), None);
@@ -1366,10 +1342,10 @@ mod tests {
 
     #[test]
     fn quota_key_over_cap_measures_utf8_bytes_not_chars() {
-        // Multi-byte UTF-8: each 'é' is 2 bytes, so 200 of them is 400 bytes
-        // -- over the 256-byte bound -- even though `.chars().count()` is
-        // only 200. The check MUST bound the same unit Postgres bounds an
-        // index entry by (bytes), not a locale-dependent character count.
+        // Multi-byte UTF-8: each 'é' is 2 bytes, so 200 of them is 400 bytes.
+        // That is over the 256-byte bound, but `.chars().count()` is only 200.
+        // The check MUST bound the unit Postgres bounds an index entry by
+        // (bytes), not a locale-dependent character count.
         let multi_byte: String = "é".repeat(200);
         assert_eq!(multi_byte.chars().count(), 200);
         assert!(multi_byte.len() > usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small"));
@@ -1378,8 +1354,6 @@ mod tests {
             Some(multi_byte.len() as u64)
         );
     }
-
-    // -- check_quota --------------------------------------------------------
 
     #[test]
     fn check_quota_no_caps_declared_never_violates() {

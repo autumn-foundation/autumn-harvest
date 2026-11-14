@@ -416,10 +416,9 @@ async fn seed_execution(
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
 
-    // `erase_workflow_payloads` tombstones BOTH the event payloads AND the
-    // execution row's own `input` column — the terminal-query erasure check is
-    // now the O(1) row check, so a realistic erased fixture must tombstone the
-    // row input too (issue #612 review).
+    // `erase_workflow_payloads` tombstones the event payloads and the row's
+    // `input` column. The terminal-query erasure check is now the O(1) row
+    // check, so a realistic erased fixture tombstones the row input too (issue #612).
     let row_input = if erased {
         erase::erasure_tombstone()
     } else {
@@ -454,11 +453,12 @@ async fn seed_execution(
     exec_id
 }
 
-/// A history the engine sealed while a workflow was parked mid-activity: full
-/// pairs for `completed`, then a bare `ActivityScheduled` for `pending` (no
-/// completion), then the `seal` terminal event. Driving `progress_workflow` with
-/// `items = completed ++ [pending]` reconstructs a partial count of
-/// `completed.len()` before parking on the incomplete activity.
+/// A history the engine sealed while a workflow was parked mid-activity.
+///
+/// It holds full pairs for `completed`, a bare `ActivityScheduled` for
+/// `pending`, then the `seal` terminal event. Driving `progress_workflow` with
+/// `items = completed ++ [pending]` counts `completed.len()`, then parks on the
+/// incomplete activity.
 fn sealed_mid_activity_history(
     completed: &[&str],
     pending: &str,
@@ -550,10 +550,10 @@ struct ExecStateRow {
 
 /// Returns the execution's `state` plus a full-row JSON snapshot.
 ///
-/// `harvest_workflow_executions` has no `updated_at` column, so the zero-writes
-/// belt snapshots the entire row via `to_jsonb(t.*)` and compares the two
-/// snapshots for byte equality — a stronger "row was not rewritten" check than
-/// any single column, and one that does not depend on a column name.
+/// `harvest_workflow_executions` has no `updated_at` column. So the zero-writes
+/// belt snapshots the entire row via `to_jsonb(t.*)` and compares the bytes.
+/// That is a stronger "row was not rewritten" check than any single column,
+/// and it does not depend on a column name.
 async fn exec_state(pool: &DbPool, exec_id: ExecutionId) -> (String, String) {
     let mut conn = pool.get().await.expect("pooled conn");
     let row = diesel::sql_query(
@@ -615,11 +615,10 @@ async fn ac2_failed_cancelled_timed_out_answer_200_with_internal_state() {
     assert_eq!(body, json!(2));
 
     // CANCELLED / TIMED_OUT: the engine seals these while the function is parked
-    // on an in-flight activity, so the history ends with a trailing incomplete
-    // ActivityScheduled + a terminal lifecycle event and the drive replays to a
+    // on an in-flight activity. The history ends with an incomplete
+    // ActivityScheduled and a terminal lifecycle event, so the drive replays to a
     // *suspension*, not Poll::Ready. It must still serve 200 with the partial
-    // internal state reconstructed at the recorded terminal point (count = 1,
-    // one activity completed before the seal).
+    // state at the recorded terminal point (count = 1).
     for (state, seal) in [
         (
             "CANCELLED",
@@ -654,9 +653,9 @@ async fn ac2_continued_as_new_answers_200_with_internal_state() {
     let app = build_app(&pool);
 
     // CONTINUED_AS_NEW: continue_as_new parks the function forever, so the run
-    // replays to a *suspension*, not Poll::Ready — yet its history ends with the
+    // replays to a *suspension*, not Poll::Ready. Its history ends with the
     // WorkflowContinuedAsNew terminal seal, so the query must serve 200 with the
-    // count reached at the continue_as_new point (2).
+    // count at the continue_as_new point (2).
     let (input, mut events) = progress_history(&["a", "b"], false);
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
@@ -858,10 +857,11 @@ async fn ac6_spinning_replay_returns_408() {
 // drive, or a spurious 410 on the terminal drift check. These DB-backed tests
 // exercise the real HTTP path.
 
-/// Seed an execution row carrying `execution_timeout` (INTERVAL) and
-/// `deadline_at` (TIMESTAMPTZ) plus a history whose events include the deadline
-/// probe — so `load_execution` in `hydrate_ctx_for_query` surfaces the budget the
-/// fix threads into the replay context.
+/// Seed an execution row with `execution_timeout` and `deadline_at`, plus a
+/// history that includes the deadline probe.
+///
+/// So `load_execution` in `hydrate_ctx_for_query` surfaces the budget that the
+/// replay context needs.
 async fn seed_execution_with_deadline(
     pool: &DbPool,
     workflow_name: &str,
@@ -943,9 +943,10 @@ fn deadline_probe_history(
     (input, events, deadline)
 }
 
-/// The finding (P2): querying a RUNNING workflow whose history contains the
-/// deadline probe must succeed with the reconstructed count — NOT diverge —
-/// once the hydration path threads the `execution_timeout`/`deadline_at`.
+/// Querying a RUNNING workflow whose history contains the deadline probe
+/// serves the reconstructed count and does not diverge.
+///
+/// The hydration path threads `execution_timeout`/`deadline_at` into the replay.
 #[tokio::test]
 async fn deadline_probe_running_query_serves_reconstructed_state() {
     let (url, _c) = setup_database().await;
@@ -977,9 +978,10 @@ async fn deadline_probe_running_query_serves_reconstructed_state() {
     );
 }
 
-/// The finding (P2, terminal drift): querying a TERMINAL (COMPLETED) workflow
-/// whose history contains the deadline probe must serve 200 — NOT a spurious 410
-/// from the drift check that mistakes the unconsumed probe for leftover history.
+/// Querying a TERMINAL (COMPLETED) workflow with the deadline probe serves 200.
+///
+/// The drift check must not mistake the unconsumed probe for leftover history
+/// and return a spurious 410.
 #[tokio::test]
 async fn deadline_probe_terminal_query_serves_not_gone() {
     let (url, _c) = setup_database().await;

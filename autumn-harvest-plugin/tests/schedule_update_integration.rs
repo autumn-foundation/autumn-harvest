@@ -1,10 +1,10 @@
 //! HTTP integration tests for `PATCH /admin/schedules/{id}` — issue #771.
 //!
-//! In-place partial schedule update: identity (`schedule_id`) preservation,
-//! #488 carryover survival across an edit, validate-before-commit (400 leaves
-//! the row byte-for-byte unchanged), workflow-type immutability, DAG-row
-//! rejection, the #350 fire-claim 409, audit rows, and immediate list
-//! visibility.
+//! Covers in-place partial schedule update. The tests check that the
+//! `schedule_id` stays the same and that #488 carryover survives an edit. A 400
+//! leaves the row byte-for-byte unchanged. They also cover workflow-type
+//! immutability, DAG-row rejection, the #350 fire-claim 409, audit rows, and
+//! immediate list visibility.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -304,9 +304,9 @@ async fn tick(pool: &DbPool, registry: &Arc<HandlerRegistry>) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// The AC11 money test: create → run once → PATCH cron+input → the id is
-/// unchanged, #488 carryover from the pre-edit run resolves on the next fire,
-/// and the next fire uses the new cadence + new input.
+/// The AC11 money test: create → run once → PATCH cron+input. The id stays
+/// the same, and #488 carryover from the pre-edit run resolves on the next
+/// fire. The next fire uses the new cadence and the new input.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn patch_preserves_identity_and_carryover_across_the_edit() {
@@ -424,11 +424,11 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
          namespace (AC6), got {run2_workflow_id}"
     );
 
-    // AC11c strengthening: the advanced next_run_at must reflect the NEW
-    // 120 s interval. Non-catchup dispatch advances to
-    // next_run_after(schedule, tick_now) = tick_now + 120 with
-    // tick_now >= t_before_tick2; under the OLD 60 s interval it would be
-    // tick_now + 60 < t_before_tick2 + 120 (the tick starts immediately).
+    // AC11c: the advanced `next_run_at` must reflect the NEW 120 s interval.
+    // Non-catchup dispatch advances to `next_run_after(schedule, tick_now)`,
+    // which is tick_now + 120, with tick_now >= t_before_tick2. The OLD 60 s
+    // interval gives tick_now + 60, which is below t_before_tick2 + 120
+    // because the tick starts immediately.
     let row_after_run2 = load_schedule_row(&url, id).await;
     let advanced = row_after_run2
         .next_run_at
@@ -774,9 +774,9 @@ async fn explicit_null_clears_and_absence_preserves_nullable_fields() {
     let _ = load_schedule_row(&url, id).await;
 }
 
-/// Write-path coverage for every remaining AC2 field: each PATCH round-trips
-/// through the row so a field silently dropped by the merge/changeset cannot
-/// hide behind response-echo only.
+/// Write-path coverage for each remaining AC2 field. Each PATCH round-trips
+/// through the row. So a field that the merge or changeset drops cannot hide
+/// behind the response echo.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn patch_covers_every_editable_field_write_path() {
@@ -826,7 +826,6 @@ async fn patch_covers_every_editable_field_write_path() {
         "the stored buffered_runs must be trimmed to the new cap"
     );
 
-    // queue_name.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -837,7 +836,6 @@ async fn patch_covers_every_editable_field_write_path() {
     let row = load_schedule_row(&url, id).await;
     assert_eq!(row.queue_name.as_deref(), Some("edited-queue"));
 
-    // skip_policy.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -865,7 +863,6 @@ async fn patch_covers_every_editable_field_write_path() {
         "a legacy-bool edit must not mint an explicit catchup policy"
     );
 
-    // consecutive_failure_limit.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -1086,11 +1083,10 @@ async fn unknown_body_field_is_rejected_with_400_not_silently_ignored() {
     );
 }
 
-/// A timezone-only PATCH on a row whose stored schedule expression is
-/// unparseable returns 400 (repair by sending `schedule_expr` explicitly)
-/// instead of leniently coercing the row to `manual` and `NULL`ing
-/// `next_run_at` as a side effect. A stored `"manual"` expression remains a
-/// legitimate timezone no-op.
+/// A timezone-only PATCH on a row with an unparseable stored expression returns
+/// 400. The caller repairs it by sending `schedule_expr` explicitly. The PATCH
+/// does not coerce the row to `manual` and set `next_run_at` to `NULL`. A
+/// stored `"manual"` expression remains a legitimate timezone no-op.
 #[tokio::test]
 async fn timezone_only_patch_on_unparseable_stored_expr_returns_400() {
     use harvest_schedules::dsl;

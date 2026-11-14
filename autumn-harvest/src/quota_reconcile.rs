@@ -113,9 +113,9 @@
 //! consistent count. The window then depends on ordinary transaction-start
 //! order, not on the whole interleaving space.
 //!
-//! The lock cannot fully close the window. An admission that committed
-//! before the next tick of this sweep never sees the rows that still wait for
-//! a backfill, whatever lock either side holds.
+//! The lock cannot fully close the window. An admission can commit before
+//! the next tick of this sweep. That admission never sees the rows that still
+//! wait for a backfill, whatever lock either side holds.
 //!
 //! To close that slice, each admission for a pre-existing row would have to
 //! resolve `quota_key` synchronously. This module avoids that design on
@@ -365,9 +365,9 @@ fn registered_quota_workflow_names() -> Vec<String> {
 /// Starts strictly after `after_id` in `id` order, and backfills each row
 /// whose workflow type has a declared `QuotaPolicy`.
 ///
-/// Returns the summary and the cursor for the NEXT call: the id of the last
-/// row examined, or `None` once a batch returns fewer than `batch_size`
-/// rows. A short batch reached the end of the candidate set, so the next
+/// Returns the summary and the cursor for the NEXT call. The cursor is the id
+/// of the last row examined. It is `None` once a batch returns fewer than
+/// `batch_size` rows. A short batch reached the end of the candidate set, so the next
 /// call wraps to the start.
 ///
 /// A caller that feeds the cursor back in (as

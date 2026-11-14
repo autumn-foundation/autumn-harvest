@@ -1,15 +1,17 @@
-//! Deterministic race tests for issue #1184: terminal workflow writes
-//! (complete/fail/pause-park) had no worker-ownership check, so a stale or
-//! zombie dispatcher whose claim was reclaimed elsewhere could commit a
-//! decision against a run a new owner was already driving.
+//! Deterministic race tests for issue #1184.
 //!
-//! Each test follows the exact pattern established by
+//! Terminal workflow writes (complete/fail/pause-park) had no worker-ownership
+//! check. A stale or zombie dispatcher whose claim was reclaimed elsewhere
+//! could commit a decision against a run that a new owner was already
+//! driving.
+//!
+//! Each test follows the pattern of
 //! [`capability_miss_tests::a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decision_when_the_claim_moved`]
-//! for the #1182 sibling guard: seed a claimed task, transfer the claim to
-//! `"thief"` on a second connection (a committed, out-of-band claim move --
-//! the same shape as a poison-pill reclaim, an operator requeue, or a
-//! concurrent claim race), then call the guarded function with the ORIGINAL,
-//! now-stale `worker_id`. Each must:
+//! for the #1182 sibling guard. It seeds a claimed task. It transfers the
+//! claim to `"thief"` on a second connection, as a committed, out-of-band
+//! claim move. That is the shape of a poison-pill reclaim, an operator
+//! requeue, or a concurrent claim race. Then it calls the guarded function
+//! with the ORIGINAL, now-stale `worker_id`. Each call must:
 //!   - return `Err` naming the exact stale task id via
 //!     `HarvestError::terminal_write_claim_ambiguous`,
 //!   - append no terminal event to the execution's history,
@@ -44,9 +46,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// DB setup / seeding helpers -- mirrors `capability_miss_tests.rs`'s own
-// self-contained copies (each integration-test file owns its own; there is
-// no shared support module in this suite).
+// DB setup and seeding helpers. They mirror the self-contained copies in
+// `capability_miss_tests.rs`. Each integration-test file owns its own, because
+// this suite has no shared support module.
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
@@ -191,9 +193,11 @@ async fn seed_claimed_task(
 }
 
 /// Commit a claim transfer to `"thief"` on a fresh, already-committed
-/// connection -- simulating a poison-pill reclaim, an operator requeue, or a
-/// concurrent claim race that moved the row while the original dispatcher's
-/// decision cycle was still in flight.
+/// connection.
+///
+/// It simulates a poison-pill reclaim, an operator requeue, or a concurrent
+/// claim race. Each moves the row while the original dispatcher's decision
+/// cycle is still in flight.
 async fn steal_claim(url: &str, task_id: Uuid) {
     let mut mover = connect(url).await;
     diesel::sql_query("UPDATE harvest_task_queue SET worker_id = 'thief' WHERE id = $1")
@@ -231,9 +235,10 @@ async fn load_history(url: &str, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
         .events
 }
 
-/// Shared assertions for every test below: the stale dispatcher's write must
-/// be a complete no-op against both the execution and the task row, whatever
-/// state `"thief"` left them in.
+/// Shared assertions for every test below.
+///
+/// The stale dispatcher's write must be a complete no-op against both the
+/// execution and the task row, whatever state `"thief"` left them in.
 async fn assert_thief_untouched(
     url: &str,
     exec_id: ExecutionId,
@@ -367,13 +372,12 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
     let (exec_id, task) = seed_claimed_task(&url, "q1184-child-completion", "dispatcher-a").await;
     steal_claim(&url, task.id).await;
 
-    // A REAL parent execution, not a dangling placeholder id: if the guard
-    // were absent, this write would otherwise proceed far enough to reach
-    // `wake_parent_for_child_completion`, whose own unrelated `NotFound` on a
-    // nonexistent parent would roll the transaction back for the wrong
-    // reason and mask the guard's absence (Codex-equivalent self-review
-    // finding). A real parent lets an unguarded write actually succeed
-    // end-to-end, so `.expect_err(...)` genuinely depends on the guard.
+    // A REAL parent execution, not a dangling placeholder id. Without the
+    // guard, this write would reach `wake_parent_for_child_completion`. Its
+    // own unrelated `NotFound` on a nonexistent parent would roll the
+    // transaction back for the wrong reason and mask the missing guard. A real
+    // parent lets an unguarded write succeed end-to-end. So `.expect_err(...)`
+    // genuinely depends on the guard.
     let mut seed_conn = connect(&url).await;
     let parent_exec_id =
         seed_execution(&mut seed_conn, "issue1184_parent_wf", serde_json::json!({})).await;
@@ -422,9 +426,9 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
     let (exec_id, task) = seed_claimed_task(&url, "q1184-child-failure", "dispatcher-a").await;
     steal_claim(&url, task.id).await;
 
-    // See the identical comment in the completion test above: a real parent
-    // execution, not a dangling placeholder, so an unguarded write would
-    // actually succeed end-to-end instead of failing for an unrelated reason.
+    // See the identical comment in the completion test above. A real parent
+    // execution lets an unguarded write succeed end-to-end, instead of failing
+    // for an unrelated reason.
     let mut seed_conn = connect(&url).await;
     let parent_exec_id =
         seed_execution(&mut seed_conn, "issue1184_parent_wf", serde_json::json!({})).await;
@@ -555,9 +559,9 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
 }
 
 // ---------------------------------------------------------------------------
-// fail_task_and_execution_with_history -- the `Unavailable` branch (execution
-// exists, but its history failed to load), which has its own independent
-// guard placed before its two bare `update_workflow_execution_failed` /
+// fail_task_and_execution_with_history: the `Unavailable` branch, where the
+// execution exists but its history failed to load. It has its own guard,
+// placed before its two bare `update_workflow_execution_failed` /
 // `queue::fail_task` writes.
 // ---------------------------------------------------------------------------
 
@@ -605,11 +609,10 @@ async fn fail_task_and_execution_with_history_makes_no_terminal_decision_when_th
 }
 
 // ---------------------------------------------------------------------------
-// persist_workflow_continue_as_new -- a related gap of the identical shape
-// found while auditing this call chain (not originally named in issue
-// #1184's confirmed call-site list): the transaction that seals the
-// predecessor execution (CONTINUED_AS_NEW) and completes its task row had no
-// ownership check either.
+// persist_workflow_continue_as_new: a related gap of the identical shape,
+// found while auditing this call chain. Issue #1184's confirmed call-site list
+// did not name it. The transaction that seals the predecessor execution
+// (CONTINUED_AS_NEW) and completes its task row had no ownership check either.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -620,9 +623,9 @@ async fn persist_workflow_continue_as_new_makes_no_terminal_decision_when_the_cl
 
     let execution = load_execution(&url, exec_id).await;
     // Same-type continuation (`new_workflow_type: None`) needs no registered
-    // workflow type at all -- `classify_continue_as_new_target` resolves it
-    // to `SameType` without touching the registry or the database, so an
-    // empty registry is a faithful, minimal fixture for this guard.
+    // workflow type. `classify_continue_as_new_target` resolves it to
+    // `SameType` without touching the registry or the database. So an empty
+    // registry is a faithful, minimal fixture for this guard.
     let registry = HandlerRegistry::new(Vec::new(), Vec::new());
     let persistence = WorkflowTaskPersistence::new_for_test(
         &task,
@@ -669,12 +672,12 @@ async fn persist_workflow_continue_as_new_makes_no_terminal_decision_when_the_cl
 // `a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive`.
 // `claim_still_held_for_update` waits at most its bound (issue #2252). So a
 // lock held past that bound by an unrelated holder (not a genuine transfer)
-// reads identically to a real loss. The standalone
-// release this drives into (`queue::release_terminal_workflow_claim`, wired
-// through `handle_ambiguous_terminal_write_claim` in production) is a plain
-// blocking UPDATE specifically so it waits out that contention and recovers
-// the task instead of stranding it -- proven here the same way the #1182
-// sibling proves it for `release_suspended_workflow_claim`.
+// reads identically to a real loss. The standalone release this drives into
+// is `queue::release_terminal_workflow_claim`. Production wires it through
+// `handle_ambiguous_terminal_write_claim`. It is a plain blocking UPDATE, so
+// it waits out that contention and recovers the task instead of stranding it.
+// This test proves that the way the #1182 sibling proves it for
+// `release_suspended_workflow_claim`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -683,9 +686,9 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
     let (url, _container) = setup_db().await;
     let (exec_id, task) = seed_claimed_task(&url, "q1184-lock-contention", "dispatcher-a").await;
 
-    // Stand in for a concurrent, unrelated transaction that happens to hold
-    // this exact row's lock for a moment -- without touching `worker_id` or
-    // `crash_strikes`, so ownership never actually changes hands.
+    // Stand in for a concurrent, unrelated transaction that holds this exact
+    // row's lock for a moment. It does not touch `worker_id` or
+    // `crash_strikes`, so ownership never changes hands.
     let mut conn_lock = connect(&url).await;
     conn_lock
         .batch_execute("BEGIN")
@@ -735,9 +738,8 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 
             // The standalone release, exactly as `process_task` performs it
             // (via `handle_ambiguous_terminal_write_claim`) after the
-            // enclosing transaction has already rolled back -- this is the
-            // call that actually blocks on `conn_lock`'s held lock, never
-            // the probe above.
+            // enclosing transaction rolled back. This call blocks on the
+            // lock that `conn_lock` holds. The probe above never does.
             let released = queue::release_terminal_workflow_claim(
                 &mut conn,
                 ambiguous_task_id,
@@ -785,10 +787,10 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
     let execution = load_execution(&url, exec_id).await;
     assert_eq!(execution.state, "RUNNING");
 
-    // The task was released back to the pool for a fresh dispatch attempt --
-    // this is the part an incomplete fix (log-and-return on the ambiguous
-    // sentinel) would fail: the row would still show `state = "RUNNING"`,
-    // `worker_id = Some("dispatcher-a")`, forever.
+    // The task went back to the pool for a fresh dispatch attempt. An
+    // incomplete fix (log-and-return on the ambiguous sentinel) fails here.
+    // The row would show `state = "RUNNING"`, `worker_id = Some("dispatcher-a")`
+    // forever.
     let reloaded = load_tasks(&url, exec_id)
         .await
         .into_iter()
@@ -839,12 +841,11 @@ async fn fail_execution_on_error_passes_terminal_write_claim_ambiguous_through_u
         "must be the same sentinel, not converted into a terminal failure"
     );
 
-    // Passing through unfailed means this function must attempt NO write at
-    // all -- unlike the guarded functions elsewhere in this file, there is no
-    // claim to have "moved": the task is still validly claimed the whole
-    // time, and the bug this guards against is precisely that an unguarded
-    // passthrough would still try (and, if the contention had cleared,
-    // succeed at) failing it anyway.
+    // Passing through unfailed means this function attempts NO write at all.
+    // Unlike the guarded functions elsewhere in this file, no claim has
+    // "moved": the task stays validly claimed the whole time. The bug this
+    // guards against is an unguarded passthrough that still tries to fail it,
+    // and succeeds if the contention has cleared.
     let history = load_history(&url, exec_id).await;
     assert!(
         !history

@@ -46,7 +46,6 @@ fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weeke
     (exclude_weekends && is_weekend(date)) || excluded_dates.contains(&date)
 }
 
-/// Returns `true` when `date` is a Saturday or Sunday.
 fn is_weekend(date: NaiveDate) -> bool {
     matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
 }
@@ -174,9 +173,9 @@ pub fn schedule_local_date(
 /// Used to derive the `exclude_weekends` flag without a separate DB lookup.
 ///
 /// This is a **scheduler-only** convention. The business-day timer primitive
-/// ([`add_business_days`], issue #806) does *not* consult it — there, Saturday
-/// and Sunday are always non-business days by definition, whatever the calendar
-/// is named. See [`is_business_day`].
+/// ([`add_business_days`], issue #806) does *not* consult it. There, Saturday
+/// and Sunday are always non-business days, whatever the calendar is named.
+/// See [`is_business_day`].
 #[must_use]
 pub fn calendar_excludes_weekends(calendar_name: &str) -> bool {
     calendar_name == "weekends-off"
@@ -195,17 +194,16 @@ pub const MAX_BUSINESS_DAYS: u32 = 3650;
 /// A date is a business day when it is **not** a Saturday or Sunday **and** does
 /// not appear in `holidays`.
 ///
-/// Weekends are always non-business here, independent of the calendar's name —
-/// deliberately *not* the [`calendar_excludes_weekends`] `"weekends-off"`
-/// convention the scheduler uses, so a calendar that only enumerates public
-/// holidays (`us-federal-holidays`, `nyse`) is immediately correct for
+/// Weekends are always non-business here, whatever the calendar's name. This
+/// deliberately ignores the scheduler's `"weekends-off"` convention
+/// ([`calendar_excludes_weekends`]). So a calendar that lists only public
+/// holidays (`us-federal-holidays`, `nyse`) is correct for
 /// [`add_business_days`] with no migration. Regions whose weekend is not
-/// Sat/Sun enumerate their weekend dates as holidays; a configurable weekend
+/// Sat/Sun list their weekend dates as holidays. A configurable weekend
 /// day-set is a named follow-up.
 ///
-/// `holidays` is a [`BTreeSet`](std::collections::BTreeSet) so lookups are
-/// O(log n) inside the scan loop rather than the O(n) slice scan
-/// [`is_excluded_date`] performs.
+/// `holidays` is a [`BTreeSet`](std::collections::BTreeSet), so a lookup in
+/// the scan loop is O(log n), not the O(n) slice scan of [`is_excluded_date`].
 #[must_use]
 pub fn is_business_day(date: NaiveDate, holidays: &std::collections::BTreeSet<NaiveDate>) -> bool {
     !is_weekend(date) && !holidays.contains(&date)
@@ -226,7 +224,7 @@ pub struct BusinessDayResolution {
 /// Why a business-day resolution could not be computed.
 ///
 /// Every variant is a **deterministic function of the anchor, `n`, and the
-/// calendar snapshot** — never of wall-clock time — so a rejection frozen into
+/// calendar snapshot**, never of wall-clock time. So a rejection frozen into
 /// history replays to the identical rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
@@ -253,9 +251,9 @@ pub enum BusinessDayRejection {
     DateOverflow,
     /// `n` exceeds [`MAX_BUSINESS_DAYS`].
     ///
-    /// Enforced by the helpers themselves, not just by their callers: both are
-    /// `pub` and re-exported, and an unbounded `n` drives a multi-million
-    /// iteration scan that accumulates a `skipped` vector proportional to it.
+    /// The helpers enforce this themselves, because both are `pub` and
+    /// re-exported. An unbounded `n` drives a multi-million iteration scan
+    /// with a `skipped` vector proportional to it.
     TooManyBusinessDays {
         /// The `n` that was passed.
         requested: u32,
@@ -294,8 +292,8 @@ impl std::fmt::Display for BusinessDayRejection {
 /// [`load_exclusions_for_calendar`] and registered the same way.
 ///
 /// **A registered-but-empty calendar is not the same as an unknown name.**
-/// [`get`](Self::get) keys on registry presence, so a typo'd calendar name
-/// resolves to `None` (a loud error) rather than an empty holiday set (a silent
+/// [`get`](Self::get) keys on registry presence. So a mistyped calendar name
+/// resolves to `None` (a loud error), not to an empty holiday set (a silent
 /// weekends-only answer).
 ///
 /// This type is not `db`-gated — it is a plain in-memory map.
@@ -314,9 +312,9 @@ struct RegisteredCalendar {
 impl BusinessCalendars {
     /// The last date the shipped built-in calendars have holiday data for.
     ///
-    /// The `2025`/`2026` arrays are complete through the end of 2026, so a
-    /// resolution needing a **2027** date is rejected with
-    /// [`BusinessDayRejection::CoverageExhausted`] rather than silently answered
+    /// The `2025`/`2026` arrays are complete through the end of 2026. A
+    /// resolution that needs a **2027** date is rejected with
+    /// [`BusinessDayRejection::CoverageExhausted`], not silently answered
     /// weekends-only. Bump this (and the arrays) when adding a year.
     pub const BUILTIN_COVERAGE_END: NaiveDate = match NaiveDate::from_ymd_opt(2026, 12, 31) {
         Some(d) => d,
@@ -335,21 +333,21 @@ impl BusinessCalendars {
     ///
     /// # Intended for demos, examples, and tests — not long-lived production
     ///
-    /// The shipped arrays are a **dated, finite** convenience. Because they
-    /// declare a horizon, a resolution needing a date past
+    /// The shipped arrays are a **dated, finite** convenience. They declare a
+    /// horizon, so a resolution that needs a date past
     /// [`BUILTIN_COVERAGE_END`](Self::BUILTIN_COVERAGE_END) is *rejected*
-    /// (loudly, never silently answered weekends-only) — and a coverage
-    /// rejection is **frozen** into the workflow's history, so extending the
-    /// arrays in a later release does **not** recover executions that already
-    /// froze one; those need a workflow reset.
+    /// loudly, never silently answered weekends-only. A coverage rejection is
+    /// **frozen** into the workflow's history. Extending the arrays in a later
+    /// release does **not** recover executions that already froze one. Those
+    /// need a workflow reset.
     ///
     /// The practical consequence: once wall-clock time approaches the horizon,
     /// every `builtin()`-backed resolution starts freezing rejections
     /// fleet-wide. For production, register a calendar loaded from
-    /// `harvest_calendar_exclusions`
-    /// ([`load_exclusions_for_calendar`](crate::calendar::load_exclusions_for_calendar))
-    /// so the holiday set — and its horizon — are operator-owned data rather
-    /// than a compiled-in constant with an expiry date.
+    /// `harvest_calendar_exclusions` with
+    /// [`load_exclusions_for_calendar`](crate::calendar::load_exclusions_for_calendar).
+    /// Then the holiday set and its horizon are operator-owned data, not a
+    /// compiled-in constant with an expiry date.
     #[must_use]
     pub fn builtin() -> Self {
         Self::new()
@@ -368,13 +366,13 @@ impl BusinessCalendars {
     /// Register (or replace) one calendar's holiday set, with **no** declared
     /// coverage horizon. Last write wins.
     ///
-    /// Without a horizon the calendar is treated as authoritative forever — a
-    /// resolution far past its last holiday is answered weekends-only rather
-    /// than rejected. That is correct for a genuinely weekends-only calendar and
-    /// convenient for tests, but for a holiday calendar loaded from a finite
-    /// data source prefer [`with_calendar_covering`](Self::with_calendar_covering)
-    /// so a resolution past the data's end fails loudly instead of quietly
-    /// ignoring every holiday beyond it.
+    /// Without a horizon the calendar is treated as authoritative forever. A
+    /// resolution far past its last holiday is answered weekends-only, not
+    /// rejected. That suits a genuinely weekends-only calendar and tests. For a
+    /// holiday calendar loaded from a finite data source, prefer
+    /// [`with_calendar_covering`](Self::with_calendar_covering). Then a
+    /// resolution past the data's end fails loudly instead of quietly ignoring
+    /// every holiday beyond it.
     #[must_use]
     pub fn with_calendar(
         mut self,
@@ -393,11 +391,11 @@ impl BusinessCalendars {
 
     /// Register (or replace) one calendar, **declaring** how far its data goes.
     ///
-    /// `coverage_end` is the last date the calendar has holiday data for — not
+    /// `coverage_end` is the last date the calendar has holiday data for, not
     /// the last date it happens to list a holiday on. A resolution that needs a
-    /// later date is rejected with [`BusinessDayRejection::CoverageExhausted`],
-    /// turning "silently ignored every holiday after the data ran out" into a
-    /// loud, deterministic error.
+    /// later date is rejected with [`BusinessDayRejection::CoverageExhausted`].
+    /// That turns "silently ignored every holiday after the data ran out" into
+    /// a loud, deterministic error.
     #[must_use]
     pub fn with_calendar_covering(
         mut self,
@@ -429,9 +427,9 @@ impl BusinessCalendars {
     ///
     /// `None` for an unknown calendar and for one registered via
     /// [`with_calendar`](Self::with_calendar) (which declares no horizon). It is
-    /// deliberately *not* inferred from the maximum exclusion date: a sparse
-    /// calendar's last holiday says nothing about how far its data extends, and
-    /// inferring one there would reject every resolution landing after it.
+    /// deliberately *not* inferred from the maximum exclusion date. A sparse
+    /// calendar's last holiday says nothing about how far its data extends.
+    /// Inferring a horizon there would reject every resolution after it.
     #[must_use]
     pub fn coverage_end(&self, name: &str) -> Option<NaiveDate> {
         self.calendars.get(name)?.coverage_end
@@ -472,10 +470,9 @@ fn parse_builtin_dates(raw: &[&str]) -> Vec<NaiveDate> {
             parsed.ok()
         })
         .collect();
-    // A `debug_assert!` alone would let a typo'd literal silently vanish from a
-    // RELEASE build's built-in calendar — a shipped holiday missing from a
-    // deadline calculation, with no error anywhere. The length check is cheap
-    // and runs in every profile.
+    // A `debug_assert!` alone lets a bad literal vanish from a release build's
+    // built-in calendar. A shipped holiday then silently drops out of deadline
+    // calculations. The length check is cheap and runs in every profile.
     assert_eq!(
         out.len(),
         raw.len(),
@@ -505,10 +502,10 @@ const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 /// the anchor's UTC time-of-day. This matches the `DATE`-typed exclusion rows
 /// and [`rebase_to_date`]'s convention, and is DST-free by construction.
 ///
-/// `n = 0` **rolls forward**: the deadline is the anchor itself when its UTC
-/// date is a business day, otherwise the next business date at the same
-/// time-of-day. (See [`next_business_day_at_or_after`] for the intent-revealing
-/// spelling.)
+/// `n = 0` **rolls forward**. The deadline is the anchor itself when its UTC
+/// date is a business day. Otherwise it is the next business date at the same
+/// time-of-day. [`next_business_day_at_or_after`] is the intent-revealing
+/// spelling.
 ///
 /// Weekends are always skipped — see [`is_business_day`].
 ///
@@ -537,10 +534,10 @@ pub fn add_business_days(
 /// [`add_business_days`], additionally rejecting past a calendar's coverage horizon.
 ///
 /// `coverage_end` is the last date the calendar knows about (see
-/// [`BusinessCalendars::coverage_end`]). When the scan needs a **later** date
-/// the result would silently degrade to a weekends-only guess that ignores
-/// every holiday beyond the horizon, so it is rejected instead. `None` disables
-/// the check (a calendar with no exclusions is correct forever).
+/// [`BusinessCalendars::coverage_end`]). A scan that needs a **later** date is
+/// rejected. Otherwise the result silently degrades to a weekends-only guess
+/// that ignores every holiday beyond the horizon. `None` disables the check (a
+/// calendar with no exclusions is correct forever).
 ///
 /// The horizon applies to **every** examined date including the anchor, so a
 /// zero-advance resolution past the horizon is rejected too. A resolution that
@@ -555,9 +552,9 @@ pub fn add_business_days_bounded(
     holidays: &std::collections::BTreeSet<NaiveDate>,
     coverage_end: Option<NaiveDate>,
 ) -> Result<BusinessDayResolution, BusinessDayRejection> {
-    // Enforced HERE, not only in the callers: both entry points are `pub` and
-    // re-exported, and an unbounded `n` otherwise drives a multi-million
-    // iteration scan whose `skipped` vector grows with it.
+    // Enforced here, not only in the callers, because both entry points are
+    // `pub` and re-exported. An unbounded `n` drives a multi-million iteration
+    // scan whose `skipped` vector grows with it.
     if n > MAX_BUSINESS_DAYS {
         return Err(BusinessDayRejection::TooManyBusinessDays {
             requested: n,
@@ -572,11 +569,11 @@ pub fn add_business_days_bounded(
     let mut run = 0_u32;
 
     loop {
-        // Checked at the TOP of the body so it also covers the ZERO-ADVANCE
-        // resolution (`n = 0` on a business-day anchor), which returns before
-        // the cursor ever moves. Checking only after advancing let a weekday
-        // anchor past the horizon resolve silently while a weekend anchor
-        // rejected — the verdict must not depend on the anchor's weekday.
+        // Checked at the top of the body so it also covers the zero-advance
+        // resolution (`n = 0` on a business-day anchor). That resolution
+        // returns before the cursor moves. A check only after advancing lets a
+        // weekday anchor past the horizon resolve while a weekend anchor
+        // rejects. The verdict must not depend on the anchor's weekday.
         // `cursor > end` (not `>=`) keeps exactly-on-horizon accepted.
         if let Some(end) = coverage_end
             && cursor > end
@@ -607,9 +604,9 @@ pub fn add_business_days_bounded(
 
 /// Resolve the first business instant at or after `anchor`.
 ///
-/// The intent-revealing spelling of `add_business_days(anchor, 0, holidays)`:
-/// returns `anchor` unchanged when its UTC date is a business day, otherwise
-/// the next business date at the same UTC time-of-day.
+/// The intent-revealing spelling of `add_business_days(anchor, 0, holidays)`.
+/// Returns `anchor` unchanged when its UTC date is a business day. Otherwise
+/// returns the next business date at the same UTC time-of-day.
 ///
 /// # Errors
 ///
@@ -754,18 +751,14 @@ pub type BackfillSlot = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono:
 /// - `RunNextBusinessDay` / `RunPrevBusinessDay` → the timestamp is adjusted to
 ///   the nearest non-excluded day while preserving the original time-of-day.
 ///
+/// Keeping both halves of each [`BackfillSlot`] stops two logical slots that
+/// rebase onto the same calendar day from colliding on the derived workflow ID.
+///
 /// # Errors
 ///
 /// Returns [`crate::scheduler::BackfillPlanError::LimitExceeded`] when the raw
 /// timestamp window would exceed `max_count` before calendar filtering.
 #[cfg(feature = "db")]
-/// Returns `(original_slot, fire_time)` pairs.
-///
-/// `original_slot` is the raw cron-generated timestamp used for deterministic
-/// workflow-ID generation. `fire_time` is the calendar-adjusted dispatch time
-/// (may equal `original_slot` for unaffected slots). Keeping both prevents
-/// two logical slots that rebase onto the same calendar day from colliding on
-/// the derived workflow ID.
 pub fn plan_backfill_with_calendar(
     schedule: Option<&crate::policy::Schedule>,
     from: chrono::DateTime<chrono::Utc>,
@@ -838,16 +831,15 @@ pub async fn load_exclusions_for_calendar(
 
 /// Batched form of [`load_exclusions_for_calendar`] for many calendar names at once.
 ///
-/// One query covering every name in `calendar_names` instead of one query
-/// per name (Ledger perf pass on `GET /admin/schedules`, which otherwise
-/// calls `load_exclusions_for_calendar` once per schedule row via
-/// `scheduler::resolve_effective_fire_at`, re-querying the same calendar's
-/// exclusions once per schedule that references it).
+/// Sends one query for every name in `calendar_names`, not one query per name.
+/// A Ledger perf pass on `GET /admin/schedules` added it. Without it, that
+/// handler calls `load_exclusions_for_calendar` once per schedule row via
+/// `scheduler::resolve_effective_fire_at`. That re-queries a calendar's
+/// exclusions once for each schedule that references it.
 ///
-/// A name with no exclusion rows (misconfigured or exclusion-free) is simply
-/// absent from the returned map, matching what `load_exclusions_for_calendar`
-/// returns for it (an empty `Vec`) -- callers should treat a missing key the
-/// same as an empty list.
+/// A name with no exclusion rows (misconfigured or exclusion-free) is absent
+/// from the returned map. `load_exclusions_for_calendar` returns an empty `Vec`
+/// for it. Treat a missing key the same as an empty list.
 ///
 /// # Errors
 ///
@@ -1263,13 +1255,13 @@ mod tests {
 
     #[test]
     fn n_zero_tolerates_a_real_corporate_shutdown() {
-        // REVIEW P2 (arithmetic): the derived scan bound was `n * 7 + 14`, so
-        // n = 0 examined only 15 days -- yet n = 0 is the ROLL-FORWARD case,
-        // which must traverse the LONGEST unbroken non-business run before
-        // finding its first business day. The bound scaled backwards from the
-        // requirement, so an ordinary corporate winter shutdown (10 weekdays,
-        // weekends automatic) spuriously rejected at n = 0 while n = 1 on the
-        // SAME anchor and calendar succeeded.
+        // Pins the scan-bound regression from issue #806. The old bound was
+        // `n * 7 + 14`, so n = 0 examined only 15 days. Yet n = 0 is the
+        // roll-forward case. It must cross the longest unbroken non-business
+        // run before it finds its first business day. The bound scaled
+        // backwards from the requirement. So an ordinary winter shutdown
+        // (10 weekdays, weekends automatic) rejected at n = 0, while n = 1 on
+        // the same anchor and calendar succeeded.
         //
         // This matters because context.rs freezes the rejection into history:
         // recovery would need a workflow reset.
@@ -1299,20 +1291,20 @@ mod tests {
             "n = 0 must roll forward across a 10-weekday shutdown"
         );
 
-        // The falsifiability half: n = 1 and n = 2 already worked, so a bound
-        // that rejects n = 0 while accepting n = 1 is self-evidently wrong.
+        // The falsifiability half: n = 1 and n = 2 already worked. A bound
+        // that rejects n = 0 but accepts n = 1 is self-evidently wrong.
         assert!(add_business_days(anchor, 1, &shutdown).is_ok());
         assert!(add_business_days(anchor, 2, &shutdown).is_ok());
     }
 
     #[test]
     fn coverage_horizon_rejects_a_zero_advance_past_the_horizon() {
-        // REVIEW P2 (arithmetic): the horizon check ran only AFTER the cursor
-        // advanced, so a resolution that returns without advancing (n = 0 on a
-        // business-day anchor) bypassed it entirely -- returning Ok for a date
-        // the calendar knows nothing about. That is exactly the "weekends-only
-        // guess" the horizon exists to prevent, and it made the outcome depend
-        // on the anchor's weekday: a Monday past the horizon silently resolved
+        // Pins the horizon regression from issue #806. The horizon check ran
+        // only after the cursor advanced. So a resolution that returns without
+        // advancing (n = 0 on a business-day anchor) bypassed it. It returned
+        // Ok for a date the calendar knows nothing about. That is the
+        // "weekends-only guess" the horizon exists to prevent. The outcome also
+        // depended on the anchor's weekday. A Monday past the horizon resolved,
         // while a Saturday past the horizon rejected.
         let holidays: std::collections::BTreeSet<NaiveDate> =
             std::iter::once(date("2026-07-03")).collect();
@@ -1609,9 +1601,9 @@ mod tests {
 
     #[test]
     fn add_business_days_past_coverage_horizon_rejects() {
-        // Anchor sits inside coverage but n = 5 walks the cursor past the last
-        // date the calendar has data for -> the answer would be weekends-only
-        // guesswork, so it must be a loud, deterministic rejection.
+        // The anchor is inside coverage, but n = 5 walks the cursor past the
+        // last date the calendar has data for. That answer would be
+        // weekends-only guesswork, so it must be a loud, deterministic rejection.
         let coverage_end = date("2026-12-31");
         let res = add_business_days_bounded(
             utc("2026-12-28T09:00:00Z"),
@@ -1627,8 +1619,8 @@ mod tests {
 
     #[test]
     fn add_business_days_within_coverage_horizon_resolves() {
-        // 2026-12-28 is a Monday; +2 business days is Wed 12-30, inside the
-        // 12-31 horizon, so the same calendar that rejects n = 5 resolves n = 2.
+        // 2026-12-28 is a Monday. Two business days later is Wed 12-30, inside
+        // the 12-31 horizon. So the calendar that rejects n = 5 resolves n = 2.
         let res = add_business_days_bounded(
             utc("2026-12-28T09:00:00Z"),
             2,

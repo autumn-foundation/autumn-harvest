@@ -9,13 +9,12 @@
 //! - **timer-id reuse**: a re-armed timer id fires again.
 //! - **m7** multi-execution `run_until_idle`.
 
-// The `#[workflow]` macro references the workflow's input parameter, so a
-// deliberately-unused param reads as a "used underscore binding" through the
-// expansion.
+// The `#[workflow]` macro references the workflow's input parameter, so an
+// unused param reads as a "used underscore binding" through the expansion.
 #![allow(clippy::used_underscore_binding)]
-// Some regression workflows deliberately have no suspension (`just_uuid`,
-// `direct_fail`) to exercise the terminal-only / direct-error paths — they are
-// `async` because `#[workflow]` requires it, but hold no `.await`.
+// Some regression workflows have no suspension (`just_uuid`, `direct_fail`).
+// They cover the terminal-only and direct-error paths. `#[workflow]` needs
+// `async`, but they hold no `.await`.
 #![allow(clippy::unused_async)]
 
 use autumn_harvest::prelude::*;
@@ -38,10 +37,9 @@ fn echo_activity() -> ActivitySpec {
 
 // ── B1(a): a side effect in a no-suspension terminal cycle is persisted ────────
 
-/// Mints a UUID and returns immediately — there is NO suspension at all, so the
-/// `RecordSideEffect` command lives only in the terminal (Completed) drain. Before
-/// the fix it was dropped and the history failed the core replayer with
-/// `SideEffectDrift`.
+/// Mints a UUID and returns at once, with NO suspension. So the
+/// `RecordSideEffect` command lives only in the terminal (Completed) drain.
+/// The bug dropped it, and the core replayer failed with `SideEffectDrift`.
 #[workflow]
 async fn just_uuid(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
     let id = ctx.new_uuid().to_string();
@@ -146,7 +144,7 @@ async fn set_current_details_does_not_wedge_completion() {
     rt.register_activity_raw("work", echo_activity());
     let exec = rt.start_workflow("status_workflow", json!(9)).unwrap();
 
-    // Must NOT return Err(Unsupported("SetCurrentDetails")).
+    // The bug returned `Err(Unsupported("SetCurrentDetails"))` here.
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(18)),
@@ -284,9 +282,9 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
         );
     } // "crash".
 
-    // Reopen: the side-effect event must NOT have persisted (the cycle's tx,
-    // which appended SideEffectRecorded before hitting the unsupported command,
-    // rolled back as a whole).
+    // Reopen: the side-effect event did NOT persist. The cycle transaction
+    // appended SideEffectRecorded before the unsupported command, and it
+    // rolled back as a whole.
     let rt2 = SqliteRuntime::open(&path).unwrap();
     let history = rt2.load_history(exec).unwrap();
     assert!(
@@ -305,9 +303,9 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
 // ── Timer-id reuse: a re-armed timer id fires again ────────────────────────────
 
 /// Arms the SAME timer id twice in sequence (the poll-loop idiom). The core
-/// supports this via cursor-based per-id FIFO pairing; the backend must create a
-/// fresh unfired row for the second arm rather than wedging on the first arm's
-/// spent row.
+/// pairs arms per id in FIFO order with a cursor. The backend must create a
+/// fresh unfired row for the second arm. It must not wedge on the spent row
+/// of the first arm.
 #[workflow]
 async fn double_timer_same_id(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
     ctx.timer("tick", 5).await.map_err(|e| e.to_string())?;
@@ -354,7 +352,6 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
         "the re-armed timer must fire and the workflow complete, got {state:?}"
     );
 
-    // History carries TWO arms and TWO fires of the same id.
     let history = rt2.load_history(exec).unwrap();
     let started = history
         .iter()

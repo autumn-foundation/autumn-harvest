@@ -13,10 +13,10 @@
 )]
 //! Task-queue pause/resume integration tests — issue #619.
 //!
-//! A queue pause **holds** dispatch on a named task queue: no worker claims new
-//! tasks from it, held tasks stay `PENDING` (never `FAILED`, never DLQ'd), the
-//! relative `schedule_to_start` timer is suspended, and a resume makes the held
-//! backlog immediately claimable again with no replay divergence.
+//! A queue pause **holds** dispatch on a named task queue. No worker claims new
+//! tasks from it. Held tasks stay `PENDING`, never `FAILED` and never DLQ'd.
+//! The relative `schedule_to_start` timer is suspended. A resume makes the held
+//! backlog claimable again at once, with no replay divergence.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
@@ -156,20 +156,20 @@ async fn scheduled_at(
 /// Backdate a task's `scheduled_at` so it looks like it has been waiting.
 async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64) {
     use diesel_async::RunQueryDsl;
-    // `created_at` moves with `scheduled_at`, because that is the only shape a
-    // real row can have: `crate::queue::enqueue` sets
-    // `created_at = NOW(), scheduled_at = NOW() + delay`, so a task that has
-    // been *due* for N seconds was necessarily *created* at least N seconds
-    // ago. Backdating `scheduled_at` alone would fabricate a row that claims to
-    // have been waiting since before it existed. That was invisible while the
-    // resume partition keyed on `transaction_timestamp()`. Now the split is
-    // `created_at` vs `paused_at` (issue #619), so `created_at` decides the
-    // row's side. A backdated `scheduled_at` alone would silently move a
-    // pre-pause backlog row onto the late-arrival side.
+    // `created_at` moves with `scheduled_at`, because a real row has no other
+    // shape. `crate::queue::enqueue` sets
+    // `created_at = NOW(), scheduled_at = NOW() + delay`. So a task *due* for N
+    // seconds was *created* at least N seconds ago. Backdating `scheduled_at`
+    // alone would fabricate a row that claims to have been waiting since before
+    // it existed. That was invisible while the resume partition keyed on
+    // `transaction_timestamp()`. Now the split is `created_at` vs `paused_at`
+    // (issue #619), so `created_at` decides the row's side. A backdated
+    // `scheduled_at` alone would silently move a pre-pause backlog row onto the
+    // late-arrival side.
     //
-    // A row whose `created_at` is already `NULL` keeps it: that is the legacy
-    // pre-`20260619000000` shape one test deliberately constructs, and the
-    // `IS NULL` arm of the primary pass exists precisely for it.
+    // A row whose `created_at` is already `NULL` keeps it. One test builds that
+    // legacy pre-`20260619000000` shape on purpose. The `IS NULL` arm of the
+    // primary pass exists for it.
     diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET scheduled_at = NOW() - ($2 || ' seconds')::interval, \
@@ -231,11 +231,11 @@ async fn claim_one(conn: &mut AsyncPgConnection, queue: &str) -> Option<Uuid> {
 /// skipped by *every* worker with no cache and no boot-ordering race.
 ///
 /// The claim path pre-filters `harvest_queue_pauses` once into a small array
-/// (`paused_queues`) rather than embedding `QUEUE_PAUSE_CLAIM_PREDICATE`
-/// verbatim — that per-row correlated form was re-probing the pause table once
-/// per *candidate row* scanned, not once per claim (docs/performance.md); see
-/// the DB-backed `claim_query_excludes_paused_queues_end_to_end` below for the
-/// behavioral proof that the two forms are equivalent.
+/// (`paused_queues`). It does not embed `QUEUE_PAUSE_CLAIM_PREDICATE` verbatim.
+/// That correlated form re-probed the pause table once per *candidate row*, not
+/// once per claim (docs/performance.md). The DB-backed
+/// `claim_query_excludes_paused_queues_end_to_end` below proves the two forms
+/// equivalent.
 #[test]
 fn claim_query_contains_the_queue_pause_anti_join() {
     let sql = queue::claim_task_query();
@@ -252,11 +252,10 @@ fn claim_query_contains_the_queue_pause_anti_join() {
         "claim_task must exclude a queue present in the pre-filtered pause \
          array; got:\n{sql}"
     );
-    // `QUEUE_PAUSE_CLAIM_PREDICATE` still exists and is still used verbatim by
-    // `oldest_pending_ages` and `claimable_pending_demand_by_queue` (asserted
-    // in `claim_mirror_queries_contain_the_queue_pause_anti_join` below);
-    // `claim_task` is the one deliberate, evidence-backed exception to
-    // embedding it.
+    // `oldest_pending_ages` and `claimable_pending_demand_by_queue` still embed
+    // `QUEUE_PAUSE_CLAIM_PREDICATE` verbatim.
+    // `claim_mirror_queries_contain_the_queue_pause_anti_join` below asserts that.
+    // `claim_task` is the one deliberate, evidence-backed exception.
 }
 
 /// The two queries that document "mirrors every claim-time gate" must mirror
@@ -344,13 +343,15 @@ fn queue_name_validation_rejects_blank_and_oversized() {
 }
 
 /// The resume shift must never push a held task's `scheduled_at` past the thaw
-/// instant (that would make a thawed task *un*claimable — the inverse of AC5).
+/// instant.
 ///
-/// The clock is `clock_timestamp()`, not `NOW()`: `NOW()` is frozen at
-/// transaction start, before the advisory-lock wait and the bulk update, so it
-/// silently charges the resume's own runtime to every held task. See
-/// `resume_credits_the_time_the_resume_itself_spends_waiting` for the behavioural
-/// proof and the query's own doc comment for the full rationale.
+/// A thawed task would then be *un*claimable, the inverse of AC5.
+///
+/// The clock is `clock_timestamp()`, not `NOW()`. `NOW()` is frozen at
+/// transaction start, before the advisory-lock wait and the bulk update. So it
+/// charges the resume's own runtime to every held task.
+/// `resume_credits_the_time_the_resume_itself_spends_waiting` is the
+/// behavioural proof. The query's own doc comment gives the full rationale.
 #[test]
 fn resume_shift_query_never_pushes_scheduled_at_past_now() {
     let sql = queue_pause::resume_shift_scheduled_at_query();
@@ -419,18 +420,17 @@ async fn pause_holds_dispatch_and_resume_releases_it() {
     );
 }
 
-/// Ledger perf pass (issue #619 follow-up): `claim_task`'s `$2` queue-name
-/// array can name several queues in one call (a worker typically polls more
-/// than one), and the pre-filtered `paused_queues` CTE this test protects
-/// derives its exclusion set from that same array. No existing test in this
-/// file drives `claim_task` with more than one queue name at once, so a bug
-/// that let a paused queue's array-membership check leak through (or wrongly
-/// excluded an *unpaused* queue sharing the `$2` call) would go unnoticed.
+/// Ledger perf pass (issue #619 follow-up). `claim_task`'s `$2` array can name
+/// several queues in one call, since a worker usually polls more than one. The
+/// pre-filtered `paused_queues` CTE derives its exclusion set from that array.
+/// No other test here claims with more than one queue name at once. So a bug in
+/// that membership check would go unnoticed. It could leak a paused queue, or
+/// exclude an *unpaused* queue in the same call.
 ///
-/// This is the DB-backed equivalence proof the claim-query rewrite's own doc
-/// comment points to: with one of three polled queues paused, every task on
-/// the paused queue is skipped and every task on the other two is still
-/// claimed — the exact set a correlated `NOT EXISTS` would have produced.
+/// The claim-query rewrite's doc comment points to this DB-backed equivalence
+/// proof. One of three polled queues is paused. Every task on it is skipped,
+/// and every task on the other two is claimed. A correlated `NOT EXISTS` gives
+/// exactly that set.
 #[tokio::test]
 async fn claim_query_excludes_paused_queues_end_to_end() {
     let (mut conn, _c) = setup_db().await;
@@ -439,9 +439,8 @@ async fn claim_query_excludes_paused_queues_end_to_end() {
     let live_q_b = unique_queue("multi-live-b");
     let queues = vec![paused_q.clone(), live_q_a.clone(), live_q_b.clone()];
 
-    // Two tasks on the queue that will be paused, one each on the two live
-    // queues -- so a bug in either direction (paused leaks through, or a live
-    // queue is wrongly excluded) shows up as a wrong total or a wrong split.
+    // Two tasks on the queue that will be paused, one on each live queue. A bug
+    // in either direction then shows as a wrong total or a wrong split.
     let held_1 = enqueue_activity(&mut conn, &paused_q, None).await;
     let held_2 = enqueue_activity(&mut conn, &paused_q, None).await;
     let live_a = enqueue_activity(&mut conn, &live_q_a, None).await;
@@ -525,7 +524,7 @@ async fn pause_does_not_abort_in_flight_tasks() {
 }
 
 /// AC4 — a task held past its `schedule_to_start` is NOT timed out while its
-/// queue is paused, and is NOT retroactively timed out the moment it resumes.
+/// queue is paused, nor retroactively when the queue resumes.
 #[tokio::test]
 async fn schedule_to_start_is_suspended_while_paused_and_after_resume() {
     let (mut conn, _c) = setup_db().await;
@@ -536,8 +535,8 @@ async fn schedule_to_start_is_suspended_while_paused_and_after_resume() {
         .await
         .expect("pause");
 
-    // Simulate a long hold: the task became due 10 minutes ago and the pause
-    // has been on for 10 minutes — well past the 30s schedule_to_start.
+    // A long hold: the task became due 10 minutes ago, and the pause began 10
+    // minutes ago. That is well past the 30s schedule_to_start.
     backdate_scheduled_at(&mut conn, task, 600).await;
     backdate_paused_at(&mut conn, &q, 600).await;
 
@@ -612,17 +611,17 @@ async fn resume_shifts_scheduled_at_by_held_time_only() {
 
 /// The resume's **own** runtime must be credited too, not just the pause span.
 ///
-/// `NOW()` is `transaction_timestamp()`, frozen before `resume_queue` waits on
-/// the advisory lock, deletes the pause row, and runs the bulk shift — yet the
-/// hold stays in force until that transaction commits. With `NOW()`, every
-/// second the resume itself spends is charged to the task: a backlog whose
-/// `schedule_to_start` is shorter than the resume's runtime times out the
-/// instant the queue thaws, which is exactly the AC3/AC4 promise ("never failed
-/// *solely because* of the pause") being broken by the thaw itself.
+/// `NOW()` is `transaction_timestamp()`. It is frozen before `resume_queue`
+/// waits on the advisory lock, deletes the pause row and runs the bulk shift.
+/// The hold stays in force until that transaction commits. With `NOW()`, each
+/// second the resume spends is charged to the task. A backlog whose
+/// `schedule_to_start` is shorter than the resume's runtime then times out as
+/// the queue thaws. The thaw itself breaks the AC3/AC4 promise ("never failed
+/// *solely because* of the pause").
 ///
-/// The delay is injected the way it actually happens in production — by holding
-/// the same advisory lock `resume_queue` takes — rather than by patching a
-/// timestamp, so this exercises the real contended path.
+/// The test injects the delay as production produces it. It holds the same
+/// advisory lock that `resume_queue` takes and does not patch a timestamp. So
+/// it exercises the real contended path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     const LOCK_HOLD_SECS: u64 = 3;
@@ -671,12 +670,11 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     let after = scheduled_at(&mut conn, task).await;
     let apparent_wait = (chrono::Utc::now() - after).num_seconds();
 
-    // The task genuinely waited ~100s pre-pause. The frozen-clock bug charges
-    // the resume's own runtime on top of that, so the assertion tolerance has to
-    // be strictly SMALLER than the delay we injected — otherwise it could not
-    // tell the fixed and broken behaviours apart. Prove that first, so a slow or
-    // descheduled runner turns this into a clear failure rather than a test that
-    // silently stops falsifying anything.
+    // The task genuinely waited ~100s pre-pause. The frozen-clock bug adds the
+    // resume's own runtime to that. So the tolerance must be strictly SMALLER
+    // than the injected delay, or the test cannot tell fixed from broken. Prove
+    // that first. A slow runner then fails clearly and does not silently stop
+    // falsifying anything.
     const TOLERANCE_SECS: i64 = 1;
     let charged = resume_wall.as_secs_f64();
     assert!(
@@ -699,12 +697,12 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     );
 }
 
-/// Issue #619 review — a task enqueued *during* the resume is still held: the
-/// pause row's `DELETE` is uncommitted, so a concurrent claimer's snapshot still
-/// sees the hold and skips the queue. But it lands after the primary shift's
-/// snapshot, so that statement can never see it, and without the late-arrivals
-/// pass it thaws carrying its full uncredited wait — letting the
-/// `schedule_to_start` scanner kill it for time it spent held (AC3/AC4).
+/// Issue #619: a task enqueued *during* the resume is still held. The pause
+/// row's `DELETE` is uncommitted, so a concurrent claimer's snapshot still sees
+/// the hold and skips the queue. The task lands after the primary shift's
+/// snapshot, so that statement never sees it. Without the late-arrivals pass,
+/// it thaws with its full wait uncredited. The `schedule_to_start` scanner can
+/// then kill it for time it spent held (AC3/AC4).
 ///
 /// Driven by hand because the window exists only *inside* `resume_queue`'s
 /// transaction, between its two statements: no end-to-end call can produce it.
@@ -826,21 +824,19 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
 ///
 /// An earlier revision split on `created_at < transaction_timestamp()`
 /// ("existed when this resume began"). But `created_at` records when the
-/// enqueuing `INSERT` *executed*, while visibility is decided by when that
-/// enqueuing transaction **committed** — and the two can straddle the resume.
-/// A row inserted *before* the resume began but committed *after* the primary
-/// pass took its snapshot therefore satisfied neither predicate: invisible to
-/// pass 1, and excluded from pass 2 by its own `created_at` test. It thawed with
-/// its entire held wait uncredited and could be schedule-to-start-failed the
-/// instant the queue came back — the exact AC3/AC4 failure the shift exists to
-/// prevent.
+/// enqueuing `INSERT` *executed*. Visibility depends on when that transaction
+/// **committed**, and the two can straddle the resume. Take a row inserted
+/// *before* the resume began but committed *after* pass 1 took its snapshot.
+/// It satisfied neither predicate. Pass 1 could not see it, and its own
+/// `created_at` test excluded it from pass 2. It thawed with its entire held
+/// wait uncredited. The schedule-to-start scanner could fail it as the queue
+/// came back. The shift exists to prevent exactly that AC3/AC4 failure.
 ///
-/// Constructed deterministically by holding the enqueuing transaction open
-/// across pass 1, which is the only way to separate insert time from commit
-/// time. Note this row is *not* the same as the one in
-/// `resume_credits_a_task_enqueued_between_the_two_shift_passes`: that one is
-/// inserted **and** committed inside the window, so its `created_at` is after
-/// the resume's transaction start and the old predicate caught it too. Only an
+/// The test holds the enqueuing transaction open across pass 1. Only that
+/// separates insert time from commit time. This row differs from the one in
+/// `resume_credits_a_task_enqueued_between_the_two_shift_passes`. That one is
+/// inserted **and** committed inside the window. Its `created_at` follows the
+/// resume's transaction start, so the old predicate caught it too. Only an
 /// insert-before / commit-after row distinguishes the two designs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
@@ -861,18 +857,18 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     backdate_paused_at(&mut conn, &q, 600).await;
     let paused_at = paused_at_of(&mut conn, &q).await;
 
-    // Enqueue on a connection whose transaction stays open: the row's INSERT
-    // (and therefore its `created_at`) happens now, but nothing else can see it
-    // until this transaction commits, several statements from now.
+    // Enqueue on a connection whose transaction stays open. The row's INSERT,
+    // and so its `created_at`, happens now. Nothing else can see the row until
+    // this transaction commits, several statements later.
     let mut inserter = connect(&url).await;
     inserter.batch_execute("BEGIN").await.expect("begin insert");
     let straddler = enqueue_activity(&mut inserter, &q, None).await;
     // Give it a visible pre-credit wait so an uncredited outcome is detectable.
     backdate_scheduled_at(&mut inserter, straddler, 100).await;
 
-    // Now open the resume's transaction — strictly after the straddler's INSERT,
-    // so `transaction_timestamp() > straddler.created_at` and the old predicate
-    // would place it on the primary side, where pass 1 cannot see it.
+    // Open the resume's transaction strictly after the straddler's INSERT. Then
+    // `transaction_timestamp() > straddler.created_at`. The old predicate would
+    // put it on the primary side, where pass 1 cannot see it.
     let mut resumer = connect(&url).await;
     let (k1, k2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
     resumer
@@ -939,13 +935,13 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
 }
 
 /// The `created_at` partition between the two resume passes must be **total**.
-/// `harvest_task_queue.created_at` is nullable — a `PENDING` row enqueued before
-/// migration `20260619000000` has none — and in SQL a comparison against `NULL`
-/// yields `NULL`, not `false`. A bare `<` / `>=` split would therefore leave such
-/// a legacy row matching *neither* pass and credited by *neither*, silently
-/// regressing against the pre-partition query (which had no `created_at`
-/// predicate and shifted it). It must land on the primary side: no `created_at`
-/// means it was certainly enqueued before this resume began.
+/// `harvest_task_queue.created_at` is nullable. A `PENDING` row enqueued before
+/// migration `20260619000000` has none. In SQL, a comparison against `NULL`
+/// yields `NULL`, not `false`. So a bare `<` / `>=` split matches such a legacy
+/// row in *neither* pass, and neither credits it. The pre-partition query had
+/// no `created_at` predicate and shifted it, so that is a silent regression.
+/// The row must land on the primary side. With no `created_at`, it was
+/// certainly enqueued before this resume began.
 #[tokio::test]
 async fn resume_credits_a_legacy_task_with_no_created_at() {
     use diesel_async::RunQueryDsl;
@@ -993,24 +989,24 @@ async fn resume_credits_a_legacy_task_with_no_created_at() {
 /// make the backlog claimable and wait for the next poll tick.
 ///
 /// A worker configured with `notification_database_url` parks in
-/// `wait_for_notification(poll_interval)` and only re-polls on a queue
-/// notification or the timeout. The resume flips held rows to claimable but
-/// emitted nothing, so on a fleet tuned for a long `poll_interval` (the whole
-/// point of running with LISTEN/NOTIFY) the thawed backlog sat idle for up to a
-/// full interval after the operator declared the outage over — with the
-/// dashboard showing the queue live and nothing moving.
+/// `wait_for_notification(poll_interval)`. It re-polls only on a queue
+/// notification or the timeout. The resume once made held rows claimable but
+/// emitted nothing. LISTEN/NOTIFY fleets tune for a long `poll_interval`. On
+/// such a fleet, the thawed backlog sat idle for up to a full interval after
+/// the operator ended the outage. The dashboard showed the queue live, and
+/// nothing moved.
 ///
-/// The notify is emitted **inside the resume transaction**: Postgres queues
-/// `NOTIFY` and delivers at `COMMIT`, so listeners wake exactly when the hold
-/// lifts — never earlier (an early wake would still see the pause row and skip
-/// the queue) and never at all if the resume rolls back.
+/// The notify is emitted **inside the resume transaction**. Postgres queues
+/// `NOTIFY` and delivers it at `COMMIT`. So listeners wake exactly when the hold
+/// lifts. An earlier wake would still see the pause row and skip the queue. A
+/// resume that rolls back wakes nobody.
 ///
 /// Asserted through a real [`QueueListener`], the same type the worker's poll
-/// loop uses. The payload assertion is load-bearing beyond "something arrived":
-/// the listener *parses* `NotifyPayload { task_id }` and surfaces a parse
-/// failure as an error the poll loop handles by sleeping a full interval — so a
-/// synthetic or nil id would be both a lie and strictly worse than sending
-/// nothing. Requiring the real claimable task id pins that.
+/// loop uses. The payload assertion checks more than "something arrived". The
+/// listener *parses* `NotifyPayload { task_id }`. The poll loop handles a parse
+/// failure by sleeping a full interval. So a synthetic or nil id would be a lie,
+/// and strictly worse than no notify. Requiring the real claimable task id pins
+/// that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn resume_notifies_parked_listeners_so_they_re_poll_immediately() {
     let (url, _c) = setup_db_url().await;
@@ -1222,11 +1218,11 @@ async fn paused_queue_names_feeds_the_gauge() {
 
 // ── AC9: no `WorkflowEvent` variant, replay byte-identical ────────────────────
 
-/// AC9, the schema half: pausing a queue must add **no** `WorkflowEvent`
-/// variant. Because the whole feature is queue metadata plus a claim-path
-/// anti-join, `queue_pause.rs` must never mention the event enum at all — the
-/// cheapest possible proof, and one that fails loudly if a future change tries
-/// to record a pause in history.
+/// AC9, the schema half: pausing a queue must add **no** `WorkflowEvent` variant.
+///
+/// The feature is queue metadata plus a claim-path anti-join. So
+/// `queue_pause.rs` must never mention the event enum. That is the cheapest
+/// proof. It fails loudly if a future change records a pause in history.
 #[test]
 fn queue_pause_module_never_touches_the_event_enum() {
     let src = include_str!("../../src/queue_pause.rs");
@@ -1252,10 +1248,10 @@ fn queue_pause_module_never_touches_the_event_enum() {
 /// AC9, the history half: a pause/resume cycle around a task must leave the
 /// owning execution's `harvest_events` **byte-identical**.
 ///
-/// This is the assertion that makes the "replay is unaffected" claim
-/// falsifiable rather than merely asserted: it snapshots the raw event rows
-/// before the pause and compares them byte-for-byte after the resume, so any
-/// future change that records a pause in history fails here.
+/// This assertion makes the "replay is unaffected" claim falsifiable. It
+/// snapshots the raw event rows before the pause. It compares them byte for
+/// byte after the resume. A future change that records a pause in history
+/// fails here.
 #[tokio::test]
 async fn pause_and_resume_leave_the_event_history_byte_identical() {
     use diesel_async::RunQueryDsl;
@@ -1334,20 +1330,19 @@ async fn pause_and_resume_leave_the_event_history_byte_identical() {
 /// A queue name carrying surrounding whitespace is **rejected**, never
 /// silently retargeted at a different queue.
 ///
-/// `EnqueueParams` stores `queue_name` verbatim (it does not normalise) and the
-/// claim anti-join matches on exact equality, so `"payments "` and `"payments"`
-/// are two genuinely distinct, independently reachable queues. That makes both
-/// of the quieter options a lie:
+/// `EnqueueParams` stores `queue_name` verbatim, and the claim anti-join
+/// matches on exact equality. So `"payments "` and `"payments"` are two
+/// distinct, independently reachable queues. Both quieter options are a lie:
 ///
 /// - Validating `name.trim()` while storing the **raw** string inserts a row
 ///   matching no task -- a reported hold on a queue that keeps dispatching.
-/// - **Trimming** inserts a row for `"payments"`, so pausing `"payments "`
-///   would hold a *different, valid* queue while the real one kept dispatching
-///   -- and the API would still report success.
+/// - **Trimming** inserts a row for `"payments"`. Pausing `"payments "` would
+///   hold a *different, valid* queue while the real one kept dispatching. The
+///   API would still report success.
 ///
-/// This test proves the two names really are distinct queues (so trimming would
-/// have conflated them), and that the padded form is refused with a
-/// `Config`-shaped error (a `400`) rather than quietly holding the wrong one.
+/// This test proves that the two names are distinct queues, so trimming would
+/// conflate them. It also proves that the padded form is refused with a
+/// `Config`-shaped error (a `400`) and holds no queue.
 #[tokio::test]
 async fn a_padded_queue_name_is_rejected_not_silently_retargeted() {
     let (mut conn, _c) = setup_db().await;
@@ -1423,11 +1418,11 @@ async fn a_padded_queue_name_is_rejected_not_silently_retargeted() {
 /// queue **unpaused** while telling the operator the pause failed.
 ///
 /// The original `INSERT ... ON CONFLICT DO NOTHING` + fallback `SELECT` shape
-/// had exactly that bug: `DO NOTHING` does not lock the conflicting row, so a
-/// resume could delete it between the two statements, the fallback `SELECT`
-/// found zero rows, and the whole transaction rolled back into a 500 — with the
-/// queue live. This reproduces the interleaving by holding the resume's
-/// transaction open across the pause attempt.
+/// had exactly that bug. `DO NOTHING` does not lock the conflicting row. A
+/// resume could delete it between the two statements. The fallback `SELECT`
+/// then found zero rows, and the transaction rolled back into a 500, with the
+/// queue live. This test holds the resume's transaction open across the pause
+/// attempt to reproduce the interleaving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn pause_racing_a_concurrent_resume_still_holds_the_queue() {
     use diesel_async::RunQueryDsl;
@@ -1440,8 +1435,8 @@ async fn pause_racing_a_concurrent_resume_still_holds_the_queue() {
         .await
         .expect("seed pause");
 
-    // Hold the row lock the way a resume transaction does, so the re-pause
-    // below is forced to queue behind it rather than racing it by luck.
+    // Hold the row lock as a resume transaction does. The re-pause below must
+    // then queue behind it, not race it by luck.
     let mut holder = connect(&url).await;
     holder.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query("SELECT 1 FROM harvest_queue_pauses WHERE queue_name = $1 FOR UPDATE")
@@ -1484,11 +1479,11 @@ async fn pause_racing_a_concurrent_resume_still_holds_the_queue() {
 /// scanner's non-locking snapshot must still suppress the `schedule_to_start`
 /// timeout.
 ///
-/// The scan predicate alone cannot guarantee this — it is a snapshot, and the
-/// enforcer performs several more round trips before committing. Both sides
-/// therefore take the same queue-scoped advisory lock. This reproduces the race
-/// deterministically: the enforcer is started while a pause transaction holds
-/// that lock, so the enforcer must block on it and observe the pause.
+/// The scan predicate alone cannot guarantee this. It is a snapshot, and the
+/// enforcer makes several more round trips before it commits. So both sides
+/// take the same queue-scoped advisory lock. The test starts the enforcer while
+/// a pause transaction holds that lock. The enforcer must block on it and
+/// observe the pause, so the race is deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
     use diesel_async::RunQueryDsl;
@@ -1581,19 +1576,19 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
 /// advisory lock BEFORE it row-locks the execution and the task.
 ///
 /// `resume_queue` takes the advisory lock and *then* row-locks every PENDING
-/// task on the queue (its `scheduled_at` shift). If the enforcer took the rows
-/// first and the advisory lock after, the two would form an ABBA cycle --
-/// enforcement holding a task row while waiting on the advisory lock, resume
-/// holding the advisory lock while waiting on that task row -- and Postgres
-/// would abort one of them, failing either the timeout pass or the operator's
-/// resume request.
+/// task on the queue (its `scheduled_at` shift). Suppose the enforcer took the
+/// rows first and the advisory lock after. The two would form an ABBA cycle.
+/// Enforcement would hold a task row while it waits on the advisory lock.
+/// Resume would hold the advisory lock while it waits on that task row.
+/// Postgres would abort one of them. That fails either the timeout pass or the
+/// operator's resume request.
 ///
-/// Proven deterministically without provoking an actual deadlock (mirrors the
-/// issue #779 `materializer_locks_execution_row_before_timers_no_abba` probe):
-/// hold the advisory lock, start the enforcer so it blocks on it, then probe
+/// Proven deterministically without a real deadlock. This mirrors the issue
+/// #779 `materializer_locks_execution_row_before_timers_no_abba` probe. Hold
+/// the advisory lock, and start the enforcer so it blocks on it. Then probe
 /// both row locks with `FOR UPDATE NOWAIT` from a third connection. Both must
-/// still be free -- under the inverted order the enforcer would already hold
-/// them and the probe would fail with `lock_not_available`.
+/// still be free. Under the inverted order, the enforcer would already hold
+/// them, and the probe would fail with `lock_not_available`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
     use diesel_async::RunQueryDsl;
@@ -1705,8 +1700,8 @@ fn release_claim_query_is_guarded_and_restores_the_attempt() {
     );
 }
 
-/// AC2/AC3 — a claim that won the race against a pause is released back to
-/// `PENDING` with its attempt restored, so the worker never dispatches it.
+/// AC2/AC3 — a claim that won the race against a pause returns to `PENDING`
+/// with its attempt restored, so the worker never dispatches it.
 #[tokio::test]
 async fn a_claim_that_beat_the_pause_is_released_with_its_attempt_restored() {
     use diesel_async::RunQueryDsl;
@@ -1802,19 +1797,18 @@ async fn an_ordinary_claim_is_not_released_when_the_queue_is_not_paused() {
 /// AC2, the authoritative half of the *claim* path: a pause committing while a
 /// claim statement is already in flight must still hold the task.
 ///
-/// `claim_task` is a single autocommit statement, so under `READ COMMITTED` its
-/// anti-join is evaluated against one snapshot taken at statement start. A
-/// pause committing after that snapshot is invisible to it, and the claim goes
-/// on to transition the task to `RUNNING` -- handing it to a worker that
-/// dispatches straight into the outage the operator is riding out.
+/// `claim_task` is a single autocommit statement. Under `READ COMMITTED`, its
+/// anti-join reads one snapshot taken at statement start. A pause that commits
+/// after that snapshot is invisible to it. The claim then moves the task to
+/// `RUNNING`. A worker dispatches it straight into the operator's outage.
 ///
-/// Reproduced deterministically by stalling the claim mid-statement on its
-/// rate-limit debit (the one part of the CTE that can block, since the
-/// candidate scan uses `SKIP LOCKED`): hold the bucket row from another
-/// transaction, start the claim, commit the pause while the claim is parked,
-/// then release the bucket. The claim then commits with a stale snapshot, and
-/// the post-claim re-check -- a fresh statement, hence a fresh snapshot -- must
-/// catch it and release the task.
+/// The test stalls the claim mid-statement on its rate-limit debit. That is the
+/// one part of the CTE that can block, since the candidate scan uses
+/// `SKIP LOCKED`. Hold the bucket row from another transaction and start the
+/// claim. Commit the pause while the claim is parked, then release the bucket.
+/// The claim commits with a stale snapshot. The post-claim re-check is a fresh
+/// statement with a fresh snapshot. It must catch the pause and release the
+/// task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_pause_committed_mid_claim_still_holds_the_task() {
     use diesel_async::RunQueryDsl;
@@ -1898,12 +1892,12 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
 /// Issue #619 — the post-claim pause re-check must be **atomic
 /// with the claim**, so a re-check that fails cannot strand the task.
 ///
-/// The re-check has to run in its own statement (a fresh `READ COMMITTED`
-/// snapshot is the entire mechanism that lets it see a pause the claim's own
-/// snapshot predated). But two *autocommit* statements are not atomic: if the
-/// re-check errors, the claim is already durable, so the row is left `RUNNING`
-/// with its attempt consumed while `claim_task` returns `Err` and the worker
-/// never receives the task. Nothing recovers it in bounded time:
+/// The re-check must run in its own statement. Only a fresh `READ COMMITTED`
+/// snapshot lets it see a pause that the claim's snapshot predated. But two
+/// *autocommit* statements are not atomic. If the re-check errors, the claim is
+/// already durable. The row stays `RUNNING` with its attempt consumed.
+/// `claim_task` returns `Err`, and the worker never receives the task. Nothing
+/// recovers it in bounded time:
 ///
 /// - the poison-pill reclaimer (#367) keys on a **missing worker heartbeat**,
 ///   and this worker is alive and polling, so it never touches the row;
@@ -1918,13 +1912,13 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
 /// claim would then silently run on a paused queue, which is the very bug this
 /// guard exists to close.
 ///
-/// Injection: the same mid-claim harness as above (hold the rate-limit bucket
-/// row so the pause commits while the claim is blocked, which is what makes the
-/// re-check fire at all), plus a `BEFORE UPDATE` trigger that raises only on the
-/// release-shaped update — `RUNNING -> PENDING` with `worker_id` cleared, which
-/// the claim's own `PENDING -> RUNNING` update cannot match. `claim_task`
-/// returns `Err` under both designs, so the assertion is purely on the row: the
-/// question is whether the claim survived the failure.
+/// Injection: the mid-claim harness above holds the rate-limit bucket row. The
+/// pause commits while the claim is blocked, so the re-check fires. A
+/// `BEFORE UPDATE` trigger then raises only on the release-shaped update:
+/// `RUNNING -> PENDING` with `worker_id` cleared. The claim's own
+/// `PENDING -> RUNNING` update cannot match it. `claim_task` returns `Err`
+/// under both designs. So the assertion checks only whether the claim row
+/// survived the failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
     use diesel_async::RunQueryDsl;
@@ -1946,9 +1940,9 @@ async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
     params.rate_limit_key = Some(rl_key.clone());
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-    // Fail exactly the release update, and only for this test's queue: the
-    // claim moves PENDING -> RUNNING and sets a worker, the release moves
-    // RUNNING -> PENDING and clears it, so the shapes cannot be confused.
+    // Fail only the release update, and only for this test's queue. The claim
+    // moves PENDING -> RUNNING and sets a worker. The release moves
+    // RUNNING -> PENDING and clears it. So the shapes cannot be confused.
     let trigger_fn = format!("fail_release_{}", q.replace('-', "_"));
     conn.batch_execute(&format!(
         "CREATE FUNCTION {trigger_fn}() RETURNS trigger AS $$
@@ -1967,9 +1961,9 @@ async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
     .await
     .expect("install release-failure trigger");
 
-    // Hold the rate-limit bucket row so the claim blocks mid-statement and the
-    // pause lands underneath it -- otherwise the claim's own anti-join skips the
-    // queue and there is no claim to roll back.
+    // Hold the rate-limit bucket row, so the claim blocks mid-statement and the
+    // pause lands under it. Otherwise the claim's own anti-join skips the queue,
+    // and there is no claim to roll back.
     let mut bucket_holder = connect(&url).await;
     bucket_holder.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(
@@ -2051,17 +2045,18 @@ async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
 /// large concurrent resume therefore records a `paused_at` that predates the
 /// effective hold by the whole lock wait, so:
 ///
-/// - `GET /admin/queues/paused`, the Vantage banner, the resume response's
-///   `paused_duration_secs`, and the `harvest_queue_paused_too_long` alert all
-///   report a hold that started earlier (and has lasted longer) than it has;
-/// - the resume shift credits `clock_timestamp() - GREATEST(scheduled_at,
-///   paused_at)`, so it credits an interval the task was never held, eroding the
-///   pre-pause wait the shift exists to preserve.
+/// - Several surfaces report a hold that started earlier, and lasted longer,
+///   than it did. They are `GET /admin/queues/paused`, the Vantage banner, the
+///   resume response's `paused_duration_secs` and the
+///   `harvest_queue_paused_too_long` alert.
+/// - The resume shift credits `clock_timestamp() - GREATEST(scheduled_at,
+///   paused_at)`. So it credits an interval the task was never held. That
+///   erodes the pre-pause wait the shift exists to preserve.
 ///
-/// The delay is injected the way production produces it — by holding the very
-/// advisory lock `pause_queue` takes — and the tolerance is strictly smaller
-/// than the injected delay, so a slow runner fails loudly rather than silently
-/// stopping falsifying anything.
+/// The test injects the delay as production produces it: it holds the advisory
+/// lock that `pause_queue` takes. The tolerance is strictly smaller than the
+/// injected delay. So a slow runner fails loudly and does not silently stop
+/// falsifying anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     const LOCK_HOLD_SECS: u64 = 3;
@@ -2132,10 +2127,10 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
 
 /// An idempotent re-pause must preserve the ORIGINAL `paused_at`.
 ///
-/// The runbook explicitly tells an operator to re-issue a pause to repair a
-/// `partial_fleet` hold, so re-stamping would erase how long the queue had
-/// really been held — and the resume shift would then credit only from the
-/// re-pause, under-crediting the very backlog the hold was protecting.
+/// The runbook tells an operator to re-issue a pause to repair a
+/// `partial_fleet` hold. A re-stamp would erase how long the queue was really
+/// held. The resume shift would then credit only from the re-pause. That
+/// under-credits the backlog the hold was protecting.
 #[tokio::test]
 async fn a_repause_preserves_the_original_paused_at() {
     let (url, _c) = setup_db_url().await;
@@ -2174,20 +2169,20 @@ async fn a_repause_preserves_the_original_paused_at() {
 /// A queue pause committing after the scan must also suppress the **workflow**
 /// schedule-to-start timeout, not just the activity one (issue #619).
 ///
-/// `find_timed_out_tasks` does not filter on `task_type`, so a PENDING workflow
-/// task carrying `schedule_to_start` is routed to `enforce_workflow_timeout`
-/// exactly as an activity task is routed to `enforce_activity_timeout` — but
-/// only the latter had the authoritative queue-pause re-check. The blast radius
-/// on this path is strictly larger: it appends `WorkflowFailed` and seals the
-/// whole execution `TIMED_OUT`, where the activity path fails one task.
+/// `find_timed_out_tasks` does not filter on `task_type`. A PENDING workflow
+/// task with `schedule_to_start` goes to `enforce_workflow_timeout`. An
+/// activity task goes to `enforce_activity_timeout`. Only the activity path had
+/// the authoritative queue-pause re-check. The workflow path has a strictly
+/// larger blast radius. It appends `WorkflowFailed` and seals the whole
+/// execution `TIMED_OUT`. The activity path fails one task.
 ///
-/// No supported product path sets `schedule_to_start` on a workflow task (every
-/// workflow enqueue site leaves it `None`; the one site that sets it is
-/// hard-coded `TaskType::Activity`), so the row is crafted here with a raw
-/// UPDATE — the same technique `child_policy_tests::
-/// workflow_task_timeout_cascades_detached_children` already uses to exercise
-/// this enforcement path. The state is nonetheless reachable by an embedder,
-/// since `queue::enqueue` and `EnqueueParams::schedule_to_start` are both public.
+/// No supported product path sets `schedule_to_start` on a workflow task. Every
+/// workflow enqueue site leaves it `None`. The one site that sets it is
+/// hard-coded `TaskType::Activity`. So this test crafts the row with a raw
+/// UPDATE. `child_policy_tests::workflow_task_timeout_cascades_detached_children`
+/// uses the same technique on this enforcement path. An embedder can still
+/// reach the state, since `queue::enqueue` and
+/// `EnqueueParams::schedule_to_start` are both public.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() {
     use diesel_async::RunQueryDsl;
@@ -2310,13 +2305,12 @@ async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() 
 /// The companion to the test above: with **no** pause in force, a workflow task
 /// past its `schedule_to_start` deadline must still be timed out.
 ///
-/// Without this, the queue-pause guard added to `enforce_workflow_timeout` could
-/// silently suppress *every* workflow schedule-to-start timeout (e.g. if the
-/// `is_queue_paused` sense were inverted, or the `matches!` reason scope
-/// widened) and the paused-side test above would still pass. This is also the
-/// local-Postgres stand-in for `child_policy_tests::
-/// workflow_task_timeout_cascades_detached_children`, which exercises the same
-/// enforcement path but is testcontainers-only.
+/// The queue-pause guard in `enforce_workflow_timeout` could silently suppress
+/// *every* workflow schedule-to-start timeout. An inverted `is_queue_paused`
+/// sense or a wider `matches!` reason scope would do it. The paused-side test
+/// above would still pass. This test is also the local-Postgres stand-in for
+/// `child_policy_tests::workflow_task_timeout_cascades_detached_children`. That
+/// test covers the same enforcement path but runs only on testcontainers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
     use diesel_async::RunQueryDsl;
@@ -2388,21 +2382,20 @@ async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
 /// A pause on one queue must not stall a queue whose name merely
 /// **hash-collides** with it.
 ///
-/// This is the money test for the collision fix, and it reproduces the reported
-/// failure directly rather than asserting a property about the key. Before the
-/// fix the advisory key was `(619, hashtext(queue))` — 32 bits of queue
-/// identity — so two unrelated names could map to the same lock. An exclusive
-/// pause on one then made the *other* queue's `try_lock_queue_for_claim` fail,
-/// and because that call is the `try` variant the failure is silent: the
-/// colliding queue's workers hand every claim back and stop dispatching for the
-/// length of an unrelated pause or (potentially long) resume, on a queue that
-/// was never paused.
+/// This is the key test for the collision fix. It reproduces the reported
+/// failure directly and does not just assert a property of the key. Before the
+/// fix, the advisory key was `(619, hashtext(queue))`, only 32 bits of queue
+/// identity. So two unrelated names could map to the same lock. An exclusive
+/// pause on one then made the *other* queue's `try_lock_queue_for_claim` fail.
+/// That call is the `try` variant, so the failure is silent. The colliding
+/// queue's workers hand every claim back and stop dispatching. That lasts for
+/// an unrelated pause or a possibly long resume, on a queue never paused.
 ///
-/// The colliding pair is *found*, not hard-coded: `hashtext` is a Postgres
-/// internal whose values are not part of any contract, so the test searches for
-/// a real collision in a 32-bit space (a birthday collision needs only ~2¹⁶
-/// samples, so 300k candidates finds several) and then asserts the two names
-/// still take different queue-pause locks.
+/// The colliding pair is *found*, not hard-coded. `hashtext` is a Postgres
+/// internal, and no contract fixes its values. So the test searches for a real
+/// collision in a 32-bit space. A birthday collision needs only ~2¹⁶ samples,
+/// so 300k candidates find several. The test then asserts that the two names
+/// take different queue-pause locks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     use diesel_async::RunQueryDsl;
@@ -2461,10 +2454,9 @@ async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     );
 
     // ── the pre-fix behaviour, demonstrated live ────────────────────────────
-    // Take the *old* key by hand -- `(619, hashtext(queue))` -- and show that a
-    // pause on one queue really did make the colliding queue's shared barrier
-    // fail. This is what makes the assertion below meaningful rather than a
-    // property nothing was ever violating.
+    // Take the *old* key `(619, hashtext(queue))` by hand. Show that a pause on
+    // one queue made the colliding queue's shared barrier fail. Without this,
+    // the assertion below could pin a property that nothing ever violated.
     let mut old_lock_holder = connect(&url).await;
     old_lock_holder.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query("SELECT pg_advisory_xact_lock(619, hashtext($1))")
@@ -2610,9 +2602,9 @@ async fn a_claim_declines_while_a_pause_transaction_is_committing() {
         "the declined claim must clear worker_id"
     );
 
-    // Once the pause transaction settles (here: rolls back, so the queue was
-    // never actually held), the task is immediately claimable again — the
-    // barrier costs at most one poll interval.
+    // Once the pause transaction settles, the task is claimable again at once.
+    // Here it rolls back, so the queue was never held. The barrier costs at
+    // most one poll interval.
     pauser.batch_execute("ROLLBACK").await.expect("rollback");
     assert_eq!(
         claim_one(&mut conn, &q).await,
@@ -2624,17 +2616,17 @@ async fn a_claim_declines_while_a_pause_transaction_is_committing() {
 /// A stale scan result must not time out a task whose deadline a
 /// completed resume has already credited forward.
 ///
-/// `find_timed_out_tasks` produces a snapshot and a large batch takes time, so
+/// `find_timed_out_tasks` produces a snapshot, and a large batch takes time. So
 /// a whole pause/resume cycle can complete before a given row is reached.
-/// Resume shifts `scheduled_at` forward to credit the held time and then
-/// **deletes** the pause row — so the pause re-check finds nothing to suppress
-/// on, and enforcement proceeds on the scan-time deadline, timing the task out
-/// the instant its deadline was extended. On this (workflow) path that seals
-/// the entire execution `TIMED_OUT`, which is exactly what AC3/AC4 forbid.
+/// Resume shifts `scheduled_at` forward to credit the held time. It then
+/// **deletes** the pause row, so the pause re-check finds nothing. Enforcement
+/// proceeds on the scan-time deadline. It times the task out just as its
+/// deadline was extended. On this workflow path, that seals the entire
+/// execution `TIMED_OUT`, which AC3/AC4 forbid.
 ///
-/// The advisory lock sequences it deterministically: the enforcer scans, then
-/// blocks on the queue lock, while the held transaction performs the very
-/// `scheduled_at` shift `resume_queue` performs and commits.
+/// The advisory lock makes the order deterministic. The enforcer scans, then
+/// blocks on the queue lock. Meanwhile the held transaction performs the
+/// `scheduled_at` shift that `resume_queue` performs, and commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
     use diesel_async::RunQueryDsl;
@@ -2691,9 +2683,9 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Exactly the row mutation `resume_queue` performs when it credits held
-    // time back, committed while the enforcer is blocked on the queue lock and
-    // leaving NO pause row behind for the re-check to find.
+    // The row mutation that `resume_queue` performs to credit held time back.
+    // It commits while the enforcer is blocked on the queue lock. It leaves NO
+    // pause row for the re-check to find.
     diesel::sql_query(
         "UPDATE harvest_task_queue SET scheduled_at = NOW() + INTERVAL '1 hour' WHERE id = $1",
     )
@@ -2737,18 +2729,18 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
 /// Issue #619: a row whose enqueue *executed* before the pause but *committed*
 /// after the primary resume shift's snapshot must still be credited.
 ///
-/// The `created_at` vs `paused_at` partition alone could not reach this case. The
-/// partition is total and visibility-independent — every due `PENDING` row
-/// belongs to exactly one side whenever it becomes visible — but totality of the
+/// The `created_at` vs `paused_at` partition alone could not reach this case.
+/// The partition is total and visibility-independent. Every due `PENDING` row
+/// belongs to exactly one side whenever it becomes visible. But totality of the
 /// *predicates* is not coverage by the *passes*. Such a row is on pass 1's side
-/// (`created_at < paused_at`) yet invisible to pass 1's snapshot, and the old
-/// pass 2 excluded it by re-testing that very predicate. Credited by neither, it
-/// thawed carrying its whole held wait and was immediately
-/// `schedule_to_start`-failable — the AC3/AC4 failure the shift exists to prevent.
+/// (`created_at < paused_at`) yet invisible to pass 1's snapshot. The old
+/// pass 2 excluded it by re-testing that predicate. Neither pass credited it. It
+/// thawed with its whole held wait, open to an immediate `schedule_to_start`
+/// failure. The shift exists to prevent exactly that AC3/AC4 failure.
 ///
-/// The race is sequenced deterministically rather than hoped for: a second
-/// connection holds the enqueue open across pass 1 and commits before pass 2, so
-/// the two statements are driven with exactly the binds `resume_queue` uses.
+/// The race is sequenced, not left to chance. A second connection holds the
+/// enqueue open across pass 1 and commits before pass 2. The two statements
+/// use exactly the binds that `resume_queue` uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited() {
     use diesel_async::RunQueryDsl;
@@ -2837,8 +2829,8 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
 
     driver.batch_execute("COMMIT").await.expect("commit resume");
 
-    // Both rows were due 2h ago and held for 1h, so both keep the 1h of wait
-    // they had accrued *before* the hold and none of the hold itself.
+    // Both rows were due 2h ago and held for 1h. So both keep the 1h of wait
+    // accrued *before* the hold, and none of the hold itself.
     let late_age =
         (chrono::Utc::now() - scheduled_at(&mut driver, late_commit).await).num_seconds();
     assert!(
@@ -2868,11 +2860,11 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
 /// with a short `schedule_to_start` could time out immediately after the thaw,
 /// for time that the pause transaction itself blocked it.
 ///
-/// Made deterministic rather than hoped for: a second connection holds an
-/// `ACCESS EXCLUSIVE` lock on `harvest_task_queue`, which blocks the `COUNT(*)`
-/// (a plain `SELECT` does wait on that lock) while leaving the advisory lock and
-/// the `harvest_queue_pauses` insert untouched. The pause therefore stalls
-/// *exactly* in the window under test.
+/// Made deterministic, not left to chance. A second connection holds an
+/// `ACCESS EXCLUSIVE` lock on `harvest_task_queue`. That blocks the `COUNT(*)`,
+/// because a plain `SELECT` waits on that lock. It leaves the advisory lock and
+/// the `harvest_queue_pauses` insert untouched. So the pause stalls *exactly*
+/// in the window under test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn pause_credits_the_backlog_scan_interval() {
     use diesel_async::RunQueryDsl;
@@ -2949,32 +2941,34 @@ async fn pause_credits_the_backlog_scan_interval() {
 /// A timeout enforcement must not stall dispatch on an unpaused queue.
 ///
 /// The `schedule_to_start` enforcer takes the queue advisory lock, so a pause
-/// committing after its scan still suppresses the timeout. It originally took the
-/// **exclusive** mode, the same one `pause_queue`/`resume_queue` take. With the
-/// claim barrier that is a dispatch outage. `try_lock_queue_for_claim` takes the
-/// **shared** mode of that key on every claim, and exclusive blocks shared. So
-/// during the whole enforcement transaction every claim on the queue fails its
-/// `try`. Each releases its task, on a queue with no pause at all. The workflow sibling holds
-/// the lock across `append_events`, the parent-close cascade and trigger
-/// evaluation. So a backlog of expired tasks can halt unrelated work repeatedly.
+/// committing after its scan still suppresses the timeout. It originally took
+/// the **exclusive** mode, the same one `pause_queue`/`resume_queue` take. With
+/// the claim barrier that is a dispatch outage. `try_lock_queue_for_claim`
+/// takes the **shared** mode of that key on every claim, and exclusive blocks
+/// shared. So during the whole enforcement transaction every claim on the
+/// queue fails its `try`. Each releases its task, on a queue with no pause at
+/// all. The workflow sibling holds the lock across `append_events`, the
+/// parent-close cascade and trigger evaluation. So a backlog of expired tasks
+/// can halt unrelated work repeatedly.
 ///
-/// Shared mode is exactly enough: it still mutually excludes the exclusive
-/// pause/resume (the ordering the re-check depends on) while being compatible with
-/// the claim barrier.
+/// Shared mode is exactly enough. It still excludes the exclusive pause/resume,
+/// which gives the order the re-check depends on. It is compatible with the
+/// claim barrier.
 ///
 /// Both halves are asserted. Dropping the lock entirely would also make the
 /// first half pass. But it would silently destroy the pause-suppression
 /// guarantee: a pause committed after the scan still suppresses the timeout.
 ///
-/// Parking the enforcer *inside* the window is the whole difficulty. A table lock
-/// on `harvest_queue_pauses` does not work: `find_timed_out_tasks` consults it for
-/// the scan's own carve-out, so the enforcer blocks in the scan, *before* taking
-/// the advisory lock — the probes then measure nothing (and the second half
-/// passes off the probe connection's own shared lock). It is instead parked on the
-/// **execution row**: the enforcer takes the advisory lock, clears both re-checks,
-/// and only then calls `lock_workflow_execution_row_and_load_history`, so holding
-/// that row `FOR UPDATE` elsewhere stalls it with the queue lock held. The scan
-/// takes no execution-row locks, so it still runs to completion.
+/// Parking the enforcer *inside* the window is the whole difficulty. A table
+/// lock on `harvest_queue_pauses` does not work. `find_timed_out_tasks` reads
+/// that table for the scan's own carve-out. So the enforcer blocks in the scan,
+/// *before* it takes the advisory lock. The probes then measure nothing. The
+/// second half passes only because of the probe connection's own shared lock.
+/// So the test parks the enforcer on the **execution row**. The enforcer takes
+/// the advisory lock and clears both re-checks. Only then does it call
+/// `lock_workflow_execution_row_and_load_history`. A `FOR UPDATE` hold on that
+/// row elsewhere stalls it with the queue lock held. The scan takes no
+/// execution-row locks, so it still runs to completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
     use diesel_async::RunQueryDsl;
@@ -3088,23 +3082,23 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
 /// resume.
 ///
 /// The documented `harvest_task_queue` order is **execution row -> task row**.
-/// `resume_workflow_execution` follows it: it holds the execution row
-/// `FOR UPDATE` and then shifts this execution's task rows with a plain,
-/// *waiting* `UPDATE` (unlike its external-task sibling, that shift has no
-/// `SKIP LOCKED` escape). An earlier locked `schedule_to_start` re-read ran
-/// before the execution lock and inverted the order. So enforcement held a task
-/// row while it waited on the execution row. At the same time the resume held
-/// the execution row and waited on that task row. Postgres detects the cycle
+/// `resume_workflow_execution` follows it. It holds the execution row
+/// `FOR UPDATE`, then shifts this execution's task rows with a plain, *waiting*
+/// `UPDATE`. Unlike its external-task sibling, that shift has no `SKIP LOCKED`
+/// escape. An earlier locked `schedule_to_start` re-read ran before the
+/// execution lock and inverted the order. So enforcement held a task row while
+/// it waited on the execution row. At the same time the resume held the
+/// execution row and waited on that task row. Postgres detects the cycle
 /// and aborts one side. That fails either the timeout sweep or the operator's
 /// resume.
 ///
-/// Sequenced deterministically rather than raced. A holder takes the execution
-/// row `FOR UPDATE` (standing in for a resume that has just entered its
-/// transaction) and the enforcer is started so it must reach the execution row;
-/// a `FOR UPDATE NOWAIT` probe from a third connection then proves the enforcer
-/// is NOT holding the task row while it waits. Under the inverted order that
-/// probe fails with `lock_not_available` — which is precisely the state that
-/// closes the deadlock cycle.
+/// Sequenced deterministically, not raced. A holder takes the execution row
+/// `FOR UPDATE`, standing in for a resume that has just entered its
+/// transaction. The enforcer starts and must reach the execution row. A
+/// `FOR UPDATE NOWAIT` probe from a third connection then proves that the
+/// enforcer does NOT hold the task row while it waits. Under the inverted
+/// order, that probe fails with `lock_not_available`. That state closes the
+/// deadlock cycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn schedule_to_start_sweep_does_not_hold_a_task_row_while_awaiting_the_execution() {
     use diesel_async::RunQueryDsl;

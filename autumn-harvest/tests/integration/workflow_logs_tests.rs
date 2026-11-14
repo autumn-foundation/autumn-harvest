@@ -8,12 +8,11 @@
 //!   `(level, message, occurred_at, sequence)` and read back in emission order.
 //! - **AC2**: **at most once, deduplicated** — never duplicated, never
 //!   reordered. A re-driven decision cycle re-mints the SAME `seq` (a pure call
-//!   ordinal), so re-appending an already-stored line is collapsed by the unique
-//!   `(workflow_exec_id, seq)` index rather than duplicated.
-//!   `randomized_replay_interleavings_never_duplicate_or_reorder_lines` is the
-//!   randomized-interleaving replay test the AC mandates: it drives the real
-//!   executor over a growing history with a randomized re-drive schedule and
-//!   persists through the real store.
+//!   ordinal). The unique `(workflow_exec_id, seq)` index collapses a re-append
+//!   of a stored line. The AC mandates a randomized-interleaving replay test:
+//!   `randomized_replay_interleavings_never_duplicate_or_reorder_lines`. It
+//!   drives the real executor over a growing history with a randomized
+//!   re-drive schedule, and persists through the real store.
 //! - **AC3**: level filtering and cursor-bounded pagination.
 //! - **AC4**: the per-execution cap drops-newest and surfaces a **truncation
 //!   marker** rather than losing lines silently; retention is tied to
@@ -168,9 +167,8 @@ async fn re_driven_cycle_does_not_duplicate_or_reorder_lines() {
         line(102, "warn", "step three"),
     ];
 
-    // Drive the same cycle five times, interleaving a *later* cycle's lines in
-    // the middle so a naive "append everything" implementation would both
-    // duplicate AND interleave out of order.
+    // Drive the same cycle five times, with a *later* cycle's lines in the
+    // middle. A naive "append everything" store would duplicate AND reorder.
     for round in 0..5 {
         store::append_workflow_logs(&mut conn, exec_id, &cycle, 1_000)
             .await
@@ -203,11 +201,10 @@ async fn re_driven_cycle_does_not_duplicate_or_reorder_lines() {
 
 #[tokio::test]
 async fn the_return_value_is_the_rows_actually_inserted_not_the_rows_admitted() {
-    // Regression (issue #790). The function documents its
-    // return as "the number of real (non-marker) rows actually inserted", but
-    // returned the *admitted* count — so a re-drive, whose rows are all
-    // collapsed by `ON CONFLICT DO NOTHING`, reported writes that never
-    // happened. Callers that log or meter on it were being told a lie.
+    // Regression (issue #790). The function documents its return as "the
+    // number of real (non-marker) rows actually inserted". It returned the
+    // *admitted* count instead. So a re-drive, whose rows all collapse under
+    // `ON CONFLICT DO NOTHING`, reported writes that never happened.
     let (url, _c) = setup_database().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let exec_id = ExecutionId::new();
@@ -244,10 +241,9 @@ async fn the_return_value_is_the_rows_actually_inserted_not_the_rows_admitted() 
         .expect("partial-overlap append");
     assert_eq!(third, 1, "only the genuinely new line is inserted");
 
-    // The critical guard on the fix: the truncation marker keys off ADMISSION,
-    // not the inserted count. Using `inserted` for that decision would fire a
-    // false marker on every re-drive (0 inserted < 3 lines), telling an operator
-    // a healthy run had dropped lines.
+    // The truncation marker keys off ADMISSION, not the inserted count. A
+    // marker keyed on `inserted` fires falsely on every re-drive (0 inserted <
+    // 3 lines). It then tells an operator that a healthy run dropped lines.
     let rows = read_all(&mut conn, exec_id).await;
     assert_eq!(
         rows.len(),
@@ -281,7 +277,6 @@ async fn level_filter_and_cursor_pagination_bound_the_read() {
         .await
         .expect("append");
 
-    // Level filter.
     let errors = store::load_workflow_logs(
         &mut conn,
         exec_id,
@@ -400,17 +395,17 @@ async fn truncation_marker_is_recorded_at_most_once() {
 /// The truncation marker is **terminal**: once an execution has truncated, a
 /// later batch is rejected even if `max_lines` has since been RAISED.
 ///
-/// Reachable on any rolling deployment. `max_lines` is per-worker-process
-/// config, so a run can truncate under an old worker's cap and then have its
-/// next decision cycle handled by a new worker with a larger one. Without the
-/// latch, the count that decides admission excludes the marker, so the raised
-/// cap re-opens the gate and stores a line *after* the one that was dropped —
-/// leaving a hole in the stored prefix and a marker whose "subsequent lines
-/// were dropped" claim is false.
+/// Any rolling deployment can reach this. `max_lines` is per-worker-process
+/// config. A run can truncate under an old worker's cap, and a new worker with
+/// a larger cap can take its next decision cycle. Without the latch, the
+/// admission count excludes the marker, so the raised cap re-opens the gate.
+/// The store then keeps a line *after* the dropped one. That leaves a hole in
+/// the stored prefix, and the marker claim "subsequent lines were dropped" is
+/// false.
 ///
-/// Latching keeps two properties that matter more than recovering a raised cap
-/// mid-run (the already-dropped lines are gone either way): the stored rows are
-/// always a contiguous prefix of the run, and the marker never lies.
+/// Latching matters more than recovering a raised cap mid-run, because the
+/// dropped lines are gone either way. It keeps two properties. The stored rows
+/// are always a contiguous prefix of the run. The marker never lies.
 #[tokio::test]
 async fn a_raised_cap_does_not_reopen_the_gate_after_truncation() {
     let (url, _c) = setup_database().await;
@@ -470,10 +465,10 @@ async fn a_raised_cap_does_not_reopen_the_gate_after_truncation() {
 
 /// The latch must not swallow a re-drive of lines that are ALREADY stored.
 ///
-/// Rejecting post-marker batches wholesale is only safe because every line in
-/// such a batch is either already stored (so `ON CONFLICT DO NOTHING` would
-/// have collapsed it anyway) or was deliberately dropped. This pins that: a
-/// re-driven cycle after truncation changes nothing, rather than losing rows.
+/// The latch rejects a post-marker batch wholesale. That is safe only because
+/// each line in it is already stored or was deliberately dropped.
+/// `ON CONFLICT DO NOTHING` would collapse a stored line anyway. This pins that
+/// a re-driven cycle after truncation changes nothing and loses no rows.
 #[tokio::test]
 async fn re_driving_a_cycle_after_truncation_preserves_the_stored_prefix() {
     let (url, _c) = setup_database().await;
@@ -537,9 +532,8 @@ async fn logs_never_outlive_their_execution() {
         1
     );
 
-    // Deleting the execution is exactly what the retention janitor does; the
-    // `ON DELETE CASCADE` FK is what ties log retention to history retention,
-    // with no bespoke delete in the janitor.
+    // The retention janitor deletes the execution row. The `ON DELETE CASCADE`
+    // FK ties log retention to history retention, with no bespoke delete.
     diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
         .bind::<SqlUuid, _>(exec_id.as_uuid())
         .execute(&mut conn)
@@ -590,10 +584,9 @@ async fn payload_erasure_removes_log_rows() {
 /// one the `POST /workflows/{id}/erase-payloads` route calls) must remove log
 /// rows and REPORT how many, via `EraseOutcome.logs_deleted`.
 ///
-/// The sibling above calls `store::delete_workflow_logs` directly, so it proves
-/// the store primitive but not that erasure actually *reaches* it — deleting the
-/// `delete_workflow_logs` call from `erase.rs` would keep it green while leaving
-/// author-emitted PII on disk after an operator ran an erasure.
+/// The sibling above calls `store::delete_workflow_logs` directly. It proves the
+/// store primitive, not that erasure *reaches* it. Without this test, removing
+/// that call from `erase.rs` stays green and leaves author-emitted PII on disk.
 #[tokio::test]
 async fn erase_workflow_payloads_deletes_logs_and_reports_the_count() {
     let (url, _c) = setup_database().await;
@@ -643,15 +636,14 @@ async fn erase_workflow_payloads_deletes_logs_and_reports_the_count() {
 /// Best-effort delivery: a FAILED log write must never wedge the workflow.
 ///
 /// `worker::persist_workflow_logs_from_commands` wraps the INSERT in a nested
-/// `conn.transaction()` — a Postgres SAVEPOINT — specifically so a failure rolls
-/// back only itself. Without it, the failed statement would poison the
-/// **enclosing** persist transaction and every later statement in the workflow's
-/// own persist would error with "current transaction is aborted", so swallowing
-/// the error would corrupt the cycle rather than save it.
+/// `conn.transaction()` — a Postgres SAVEPOINT — so a failure rolls back only
+/// itself. Without it, the failed statement poisons the **enclosing** persist
+/// transaction. Every later statement in that persist then fails with "current
+/// transaction is aborted". Swallowing the error would corrupt the cycle.
 ///
-/// This asserts that property directly against Postgres, and asserts the
-/// **control** — without the savepoint the outer transaction is genuinely
-/// poisoned — so the test is load-bearing rather than tautological.
+/// This asserts that property directly against Postgres. It also asserts the
+/// **control**: without the savepoint, the outer transaction is poisoned. So
+/// the test is load-bearing, not tautological.
 #[tokio::test]
 async fn a_failed_log_write_in_a_savepoint_leaves_the_outer_transaction_usable() {
     use autumn_harvest::error::HarvestError;
@@ -719,9 +711,8 @@ async fn a_failed_log_write_in_a_savepoint_leaves_the_outer_transaction_usable()
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker-driven end-to-end (AC1 / AC2 / AC6)
 //
-// The store-level tests above prove the persistence contract in isolation. These
-// drive a REAL `Worker` against a REAL `#[workflow]`-shaped handler that calls
-// `ctx.log_info` / `log_warn` / `log_error`, so they prove the whole chain:
+// These drive a REAL `Worker` against a REAL `#[workflow]`-shaped handler that
+// calls `ctx.log_info` / `log_warn` / `log_error`. They prove the whole chain:
 // context emission -> bookkeeping command -> worker persist -> `harvest_workflow_logs`.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -748,12 +739,11 @@ fn logging_workflow<'a>(
     })
 }
 
-/// Logs, parks on a durable timer, then logs again — so the handler body is
-/// re-driven by the worker at least twice and the SECOND cycle replays the
-/// first cycle's `ctx.log_*` calls.
+/// Logs, parks on a durable timer, then logs again. The worker drives the body
+/// at least twice, and the SECOND cycle replays the first `ctx.log_*` calls.
 ///
-/// This is the AC2 end-to-end shape: replay suppression plus the deterministic
-/// positional `seq` must together yield exactly one stored copy of each line.
+/// This is the AC2 end-to-end shape. Replay suppression and the positional
+/// `seq` must together store exactly one copy of each line.
 fn logging_workflow_across_cycles<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -906,9 +896,8 @@ async fn worker_persists_author_log_lines_end_to_end() {
         "the worker must persist every ctx.log_* line, in emission order, \
          with its level -- got {rows:?}"
     );
-    // `seq` is a deterministic LOGICAL-POSITION identity (epoch << 24 | index),
-    // not a 0-based counter, so assert the contract (strictly increasing in
-    // emission order) rather than the encoding's concrete values.
+    // `seq` is a LOGICAL-POSITION identity (epoch << 24 | index), not a
+    // 0-based counter. Assert the contract (strictly increasing), not values.
     assert!(
         rows.windows(2).all(|w| w[0].0 < w[1].0),
         "seq must strictly increase in emission order -- got {rows:?}"
@@ -953,9 +942,9 @@ async fn sink_disabled_persists_nothing_and_the_workflow_is_unchanged() {
     assert_eq!(execution.output, Some(serde_json::json!({"ok": true})));
 }
 
-/// AC2 end-to-end: a workflow whose body is re-driven across MULTIPLE decision
-/// cycles (log -> durable timer -> log) stores each line **exactly once**, in
-/// emission order — no duplication from the replayed first cycle, no reordering.
+/// AC2 end-to-end: a body re-driven across MULTIPLE decision cycles stores each
+/// line **exactly once**, in emission order. The replayed first cycle adds no
+/// duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_cycle_workflow_stores_each_line_exactly_once() {
     let (database_url, _container) = setup_database().await;
@@ -1004,9 +993,9 @@ async fn multi_cycle_workflow_stores_each_line_exactly_once() {
 /// Logs several lines per decision cycle across three cycles, parking on a
 /// durable timer between them.
 ///
-/// Shape (6 lines / 3 cycles) chosen so a re-drive at cycle 2 or 3 must REPLAY
-/// (and therefore suppress) every earlier cycle's lines while re-emitting its
-/// own — the exact interleaving AC2's randomized test has to exercise.
+/// With 6 lines over 3 cycles, a re-drive at cycle 2 or 3 must REPLAY and
+/// suppress each earlier line, and re-emit its own. AC2's randomized test must
+/// exercise that interleaving.
 fn interleaved_logging_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -1121,14 +1110,14 @@ async fn drive_once(
 
 /// Grow `history` by a REPLAY-TRANSPARENT `Paused`/`Resumed` pair (issue #383).
 ///
-/// `HistoryMatcher::new` pre-marks both consumed, so the pair lengthens the
-/// history WITHOUT advancing the workflow's own command cursor: the very same
-/// lines are then re-emitted LIVE at a different history length.
+/// `HistoryMatcher::new` pre-marks both consumed. The pair lengthens the history
+/// WITHOUT advancing the command cursor. The same lines then re-emit LIVE at a
+/// different history length.
 ///
-/// This is the dimension that makes the randomized test load-bearing. A `seq`
-/// derived from the loaded-history length (the encoding `publish_progress` uses)
-/// re-mints a DIFFERENT id for the same logical line here and duplicates it; a
-/// pure call ordinal does not. Without this growth, every re-drive sits at an
+/// This dimension makes the randomized test load-bearing. Consider a `seq`
+/// derived from the loaded-history length, the encoding `publish_progress` uses.
+/// It re-mints a DIFFERENT id for the same logical line here and duplicates it.
+/// A pure call ordinal does not. Without this growth, every re-drive sits at an
 /// unchanged history length and both encodings look identical.
 fn grow_history_replay_transparently(history: &mut Vec<WorkflowEvent>) {
     history.push(WorkflowEvent::WorkflowExecutionPaused {
@@ -1173,20 +1162,18 @@ fn advance_history_past_timer(
 
 /// AC2, the mandated **randomized-interleaving replay** test.
 ///
-/// Each trial drives the workflow body over a GROWING history with a randomized
-/// schedule — a randomized number of re-drives at every history position before
-/// the history is advanced — and persists each cycle's `RecordLog` commands
-/// through the REAL [`store::append_workflow_logs`] into the REAL
-/// `harvest_workflow_logs` table.
+/// Each trial drives the workflow body over a GROWING history. It re-drives
+/// each history position a randomized number of times before it advances. It
+/// persists each cycle's `RecordLog` commands through the REAL
+/// [`store::append_workflow_logs`] into the REAL `harvest_workflow_logs` table.
 ///
 /// This is load-bearing in three ways a simulated store cannot be:
 ///
-/// 1. It genuinely **replays**: once the history has grown past cycle 1, every
-///    later drive re-executes cycle 1's `ctx.log_*` calls in replay mode, so
-///    replay suppression is exercised on every drive rather than never.
-/// 2. It genuinely **interleaves**: the re-drive count varies per position, so
-///    a live line and a replayed line land in the same drive in many different
-///    combinations across trials.
+/// 1. It genuinely **replays**: after cycle 1, every drive re-executes cycle
+///    1's `ctx.log_*` calls in replay mode. So every drive exercises replay
+///    suppression.
+/// 2. It genuinely **interleaves**: the re-drive count varies per position.
+///    So live and replayed lines share a drive in many combinations.
 /// 3. It genuinely depends on **the durable dedup**: collapsing happens in
 ///    Postgres via `ON CONFLICT (workflow_exec_id, seq) DO NOTHING`, so
 ///    dropping the unique index fails this test.
@@ -1218,13 +1205,11 @@ async fn randomized_replay_interleavings_never_duplicate_or_reorder_lines() {
         // Bounded so a regression that never completes fails loudly rather
         // than hanging the suite.
         for _ in 0..64 {
-            // Re-drive the SAME logical position a randomized number of times
-            // (2..=4) before advancing — the crash-recovery / task-requeue
-            // shape, where a decision cycle is replayed without the workflow
-            // having made progress. At least two, so every position offers a
-            // window in which to grow the history replay-transparently (see
-            // below); a single-drive position would make that dimension
-            // unreachable and the trial vacuous.
+            // Re-drive the SAME logical position 2 to 4 times before advancing.
+            // This is the crash-recovery / task-requeue shape: a cycle replays
+            // with no workflow progress. Each position needs two drives or more,
+            // so the history can grow replay-transparently between them.
+            // Otherwise that dimension is unreachable and the trial is vacuous.
             let repeats = rng.in_range(3) + 1;
             let mut last: Option<(_, _)> = None;
             for repeat in 0..repeats {

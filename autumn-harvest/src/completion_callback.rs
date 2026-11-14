@@ -3,16 +3,16 @@
 //!
 //! # Overview
 //!
-//! An embedder starting a workflow from an external service has no push
-//! notification when it finishes today — only polling `GET
-//! /workflows/{id}/result` (issue #527) or a long-poll. This module lets an
-//! embedder register one or more **completion callback targets** — a URL
-//! plus an [`EventFilter`] selecting which terminal states deliver — either
-//! per-start ([`crate::execution::StartWorkflowParams::completion_callbacks`])
-//! or as a [`HarvestBuilder`](crate::builder::HarvestBuilder)-wide default.
-//! On the workflow's terminal transition, a durable, shard-local delivery row
-//! is enqueued that a background scanner POSTs (HMAC-signed, SSRF-guarded,
-//! retried with backoff, dead-lettered on exhaustion) to the target URL.
+//! An external service that starts a workflow gets no push notification of
+//! its end. It can only poll `GET /workflows/{id}/result` (issue #527) or
+//! long-poll. This module lets an embedder register one or more **completion
+//! callback targets**. A target is a URL plus an [`EventFilter`] that selects
+//! which terminal states deliver. Register targets per start
+//! ([`crate::execution::StartWorkflowParams::completion_callbacks`]) or as a
+//! [`HarvestBuilder`](crate::builder::HarvestBuilder)-wide default.
+//! The terminal transition enqueues a durable, shard-local delivery row. A
+//! background scanner POSTs it to the target URL. The POST is HMAC-signed
+//! and SSRF-guarded, retries with backoff, and dead-letters on exhaustion.
 //!
 //! # Determinism contract
 //!
@@ -32,9 +32,9 @@
 //!
 //! # SSRF guard
 //!
-//! Every target URL is validated against an operator-configured
-//! [`SsrfPolicy`] both at registration time (builder default / per-start
-//! option) and again at enqueue time (defense in depth). The default policy
+//! Every target URL is checked against an operator-configured
+//! [`SsrfPolicy`]. The check runs at registration (builder default or
+//! per-start option) and again at enqueue, as defense in depth. The default policy
 //! is HTTPS-only with a required host allowlist; private, loopback,
 //! link-local, and other non-routable IP literals are always rejected unless
 //! explicitly allowed.
@@ -59,9 +59,9 @@ pub use crate::completion_trigger::TerminalState;
 ///   (case-insensitive).
 /// - **Suffix wildcard**: `*.example.com` matches any host with one or more
 ///   labels before `.example.com` (e.g. `a.example.com`,
-///   `a.b.example.com`) but never the bare `example.com` itself, and never
-///   an unrelated host that merely ends with the same characters (e.g.
-///   `evilexample.com` does not match `*.example.com`).
+///   `a.b.example.com`). It never matches the bare `example.com`. It never
+///   matches an unrelated host with the same ending, such as
+///   `evilexample.com`.
 ///
 /// An entry may optionally pin a specific port; when it does, the target
 /// URL's port (defaulted per-scheme) must equal it exactly.
@@ -78,16 +78,13 @@ impl AllowlistEntry {
     /// `"api.example.com:8443"`, or `"*.example.com:8443"`.
     #[must_use]
     pub fn parse(pattern: &str) -> Self {
-        // issue #921 review (Codex): an out-of-range port digit string (e.g.
-        // "api.example.com:70000", which cannot fit in a u16) must NOT
-        // silently fall back to an *unpinned* entry — that would broaden a
-        // malformed SSRF-allowlist pattern into "any port on this host" is
-        // allowed, exactly backwards for a security control. Only split the
-        // host from the port when the digits actually parse as a valid
-        // `u16`; otherwise treat the whole pattern (colon included) as the
-        // host literal, which can never match a real parsed URL host (a
-        // `url::Host::Domain` never contains a colon), so the entry simply
-        // never matches anything rather than silently widening access.
+        // An out-of-range port (e.g. "api.example.com:70000") must NOT fall
+        // back to an *unpinned* entry (issue #921). That would widen a
+        // malformed SSRF allowlist pattern to "any port on this host". So
+        // split off the port only when the digits parse as a `u16`.
+        // Otherwise the whole pattern, colon included, is the host literal.
+        // A parsed `url::Host::Domain` never contains a colon, so that entry
+        // never matches anything.
         let (host_part, port) = match pattern.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => p
                 .parse::<u16>()
@@ -149,12 +146,12 @@ impl HostAllowlist {
         self.entries.is_empty()
     }
 
-    /// Returns every entry whose host pattern matches `host` (issue #921
-    /// review: an operator can legitimately configure multiple entries for
-    /// the same host with different pinned ports, e.g.
-    /// `api.example.com:8443` and `api.example.com:9443` — the caller must
-    /// consider all of them, not just the first, or a valid multi-port
-    /// allowlist becomes order-dependent).
+    /// Returns every entry whose host pattern matches `host`.
+    ///
+    /// An operator can pin several ports for one host, e.g.
+    /// `api.example.com:8443` and `api.example.com:9443` (issue #921). The
+    /// caller must consider every match, not just the first. Otherwise a
+    /// valid multi-port allowlist becomes order-dependent.
     fn matching_entries<'a>(&'a self, host: &'a str) -> impl Iterator<Item = &'a AllowlistEntry> {
         self.entries.iter().filter(move |e| e.matches_host(host))
     }
@@ -170,11 +167,11 @@ pub struct SsrfPolicy {
     /// When `true`, `http://` targets are also permitted (still subject to
     /// the same host allowlist and IP-literal rules).
     pub allow_http: bool,
-    /// When `false` (default), an IP-literal host (`https://127.0.0.1/...`,
-    /// `https://93.184.216.34/...`) is always rejected — even a public IP —
-    /// because it can never be `HostAllowlist`-matched and bypasses the
-    /// operator's domain-based intent. When `true`, IP literals are
-    /// permitted subject to the private/loopback/link-local rejection below.
+    /// When `false` (default), every IP-literal host is rejected, even a
+    /// public one such as `https://93.184.216.34/`. An IP literal never
+    /// matches the `HostAllowlist`, so it bypasses the operator's
+    /// domain-based intent. When `true`, IP literals pass subject to the
+    /// private/loopback/link-local rejection below.
     pub allow_ip_literals: bool,
 }
 
@@ -239,9 +236,9 @@ const fn is_ipv4_non_routable(ip: Ipv4Addr) -> bool {
         // 100.64.0.0/10 — shared address space (CGNAT, RFC 6598).
         || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
         // 0.0.0.0/8 — "this host on this network" (RFC 1122). On Linux the
-        // whole range routes to localhost, so it is an SSRF bypass of the
-        // host allowlist; `is_unspecified()` above only catches the bare
-        // 0.0.0.0 address, not the rest of the /8.
+        // whole range routes to localhost, so it bypasses the host
+        // allowlist. `is_unspecified()` above catches only the bare 0.0.0.0
+        // address, not the rest of the /8.
         || ip.octets()[0] == 0
         // 198.18.0.0/15 — benchmarking / device testing (RFC 2544).
         || (ip.octets()[0] == 198 && (ip.octets()[1] == 18 || ip.octets()[1] == 19))
@@ -294,16 +291,16 @@ const fn is_ip_non_routable(ip: IpAddr) -> bool {
 ///    even then is rejected if it is loopback/private/link-local/etc. An IP
 ///    literal is *never* matched against the domain allowlist.
 /// 6. A domain host must match an entry in `policy.allowlist` (exact or
-///    `*.suffix`); a bare, dotless host (e.g. `localhost`) is only ever
-///    accepted via an explicit exact-match allowlist entry.
+///    `*.suffix`). A bare, dotless host (e.g. `localhost`) passes only
+///    through an explicit exact-match entry.
 /// 7. If the matched allowlist entry pins a port, the URL's effective port
 ///    (explicit, or the scheme default) must equal it.
 ///
-/// DNS resolution is intentionally **not** performed here (doing so would
-/// both be a TOCTOU race against the actual delivery connection and require
-/// this pure function to become I/O); the guard is syntactic (scheme/host)
-/// plus IP-literal blocking. Deployments with strict SSRF requirements
-/// should pair this with network-level egress controls.
+/// This function does **no** DNS resolution. A lookup here would race the
+/// actual delivery connection (TOCTOU) and would make this pure function do
+/// I/O. The guard is syntactic (scheme/host) plus IP-literal blocking.
+/// Deployments with strict SSRF requirements should pair this with
+/// network-level egress controls.
 ///
 /// # Errors
 /// Returns [`SsrfRejection`] when `raw_url` fails any of the rules above.
@@ -350,11 +347,10 @@ fn validate_domain_host(
     domain: &str,
     policy: &SsrfPolicy,
 ) -> Result<(), SsrfRejection> {
-    // issue #921 review (Codex): check every matching entry, not just the
-    // first one `matching_entries` yields — an operator can register
-    // multiple entries for the same host with different pinned ports (or a
-    // mix of pinned and unpinned entries), and the URL is allowed if *any*
-    // of them accepts it.
+    // Check every matching entry, not just the first (issue #921). An
+    // operator can register several entries for one host with different
+    // pinned ports, or a mix of pinned and unpinned entries. The URL passes
+    // if *any* of them accepts it.
     let mut host_matched = false;
     for entry in policy.allowlist.matching_entries(domain) {
         host_matched = true;
@@ -613,11 +609,10 @@ mod ssrf_tests {
 
     #[test]
     fn an_out_of_range_port_pattern_fails_closed_instead_of_becoming_unpinned() {
-        // Issue #921 review (Codex): "api.example.com:70000" has a digit
-        // string that cannot fit in a u16. Silently dropping the port
-        // constraint would turn a malformed pattern into "any port on this
-        // host is allowed" -- backwards for an SSRF control. It must
-        // instead fail closed: the entry never matches a real host at all.
+        // Issue #921: "api.example.com:70000" has a digit string that cannot
+        // fit in a u16. Dropping the port constraint would turn a malformed
+        // pattern into "any port on this host is allowed". It must instead
+        // fail closed: the entry never matches a real host at all.
         let policy = policy_with(&["api.example.com:70000"]);
         let err = validate_target_url("https://api.example.com/hook", &policy).unwrap_err();
         assert_eq!(
@@ -637,9 +632,8 @@ mod ssrf_tests {
 
     #[test]
     fn multiple_pinned_port_entries_for_the_same_host_are_all_considered() {
-        // Issue #921 review (Codex): registering both
-        // api.example.com:8443 and api.example.com:9443 must allow either
-        // port -- not just whichever entry happens to come first.
+        // Issue #921: registering both api.example.com:8443 and
+        // api.example.com:9443 must allow either port, not just the first.
         let policy = policy_with(&["api.example.com:8443", "api.example.com:9443"]);
         assert!(validate_target_url("https://api.example.com:8443/hook", &policy).is_ok());
         assert!(validate_target_url("https://api.example.com:9443/hook", &policy).is_ok());
@@ -690,10 +684,9 @@ mod ssrf_tests {
     // also pin the two newly closed gaps: 0.0.0.0/8 and 198.18.0.0/15.
     // ---------------------------------------------------------------------
 
-    /// A policy that allows IP literals (so the classifier — not the
-    /// blanket `IpLiteralNotAllowed` rule — is what makes the decision) with
-    /// no host allowlist (irrelevant for IP literals, which are never matched
-    /// against the domain allowlist).
+    /// A policy that allows IP literals, so the classifier decides, not the
+    /// blanket `IpLiteralNotAllowed` rule. It has no host allowlist, because
+    /// IP literals never match the domain allowlist.
     fn ip_literal_policy() -> SsrfPolicy {
         SsrfPolicy::default().with_allow_ip_literals(true)
     }
@@ -713,9 +706,9 @@ mod ssrf_tests {
     }
 
     fn assert_ip_not_special_range_rejected(addr: &str) {
-        // With IP literals allowed and no allowlist gate, a genuinely
-        // routable public IP must pass — proving the special-range
-        // classifier does not over-reach into neighboring ranges.
+        // With IP literals allowed and no allowlist gate, a routable public
+        // IP must pass. This proves the special-range classifier does not
+        // reach into neighboring ranges.
         let policy = ip_literal_policy();
         assert!(
             validate_target_url(&format!("https://{addr}/hook"), &policy).is_ok(),
@@ -843,9 +836,9 @@ pub struct CompletionEnvelope {
 ///
 /// `result` is populated only for [`TerminalState::Completed`] (from
 /// `execution_output`); `error` is populated for every other terminal state
-/// (from `execution_error`). `completed_at` defaults to `Utc::now()` if the
-/// execution row has not yet recorded one (should not normally happen for a
-/// terminal row, but keeps this a total function).
+/// (from `execution_error`). `completed_at` defaults to `Utc::now()` when
+/// the row has none. A terminal row normally has one. The default keeps this
+/// a total function.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_envelope(
@@ -1211,22 +1204,20 @@ impl CallbackTarget {
 
 /// Resolve the full, deterministic, deduplicated set of effective callback targets.
 ///
-/// Per-execution targets come first (in the order given), then builder-wide
-/// defaults, skipping any entry that exactly duplicates an already-included
-/// `(url, filter)` pair — including a duplicate *within* `per_exec` itself
-/// (issue #921 review): a caller that repeats the same target twice in one
-/// start request must still get exactly one delivery row/`delivery_id` for
-/// it, not two independently-retried deliveries to the same receiver for
-/// the same logical registration.
+/// Per-execution targets come first, in the given order, then builder-wide
+/// defaults. The result skips any exact duplicate of an included
+/// `(url, filter)` pair, even a duplicate *within* `per_exec` (issue #921).
+/// A caller that repeats one target in a start request gets one delivery
+/// row and one `delivery_id`. It does not get two independently retried
+/// deliveries to the same receiver.
 ///
-/// The returned `Vec`'s index is the **stable `callback_index`** used as
-/// half of the `(workflow_exec_id, callback_index)` uniqueness key in
-/// `harvest_completion_deliveries` — it is computed over the *full* union,
-/// not just the subset that matches a particular fired state, so a given
-/// `(execution, target)` pair always has exactly one permanent slot
-/// regardless of which terminal state actually fires (an execution only
-/// ever reaches one terminal state, so this is purely a stability
-/// guarantee, not a multi-fire concern).
+/// The returned `Vec`'s index is the **stable `callback_index`**. It is half
+/// of the `(workflow_exec_id, callback_index)` uniqueness key in
+/// `harvest_completion_deliveries`. The index covers the *full* union, not
+/// the subset that matches the fired state. So an `(execution, target)` pair
+/// has one permanent slot, whatever terminal state fires. An execution
+/// reaches only one terminal state, so this is a stability guarantee, not a
+/// multi-fire concern.
 #[must_use]
 pub fn resolve_all_targets(
     per_exec: &[CallbackTarget],
@@ -1244,9 +1235,9 @@ pub fn resolve_all_targets(
 /// Select the `(callback_index, target)` pairs from the full effective-target
 /// union (see [`resolve_all_targets`]) whose [`EventFilter`] matches `state`.
 ///
-/// Returns an empty `Vec` when nothing matches — including the common case
-/// of no configured targets at all — which is exactly the "identical
-/// behavior for callback-less workflows" guarantee.
+/// Returns an empty `Vec` when nothing matches, including when no target is
+/// configured. That is the "identical behavior for callback-less workflows"
+/// guarantee.
 #[must_use]
 pub fn resolve_effective_targets(
     all_targets: &[CallbackTarget],
@@ -1327,10 +1318,9 @@ mod config_resolution_tests {
 
     #[test]
     fn resolve_all_targets_dedupes_a_repeated_target_within_per_exec_itself() {
-        // Issue #921 review (Codex): a caller repeating the same {url, filter}
-        // twice in one start request's completion_callbacks list must still
-        // resolve to exactly one target/callback_index/delivery_id, not two
-        // independently-delivered duplicates to the same receiver.
+        // Issue #921: one {url, filter} repeated in a start request's
+        // completion_callbacks list must resolve to one target,
+        // callback_index and delivery_id. It must not deliver twice.
         let dup = target("https://a.example.com", EventFilter::AnyTerminal);
         let per_exec = vec![
             dup.clone(),
@@ -1430,10 +1420,9 @@ pub type DeliverFuture<'a> =
 
 /// The result of one delivery attempt.
 ///
-/// Either the HTTP response status was observed (`status`, regardless of
-/// whether it was 2xx), or the request never got a response
-/// (`transport_error` — connect failure, timeout, TLS error, DNS failure,
-/// etc).
+/// Holds either the observed HTTP response status (`status`, 2xx or not) or
+/// a transport failure. A `transport_error` means no response arrived:
+/// connect failure, timeout, TLS error, DNS failure, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryAttempt {
     pub status: Option<u16>,
@@ -1758,16 +1747,17 @@ pub enum OutcomeAction {
     },
 }
 
-/// Deterministic per-delivery jitter seed, mirroring `worker.rs`'s
-/// `retry_stream_seed` (same FNV-offset-basis-XOR-halves idiom applied to a
-/// single UUID instead of two): two different deliveries never share a
-/// jitter stream, and the same delivery always jitters the same way for a
-/// given attempt number, so `JitterPolicy::Full`/`Equal`/`Decorrelated`
-/// spread retries across deliveries instead of all of them backing off in
-/// lockstep (the whole point of configuring jitter).
-// The only non-test caller (`fire_due_on_conn`) is `db`-gated, so without
-// `db` (e.g. `--no-default-features --features testing`, the combo the CLI's
-// clippy job builds) this helper would otherwise be dead code.
+/// Deterministic per-delivery jitter seed.
+///
+/// It mirrors `worker.rs`'s `retry_stream_seed`: the same
+/// FNV-offset-basis-XOR-halves idiom, on one UUID instead of two. Two
+/// deliveries never share a jitter stream. One delivery always jitters the
+/// same way for a given attempt number. So `JitterPolicy::Full`/`Equal`/
+/// `Decorrelated` spread retries across deliveries instead of backing off in
+/// lockstep.
+// The only non-test caller (`fire_due_on_conn`) is `db`-gated. Without `db`
+// (e.g. `--no-default-features --features testing`, which the CLI's clippy
+// job builds), this helper is dead code.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 #[must_use]
 fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
@@ -1788,8 +1778,8 @@ fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
 /// the scanner's claim-time increment). `max_attempts` is frozen onto the
 /// delivery row at enqueue time from the effective retry policy. `seed`
 /// (typically [`delivery_stream_seed`] of the delivery's id) drives
-/// `retry_policy.jitter` — without it, a configured `JitterPolicy` would be
-/// silently ignored and every delivery would back off in perfect lockstep.
+/// `retry_policy.jitter`. Without it, a configured `JitterPolicy` is ignored
+/// and every delivery backs off in lockstep.
 ///
 /// A permanent 4xx dead-letters at once. A `Retry-After` hint sets the
 /// minimum backoff, clamped to
@@ -1979,12 +1969,11 @@ mod classify_outcome_tests {
 
     #[test]
     fn jitter_policy_is_honored_not_ignored() {
-        // issue #921 review (Codex P2): classify_outcome used to call the
-        // raw, non-jittered `compute_retry_delay` directly, silently
-        // dropping any configured `RetryPolicy::jitter`. Two different seeds
-        // under a `Full` jitter policy must be able to produce different
-        // delays for the same attempt — proving the seed actually reaches
-        // the jitter computation instead of being ignored.
+        // Issue #921: classify_outcome used to call the raw, non-jittered
+        // `compute_retry_delay`, which dropped any `RetryPolicy::jitter`.
+        // Two seeds under a `Full` jitter policy must be able to produce
+        // different delays for one attempt. That proves the seed reaches
+        // the jitter computation.
         let policy = test_policy().with_jitter(crate::policy::JitterPolicy::Full);
         let outcome = DeliveryAttempt::success(500);
         let mut delays = std::collections::HashSet::new();
@@ -2140,8 +2129,8 @@ mod classify_outcome_tests {
 /// Default delivery retry policy: exponential backoff over roughly a 1-hour window.
 ///
 /// 10 attempts, 30s initial interval, coefficient 2.0, capped at 10 minutes
-/// per retry — matching the issue's "survives a receiver outage up to the
-/// configured retry window (default 1 h)" success metric.
+/// per retry. This matches the success metric of issue #605: "survives a
+/// receiver outage up to the configured retry window (default 1 h)".
 #[must_use]
 pub const fn default_delivery_retry_policy() -> crate::policy::RetryPolicy {
     crate::policy::RetryPolicy {
@@ -2157,11 +2146,10 @@ pub const fn default_delivery_retry_policy() -> crate::policy::RetryPolicy {
 /// Builder-level completion-callback configuration.
 ///
 /// Collected by [`HarvestBuilder`](crate::builder::HarvestBuilder)'s fluent
-/// `completion_callback_*` methods and resolved into a
-/// [`CallbackRuntimeConfig`] at plugin-startup time (the plugin supplies a
-/// default [`CompletionCallbackDeliverer`] — a `reqwest`-based
-/// implementation — when `deliverer` is `None`, since core ships no HTTP
-/// client).
+/// `completion_callback_*` methods. Plugin startup resolves it into a
+/// [`CallbackRuntimeConfig`]. Core ships no HTTP client, so the plugin
+/// supplies a `reqwest`-based [`CompletionCallbackDeliverer`] when
+/// `deliverer` is `None`.
 #[derive(Clone)]
 pub struct CompletionCallbackBuilderConfig {
     pub allowlist: HostAllowlist,
@@ -2351,11 +2339,10 @@ mod builder_config_tests {
 /// — the same pattern as
 /// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`].
 ///
-/// `None` (the default, before any builder wiring runs) means the feature
-/// is fully inert: [`enqueue_completion_deliveries`] is a no-op and no
-/// `harvest_completion_deliveries` row is ever written, so an embedder who
-/// never touches the completion-callback builder API sees zero behavior
-/// change.
+/// `None` (the default, before builder wiring runs) means the feature is
+/// inert. [`enqueue_completion_deliveries`] is a no-op and writes no
+/// `harvest_completion_deliveries` row. So an embedder who never touches the
+/// completion-callback builder API sees no behavior change.
 #[cfg(feature = "db")]
 #[derive(Clone)]
 pub struct CallbackRuntimeConfig {
@@ -2366,38 +2353,35 @@ pub struct CallbackRuntimeConfig {
     pub retry_policy: crate::policy::RetryPolicy,
 }
 
-// `Arc`-wrapped (issue #605 code review): every read clones the value out of
-// the lock (see below), and `CallbackRuntimeConfig` carries owned `Vec<u8>`/
-// `Vec<String>`/`Vec<CallbackTarget>` fields alongside the already-cheap
-// `Arc<dyn CompletionCallbackDeliverer>` — without the outer `Arc`, a clone
-// deep-copies all of those on every terminal transition and every scanner
-// tick, a config value that is otherwise identical across calls and only
-// ever changes at startup. Wrapping the whole struct turns that into an O(1)
+// `Arc`-wrapped (issue #605). Every read clones the value out of the lock
+// (see below). `CallbackRuntimeConfig` carries owned `Vec<u8>`,
+// `Vec<String>` and `Vec<CallbackTarget>` fields beside the cheap
+// `Arc<dyn CompletionCallbackDeliverer>`. Without the outer `Arc`, a clone
+// deep-copies them on every terminal transition and scanner tick. The value
+// changes only at startup. The outer `Arc` makes each clone an O(1)
 // refcount bump.
 #[cfg(feature = "db")]
 pub static GLOBAL_CALLBACK_CONFIG: std::sync::RwLock<
     Option<std::sync::Arc<CallbackRuntimeConfig>>,
 > = std::sync::RwLock::new(None);
 
-/// Read the current [`GLOBAL_CALLBACK_CONFIG`], tolerating a poisoned lock
-/// (issue #921 review) rather than either panicking or silently treating a
-/// poisoned lock the same as "never configured".
+/// Read the current [`GLOBAL_CALLBACK_CONFIG`], tolerating a poisoned lock.
 ///
-/// A poisoned `RwLock` means some other thread panicked while holding the
-/// write guard — but the single `*lock = Some(..)` assignment that write
-/// path performs is not itself a multi-step invariant that a panic could
-/// leave half-updated, so the data behind a poisoned read guard is still
-/// perfectly valid to read. Recovering it (via `into_inner()`) rather than
-/// discarding it avoids the failure mode a bare `.read().ok()` has: if
-/// *anything* elsewhere in the process ever panics while holding this
-/// lock's write guard, every subsequent terminal transition would
-/// otherwise silently stop enqueuing/delivering completion callbacks for
-/// the rest of the process's life, with no diagnostic at all. Panicking
-/// instead (the alternative some reviewers suggest) was rejected: it would
-/// propagate into `enqueue_completion_deliveries`, called inside the
-/// worker's terminal-transition transaction for *every* workflow
-/// completion in the system — crashing delivery of a completion callback
-/// must never crash the workflow's own terminal transition.
+/// It neither panics nor treats a poisoned lock as "never configured"
+/// (issue #921).
+///
+/// A poisoned `RwLock` means another thread panicked while it held the
+/// write guard. The write path does one `*lock = Some(..)` assignment. A
+/// panic cannot leave that half-updated, so the data behind a poisoned guard
+/// is still valid. Recovering it (via `into_inner()`) avoids the failure
+/// mode of a bare `.read().ok()`. There, one panic under this lock's write
+/// guard would silently stop every later terminal transition from enqueuing
+/// or delivering callbacks. That would last for the life of the process,
+/// with no diagnostic. Panicking instead was rejected. The panic would
+/// propagate into `enqueue_completion_deliveries`, which runs inside the
+/// worker's terminal-transition transaction for *every* workflow completion.
+/// A completion callback must never crash the workflow's own terminal
+/// transition.
 #[cfg(feature = "db")]
 fn read_global_callback_config() -> Option<std::sync::Arc<CallbackRuntimeConfig>> {
     match GLOBAL_CALLBACK_CONFIG.read() {
@@ -2416,35 +2400,31 @@ fn read_global_callback_config() -> Option<std::sync::Arc<CallbackRuntimeConfig>
 /// Install [`GLOBAL_CALLBACK_CONFIG`] for an embedder using the core
 /// `HarvestBuilder::build()` -> `into_worker_parts()` path directly.
 ///
-/// This bypasses `autumn-harvest-plugin`'s `HarvestPlugin`/`HarvestRunner`
-/// (issue #921 review, Codex P2). `autumn-harvest-plugin`'s
-/// `PreparedHarvestRuntime::build` is the *only*
-/// installer this crate ships (core has no `reqwest` dependency to fall back
-/// to when no deliverer is configured, and no obvious place to warn-and-noop
-/// otherwise), so a caller who never goes through the plugin — the
-/// documented "direct core worker" embedding path — got a builder API
-/// (`completion_callback_default`/`completion_callback_deliverer`/etc.) that
-/// silently did nothing: `enqueue_completion_deliveries` reads
-/// `GLOBAL_CALLBACK_CONFIG` and treats `None` as "feature never configured",
-/// so no delivery row was ever enqueued.
+/// This path bypasses `autumn-harvest-plugin`'s `HarvestPlugin`/
+/// `HarvestRunner` (issue #921). The plugin's `PreparedHarvestRuntime::build`
+/// is the *only* installer this crate ships. Core has no `reqwest`
+/// dependency to fall back to without a deliverer, and no obvious place to
+/// warn and no-op. So a caller on the documented "direct core worker" path
+/// got a builder API (`completion_callback_default`/
+/// `completion_callback_deliverer`/etc.) that silently did nothing.
+/// `enqueue_completion_deliveries` reads `GLOBAL_CALLBACK_CONFIG` and treats
+/// `None` as "feature never configured", so it never enqueued a delivery row.
 ///
-/// Only installs when a [`CompletionCallbackDeliverer`] was actually
-/// supplied via `completion_callback_deliverer(...)` — with no deliverer
-/// there is nothing to POST with, and unlike the plugin path this crate has
-/// no default implementation to substitute, so this runtime must be
-/// callback-inert.
+/// Installs only when `completion_callback_deliverer(...)` supplied a
+/// [`CompletionCallbackDeliverer`]. Without one there is nothing to POST
+/// with. Unlike the plugin path, this crate has no default implementation to
+/// substitute, so this runtime must be callback-inert.
 ///
-/// **Clears any prior [`GLOBAL_CALLBACK_CONFIG`] on this path** (issue #921
-/// review, Codex P2): the config is a single process-wide static, not
-/// per-worker-instance, so a process that builds a direct core worker with
-/// `completion_callback_deliverer(...)` and later builds a *second* direct
-/// worker without one must not leave the first worker's deliverer/default
-/// targets/secret installed — otherwise the second (supposedly
-/// callback-inert) runtime's terminal workflows would still enqueue
-/// deliveries and POST results to the first runtime's callback URL using a
-/// deliverer/secret that has nothing to do with this runtime. Clearing to
-/// `None` here matches the documented "no deliverer configured -> no
-/// deliveries enqueued" contract for whichever runtime was built most
+/// **Clears any prior [`GLOBAL_CALLBACK_CONFIG`] on this path**
+/// (issue #921). The config is one process-wide static, not per worker. A
+/// process can build a direct core worker with
+/// `completion_callback_deliverer(...)` and later a *second* direct worker
+/// without one. The first worker's deliverer, default targets and secret
+/// must not stay installed. Otherwise the second, callback-inert runtime
+/// would still enqueue deliveries for its terminal workflows. It would POST
+/// results to the first runtime's callback URL with an unrelated deliverer
+/// and secret. Clearing to `None` keeps the documented "no deliverer
+/// configured -> no deliveries enqueued" contract for the runtime built most
 /// recently in this process.
 #[cfg(feature = "db")]
 pub fn install_global_callback_config_for_direct_worker(config: &CompletionCallbackBuilderConfig) {
@@ -2474,12 +2454,11 @@ pub fn install_global_callback_config_for_direct_worker(config: &CompletionCallb
     }
 }
 
-// `GLOBAL_CALLBACK_CONFIG` is a process-wide static (by design -- it mirrors
-// `GLOBAL_WORKFLOW_METADATA`'s "set once at startup" contract in production),
-// so tests that mutate it must serialize against each other the same way
-// `tests/completion_callback_tests.rs`'s `TEST_SERIAL` does -- this is a
-// separate test binary (`--lib`) from that integration-test file, so it
-// needs its own guard rather than sharing that one.
+// `GLOBAL_CALLBACK_CONFIG` is a process-wide static by design. It mirrors
+// the "set once at startup" production contract of
+// `GLOBAL_WORKFLOW_METADATA`. So tests that mutate it must serialize, like
+// `TEST_SERIAL` in `tests/completion_callback_tests.rs`. This `--lib` test
+// binary is separate from that file, so it needs its own guard.
 #[cfg(all(test, feature = "db"))]
 static DIRECT_WORKER_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2500,12 +2479,11 @@ mod direct_worker_install_tests {
         }
     }
 
-    // Regression (issue #921 review, Codex P2): a process that builds a
-    // direct core worker with a deliverer, then later builds a *second*
-    // direct worker with none, must not leave the first runtime's
-    // deliverer/secret/targets installed -- the second (supposedly
-    // callback-inert) runtime would otherwise still enqueue deliveries using
-    // stale config that has nothing to do with it.
+    // Regression (issue #921): a process builds a direct core worker with a
+    // deliverer, then a *second* direct worker with none. The first
+    // runtime's deliverer, secret and targets must not stay installed.
+    // Otherwise the second, callback-inert runtime would still enqueue
+    // deliveries with stale config.
     #[test]
     fn installing_without_a_deliverer_clears_a_previously_installed_config() {
         let _guard = DIRECT_WORKER_INSTALL_TEST_SERIAL
@@ -2531,9 +2509,9 @@ mod direct_worker_install_tests {
         );
     }
 
-    // The existing behavior this fix must not regress: installing with no
-    // deliverer when nothing was ever configured stays a no-op (`None`
-    // stays `None`), not an error.
+    // The behavior this fix must not regress: installing with no deliverer
+    // when nothing was configured stays a no-op (`None` stays `None`), not
+    // an error.
     #[test]
     fn installing_without_a_deliverer_when_never_configured_stays_none() {
         let _guard = DIRECT_WORKER_INSTALL_TEST_SERIAL
@@ -2556,20 +2534,18 @@ mod direct_worker_install_tests {
 /// transition to `state`.
 ///
 /// Called from [`crate::completion_trigger::evaluate_triggers_for_execution`]
-/// immediately after it loads the execution row, so it runs inside the
-/// *same* transaction as every terminal-state write (completion, failure,
-/// cancellation, termination, timeout) — never on a `ContinueAsNew`
-/// transition, since that function has no such call site. Because the
-/// insert happens inside the terminal transaction, a background scanner
-/// that only reads committed rows observes the delivery *after* the
-/// terminal transition has durably committed, without any extra
+/// right after it loads the execution row. So it runs inside the *same*
+/// transaction as every terminal-state write: completion, failure,
+/// cancellation, termination and timeout. It never runs on a `ContinueAsNew`
+/// transition, since that function has no such call site. The insert is in
+/// the terminal transaction. So a scanner that reads only committed rows
+/// sees the delivery *after* the terminal transition commits, with no extra
 /// coordination.
 ///
-/// Idempotent: the `UNIQUE (workflow_exec_id, callback_index)` constraint +
-/// `ON CONFLICT DO NOTHING` means calling this twice for the same execution
-/// and state (e.g. if a parent-close-cascade recursion re-enters the
-/// caller for the same execution) enqueues each target's delivery at most
-/// once.
+/// Idempotent: the `UNIQUE (workflow_exec_id, callback_index)` constraint and
+/// `ON CONFLICT DO NOTHING` enqueue each target's delivery at most once.
+/// That holds when a call repeats for the same execution and state, e.g.
+/// when a parent-close-cascade recursion re-enters the caller.
 ///
 /// `codecs` decodes the output column for the webhook body (issue #1979).
 ///
@@ -2611,13 +2587,12 @@ pub async fn enqueue_completion_deliveries(
     let output = codecs.decode_column_opt(execution.output.as_ref())?;
 
     for (callback_index, target) in matching {
-        // Defense-in-depth: re-validate against the *live* SSRF policy even
-        // though the target was already validated at registration time
-        // (builder default at build time, or per-start option at the HTTP
-        // start route). A tightened operator policy must never be bypassed
-        // by an execution registered under a looser prior policy. Rejection
-        // here skips just this one target rather than aborting the
-        // terminal transaction.
+        // Defense in depth: re-validate against the *live* SSRF policy. The
+        // target already passed at registration (builder default at build
+        // time, or per-start option at the HTTP start route). A tightened
+        // operator policy must never be bypassed by an execution registered
+        // under a looser prior policy. A rejection skips only this target.
+        // It does not abort the terminal transaction.
         if let Err(rejection) = validate_target_url(&target.url, &config.ssrf_policy) {
             // REDACTED to its origin, not logged whole (issue #1274). A
             // completion-callback target often carries a bearer token in
@@ -2732,25 +2707,23 @@ struct ClaimedDeliveryRow {
 }
 
 /// Claim up to [`COMPLETION_DELIVERY_FIRE_BATCH_SIZE`] due rows in one
-/// atomic statement: a `FOR UPDATE SKIP LOCKED` candidate CTE feeding an
-/// `UPDATE ... RETURNING`, so the claim and the `INFLIGHT` transition
-/// happen together with no gap a concurrent scanner could race into
-/// (mirrors `queue::claim_task`'s candidate-CTE shape). This one SQL
-/// statement is atomic by itself — no explicit transaction wrapper needed
-/// — and, critically, does **not** hold any lock across the network POST
-/// that follows: the statement (and its row locks) completes before this
+/// atomic statement. A `FOR UPDATE SKIP LOCKED` candidate CTE feeds an
+/// `UPDATE ... RETURNING`, like `queue::claim_task`. So the claim and the
+/// `INFLIGHT` transition happen together, with no gap a concurrent scanner
+/// could race into. The statement is atomic by itself and needs no
+/// transaction wrapper. Critically, it holds **no** lock across the network
+/// POST that follows. The statement and its row locks complete before this
 /// function returns.
 ///
-/// `shard_id` scopes the claim to one logical shard (issue #921 review,
-/// Codex P2): when two or more logical shards share the same physical
-/// Postgres database (the connection handed to a per-shard scanner tick can
-/// be the same pool as a sibling shard's), an unscoped claim would let one
-/// shard's tick claim and deliver rows that belong to a different shard,
-/// violating shard assignment and starving the owning shard's scan. `None`
-/// (the single-pool fallback path with no sharded configuration at all)
-/// claims across the whole table, matching every pre-sharding deployment's
-/// existing behavior — mirrors `event_batch::fire_due_on_conn`'s identical
-/// `Option<i32>` shard parameter and conditional-SQL shape.
+/// `shard_id` scopes the claim to one logical shard (issue #921). Two or
+/// more logical shards can share one physical Postgres database. The
+/// connection of a per-shard scanner tick can then be a sibling shard's
+/// pool. An unscoped claim would let one shard's tick claim and deliver
+/// another shard's rows. That violates shard assignment and starves the
+/// owning shard's scan. `None` is the single-pool fallback with no sharded
+/// configuration. It claims across the whole table, like every pre-sharding
+/// deployment. This mirrors the `Option<i32>` shard parameter and
+/// conditional SQL of `event_batch::fire_due_on_conn`.
 #[cfg(feature = "db")]
 async fn claim_due_deliveries(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -2810,10 +2783,9 @@ async fn claim_due_deliveries(
 }
 
 /// Re-read the current `payload` for a batch of just-claimed delivery ids,
-/// keyed by id. A non-locking bulk `SELECT` — used only to narrow the
-/// window between claim and dispatch during which a concurrent
-/// `erase_workflow_payloads` call could tombstone a row's payload (issue
-/// #921 review, Codex P1, follow-up); see the call site in
+/// keyed by id. This non-locking bulk `SELECT` narrows the window between
+/// claim and dispatch. In that window a concurrent `erase_workflow_payloads`
+/// call could tombstone a row's payload (issue #921). See the call site in
 /// [`fire_due_on_conn`] for the full rationale.
 #[cfg(feature = "db")]
 async fn reread_claimed_payloads(
@@ -2839,22 +2811,22 @@ async fn reread_claimed_payloads(
     Ok(rows.into_iter().collect())
 }
 
-/// Build the [`crate::dlq::NewDeadLetterEntry`] for an exhausted delivery,
-/// sourcing `input` from a *fresh* read of the row's `payload` column rather
-/// than the in-memory [`ClaimedDeliveryRow`] snapshot captured at claim time
-/// (issue #921 review, Codex P1).
+/// Build the [`crate::dlq::NewDeadLetterEntry`] for an exhausted delivery.
 ///
-/// A concurrent `erase_workflow_payloads` call can tombstone this row's
-/// `payload` column *after* the claim but *before* this outcome is
-/// recorded, and that erase transaction may have already committed by the
-/// time this runs. Dead-lettering with the stale, pre-erase `row.payload`
-/// would re-insert the erased result/error PII into
-/// `harvest_dead_letters.input`, silently undoing an erasure the operator
-/// believed was durable. Must be called from inside the same transaction
-/// that subsequently writes the `FAILED` state, under `FOR UPDATE`, which
-/// also serializes this read against a concurrent erase's own `UPDATE` on
-/// this row: whichever transaction's lock-acquiring statement runs first is
-/// authoritative, and the other blocks until it commits.
+/// It sources `input` from a *fresh* read of the row's `payload` column, not
+/// the [`ClaimedDeliveryRow`] snapshot from claim time (issue #921). A
+/// concurrent `erase_workflow_payloads` call can tombstone this `payload`
+/// *after* the claim but *before* this outcome is recorded. That erase may
+/// have committed by the time this runs. Dead-lettering the stale
+/// `row.payload` would re-insert the erased result/error PII into
+/// `harvest_dead_letters.input`. That silently undoes an erasure the
+/// operator believed durable.
+///
+/// Call this inside the transaction that then writes the `FAILED` state,
+/// under `FOR UPDATE`. That lock also serializes this read against a
+/// concurrent erase's own `UPDATE` on this row. The transaction whose
+/// lock-acquiring statement runs first wins. The other blocks until it
+/// commits.
 #[cfg(feature = "db")]
 async fn dead_letter_entry_with_current_payload(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -2992,10 +2964,11 @@ async fn apply_backoff_outcomes_batch(
     Ok(())
 }
 
-/// Record the outcome of one delivery attempt: `DELIVERED` (single
-/// `UPDATE`), rescheduled with backoff (single `UPDATE`), or dead-lettered
-/// (`UPDATE` + `harvest_dead_letters` insert, in one transaction so the two
-/// writes are atomic).
+/// Record the outcome of one delivery attempt.
+///
+/// `DELIVERED` and a backoff reschedule are each one `UPDATE`. A dead-letter
+/// is an `UPDATE` plus a `harvest_dead_letters` insert, in one transaction
+/// so the two writes are atomic.
 ///
 /// Only the `DeadLetter` branch is still reachable from the main per-tick
 /// scanner loop. `Delivered` and `Backoff` outcomes there are recorded via
@@ -3017,18 +2990,16 @@ async fn apply_outcome(
 
     use crate::schema::harvest_completion_deliveries::dsl;
 
-    // Guard every outcome write by the exact `attempt` number this row had
-    // *when it was claimed* (issue #921 review, Codex P2): if a delivery
-    // attempt runs longer than the INFLIGHT lease (a slow custom deliverer,
-    // a stalled executor, or just an unlucky scheduling gap), a later
-    // scanner tick can reclaim the same row and bump `attempt` again while
-    // the earlier, stale attempt is still in flight. Without this guard,
-    // the stale attempt's outcome — arriving after the newer attempt's —
-    // would win the update-by-`id`-only race and could silently revive an
-    // already-`DELIVERED`/`FAILED` row back to `PENDING`, or overwrite a
-    // fresher dead-letter with stale status/error text. Filtering on
-    // `attempt.eq(row.attempt)` makes a superseded attempt's write a
-    // no-op (0 rows matched) instead of corrupting the newer state.
+    // Guard every outcome write by the `attempt` number this row had *when
+    // it was claimed* (issue #921). A delivery attempt can outlive the
+    // INFLIGHT lease: a slow custom deliverer, a stalled executor, or an
+    // unlucky scheduling gap. A later scanner tick can then reclaim the row
+    // and bump `attempt` while the stale attempt is still in flight. Without
+    // this guard, the stale outcome arrives after the newer one and wins the
+    // update-by-`id`-only race. It could revive a `DELIVERED`/`FAILED` row to
+    // `PENDING`, or overwrite a fresher dead-letter with stale status and
+    // error text. Filtering on `attempt.eq(row.attempt)` makes a superseded
+    // attempt's write a no-op (0 rows matched).
     match action {
         OutcomeAction::Delivered { status } => {
             diesel::update(
@@ -3133,12 +3104,13 @@ async fn completion_deliveries_table_exists(
     Ok(exists.present)
 }
 
-/// Claim and process one shard's due deliveries: claim (tx-free, one atomic
-/// statement) -> POST unlocked -> record outcome (single statement, or a
-/// transaction for the dead-letter path). Returns the number of rows
-/// processed (delivered, rescheduled, or dead-lettered — all count as
-/// "processed" for scanner-tick accounting, mirroring
-/// `enforce_timeouts_once`'s `count` semantics).
+/// Claim and process one shard's due deliveries.
+///
+/// The steps are: claim (no transaction, one atomic statement), POST
+/// unlocked, then record the outcome (one statement, or a transaction for
+/// the dead-letter path). Returns the number of rows processed. Delivered,
+/// rescheduled and dead-lettered rows all count, like the `count` of
+/// `enforce_timeouts_once`.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)] // claim + re-read + dispatch + classify + batched-apply is one tick
 async fn fire_due_on_conn(
@@ -3155,22 +3127,18 @@ async fn fire_due_on_conn(
     let claimed = claim_due_deliveries(conn, now, shard_id).await?;
     let mut processed = 0usize;
 
-    // Re-read each row's payload immediately before serializing it for
-    // dispatch (issue #921 review, Codex P1, follow-up): `claimed` carries
-    // the payload as of the claim, but `erase_workflow_payloads` can
-    // tombstone this row's payload column at any point afterward --
-    // including while this tick is still building its dispatch batch.
-    // Bytes already POSTed to an external receiver cannot be recalled, so
-    // the freshness check for the network body has to happen as close to
-    // send time as realistically achievable without holding a lock across
-    // the network call. This does not close the race entirely (an erase
-    // landing in the gap between this read and the actual `deliver()` call
-    // moments later is still possible), but it eliminates the dominant
-    // source of staleness: the full claim-to-dispatch batch-build time,
-    // plus (for every row after the first in a large batch) the cumulative
-    // serialization work for earlier rows. `dead_letter_entry_with_current_
-    // payload` performs its own separate re-read *after* the network round
-    // trip, closing the remaining window for what gets written to the DLQ.
+    // Re-read each row's payload right before serializing it for dispatch
+    // (issue #921). `claimed` carries the payload as of the claim. But
+    // `erase_workflow_payloads` can tombstone it at any later point, even
+    // while this tick builds its dispatch batch. Bytes POSTed to an external
+    // receiver cannot be recalled. So the freshness check must run as close
+    // to send time as possible without a lock across the network call. An
+    // erase can still land between this read and the `deliver()` call. But
+    // this removes the dominant source of staleness: the claim-to-dispatch
+    // batch-build time, plus the serialization of earlier rows in a large
+    // batch. `dead_letter_entry_with_current_payload` re-reads again *after*
+    // the network round trip. That closes the remaining window for what goes
+    // to the DLQ.
     let claimed_ids: Vec<Uuid> = claimed.iter().map(|row| row.id).collect();
     let fresh_payloads = reread_claimed_payloads(conn, &claimed_ids).await?;
 
@@ -3190,17 +3158,15 @@ async fn fire_due_on_conn(
     let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
         // Re-validate the target URL against the *live* SSRF policy before
-        // dispatching (issue #921 review, Codex P2): `target_url` was only
-        // ever checked at enqueue time (`enqueue_completion_deliveries`'s
-        // own defense-in-depth re-check). A row can sit `PENDING`/`INFLIGHT`/
-        // `FAILED` for a long time -- or be manually redriven long after
-        // enqueue -- so an operator who tightens the allowlist (removing a
-        // compromised or decommissioned host) after enqueue must have that
-        // change actually enforced on the next dispatch attempt, not just
-        // for brand-new deliveries. A rejection here dead-letters the row
-        // immediately rather than silently dropping it forever: the
-        // operator gets a visible, actionable DLQ entry instead of a task
-        // that appears to make no progress.
+        // dispatch (issue #921). Before, only enqueue checked `target_url`
+        // (the defense-in-depth re-check in `enqueue_completion_deliveries`).
+        // A row can sit `PENDING`/`INFLIGHT`/`FAILED` for a long time, or be
+        // redriven long after enqueue. An operator can tighten the allowlist
+        // after enqueue to remove a compromised or decommissioned host. The
+        // next dispatch attempt must enforce that, not only new deliveries.
+        // A rejection dead-letters the row at once instead of dropping it.
+        // The operator gets a visible, actionable DLQ entry, not a task that
+        // seems to make no progress.
         if let Err(rejection) = validate_target_url(&row.target_url, &config.ssrf_policy) {
             // REDACTED to its origin, not logged whole (issue #1274). See
             // the matching note in `enqueue_completion_deliveries` above.
@@ -3284,31 +3250,26 @@ async fn fire_due_on_conn(
     });
     let attempt_outcomes = futures::future::join_all(delivery_futures).await;
 
-    // A fresh timestamp for backoff scheduling (issue #921 review, Codex
-    // P2): `now` above was captured *before* claim + dispatch, so reusing it
-    // here as the base for `next_attempt_at = now + delay` would understate
-    // the delay by however long the batch's slowest concurrent POST (or, for
-    // a large batch, the cumulative per-row serialization work before
-    // dispatch) actually took -- for a delivery whose attempt took longer
-    // than its own computed delay, `next_attempt_at` could already be in the
-    // past by the time `apply_outcome` writes it, so the scanner's very next
-    // tick would immediately retry instead of honoring the configured
-    // backoff, hammering an unhealthy receiver. `join_all` is a barrier, so
-    // every attempt in this batch has genuinely completed by this point --
-    // one fresh capture correctly anchors backoff to "after this attempt
+    // A fresh timestamp for backoff scheduling (issue #921). `now` above was
+    // captured *before* claim and dispatch. As the base for
+    // `next_attempt_at = now + delay`, it would understate the delay by the
+    // time of the slowest concurrent POST. In a large batch, the per-row
+    // serialization work before dispatch adds to that. An attempt can take
+    // longer than its own computed delay. Then `next_attempt_at` is already
+    // past when `apply_outcome` writes it. The next tick would retry at once,
+    // ignore the configured backoff, and hammer an unhealthy receiver.
+    // `join_all` is a barrier, so every attempt in this batch has completed
+    // here. One fresh capture anchors backoff to "after this attempt
     // finished" for the whole batch.
     let backoff_now = Utc::now();
 
     // Classify every attempt's outcome first, sorting rows into three
     // buckets by action kind. Then write each bucket in one round trip,
-    // instead of one `apply_outcome` call per row. The classify/apply
-    // split itself is unchanged; only how the resulting actions get
-    // written is new. `Delivered` and `Backoff` are the common paths and
-    // are batched below. `DeadLetter` keeps the per-row transaction
-    // `apply_outcome` already used. Its fence-check + `FOR UPDATE`
-    // re-read + DLQ insert are a documented atomicity guarantee, named
-    // on `dead_letter_entry_with_current_payload`. This change does not
-    // touch that guarantee.
+    // instead of one `apply_outcome` call per row. `Delivered` and
+    // `Backoff` are the common paths and are batched below. `DeadLetter`
+    // keeps the per-row `apply_outcome` transaction. Its fence check,
+    // `FOR UPDATE` re-read and DLQ insert are a documented atomicity
+    // guarantee, named on `dead_letter_entry_with_current_payload`.
     let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
     let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
     let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
@@ -3375,10 +3336,11 @@ async fn fire_due_on_conn(
 
 /// Fire all due completion-callback deliveries across every assigned shard.
 ///
-/// Mirrors [`crate::debounce::fire_due_debounced_starts`]'s per-shard
-/// fan-out: `harvest_completion_deliveries` rows live on the shard that
-/// owned the terminal transaction that enqueued them, so a single-
-/// connection scan would never see rows on non-default shards.
+/// Mirrors the per-shard fan-out of
+/// [`crate::debounce::fire_due_debounced_starts`]. A
+/// `harvest_completion_deliveries` row lives on the shard that owned the
+/// terminal transaction that enqueued it. So a single-connection scan would
+/// never see rows on non-default shards.
 ///
 /// Called from [`crate::timeout::enforce_timeouts_once`] on the existing
 /// `spawn_timeout_checker` poll interval — no new background task is
@@ -3509,12 +3471,11 @@ pub async fn list_deliveries_for_execution(
 /// Outcome of a [`redrive_delivery`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryRedriveOutcome {
-    /// The delivery was reset to `PENDING` (fresh retry budget granted by
-    /// extending `max_attempts` — see [`redrive_delivery`]'s doc comment for
-    /// why `attempt` itself is deliberately *not* reset) so the scanner
-    /// retries it on its next tick, and any associated
-    /// `harvest_dead_letters` row from the original exhaustion was deleted
-    /// (mirrors `dlq::redrive_dead_letter`'s cleanup).
+    /// The delivery was reset to `PENDING`, so the scanner retries it on its
+    /// next tick. A larger `max_attempts` grants a fresh retry budget.
+    /// [`redrive_delivery`] explains why `attempt` is *not* reset. Any
+    /// `harvest_dead_letters` row from the original exhaustion was deleted,
+    /// like the cleanup in `dlq::redrive_dead_letter`.
     Redriven,
     /// No delivery row exists with this id.
     NotFound,
@@ -3528,39 +3489,39 @@ pub enum DeliveryRedriveOutcome {
 /// Self-contained: it only ever mutates the `harvest_completion_deliveries`
 /// row (and deletes the matching `harvest_dead_letters` row, if any) —
 /// never `harvest_workflow_executions` or the task queue. Unlike
-/// [`crate::dlq::redrive_dead_letter`], there is no owning task or
-/// execution to reactivate: the terminal workflow already completed its
-/// own lifecycle independently of whether its callback was ever delivered.
+/// [`crate::dlq::redrive_dead_letter`], it has no owning task or execution
+/// to reactivate. The terminal workflow finished its own lifecycle whether
+/// or not its callback was delivered.
 ///
 /// Redelivery reuses the same `delivery_id` (the row's own primary key),
 /// preserving the at-least-once + receiver-side-dedup contract.
 ///
-/// **`attempt` is deliberately never reset** (issue #921 review, Codex P2).
-/// [`apply_outcome`] guards every outcome write with `.filter(attempt.eq(row.attempt))`
-/// so a stale attempt whose HTTP call outlives the `INFLIGHT` lease (and is
-/// therefore reclaimed by a later scanner tick, per that guard's own doc
-/// comment) can never overwrite a fresher attempt's result — that guard's
-/// soundness depends on `attempt` values never repeating over a delivery
-/// row's lifetime. Resetting `attempt` to `0` on redrive would violate that:
-/// a genuinely-still-in-flight pre-redrive call (e.g. one that raced the
-/// lease and is still awaiting a slow deliverer response) could return
-/// *after* the redrive and its captured `row.attempt` (a small number like
-/// `1`) could alias a fresh post-redrive claim that legitimately reaches the
-/// same small number, silently applying the ancient response's outcome to
-/// the wrong attempt. Instead, a "fresh retry budget" is granted by
-/// extending `max_attempts` (by the row's current `max_attempts`, so a
-/// redrive always grants at least as many additional attempts as the
-/// original policy allowed) while leaving the monotonically-increasing
-/// `attempt` counter untouched, so no attempt number is ever reused across
-/// a redrive.
+/// **`attempt` is deliberately never reset** (issue #921).
+/// [`apply_outcome`] guards every outcome write with
+/// `.filter(attempt.eq(row.attempt))`. A stale attempt whose HTTP call
+/// outlives the `INFLIGHT` lease is reclaimed by a later scanner tick. The
+/// guard stops it from overwriting a fresher attempt's result. The guard is
+/// sound only if `attempt` values never repeat over a row's lifetime.
+/// Resetting `attempt` to `0` on redrive would break that. A pre-redrive
+/// call can still be in flight, e.g. one that raced the lease and still
+/// awaits a slow deliverer. It could return *after* the redrive with a small
+/// captured `row.attempt`, such as `1`. A fresh post-redrive claim can reach
+/// that same number. The old response's outcome would then apply to the
+/// wrong attempt.
 ///
-/// `exec_id` scopes the lookup to the execution named by the caller (e.g.
-/// the `{id}` path segment of `POST
-/// /workflows/{id}/completion-deliveries/{delivery_id}/redrive`) — a
-/// `delivery_id` that exists but belongs to a *different* execution is
-/// reported as [`DeliveryRedriveOutcome::NotFound`], exactly like an
-/// unknown id, so the caller can never redrive (or learn the existence of)
-/// a delivery outside the execution they named.
+/// Instead, a redrive grants a "fresh retry budget" by extending
+/// `max_attempts` by the row's current `max_attempts`. So a redrive always
+/// grants at least as many extra attempts as the original policy allowed.
+/// The monotonic `attempt` counter stays untouched, so no attempt number
+/// repeats across a redrive.
+///
+/// `exec_id` scopes the lookup to the execution the caller names, e.g. the
+/// `{id}` path segment of
+/// `POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive`. A
+/// `delivery_id` of a *different* execution reports
+/// [`DeliveryRedriveOutcome::NotFound`], exactly like an unknown id. So the
+/// caller can never redrive, or learn of, a delivery outside the execution
+/// it named.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.

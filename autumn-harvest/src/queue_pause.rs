@@ -1,9 +1,9 @@
 //! Task-queue pause/resume — hold dispatch during a downstream outage (issue #619).
 //!
-//! When a downstream dependency for a whole *class* of activities goes down —
-//! Stripe, `SendGrid`, the data warehouse — the operator's job-to-be-done is to
-//! **hold** the affected work, not fail it: freeze the queue, let the dependency
-//! recover, thaw, and have everything continue as if nothing happened.
+//! A downstream dependency for a whole *class* of activities can go down:
+//! Stripe, `SendGrid`, the data warehouse. The operator then must **hold** the
+//! affected work, not fail it. Freeze the queue, let the dependency recover,
+//! thaw, and everything continues as if nothing happened.
 //!
 //! # How it composes with the neighbouring primitives
 //!
@@ -24,26 +24,23 @@
 //! in-process cache like the admission gate's:
 //!
 //! - "Durable and re-applied before the worker pool begins claiming" is true
-//!   **by construction** — there is no boot window to lose a pause in, no
+//!   **by construction**. There is no boot window to lose a pause in, no
 //!   refresh interval, and no fleet-wide staleness window.
 //! - There is no global static, no fail-closed reasoning, and no write-through
 //!   path that can diverge from the database.
 //!
-//! The cost is meant to be one probe per claim against a table bounded by the
-//! number of distinct queue names — but the *shape* that delivers that cost
-//! matters. `claim_task` originally embedded [`queue_pause_anti_join`]
-//! verbatim as a per-row correlated `NOT EXISTS`, which the planner evaluates
-//! once for every *candidate row* it walks while sorting toward `LIMIT 1`, not
-//! once per claim; at a 10k-row backlog that accounted for ~99% of the
-//! query's buffer touches (`docs/performance.md`). `claim_task_query` now
-//! pre-filters `harvest_queue_pauses` once, up front, into a small array
-//! (`paused_queues`) and tests membership per row instead of re-probing the
-//! table per row — the cost model this section describes, actually delivered.
-//! [`queue_pause_anti_join`] and [`QUEUE_PAUSE_CLAIM_PREDICATE`] remain the
-//! correct choice for a **mirror** query that only ever loads a handful of
-//! rows (`oldest_pending_ages`, `claimable_pending_demand_by_queue`) — the
-//! rewrite is only worth its complexity on `claim_task`'s own high-cardinality
-//! candidate scan.
+//! The target cost is one probe per claim, against a table bounded by the
+//! number of distinct queue names. The query *shape* decides whether that holds.
+//! `claim_task` first embedded [`queue_pause_anti_join`] as a per-row correlated
+//! `NOT EXISTS`. The planner ran it once per *candidate row* on the way to
+//! `LIMIT 1`, not once per claim. At a 10k-row backlog that was ~99% of the
+//! query's buffer touches (`docs/performance.md`). `claim_task_query` now reads
+//! `harvest_queue_pauses` once into a small array (`paused_queues`). It tests
+//! membership per row and does not probe the table per row.
+//! [`queue_pause_anti_join`] and [`QUEUE_PAUSE_CLAIM_PREDICATE`] stay correct
+//! for a **mirror** query that loads few rows (`oldest_pending_ages`,
+//! `claimable_pending_demand_by_queue`). The array rewrite only pays off on
+//! the high-cardinality candidate scan of `claim_task`.
 //!
 //! # Replay contract
 //!
@@ -53,12 +50,11 @@
 //!
 //! # Timeout interaction
 //!
-//! The *relative* `schedule_to_start` timer is suspended for held tasks (both in
-//! the scan predicate and in the locked re-check), and a resume credits held
-//! time back to `scheduled_at` so a thaw does not retroactively time out the
-//! whole backlog. The *absolute* `schedule_to_close` deadline (#378) keeps
-//! ticking — a paused queue does not extend an SLA. See
-//! [`queue_pause_suppresses_timeout`].
+//! The *relative* `schedule_to_start` timer stops for held tasks, in the scan
+//! predicate and in the locked re-check. A resume credits held time back to
+//! `scheduled_at`, so a thaw does not time out the whole backlog. The
+//! *absolute* `schedule_to_close` deadline (#378) keeps ticking: a paused queue
+//! does not extend an SLA. See [`queue_pause_suppresses_timeout`].
 
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
@@ -105,12 +101,11 @@ struct ShiftedTaskId {
 
 /// Domain separator for [`queue_lock_keys`] (issue #619).
 ///
-/// Mirrors `crate::build_routing`'s `RAMP_HASH_DOMAIN_SEP`: the digest is this
-/// feature's alone, so a queue name can never derive the same key as an
-/// unrelated subsystem that happens to hash the same string. The `v1` marker
-/// makes a future re-keying an explicit, greppable decision rather than a
-/// silent behaviour change — see [`queue_lock_keys`] on why re-keying is not
-/// a rolling-deploy-safe operation.
+/// Mirrors `RAMP_HASH_DOMAIN_SEP` in `crate::build_routing`. The digest is
+/// this feature's alone. So a queue name never derives the same key as another
+/// subsystem that hashes the same string. The `v1` marker makes a future
+/// re-keying an explicit, greppable decision, not a silent change. See
+/// [`queue_lock_keys`] for why a re-key is not safe in a rolling deploy.
 const QUEUE_PAUSE_LOCK_DOMAIN: &str = "harvest:queue_pause:v1:";
 
 /// Derive the `(key1, key2)` advisory-lock key that identifies `queue_name`.
@@ -123,40 +118,40 @@ const QUEUE_PAUSE_LOCK_DOMAIN: &str = "harvest:queue_pause:v1:";
 ///
 /// Postgres exposes two *disjoint* advisory-lock keyspaces: a 64-bit one
 /// (`pg_advisory_xact_lock(bigint)`) and a 2×32-bit one
-/// (`pg_advisory_xact_lock(int, int)`). A key in one can never collide with a
-/// key in the other, and **every other advisory-lock user in this engine is in
-/// the single-argument one** — the per-key concurrency gate on the hot claim
-/// path (`crate::queue::claim_task`), `crate::mutex`, `crate::wasm_store`,
-/// `crate::admission_gate` and `crate::scheduler`'s registration lock
-/// (issue #1157). So the two-argument keyspace belongs to this
-/// feature alone. That separation is load-bearing, and this function preserves
-/// it. A source-level guard test keeps it true.
+/// (`pg_advisory_xact_lock(int, int)`). A key in one never collides with a key
+/// in the other. **Every other advisory-lock user in this engine is in the
+/// single-argument one.** These are the per-key concurrency gate on the hot
+/// claim path (`crate::queue::claim_task`), `crate::mutex`,
+/// `crate::wasm_store`, `crate::admission_gate` and the registration lock of
+/// `crate::scheduler` (issue #1157). So the two-argument keyspace belongs to
+/// this feature alone. That separation is load-bearing, and this function
+/// preserves it. A source-level guard test keeps it true.
 ///
 /// An earlier key spent the first 32 bits on a constant class id. It derived the
 /// second from `hashtext(queue_name)`, which is only 32 bits wide. That left
-/// **queue identity** at 32 bits: two unrelated queue names collide with
-/// probability ≈ n²/2³³, and the consequence is precisely the failure this
-/// feature exists to prevent. An exclusive pause on queue `a` makes
-/// [`try_lock_queue_for_claim`] fail for the colliding queue `b`, and because
-/// that call uses the *try* variant the failure is silent — `b`'s workers
-/// release every claim and stop dispatching for as long as `a`'s pause or
-/// (potentially long) resume runs, on a queue that was never paused.
+/// **queue identity** at 32 bits. Two unrelated queue names collide with
+/// probability ≈ n²/2³³. The result is the exact failure this feature exists
+/// to prevent. An exclusive pause on queue `a` makes
+/// [`try_lock_queue_for_claim`] fail for the colliding queue `b`. That call uses
+/// the *try* variant, so the failure is silent. The workers of `b` release
+/// every claim and stop dispatching on a queue that was never paused. This
+/// lasts for as long as the pause or the (possibly long) resume of `a` runs.
 ///
-/// The fix is to stop spending half the key on a constant: `key1` and `key2`
-/// are the high and low halves of a domain-separated SHA-256 digest, so
-/// identity is the full 64 bits and a false share needs a 64-bit collision.
+/// The fix stops spending half the key on a constant. `key1` and `key2` are
+/// the high and low halves of a domain-separated SHA-256 digest. So identity
+/// is the full 64 bits, and a false share needs a 64-bit collision.
 ///
 /// # Why not two locks, or the single-argument form
 ///
-/// **Two locks** (a class-scoped pair, 32 identity bits each) would make this
-/// *worse*, not better: lock conflicts are evaluated per key, so a claim
-/// needing both locks fails if **either** collides. That doubles the
-/// false-share probability rather than squaring it away.
+/// **Two locks** (a class-scoped pair, 32 identity bits each) make this
+/// *worse*, not better. Postgres evaluates lock conflicts per key. So a claim
+/// that needs both locks fails if **either** collides. That doubles the
+/// false-share probability and does not square it away.
 ///
-/// **The single-argument 64-bit form** would give the same identity width but
-/// drop us into the keyspace `claim_task`'s concurrency gate already hashes raw
-/// text into — trading an intra-feature collision for a cross-feature one whose
-/// blast radius is strictly worse and far harder to diagnose.
+/// **The single-argument 64-bit form** gives the same identity width. But it
+/// shares the keyspace that the concurrency gate of `claim_task` hashes raw
+/// text into. That trades an intra-feature collision for a cross-feature one.
+/// Its blast radius is strictly worse and it is far harder to diagnose.
 ///
 /// # Diagnosing in `pg_locks`
 ///
@@ -173,18 +168,18 @@ const QUEUE_PAUSE_LOCK_DOMAIN: &str = "harvest:queue_pause:v1:";
 ///
 /// # Why SHA-256 rather than a fast hash
 ///
-/// The same reason issue #699's rate-limit bucket keys use it: a collision here
-/// silently shares state between two unrelated queues, and queue names are
-/// influenced from outside this module. The digest is computed once per lock
+/// The rate-limit bucket keys of issue #699 use it for the same reason. A
+/// collision here silently shares state between two unrelated queues. Callers
+/// outside this module influence queue names. The digest runs once per lock
 /// call, in-process, so it costs nothing next to the round trip it rides on.
 ///
 /// # Compatibility
 ///
-/// The key derivation is part of the *runtime* protocol between concurrently
-/// running processes, not a persisted format — nothing stores it. Changing it
-/// (including the domain separator) is therefore safe across a restart but
-/// **not** across a rolling deploy: two processes on different derivations
-/// would take non-conflicting locks for the same queue and lose mutual
+/// The key derivation is part of the *runtime* protocol between concurrent
+/// processes. It is not a persisted format, and nothing stores it. So a change
+/// to it (the domain separator included) is safe across a restart. It is
+/// **not** safe across a rolling deploy. Two processes on different
+/// derivations take non-conflicting locks for the same queue. They lose mutual
 /// exclusion for the length of the rollout.
 #[must_use]
 pub fn queue_lock_keys(queue_name: &str) -> (i32, i32) {
@@ -222,23 +217,23 @@ pub const fn lock_queue_for_timeout_recheck_query() -> &'static str {
 
 /// Upper bound on a pausable queue name.
 ///
-/// Queue names are free-form `TEXT` everywhere else in the engine, but this
-/// table's primary key is the queue name, so an unbounded operator-supplied
-/// string would be an unbounded btree key. 255 matches the one other place the
+/// Queue names are free-form `TEXT` everywhere else in the engine. Here the
+/// queue name is the primary key, so an unbounded operator-supplied string is
+/// an unbounded btree key. 255 matches the one other place the
 /// engine bounds a queue name (`harvest_completion_triggers.queue_name`).
 pub const MAX_QUEUE_NAME_LEN: usize = 255;
 
 /// Render the queue-pause anti-join correlated against `outer_table` — the
 /// single source of truth for the claim gate and every query that mirrors it.
 ///
-/// A paused queue that a mirror query forgot about would report a phantom
-/// backlog and drive a false capacity alert during a deliberate hold, so all of
-/// them are generated from (or drift-locked against) this one function.
+/// A mirror query that forgets a paused queue reports a phantom backlog. That
+/// drives a false capacity alert during a deliberate hold. So every mirror
+/// comes from this one function, or is drift-locked against it.
 ///
-/// The outer column reference **must** be qualified: inside the subquery an
-/// unqualified `queue_name` resolves against `harvest_queue_pauses` first,
-/// degenerating the predicate to `qp.queue_name = qp.queue_name` — always true,
-/// which would silently pause *every* queue the moment any one queue is paused.
+/// The outer column reference **must** be qualified. Inside the subquery an
+/// unqualified `queue_name` resolves against `harvest_queue_pauses` first. The
+/// predicate then becomes `qp.queue_name = qp.queue_name`, which is always
+/// true. That silently pauses *every* queue as soon as one queue is paused.
 #[must_use]
 pub fn queue_pause_anti_join(outer_table: &str) -> String {
     format!(
@@ -260,41 +255,39 @@ pub const QUEUE_PAUSE_CLAIM_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM harvest
 ///
 /// # Why a second statement is required
 ///
-/// [`crate::queue::claim_task`] is a single autocommit statement, so under
-/// `READ COMMITTED` its whole CTE — including the
-/// [`QUEUE_PAUSE_CLAIM_PREDICATE`] anti-join — evaluates against **one snapshot
-/// taken at statement start**. A pause that commits after that snapshot is
-/// invisible to it, so a claim already in flight when the operator paused can
-/// still transition its task to `RUNNING` and hand it to a worker that
-/// dispatches into the outage. The window is normally sub-millisecond but is
-/// unbounded in principle: the claim's rate-limit debit can block on a row lock
-/// held by a competing claim, and Postgres's `EvalPlanQual` re-check on unblock
-/// only re-evaluates conditions on the *locked row*, never a correlated
-/// subquery over another table.
+/// [`crate::queue::claim_task`] is a single autocommit statement. Under
+/// `READ COMMITTED` its whole CTE evaluates against **one snapshot taken at
+/// statement start**. That includes the [`QUEUE_PAUSE_CLAIM_PREDICATE`]
+/// anti-join. The snapshot does not see a pause that commits after it. So a
+/// claim in flight at pause time can still move its task to `RUNNING`. A
+/// worker then dispatches that task into the outage. The window is normally
+/// sub-millisecond, but it has no upper bound. The rate-limit debit of the
+/// claim can block on a row lock that a competing claim holds. On unblock, the
+/// `EvalPlanQual` re-check of Postgres only re-evaluates the *locked row*. It
+/// never re-evaluates a correlated subquery over another table.
 ///
-/// Taking an *exclusive* queue-scoped lock inside the claim path would close
-/// the window but serialize every claim for a queue against every other,
-/// defeating `FOR UPDATE SKIP LOCKED`'s parallel claiming for a feature that is
-/// inactive almost all of the time. Re-checking in a **fresh statement** gets a
-/// fresh snapshot for the cost of one indexed primary-key probe per *successful*
-/// claim (never per empty poll), and yields a crisp contract: **a pause
-/// committed before this re-check's statement begins always wins.**
+/// An *exclusive* queue-scoped lock inside the claim path closes the window.
+/// But it serializes every claim for a queue against every other. That
+/// defeats the parallel claiming of `FOR UPDATE SKIP LOCKED`, for a feature
+/// that is almost always inactive. A re-check in a **fresh statement** gets a
+/// fresh snapshot. It costs one indexed primary-key probe per *successful*
+/// claim, never per empty poll. The contract is crisp: **a pause committed
+/// before this re-check's statement begins always wins.**
 ///
 /// That contract is only sound if the claim is *durable* by the time the pause
 /// commits. The claim and this re-check run in one transaction, so a re-check
 /// error cannot strand a `RUNNING` row. That puts the claim's commit *after*
 /// the re-check's snapshot. It opens a new window: a pause that commits in
 /// between is acknowledged to the operator, and the claim still commits
-/// afterwards. [`try_lock_queue_for_claim`] closes it
-/// with a **shared** lock on the same key `pause_queue` takes exclusively — see
-/// there for why the *try* variant is what keeps this deadlock-free.
+/// afterwards. [`try_lock_queue_for_claim`] closes it with a **shared** lock
+/// on the key that `pause_queue` takes exclusively. See there for why the
+/// *try* variant keeps this deadlock-free.
 ///
-/// The release is guarded on `state = 'RUNNING' AND worker_id = $2` so it can
-/// only ever undo *this* worker's own claim, and it restores `attempt` — the
-/// task never ran, so a hold must not consume retry budget (AC3). The
-/// rate-limit token the claim debited is not refunded; that is the same
-/// safe-side, self-healing leak already documented for a lost claim in
-/// [`crate::queue::claim_task`] (it only ever under-dispatches).
+/// The guard `state = 'RUNNING' AND worker_id = $2` lets the release undo only
+/// *this* worker's own claim. The release restores `attempt`. The task never
+/// ran, so a hold must not consume retry budget (AC3). The rate-limit token
+/// of the claim is not refunded. [`crate::queue::claim_task`] documents the
+/// same safe-side, self-healing leak for a lost claim. It only under-dispatches.
 ///
 /// Returns `true` when the claim was released (the caller must behave as if no
 /// task was claimed).
@@ -319,11 +312,10 @@ pub async fn release_claim_if_queue_paused(
 
 /// The shared prefix of both claim-release statements.
 ///
-/// A macro rather than a `const` so the two `const fn`s below can `concat!` it
+/// A macro rather than a `const`, so the two `const fn`s below can `concat!` it
 /// with their own tail at compile time. Both releases must restore `attempt`
-/// and be guarded on `state = 'RUNNING' AND worker_id = $2` identically; keeping
-/// one copy makes that structural rather than a convention two sites must
-/// remember.
+/// and use the same `state = 'RUNNING' AND worker_id = $2` guard. One copy
+/// makes that structural, not a convention that two sites must remember.
 macro_rules! release_claim_prefix {
     () => {
         "UPDATE harvest_task_queue \
@@ -339,9 +331,8 @@ macro_rules! release_claim_prefix {
 
 /// SQL for [`release_claim_if_queue_paused`], exposed for shape tests.
 ///
-/// One statement, so it takes a fresh `READ COMMITTED` snapshot and therefore
-/// sees any pause committed before it began — which is the entire point (see
-/// [`release_claim_if_queue_paused`]).
+/// One statement, so it takes a fresh `READ COMMITTED` snapshot. It sees any
+/// pause committed before it began. See [`release_claim_if_queue_paused`].
 #[must_use]
 pub const fn release_claim_if_queue_paused_query() -> &'static str {
     concat!(
@@ -360,11 +351,10 @@ pub const fn release_claim_query() -> &'static str {
 /// Release this worker's own just-made claim **unconditionally**.
 ///
 /// The sibling of [`release_claim_if_queue_paused`] for the one case where the
-/// pause table cannot be consulted: [`try_lock_queue_for_claim`] failed, so
-/// some pause or resume transaction is mid-flight on this queue and its rows
-/// are, by definition, not yet visible to us. Guarded and attempt-restoring
-/// exactly like the paused variant, so a barrier miss costs a task nothing
-/// beyond one poll interval.
+/// pause table cannot be consulted. [`try_lock_queue_for_claim`] failed, so a
+/// pause or resume transaction is mid-flight on this queue. Its rows are not
+/// yet visible here. The guard and the `attempt` restore match the paused variant.
+/// So a barrier miss costs a task at most one poll interval.
 ///
 /// # Errors
 ///
@@ -388,37 +378,36 @@ pub const fn try_lock_queue_for_claim_query() -> &'static str {
 
 /// Commit-order barrier between a claim and a concurrent pause (issue #619).
 ///
-/// Takes the **shared** mode of the very key [`lock_queue_for_pause`] takes
-/// exclusively, so while a claim transaction holds it a `pause_queue` cannot
-/// commit — and therefore cannot acknowledge a hold to the operator — until
-/// that claim has committed. That is the ordering guarantee the post-claim
-/// re-check alone cannot provide: the re-check's snapshot is taken before its
-/// own transaction commits, so without this a pause could slot in between and
-/// still be beaten by a claim it had already reported as held.
+/// Takes the **shared** mode of the key that [`lock_queue_for_pause`] takes
+/// exclusively. While a claim transaction holds it, a `pause_queue` cannot
+/// commit until that claim has committed. So the pause cannot acknowledge a
+/// hold to the operator first. The post-claim re-check alone cannot give this
+/// order. The re-check takes its snapshot before its own transaction commits.
+/// Without this lock, a pause can slot in between. A claim then beats a pause
+/// that already reported the queue as held.
 ///
 /// # Why *shared*, and why *try*
 ///
-/// **Shared** because claims must stay parallel: shared mode is compatible with
-/// itself, so an arbitrary number of workers claim concurrently and only the
-/// (rare, brief) exclusive pause/resume transaction is excluded. An exclusive
-/// lock here would serialize every claim on a queue and defeat
-/// `FOR UPDATE SKIP LOCKED`.
+/// **Shared** because claims must stay parallel. Shared mode is compatible with
+/// itself, so any number of workers claim concurrently. Only the rare, brief
+/// exclusive pause/resume transaction is excluded. An exclusive lock here
+/// serializes every claim on a queue and defeats `FOR UPDATE SKIP LOCKED`.
 ///
-/// **Try** because of lock ordering. This is necessarily called *after* the
-/// claim query, since the queue to lock is not known until a task is in hand,
-/// so the claim path holds task rows and then wants this lock — the exact
-/// inverse of `resume_queue`, which holds this lock and then row-locks every
-/// `PENDING` task on the queue for its `scheduled_at` shift. A *blocking*
-/// acquire would therefore create an ABBA deadlock between a claim and a
-/// resume. Postgres would then abort either the claim or the operator's resume.
+/// **Try** because of lock ordering. This call must come *after* the claim
+/// query, because the queue to lock is not known until a task is in hand. So
+/// the claim path holds task rows and then wants this lock. `resume_queue` does
+/// the exact inverse. It holds this lock and then row-locks every `PENDING`
+/// task on the queue for its `scheduled_at` shift. A *blocking* acquire here
+/// creates an ABBA deadlock between a claim and a resume. Postgres then aborts
+/// either the claim or the operator's resume.
 /// `pg_try_advisory_xact_lock_shared` never waits, so it cannot participate in
 /// a wait cycle at all.
 ///
-/// Returning `false` means "a pause or resume is committing on this queue right
-/// now"; the caller must release its claim rather than dispatch. That is
-/// deliberately conservative in the safe direction — a resume is not a hold, so
-/// releasing during one costs at most one poll interval, while dispatching
-/// during a *pause* is the failure this whole feature exists to prevent.
+/// `false` means "a pause or resume is committing on this queue right now".
+/// The caller must then release its claim and not dispatch. That errs on the
+/// safe side. A resume is not a hold, so a release during one costs at most
+/// one poll interval. Dispatch during a *pause* is the failure this whole
+/// feature exists to prevent.
 ///
 /// # Errors
 ///
@@ -457,26 +446,24 @@ pub async fn try_lock_queue_for_claim(
 /// Surrounding whitespace is **rejected**, not trimmed, and the name is
 /// otherwise used verbatim by every read and write in this module.
 ///
-/// Both halves of that rule matter, because the anti-join matches on exact
-/// equality and `EnqueueParams` stores `queue_name` verbatim (it does not
-/// normalise), so a queue genuinely named `"payments "` is reachable:
+/// Both halves of that rule matter. The anti-join matches on exact equality.
+/// `EnqueueParams` stores `queue_name` verbatim and does not normalise. So a
+/// queue named `"payments "` is reachable:
 ///
-/// - Storing the **raw** name while validating a trimmed one would insert a row
-///   matching no task, reporting a successful hold (`newly_paused: true`,
+/// - A **raw** stored name with a trimmed validated one inserts a row that
+///   matches no task. It reports a successful hold (`newly_paused: true`,
 ///   `held_task_count: 0`) on a queue that keeps dispatching.
-/// - **Trimming** is no better, just quieter: pausing `"payments "` would
-///   insert a row for `"payments"`, so the hold would silently target a
-///   *different, valid* queue while the real one kept dispatching — and the API
-///   would again report success.
+/// - **Trimming** is no better, just quieter. A pause of `"payments "` inserts
+///   a row for `"payments"`. The hold silently targets a *different, valid*
+///   queue, and the real one keeps dispatching. The API again reports success.
 ///
-/// Rejecting is the only option that cannot lie. In the overwhelmingly common
-/// case a stray space is a copy-paste typo, and the operator gets a `400`
-/// naming it instead of a false green. In the pathological case the queue
-/// really does carry surrounding whitespace, it is not pausable through this
-/// API — an honest refusal, and strictly safer than a silent success against
-/// the wrong queue during an outage. Normalising queue names at *creation* time
-/// is the alternative fix, but that reaches across every enqueue path and is
-/// out of scope here.
+/// Rejecting is the only option that cannot lie. Almost always a stray space
+/// is a copy-paste typo, and the operator gets a `400` that names it, not a
+/// false green. Rarely the queue really has surrounding whitespace. Then this
+/// API cannot pause it. That is an honest refusal. It is strictly safer than a
+/// silent success against the wrong queue during an outage. The alternative
+/// fix normalises queue names at *creation* time. That reaches across every
+/// enqueue path and is out of scope here.
 ///
 /// # Errors
 ///
@@ -508,10 +495,10 @@ pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
 ///
 /// The `schedule_to_start` enforcer must not fail a task on a queue that an
 /// operator is concurrently pausing. Its non-locking `is_queue_paused`
-/// re-check alone cannot guarantee that: `pause_queue` shares no lock with the
-/// enforcer, so a pause can commit in the window between the re-check and the
-/// enforcer's own commit — terminally failing a task *because* its queue was
-/// paused, the exact outcome AC2/AC3/AC4 forbid.
+/// re-check alone cannot guarantee that. Without this lock, `pause_queue`
+/// shares no lock with the enforcer. So a pause can commit between the
+/// re-check and the enforcer's own commit. The enforcer then fails a task
+/// *because* its queue was paused. AC2/AC3/AC4 forbid exactly that outcome.
 ///
 /// Both sides therefore take this transaction-scoped advisory lock first,
 /// mirroring the `concurrency_key` and `ctx.mutex` patterns already used in the
@@ -521,22 +508,21 @@ pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
 /// # Why the two-argument lock form (issue #619)
 ///
 /// It uses the **two-argument** keyspace, which no other advisory-lock user in
-/// this engine touches, because the single-argument `hashtext(<some text>)`
-/// keyspace is already shared, unnamespaced, by several unrelated features —
-/// most importantly the per-key concurrency gate on the hot claim path
-/// (`queue::claim_task`'s
-/// `pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint)`).
+/// this engine touches. Several unrelated features already share the
+/// single-argument `hashtext(<some text>)` keyspace, with no namespace. The
+/// most important is the per-key concurrency gate on the hot claim path
+/// (`pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint)`
+/// in `queue::claim_task`).
 ///
-/// Sharing it would be a genuine cross-feature outage, not a theoretical one:
-/// a queue name that merely hash-collides with some *other* queue's
-/// `concurrency_key` would make that key's `pg_try_advisory_xact_lock` fail for
-/// as long as a large `resume_queue` held this lock while shifting its backlog.
-/// Because the claim path uses the *try* variant, the failure is silent — the
-/// claim simply yields no task — so tasks on a queue that was never paused
-/// would quietly stop dispatching for the duration of an unrelated queue's
-/// resume. That is precisely the "silently stops dispatching" failure mode this
-/// whole feature exists to prevent, so the namespace separation is load-bearing
-/// rather than hygiene.
+/// A shared keyspace causes a real cross-feature outage, not a theoretical
+/// one. Take a queue name that hash-collides with the `concurrency_key` of some
+/// *other* queue. The `pg_try_advisory_xact_lock` of that key then fails while
+/// a large `resume_queue` holds this lock to shift its backlog. The claim path
+/// uses the *try* variant, so the failure is silent: the claim yields no task.
+/// Tasks on a queue that was never paused stop dispatching for the whole
+/// resume of an unrelated queue. This feature exists to prevent exactly that
+/// "silently stops dispatching" failure. So the namespace separation is
+/// load-bearing, not hygiene.
 ///
 /// [`queue_lock_keys`] closes the *intra*-feature half of the same hazard. See
 /// it for why both key slots are spent on queue identity rather than one on a
@@ -580,11 +566,11 @@ pub async fn lock_queue_for_pause(
 /// every claim. So an exclusive enforcement transaction stalls *all* dispatch on
 /// its queue for its full duration, on a queue with **no pause at all**. The
 /// workflow sibling holds the lock across `append_events`, the parent-close
-/// cascade and trigger evaluation, so a backlog of expired tasks could
-/// repeatedly halt unrelated work. Claims fail their `try` silently and simply
-/// yield no task, which is the same "silently stops dispatching" failure the
-/// class-id separation documented on
-/// [`lock_queue_for_pause`] exists to prevent — reached from a different side.
+/// cascade and trigger evaluation. So a backlog of expired tasks can halt
+/// unrelated work again and again. Claims fail their `try` silently and yield
+/// no task. The class-id separation on [`lock_queue_for_pause`] exists to
+/// prevent that same "silently stops dispatching" failure. This reaches it
+/// from a different side.
 ///
 /// Shared mode is sufficient because this lock's only job is to order the
 /// enforcement against pause/resume. Two concurrent enforcements need no mutual
@@ -593,13 +579,13 @@ pub async fn lock_queue_for_pause(
 ///
 /// # Why blocking, not `try`
 ///
-/// Unlike [`try_lock_queue_for_claim`] — which is called *after* the claim
-/// query, so it must never wait — this is the **first** statement in the
-/// enforcement transaction, before any row lock, so it cannot participate in a
-/// wait cycle (see the lock-ordering note in `enforce_activity_timeout`). It
-/// must actually wait: bailing out on contention would skip the pause re-check
-/// and let the enforcement proceed against a stale snapshot, terminally failing
-/// the very task an in-flight pause was protecting.
+/// [`try_lock_queue_for_claim`] runs *after* the claim query, so it must never
+/// wait. This lock is the **first** statement in the enforcement transaction,
+/// before any row lock. So it cannot participate in a wait cycle. See the
+/// lock-ordering note in `enforce_activity_timeout`. It must really wait. A
+/// bail-out on contention skips the pause re-check. The enforcement then
+/// proceeds against a stale snapshot. It terminally fails the very task that an
+/// in-flight pause protects.
 ///
 /// # Errors
 ///
@@ -622,21 +608,20 @@ pub async fn lock_queue_for_timeout_recheck(
 
 /// How much of the fleet a hold is **actually** in effect on.
 ///
-/// Distinct from the stored `scope_shard_id`, which records the *intent* of the
-/// request that wrote a row (`NULL` = "this was a fleet-wide request"), not its
-/// coverage. A fleet-wide pause that only reached some shards persists
-/// `scope_shard_id = NULL` on the shards it reached and **no row at all** on the
-/// ones it missed, so reading intent alone would present a partially-applied
-/// hold as fleet-wide while the missed shards keep dispatching (issue #619
-/// review).
+/// Distinct from the stored `scope_shard_id`. That column records the *intent*
+/// of the request that wrote a row (`NULL` = "this was a fleet-wide request"),
+/// not its coverage. A fleet-wide pause can reach only some shards. It then
+/// stores `scope_shard_id = NULL` on the shards it reached. It stores **no row
+/// at all** on the shards it missed. A read of intent alone shows such a
+/// partial hold as fleet-wide. The missed shards meanwhile keep dispatching
+/// (issue #619 review).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseCoverage {
     /// Every expected shard holds the queue.
     Fleet,
-    /// At least one row was written by a fleet-wide request, but at least one
-    /// expected shard does not hold the queue — so part of the fleet is still
-    /// dispatching.
+    /// A fleet-wide request wrote at least one row, but at least one expected
+    /// shard does not hold the queue. So part of the fleet still dispatches.
     PartialFleet,
     /// Every row is explicitly shard-scoped, and they do not cover the fleet.
     Shard,
@@ -663,15 +648,15 @@ impl PauseCoverage {
 
 /// Classify a hold's real coverage from the shards that actually hold it.
 ///
-/// `holding_shards` are the shards whose read returned a row for this queue;
-/// `scope_shard_ids` are those rows' stored scopes; `expected_shards` is the
-/// shard set the fleet is *supposed* to span (`shard_fanout::expected_shards`,
-/// i.e. every pool plus every shard the router knows about).
+/// `holding_shards` are the shards whose read returned a row for this queue.
+/// `scope_shard_ids` are the stored scopes of those rows. `expected_shards` is
+/// the shard set the fleet is *supposed* to span
+/// (`shard_fanout::expected_shards`: every pool plus every shard the router
+/// knows about).
 ///
-/// Using **expected** rather than merely-inspected shards is deliberate and is
-/// the safe direction: a shard that could not be read might well be
-/// dispatching, so a hold is only ever reported as `Fleet` when every shard the
-/// fleet is supposed to have is known to hold it.
+/// **Expected** shards, not merely inspected ones, is the safe direction. A
+/// shard that could not be read can still be dispatching. So a hold is `Fleet`
+/// only when every shard the fleet is supposed to have is known to hold it.
 ///
 /// An empty `expected_shards` (a degenerate configuration) falls back to the
 /// holding set, so a single-shard deployment still reads `Fleet`.
@@ -723,9 +708,9 @@ pub const fn queue_pause_suppresses_timeout(
 /// The resume-time `scheduled_at` shift — the single most load-bearing query in
 /// this feature.
 ///
-/// Without it, thawing a queue whose backlog waited past its
-/// `schedule_to_start` would immediately time out the *entire* held backlog:
-/// exactly the failure AC4/AC5 exist to prevent.
+/// Without it, a thaw times out the *entire* held backlog at once when that
+/// backlog waited past its `schedule_to_start`. AC4/AC5 exist to prevent
+/// exactly that failure.
 ///
 /// For each `PENDING` row on the queue that is actually **due**
 /// (`scheduled_at <= clock_timestamp()`), it credits back only the time the row
@@ -736,8 +721,8 @@ pub const fn queue_pause_suppresses_timeout(
 /// ```
 ///
 /// - **Eligible before the pause** (`scheduled_at <= paused_at`): shifted by the
-///   full pause span, so pre-pause waiting is preserved (a task that had already
-///   waited 100 s still shows 100 s of wait after the thaw).
+///   full pause span, so pre-pause waiting is preserved. A task that had waited
+///   100 s still shows 100 s of wait after the thaw.
 /// - **Became eligible mid-pause** (`paused_at < scheduled_at <= now`):
 ///   collapses to the thaw instant — it was held from the moment it became due,
 ///   so it accrues no wait.
@@ -746,28 +731,27 @@ pub const fn queue_pause_suppresses_timeout(
 ///
 /// # Why `clock_timestamp()` and not `NOW()`
 ///
-/// `NOW()` is `transaction_timestamp()` — frozen at **transaction start**, which
-/// here is *before* the advisory-lock wait, before the pause-row `DELETE`, and
-/// before this bulk `UPDATE` runs. But the hold stays in force until this
-/// transaction **commits**, so a frozen `NOW()` silently omits the resume's own
-/// duration from the credit. Measured directly: with a task that had genuinely
-/// waited 100 s pre-pause and a resume that spent 3 s on the lock, `NOW()`
-/// leaves it looking like it waited 103 s the instant the queue thaws — so any
-/// task whose `schedule_to_start` is shorter than the resume's own runtime times
-/// out immediately after the thaw, which is precisely the AC3/AC4 failure
-/// ("never failed *solely because* of the pause") this query exists to prevent.
-/// The same frozen value also excluded rows that fell due *during* the
-/// transaction from the predicate.
+/// `NOW()` is `transaction_timestamp()`, frozen at **transaction start**. Here
+/// that is *before* the advisory-lock wait, the pause-row `DELETE` and this
+/// bulk `UPDATE`. But the hold stays in force until this transaction
+/// **commits**. So a frozen `NOW()` silently omits the resume's own duration
+/// from the credit. A direct measurement: a task waited 100 s before the pause,
+/// and the resume spent 3 s on the lock. With `NOW()`, the task shows 103 s of
+/// wait the instant the queue thaws. So a task whose `schedule_to_start` is
+/// shorter than the resume's runtime times out right after the thaw. This
+/// query exists to prevent exactly that AC3/AC4 failure ("never failed *solely
+/// because* of the pause"). The same frozen value also kept rows that fell due
+/// *during* the transaction out of the predicate.
 ///
-/// `clock_timestamp()` is volatile and re-read per row at execution time, so it
-/// sees the real wall clock after the lock is held and advances as the scan
+/// `clock_timestamp()` is volatile and re-read per row at execution time. So
+/// it sees the real wall clock after the lock is held. It advances as the scan
 /// progresses.
 ///
-/// It is still a **lower bound**, deliberately: the true thaw instant is commit
-/// time, which no in-statement expression can know, so each row is under-credited
-/// by at most the remaining duration of this `UPDATE`. That is the *safe*
-/// direction — over-crediting past commit time would push `scheduled_at` into
-/// the future and make the task **un**claimable, the inverse of AC5.
+/// It is still a **lower bound**, by design. The true thaw instant is commit
+/// time, and no in-statement expression can know it. So each row is
+/// under-credited by at most the remaining duration of this `UPDATE`. That is
+/// the *safe* direction. Over-credit past commit time pushes `scheduled_at`
+/// into the future and makes the task **un**claimable, the inverse of AC5.
 ///
 /// The result stays provably `<= clock_timestamp()` at evaluation, hence
 /// `<= commit time`, in every branch. `RUNNING` rows are untouched, and
@@ -776,100 +760,98 @@ pub const fn queue_pause_suppresses_timeout(
 /// # Why the partition is `created_at` vs `paused_at`
 ///
 /// This pass owns the rows that had already accrued wait *before* the hold
-/// began; [`resume_shift_late_arrivals_query`] owns the rows created *during*
-/// it. The two predicates partition the due `PENDING` rows so no row is shifted
-/// twice — a second application of this *relative* `+=` formula would erase the
-/// pre-pause wait it exists to preserve.
+/// began. [`resume_shift_late_arrivals_query`] owns the rows created *during*
+/// it. The two predicates partition the due `PENDING` rows, so no row shifts
+/// twice. A second application of this *relative* `+=` formula erases the
+/// pre-pause wait that it exists to preserve.
 ///
-/// The split is **semantic, not temporal** (issue #619). An
-/// earlier revision partitioned on `created_at < transaction_timestamp()`
-/// ("existed when this resume began"), which is subtly wrong: `created_at`
-/// records when the enqueuing `INSERT` *executed*, while whether this pass can
-/// *see* the row is decided by when that enqueuing transaction **committed**. A
-/// row inserted before the resume began but committed after this statement took
-/// its snapshot therefore satisfied neither predicate — invisible to this pass,
-/// and excluded from the late pass by its own `created_at` test — so it thawed
-/// with its entire held wait uncredited and could be schedule-to-start-failed
-/// immediately after the thaw.
+/// The split is **semantic, not temporal** (issue #619). An earlier revision
+/// split on `created_at < transaction_timestamp()` ("existed when this resume
+/// began"). That is subtly wrong. `created_at` records when the enqueuing
+/// `INSERT` *executed*. Whether this pass can *see* the row depends on when
+/// that enqueuing transaction **committed**. Take a row inserted before the
+/// resume began but committed after this statement took its snapshot. It
+/// matched neither predicate. This pass could not see it, and the late pass
+/// excluded it by its own `created_at` test. So it thawed with its entire held
+/// wait uncredited. A schedule-to-start failure could then follow at once.
 ///
-/// Comparing against `paused_at` removes visibility from the question
-/// altogether: `created_at` and `paused_at` are both fixed values on rows that
-/// already exist, so a row's side is the same no matter which statement first
-/// observes it, and a row that becomes visible late is still credited correctly
-/// by whichever pass owns it. It also happens to be the more meaningful split —
-/// "did this task accrue wait before the hold, or was it held from birth?" —
-/// which is exactly the distinction the two formulas encode.
+/// A comparison against `paused_at` removes visibility from the question.
+/// `created_at` and `paused_at` are both fixed values on rows that already
+/// exist. So the side of a row is the same, whichever statement sees it first.
+/// The pass that owns a late-visible row still credits it correctly. It is
+/// also the more meaningful split. It asks "did this task accrue wait before
+/// the hold, or was it held from birth?". The two formulas encode exactly that.
 ///
-/// `created_at` is **nullable** (a pre-`20260619000000` `PENDING` row has none),
-/// and in SQL a comparison against `NULL` is `NULL`, not `false` — so without the
-/// explicit `IS NULL` arm such a row would satisfy *neither* predicate and be
-/// credited by *neither* pass. It belongs on this side: a row with no
-/// `created_at` predates that migration and therefore predates any pause.
+/// `created_at` is **nullable**: a pre-`20260619000000` `PENDING` row has none.
+/// In SQL a comparison against `NULL` is `NULL`, not `false`. Without the
+/// explicit `IS NULL` arm, such a row matches *neither* predicate. Then
+/// *neither* pass credits it. It belongs on this side. A row with no
+/// `created_at` predates that migration, so it predates any pause.
 ///
 /// # Why a total partition was still not enough (issue #619)
 ///
-/// The partition above is total and visibility-independent — every due
+/// The partition above is total and visibility-independent. Every due
 /// `PENDING` row matches exactly one predicate, whenever it becomes visible.
-/// That is a statement about the *predicates*, and an earlier revision wrongly
-/// read it as a statement about **coverage**. It is not: a row on *this* pass's
-/// side that is invisible to *this* pass's snapshot is simply never shifted,
-/// and it cannot be picked up later, because the second pass used to test the
-/// same `created_at` predicate and so excluded it by construction.
+/// That is a statement about the *predicates*. An earlier revision wrongly read
+/// it as a statement about **coverage**. Take a row on *this* pass's side that
+/// *this* pass's snapshot cannot see. This pass never shifts it. A later pass
+/// cannot pick it up either. The second pass used to test the same
+/// `created_at` predicate, so it excluded the row by construction.
 ///
-/// Concretely: an enqueue whose `INSERT` *executes* before the pause (so
-/// `created_at < paused_at`, this pass's side) but whose transaction *commits*
-/// after this statement's snapshot is invisible here and was rejected there —
-/// thawing with its entire held wait uncredited, and so immediately
-/// `schedule_to_start`-failable. The `paused_at` partition removes the
-/// dependence on visibility for *which side a row belongs to*. It cannot
-/// remove the dependence on visibility for *whether a pass sees the row at all*.
+/// An example: an enqueue `INSERT` *executes* before the pause, so
+/// `created_at < paused_at` puts it on this side. Its transaction *commits*
+/// after this statement's snapshot. This pass cannot see it, and pass 2
+/// rejected it. So it thawed with its entire held wait uncredited, and a
+/// `schedule_to_start` failure could follow at once. The `paused_at` partition
+/// removes the dependence on visibility for *which side a row belongs to*. It
+/// cannot remove the dependence on visibility for *whether a pass sees the row
+/// at all*.
 ///
-/// The fix is to stop deriving pass 2's exclusion from a predicate and derive
-/// it from the rows this pass **actually shifted**: this statement now
-/// `RETURNING id`s them, and [`resume_shift_late_arrivals_query`] covers *both*
-/// sides of the partition for every row not in that set. Coverage is then total
-/// across the two snapshots by construction, for any commit order.
+/// The fix derives the exclusion of pass 2 from the rows this pass **actually
+/// shifted**, not from a predicate. This statement now returns their ids
+/// (`RETURNING id`). [`resume_shift_late_arrivals_query`] covers *both* sides
+/// of the partition for every row not in that set. Coverage across the two
+/// snapshots is then total by construction, for any commit order.
 ///
-/// The remaining, genuinely irreducible residual — a row committing after pass
-/// 2's snapshot — is documented on [`resume_shift_late_arrivals_query`].
+/// [`resume_shift_late_arrivals_query`] documents the irreducible residual: a
+/// row that commits after the snapshot of pass 2.
 ///
 /// # Re-pend paths
 ///
-/// A row can also change **state** between the two snapshots: a `RUNNING` row
-/// re-pended after this pass's snapshot is invisible here. Every such row is
-/// now covered by pass 2 regardless of which side of the partition it lands on,
-/// so this is no longer a correctness argument — but it is still worth
-/// recording that each reachable re-pend path *refreshes* `scheduled_at` to the
-/// re-pend instant (`crate::queue::requeue_for_retry`, `crate::poison_pill`
-/// reclaim, `primary_repend_workflow_task`) and so accrued no held time anyway.
-/// The one path that re-pends while *preserving* a pre-pause `scheduled_at` is
-/// [`release_claim_if_queue_paused`], which does so deliberately so a released
-/// claim keeps the wait it had already accrued; it is now credited correctly by
-/// pass 2 rather than relying on being unreachable in this window.
+/// A row can also change **state** between the two snapshots. This pass cannot
+/// see a `RUNNING` row re-pended after its snapshot. Pass 2 now covers every
+/// such row, on either side of the partition. So this is no longer a
+/// correctness argument. Still, each reachable re-pend path *refreshes*
+/// `scheduled_at` to the re-pend instant, so it accrued no held time anyway.
+/// These paths are `crate::queue::requeue_for_retry`, the `crate::poison_pill`
+/// reclaim and `primary_repend_workflow_task`. [`release_claim_if_queue_paused`]
+/// is the one path that re-pends and *preserves* a pre-pause `scheduled_at`.
+/// It does so on purpose, so a released claim keeps the wait it had accrued.
+/// Pass 2 now credits it correctly. It no longer relies on the path being
+/// unreachable in this window.
 ///
 /// # Why the ids round-trip through this process (issue #619)
 ///
-/// The shifted ids are loaded here and sent back to pass 2 as an array bind,
-/// which is linear in the released backlog: one `Uuid` per shifted task in
-/// application memory, then that array re-serialised onto the wire and
-/// re-materialised server-side by `unnest`, all while this transaction holds
-/// the queue's exclusive advisory lock.
+/// The shifted ids load here and go back to pass 2 as an array bind. That is
+/// linear in the released backlog. Application memory holds one `Uuid` per
+/// shifted task. The array then goes back over the wire, and `unnest`
+/// rebuilds it on the server. All of this happens while this transaction holds
+/// the exclusive advisory lock of the queue.
 ///
 /// A data-modifying CTE could capture the ids straight into a transaction-scoped
 /// `CREATE TEMP TABLE ... ON COMMIT DROP` scratch table and remove that cost.
 /// This module does not do that, because `CREATE TEMP TABLE` requires the
-/// database-level `TEMPORARY` privilege. Nothing in the migration grants it and
-/// nothing in preflight validates it, so a deployment that has revoked
-/// `TEMPORARY` — a recognised hardening step — passes every current permission
-/// check and then fails EVERY resume, rolling back the pause deletion and
-/// leaving the queue frozen at precisely the moment an operator is trying to
-/// thaw it. A rare scale problem is a better failure than a deterministic,
-/// silent, config-dependent break of the feature's core operation.
+/// database-level `TEMPORARY` privilege. The migration does not grant it, and
+/// preflight does not validate it. Revoking `TEMPORARY` is a recognised
+/// hardening step. Such a deployment passes every current permission check.
+/// It then fails EVERY resume, which rolls back the pause deletion. The queue
+/// stays frozen at the exact moment an operator tries to thaw it. A rare scale
+/// problem is a better failure than a deterministic, silent, config-dependent
+/// break of the core operation of this feature.
 ///
-/// The memory cost is real and is tracked as a follow-up. Fixing it properly
-/// needs a handoff covered by the grants the migration already issues (a real
-/// table keyed by a per-resume token), not a privilege the deployment may not
-/// have.
+/// The memory cost is real and is tracked as a follow-up. A proper fix needs a
+/// handoff that the existing migration grants cover, such as a real table keyed
+/// by a per-resume token. It must not need a privilege the deployment may lack.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -884,61 +866,61 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// Second pass of the resume shift: credit rows **enqueued during the thaw
 /// itself** (issue #619 review).
 ///
-/// The hold stays in force until `resume_queue`'s transaction *commits* — a
-/// concurrent claimer's snapshot still sees the not-yet-committed pause row, so
-/// it still skips the queue. A task enqueued after
-/// [`resume_shift_scheduled_at_query`]'s snapshot is therefore genuinely held,
-/// yet that statement can never see it, so without this pass it would thaw
-/// carrying an uncredited `scheduled_at` and could be timed out by the
-/// `schedule_to_start` scanner for time it spent held — the AC3/AC4 failure the
-/// primary shift exists to prevent.
+/// The hold stays in force until the `resume_queue` transaction *commits*. The
+/// snapshot of a concurrent claimer still sees the uncommitted pause row, so
+/// it still skips the queue. A task enqueued after the snapshot of
+/// [`resume_shift_scheduled_at_query`] is therefore really held. That
+/// statement can never see it. Without this pass, the task thaws with an
+/// uncredited `scheduled_at`. The `schedule_to_start` scanner can then time it
+/// out for time it spent held. The primary shift exists to prevent exactly
+/// that AC3/AC4 failure.
 ///
 /// # Why this pass covers *both* sides of the partition (issue #619)
 ///
-/// It is not enough for this pass to own only the rows created during the hold.
-/// A row on the *primary* pass's side (`created_at < paused_at`) that was
-/// invisible to that pass's snapshot — an enqueue that executed before the
-/// pause but committed after the primary shift ran — would otherwise be
-/// credited by neither pass and thaw with its whole held wait uncredited. See
-/// the "total partition" note on [`resume_shift_scheduled_at_query`].
+/// It is not enough for this pass to own only the rows created during the
+/// hold. Take a row on the side of the *primary* pass (`created_at < paused_at`)
+/// that its snapshot could not see. That is an enqueue that executed before the
+/// pause but committed after the primary shift ran. With that narrower scope,
+/// neither pass credits it, and it thaws with its whole held wait uncredited.
+/// See the "total partition" note on [`resume_shift_scheduled_at_query`].
 ///
-/// So this statement applies the **same per-side formula** the partition
-/// defines, via a `CASE`, and derives its exclusion from the ids the primary
-/// pass actually shifted (`$3`) rather than from a `created_at` predicate:
+/// So this statement applies, via a `CASE`, the **same per-side formula** that
+/// the partition defines. It derives its exclusion from the ids the primary
+/// pass actually shifted (`$3`), not from a `created_at` predicate:
 ///
-/// - `created_at IS NULL OR created_at < $2` → the primary pass's *relative*
-///   `+=` delta, preserving the wait the row accrued before the hold.
-/// - otherwise → `clock_timestamp()` (absolute), because a row created during
-///   the hold has no pre-pause wait to preserve: it was held from the moment it
-///   became due, so it accrues none.
+/// - `created_at IS NULL OR created_at < $2` → the *relative* `+=` delta of the
+///   primary pass. It preserves the wait the row accrued before the hold.
+/// - otherwise → `clock_timestamp()` (absolute). A row created during the hold
+///   has no pre-pause wait to preserve. It was held from the moment it became
+///   due, so it accrues none.
 ///
-/// Excluding by id rather than by predicate is what makes coverage total for
-/// *any* commit order: a row the primary pass shifted is in `$3` and is skipped
-/// here (a second application of the relative formula would erase the very
-/// pre-pause wait it exists to preserve), and every other due `PENDING` row is
-/// credited here, whichever side it belongs to. An empty `$3` — the primary
-/// pass shifted nothing — correctly leaves every row to this pass.
+/// The exclusion by id, not by predicate, makes coverage total for *any*
+/// commit order. A row the primary pass shifted is in `$3`, so this pass skips
+/// it. A second application of the relative formula erases the pre-pause wait
+/// it exists to preserve. This pass credits every other due `PENDING` row,
+/// whichever side it belongs to. An empty `$3` means the primary pass shifted
+/// nothing. It correctly leaves every row to this pass.
 ///
-/// The exclusion is written as `NOT EXISTS (… unnest …)` rather than
-/// `id <> ALL(<array>)` deliberately: the latter is a per-row linear scan of
-/// the array, while the former lets the planner build a hash anti-join, so the
-/// cost is O(rows + ids) rather than O(rows × ids).
+/// The exclusion is `NOT EXISTS (… unnest …)`, not `id <> ALL(<array>)`, by
+/// design. The latter is a per-row linear scan of the array. The former lets
+/// the planner build a hash anti-join. So the cost is O(rows + ids), not
+/// O(rows × ids).
 ///
 /// # Irreducible residual
 ///
 /// This narrows the uncredited window from "the whole bulk `UPDATE`" to "this
-/// final, small statement", but cannot close it: a row committed after *this*
-/// statement's snapshot and before this transaction commits is still held and
-/// still gets no credit. The under-credit is bounded by the remaining duration of
-/// this statement (microseconds for a queue with no late arrivals), the same
-/// safe direction as the primary pass's lower-bound credit.
+/// final, small statement". It cannot close it. A row committed after *this*
+/// statement's snapshot and before this transaction commits is still held. It
+/// still gets no credit. The remaining duration of this statement bounds the
+/// under-credit (microseconds for a queue with no late arrivals). That is the
+/// same safe direction as the lower-bound credit of the primary pass.
 ///
-/// Closing it completely would require serializing **enqueue** behind the queue's
-/// advisory lock, putting a queue-scoped serialization point on the hot enqueue
-/// path for every task on every queue, paused or not. That is the exact trade
-/// this module's design notes reject for the claim path, and it is not worth
-/// paying to recover a sub-millisecond credit — so the residual is documented
-/// rather than eliminated.
+/// A full close needs **enqueue** to serialize behind the advisory lock of the
+/// queue. That puts a queue-scoped serialization point on the hot enqueue path
+/// for every task on every queue, paused or not. The design notes of this
+/// module reject that exact trade for the claim path. A sub-millisecond credit
+/// is not worth that cost. So this documents the residual and does not remove
+/// it.
 ///
 /// The statement returns the ids it shifts. The resume publishes a dispatch
 /// hint for each one after commit (issue #2066). A resume with no dispatch
@@ -966,25 +948,25 @@ pub const fn resume_shift_late_arrivals_count_query() -> &'static str {
 ///
 /// # Why a correlated count rather than a grouped join (issue #619)
 ///
-/// The obvious shape — `LEFT JOIN (SELECT queue_name, COUNT(*) … GROUP BY
-/// queue_name)` — aggregates the **entire** `PENDING` backlog of every queue on
-/// the shard and only then joins the result to the (tiny) pause table. Postgres
-/// cannot reliably push the pause table's queue names down into that grouped
-/// subquery, so the cost scales with the whole shard's backlog rather than with
+/// The obvious shape is `LEFT JOIN (SELECT queue_name, COUNT(*) … GROUP BY
+/// queue_name)`. It aggregates the **entire** `PENDING` backlog of every queue
+/// on the shard. Only then does it join the result to the tiny pause table.
+/// Postgres cannot reliably push the paused queue names down into that grouped
+/// subquery. So the cost scales with the backlog of the whole shard, not with
 /// the paused queues.
 ///
-/// That is backwards for this query specifically: it is a **diagnostic read**,
-/// executed per shard by both the management endpoint and the Workers-page
-/// banner, and it is consulted during exactly the incident where the backlog is
-/// largest. Making the operator's "what is on hold?" view slow (or time out) in
-/// proportion to unrelated pending work defeats its purpose.
+/// That is backwards for this query. It is a **diagnostic read**. The
+/// management endpoint and the Workers-page banner both run it per shard.
+/// Operators read it during exactly the incident where the backlog is largest.
+/// A "what is on hold?" view that slows (or times out) with unrelated pending
+/// work defeats its purpose.
 ///
-/// The correlated `COUNT(*)` instead runs once per **paused queue** — a set
-/// bounded by the number of rows in `harvest_queue_pauses`, normally a handful —
-/// and each one is a selective `(queue_name, state)` lookup rather than a full
-/// aggregation. It also drops the `COALESCE`: a correlated count returns `0`
-/// for a paused queue with no held work, so such a queue still lists rather
-/// than disappearing, which was the only reason the `LEFT JOIN` existed.
+/// The correlated `COUNT(*)` runs once per **paused queue** instead. The row
+/// count of `harvest_queue_pauses` bounds that set, normally to a handful. Each
+/// count is a selective `(queue_name, state)` lookup, not a full aggregation.
+/// It also drops the `COALESCE`. A correlated count returns `0` for a paused
+/// queue with no held work. So such a queue still lists and does not vanish.
+/// That was the only reason for the `LEFT JOIN`.
 #[must_use]
 pub const fn list_paused_queues_query() -> &'static str {
     "SELECT p.queue_name, p.reason, p.paused_by, p.paused_at, p.scope_shard_id, \
@@ -1004,16 +986,15 @@ pub const fn held_task_count_query() -> &'static str {
 /// One claimable task id on a just-resumed queue, used only as the payload for
 /// the resume's wake notification (`$1` = queue name).
 ///
-/// `LIMIT 1` because the notification is a *doorbell*, not a work assignment:
+/// `LIMIT 1` because the notification is a *doorbell*, not a work assignment.
 /// [`crate::notify::QueueListener`] hands the payload back to the poll loop,
-/// which ignores it and re-polls the queue normally. One indexed row is
-/// therefore all this needs, and it deliberately does **not** use
-/// `RETURNING id` on the shift statements — that would materialise an id array
-/// proportional to the whole released backlog to carry a single value.
+/// which ignores it and re-polls the queue normally. So one indexed row is
+/// enough. It deliberately does **not** use `RETURNING id` on the shift
+/// statements. That materialises an id array as large as the whole released
+/// backlog, only to carry a single value.
 ///
-/// The predicate mirrors the shift passes' own due-row filter, so the id is one
-/// of the rows this resume just made claimable rather than a future-scheduled
-/// retry that is still not due.
+/// The predicate mirrors the due-row filter of the shift passes. So the id is
+/// a row this resume just made claimable, not a retry that is still not due.
 #[must_use]
 pub const fn resumed_queue_notify_task_query() -> &'static str {
     "SELECT id FROM harvest_task_queue \
@@ -1032,14 +1013,14 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 /// earlier wake would still see the uncommitted pause row and skip the queue.
 /// A resume that rolls back sends no wake.
 ///
-/// Reuses [`crate::notify::notify_task_enqueued`] rather than introducing a
-/// second channel or payload shape, because [`crate::notify::QueueListener`]
-/// **parses** the payload as `NotifyPayload { task_id }` and surfaces a parse
-/// failure as an error — which the poll loop handles by logging and sleeping a
-/// full `poll_interval`, i.e. strictly worse than sending nothing. A synthetic
-/// or nil id would be a lie in a field that is typed as a real task; a genuine
-/// id is both honest and free (one indexed row). The sender can still merge
-/// this wake with others on the queue into one nil-id wake (issue #1796).
+/// Reuses [`crate::notify::notify_task_enqueued`] and adds no second channel or
+/// payload shape. [`crate::notify::QueueListener`] **parses** the payload as
+/// `NotifyPayload { task_id }` and surfaces a parse failure as an error. The
+/// poll loop then logs and sleeps a full `poll_interval`. That is strictly
+/// worse than sending nothing. A synthetic or nil id is a lie in a field typed
+/// as a real task. A real id is honest and free (one indexed row). The sender
+/// can still merge this wake with others on the queue into one nil-id wake
+/// (issue #1796).
 ///
 /// A queue that raced to empty between the shift and this lookup needs no
 /// doorbell, so the lookup returning nothing is a silent no-op.
@@ -1092,10 +1073,9 @@ pub struct PausedQueue {
 
 /// Result of a pause request.
 ///
-/// Idempotent: re-pausing an already-paused queue is a success no-op with
-/// `newly_paused == false` and the **original** pause provenance preserved
-/// (mirroring the `newly_terminated` / `newly_resumed` convention from
-/// #504 / #609).
+/// Idempotent: a re-pause of a paused queue is a success no-op with
+/// `newly_paused == false`. It keeps the **original** pause provenance. This
+/// mirrors the `newly_terminated` / `newly_resumed` convention from #504 / #609.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PauseOutcome {
     /// The queue that is now paused.
@@ -1133,10 +1113,10 @@ pub struct ResumeOutcome {
     pub paused_duration_secs: i64,
     /// The reason the hold was originally placed, echoed back on release.
     ///
-    /// The pause row is deleted on resume, so this is the last moment the
-    /// *why* is recoverable — the resume response (and therefore the CLI
-    /// output and the Vantage flash) carries it so an operator closing out an
-    /// incident sees exactly which hold they released. `None` on a no-op.
+    /// The resume deletes the pause row, so this is the last chance to recover
+    /// the *why*. The resume response carries it, and so do the CLI output and
+    /// the Vantage flash. An operator who closes an incident then sees exactly
+    /// which hold was released. `None` on a no-op.
     pub released_reason: Option<String>,
     /// The operator who placed the hold being released. `None` on a no-op.
     pub released_paused_by: Option<String>,
@@ -1193,89 +1173,89 @@ struct UpsertedPauseRow {
 
 /// The pause upsert.
 ///
-/// A single upsert, not `INSERT ... DO NOTHING` + a fallback `SELECT`:
-/// `DO NOTHING` does not lock the conflicting row, so a concurrent resume could
-/// delete it between the two statements, leaving the fallback `SELECT` with zero
-/// rows — a `500` and, worse, a queue left *unpaused* for an operator who was
-/// told the pause failed.
+/// A single upsert, not `INSERT ... DO NOTHING` + a fallback `SELECT`.
+/// `DO NOTHING` does not lock the conflicting row. So a concurrent resume can
+/// delete it between the two statements. The fallback `SELECT` then returns
+/// zero rows. That is a `500`. Worse, the queue stays *unpaused*, and the
+/// operator was told the pause failed.
 ///
-/// The no-op `SET queue_name = ...` preserves the ORIGINAL provenance on a
-/// re-pause while still taking the row lock, and `xmax = 0` is the standard
+/// The no-op `SET queue_name = ...` keeps the ORIGINAL provenance on a
+/// re-pause and still takes the row lock. `xmax = 0` is the standard
 /// discriminator for "this tuple was inserted, not updated".
 ///
 /// # Why `paused_at` is stamped explicitly, not left to `DEFAULT NOW()`
 ///
-/// The column defaults to `NOW()`, which is `transaction_timestamp()` — frozen
-/// at **transaction start**, i.e. *before* [`lock_queue_for_pause`] waits. The
-/// hold does not become effective until that lock is held (and, strictly, until
-/// this transaction commits), so a defaulted `paused_at` predates the effective
-/// hold by the entire lock wait — which is unbounded in principle, since it can
-/// queue behind a large concurrent resume shifting a big backlog.
+/// The column defaults to `NOW()`, which is `transaction_timestamp()`. That
+/// value is frozen at **transaction start**, *before* [`lock_queue_for_pause`]
+/// waits. The hold takes effect only once that lock is held (strictly, at
+/// commit). So a defaulted `paused_at` predates the effective hold by the whole
+/// lock wait. That wait has no upper bound. It can queue behind a large
+/// concurrent resume that shifts a big backlog.
 ///
 /// Two consequences, both real:
 ///
 /// - **Reported start and duration are overstated.** `GET /admin/queues/paused`
-///   and the Vantage banner show `paused_at`, the resume response derives
-///   `paused_duration_secs` from it, and the `harvest_queue_paused_too_long`
-///   alert exists precisely so an operator reasons about *how long* a hold has
-///   been in place. All of them read too long by the lock wait.
+///   and the Vantage banner show `paused_at`. The resume response derives
+///   `paused_duration_secs` from it. The `harvest_queue_paused_too_long` alert
+///   exists so an operator can reason about *how long* a hold has been in
+///   place. All of them read too long by the lock wait.
 /// - **The resume shift over-credits.** `resume_shift_scheduled_at_query`
-///   credits `clock_timestamp() - GREATEST(scheduled_at, paused_at)`, so an
-///   understated `paused_at` credits an interval the task was not actually
-///   held, eroding the pre-pause wait the shift exists to preserve.
+///   credits `clock_timestamp() - GREATEST(scheduled_at, paused_at)`. So an
+///   understated `paused_at` credits an interval when the task was not held. It
+///   erodes the pre-pause wait that the shift exists to preserve.
 ///
-/// Note the *direction* of that second one: the shift's `GREATEST` clamps its
-/// result to `<= clock_timestamp()` in every branch, so an understated
-/// `paused_at` can never push `scheduled_at` into the future and make a task
-/// **un**claimable (the AC5 inverse). It reduces the apparent wait, which is the
-/// safe side for `schedule_to_start`. It still loses fidelity in `paused_at`,
-/// the value the resume shift reads.
+/// Note the *direction* of that second one. The `GREATEST` of the shift clamps
+/// its result to `<= clock_timestamp()` in every branch. So an understated
+/// `paused_at` never pushes `scheduled_at` into the future. It cannot make a
+/// task **un**claimable (the AC5 inverse). It reduces the apparent wait, which
+/// is the safe side for `schedule_to_start`. It still loses fidelity in
+/// `paused_at`, the value the resume shift reads.
 ///
-/// `paused_at` is therefore **bound** (`$5`), read by [`pause_clock_query`]
-/// immediately after the advisory lock is granted rather than evaluated inline
-/// when this statement runs — see below. It appears **only** in the `INSERT`
-/// half: the `DO UPDATE` deliberately does not touch `paused_at`, so an
-/// idempotent re-pause still preserves the original hold's start time.
+/// `paused_at` is therefore **bound** (`$5`). [`pause_clock_query`] reads it
+/// right after the advisory lock is granted. It is not evaluated inline when
+/// this statement runs; see below. It appears **only** in the `INSERT` half.
+/// The `DO UPDATE` deliberately does not touch `paused_at`. So an idempotent
+/// re-pause keeps the start time of the original hold.
 ///
 /// # Why the stamp is taken at lock acquisition, not later (issue #619)
 ///
-/// Earlier revisions read `clock_timestamp()` inline here and had [`pause_queue`]
-/// run the [`held_task_count_query`] backlog scan *first*, so the stamp landed as
-/// close to `COMMIT` as possible. The reasoning was that claimers share neither
-/// the advisory lock nor visibility of the uncommitted pause row, so they keep
-/// dispatching until `COMMIT` — making everything before it *unheld* time that
-/// must not be credited back on resume.
+/// Earlier revisions read `clock_timestamp()` inline here. [`pause_queue`] ran
+/// the [`held_task_count_query`] backlog scan *first*. So the stamp landed as
+/// close to `COMMIT` as possible. The reasoning: claimers share neither the
+/// advisory lock nor visibility of the uncommitted pause row. So they keep
+/// dispatching until `COMMIT`. All time before it is then *unheld* time, which
+/// a resume must not credit back.
 ///
 /// The first half of that is no longer true. [`try_lock_queue_for_claim`] takes
-/// the **shared** mode of the very key [`lock_queue_for_pause`] takes
-/// exclusively, so from the moment this transaction is granted that lock every
-/// claim on the queue fails its `try` and gives the task back. The queue is
-/// therefore **effectively held from lock acquisition**, not from `COMMIT` — and
-/// stamping after the scan credits none of the scan interval, which is unbounded
-/// in principle on a large `PENDING` backlog. A task with a short
-/// `schedule_to_start` could then be timed out immediately after the thaw for
-/// time it spent blocked by the pause transaction itself: the exact AC3/AC4
-/// failure the shift exists to prevent.
+/// the **shared** mode of the key that [`lock_queue_for_pause`] takes
+/// exclusively. Once this transaction holds that lock, every claim on the
+/// queue fails its `try` and gives the task back. So the queue is
+/// **effectively held from lock acquisition**, not from `COMMIT`. A stamp after
+/// the scan credits none of the scan interval. On a large `PENDING` backlog
+/// that interval has no upper bound. A task with a short `schedule_to_start`
+/// can then time out right after the thaw. The cause is time it spent blocked
+/// by the pause transaction itself. The shift exists to prevent exactly that
+/// AC3/AC4 failure.
 ///
 /// Note the *direction*. The shift is
-/// `scheduled_at += clock_timestamp() - GREATEST(scheduled_at, paused_at)`, so a
-/// **later** `paused_at` shrinks the credit (under-credit → spurious timeouts,
-/// the dangerous side), while an **earlier** one only grows it, and the
-/// `GREATEST` clamps the result to `<= clock_timestamp()` in every branch — so
-/// it can never push `scheduled_at` into the future and make a task
-/// **un**claimable (the AC5 inverse). Stamping at lock acquisition is thus both
-/// the correct instant *and* the safe direction.
+/// `scheduled_at += clock_timestamp() - GREATEST(scheduled_at, paused_at)`. A
+/// **later** `paused_at` shrinks the credit. That under-credit causes spurious
+/// timeouts, the dangerous side. An **earlier** one only grows the credit. The
+/// `GREATEST` clamps the result to `<= clock_timestamp()` in every branch. So
+/// it never pushes `scheduled_at` into the future or makes a task
+/// **un**claimable (the AC5 inverse). A stamp at lock acquisition is thus the
+/// correct instant *and* the safe direction.
 ///
-/// The lock is acquired in its own statement and the clock read in the next, not
-/// together in one target list: Postgres does not guarantee evaluation order
-/// within a select list, so a combined statement could read the clock *before*
-/// the blocking lock call and silently reintroduce the lock-wait as
+/// One statement acquires the lock and the next reads the clock. They are not
+/// together in one target list. Postgres does not guarantee evaluation order
+/// within a select list. So a combined statement can read the clock *before*
+/// the blocking lock call. That silently reintroduces the lock wait as
 /// over-credit. Guarded by
 /// `pause_stamps_paused_at_at_lock_acquisition_not_after_the_scan`.
 ///
-/// The genuinely irreducible residue is now only `COMMIT` itself: a claim
-/// released by the barrier between the stamp and commit is held but uncredited,
-/// bounded by this transaction's remaining runtime.
+/// The irreducible residue is now only `COMMIT` itself. The barrier can release
+/// a claim between the stamp and commit. That claim is held but uncredited.
+/// The remaining runtime of this transaction bounds it.
 ///
 /// Binds: `$1` = queue name, `$2` = reason, `$3` = actor, `$4` = scope shard id,
 /// `$5` = the lock-acquisition instant.
@@ -1292,10 +1272,10 @@ pub const fn pause_upsert_query() -> &'static str {
 
 /// Read the wall clock at the instant the queue hold takes effect.
 ///
-/// Run by [`pause_queue`] immediately after [`lock_queue_for_pause`] returns, in
-/// its own statement so the blocking lock acquisition provably happens first.
-/// `clock_timestamp()` (volatile, real current time) rather than `NOW()`, which
-/// is frozen at transaction start — before the lock wait.
+/// [`pause_queue`] runs it right after [`lock_queue_for_pause`] returns. It is
+/// its own statement, so the blocking lock acquisition provably comes first.
+/// It reads `clock_timestamp()` (volatile, real current time), not `NOW()`.
+/// `NOW()` is frozen at transaction start, before the lock wait.
 #[must_use]
 pub const fn pause_clock_query() -> &'static str {
     "SELECT clock_timestamp() AS now"
@@ -1331,25 +1311,23 @@ pub async fn pause_queue(
     let actor_owned = actor.to_string();
 
     // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
-    // `resume_queue` — see the note there (issue #619). The
-    // advisory lock establishes this transaction's snapshot before it waits, so
-    // under `REPEATABLE READ` a pause that lands behind a concurrent
-    // pause/resume would read pre-lock state for the rest of the transaction.
+    // `resume_queue`; see the note there (issue #619). The advisory lock
+    // establishes the snapshot of this transaction before it waits. Under
+    // `REPEATABLE READ`, a pause queued behind a concurrent pause/resume then
+    // reads pre-lock state for the rest of the transaction.
     let mut tx = conn.build_transaction().read_committed();
     Box::pin(tx.run::<PauseOutcome, HarvestError, _>(async |conn| {
-        // Serialize against the schedule_to_start enforcer so it cannot
-        // fail a task on the queue we are pausing (see
-        // `lock_queue_for_pause`).
+        // Serialize against the `schedule_to_start` enforcer, so it cannot
+        // fail a task on this queue (see `lock_queue_for_pause`).
         lock_queue_for_pause(conn, &queue_owned).await?;
 
-        // The hold takes effect HERE, not at COMMIT: `try_lock_queue_for_claim`
-        // takes the shared mode of the key just locked exclusively, so every
+        // The hold takes effect HERE, not at COMMIT. `try_lock_queue_for_claim`
+        // takes the shared mode of the key just locked exclusively. So every
         // claim on this queue now fails its `try` and gives the task back.
-        // Read the clock in its own statement, immediately after the lock, so
-        // the whole rest of this transaction — the unbounded backlog scan
-        // below included — is credited back on resume. See
-        // `pause_upsert_query` for why a later stamp under-credits and can
-        // spuriously time a task out after the thaw.
+        // Read the clock in its own statement, right after the lock. A resume
+        // then credits back the whole rest of this transaction, including the
+        // unbounded backlog scan below. See `pause_upsert_query` for why a
+        // later stamp under-credits and can time a task out after the thaw.
         let clock: ClockRow = diesel::sql_query(pause_clock_query())
             .get_result(conn)
             .await?;
@@ -1386,10 +1364,10 @@ pub async fn pause_queue(
 
 /// Resume dispatch on `queue_name`, crediting held time back to `scheduled_at`.
 ///
-/// Runs in one transaction so the pause row is deleted and the held backlog is
-/// re-timed atomically: no worker can observe a thawed queue whose backlog is
-/// still carrying its stale, pre-thaw `scheduled_at` (which would let the
-/// `schedule_to_start` scanner kill the very work the pause protected).
+/// Runs in one transaction, so the pause row delete and the backlog re-time are
+/// atomic. No worker can see a thawed queue whose backlog still carries its
+/// stale, pre-thaw `scheduled_at`. That lets the `schedule_to_start` scanner
+/// kill the very work the pause protected.
 ///
 /// # Errors
 ///
@@ -1408,22 +1386,21 @@ pub async fn resume_queue(
 
     // Pinned `READ COMMITTED`, not the session default (issue #619).
     //
-    // The advisory lock below is a `SELECT`, so it establishes this
-    // transaction's snapshot and *then* blocks waiting for any in-flight pause.
-    // Under `REPEATABLE READ` that snapshot is the transaction's only one, so
-    // once the pause commits and releases the lock, the `DELETE` below still
-    // cannot see the pause row it was waiting for: the resume reports a
-    // successful `newly_resumed: false` no-op while the queue stays held —
-    // the operator believes they thawed and nothing dispatches.
+    // The advisory lock below is a `SELECT`. So it establishes the snapshot
+    // of this transaction and *then* blocks on any in-flight pause. Under
+    // `REPEATABLE READ` that snapshot is the only one of the transaction. The
+    // pause then commits and releases the lock. The `DELETE` below still
+    // cannot see the pause row it waited for. The resume reports a successful
+    // `newly_resumed: false` no-op, and the queue stays held. The operator
+    // believes the queue is thawed, and nothing dispatches.
     //
-    // Under `READ COMMITTED` each statement takes a fresh snapshot, so the
-    // post-lock `DELETE` observes the pause that committed while we waited.
-    // Inheriting the level would let a `default_transaction_isolation =
-    // repeatable read` on the database or the role silently disable the
-    // guarantee from outside this code; `build_transaction().read_committed()`
-    // emits the level on the `BEGIN`, so it travels with the query. This
-    // mirrors `queue::claim_task`, which pins the same level for the same
-    // fresh-snapshot reason.
+    // Under `READ COMMITTED` each statement takes a fresh snapshot. So the
+    // post-lock `DELETE` sees the pause that committed during the wait. An
+    // inherited level lets `default_transaction_isolation = repeatable read`
+    // on the database or the role silently disable the guarantee from outside
+    // this code. `build_transaction().read_committed()` emits the level on the
+    // `BEGIN`, so it travels with the query. `queue::claim_task` pins the same
+    // level for the same fresh-snapshot reason.
     // Ids both shift passes below thawed, collected so the dispatch hints for them are
     // published **after** this transaction commits (issue #1312). Publishing
     // from inside would name rows a channel reader still sees as held.
@@ -1440,16 +1417,16 @@ pub async fn resume_queue(
         // PENDING task rows the `scheduled_at` shift below updates. The
         // `schedule_to_start` enforcer takes the same two in the same order
         // (see the lock-ordering note in `timeout::enforce_activity_timeout`).
-        // Inverting either side would let enforcement hold a task row while
-        // waiting on this advisory lock and this transaction hold the
-        // advisory lock while waiting on that task row — an ABBA deadlock
-        // Postgres would break by aborting one, failing either the timeout
-        // pass or the operator's resume.
+        // An inversion on either side creates an ABBA deadlock. Enforcement
+        // holds a task row and waits on this advisory lock. This transaction
+        // holds the advisory lock and waits on that task row. Postgres breaks
+        // the deadlock by aborting one. That fails either the timeout pass or
+        // the operator's resume.
         lock_queue_for_pause(conn, &queue_owned).await?;
 
-        // Delete-and-return: a single statement that is both the
-        // "was it paused?" test and the release, so two concurrent
-        // resumes cannot both claim to have released the same hold.
+        // Delete-and-return: one statement is both the "was it paused?" test
+        // and the release. So two concurrent resumes cannot both claim to have
+        // released the same hold.
         let deleted: Vec<PauseRow> = diesel::sql_query(
             "DELETE FROM harvest_queue_pauses WHERE queue_name = $1 \
                      RETURNING reason, paused_by, paused_at",
@@ -1473,17 +1450,10 @@ pub async fn resume_queue(
         // notes on both queries explain why a `created_at` predicate cannot
         // do that job.
         //
-        // A server-side `CREATE TEMP TABLE ... ON COMMIT DROP` scratch table
-        // would keep application memory O(1) in the released backlog. It
-        // needs the database-level `TEMPORARY` privilege, which nothing in
-        // the migration grants and nothing in preflight validates. A
-        // deployment that has revoked it (a recognised hardening step)
-        // would pass every current permission check and then fail EVERY
-        // resume. That rolls back the pause deletion and leaves the queue
-        // frozen at exactly the moment an operator is trying to thaw it.
-        // Trading a rare scale problem for a deterministic, silent,
-        // config-dependent break of the feature's core operation is the
-        // wrong trade. The memory cost is tracked as a follow-up.
+        // A server-side temp table keeps application memory O(1) in the
+        // released backlog. It needs the `TEMPORARY` privilege, which a
+        // hardened deployment may revoke. Then EVERY resume fails. So this code
+        // does not use one. `resume_shift_scheduled_at_query` explains why.
         // A per-shard install passes `hints_wanted` but gives an unbound caller
         // no channel. Build the id set only when a publish can land.
         let publish_hints = crate::dispatch::hints_deliverable();
@@ -1504,16 +1474,15 @@ pub async fn resume_queue(
                 .extend(shifted_ids.iter().copied());
         }
 
-        // Second pass, LAST so it sees the freshest snapshot: a task still
-        // held (our DELETE has not committed, so concurrent claimers still
-        // see the pause row) may be invisible to the primary shift above --
-        // whether it was created during the hold, or created *before* it by
-        // an enqueue that only committed just now. This pass covers BOTH
-        // sides of the partition and excludes exactly the rows the primary
-        // pass reported shifting, so the two are disjoint by construction
-        // (the counts sum exactly, no row is shifted twice) for any commit
-        // order rather than only for the ones a `created_at` test happens
-        // to separate.
+        // Second pass, LAST, so it sees the freshest snapshot. A task is still
+        // held, because the DELETE has not committed and concurrent claimers
+        // still see the pause row. The primary shift above may not see it.
+        // The task was created during the hold, or by an enqueue before the
+        // hold that only committed now. This pass covers BOTH sides of the
+        // partition. It excludes exactly the rows the primary pass shifted.
+        // So the two passes are disjoint by construction, for any commit
+        // order: the counts sum exactly, and no row shifts twice. A
+        // `created_at` test separates only some commit orders.
         // Load the ids only when a channel will publish them. The late pass can
         // cover the whole backlog created during a long pause (issue #2066).
         let late = if publish_hints {
@@ -1543,19 +1512,17 @@ pub async fn resume_queue(
 
         // Wake sleeping listeners (issue #619).
         //
-        // AC5 promises held tasks are claimable *immediately* on resume,
-        // but a worker with `notification_database_url` set parks in
-        // `wait_for_notification(poll_interval)` and only re-polls when a
-        // `NOTIFY` arrives on the queue channel. Every held row was
-        // enqueued *before* the pause, so its enqueue notification fired
-        // long ago and was consumed (or missed) while the queue was held —
-        // and nothing about a resume enqueues anything new. Without a
-        // notification here the queue therefore stays idle for up to a full
-        // `poll_interval` after the thaw. That is invisible at the 500 ms
-        // default, but `poll_interval` is configurable and raising it is
-        // precisely why an operator configures LISTEN/NOTIFY in the first
-        // place, so the deployments most likely to be tuned this way are
-        // the ones that would sit idle longest.
+        // AC5 promises held tasks are claimable *immediately* on resume. But
+        // a worker with `notification_database_url` set parks in
+        // `wait_for_notification(poll_interval)`. It re-polls only when a
+        // `NOTIFY` arrives on the queue channel. Every held row was enqueued
+        // *before* the pause. So its enqueue notification fired long ago and
+        // was consumed (or missed) during the hold. A resume enqueues nothing
+        // new. Without a notification here, the queue stays idle for up to a
+        // full `poll_interval` after the thaw. That is invisible at the 500 ms
+        // default. But `poll_interval` is configurable. A higher value is
+        // exactly why an operator configures LISTEN/NOTIFY. So the
+        // deployments most likely to tune it would sit idle longest.
         //
         // Staged INSIDE this transaction on purpose. The sender sends the
         // wake only after COMMIT (issue #1796), so listeners wake exactly
@@ -1754,10 +1721,9 @@ mod tests {
         assert!(!PauseCoverage::Shard.is_incomplete_fleet());
     }
 
-    /// Surrounding whitespace is rejected rather than trimmed: a queue named
-    /// `"payments "` is genuinely reachable (`EnqueueParams` stores names
-    /// verbatim), so trimming would hold a *different, valid* queue while
-    /// reporting success.
+    /// Surrounding whitespace is rejected, not trimmed. A queue named
+    /// `"payments "` is reachable, because `EnqueueParams` stores names
+    /// verbatim. A trim holds a *different, valid* queue and reports success.
     #[test]
     fn validate_queue_name_rejects_surrounding_whitespace() {
         for name in ["payments ", " payments", "\tpayments", "payments\n"] {
@@ -1820,13 +1786,13 @@ mod tests {
     /// transaction timestamp.
     ///
     /// `NOW()` is `transaction_timestamp()`, fixed before the advisory-lock
-    /// wait, the pause-row `DELETE`, and this `UPDATE` — yet the hold stays in
-    /// force until commit. Using it silently omits the resume's own runtime from
-    /// the credit, so a task whose `schedule_to_start` is shorter than the
-    /// resume duration times out the instant the queue thaws: the exact AC3/AC4
-    /// violation ("never failed *solely because* of the pause") this query
-    /// exists to prevent. This guard exists because the fix is a one-word
-    /// change that a later "simplification" could quietly undo.
+    /// wait, the pause-row `DELETE`, and this `UPDATE`. Yet the hold stays in
+    /// force until commit. So `NOW()` silently omits the resume's own runtime
+    /// from the credit. A task whose `schedule_to_start` is shorter than the
+    /// resume then times out the instant the queue thaws. This query exists to
+    /// prevent that exact AC3/AC4 violation ("never failed *solely because* of
+    /// the pause"). The fix is a one-word change that a later "simplification"
+    /// can quietly undo, so this guard pins it.
     #[test]
     fn resume_shift_never_uses_the_frozen_transaction_clock() {
         let sql = resume_shift_scheduled_at_query();
@@ -1863,10 +1829,10 @@ mod tests {
     /// `paused_at` must be stamped from the live clock, not left to the column's
     /// `DEFAULT NOW()`.
     ///
-    /// `NOW()` is frozen at transaction start — before `lock_queue_for_pause`
-    /// waits — so a defaulted `paused_at` predates the effective hold by the
-    /// whole lock wait, overstating the reported start/duration and
-    /// over-crediting the resume shift. It is the write-side mirror of the
+    /// `NOW()` is frozen at transaction start, before `lock_queue_for_pause`
+    /// waits. So a defaulted `paused_at` predates the effective hold by the
+    /// whole lock wait. It overstates the reported start and duration, and the
+    /// resume shift over-credits. It is the write-side mirror of the
     /// frozen-clock hazard in the resume shift.
     #[test]
     fn pause_upsert_stamps_paused_at_from_the_live_clock() {
@@ -1901,11 +1867,11 @@ mod tests {
     /// An idempotent re-pause must preserve the ORIGINAL hold's start time, so
     /// the live-clock stamp above must appear only in the `INSERT` half.
     ///
-    /// Without this, re-issuing a pause (which the runbook explicitly tells an
-    /// operator to do to repair a `partial_fleet` hold) would reset `paused_at`
-    /// and erase how long the queue had really been held — and the resume shift
-    /// would then credit only from the re-pause, silently under-crediting the
-    /// backlog it was supposed to protect.
+    /// The runbook tells an operator to re-issue a pause to repair a
+    /// `partial_fleet` hold. Without this guard, that re-pause resets
+    /// `paused_at`. It erases how long the queue was really held. The resume
+    /// shift then credits only from the re-pause. It silently under-credits
+    /// the backlog it must protect.
     #[test]
     fn pause_upsert_does_not_restamp_paused_at_on_a_repause() {
         let sql = pause_upsert_query();
@@ -1962,12 +1928,11 @@ mod tests {
     /// 3. the upsert **binds** `paused_at` rather than evaluating
     ///    `clock_timestamp()` inline, which would re-read it at statement time.
     ///
-    /// Asserted on the source because the ordering *is* the invariant; the
-    /// wall-clock consequence is covered by the DB test
-    /// `pause_credits_the_backlog_scan_interval` (which makes the scan slow
-    /// deterministically by holding an `ACCESS EXCLUSIVE` lock on
-    /// `harvest_task_queue`). Mirrors the file-reading guards in
-    /// `migration_hygiene`/`ci_run_coverage`.
+    /// Asserted on the source because the ordering *is* the invariant. The DB
+    /// test `pause_credits_the_backlog_scan_interval` covers the wall-clock
+    /// consequence. It makes the scan slow deterministically with an
+    /// `ACCESS EXCLUSIVE` lock on `harvest_task_queue`. Mirrors the
+    /// file-reading guards in `migration_hygiene`/`ci_run_coverage`.
     #[test]
     fn pause_stamps_paused_at_at_lock_acquisition_not_after_the_scan() {
         let src = std::fs::read_to_string(
@@ -2114,11 +2079,11 @@ mod tests {
 
     /// The partition must be **total**, and `created_at` is nullable (a
     /// pre-`20260619000000` `PENDING` row has none). In SQL a comparison against
-    /// `NULL` yields `NULL`, not `false`, so a bare `<` / `>=` split would leave
-    /// such a row matching *neither* pass and credited by neither — a silent
-    /// regression against the pre-partition query, which had no `created_at`
-    /// predicate at all and shifted it. It belongs to the primary pass: no
-    /// `created_at` means it was certainly enqueued before this resume began.
+    /// `NULL` yields `NULL`, not `false`. So a bare `<` / `>=` split leaves such
+    /// a row matching *neither* pass, and neither pass credits it. That is a
+    /// silent regression against the pre-partition query. That query had no
+    /// `created_at` predicate at all and shifted the row. It belongs to the
+    /// primary pass. No `created_at` means it was enqueued before this resume.
     #[test]
     fn the_partition_is_total_for_a_null_created_at() {
         let primary = resume_shift_scheduled_at_query();
@@ -2126,10 +2091,10 @@ mod tests {
             primary.contains("(created_at IS NULL OR created_at < $2)"),
             "a legacy row with no created_at must still be credited; got:\n{primary}"
         );
-        // Pass 2 now covers both sides, so the same NULL arm must appear in its
-        // CASE -- otherwise a legacy row pass 1 could not see would fall to the
-        // absolute arm and be handed a full fresh budget instead of keeping the
-        // wait it accrued before the hold.
+        // Pass 2 now covers both sides, so its CASE needs the same NULL arm.
+        // Otherwise a legacy row that pass 1 could not see falls to the
+        // absolute arm. It then gets a full fresh budget and loses the wait it
+        // accrued before the hold.
         let late = resume_shift_late_arrivals_query();
         assert!(
             late.contains("WHEN created_at IS NULL OR created_at < $2"),
@@ -2138,18 +2103,12 @@ mod tests {
         );
     }
 
-    /// The late-arrivals pass must be an **absolute** assignment, never the
-    /// primary pass's relative `+=` delta: a row enqueued during the hold has no
-    /// pre-pause wait to preserve, and an absolute assignment is idempotent under
-    /// repetition (it can only move `scheduled_at` to a later instant that is
-    /// still `<= clock_timestamp() <= commit time`, never into the future).
     /// The resume's wake doorbell must pick a genuinely **claimable** row.
     ///
-    /// A future-scheduled retry backoff is deliberately not shifted by either
-    /// resume pass, so using one as the notify payload would name a task the
-    /// woken worker cannot claim. The predicate therefore mirrors the shift
-    /// passes' own due-row filter, and stays `LIMIT 1` — this is a doorbell,
-    /// not a work assignment.
+    /// Neither resume pass shifts a future-scheduled retry backoff, by design.
+    /// As the notify payload, such a row names a task the woken worker cannot
+    /// claim. So the predicate mirrors the due-row filter of the shift passes.
+    /// It stays `LIMIT 1`, because this is a doorbell, not a work assignment.
     #[test]
     fn resume_notify_payload_comes_from_a_claimable_row() {
         let sql = resumed_queue_notify_task_query();
@@ -2175,11 +2134,10 @@ mod tests {
     /// that it covers on pass 1's behalf gets exactly the credit pass 1 would
     /// give it.
     ///
-    /// Both arms are load-bearing and independently falsifiable. Collapsing to
-    /// the absolute arm alone hands a pre-pause row a full fresh
-    /// `schedule_to_start` budget, erasing the wait it had already accrued;
-    /// collapsing to the relative arm alone credits a row born during the hold
-    /// for wait it never accrued.
+    /// Both arms are load-bearing and independently falsifiable. The absolute
+    /// arm alone gives a pre-pause row a full fresh `schedule_to_start` budget.
+    /// That erases the wait it had already accrued. The relative arm alone
+    /// credits a row born during the hold for wait it never accrued.
     #[test]
     fn second_pass_applies_the_correct_formula_per_side() {
         let sql = resume_shift_late_arrivals_query();
@@ -2213,25 +2171,17 @@ mod tests {
         assert!(!sql.contains("schedule_to_close_at"), "got:\n{sql}");
     }
 
-    /// The drift lock: the `const` the hot claim path embeds must be exactly
-    /// what the renderer produces for the unaliased table.
-    /// The queue-pause lock must live in the two-argument advisory keyspace,
-    /// which is disjoint from the single-argument `bigint` one that
-    /// `claim_task`'s per-key concurrency gate hashes `concurrency_key` into.
-    ///
-    /// Sharing that keyspace is not hygiene: a queue name hash-colliding with
-    /// some other queue's `concurrency_key` would make that key's
-    /// `pg_try_advisory_xact_lock` fail -- silently, since it is the *try*
-    /// variant -- for as long as a large resume held the lock, so an unpaused
-    /// queue would stop dispatching during an unrelated queue's resume.
     /// The claim-side barrier must be the *shared*, *try* variant
     /// of exactly the key `pause_queue` takes exclusively.
     ///
     /// Each of the three properties is load-bearing and independently
-    /// falsifiable: exclusive would serialize every claim on a queue and defeat
-    /// `SKIP LOCKED`; a blocking acquire would be an ABBA deadlock against
-    /// `resume_queue`'s advisory-then-rows order; and the single-argument
-    /// keyspace would collide with `claim_task`'s own `concurrency_key` gate.
+    /// falsifiable. Exclusive mode serializes every claim on a queue and
+    /// defeats `SKIP LOCKED`. A blocking acquire is an ABBA deadlock against
+    /// the advisory-then-rows order of `resume_queue`. The single-argument
+    /// keyspace collides with the `concurrency_key` gate of `claim_task`. A
+    /// collision there fails silently, because that gate uses the *try*
+    /// variant. An unpaused queue then stops dispatching during the resume of
+    /// an unrelated queue.
     #[test]
     fn claim_barrier_is_a_shared_try_lock_on_the_pause_key() {
         let sql = try_lock_queue_for_claim_query();
@@ -2307,8 +2257,8 @@ mod tests {
     /// Neither `schedule_to_start` enforcement path may reach for
     /// the exclusive lock.
     ///
-    /// Source-level because the hazard is a *call site* choosing the wrong
-    /// helper — the exclusive function is still correct, and still used, for
+    /// Source-level because the hazard is a *call site* that picks the wrong
+    /// helper. The exclusive function is still correct, and still used, for
     /// pause and resume themselves. The workflow path is the worse of the two:
     /// it holds the lock across `append_events`, the parent-close cascade and
     /// trigger evaluation.
@@ -2451,15 +2401,14 @@ mod tests {
 
     /// This feature owns the two-argument advisory keyspace.
     ///
-    /// [`queue_lock_keys`] spends all 64 bits on queue identity rather than
-    /// reserving 32 for a class id, so the *only* thing keeping queue-pause
-    /// locks from colliding with another subsystem is that no other subsystem
-    /// uses the two-argument form. Every other advisory-lock user in the engine
-    /// is in the single-argument `bigint` keyspace (`queue::claim_task`'s
-    /// concurrency gate, `mutex`, `wasm_store`, `admission_gate`,
-    /// `scheduler`'s registration lock), and this
-    /// walks the crate to keep that true -- turning a documented convention
-    /// into a CI-enforced one.
+    /// [`queue_lock_keys`] spends all 64 bits on queue identity and reserves
+    /// none for a class id. So queue-pause locks avoid a collision with another
+    /// subsystem *only* because no other subsystem uses the two-argument form.
+    /// Every other advisory-lock user in the engine is in the single-argument
+    /// `bigint` keyspace. These are the concurrency gate of `queue::claim_task`,
+    /// `mutex`, `wasm_store`, `admission_gate` and the registration lock of
+    /// `scheduler`. This test walks the crate to keep that true. It turns a
+    /// documented convention into a CI-enforced one.
     #[test]
     fn queue_pause_owns_the_two_argument_advisory_keyspace() {
         /// Does `src` call an advisory-lock function with two arguments?
@@ -2546,9 +2495,9 @@ mod tests {
     /// The paused-queue read must count per paused queue, not aggregate the
     /// whole shard's PENDING backlog and then join.
     ///
-    /// This is the diagnostic an operator opens *during* a backlog incident, so
-    /// its cost must scale with the number of paused queues (a handful) rather
-    /// than with the unrelated pending work (potentially millions of rows).
+    /// An operator opens this diagnostic *during* a backlog incident. So its
+    /// cost must scale with the number of paused queues (a handful). It must
+    /// not scale with unrelated pending work (possibly millions of rows).
     #[test]
     fn list_paused_queues_counts_per_paused_queue_not_the_whole_backlog() {
         let sql = list_paused_queues_query();
@@ -2568,6 +2517,8 @@ mod tests {
         );
     }
 
+    /// The drift lock: the `const` the hot claim path embeds must be exactly
+    /// what the renderer produces for the unaliased table.
     #[test]
     fn const_matches_the_renderer() {
         assert_eq!(
@@ -2576,10 +2527,11 @@ mod tests {
         );
     }
 
-    /// Regression guard for the subtlest bug in this feature: an *unqualified*
-    /// outer reference resolves against `harvest_queue_pauses` inside the
-    /// subquery, degenerating to `qp.queue_name = qp.queue_name` — which would
-    /// pause every queue the moment any one queue is paused.
+    /// Regression guard for the subtlest bug in this feature. Inside the
+    /// subquery, an *unqualified* outer reference resolves against
+    /// `harvest_queue_pauses`. The predicate then reads
+    /// `qp.queue_name = qp.queue_name`. That pauses every queue as soon as one
+    /// queue is paused.
     #[test]
     fn anti_join_always_qualifies_the_outer_column() {
         for outer in ["harvest_task_queue", "tq", "t"] {

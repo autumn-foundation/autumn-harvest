@@ -91,13 +91,13 @@ type WorkflowChildProjection = (
 
 /// The identity codec registry used by every non-codec-aware call site.
 ///
-/// A `PayloadCodecs::default()` now allocates an `Arc<RwLock<_>>` and a
-/// `String` for its rotation state (issue #948), and `append_events` /
+/// A `PayloadCodecs::default()` allocates an `Arc<RwLock<_>>` and a `String`
+/// for its rotation state (issue #948). `append_events` and
 /// `events_to_insert_rows*` are on the worker's hot write path with 20+ call
-/// sites — constructing a throwaway registry per append would be a real, if
-/// small, regression for every deployment. One shared instance costs nothing
-/// and behaves identically: it registers no keyed codec, so its rotation state
-/// is inert.
+/// sites. A throwaway registry per append would be a real, if small,
+/// regression for every deployment. One shared instance costs nothing and
+/// behaves identically. It registers no keyed codec, so its rotation state is
+/// inert.
 pub(crate) static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
     std::sync::LazyLock::new(crate::payload_codec::PayloadCodecs::default);
 
@@ -158,10 +158,10 @@ pub fn events_to_insert_rows_from_with_codecs<'a>(
 
 /// Append events to a workflow's history in a single INSERT.
 ///
-/// Returns the number of events inserted. Fails with a unique constraint
-/// violation (wrapped as [`crate::error::HarvestError::Database`]) if `start_id` conflicts --
-/// this indicates a concurrency conflict where two workers tried to advance
-/// the same workflow simultaneously.
+/// Returns the number of events inserted. A conflicting `start_id` fails with
+/// a unique constraint violation, wrapped as
+/// [`crate::error::HarvestError::Database`]. That conflict means two workers
+/// tried to advance the same workflow simultaneously.
 ///
 /// # Errors
 ///
@@ -179,10 +179,10 @@ pub async fn append_events(
 /// Append events, encoding payload-bearing fields through `codecs` (issue #948).
 ///
 /// The codec-aware sibling of [`append_events`], which delegates here with the
-/// identity registry. Payloads are encoded under `codecs`' **active** key, so a
-/// write issued after a rotation lands under the new key even when the caller
-/// captured its registry clone before the flip — the rotation state is shared
-/// across clones for exactly this reason.
+/// identity registry. Payloads are encoded under the **active** key of
+/// `codecs`. So a write issued after a rotation lands under the new key, even
+/// when the caller captured its registry clone before the flip. The rotation
+/// state is shared across clones for exactly this reason.
 ///
 /// # Errors
 ///
@@ -236,13 +236,13 @@ async fn insert_event_rows(
     //
     // Callers skip an empty append — it writes nothing, so there is nothing to
     // fence. When fencing is on, the fence runs in the **same
-    // transaction** as the INSERT. That pairing is the whole guarantee: the
-    // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
-    // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
-    // released at statement end. Checked-then-inserted across two autocommit
-    // statements, a concurrent `harvest dr fence` could commit in between and
-    // the stale worker would still append history the operator had been told
-    // was fenced off.
+    // transaction** as the INSERT. That pairing is the whole guarantee. The
+    // `ACCESS SHARE` of the fence read is what blocks the `ACCESS EXCLUSIVE`
+    // of `bump_generation`. A lock taken by an autocommit statement is
+    // released at statement end. Suppose the check and the insert ran as two
+    // autocommit statements. A concurrent `harvest dr fence` could commit in
+    // between. The stale worker would then still append history that the
+    // operator had been told was fenced off.
     //
     // Most callers already hold a transaction, in which case `transaction()`
     // opens a savepoint and the outer lock already covers this. The wrapper is
@@ -369,10 +369,10 @@ pub(crate) async fn append_decision_boundary(
 /// [`PayloadOffloader`](crate::payload_store::PayloadOffloader).
 /// When `offloader` is `None` this delegates verbatim to [`append_events`], so a
 /// deployment with no `PayloadStore` registered sees byte-for-byte identical
-/// behaviour. Otherwise each event's payload-bearing fields are offloaded (after
-/// codec encode) and a per-execution reference row is recorded in
-/// `harvest_payload_refs` for each blob created, so the retention sweep can GC it
-/// when the execution is collected.
+/// behaviour. Otherwise the payload-bearing fields of each event are offloaded
+/// after codec encode. Each blob created gets a per-execution reference row in
+/// `harvest_payload_refs`. The retention sweep then can GC it when the
+/// execution is collected.
 ///
 /// # Errors
 ///
@@ -400,12 +400,13 @@ pub async fn append_events_offloaded(
 /// Append events through both the codec and the offloader (issues #948, #1243).
 ///
 /// Composition order is the one ADR-0003 fixes and issue #524 assumes: **encode
-/// first, then offload.** The codec turns a payload into ciphertext; the
+/// first, then offload.** The codec turns a payload into ciphertext. The
 /// offloader then decides whether that ciphertext is large enough to move out
-/// of line, leaving a reference envelope behind. Reversing the two would hand
-/// the codec a reference envelope to encrypt, orphaning the blob and leaving a
-/// row whose payload cannot be resolved without the key — which is why the
-/// rotation sweep skips offload envelopes rather than re-encoding them.
+/// of line, and leaves a reference envelope behind. The reverse order would
+/// hand the codec a reference envelope to encrypt. That orphans the blob. It
+/// leaves a row whose payload cannot be resolved without the key. For this
+/// reason the rotation sweep skips offload envelopes and does not re-encode
+/// them.
 ///
 /// # Errors
 ///
@@ -437,10 +438,10 @@ pub async fn append_events_offloaded_with_codecs(
     }
     crate::decision_owner::end_upload_allowance(conn).await?;
 
-    // Wrap the event INSERT and the ref INSERT in one transaction so that a
-    // failed ref INSERT cannot leave events with offload envelopes but no
-    // corresponding harvest_payload_refs rows (which would make those blobs
-    // permanently invisible to the GC sweep).
+    // The event INSERT and the ref INSERT share one transaction. A failed ref
+    // INSERT then cannot leave events with offload envelopes but no matching
+    // harvest_payload_refs rows. Such blobs would be permanently invisible to
+    // the GC sweep.
     // Decide before the transaction below opens (issue #2125). Inside it, an
     // autocommit write would ask for a stamp. A failed stamp would then fail a
     // write that the probe path lets commit.
@@ -448,12 +449,12 @@ pub async fn append_events_offloaded_with_codecs(
     let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
             // Cross-region DR write-authority fence (issue #954), inside the
-            // transaction and *after* the offload upload above. Checking before
-            // the upload was doubly wrong: the check's `ACCESS SHARE` was
-            // released before the INSERT ever began (so it was not a barrier at
-            // all on an autocommit caller), and on a transactional caller it
-            // held the lock across an unbounded network upload — so an operator
-            // fencing during an incident queued behind the slowest payload PUT.
+            // transaction and *after* the offload upload above. A check before
+            // the upload was doubly wrong. First, its `ACCESS SHARE` was
+            // released before the INSERT began. So it was no barrier at all on
+            // an autocommit caller. Second, on a transactional caller it held
+            // the lock across an unbounded network upload. An operator fencing
+            // during an incident then queued behind the slowest payload PUT.
             crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
             let inserted = insert_events(conn, &rows, stamped).await?;
@@ -575,9 +576,9 @@ const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
 #[cfg(feature = "db")]
 const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
 
-/// [`crate::models::NewHarvestPayloadRef`]'s field count (issue #1589
-/// Codex review: a batch's offloaded refs need their own chunk bound, not
-/// just the event rows). Pinned by a regression test below.
+/// [`crate::models::NewHarvestPayloadRef`]'s field count (issue #1589: a
+/// batch's offloaded refs need their own chunk bound, not just the event
+/// rows). Pinned by a regression test below.
 #[cfg(feature = "db")]
 const NEW_HARVEST_PAYLOAD_REF_COLUMNS: usize = 4;
 
@@ -607,8 +608,8 @@ const _: () = assert!(
 
 /// Exact byte length `serde_json::to_vec(value)` would produce, without
 /// allocating that `Vec`. Mirrors `queue.rs`'s identical helper, generic
-/// over anything `Serialize` (issue #1589 Codex review) so it can measure
-/// a `WorkflowEvent` directly, before that event is ever encoded.
+/// over anything `Serialize` (issue #1589) so it can measure a
+/// `WorkflowEvent` directly, before that event is ever encoded.
 #[cfg(feature = "db")]
 fn json_byte_len<T: serde::Serialize>(value: &T) -> usize {
     struct CountingWriter(usize);
@@ -630,8 +631,8 @@ fn json_byte_len<T: serde::Serialize>(value: &T) -> usize {
 /// [`ROWS_PER_EVENT_INSERT_CHUNK`] rows and
 /// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed event size.
 ///
-/// Measured directly from each `WorkflowEvent` (Codex review, issue
-/// #1589), before any [`NewHarvestEvent`] row is built, encoded, or
+/// Measured directly from each `WorkflowEvent` (issue #1589), before
+/// any [`NewHarvestEvent`] row is built, encoded, or
 /// offloaded. Peak memory during that build therefore stays bounded by
 /// one chunk, not the whole `events` slice. This is a size ESTIMATE, not
 /// the exact post-encode/post-offload byte count -- a codec or an offload
@@ -698,7 +699,7 @@ fn distinct_shards(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<crate::types:
 /// transaction, paired with its `INSERT`s. A single-shard chunk pays
 /// for exactly one fence check, same as before.
 ///
-/// **Atomicity is per chunk, not across the whole call** (Codex review).
+/// **Atomicity is per chunk, not across the whole call** (issue #1589).
 /// Each chunk commits in its own transaction, opened after that chunk's
 /// offload upload. It is never one transaction wrapping every chunk,
 /// which would hold the DR fence lock across every chunk's upload. A
@@ -729,8 +730,8 @@ pub async fn append_new_execution_started_events_batch(
         return Ok(());
     }
 
-    // Chunk boundaries are decided up front from `events` itself (Codex
-    // review, issue #1589), before any row is encoded or offloaded. Each
+    // Chunk boundaries are decided up front from `events` itself (issue
+    // #1589), before any row is encoded or offloaded. Each
     // chunk then builds, encodes, offloads, and inserts its own small row
     // `Vec`s in turn. Peak memory therefore stays bounded by one chunk's
     // payload, not the whole `events` slice.
@@ -948,8 +949,8 @@ pub async fn blob_key_still_referenced(
 /// Return the subset of `blob_keys` that are still referenced by at least one
 /// execution (issue #524).
 ///
-/// Used by the retention sweep to batch-check all of a candidate's blobs in a
-/// single query rather than one query per blob, eliminating the N+1 pattern.
+/// The retention sweep uses it to check all of a candidate's blobs in one
+/// query, not one query per blob. That avoids the N+1 pattern.
 #[cfg(feature = "db")]
 pub async fn batch_blob_keys_still_referenced(
     conn: &mut AsyncPgConnection,
@@ -1024,10 +1025,10 @@ pub async fn append_single_event(
 /// (issue #1243).
 ///
 /// Acquires a row-level lock on the workflow execution before reading
-/// `MAX(event_id)`, serializing concurrent appenders (management API paths,
-/// timeout enforcement) so they never race to allocate the same event ID.
-/// Must be called inside a transaction; the lock is held until the transaction
-/// commits or rolls back.
+/// `MAX(event_id)`. That serializes concurrent appenders (management API
+/// paths, timeout enforcement), so they never race to allocate the same event
+/// ID. Must be called inside a transaction. The lock is held until the
+/// transaction commits or rolls back.
 ///
 /// # Errors
 ///
@@ -1044,8 +1045,8 @@ pub async fn append_single_event_with_codecs(
     use diesel::dsl::max;
 
     // Cross-region DR fence (see `replication::assert_fence`), before the
-    // execution row lock so a fenced worker releases immediately rather than
-    // holding a lock the region that now owns this data needs.
+    // execution row lock. A fenced worker then releases immediately. It does
+    // not hold a lock that the region that now owns this data needs.
     crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Lock the parent execution row so that concurrent callers serialise their
@@ -1078,19 +1079,20 @@ pub async fn append_single_event_with_codecs(
     Ok(())
 }
 
-/// Read the next event id (`MAX(event_id) + 1`) for an execution's history,
-/// taking the same `FOR UPDATE` row lock [`append_single_event`] uses so the
-/// returned value stays valid for a subsequent append inside the same
-/// transaction. Returns `0` when the execution has no events yet.
+/// Read the next event id (`MAX(event_id) + 1`) for an execution's history.
 ///
-/// Callers that maintain an in-memory event-id cursor must use this (rather
-/// than a fixed increment) to re-synchronise after another code path appended a
-/// **variable** number of events onto the same history within the transaction —
-/// e.g. `notify_awaited_parent_of_child_terminal`, which appends the child
-/// terminal plus zero or more preceding materialized `__child_timeout`
-/// `TimerFired` deadlines (issue #779, Codex P2). Re-reading the true next id
-/// prevents a later append from reusing a consumed id and colliding on the
-/// `UNIQUE(workflow_exec_id, event_id)` constraint.
+/// It takes the same `FOR UPDATE` row lock as [`append_single_event`]. So the
+/// returned value stays valid for a later append inside the same transaction.
+/// Returns `0` when the execution has no events yet.
+///
+/// A caller with an in-memory event-id cursor must use this, not a fixed
+/// increment. It re-synchronises after another code path appended a
+/// **variable** number of events onto the same history within the
+/// transaction. An example is `notify_awaited_parent_of_child_terminal`. It
+/// appends the child terminal plus zero or more preceding materialized
+/// `__child_timeout` `TimerFired` deadlines (issue #779). Re-reading the true
+/// next id prevents a later append from reusing a consumed id and colliding on
+/// the `UNIQUE(workflow_exec_id, event_id)` constraint.
 ///
 /// # Errors
 ///
@@ -1134,11 +1136,11 @@ pub async fn next_event_id_for(
 /// Lock-free (no `FOR UPDATE`, no execution-row existence check) and
 /// autocommit-safe -- unlike [`next_event_id_for`], which is meant for
 /// in-transaction use and raises [`crate::error::HarvestError::NotFound`] on
-/// a missing execution. This is a best-effort read intended for post-commit
-/// telemetry decisions (issue #704's history-bloat soft-threshold warning):
-/// the caller must already know the execution exists (it just persisted a
-/// decision cycle for it), so a `NotFound` distinction is unnecessary here
-/// -- an execution with zero rows (impossible in practice) simply counts 0.
+/// a missing execution. This is a best-effort read for post-commit telemetry
+/// decisions (issue #704's history-bloat soft-threshold warning). The caller
+/// already knows the execution exists, because it just persisted a decision
+/// cycle for it. So a `NotFound` distinction is unnecessary here. An
+/// execution with zero rows (impossible in practice) simply counts 0.
 ///
 /// # Errors
 ///
@@ -1198,12 +1200,12 @@ pub(crate) async fn sum_history_bytes_between(
 
 /// Durably admit an update into a workflow's event history.
 ///
-/// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the
-/// execution row, verifies the execution is still `RUNNING`, reads
-/// `MAX(event_id)`, and then appends the `UpdateAdmitted` event.  Doing
-/// the state check and the insert inside the same lock ensures that a
-/// concurrent state transition (e.g. `RUNNING → COMPLETED` from the worker)
-/// is fully visible before admission proceeds.
+/// Opens a transaction and takes a row-level `FOR UPDATE` lock on the
+/// execution row. Then it verifies that the execution is still `RUNNING`,
+/// reads `MAX(event_id)`, and appends the `UpdateAdmitted` event. The state
+/// check and the insert share that lock. So a concurrent state transition
+/// (e.g. `RUNNING → COMPLETED` from the worker) is fully visible before
+/// admission proceeds.
 ///
 /// # Errors
 ///
@@ -1214,20 +1216,20 @@ pub(crate) async fn sum_history_bytes_between(
 ///
 /// When `metrics` is `Some`, `harvest.update.admitted` is emitted **once,
 /// post-commit** (issue #684), labeled by the resolved workflow name and queue.
-/// Callers that run `admit_update_event` inside a larger outer transaction
-/// (e.g. `update_with_start`) pass `None` and emit at their own outer-commit
+/// A caller that runs `admit_update_event` inside a larger outer transaction
+/// (e.g. `update_with_start`) passes `None`. It emits at its own outer-commit
 /// boundary instead, so the metric never fires on a rollback.
 ///
-/// The update `name` is deliberately NOT a label (issue #684, Codex P2): unlike
-/// the terminal `harvest.update.completed`/`failed` counters — which bound an
-/// unregistered name to the `__unregistered__` sentinel using the workflow's
-/// handler-not-found result — the admission site has no way to know whether a
-/// name resolves to a handler (imperative `ctx.register_update_handler`
-/// handlers are not known until the workflow executes), so it cannot bound the
-/// name without mislabeling legitimate imperatively-registered updates.
-/// Dropping the label bounds this counter's cardinality by construction;
-/// per-name visibility lives on the post-resolution completed/failed/rejected
-/// counters.
+/// The update `name` is deliberately NOT a label (issue #684). The terminal
+/// `harvest.update.completed`/`failed` counters differ. They bound an
+/// unregistered name to the `__unregistered__` sentinel, using the
+/// handler-not-found result of the workflow. The admission site cannot know
+/// whether a name resolves to a handler. Imperative
+/// `ctx.register_update_handler` handlers are not known until the workflow
+/// executes. So it cannot bound the name without mislabeling legitimate
+/// imperatively-registered updates. Dropping the label bounds the cardinality
+/// of this counter by construction. Per-name visibility lives on the
+/// post-resolution completed/failed/rejected counters.
 pub async fn admit_update_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1287,14 +1289,13 @@ pub async fn admit_update_event_with_codecs(
                 })?;
 
             // Reject updates submitted while the execution is paused with a
-            // dedicated error (issue #383). Updates may admit-and-mutate workflow
-            // state, so they are rejected rather than silently queued behind the
-            // pause — surfacing operator intent as a 409 at the API layer.
+            // dedicated error (issue #383). Updates may admit-and-mutate
+            // workflow state. So they are rejected, not silently queued behind
+            // the pause. The API layer surfaces that operator intent as a 409.
             if execution.state == "PAUSED" {
                 return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
             }
 
-            // Reject the update if the execution is no longer running.
             if execution.state != "RUNNING" {
                 return Err(crate::error::HarvestError::UpdateRejected {
                     reason: format!(
@@ -1336,10 +1337,9 @@ pub async fn admit_update_event_with_codecs(
 /// Lock the workflow execution row `FOR UPDATE` and then load its full event
 /// history.
 ///
-/// Acquiring the row lock first ensures that concurrent event appends
-/// (e.g. from a second worker racing on the same task) serialise correctly:
-/// the transaction that holds the lock owns the right to append the next
-/// event batch.
+/// Acquiring the row lock first serialises concurrent event appends (e.g.
+/// from a second worker racing on the same task). The transaction that holds
+/// the lock owns the right to append the next event batch.
 ///
 /// This is an internal helper called by the transactional activity commit
 /// path in [`crate::context::ActivityContext::run_transactional`] and by
@@ -1354,11 +1354,11 @@ pub async fn admit_update_event_with_codecs(
 ///
 /// Its one caller -- `ActivityContext::run_transactional` -- reads only
 /// `next_event_id`, to append the inline `ActivityCompleted` at the right
-/// position. It never looks at a payload field, so decoding buys it nothing
-/// and costs it correctness: decoding here would need the identity registry,
-/// which raises `UnknownCodecKey` on the first keyed envelope and would roll
-/// back **every** transactional activity commit on a deployment with a codec
-/// configured.
+/// position. It never looks at a payload field, so decoding buys it nothing.
+/// Decoding would also cost it correctness. It would need the identity
+/// registry, which raises `UnknownCodecKey` on the first keyed envelope. That
+/// would roll back **every** transactional activity commit on a deployment
+/// with a codec configured.
 ///
 /// The name says `undecoded` so a future caller that does want decoded events
 /// has to notice it is asking the wrong function. See
@@ -1371,7 +1371,7 @@ pub(crate) async fn lock_and_load_history_undecoded(
     use crate::schema::harvest_workflow_executions::dsl;
 
     // Acquire a row-level lock so concurrent writers serialize around this
-    // transaction.  We only need the id to confirm the row exists.
+    // transaction. The id alone confirms that the row exists.
     dsl::harvest_workflow_executions
         .find(exec_id.as_uuid())
         .for_update()
@@ -1433,16 +1433,15 @@ pub async fn load_history_with_codecs(
 
 /// Load history **without** applying any payload-codec transform (issue #608).
 ///
-/// Each row's `event_data` is deserialized directly into [`WorkflowEvent`],
-/// so codec envelopes (`_harvest_codec_envelope`) written by a non-identity
+/// Each row's `event_data` is deserialized directly into [`WorkflowEvent`].
+/// So codec envelopes (`_harvest_codec_envelope`) written by a non-identity
 /// codec ride along verbatim as opaque [`serde_json::Value`]s inside the
 /// event's payload fields. This is the loader for operator **read surfaces**
-/// that apply their own payload policy downstream — history-export redaction
-/// replaces payload fields wholesale (envelope included), and the issue-#608
-/// read-path decoder tolerantly decodes (or marks) each envelope per-field —
-/// so the strict identity-only [`load_history`] path (which hard-errors
-/// `UnknownPayloadCodec` on the first foreign envelope) must not pre-empt
-/// them.
+/// that apply their own payload policy downstream. History-export redaction
+/// replaces payload fields wholesale (envelope included). The issue-#608
+/// read-path decoder tolerantly decodes (or marks) each envelope per-field. So
+/// the strict identity-only [`load_history`] path must not pre-empt them. That
+/// path hard-errors `UnknownPayloadCodec` on the first foreign envelope.
 ///
 /// On an identity-codec deployment no envelopes are ever stored (the identity
 /// default encodes payloads as plain JSON), so this returns byte-identical
@@ -1453,13 +1452,13 @@ pub async fn load_history_with_codecs(
 /// [`load_history_with_codecs`]).
 ///
 /// There is a second sanctioned use, distinct from the read surfaces above:
-/// **id arithmetic**. A caller that reads only `next_event_id` (to append at
-/// the right position) or matches on event *variants* and non-payload fields
-/// never looks at a payload, so decoding buys it nothing — and costs it
-/// correctness, because a codec-aware read needs a registry the caller may not
-/// have, and an identity read hard-errors `UnknownCodecKey` on the first keyed
-/// envelope. That would fail an append, a cancel, or a diagnostic scan over a
-/// payload none of them were going to read. `execution.rs`'s
+/// **id arithmetic**. Some callers read only `next_event_id` (to append at
+/// the right position), or match on event *variants* and non-payload fields.
+/// Such a caller never looks at a payload, so decoding buys it nothing. It
+/// also costs it correctness. A codec-aware read needs a registry the caller
+/// may not have. An identity read hard-errors `UnknownCodecKey` on the first
+/// keyed envelope. That would fail an append, a cancel, or a diagnostic scan
+/// over a payload none of them were going to read. `execution.rs`'s
 /// cancel/pause/resume/redrive paths and
 /// [`crate::execution::check_and_report_unfinished_handlers`] are this case.
 ///
@@ -1645,23 +1644,23 @@ pub async fn load_histories_undecoded_batch(
 ///
 /// This is the read-only input loader for the per-execution timeline read model
 /// ([`crate::timeline::derive_timeline`]). Each row's `event_data` is decoded
-/// directly with `serde_json::from_value` — **no** payload codec is applied
-/// (mirroring [`load_history_undecoded`]): the timeline reads only structural
+/// directly with `serde_json::from_value`. **No** payload codec is applied
+/// (mirroring [`load_history_undecoded`]). The timeline reads only structural
 /// fields (ids, names, `attempt`, durations), which payload codecs never
-/// encrypt, so a foreign codec envelope riding along inside a payload field is
-/// harmless and must not make the strict identity-only [`load_history`] path
-/// hard-error `UnknownPayloadCodec`.
+/// encrypt. So a foreign codec envelope inside a payload field is harmless. It
+/// must not make the strict identity-only [`load_history`] path hard-error
+/// `UnknownPayloadCodec`.
 ///
 /// **Known limitation — unbounded load.** No pagination or `LIMIT`: the *entire*
 /// event history is loaded (consistent with replay's full load), even though
 /// this is an HTTP-triggerable read surface. A hard cap is deliberately **not**
 /// imposed, because a silently-truncated history would make the timeline rollup
 /// (busy/wait attribution, slowest step) wrong rather than merely incomplete.
-/// Bounding the history size is instead the workflow author's responsibility via
-/// continue-as-new discipline (the ≤500-event target); a run that ignores that
-/// discipline and accumulates a very large history will make this loader (and the
-/// timeline derivation) proportionally expensive. **Never use this for replay or
-/// any engine execution path**; it is a read-surface loader only.
+/// The workflow author bounds the history size instead, via continue-as-new
+/// discipline (the ≤500-event target). A run that ignores that discipline can
+/// accumulate a very large history. It then makes this loader (and the
+/// timeline derivation) proportionally expensive. **Never use this for replay
+/// or any engine execution path**; it is a read-surface loader only.
 ///
 /// # Errors
 ///
@@ -1706,12 +1705,13 @@ pub async fn load_timestamped_history(
 /// Payloads are deserialized directly (no codec transform), matching
 /// [`load_history_undecoded`]: on an identity-codec deployment this is
 /// byte-identical to [`load_history`]. The DAG graph classification reads
-/// non-payload fields (activity name, error type) plus the error string, and
-/// the `dag_skip:{idx}` marker's `details` fingerprint — a payload field that
-/// is an opaque codec/offload envelope on a non-identity-codec deployment. The
-/// classifier (`dag_graph::has_skip_marker`, issue #690 review) tolerates that
-/// opacity by falling back to the always-clear marker name/index, so this raw
-/// (non-decoding) load is correct for the graph view in every deployment.
+/// non-payload fields (activity name, error type) plus the error string. It
+/// also reads the `details` fingerprint of the `dag_skip:{idx}` marker. That
+/// is a payload field, and an opaque codec/offload envelope on a
+/// non-identity-codec deployment. The classifier (`dag_graph::has_skip_marker`,
+/// issue #690 review) tolerates that opacity. It falls back to the
+/// always-clear marker name/index. So this raw (non-decoding) load is correct
+/// for the graph view in every deployment.
 ///
 /// **Never use this for replay or any engine execution path** — replay must see
 /// codec-decoded plaintext and uses the codec-aware loaders.
@@ -1748,8 +1748,8 @@ pub async fn load_history_with_timestamps(
 ///
 /// When `offloader` is `None` this delegates verbatim to [`load_history`].
 /// Otherwise each loaded event is inflated (store fetch + checksum verify)
-/// **before** codec decode, the inverse of the encode-then-offload write order,
-/// so replay sees byte-identical payloads.
+/// **before** codec decode. That is the inverse of the encode-then-offload
+/// write order, so replay sees byte-identical payloads.
 ///
 /// # Errors
 ///
@@ -1858,9 +1858,9 @@ pub(crate) async fn load_history_inflated_with_bytes(
 /// When the result is empty (no new events), `next_event_id` is set to
 /// `from_event_id` so callers can use it as the baseline for the next ingestion.
 ///
-/// This is the delta-load companion to [`load_history`]: the worker calls this
-/// on cache hits to fetch only the timer-fire / signal events appended since
-/// the last suspension, and prepends the cached event snapshot to reconstruct
+/// This is the delta-load companion to [`load_history`]. On a cache hit, the
+/// worker calls it to fetch only the timer-fire / signal events appended since
+/// the last suspension. It prepends the cached event snapshot to reconstruct
 /// the full history without reading old events from Postgres.
 ///
 /// # Errors
@@ -2137,8 +2137,8 @@ pub async fn load_history_page(
         .map_err(crate::error::database_error)?;
 
     // ── 3. Detect next page using the extra row ───────────────────────────────
-    // `limit` is validated to [1, MAX_HISTORY_PAGE=1000] by the caller before this function is
-    // invoked, so the usize conversions below are always safe on any supported target.
+    // The caller validates `limit` to [1, MAX_HISTORY_PAGE=1000]. So the usize
+    // conversions below are always safe on any supported target.
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let next_cursor = if rows.len() > limit_usize {
         let cursor = rows[limit_usize - 1].id;
@@ -2301,12 +2301,12 @@ fn workflow_child_row_from_parts(
 /// Load the direct children of every id in `parent_ids` from one shard, in
 /// one `parent_id = ANY($1)` query.
 ///
-/// This is the batched sibling of `load_workflow_children`: a caller walking
-/// a traversal *frontier* (the accumulated set of parents discovered at one
-/// depth level) should call this once per shard per depth level rather than
-/// calling `load_workflow_children` once per *parent* per shard per depth
-/// level — the latter costs `O(nodes × shards)` round trips for a depth-`D`
-/// tree, this costs `O(D × shards)`. See the "Cross-shard lineage tree
+/// This is the batched sibling of `load_workflow_children`. A caller walking a
+/// traversal *frontier* (the set of parents found at one depth level) calls
+/// this once per shard per depth level. It does not call
+/// `load_workflow_children` once per *parent* per shard per depth level. For a
+/// depth-`D` tree, that costs `O(nodes × shards)` round trips, and this costs
+/// `O(D × shards)`. See the "Cross-shard lineage tree
 /// loaders" doc comment below for the same argument as applied to
 /// `load_workflow_children_batch`. This function mirrors it exactly, except
 /// that it returns `WorkflowChildRow` instead of `LineageChildRow`.
@@ -2411,12 +2411,12 @@ pub async fn load_workflow_children_multi(
 
 // ── Cross-shard lineage tree loaders (issue #621) ────────────────────────────
 //
-// The recursive lineage walk expands a whole *frontier* of parents per level,
-// so these helpers take a batch of parent ids (`parent_id = ANY($1)`) rather
-// than a single parent. That turns a depth-`D` tree over `S` shards from
-// `O(nodes × S)` round trips (one query per parent per shard — what a naive
-// recursion over `load_workflow_children` costs) into `O(D × S)`, which is what
-// keeps a ~200-node/8-shard tree inside the issue's p95 < 500 ms budget.
+// The recursive lineage walk expands a whole *frontier* of parents per level.
+// So these helpers take a batch of parent ids (`parent_id = ANY($1)`), not a
+// single parent. A depth-`D` tree over `S` shards then costs `O(D × S)` round
+// trips. A naive recursion over `load_workflow_children` costs
+// `O(nodes × S)`, one query per parent per shard. The batch keeps a
+// ~200-node/8-shard tree inside the issue's p95 < 500 ms budget.
 //
 // Both helpers are shard-local reads; the cross-shard fan-out and the bounded
 // walk itself live in the plugin (`autumn-harvest-plugin::lineage`).
@@ -2424,8 +2424,8 @@ pub async fn load_workflow_children_multi(
 /// One execution row in a cross-shard lineage tree (issue #621).
 ///
 /// Distinct from [`WorkflowChildRow`] (the `GET /workflows/{id}/children` read
-/// model): a lineage node additionally carries its own `parent_id` — needed to
-/// nest a flat, cross-shard row set back into a tree — and `workflow_id`, the
+/// model). A lineage node also carries its own `parent_id`, which nests a flat,
+/// cross-shard row set back into a tree. It also carries `workflow_id`, the
 /// business key an operator recognises. It deliberately does **not** carry an
 /// error summary: the tree is a topology/state map, and a node's failure detail
 /// is one `GET /workflows/{id}` away.
@@ -2433,9 +2433,9 @@ pub async fn load_workflow_children_multi(
 pub struct LineageChildRow {
     /// This execution's id.
     pub exec_id: ExecutionId,
-    /// The parent this row was discovered through. `None` only for a row whose
-    /// `parent_id` column is NULL (a root), which the batch loader never
-    /// returns — it is populated for every discovered descendant.
+    /// The parent this row was discovered through. It is `None` only for a
+    /// root, whose `parent_id` column is NULL. The batch loader never returns a
+    /// root, so it is populated for every discovered descendant.
     pub parent_id: Option<ExecutionId>,
     /// Registered workflow type name.
     pub workflow_name: String,
@@ -2472,13 +2472,13 @@ type LineageChildProjection = (
 /// in a single query (issue #621).
 ///
 /// Rows are ordered `started_at ASC, id ASC` and capped at `limit`. The
-/// ordering is load-bearing, not cosmetic: when the walk's `max_nodes` budget
-/// truncates a level it keeps the first `N` rows of this order, so the tree an
-/// operator sees is stable across retries instead of varying with Postgres'
-/// physical row order.
+/// ordering is load-bearing, not cosmetic. When the `max_nodes` budget of the
+/// walk truncates a level, it keeps the first `N` rows of this order. So the
+/// tree an operator sees is stable across retries. It does not vary with the
+/// physical row order of Postgres.
 ///
 /// Returns an empty vector without touching the database when `parent_ids` is
-/// empty or `limit <= 0` — the walk calls this once per shard per level and
+/// empty or `limit <= 0`. The walk calls this once per shard per level, and
 /// both cases occur naturally (an exhausted node budget, an empty frontier).
 ///
 /// # Errors
@@ -2560,12 +2560,12 @@ fn lineage_child_row_from_parts(parts: LineageChildProjection) -> LineageChildRo
 ///
 /// This is what lets a truncated lineage walk name **precisely** the nodes whose
 /// subtrees were dropped, instead of conservatively naming every unexpanded
-/// leaf. A false positive there would send an operator chasing a subtree that
-/// does not exist, so the walk pays one extra `SELECT DISTINCT` per shard to
-/// stay honest.
+/// leaf. A false positive would send an operator chasing a subtree that does
+/// not exist. So the walk pays one extra `SELECT DISTINCT` per shard to stay
+/// honest.
 ///
-/// The result is `DISTINCT`, so a parent with 500 children contributes one id —
-/// the response's dropped-subtree list is bounded by frontier size, not by
+/// The result is `DISTINCT`, so a parent with 500 children contributes one id.
+/// The dropped-subtree list of the response is bounded by frontier size, not by
 /// child count.
 ///
 /// # Errors
@@ -2594,23 +2594,23 @@ pub async fn load_parents_with_children(
 /// `parent_ids` have a demoted child on this shard? (issues #621, #752)
 ///
 /// "Demoted" means the child now lives only in `harvest_execution_summaries`.
-/// Tiered summary retention is opt-in, but when it is on, a *terminal* child is
-/// independently retention-eligible: it can be demoted into a summary and have
-/// its `harvest_workflow_executions` row deleted while its long-running parent
-/// is still live. [`load_workflow_children_batch`] reads only the executions
-/// table, so such a child — and everything beneath it — is invisible to a
-/// lineage walk. Without this probe a `FAILED` demoted child would produce a
-/// tree that reports itself complete, which is precisely the silent omission
-/// the walk's bounds machinery exists to prevent.
+/// Tiered summary retention is opt-in. When it is on, a *terminal* child is
+/// independently retention-eligible. It can be demoted into a summary, and its
+/// `harvest_workflow_executions` row deleted, while its long-running parent is
+/// still live. [`load_workflow_children_batch`] reads only the executions
+/// table. So such a child, and everything beneath it, is invisible to a
+/// lineage walk. Without this probe, a `FAILED` demoted child would produce a
+/// tree that reports itself complete. The bounds machinery of the walk exists
+/// to prevent precisely that silent omission.
 ///
 /// Retention deliberately preserves `harvest_execution_summaries.parent_id` for
-/// exactly this case (it skips the terminal-child `parent_id` null-out when
-/// summary retention is enabled), and [`crate::erase`]'s cascade already unions
-/// both tables on it; this is the read-side counterpart.
+/// exactly this case. It skips the terminal-child `parent_id` null-out when
+/// summary retention is enabled. The cascade of [`crate::erase`] already
+/// unions both tables on it. This is the read-side counterpart.
 ///
-/// Returns only the *nearest live ancestors* of omitted lineage. A summary
-/// child's own children are not enumerated — naming the live node an operator
-/// can actually act from is the useful signal, and it keeps the probe a single
+/// Returns only the *nearest live ancestors* of omitted lineage. The children
+/// of a summary child are not enumerated. The useful signal is the live node
+/// that an operator can act from. That also keeps the probe a single
 /// `DISTINCT` per shard.
 ///
 /// When summary retention is disabled (the default) the table is empty and this
@@ -2656,8 +2656,8 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
         return Ok(());
     }
 
-    // Read the current value so we can apply the merge in Rust.  Workflow
-    // tasks are serialised per-execution by SKIP LOCKED, so no TOCTOU risk.
+    // Read the current value to apply the merge in Rust. Workflow tasks are
+    // serialised per-execution by SKIP LOCKED, so no TOCTOU risk.
     let current: Option<serde_json::Value> = dsl::harvest_workflow_executions
         .find(exec_id.as_uuid())
         .select(dsl::search_attrs)
@@ -2706,10 +2706,10 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
 ///
 /// Called by the worker after each execution cycle when the workflow author
 /// called `ctx.set_current_details(...)` during live (non-replay) execution.
-/// Uses a simple overwrite; the application layer enforces last-write-wins
+/// Uses a simple overwrite. The application layer enforces last-write-wins
 /// (and empty-string-clears, issue #593) via
-/// `worker::latest_current_details_update`, which resolves the command list
-/// to the single effective write before this function is ever called.
+/// `worker::latest_current_details_update`. That function resolves the
+/// command list to the single effective write before this one is called.
 ///
 /// `details = None` clears the column to SQL `NULL` (the workflow called
 /// `set_current_details("")`); `details = Some(s)` sets it to `s`.
@@ -2738,13 +2738,12 @@ pub async fn update_current_details(
 
 /// `seq` reserved for the per-execution truncation marker (issue #790).
 ///
-/// `i64::MAX` sorts strictly after every real line — a real `seq` is a
-/// **call ordinal** (the Nth `ctx.log_*` call of this run), so a workflow would
-/// have to make ~2^63 log calls in one execution to reach it, and the
-/// per-execution line cap plus the in-memory enqueue bound stop storing long
-/// before that. Using the ordering key itself to pin the marker last means no
-/// extra column and no special-casing in the read path: the marker is just the
-/// final line.
+/// `i64::MAX` sorts strictly after every real line. A real `seq` is a **call
+/// ordinal** (the Nth `ctx.log_*` call of this run). So a workflow would have
+/// to make ~2^63 log calls in one execution to reach it. The per-execution
+/// line cap and the in-memory enqueue bound stop storing long before that.
+/// The ordering key itself pins the marker last. So there is no extra column
+/// and no special case in the read path: the marker is just the final line.
 pub const WORKFLOW_LOG_TRUNCATION_SEQ: i64 = i64::MAX;
 
 /// Message stored on the truncation marker row.
@@ -2766,34 +2765,35 @@ pub struct WorkflowLogLine {
 ///
 /// **Exactly-once (issue #790 AC2).** Every row is inserted with
 /// `ON CONFLICT DO NOTHING` against the unique `(workflow_exec_id, seq)` index.
-/// Replay-suppression alone is not sufficient — a decision cycle that logs and
-/// then parks can be re-driven at an *unchanged* history position (a spurious
-/// wake, or a cycle whose persist rolled back), where `is_replaying()` is still
-/// false and the line is emitted again. Because `seq` is a deterministic
-/// function of that position, the re-emitted line collides and is collapsed.
+/// Replay-suppression alone is not sufficient. A decision cycle that logs and
+/// then parks can be re-driven at an *unchanged* history position. Examples are
+/// a spurious wake, or a cycle whose persist rolled back. At that position,
+/// `is_replaying()` is still false and the line is emitted again. Because
+/// `seq` is a deterministic function of that position, the re-emitted line
+/// collides and is collapsed.
 ///
 /// **Bounded volume (AC4) — drop-newest.** Once the execution holds `max_lines`
-/// real lines, further lines are dropped and a single terminal truncation
-/// marker (`WORKFLOW_LOG_TRUNCATION_SEQ`) is recorded instead, so the loss is
-/// visible rather than silent. Drop-newest keeps the start of the run (where a
-/// workflow's setup and branch decisions are) and costs one bounded `COUNT`
-/// per decision cycle rather than a `DELETE` per line.
+/// real lines, further lines are dropped. A single terminal truncation marker
+/// (`WORKFLOW_LOG_TRUNCATION_SEQ`) is recorded instead, so the loss is visible,
+/// not silent. Drop-newest keeps the start of the run, where the setup and
+/// branch decisions of a workflow are. It costs one bounded `COUNT` per
+/// decision cycle, not a `DELETE` per line.
 ///
 /// **The marker is terminal.** Once it exists the gate stays shut: a later
 /// batch is rejected even if `max_lines` has since been RAISED. This is not
-/// hypothetical — `max_lines` is per-worker-process config, so on a rolling
-/// deployment a run can truncate under an old worker's cap and have its next
-/// decision cycle handled by a new worker with a larger one. Re-deciding
-/// admission against the current policy would store a line *after* the one that
-/// was dropped, leaving a hole in the stored prefix and a marker whose
-/// "subsequent lines were dropped" claim is false. Latching keeps the stored
-/// rows a contiguous prefix of the run and keeps the marker honest; the
+/// hypothetical. `max_lines` is per-worker-process config. So on a rolling
+/// deployment, a run can truncate under the cap of an old worker. Its next
+/// decision cycle can then go to a new worker with a larger cap. Re-deciding
+/// admission against the current policy would store a line *after* the one
+/// that was dropped. That leaves a hole in the stored prefix, and a marker
+/// whose "subsequent lines were dropped" claim is false. Latching keeps the
+/// stored rows a contiguous prefix of the run and keeps the marker honest. The
 /// already-dropped lines are unrecoverable either way, so re-opening the gate
 /// buys nothing.
 ///
-/// Rejecting a post-marker batch wholesale loses nothing: every line in such a
-/// batch is either already stored (so `ON CONFLICT DO NOTHING` would have
-/// collapsed it) or was deliberately dropped.
+/// Rejecting a post-marker batch wholesale loses nothing. Every line in such a
+/// batch is either already stored, or was deliberately dropped. `ON CONFLICT DO
+/// NOTHING` would have collapsed a stored line.
 ///
 /// Returns the number of real (non-marker) rows **actually inserted** — the
 /// affected-row count from the INSERT, not the number offered. A re-driven
@@ -2832,13 +2832,13 @@ pub async fn append_workflow_logs(
     // Two exclusions, each load-bearing:
     //   * the marker, so its own presence can never push the count over the cap
     //     and re-trigger truncation accounting; and
-    //   * this batch's own seqs (issue #790 review), because on the re-drive
-    //     path the design depends on -- the same position re-minting the same
-    //     seq -- those rows are ALREADY stored and `ON CONFLICT DO NOTHING`
-    //     will collapse them. Counting them would charge the cycle's lines to
-    //     the budget twice and fire the truncation marker on a run that
-    //     dropped nothing, which is exactly the false alarm the marker exists
-    //     to rule out.
+    //   * this batch's own seqs (issue #790 review). The design depends on a
+    //     re-drive path where the same position re-mints the same seq. On that
+    //     path those rows are ALREADY stored, and `ON CONFLICT DO NOTHING`
+    //     will collapse them. Counting them would charge the lines of the cycle
+    //     to the budget twice. It would fire the truncation marker on a run that
+    //     dropped nothing. The marker exists to rule out exactly that false
+    //     alarm.
     let batch_seqs: Vec<i64> = lines.iter().map(|line| line.seq).collect();
     let existing: i64 = dsl::harvest_workflow_logs
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -2877,12 +2877,13 @@ pub async fn append_workflow_logs(
         0
     };
 
-    // Anything we could not admit is dropped -- record the marker exactly once.
+    // A line that is not admitted is dropped. Record the marker exactly once.
     //
     // This condition MUST stay on `admit`, never on `inserted`. A re-drive
-    // offers rows that are already stored, so `inserted` is 0 while nothing was
-    // dropped at all -- gating on it would stamp a truncation marker on every
-    // re-driven cycle and tell an operator a healthy run had lost lines.
+    // offers rows that are already stored. So `inserted` is 0 while nothing was
+    // dropped at all. A gate on it would stamp a truncation marker on every
+    // re-driven cycle. It would tell an operator that a healthy run had lost
+    // lines.
     if admit < lines.len() {
         diesel::insert_into(dsl::harvest_workflow_logs)
             .values(crate::models::NewHarvestWorkflowLog {
@@ -2956,11 +2957,11 @@ pub async fn load_workflow_logs(
 /// Count an execution's **real** durable log lines, across all levels.
 ///
 /// The synthetic truncation marker is excluded, matching the accounting in
-/// [`append_workflow_logs`]: it is engine bookkeeping, not an author line, so
-/// counting it would make a capped execution report `max_lines + 1` and break
-/// the `total_lines <= max_lines` invariant exactly on the runs an operator is
-/// most likely inspecting. Whether a run was truncated is reported separately,
-/// by probing for the marker directly.
+/// [`append_workflow_logs`]. It is engine bookkeeping, not an author line. A
+/// count of it would make a capped execution report `max_lines + 1`. That
+/// breaks the `total_lines <= max_lines` invariant exactly on the runs an
+/// operator most likely inspects. A separate probe for the marker reports
+/// whether a run was truncated.
 pub async fn count_workflow_logs(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2978,9 +2979,9 @@ pub async fn count_workflow_logs(
 
 /// Delete every durable log line for an execution (issue #790 × issue #495).
 ///
-/// Called by the targeted PII-erasure path: an author's log messages are
-/// free-form text that can carry personal data, so erasing an execution's
-/// payloads must erase its logs too. Returns the number of rows removed.
+/// Called by the targeted PII-erasure path. An author's log messages are
+/// free-form text that can carry personal data. So an erasure of the payloads
+/// of an execution must erase its logs too. Returns the number of rows removed.
 pub async fn delete_workflow_logs(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -3314,12 +3315,12 @@ pub async fn delete_llm_ledger(
 /// `history_bloat_warn_fraction * event_hard_cap` for the first time.
 ///
 /// The `WHERE history_bloat_warned_at IS NULL` guard makes this exactly-once
-/// and race-safe: concurrent workers racing to persist the same execution's
-/// next cycle (or repeated re-dispatch of an already-warned execution) can
-/// never double-stamp the row. Returns `Ok(true)` iff THIS call performed the
-/// transition (the row was NULL and is now stamped) so the caller emits the
-/// counter exactly once; `Ok(false)` means it was already stamped (by an
-/// earlier cycle or a racing worker) and the caller must not emit again.
+/// and race-safe. Concurrent workers can race to persist the next cycle of the
+/// same execution. An already-warned execution can be re-dispatched. Neither
+/// can double-stamp the row. Returns `Ok(true)` iff THIS call performed the
+/// transition (the row was NULL and is now stamped). The caller then emits the
+/// counter exactly once. `Ok(false)` means an earlier cycle or a racing worker
+/// already stamped it, and the caller must not emit again.
 pub async fn mark_history_bloat_warned(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -3507,7 +3508,7 @@ mod tests {
         );
     }
 
-    /// Codex review, issue #1589: a `pub` helper must not silently fence
+    /// Issue #1589: a `pub` helper must not silently fence
     /// only the first event's shard. `distinct_shards` must report every
     /// shard a batch represents, deduplicated, so the caller can fence
     /// each one.
@@ -3642,11 +3643,9 @@ mod tests {
             },
         ];
 
-        // Serialize via the writer path
         let rows = events_to_insert_rows(exec_id, &events).unwrap();
         assert_eq!(rows.len(), 3);
 
-        // Deserialize each row's event_data back into WorkflowEvent
         let deserialized: Result<Vec<WorkflowEvent>, _> = rows
             .iter()
             .map(|row| serde_json::from_value(row.event_data.clone()))
@@ -3667,14 +3666,12 @@ mod tests {
             WorkflowEvent::WorkflowCompleted { .. }
         ));
 
-        // Verify data fidelity on WorkflowStarted
         if let WorkflowEvent::WorkflowStarted { ref input, .. } = deserialized[0] {
             assert_eq!(input, &serde_json::json!({"user": "alice"}));
         } else {
             panic!("expected WorkflowStarted");
         }
 
-        // Verify data fidelity on ActivityScheduled
         if let WorkflowEvent::ActivityScheduled {
             ref name,
             ref queue,
@@ -3687,7 +3684,6 @@ mod tests {
             panic!("expected ActivityScheduled");
         }
 
-        // Verify data fidelity on WorkflowCompleted
         if let WorkflowEvent::WorkflowCompleted { ref output } = deserialized[2] {
             assert_eq!(output, &serde_json::json!({"status": "ok"}));
         } else {

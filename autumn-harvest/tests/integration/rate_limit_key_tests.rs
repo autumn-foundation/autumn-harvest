@@ -205,7 +205,6 @@ async fn ac2_dynamic_per_key_cross_tenant_isolation() {
     let task_a = enqueue_activity(&mut conn, q, "charge", Some(key_a.clone()), None).await;
     let task_b = enqueue_activity(&mut conn, q, "charge", Some(key_b.clone()), None).await;
 
-    // Drain ONLY tenant A.
     set_bucket_tokens(&mut conn, &key_a, 0.0).await;
 
     // The claim gate must skip A and hand back B; a second claim finds nothing
@@ -289,7 +288,6 @@ async fn ac6_dynamic_defer_not_fail() {
 async fn lazy_registration_creates_composite_bucket_row() {
     let (mut conn, _g) = setup_db().await;
     let key = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
-    // Bucket does not exist yet.
     assert_eq!(
         scalar_i64(
             &mut conn,
@@ -403,10 +401,10 @@ async fn ac8_dynamic_rate_composes_with_per_key_concurrency() {
 
 // ── Worker-level resolution: the WORKFLOW input is the source (issue #699, #3) ──
 
-// An activity whose OWN input differs from the workflow input. If the enqueue
-// path ever resolved the dynamic key from `scheduled.input` (the activity input)
-// instead of the workflow input, this test would fail (both executions would
-// resolve to the same fallback bucket).
+// An activity whose OWN input differs from the workflow input. Suppose the
+// enqueue path resolved the dynamic key from `scheduled.input`, the activity
+// input. Both executions would then resolve to the same fallback bucket, and
+// this test would fail.
 #[activity(rate_limit(key = "input.tenant_id", rps = 50))]
 async fn charge(_ctx: &ActivityContext, item: serde_json::Value) -> Result<(), String> {
     let _ = item;
@@ -416,9 +414,9 @@ async fn charge(_ctx: &ActivityContext, item: serde_json::Value) -> Result<(), S
 #[workflow]
 async fn tenant_wf(ctx: &WorkflowContext, input: serde_json::Value) -> Result<(), String> {
     let _ = input; // the engine resolves the rate-limit key from the execution row's input
-    // The activity input is deliberately DIFFERENT from the workflow input and
-    // carries no `tenant_id`, so a `workflow_input` -> `scheduled.input` swap
-    // would collapse the key to the fallback bucket.
+    // The activity input differs from the workflow input on purpose. It has
+    // no `tenant_id`. So a `workflow_input` -> `scheduled.input` swap would
+    // collapse the key to the fallback bucket.
     let _: () = ctx
         .execute_activity(&charge_info(), serde_json::json!({ "item": "x" }))
         .await
@@ -537,7 +535,6 @@ async fn worker_resolves_dynamic_key_from_workflow_input_not_activity_input() {
     let pool = crate::integration_e2e::build_test_pool(&url);
     let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
 
-    // Drive both executions to completion.
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let a = task_state_workflow(&mut conn, exec_acme).await;
@@ -684,9 +681,9 @@ async fn success_metric_cross_key_burst_fairness() {
     let q = "fairness-queue";
     let key_a = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     let key_b = dynamic_rate_bucket_key("input.tenant_id", Some("globex"));
-    // Both tenants: burst 5. A tiny refill rate keeps the test deterministic —
-    // neither bucket refills meaningfully during the tight claim loop, so a
-    // drained A stays drained and a full B yields exactly its burst.
+    // Both tenants: burst 5. A tiny refill rate keeps the test deterministic.
+    // Neither bucket refills meaningfully during the tight claim loop. So a
+    // drained A stays drained, and a full B yields exactly its burst.
     ensure_rate_limit_bucket(&mut conn, &key_a, 0.001, 5.0)
         .await
         .unwrap();
@@ -694,7 +691,6 @@ async fn success_metric_cross_key_burst_fairness() {
         .await
         .unwrap();
 
-    // Many tasks for each tenant.
     let mut a_tasks = std::collections::HashSet::new();
     let mut b_tasks = std::collections::HashSet::new();
     for _ in 0..8 {
@@ -702,7 +698,6 @@ async fn success_metric_cross_key_burst_fairness() {
         b_tasks.insert(enqueue_activity(&mut conn, q, "charge", Some(key_b.clone()), None).await);
     }
 
-    // Drain A entirely; leave B at full burst.
     set_bucket_tokens(&mut conn, &key_a, 0.0).await;
     set_bucket_tokens(&mut conn, &key_b, 5.0).await;
 
@@ -740,19 +735,19 @@ async fn success_metric_cross_key_burst_fairness() {
 // ── Issue #699: comprehensive worker-startup gate ─────────────────────────────
 //
 // The public `HandlerRegistry` path bypasses ALL `HarvestBuilder::try_build`
-// rate-limit validation, so an invalid config used to slip through and only be
-// caught piecemeal (or not at all) by the schedule-time guards in
-// `persist_scheduled_activities`. The class fix runs the SAME shared validator
-// (`crate::builder::validate_activity_rate_limits`) at the fallible
-// `Worker::new` startup boundary, so every invalid rate-limit config fails
-// loud ONCE at startup, before the poll loop and first enqueue. These tests
-// build a `HandlerRegistry` DIRECTLY (bypassing `try_build`) and assert
-// `Worker::new` returns `Err` (or `Ok` for a valid set). The schedule-time
+// rate-limit validation. An invalid config used to slip through. The
+// schedule-time guards in `persist_scheduled_activities` caught it piecemeal,
+// or not at all. The fix runs the SAME shared validator
+// (`crate::builder::validate_activity_rate_limits`) in the fallible
+// `Worker::new`. So every invalid rate-limit config fails loud ONCE at
+// startup, before the poll loop and the first enqueue. These tests build a
+// `HandlerRegistry` DIRECTLY (bypassing `try_build`). They assert that
+// `Worker::new` returns `Err`, or `Ok` for a valid set. The schedule-time
 // guards remain as defense-in-depth behind this primary gate.
 
-/// A dynamic per-key rate limit on a LOCAL activity is silently unenforced:
-/// local activities run inline via `run_local_activity_inline`, bypassing the
-/// task-dispatch/enqueue path where per-key rate limiting lives. The
+/// A dynamic per-key rate limit on a LOCAL activity is silently unenforced.
+/// Local activities run inline via `run_local_activity_inline`. They bypass
+/// the task-dispatch/enqueue path where per-key rate limiting lives. The
 /// `#[activity]` macro rejects this at parse time, but a hand-built
 /// `ActivityInfo` (direct `HandlerRegistry`) bypasses the macro. The
 /// worker-startup gate must reject it (see `worker.rs`).
@@ -792,11 +787,13 @@ fn worker_startup_rejects_dynamic_rate_limit_on_local_activity() {
     );
 }
 
-/// Two activities sharing a normalized dynamic key-expression that declare
-/// DIFFERENT `rps` must be rejected: both register the same composite bucket
-/// `ON CONFLICT DO NOTHING`, so the bucket's rate/burst would become
-/// insertion-order dependent. The builder path (`try_build`) already rejects
-/// this; the worker-startup gate must too (see `worker.rs`).
+/// Two activities that share a normalized dynamic key-expression but declare
+/// DIFFERENT `rps` must be rejected.
+///
+/// Both register the same composite bucket `ON CONFLICT DO NOTHING`. So the
+/// bucket's rate/burst would depend on insertion order. The builder path
+/// (`try_build`) already rejects this; the worker-startup gate must too (see
+/// `worker.rs`).
 #[test]
 fn worker_startup_rejects_conflicting_rps_for_same_key_expr() {
     // Two dynamic-key activities on the SAME normalized expression

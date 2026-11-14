@@ -1,10 +1,10 @@
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Large-payload offloading via claim-check — issue #524.
 //!
-//! Demonstrates how an embedder enables transparent offloading of oversized
-//! payloads to external storage by implementing **one trait** ([`PayloadStore`])
-//! and adding **one builder call** ([`HarvestBuilder::payload_store`]) — with no
-//! change to any workflow or activity function signature.
+//! Demonstrates how an embedder offloads oversized payloads to external
+//! storage. It implements **one trait** ([`PayloadStore`]) and adds **one
+//! builder call** ([`HarvestBuilder::payload_store`]). No workflow or activity
+//! function signature changes.
 //!
 //! ## The problem
 //!

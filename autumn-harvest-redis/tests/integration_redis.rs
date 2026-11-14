@@ -1,10 +1,10 @@
 //! End-to-end tests for the Redis Streams adapter.
 //!
 //! Each test spins up a fresh `redis:5.0` container via `testcontainers` so
-//! tests are hermetic. They are skipped automatically when Docker is not
-//! available -- the `start()` call returns an error and we mark the test as
-//! `Ok(())` rather than panicking, which keeps the suite green on machines
-//! without a Docker daemon (e.g. Windows CI without Docker Desktop).
+//! tests are hermetic. A test skips when Docker is not available. The
+//! `start()` call then returns an error, and the test returns `Ok(())` and
+//! does not panic. This keeps the suite green on machines without a Docker
+//! daemon (e.g. Windows CI without Docker Desktop).
 
 use std::time::Duration;
 
@@ -16,9 +16,8 @@ use testcontainers_modules::redis::{REDIS_PORT, Redis};
 
 /// A live Redis instance plus a queue connected to it.
 ///
-/// The `_container` slot keeps the testcontainer alive for the duration of
-/// the test; when the env-var path is taken (CI / local dev with an existing
-/// Redis), it stays `None`.
+/// The `_container` slot keeps the testcontainer alive for the test. It
+/// stays `None` on the env-var path (CI or local dev with an existing Redis).
 struct RedisFixture {
     _container: Option<testcontainers::ContainerAsync<Redis>>,
     queue: RedisTaskQueue,
@@ -105,7 +104,6 @@ async fn enqueue_and_claim_round_trips_a_task() {
         .await
         .expect("complete");
 
-    // Stream should be empty now.
     let depths = queue.queue_depths(&[q]).await.expect("depths");
     assert_eq!(depths[0].1, 0, "queue must drain after complete");
 }

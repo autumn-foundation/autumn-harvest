@@ -12,14 +12,14 @@
 //! | AC5 `SIGKILL` survivors are reclaimed on the next start | `the_reaper_reclaims_an_abandoned_session_directory` |
 //!
 //! **Skips cleanly** (prints `SKIP:` and returns) where no Postgres server
-//! binaries are discoverable, so CI legs without them stay green — the same
-//! convention `status_summary_localpg.rs` uses for `DATABASE_URL`.
+//! binaries are discoverable, so CI legs without them stay green.
+//! `status_summary_localpg.rs` uses the same convention for `DATABASE_URL`.
 //!
-//! A silent skip is also how a suite quietly stops testing anything, and this
-//! one is invisible to `ci_run_coverage.rs` (it uses no live-DB token, so that
-//! guard never classifies it). Set **`HARVEST_DEV_REQUIRE_POSTGRES=1`** — as the
-//! Linux CI leg does — to turn every skip into a failure, so a runner image that
-//! drops `PostgreSQL` is a red build rather than a green no-op.
+//! A silent skip can also quietly stop a suite from testing anything.
+//! `ci_run_coverage.rs` never classifies this file, because it uses no
+//! live-DB token. Set **`HARVEST_DEV_REQUIRE_POSTGRES=1`**, as the Linux CI
+//! leg does, to turn every skip into a failure. A runner image that drops
+//! `PostgreSQL` is then a red build, not a green no-op.
 
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use autumn_harvest_plugin::dev::{
 };
 
 /// Serializes every `DevRuntime::start` call in this file against env-var
-/// mutation (Codex review, issue #1291).
+/// mutation (issue #1291).
 ///
 /// `DevRuntime::start`'s harvest-mode gate reads `AUTUMN_HARVEST__MODE` and
 /// friends from the real process environment. A developer environment might
@@ -84,7 +84,7 @@ impl Drop for EnvVarGuard {
 /// default. This holds regardless of what the process inherited.
 ///
 /// `AUTUMN_MANIFEST_DIR` is pointed at a fresh directory holding its own
-/// empty `autumn.toml`, not merely unset (Codex review, issue #1291).
+/// empty `autumn.toml`, not merely unset (issue #1291).
 ///
 /// `find_config_file_named` falls back to the process's current directory.
 /// It does this whenever the manifest directory has no matching file.
@@ -96,7 +96,7 @@ impl Drop for EnvVarGuard {
 ///
 /// `AUTUMN_PROFILE` is forced unset too, so no `autumn-<profile>.toml`
 /// lookup happens from that source. `resolve_profile` also falls back to
-/// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
+/// `AUTUMN_IS_DEBUG` (issue #1291), so this unsets that too.
 /// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
 /// profile and reopen the same checkout-root fallback for its file.
 /// `AUTUMN_ENV` selects a profile first (issue #1614), so this unsets it too.
@@ -120,9 +120,9 @@ fn harvest_mode_env_cleared() -> [EnvVarGuard; 6] {
 
 /// The binaries to provision with, or `None` with a printed reason.
 ///
-/// Two environmental reasons to skip rather than fail: no Postgres server
-/// binaries anywhere, and running as `root` (`PostgreSQL` refuses to start as
-/// root by design, so a root container simply cannot exercise this path).
+/// Two environmental reasons skip rather than fail. One is no Postgres
+/// server binaries. The other is running as `root`: `PostgreSQL` refuses
+/// to start as root, so a root container cannot exercise this path.
 fn binaries() -> Option<PostgresBinaries> {
     if running_as_root() {
         return skip("running as root; PostgreSQL refuses to run as root by design");
@@ -143,7 +143,7 @@ fn binaries() -> Option<PostgresBinaries> {
 /// runner image that lost its `PostgreSQL` a red build rather than a green
 /// no-op.
 ///
-/// Reads through `DEV_RUNTIME_START_SERIAL` (Codex review, issue #1291),
+/// Reads through `DEV_RUNTIME_START_SERIAL` (issue #1291),
 /// the same lock every `EnvVarGuard` mutation in this file holds. A bare
 /// `std::env::var` here could run from an unguarded test in parallel with
 /// a guarded one's `set`/`remove`. That would race a live mutation of the
@@ -362,10 +362,10 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
 async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_it() {
     // The reservation above cannot be *held* across
     // provisioning — autumn-web binds the same port itself — and provisioning
-    // is the long step. Two `cargo dev` runs that both found the port free
-    // therefore both get past the first check, and the loser would reach
-    // autumn-web's bind-failure `process::exit(1)`, which skips every
-    // destructor and strands the cluster it just built.
+    // is the long step. So two `cargo dev` runs that found the port free both
+    // pass the first check. The loser reaches the autumn-web bind failure
+    // `process::exit(1)`. That skips every destructor and strands the
+    // cluster it just built.
     let Some(_binaries) = binaries() else { return };
 
     let base = std::env::temp_dir().join(format!("harvest-dev-portrace-{}", std::process::id()));
@@ -377,7 +377,7 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         probe.local_addr().expect("addr").port()
     };
 
-    // Acquired before the timed watcher below is spawned (Codex review, issue
+    // Acquired before the timed watcher below is spawned (issue
     // #1291). Another `DevRuntime::start` test can hold this mutex longer
     // than the watcher's 10-second polling window. A watcher started first
     // could then time out and return `None` before this test starts
@@ -388,10 +388,10 @@ async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _env = harvest_mode_env_cleared();
 
-    // Event-driven, not timed: the session directory is created at the very
-    // start of provisioning and `initdb` runs for seconds afterwards, so
-    // claiming the port the moment that directory appears lands reliably in
-    // the middle of provisioning — the window the second check exists for.
+    // Event-driven, not timed. Provisioning creates the session directory
+    // first, and `initdb` then runs for seconds. So a claim the moment that
+    // directory appears lands in the middle of provisioning. That is the
+    // window the second check exists for.
     let watched = base.clone();
     let claimed = std::thread::spawn(move || {
         for _ in 0..2000 {
@@ -511,9 +511,9 @@ async fn a_durable_workflow_executes_and_is_observable() {
         .expect("client");
 
     // AC1: migrations were applied automatically — no `diesel migration run`,
-    // no `DATABASE_URL`, no compose file. If they had not been, the engine's
-    // tables would not exist and the start below would fail; assert it directly
-    // so the failure names the actual cause.
+    // no `DATABASE_URL`, no compose file. Without them the engine tables do
+    // not exist and the start below fails. Assert it directly so the failure
+    // names the actual cause.
     let health = client
         .get(format!("{base}/health"))
         .send()

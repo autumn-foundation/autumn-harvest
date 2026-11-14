@@ -1,22 +1,24 @@
 //! Embedded, single-writer **`SQLite`** backend for `autumn-harvest` — an
 //! edge / local-first workflow runtime.
 //!
-//! The valuable, hard part of `autumn-harvest` — the deterministic replay engine
-//! (`run_workflow`, [`WorkflowEvent`](autumn_harvest::WorkflowEvent), the history
-//! matcher, `WorkflowContext`) — is already backend-neutral: it consumes plain
-//! values (an `ExecutionId`, a `Vec<WorkflowEvent>`, a handler `fn`, a JSON
-//! input) and needs no database connection or trait object. This crate reuses
-//! that core **wholesale** and reimplements only *persistence* — the event store
-//! ([`store`]), the task queue + durable timers ([`queue`]), and the worker pass
-//! ([`worker`]) — on embedded `SQLite` via `rusqlite` (`bundled`, so no system
-//! `SQLite` and no Docker are required). It depends on `autumn-harvest` with
+//! The hard part of `autumn-harvest` is the deterministic replay engine:
+//! `run_workflow`, [`WorkflowEvent`](autumn_harvest::WorkflowEvent), the history
+//! matcher and `WorkflowContext`. That core is already backend-neutral. It
+//! consumes plain values (an `ExecutionId`, a `Vec<WorkflowEvent>`, a handler
+//! `fn`, a JSON input) and needs no database connection or trait object.
+//!
+//! This crate reuses that core **wholesale** and reimplements only
+//! *persistence*. It reimplements the event store ([`store`]), the task queue and
+//! durable timers ([`queue`]), and the worker pass ([`worker`]). It runs on
+//! embedded `SQLite` via `rusqlite` (`bundled`, so no system `SQLite` and no
+//! Docker are required). It depends on `autumn-harvest` with
 //! `default-features = false`, so no Diesel/Postgres is pulled in.
 //!
-//! A history produced by this backend is byte-identical, **per event**, to one
-//! the Postgres backend would write (both serialize `WorkflowEvent` in the same
-//! adjacently-tagged `#[serde(tag = "type", content = "data")]` form), so it
-//! replays unchanged on the core `WorkflowReplayer` — the property the
-//! cross-backend tests assert.
+//! A history from this backend is byte-identical, **per event**, to one the
+//! Postgres backend writes. Both serialize `WorkflowEvent` in the same
+//! adjacently-tagged `#[serde(tag = "type", content = "data")]` form. So the
+//! history replays unchanged on the core `WorkflowReplayer`. The cross-backend
+//! tests assert that property.
 //!
 //! # The single-writer / single-server contract
 //!
@@ -32,67 +34,73 @@
 //!   claim takes `SQLite`'s database-level write lock up front, selects the oldest
 //!   ready task, and flips it to `RUNNING`. Under the single-writer assumption
 //!   this is exactly-once by construction — no two claimers race.
-//! - **Polling replaces `LISTEN`/`NOTIFY`.** `SQLite` has no push notification, so
-//!   the driver drains all ready work, re-runs the workflow, and repeats until a
-//!   run is terminal or blocked ([`SqliteRuntime::run_until_blocked`] /
-//!   [`SqliteRuntime::run_until_idle`]).
+//! - **Polling replaces `LISTEN`/`NOTIFY`.** `SQLite` has no push notification.
+//!   So the driver drains all ready work, re-runs the workflow, and repeats
+//!   until a run is terminal or blocked
+//!   ([`SqliteRuntime::run_until_blocked`] / [`SqliteRuntime::run_until_idle`]).
 //! - **Restart = drop the runtime + re-open the file.** All state is in the
 //!   database. [`SqliteRuntime::open`] reclaims any task stranded `RUNNING` by a
-//!   crash (there is one server, so a `RUNNING` row at startup is an orphan) and
-//!   the workflow resumes purely by deterministic replay. This makes activity
-//!   execution **at-least-once**: a crash *after a body runs but before its result
-//!   commits* re-runs the body on resume — write activity bodies to be idempotent.
+//!   crash. There is one server, so a `RUNNING` row at startup is an orphan.
+//!   The workflow then resumes purely by deterministic replay. So activity
+//!   execution is **at-least-once**. A crash *after a body runs but before its
+//!   result commits* re-runs the body on resume. Write activity bodies to be
+//!   idempotent.
 //! - **Durable timers use the real wall clock, at millisecond precision.** A
-//!   timer's absolute deadline is stored at arm time (`now + duration`) as an
-//!   epoch-MILLISECOND (issue #1069 P2), so a fractional-second arm never fires
-//!   before its true deadline (a `duration = 1s` timer armed at `…000.900` fires
-//!   at `…001.900`, not the floored `…001.001`). On any pass, timers whose deadline
+//!   timer stores its absolute deadline at arm time (`now + duration`) in epoch
+//!   MILLISECONDS (issue #1069). So a fractional-second arm never fires before
+//!   its true deadline. A `duration = 1s` timer armed at `…000.900` fires at
+//!   `…001.900`, not the floored `…001.001`. On any pass, timers whose deadline
 //!   has passed fire. There is no virtual clock to persist or reset, so timers are
 //!   naturally monotonic across restarts. The public drivers read
-//!   [`chrono::Utc::now`] **once per decision cycle** (issue #1069 P2), so a timer
-//!   armed after a real-time activity anchors to its true arm instant rather than
-//!   the start of the driver call; the `*_as_of` variants inject a single as-of
-//!   time for deterministic, sleep-free tests.
-//!   Timers that share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
-//!   ctx.timer("b", 1))`) fire in `(fire_at, arm_seq)` order, so their `TimerFired`
-//!   events land in `TimerStarted`-append order — the core matcher requires it to
-//!   replay (issue #1069 P2).
+//!   [`chrono::Utc::now`] **once per decision cycle** (issue #1069). So a timer
+//!   armed after a real-time activity anchors to its true arm instant, not the
+//!   start of the driver call. The `*_as_of` variants inject a single as-of time
+//!   for deterministic, sleep-free tests.
+//!   Timers that share a `fire_at` fire in `(fire_at, arm_seq)` order, for
+//!   example `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`. So their
+//!   `TimerFired` events land in `TimerStarted`-append order. The core matcher
+//!   requires that order to replay (issue #1069).
 //! - **Declared/per-call retry policies are honored IN FULL.** The typed
-//!   `ctx.execute_activity(&info, ...)` / `execute_activity_with_opts` path carries
-//!   the activity's resolved [`RetryPolicy`](autumn_harvest::policy::RetryPolicy) in
-//!   the scheduling command's `retry_policy_override`; the backend persists the WHOLE
-//!   policy (`retry_policy_json` on the task row) and the worker honors all of it
-//!   (issue #1069 P2): `max_attempts` in preference to the registered
-//!   [`ActivitySpec`] cap; **backoff timing** — a retryable failure is requeued at
+//!   `ctx.execute_activity(&info, ...)` / `execute_activity_with_opts` path
+//!   carries the resolved [`RetryPolicy`](autumn_harvest::policy::RetryPolicy).
+//!   It travels in the scheduling command's `retry_policy_override`. The backend
+//!   persists the WHOLE policy (`retry_policy_json` on the task row). The worker
+//!   honors all of it (issue #1069). It prefers `max_attempts` to the registered
+//!   [`ActivitySpec`] cap.
+//!   For **backoff timing**, a retryable failure is requeued at
 //!   `failure_now + compute_retry_delay(initial_interval, backoff_coefficient,
-//!   max_interval, attempt)` (the shared core helper), so the workflow BLOCKS on the
-//!   backing-off activity until the driver advances the clock past the deadline
-//!   rather than busy-retrying; and **non-retryable classification** — a typed
-//!   `non_retryable` failure OR one matching the policy's `non_retryable_errors` list
-//!   (incl. legacy `Err(String)`, via the core's `is_non_retryable` rule) fails
-//!   terminally on the first attempt regardless of `max_attempts`, so a non-retryable
-//!   error never repeats side effects. The backoff anchors to `failure_now` — the
-//!   instant the body actually returned, re-read from the clock seam at *finalize*
-//!   time — NOT the pre-body cycle-start `now` (Codex #1069 P2, `worker.rs:328`), so a
-//!   body that ran for real time before failing schedules its next attempt `delay`
-//!   after the failure, matching the Postgres path (which computes the delay AFTER
-//!   handling the result). A **zero** computed delay is an IMMEDIATE retry requeued at
-//!   the cycle-start `now`, so it re-claims in the same drain pass and the retry
-//!   sequence converges in one call — this covers both the raw `execute_activity_raw`
-//!   path (no override, no policy non-retryable list) AND a zero-interval policy like
-//!   `RetryPolicy::fixed(n, 0ms)`; only a POSITIVE backoff anchors to `failure_now`.
-//!   **Retry jitter is an accepted v0.1 simplification** — a `RetryPolicy` with
-//!   `JitterPolicy::Full`/`Equal`/`Decorrelated` is retried at the deterministic base
-//!   delay (`compute_retry_delay`), not the seeded jitter helper. Jitter exists to
-//!   de-synchronize a FLEET of concurrent workers; this backend is single-writer /
-//!   single-server (no fleet to de-synchronize), and retry timing (`run_at`) is not
-//!   recorded in `harvest_events`, so the base delay is behaviorally equivalent with
-//!   ZERO replay / byte-identity impact (Codex #1069 P2, `worker.rs:325`).
+//!   max_interval, attempt)`, the shared core helper. So the workflow BLOCKS on
+//!   the backing-off activity until the driver advances the clock past the
+//!   deadline. It does not busy-retry.
+//!   For **non-retryable classification**, a typed `non_retryable` failure fails
+//!   terminally on the first attempt, whatever `max_attempts` says. So does a
+//!   failure that matches the policy's `non_retryable_errors` list, legacy
+//!   `Err(String)` included, via the core's `is_non_retryable` rule. So a
+//!   non-retryable error never repeats side effects.
+//!   The backoff anchors to `failure_now`, the instant the body returned. It is
+//!   re-read from the clock seam at *finalize* time. It is NOT the pre-body
+//!   cycle-start `now` (issue #1069). So a body that ran for real time before it
+//!   failed schedules its next attempt `delay` after the failure. That matches
+//!   the Postgres path, which computes the delay AFTER it handles the result.
+//!   A **zero** computed delay is an IMMEDIATE retry, requeued at the cycle-start
+//!   `now`. It re-claims in the same drain pass, so the retry sequence converges
+//!   in one call. This covers the raw `execute_activity_raw` path (no override,
+//!   no policy non-retryable list). It also covers a zero-interval policy like
+//!   `RetryPolicy::fixed(n, 0ms)`. Only a POSITIVE backoff anchors to
+//!   `failure_now`.
+//!   **Retry jitter is an accepted v0.1 simplification.** A `RetryPolicy` with
+//!   `JitterPolicy::Full`/`Equal`/`Decorrelated` retries at the deterministic
+//!   base delay (`compute_retry_delay`), not the seeded jitter helper. Jitter
+//!   exists to de-synchronize a FLEET of concurrent workers. This backend is
+//!   single-writer and single-server, so it has no fleet to de-synchronize.
+//!   Retry timing (`run_at`) is not recorded in `harvest_events`. So the base
+//!   delay is behaviorally equivalent, with ZERO replay or byte-identity impact
+//!   (issue #1069).
 //! - **Activity `start_to_close` timeouts are honored.** The declared or per-call
 //!   `start_to_close` comes from `#[activity(start_to_close = "…")]` or
 //!   `execute_activity_with_opts`. It flows through the scheduling command's
 //!   `start_to_close_override`. The backend persists it in milliseconds on the task
-//!   row. The worker enforces it as a **post-execution outcome** (issue #1069 P2).
+//!   row. The worker enforces it as a **post-execution outcome** (issue #1069).
 //!   The drive does not cancel a body mid-flight in a single-writer runtime. So a
 //!   body that runs past its budget records a **terminal**
 //!   `ActivityTimedOut { StartToClose }` instead of `ActivityCompleted`. The
@@ -102,21 +110,24 @@
 //!   runs to completion before the timeout is recorded. The history stays
 //!   replay-safe, because the outcome is recorded once and replay never re-runs the
 //!   body. `None` means no budget, so the activity is unbounded, as before.
-//! - **Typed workflow failures preserve their metadata.** A `#[workflow]` returning a
-//!   typed [`WorkflowFailure`](autumn_harvest::failure::WorkflowFailure) (issue #767)
-//!   is decoded from its `harvest_workflow_failure_v1` wire envelope before the
-//!   terminal `WorkflowFailed` event is appended, so the event carries the typed
-//!   `error_type`/`details` and the execution `error` column holds the human message
-//!   — byte-equivalent to the Postgres terminal path (issue #1069 P2). A legacy
-//!   `Err(String)` is unchanged (all typed fields `None`).
-//! - **Typed ACTIVITY failures preserve their metadata too.** A registered activity
-//!   returning an encoded [`ActivityFailure`](autumn_harvest::failure::ActivityFailure)
-//!   (issue #227) is decoded (`failure::parse_error_payload_full`) before the terminal
-//!   `ActivityFailed` event is appended, so the event carries the typed
-//!   `error_type`/`details`/`non_retryable` and the human `message` (never the raw
-//!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
-//!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
-//!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
+//! - **Typed workflow failures preserve their metadata.** A `#[workflow]` that
+//!   returns a typed [`WorkflowFailure`](autumn_harvest::failure::WorkflowFailure)
+//!   (issue #767) is decoded from its `harvest_workflow_failure_v1` wire envelope.
+//!   That happens before the terminal `WorkflowFailed` event is appended. So the
+//!   event carries the typed `error_type`/`details`, and the execution `error`
+//!   column holds the human message. This is byte-equivalent to the Postgres
+//!   terminal path (issue #1069). A legacy `Err(String)` is unchanged (all typed
+//!   fields `None`).
+//! - **Typed ACTIVITY failures preserve their metadata too.** A registered
+//!   activity that returns an encoded
+//!   [`ActivityFailure`](autumn_harvest::failure::ActivityFailure) (issue #227) is
+//!   decoded (`failure::parse_error_payload_full`). That happens before the
+//!   terminal `ActivityFailed` event is appended. So the event carries the typed
+//!   `error_type`/`details`/`non_retryable` and the human `message`, never the raw
+//!   `harvest_activity_failure_v1` envelope. This is byte-equivalent to the
+//!   Postgres worker's `finalize_activity_failure` (issue #1069). A legacy
+//!   `Err(String)` decodes to `error_type = "Error"`, `non_retryable = false`,
+//!   `details = None`, unchanged.
 //! - **Payload depth is capped at ingress and on activity output** (issues #2157 and
 //!   #2216). `serde_json` reads at most
 //!   128 levels. A start input, memo, signal payload or update input that nests deeper than
@@ -134,21 +145,23 @@
 //!   run with a non-retryable [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure. An update
 //!   result that nests too deep fails the update.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
-//!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
-//!   can enter `harvest_events`, so this backend never stores an unbounded history
-//!   row or accepts a payload the Postgres path rejects. The **workflow START input**
-//!   (`start_workflow`) and an **inbound signal payload** (`send_signal`) over their
-//!   caps (`DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB /
-//!   `DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES` = 256 KiB) are rejected at ingress with
-//!   [`SqliteError::PayloadTooLarge`] BEFORE anything is persisted (the signal cap is
-//!   checked AFTER the not-found / terminal-target rejections). An oversized
-//!   **activity RESULT** (over `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` = 2 MiB) is
-//!   normalized — exactly as the Postgres worker's `handle_activity_result` does —
-//!   into a NON-RETRYABLE `PayloadTooLarge` `ActivityFailed` (the workflow observes
-//!   the failure and drives its own error branch) rather than stored as an unbounded
-//!   `ActivityCompleted`. The reused core [`WorkflowContext`] enforces the
-//!   **activity INPUT** (schedule time), **side-effect value**, **continue-as-new
-//!   input**, **child-workflow input** and **external-signal payload** caps itself.
+//!   #252). A caller-supplied payload over its byte cap is refused before it can
+//!   enter `harvest_events`. So this backend never stores an unbounded history
+//!   row. It never accepts a payload that the Postgres path rejects.
+//!   Two ingress checks run BEFORE anything is persisted, and both fail with
+//!   [`SqliteError::PayloadTooLarge`]. The **workflow START input**
+//!   (`start_workflow`) has a cap of `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB.
+//!   An **inbound signal payload** (`send_signal`) has a cap of
+//!   `DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES` = 256 KiB. The signal cap is checked
+//!   AFTER the not-found and terminal-target rejections.
+//!   An oversized **activity RESULT** (over `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` =
+//!   2 MiB) is not stored as an unbounded `ActivityCompleted`. It is normalized
+//!   into a NON-RETRYABLE `PayloadTooLarge` `ActivityFailed`, exactly as the
+//!   Postgres worker's `handle_activity_result` does. The workflow observes the
+//!   failure and drives its own error branch.
+//!   The reused core [`WorkflowContext`] enforces the **activity INPUT**
+//!   (schedule time), **side-effect value**, **continue-as-new input**,
+//!   **child-workflow input** and **external-signal payload** caps itself.
 //!   The last two apply because this backend supports child workflows and external
 //!   signals (issue #2026). The executor threads the same global caps into the
 //!   context. So the only boundaries this backend enforces directly are the two
@@ -158,9 +171,9 @@
 //!
 //! # Crash-model bound (accepted non-goal)
 //!
-//! The only residual crash window is **mid activity body** — a crash while a body
-//! is executing leaves the task `RUNNING` and is recovered by the orphan reclaim
-//! on the next [`open`](SqliteRuntime::open) (re-running the body, at-least-once).
+//! The only residual crash window is **mid activity body**. A crash while a body
+//! executes leaves the task `RUNNING`. The orphan reclaim on the next
+//! [`open`](SqliteRuntime::open) recovers it and re-runs the body, at-least-once.
 //! A single-process design has no heartbeat-timeout / poison-pill reclaimer for a
 //! *live* peer, by design; multi-writer / multi-server recovery is out of scope.
 //!
@@ -292,22 +305,22 @@
 //! [`start_workflow_with_id`](crate::SqliteRuntime::start_workflow_with_id) is
 //! idempotent by default (the
 //! [`AllowDuplicate`](autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate)
-//! policy): a duplicate delivery for the same non-sealed `workflow_id` ATTACHES —
-//! the same [`ExecutionId`](crate::ExecutionId) is returned and no second run is
-//! started — so a retried webhook is idempotent instead of repeating its side
-//! effects.
+//! policy). A duplicate delivery for the same non-sealed `workflow_id` ATTACHES.
+//! It returns the same [`ExecutionId`](crate::ExecutionId) and starts no second
+//! run. So a retried webhook is idempotent instead of repeating its side effects.
 //! [`start_workflow_with_reuse_policy`](crate::SqliteRuntime::start_workflow_with_reuse_policy)
-//! exposes the full four-policy matrix and returns a
-//! [`StartOutcome`](crate::StartOutcome) (whether a fresh run was created);
-//! [`start_workflow`](crate::SqliteRuntime::start_workflow) (no id) still creates a
-//! distinct run every call, since its defaulted `workflow_id` is unique per run.
+//! exposes the full four-policy matrix. It returns a
+//! [`StartOutcome`](crate::StartOutcome) that says whether a fresh run was
+//! created. [`start_workflow`](crate::SqliteRuntime::start_workflow) (no id)
+//! still creates a distinct run every call, since its defaulted `workflow_id` is
+//! unique per run.
 //!
-//! The reuse decision is atomic in the single-writer start transaction (no
-//! concurrent writers ⇒ a lookup-then-decide needs no database uniqueness index; a
-//! unique index would also fail to build on reopen of a pre-#1068 file already
-//! holding duplicate active ids). A replaced/superseded prior is SEALED to
-//! `CONTINUED_AS_NEW` and thereby excluded from the reuse lookup, mirroring core's
-//! uniqueness-index-excludes-terminal nuance.
+//! The reuse decision is atomic in the single-writer start transaction. With no
+//! concurrent writers, a lookup-then-decide needs no database uniqueness index.
+//! A unique index would also fail to build on reopen of a pre-#1068 file that
+//! already holds duplicate active ids. A replaced or superseded prior is SEALED
+//! to `CONTINUED_AS_NEW`, so the reuse lookup excludes it. This mirrors the core
+//! nuance that the uniqueness index excludes terminal rows.
 //!
 //! ### State-model restriction vs. the Postgres core
 //!
@@ -328,12 +341,13 @@
 //!   else fresh.
 //!   A `CANCELLED` prior comes from [`SqliteRuntime::cancel`] (issue #2021) or
 //!   from another run's cancel (issue #2026).
-//! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
-//!   prior's PENDING tasks and unfired timers) then seal a RUNNING prior; seal an
-//!   already-terminal prior without a cancellation event; then start fresh. The
-//!   single-writer runtime replaces the prior atomically and never drives it again,
-//!   so this forcefully seals the prior (observably equivalent to core) rather than
-//!   delivering cooperative cancellation the prior's body could observe.
+//! - `TerminateIfRunning` — cancel a RUNNING prior, then seal it. The cancel
+//!   records `WorkflowCancelled` and cleans up the prior's PENDING tasks and
+//!   unfired timers. An already-terminal prior is sealed without a cancellation
+//!   event. Then a fresh run starts. The single-writer runtime replaces the prior
+//!   atomically and never drives it again. So this forcefully seals the prior
+//!   (observably equivalent to core). It does not deliver a cooperative
+//!   cancellation that the body of the prior could observe.
 //!
 //! See the per-method rustdoc on `start_workflow_with_reuse_policy` for the full
 //! matrix table.
@@ -360,7 +374,7 @@
 //!
 //! Every out-of-subset primitive a workflow can reach surfaces as
 //! [`SqliteError::Unsupported`]. Its message NAMES the specific
-//! `WorkflowCommand`, never an opaque `"Unknown"` (Codex #1069 P2). A workflow
+//! `WorkflowCommand`, never an opaque `"Unknown"` (issue #1069). A workflow
 //! author gets an actionable failure, not a silent gap.
 //!
 //! The run then ends `FAILED` (issue #1834). The drive rolls back the cycle and
@@ -387,9 +401,9 @@
 //!   name (`ScheduleActivity`, `StartTimer`, `WaitForSignal`). This backend
 //!   accepts an unawaited `ctx.start_timer`, which records `TimerStarted`.
 //!
-//! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
-//! `WorkflowCommand` variant is a compile error in this backend, forcing an
-//! explicit supported / unsupported decision rather than a silent `"Unknown"`.
+//! The command-name table (`runtime.rs`) is EXHAUSTIVE. A future core
+//! `WorkflowCommand` variant is a compile error in this backend. That forces an
+//! explicit supported / unsupported decision, not a silent `"Unknown"`.
 //!
 //! Six commands append no `WorkflowEvent`: `SetCurrentDetails`
 //! (`ctx.set_current_details`, the operator status breadcrumb, issue #593),
@@ -399,19 +413,21 @@
 //! records the signal. The cross-backend conformance suite (issue #2030)
 //! checks each one against Postgres.
 //!
-//! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
-//! author-declared field on the core `ScheduleActivity` command is either HONORED
-//! (`activity_id`/`name`/`input`; `queue` — persisted, though routing is a
-//! single-process no-op; `retry_policy_override` → the WHOLE `RetryPolicy`
-//! (`max_attempts` + backoff timing + non-retryable classification);
-//! `start_to_close_override`, above) or REJECTED LOUDLY with
-//! [`SqliteError::Unsupported`] (`session_id`/`session_worker_id` and the
-//! session-acquire-only `schedule_to_start_override`, all outside the subset) —
-//! never silently ignored, so a workflow's declared setting can never take
-//! silently-wrong effect.
-//! `result_writer` (the fan-out result writer, issue #1986) is REJECTED LOUDLY
-//! too, because it needs a `PayloadStore`. This backend has no store, so the
-//! core context fails the fan-out first.
+//! **No `ScheduleActivity` field is silently dropped** (issue #1069). Each
+//! author-declared field on the core `ScheduleActivity` command is either
+//! HONORED or REJECTED LOUDLY. So a declared setting never takes silently-wrong
+//! effect.
+//!
+//! - HONORED: `activity_id`/`name`/`input`, and `queue` (persisted, though
+//!   routing is a single-process no-op). Also `retry_policy_override`, which
+//!   carries the WHOLE `RetryPolicy`: `max_attempts`, backoff timing and
+//!   non-retryable classification. Also `start_to_close_override`, above.
+//! - REJECTED LOUDLY with [`SqliteError::Unsupported`]: `session_id`,
+//!   `session_worker_id` and the session-acquire-only
+//!   `schedule_to_start_override`, all outside the subset.
+//! - `result_writer` (the fan-out result writer, issue #1986) is REJECTED LOUDLY
+//!   too, because it needs a `PayloadStore`. This backend has no store, so the
+//!   core context fails the fan-out first.
 //!
 //! ## Long-lived runs (issue #2023)
 //!
@@ -467,29 +483,34 @@
 //! if the info declares an execution- or admission-affecting feature that this
 //! v0.1 backend cannot honor. The Postgres `HarvestPlugin::build()` panics on a
 //! misconfiguration in the same way. The panic names the feature and points at
-//! the supported alternative (Codex #1069 P2). The partition:
+//! the supported alternative (issue #1069). The partition:
 //!
 //! - **REJECTED (would change lifecycle or admission semantics if ignored):**
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —
 //!     pre-start admission-gate features with no single-writer analog.
 //!   - `quota` (#946) — per-tenant resource quota enforcement needs the shared
 //!     Postgres backend's admission-time advisory lock, absent here.
-//!   - a raised `max_input_bytes` (#252) — a per-workflow raised input cap is not
-//!     threaded into this backend's replay caps, so the global default would apply
-//!     and silently REJECT an input the workflow declared acceptable; rejected so
-//!     the divergence surfaces at setup, not as a surprising runtime `PayloadTooLarge`.
-//! - **ACCEPTED, inert (pure metadata / observability — execution never consults
-//!   them here, so ignoring them is harmless, NOT silently-wrong):** `sla` (#487 —
-//!   no scanner, so no `harvest.workflow.sla_breached` metric; the run's lifecycle
-//!   is unaffected either way), `owner` / `runbook_url` / `severity` (#372),
-//!   `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
-//!   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597
-//!   — HTTP-edge MCP tool exposure), `declared_activities` / `declared_children`
-//!   (#802 — an opt-in dependency declaration consumed only by the Postgres plugin's
-//!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
-//!   discovery endpoint, neither of which this backend has; the core execution path
-//!   never reads either field), and `module` (diagnostics).
-//!   A bare runtime logs a `WARN` for `mcp` at registration (issue #2488).
+//!   - a raised `max_input_bytes` (#252). This backend's replay caps do not take
+//!     a per-workflow raised input cap. The global default would apply and
+//!     silently REJECT an input that the workflow declared acceptable. The
+//!     rejection surfaces the divergence at setup, not as a surprising runtime
+//!     `PayloadTooLarge`.
+//! - **ACCEPTED, inert:** pure metadata or observability. Execution never
+//!   consults these fields here, so ignoring them is harmless, NOT
+//!   silently-wrong.
+//!   - `sla` (#487). There is no scanner, so no `harvest.workflow.sla_breached`
+//!     metric. The run's lifecycle is unaffected either way.
+//!   - `owner` / `runbook_url` / `severity` (#372).
+//!   - `description` + `input_schema` / `output_schema` / `error_schema` (#373):
+//!     HTTP-edge discovery and validation. This backend has no HTTP edge.
+//!   - `mcp` (#597): HTTP-edge MCP tool exposure. A bare runtime logs a `WARN`
+//!     for `mcp` at registration (issue #2488).
+//!   - `declared_activities` / `declared_children` (#802): an opt-in dependency
+//!     declaration. Only the Postgres plugin's `catalog_consistency` deploy-time
+//!     preflight check and its `/workflows/registered` discovery endpoint read
+//!     it. This backend has neither. The core execution path never reads either
+//!     field.
+//!   - `module` (diagnostics).
 //! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
 //!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
 //!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
@@ -503,30 +524,34 @@
 //!
 //! ## Unsupported `ActivityInfo`-level features — honored or rejected at registration
 //!
-//! This closes the **third** author-declared-feature ingress surface (Codex #1069 P2,
-//! `runtime.rs:39`), after the `ScheduleActivity` command fields and the
-//! `WorkflowInfo` fields above. A `#[activity(...)]` can declare *dispatch-time
-//! defaults the Postgres worker enforces from `ActivityInfo` but which are NOT copied
-//! into the `ScheduleActivity` command* — so a name-only body registration never saw
-//! them, and they were neither honored nor rejected. The audited, `ActivityInfo`-driven
-//! [`register_activity`](crate::SqliteRuntime::register_activity) (the analog of
-//! `register_workflow`) closes that gap: it **PANICS at registration** for an
-//! unsupported field, naming it and pointing at the alternative. (The escape hatch
-//! [`register_activity_raw`](crate::SqliteRuntime::register_activity_raw) carries no
-//! `ActivityInfo` and so runs no audit — the analog of `execute_activity_raw`.) The
-//! partition:
+//! This closes the **third** author-declared-feature ingress surface (issue
+//! #1069), after the `ScheduleActivity` command fields and the `WorkflowInfo`
+//! fields above. A `#[activity(...)]` can declare *dispatch-time defaults* that
+//! the Postgres worker enforces from `ActivityInfo`. Those defaults are NOT
+//! copied into the `ScheduleActivity` command. So a name-only body registration
+//! never saw them, and they were neither honored nor rejected. The audited,
+//! `ActivityInfo`-driven
+//! [`register_activity`](crate::SqliteRuntime::register_activity) closes that
+//! gap, as the analog of `register_workflow`. It **PANICS at registration** for
+//! an unsupported field, naming it and pointing at the alternative. The escape
+//! hatch [`register_activity_raw`](crate::SqliteRuntime::register_activity_raw)
+//! carries no `ActivityInfo` and so runs no audit, like `execute_activity_raw`.
+//! The partition:
 //!
 //! - **HONORED:**
-//!   - `default_schedule_to_close` (#378) — the total, cross-retry wall-clock deadline.
-//!     Resolved by name from the registry at dispatch (exactly as the Postgres worker
-//!     resolves `ActivityInfo` from its `HandlerRegistry`), persisted as an ABSOLUTE
-//!     deadline on the task row, and enforced by the worker: a task drained at/after
-//!     it, or a retry whose next attempt would land at/after it, records a terminal
-//!     `ActivityTimedOut { ScheduleToClose }` instead of running/retrying —
-//!     byte-equivalent to the Postgres `schedule_to_close_deadline_exceeded` path.
-//!   - `default_retry_policy` — its `max_attempts` becomes the registered fallback
-//!     attempt cap; the WHOLE policy also reaches the worker per-dispatch via the
-//!     command's `retry_policy_override` (backoff timing + non-retryable classification).
+//!   - `default_schedule_to_close` (#378): the total, cross-retry wall-clock
+//!     deadline. The worker resolves it by name from the registry at dispatch,
+//!     exactly as the Postgres worker resolves `ActivityInfo` from its
+//!     `HandlerRegistry`. The task row stores it as an ABSOLUTE deadline. A task
+//!     drained at or after the deadline records a terminal
+//!     `ActivityTimedOut { ScheduleToClose }` instead of running. A retry whose
+//!     next attempt would land at or after it records the same event instead of
+//!     retrying. This is byte-equivalent to the Postgres
+//!     `schedule_to_close_deadline_exceeded` path.
+//!   - `default_retry_policy`: its `max_attempts` becomes the registered fallback
+//!     attempt cap. The WHOLE policy also reaches the worker per dispatch via the
+//!     command's `retry_policy_override` (backoff timing + non-retryable
+//!     classification).
 //!   - `default_start_to_close` — honored via the command's `start_to_close_override`
 //!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`). The
 //!     timeout is terminal here. Postgres retries it per the retry policy (issue
@@ -588,7 +613,7 @@
 //! A signal-or-deadline wait races the signal against a durable deadline
 //! timer. The signal wins if it arrives first. Otherwise the timer fires and
 //! the wait resolves to `None`. **Arrival time** decides the winner, at
-//! millisecond precision (issue #1069 P2), not consumption order:
+//! millisecond precision (issue #1069), not consumption order:
 //! - The ingest reads staged signals in arrival order (`received_at`), not
 //!   insertion order (`signal_seq`). An on-time signal staged after a late one
 //!   still wins.
@@ -600,7 +625,7 @@
 //!   The timeout wins, and the late signal stays in history for a later wait.
 //! - An on-time signal wins, also when the drive comes after the deadline.
 //! - **Only the race deadline timer** (the core `__signal_timeout:{seq}:{name}`
-//!   row) can go ahead of a signal (issue #1069 P2). An unrelated durable
+//!   row) can go ahead of a signal (issue #1069). An unrelated durable
 //!   timer never does.
 //!
 //! When the **signal** wins, the core emits a `CancelRaceLosers` bookkeeping
@@ -669,27 +694,29 @@
 //!
 //! The handler runs on that separate replay. State that the handler writes does
 //! not reach the workflow body. Use an update to compute a result from the
-//! workflow state, not to change that state. A `RecordUpdateResult` command from the workflow body records
-//! the same events in the decision cycle, as on Postgres.
+//! workflow state, not to change that state. A `RecordUpdateResult` command
+//! from the workflow body records the same events in the decision cycle, as on
+//! Postgres.
 //!
 //! The handler can await any future, within a 5 second limit. It cannot await
 //! a durable command, such as an activity or a timer. Such a handler returns
 //! [`SqliteError::UpdateTimedOut`] and writes no event.
 //!
-//! # Robustness — healthy-run-killer containment (Codex #1069)
+//! # Robustness — healthy-run-killer containment (issue #1069)
 //!
 //! Failure modes that would otherwise WEDGE (or wrongly seal) a healthy run are
 //! contained:
 //!
 //! - **A workflow-handler panic is bounded-retried, not sealed on the first
-//!   strike.** A `#[workflow]` body that `panic!()`s (distinct from an activity
-//!   body panic, above) is caught by the core at the dispatch boundary and
-//!   surfaced as a contained panic. Rather than sealing the run `FAILED` on the
-//!   first strike — permanently closing a transiently-panicking or hotfix-able run
-//!   — the backend discards the panicked decision cycle (appends nothing, persists
-//!   no bookkeeping command, state stays `RUNNING`) and surfaces
-//!   [`SqliteError::WorkflowPanicked`] under a bounded consecutive-panic budget, so
-//!   a fixed/rolled-back build can re-drive the UNCHANGED history to completion.
+//!   strike.** The core catches a `#[workflow]` body that `panic!()`s at the
+//!   dispatch boundary and surfaces a contained panic. This is distinct from an
+//!   activity body panic. Sealing the run `FAILED` on the first strike would
+//!   permanently close a transiently-panicking or hotfix-able run. So the
+//!   backend discards the panicked decision cycle instead. It appends nothing,
+//!   persists no bookkeeping command, and the state stays `RUNNING`. It surfaces
+//!   [`SqliteError::WorkflowPanicked`] under a bounded consecutive-panic budget.
+//!   So a fixed or rolled-back build can re-drive the UNCHANGED history to
+//!   completion.
 //!   Only after the budget is exhausted is the run sealed `FAILED` with the typed
 //!   `HandlerPanic` error (as a normal [`RunState::Failed`]). A genuine author
 //!   `Err(...)` still fails terminally on the first strike, unchanged. Mirrors the
@@ -697,24 +724,26 @@
 //!
 //! - **Engine replay non-determinism is NON-TERMINAL.** If a workflow's code
 //!   drifts from its recorded history (a bad deploy), the determinism core
-//!   returns a non-determinism divergence. Rather than sealing the run `FAILED`
-//!   and poisoning history with a terminal event from the bad build, the backend
-//!   **discards** the divergent decision cycle (appends nothing, persists no
-//!   bookkeeping command), leaves the execution `RUNNING` / resumable, and
-//!   surfaces [`SqliteError::NonDeterministic`]. A fixed or rolled-back build then
-//!   re-drives the UNCHANGED history to completion. This mirrors the Postgres
-//!   engine's issue #603 semantics ("a workflow-task failure must never fail the
-//!   workflow"); the full automatic block-with-backoff is a documented follow-up.
+//!   returns a non-determinism divergence. Sealing the run `FAILED` would poison
+//!   history with a terminal event from the bad build. So the backend
+//!   **discards** the divergent decision cycle instead. It appends nothing and
+//!   persists no bookkeeping command. It leaves the execution `RUNNING` and
+//!   resumable, and surfaces [`SqliteError::NonDeterministic`]. A fixed or
+//!   rolled-back build then re-drives the UNCHANGED history to completion.
+//!   This mirrors the Postgres engine's issue #603 semantics ("a workflow-task
+//!   failure must never fail the workflow"); the full automatic
+//!   block-with-backoff is a documented follow-up.
 //!   A genuine author `Err(...)` still fails terminally, unchanged.
-//! - **An unregistered activity leaves its task re-claimable.** A workflow that
-//!   schedules an activity whose body is not registered has the just-claimed task
-//!   RELEASED back to `PENDING` (not stranded `RUNNING`) before the
-//!   [`SqliteError::UnregisteredActivity`] error is surfaced, so a later drain
-//!   re-claims it once the body is registered in the SAME runtime — no DB reopen.
+//! - **An unregistered activity leaves its task re-claimable.** A workflow can
+//!   schedule an activity whose body is not registered. The backend then
+//!   RELEASES the just-claimed task back to `PENDING`, not stranded `RUNNING`.
+//!   It does so before it surfaces [`SqliteError::UnregisteredActivity`]. So a
+//!   later drain re-claims the task once the body is registered in the SAME
+//!   runtime, with no DB reopen.
 //! - **A panicking activity body is contained.** A body that `panic!()`s (rather
-//!   than returning `Err`) is caught at the dispatch boundary and routed through
-//!   the NORMAL retryable-failure path (record the attempt, requeue if attempts
-//!   remain, else terminal `ActivityFailed`), so it never unwinds past the
+//!   than returning `Err`) is caught at the dispatch boundary. It goes through
+//!   the NORMAL retryable-failure path: record the attempt, requeue if attempts
+//!   remain, else terminal `ActivityFailed`. So it never unwinds past the
 //!   finalize and strands the task `RUNNING`. Mirrors the Postgres worker's
 //!   handler-panic containment (issue #782). Write bodies to be idempotent
 //!   regardless — a caught panic is a retry, and (as with any failure) the body
@@ -791,15 +820,16 @@
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
 //! record a frozen value as a `SideEffectRecorded` event so replay never re-mints
 //! it. These events are persisted **atomically with the rest of the cycle** in
-//! every case — whether they ride a **suspending** batch (a side effect *before*
-//! an activity/timer/signal, via [`apply_commands`](crate::SqliteRuntime)) or are
-//! emitted in the cycle that **completes/fails** the workflow with no further
-//! suspension (e.g. `ctx.new_uuid()` right before `Ok(..)`): the terminal cycle
-//! drains those pending bookkeeping commands and appends each one BEFORE the
-//! terminal `WorkflowCompleted`/`WorkflowFailed` event, in the same transaction,
-//! mirroring the Postgres worker's `persist_terminal_outcome_commands`. So a
-//! deterministic primitive is **never** silently dropped, and a history written
-//! here always replays byte-identically on the core `WorkflowReplayer`.
+//! every case. A side effect can ride a **suspending** batch, *before* an
+//! activity, timer or signal, via [`apply_commands`](crate::SqliteRuntime). Or
+//! it can be emitted in the cycle that **completes or fails** the workflow with
+//! no further suspension, for example `ctx.new_uuid()` right before `Ok(..)`.
+//! The terminal cycle drains those pending bookkeeping commands. It appends each
+//! one BEFORE the terminal `WorkflowCompleted`/`WorkflowFailed` event, in the
+//! same transaction. This mirrors the Postgres worker's
+//! `persist_terminal_outcome_commands`. So a deterministic primitive is
+//! **never** silently dropped, and a history written here always replays
+//! byte-identically on the core `WorkflowReplayer`.
 
 mod agent_policy_log;
 mod agent_store;
@@ -864,7 +894,6 @@ pub use crate::runtime::{
     SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
     StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
-// The depth cap is shared with the Postgres backend (issue #2225).
 pub use crate::retention::{PURGE_BATCH, PurgePolicy, PurgeReport};
 pub use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 pub use crate::store::ActivityAttempt;
@@ -875,5 +904,6 @@ pub use crate::visibility::{
 pub use crate::workflow_log::{
     LogFilter, LogLine, WORKFLOW_LOG_TRUNCATION_MESSAGE, WORKFLOW_LOG_TRUNCATION_SEQ,
 };
+// The depth cap is shared with the Postgres backend (issue #2225).
 #[doc(inline)]
 pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE};

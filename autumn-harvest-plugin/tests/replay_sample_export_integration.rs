@@ -1,9 +1,9 @@
 //! `GET /admin/history/export-sample` — the stratified in-flight sample export
 //! that feeds the replay-drift gate (issue #798).
 //!
-//! The route answers "give me at most N in-flight histories per registered
-//! workflow type, across every shard, plus how many I did *not* take" so a CI
-//! job can replay that sample against the candidate build before promotion.
+//! The route returns at most N in-flight histories per registered workflow
+//! type, across every shard, plus how many it did *not* take. A CI job replays
+//! that sample against the candidate build before promotion.
 //!
 //! AC1 — read-only export, at most N per workflow type, cross-shard, caller-
 //!       specified non-terminal states.
@@ -11,11 +11,10 @@
 //!       never silent.
 //! AC3 — honours the existing `payload_policy` redaction/codec path.
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which fresh shard databases are created) when set — no Docker
-//! required — else boots a fresh testcontainers Postgres. Docker is not
-//! available in every sandbox, so these tests are compile-checked there and run
-//! Docker-backed in CI (matching the #543/#544/#601 precedent).
+//! Dual-mode: with `HARVEST_TEST_DATABASE_URL` set, the tests create fresh shard
+//! databases through that admin URL, with no Docker. Else they boot a fresh
+//! testcontainers Postgres. Some sandboxes have no Docker, so the tests only
+//! compile there and run in CI (the #543/#544/#601 precedent).
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
@@ -137,9 +136,9 @@ fn build_app(urls: &[String]) -> HarvestApiApp {
 }
 
 /// Build an app whose **router** knows about more shards than this process has
-/// pools for — the mid-rollout topology from the `docs/architecture.md` "add a shard"
-/// procedure, where `readable_shards` is widened before every process has the
-/// new shard's pool wired up.
+/// pools for. That is the mid-rollout topology of the `docs/architecture.md`
+/// "add a shard" procedure. `readable_shards` widens before each process has
+/// the new shard's pool.
 fn build_app_with_router_knowing_extra_shard(
     urls: &[String],
     router_shards: &[i32],
@@ -332,9 +331,9 @@ fn base_time() -> chrono::DateTime<chrono::Utc> {
 // AC1 — stratified per-workflow-type cap
 // ---------------------------------------------------------------------------
 
-/// AC1 + AC2, the headline behaviour: an unbalanced fleet (one noisy workflow
-/// type, one quiet one) must yield **at most N per type**, not the global
-/// top-N — and must report the population it sampled *from*.
+/// AC1 + AC2: an unbalanced fleet (one noisy workflow type, one quiet one) must
+/// yield **at most N per type**, not the global top-N. It must also report the
+/// population it sampled *from*.
 #[tokio::test]
 async fn sample_is_stratified_per_workflow_type_and_reports_coverage() {
     let (urls, _guard) = setup_shards(1).await;
@@ -520,9 +519,9 @@ async fn terminal_state_request_is_rejected_with_400() {
 // AC1 — cross-shard
 // ---------------------------------------------------------------------------
 
-/// AC1: the per-type cap is **global**, not per shard. Two shards each holding
-/// 3 in-flight runs of one type, sampled at `per_workflow=4`, must yield 4 —
-/// not 8 — and must report the merged population of 6.
+/// AC1: the per-type cap is **global**, not per shard. Two shards each hold 3
+/// in-flight runs of one type. At `per_workflow=4` they must yield 4, not 8,
+/// and report the merged population of 6.
 #[tokio::test]
 async fn per_workflow_cap_is_global_across_shards() {
     let (urls, _guard) = setup_shards(2).await;
@@ -571,18 +570,17 @@ async fn per_workflow_cap_is_global_across_shards() {
 /// Two **logical** shards backed by one **physical** database must not
 /// double-count.
 ///
-/// This topology is supported (and is why `execution::COUNT_WHERE_CLAUSE`,
+/// This topology is supported. That is why `execution::COUNT_WHERE_CLAUSE`,
 /// `schedule_run_state_summary`, and `non_terminal_counts_by_workflow_name` all
-/// carry `WHERE shard_id = $N`). Without the same predicate on the sample query,
-/// the fan-out runs the identical statement twice over the identical rows and
-/// corrupts the manifest in both directions at once:
+/// carry `WHERE shard_id = $N`. Without that predicate on the sample query, the
+/// fan-out runs one statement twice over the same rows. That corrupts the
+/// manifest in two directions:
 ///
-/// * `in_flight_total` doubles — the denominator AC2 exists to state honestly
-///   becomes a lie, so "50 of 4021" is really "50 of 2010" and an operator
-///   under-reads their own coverage by half.
-/// * every execution is sampled twice — the bundle carries duplicate fixtures,
-///   so real per-type coverage is halved while `sampled` looks unchanged, and
-///   the gate spends its budget replaying the same execution twice.
+/// * `in_flight_total` doubles. The AC2 denominator becomes a lie: "50 of 4021"
+///   is really "50 of 2010", and an operator under-reads coverage by half.
+/// * every execution is sampled twice. The bundle carries duplicate fixtures,
+///   so real per-type coverage halves while `sampled` looks unchanged. The gate
+///   spends its budget on the same execution twice.
 ///
 /// Both are silent. Nothing errors; the numbers are just wrong.
 #[tokio::test]
@@ -643,9 +641,9 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
 /// `inspected_shards` and `unavailable_shards` — and `SampleStatus::from_counts`
 /// derives `Complete` from `unavailable == 0`.
 ///
-/// The consequence is the worst one this gate has: the manifest claims complete
-/// coverage, so even `require_complete_coverage(true)` certifies the candidate
-/// without replaying a single in-flight execution from that shard.
+/// That is the worst failure of this gate. The manifest claims complete
+/// coverage. So even `require_complete_coverage(true)` certifies the candidate
+/// without a replay of any in-flight execution from that shard.
 #[tokio::test]
 async fn a_router_known_shard_with_no_pool_is_reported_unavailable() {
     let (urls, _guard) = setup_shards(1).await;
@@ -706,11 +704,10 @@ async fn a_fully_pooled_router_still_reports_complete_coverage() {
 
 /// The engine's built-in liveness canary (issue #796) must never enter a bundle.
 ///
-/// Its probe workflow is registered by the engine, not by the user's gate
-/// binary, so a sampled probe lands in `blocked` — and `blocked` dominates the
-/// exit-code ladder. A single in-flight probe would therefore pin the gate at
-/// exit 2 permanently on any deployment that enables the canary, which is the
-/// deployments that care most about deploy safety.
+/// The engine registers its probe workflow, not the user's gate binary. So a
+/// sampled probe lands in `blocked`, which dominates the exit-code ladder. One
+/// in-flight probe would pin the gate at exit 2 on each deployment that enables
+/// the canary. Those deployments care most about deploy safety.
 #[tokio::test]
 async fn liveness_canary_probes_are_never_sampled() {
     let (urls, _guard) = setup_shards(1).await;
@@ -798,17 +795,16 @@ async fn unreachable_shard_degrades_the_manifest_to_partial() {
 /// A shard whose **connection succeeds but whose query fails** must not be
 /// counted as inspected.
 ///
-/// This is the distinct sibling of the unreachable-shard case above: there the
-/// failure happens at `acquire_conn`, here it happens one step later. Counting
-/// the shard the moment its connection is acquired puts it in *both* the
-/// inspected and unavailable lists, and `SampleStatus::from_counts` reads
-/// `inspected == 0` as its "unavailable" signal — so a single-shard deployment
-/// whose query fails would report `partial` while naming one supposedly
-/// inspected shard, overstating coverage in the very record the gate uses to
-/// decide whether coverage was proven.
+/// This is the sibling of the unreachable-shard case, which fails at
+/// `acquire_conn`. Here the failure comes one step later. Counting the shard at
+/// connection acquire puts it in *both* the inspected and unavailable lists.
+/// `SampleStatus::from_counts` reads `inspected == 0` as its "unavailable"
+/// signal. So a single-shard deployment with a failed query reports `partial`
+/// but names one inspected shard. That overstates coverage in the record that
+/// the gate uses to decide if coverage was proven.
 ///
-/// The fault is injected by dropping the table the sample query reads, which
-/// leaves the connection perfectly healthy.
+/// The test drops the table that the sample query reads. The connection stays
+/// healthy.
 #[tokio::test]
 async fn a_shard_whose_query_fails_is_not_counted_as_inspected() {
     let (urls, _guard) = setup_shards(1).await;
@@ -968,9 +964,9 @@ async fn per_workflow_is_clamped_and_reported() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// An idle fleet yields an empty-but-well-formed bundle: the manifest still
-/// says `complete`, so the *harness* (not the exporter) decides whether an
-/// empty bundle should block promotion.
+/// An idle fleet yields an empty but well-formed bundle. The manifest still
+/// says `complete`, so the *harness*, not the exporter, decides if an empty
+/// bundle blocks promotion.
 #[tokio::test]
 async fn idle_fleet_yields_an_empty_but_complete_manifest() {
     let (urls, _guard) = setup_shards(1).await;
@@ -1034,9 +1030,8 @@ fn reordered_workflow<'a>(
 async fn seed_in_flight_two_step(url: &str, shard: ShardId, workflow_id: &str) -> ExecutionId {
     let t0 = base_time();
     let exec_id = seed_execution(url, shard, "gate_wf", workflow_id, "RUNNING", t0).await;
-    // `seed_execution` wrote a generic 2-event history; replace it with one that
-    // matches `canonical_workflow`'s first command so the bundle is a realistic
-    // in-flight fixture rather than a synthetic one.
+    // `seed_execution` wrote a generic 2-event history. Replace it with one that
+    // matches `canonical_workflow`'s first command, for a realistic fixture.
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
@@ -1085,11 +1080,11 @@ fn write_bundle(dir: &std::path::Path, body: &Value) {
 }
 
 /// **The money test.** Export a real in-flight sample, write it as a bundle,
-/// and run the drift gate over it: clean against the code that produced the
-/// history, non-zero against a build that reordered its activities.
+/// and run the drift gate over it. The gate is clean against the code that
+/// produced the history. It is non-zero against a build that reordered its
+/// activities.
 ///
-/// This is the whole loop issue #798 exists to make possible, end to end
-/// through the real HTTP route — not a hand-built fixture.
+/// This is the whole loop of issue #798, end to end through the real HTTP route.
 #[tokio::test]
 async fn exported_bundle_passes_the_gate_and_catches_a_reordering_regression() {
     let (urls, _guard) = setup_shards(1).await;
@@ -1155,15 +1150,17 @@ async fn exported_bundle_passes_the_gate_and_catches_a_reordering_regression() {
 }
 
 /// **Success metric**: export + replay of a 1,000-execution cross-shard sample
-/// completes in well under 30 s, and catches a regression with zero false
+/// completes in well under 30 s. It catches a regression with zero false
 /// negatives on the sampled set.
 ///
-/// Both halves are asserted against the same bundle, because the metric is only
-/// meaningful as a pair — a gate that is fast because it verifies nothing, or
-/// thorough but too slow to sit in CI, satisfies neither. The wall clock covers
-/// the whole loop an operator actually runs: the cross-shard stratified query,
-/// the export pipeline (payload policy, size limits, per-entry failures), the
-/// bundle write, and 1,000 replays.
+/// Both halves use the same bundle, because the metric means something only as
+/// a pair. A gate that verifies nothing is fast. A thorough gate can be too slow
+/// for CI. Neither satisfies the metric. The wall clock covers the whole
+/// operator loop:
+///
+/// - the cross-shard stratified query,
+/// - the export pipeline (payload policy, size limits, per-entry failures),
+/// - the bundle write, and 1,000 replays.
 ///
 /// Ignored by default: seeding 1,000 executions with histories is far heavier
 /// than the rest of this suite. Run it deliberately:
@@ -1180,15 +1177,13 @@ async fn thousand_execution_cross_shard_sample_exports_and_replays_within_budget
     // 20 types x 50 (the documented default per-workflow cap) = 1000, so the
     // sample is genuinely stratified rather than one type's rows.
     const TYPES: usize = 20;
-    // The issue's metric describes the operator-facing gate, which ships
-    // release-built. Replay is pure local CPU and dominates this test (measured:
-    // ~96% of the wall clock, with the cross-shard query + export pipeline under
-    // a second), and a debug build pays a large tax on exactly that path — so
-    // asserting the literal 30 s against a debug build asserts something far
-    // stricter than the metric and would flake on a loaded runner. Release
-    // replay throughput is separately pinned by the pre-existing
-    // `replay_verifier_bench` (issue #251): 1,000 fixtures averaging 1k events
-    // each in under 30 s, versus the ~3 events per fixture here.
+    // The metric describes the operator-facing gate, which ships release-built.
+    // Replay is pure local CPU and dominates this test. Measured, it is ~96% of
+    // the wall clock; the query and export take under a second. A debug build
+    // pays a large tax on that path. So 30 s under debug is far stricter than
+    // the metric and flakes on a loaded runner. `replay_verifier_bench` (issue
+    // #251) pins release replay throughput separately. It runs 1,000 fixtures of
+    // about 1k events each in under 30 s. Here each fixture has ~3 events.
     const BUDGET: std::time::Duration = if cfg!(debug_assertions) {
         std::time::Duration::from_secs(120)
     } else {
@@ -1329,10 +1324,10 @@ async fn seed_in_flight_named(
 /// be reported as a determinism regression.
 ///
 /// Redaction rewrites payload-bearing fields in place, and canary replay sets
-/// `strict_replay = true` — so `match_activity_strict` compares the *redacted
-/// stub* against the input the workflow actually computes and diverges on every
-/// fixture. Reporting that as "your code drifted" would block a healthy build and
-/// send the operator hunting a regression that does not exist.
+/// `strict_replay = true`. So `match_activity_strict` compares the *redacted
+/// stub* with the computed input and diverges on every fixture. A "your code
+/// drifted" report would block a healthy build. The operator would then hunt a
+/// regression that does not exist.
 ///
 /// The gate must instead refuse the bundle as unreplayable (a harness error,
 /// exit 2) and say how to fix it.
@@ -1381,13 +1376,12 @@ async fn a_redacted_bundle_is_refused_not_reported_as_drift() {
 
 /// The exported fixture must carry the execution's own `context_headers`.
 ///
-/// Headers live in no `WorkflowEvent`, so a fixture that drops them replays the
+/// Headers live in no `WorkflowEvent`. A fixture that drops them replays the
 /// workflow against an *empty* header map. A workflow that branches on
-/// `ctx.header(..)` — or embeds one in an activity input — then takes the other
-/// branch and the gate reports a divergence the candidate build did not cause:
-/// a false red on healthy code, which is how a determinism gate loses its
-/// audience. The single-execution export and the DB replay canary both carry
-/// them; the sample export must have parity.
+/// `ctx.header(..)`, or puts one in an activity input, then takes the other
+/// branch. The gate reports a divergence that the candidate did not cause. A
+/// false red on healthy code loses a determinism gate its audience. The
+/// single-execution export and the DB replay canary carry headers too.
 #[tokio::test]
 async fn exported_fixture_carries_context_headers_for_replay() {
     let (urls, _guard) = setup_shards(1).await;
@@ -1462,17 +1456,17 @@ async fn workflow_name_filter_narrows_the_sample() {
 /// must not cost the population census.
 ///
 /// The per-type limit is `per_workflow`, but nothing bounds the number of
-/// *types*, so discovery returned `types × per_workflow` rows for the
-/// stratifier to throw all but `MAX_SAMPLE_TOTAL` of away. The fix bounds each
-/// shard by the effective share the global budget allows — which is only safe
-/// if the floor of one row per type holds, because the manifest's
-/// `in_flight_total` (and therefore `zero_coverage_types`, the "this type was
-/// never replayed" alarm) is read off the first row of each name partition.
+/// *types*. So discovery returned `types × per_workflow` rows, and the
+/// stratifier kept only `MAX_SAMPLE_TOTAL`. The fix bounds each shard by the
+/// share that the global budget allows. That is safe only with a floor of one
+/// row per type. The manifest reads `in_flight_total` off the first row of each
+/// name partition. `zero_coverage_types`, the "never replayed" alarm, depends
+/// on it.
 ///
-/// So this seeds many types, each with more executions than the share allows,
-/// and asserts the property that a naive `LIMIT` would break: **every type is
-/// still present in the manifest with its true population**, even the ones the
-/// budget starves down to a single fixture.
+/// So this seeds many types, each with more executions than the share allows.
+/// A naive `LIMIT` would break the asserted property: **every type is still in
+/// the manifest with its true population**. That includes types that the
+/// budget starves down to one fixture.
 #[tokio::test]
 async fn many_types_keep_their_population_census_under_the_discovery_bound() {
     // Three executions each, so every type is genuinely truncatable.
@@ -1521,9 +1515,8 @@ async fn many_types_keep_their_population_census_under_the_discovery_bound() {
         );
     }
 
-    // And the sample itself is unchanged by the bound: `per_workflow = 2` is far
-    // below the global share here, so it is the binding constraint exactly as
-    // before.
+    // The bound does not change the sample. `per_workflow = 2` is far below the
+    // global share, so it is still the binding constraint.
     let names = exported_workflow_names(&body);
     for type_index in 0..TYPES {
         let name = format!("wf_{type_index:03}");
@@ -1539,11 +1532,10 @@ async fn many_types_keep_their_population_census_under_the_discovery_bound() {
 
 /// The exporter must record *which* executions it wrote, not just how many.
 ///
-/// `sampled` alone accepts any substitution that preserves the count, so the
-/// gate cannot tell the bundle it was handed apart from a bundle of the right
-/// shape. The identities are what
-/// `ReplayDriftReport::bundle_inventory_mismatches` reconciles against, so an
-/// exporter that stopped recording them would silently disarm that check.
+/// `sampled` alone accepts any substitution that keeps the count. The gate
+/// then cannot tell its bundle from any bundle of the right shape.
+/// `ReplayDriftReport::bundle_inventory_mismatches` reconciles against the
+/// identities. Without them, that check is silently disarmed.
 #[tokio::test]
 async fn the_manifest_records_the_exported_execution_identities() {
     let (urls, _guard) = setup_shards(1).await;
@@ -1574,9 +1566,8 @@ async fn the_manifest_records_the_exported_execution_identities() {
         "the manifest must name every exported execution: {body}"
     );
 
-    // The identities must be exactly the documents the export actually wrote —
-    // a list that merely has the right length would satisfy the count check it
-    // is meant to strengthen.
+    // The identities must be exactly the written documents. A list with only
+    // the right length passes the count check that it is meant to strengthen.
     let exported: std::collections::BTreeSet<String> = body["exports"]
         .as_array()
         .expect("exports array")

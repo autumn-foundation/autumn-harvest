@@ -149,12 +149,12 @@ fn progress_stream_route_is_classified_as_read_only() {
     );
 }
 
-/// AC5: the progress stream is deliberately NOT admin-gated — an app's
-/// end-users stream their own workflows. Prove it by contrast: with the admin
-/// boundary closed and no session, the admin-gated events stream rejects the
-/// request (401), while the same unauthenticated request to the progress stream
-/// REACHES the handler (never 401/403; here it fails config-side because no
-/// notification URL is set). This is the exact posture #791 AC5 requires.
+/// AC5: the progress stream is deliberately NOT admin-gated, because an app's
+/// end-users stream their own workflows. The test proves it by contrast.
+/// With the admin boundary closed and no session, the events stream rejects
+/// the request (401). The same request to the progress stream REACHES the
+/// handler (never 401/403). Here it fails config-side, because no notification
+/// URL is set. This is the posture that #791 AC5 requires.
 #[tokio::test]
 async fn progress_stream_is_not_admin_gated() {
     use autumn_web::reexports::axum::body::Body;
@@ -218,10 +218,9 @@ async fn progress_stream_is_not_admin_gated() {
     );
 }
 
-/// FIX (#791 review): an unconfigured / unavailable LISTEN/NOTIFY URL is a
-/// *server* misconfiguration, so the progress stream must return 503 (retriable),
-/// not the 400 a `HarvestError::Config` would otherwise map to. With no
-/// notification URL configured, the handler short-circuits to 503.
+/// #791: an unconfigured or unavailable LISTEN/NOTIFY URL is a *server*
+/// misconfiguration. So the progress stream returns 503 (retriable), not the 400
+/// that a `HarvestError::Config` maps to by default.
 #[tokio::test]
 async fn progress_stream_returns_service_unavailable_when_not_configured() {
     use autumn_web::reexports::axum::body::Body;

@@ -1,8 +1,8 @@
 //! Integration tests for the `harvest debug` subcommand (issue #949).
 //!
-//! Black-box tests over the crate's public debug surface: they write
-//! `HistorySnapshot` JSON fixtures to disk and drive the pure
-//! breakpoint/focus/render helpers plus `run_replay` / `run_diff` end to end.
+//! Black-box tests over the public debug surface. They write `HistorySnapshot`
+//! JSON fixtures to disk. They drive the breakpoint, focus and render helpers,
+//! and `run_replay` / `run_diff` end to end.
 //!
 //! These exercise the **handler-free** arm of the debugger (everything except
 //! per-step pending commands). Per-step commands need registered workflow code
@@ -28,9 +28,9 @@ fn started() -> WorkflowEvent {
 
 /// `[started, ActivityScheduled(charge), ActivityCompleted, SignalReceived(go)]`
 ///
-/// The scheduled and completed events share one `activity_id` so the awaitable
-/// actually closes — a fixture whose ids differed would leave it open forever
-/// and quietly weaken every open-awaitable assertion below.
+/// The scheduled and completed events share one `activity_id`, so the awaitable
+/// closes. Different ids would leave it open forever. That would quietly weaken
+/// every open-awaitable assertion below.
 fn base_events() -> Vec<WorkflowEvent> {
     let activity_id = ActivityExecId::new();
     vec![
@@ -354,11 +354,10 @@ fn run_replay_fails_on_an_out_of_range_step() {
 #[test]
 fn tui_rejects_an_unsatisfiable_focus_rather_than_opening_step_zero() {
     // The `--tui` arm previously fell through to cursor 0 for both error
-    // resolutions, so `--tui --break-at-activity nonexistent` looked like a hit
-    // and exited 0 once the user quit — the one thing a breakpoint must never
-    // do, and inconsistent with the text and JSON paths. Both must error
-    // BEFORE the terminal is put into raw mode, which is also why this test can
-    // run headless: it never reaches `debug_tui::run`.
+    // resolutions. So `--tui --break-at-activity nonexistent` looked like a hit
+    // and exited 0 when the user quit. A breakpoint must never do that, and the
+    // text and JSON paths do not. Both must error BEFORE the terminal enters
+    // raw mode. So this test runs headless: it never reaches `debug_tui::run`.
     let dir = tempfile::tempdir().unwrap();
     let path = snapshot_file(dir.path(), "history.json", &base_events());
 
@@ -460,9 +459,9 @@ fn diff_render_names_the_first_divergent_step() {
 
 #[test]
 fn diff_render_reports_agreement_explicitly() {
-    // Two *independent* recordings of the same scenario: their activity UUIDs
-    // and start timestamps differ, but the diff normalizes per-run identity out
-    // and must therefore report agreement rather than UUID noise.
+    // Two *independent* recordings of the same scenario. Their activity UUIDs
+    // and start timestamps differ. The diff normalizes per-run identity out, so
+    // it must report agreement, not UUID noise.
     let left = trace_of(&base_events());
     let right = trace_of(&base_events());
     let diff = autumn_harvest::debugger::diff_traces(&left, &right);
@@ -701,14 +700,15 @@ fn activity_breakpoint_does_not_match_the_queue_name() {
 
 // ── `render_step_detail`'s remaining sections ───────────────────────────────
 //
-// The overview table and the commands/cap/handler-free notices are covered
-// above. These pin the four sections that are only reachable from a history
-// carrying the corresponding event kinds — without them a rendering regression
-// (a swapped column, a dropped section) would ship silently.
+// The tests above cover the overview table and the commands, cap and
+// handler-free notices. These pin the four sections that need a history with
+// the matching event kinds. Without them, a rendering regression (a swapped
+// column, a dropped section) would ship silently.
 
-/// A history exercising every remaining detail section in one trace:
-/// a version gate, a patch gate, a plain marker, a side effect, and an open
-/// timer awaitable.
+/// A history that exercises every remaining detail section in one trace.
+///
+/// It has a version gate, a patch gate, a plain marker, a side effect and an
+/// open timer awaitable.
 fn rich_events() -> Vec<WorkflowEvent> {
     vec![
         started(),
@@ -800,11 +800,10 @@ fn step_detail_renders_the_resolved_payload() {
 
 #[test]
 fn a_history_fact_divergence_shows_the_values_that_differ_not_just_the_field_name() {
-    // The handler-free CLI arm emits no commands, so a diff that rendered only
+    // The handler-free CLI arm emits no commands. A diff that rendered only
     // commands would print "the recorded histories differ (open_awaitables)"
-    // followed by two identical `<no pending commands>` lines — naming a
-    // difference the operator cannot see. On a divergence-finding tool that is
-    // worse than useless.
+    // and then two identical `<no pending commands>` lines. That names a
+    // difference the operator cannot see.
     let left = trace_of(&base_events());
     let right = trace_of(&renamed_events());
     let diff = autumn_harvest::debugger::diff_traces(&left, &right);
@@ -822,12 +821,11 @@ fn a_history_fact_divergence_shows_the_values_that_differ_not_just_the_field_nam
 
 #[test]
 fn an_event_facts_divergence_renders_both_normalized_events() {
-    // `event_facts` is the completeness backstop: it fires for a semantic
-    // difference no curated projection names (here, a timer's duration). If the
-    // CLI did not render it, the operator would be told the histories differ
-    // and shown nothing — the exact failure mode the field vocabulary exists to
-    // avoid. That class of failure is a *false clean*. This test pins both the
-    // detection and the rendering.
+    // `event_facts` is the completeness backstop. It fires for a semantic
+    // difference that no curated projection names (here, a timer's duration).
+    // Without rendering, the operator would learn that the histories differ
+    // and see nothing. The field vocabulary exists to prevent that *false
+    // clean*. This test pins both the detection and the rendering.
     let timer = |secs: u64| {
         vec![
             started(),
@@ -858,10 +856,10 @@ fn an_event_facts_divergence_renders_both_normalized_events() {
 
 #[test]
 fn diff_of_two_workflow_types_exits_nonzero_and_names_both() {
-    // `workflow_name` lives on the execution row, not in any event, so two
+    // `workflow_name` lives on the execution row, not in any event. Two
     // recordings of DIFFERENT workflows with identical event arrays would
-    // otherwise walk every step and exit 0 — the CLI reporting agreement
-    // between recordings that are not even of the same thing.
+    // otherwise walk every step and exit 0. The CLI would report agreement
+    // between recordings of different things.
     let dir = tempfile::tempdir().unwrap();
     let events = base_events();
     let left = snapshot_file_for(dir.path(), "left.json", "onboarding", &events);
@@ -916,12 +914,11 @@ fn diff_render_reports_a_capped_comparison_as_inconclusive() {
 
 #[tokio::test]
 async fn diff_render_never_calls_a_panicked_side_clean() {
-    // `step_diff_kind` compares `divergence` BEFORE `outcome`, so a side that
-    // panicked — and therefore recorded no divergence, because it never got far
-    // enough to disagree with anything — reaches the `DiffKind::Divergence` arm
-    // carrying `None`. Labelling that "replays cleanly" is the same false-clean
-    // this tool exists to refuse: a build that crashes must never be described
-    // as replaying cleanly in the very report a reviewer reads to decide.
+    // `step_diff_kind` compares `divergence` BEFORE `outcome`. A side that
+    // panicked recorded no divergence, because it never got far enough to
+    // disagree. So it reaches the `DiffKind::Divergence` arm carrying `None`.
+    // A label of "replays cleanly" is the false clean that this tool refuses.
+    // The report must never describe a crashing build as replaying cleanly.
     use std::future::Future;
     use std::pin::Pin;
 
@@ -931,10 +928,10 @@ async fn diff_render_never_calls_a_panicked_side_clean() {
 
     /// Returns immediately at step 0, panics from step 1 on.
     ///
-    /// The branch is on the *prefix* length (each step replays `events[0..=k]`),
-    /// which is what lets both builds agree at step 0 and part company at step
-    /// 1 — the only shape in which a panic can be the FIRST difference without
-    /// the earlier command/outcome checks firing first.
+    /// The branch is on the *prefix* length (each step replays `events[0..=k]`).
+    /// So both builds agree at step 0 and differ at step 1. Only in that shape
+    /// can a panic be the FIRST difference before the command and outcome
+    /// checks fire.
     fn panics_after_the_first_step<'a>(
         ctx: &'a WorkflowContext,
         _input: serde_json::Value,
@@ -982,9 +979,9 @@ async fn diff_render_never_calls_a_panicked_side_clean() {
         .await
         .expect("trace");
 
-    // Precondition: the test is only meaningful while the two sides reach the
-    // `Divergence` arm with the panicked side carrying `None` — the exact shape
-    // that used to render as "replays cleanly".
+    // Precondition: the two sides reach the `Divergence` arm, and the panicked
+    // side carries `None`. That exact shape used to render as "replays
+    // cleanly".
     let diff = autumn_harvest::debugger::diff_traces(&left, &right);
     let div = diff
         .divergence

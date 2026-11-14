@@ -1,26 +1,26 @@
 //! CI-gated performance contract for the task-claim hot path (issue #786).
 //!
-//! `queue::claim_task` is the single most scalability-critical query in the
-//! engine and has accreted roughly a `WHERE` predicate per phase since 3.7
-//! (build-id routing #171, per-key concurrency #247, rate-limit gate #332/#699,
-//! circuit-breaker tracked set #369, schedule-to-close #378, pause skip #383,
-//! worker sessions #606, queue pauses #619). Each was added for correctness;
-//! until this suite, none was measured.
+//! `queue::claim_task` is the most scalability-critical query in the engine.
+//! It has gained about one `WHERE` predicate per phase since 3.7. The first
+//! were build-id routing #171, per-key concurrency #247, rate-limit gate
+//! #332/#699 and circuit-breaker tracked set #369. Then came schedule-to-close
+//! #378, pause skip #383, worker sessions #606 and queue pauses #619. Each was
+//! added for correctness. Until this suite, none was measured.
 //!
 //! This is the gate. It runs the single published **headline scenario** and
 //! fails the build when **p50** claim latency exceeds the budget in
-//! `docs/performance.md`. The exploratory report — every gate at every backlog
-//! depth, plus `EXPLAIN (ANALYZE, BUFFERS)` — lives in `benches/claim_bench.rs`
-//! and shares this crate's [`claim_bench_support`] harness, so the gate and the
-//! benchmark can never drift apart.
+//! `docs/performance.md`. The exploratory report is in
+//! `benches/claim_bench.rs`. It covers every gate at every backlog depth, plus
+//! `EXPLAIN (ANALYZE, BUFFERS)`. It shares the [`claim_bench_support`] harness
+//! of this crate, so the gate and the benchmark can never drift apart.
 //!
 //! # Why p50 and not p99
 //!
-//! The headline scenario runs 8 concurrent claimers against a 4-core reference
-//! box, so the database is deliberately oversubscribed — contention is the point
-//! of the scenario. That makes the *tail* a measurement of the run queue rather
-//! than of the claim path: across repeated reference runs p50 moved ~2.3x
-//! between an idle and a loaded box (~220 ms → ~516 ms) while p99 moved ~15x
+//! The headline scenario runs 8 concurrent claimers against a 4-core
+//! reference box. The database is deliberately oversubscribed, because the
+//! scenario measures contention. So the *tail* measures the run queue, not the
+//! claim path. Across repeated reference runs, p50 moved ~2.3x between an idle
+//! and a loaded box (~220 ms → ~516 ms). p99 moved ~15x
 //! (~300 ms → ~4 665 ms). A p99 gate at this budget failed about one run in
 //! three during review, on the same hardware class that produced the published
 //! numbers. p99 is still measured, still published, and printed below on
@@ -56,11 +56,11 @@ use super::claim_bench_support::{
 };
 
 // The published budget lives in the shared harness as
-// `HEADLINE_P50_BUDGET_MS`, not here, so a pure test can hold it and the
-// wall-clock ceiling to a coherent pair — a latency budget the wall clock does
-// not admit would make the truncation assertion fire before this gate ever
-// rendered a verdict. See its doc comment for how the number was derived and
-// why it is a cliff detector rather than a drift detector.
+// `HEADLINE_P50_BUDGET_MS`, not here. So a pure test can hold it and the
+// wall-clock ceiling to a coherent pair. Suppose the wall clock does not admit
+// the latency budget. The truncation assertion then fires before this gate
+// renders a verdict. Its doc comment derives the number. It also says why it
+// is a cliff detector, not a drift detector.
 //
 // Override for a one-off run with `HARVEST_CLAIM_BUDGET_MS`, deliberately not
 // named for a statistic so it stays honest if the gate ever asserts a different
@@ -68,8 +68,8 @@ use super::claim_bench_support::{
 
 /// Minimum fraction of measured operations that must actually return a task.
 ///
-/// Without this floor the gate could "pass" while measuring nothing: a harness
-/// that claimed zero tasks would report a tiny latency for a queue it never
+/// Without this floor, the gate could "pass" while it measures nothing. A
+/// harness that claims zero tasks reports a tiny latency for a queue it never
 /// touched.
 const MIN_CLAIM_RATIO: f64 = 0.90;
 
@@ -154,10 +154,10 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
         report.stats.count,
     );
 
-    // Soundness zero-and-a-half: `count >= MIN_MEANINGFUL_SAMPLES` can be
-    // satisfied by a run that was cut off part way, and a truncated run's
-    // percentiles describe a shorter, differently-warmed window than the
-    // published ones. The gate defends a *complete* scenario or it says so.
+    // Soundness zero-and-a-half: a run that was cut off part way can satisfy
+    // `count >= MIN_MEANINGFUL_SAMPLES`. The percentiles of a truncated run
+    // describe a shorter, differently-warmed window than the published ones.
+    // The gate defends a *complete* scenario or it says so.
     assert!(
         !report.truncated,
         "measurement unsound: the scenario hit its {}s wall-clock budget and \
@@ -170,12 +170,11 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
     );
 
     // Soundness zero-and-three-quarters: `truncated` is set only where the
-    // harness *checks* the deadline, so it cannot catch an await that never
-    // returns to a check — a stalled pool checkout, say. Assert the ceiling
-    // the harness advertises directly, against the clock, so an unbounded
-    // wait anywhere in the scenario surfaces as a failure rather than as a
-    // job that quietly runs for minutes past its cap. See `WALL_CLOCK_SLACK`
-    // for why the slack is safe.
+    // harness *checks* the deadline. So it cannot catch an await that never
+    // returns to a check, such as a stalled pool checkout. This asserts the
+    // advertised ceiling directly against the clock. An unbounded wait in the
+    // scenario then fails, and the job cannot run for minutes past its cap.
+    // See `WALL_CLOCK_SLACK` for why the slack is safe.
     let ceiling = scenario_time_budget() + WALL_CLOCK_SLACK;
     assert!(
         report.wall_secs <= ceiling.as_secs_f64(),
@@ -218,10 +217,10 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
         scenario.backlog,
     );
 
-    // The gate itself. Asserted on p50 rather than p99: at 8 claimers against a
-    // 4-core box the tail measures the run queue, not the claim path (see the
-    // module docs). The full stat line — p99 included — is in the message, so a
-    // tail regression is still visible to whoever reads the failure.
+    // The gate itself. It asserts p50, not p99. At 8 claimers against a
+    // 4-core box, the tail measures the run queue, not the claim path (see the
+    // module docs). The message carries the full stat line, p99 included. So
+    // a tail regression is still visible in the failure.
     assert_eq!(
         budget_verdict(report.stats.p50_ms, budget),
         BudgetVerdict::WithinBudget,
@@ -241,10 +240,9 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
 /// The gate must be falsifiable against **real measured data**, not just in the
 /// unit tests of the comparison function.
 ///
-/// Runs the same measurement and asserts that a budget below the observed p50 —
-/// the statistic the gate actually asserts on — would have tripped it. Without
-/// this, a harness bug that reported `0.0` for every percentile would let the
-/// gate pass forever.
+/// Runs the same measurement. Asserts that a budget below the observed p50
+/// trips the gate, because the gate asserts on p50. Without this, a harness
+/// bug that reports `0.0` for every percentile lets the gate pass forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gate_would_trip_on_a_budget_below_the_measured_p50() {
     let Some(db) = bench_db_or_skip().await else {
@@ -297,9 +295,9 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         report.rows_per_sec(),
     );
 
-    // Same soundness contract as the claim gate: a run that stopped on the
-    // wall-clock ceiling has percentiles over a partial window, so say so
-    // rather than publishing them.
+    // Same soundness contract as the claim gate. A run that stopped on the
+    // wall-clock ceiling has percentiles over a partial window. Say so, and do
+    // not publish them.
     assert!(
         !report.truncated,
         "measurement unsound: the enqueue scenario hit its {}s wall-clock budget \
@@ -310,10 +308,10 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         SCENARIO_BUDGET_ENV_VAR,
     );
 
-    // And the backstop the claim gate learned the hard way: `truncated` is only
-    // set where the harness *checks* the deadline, so it can never catch an
-    // await that never returns to a check. Assert the ceiling directly, so a
-    // future unbounded await fails here instead of hanging CI.
+    // The same backstop as the claim gate. `truncated` is set only where the
+    // harness *checks* the deadline. So it cannot catch an await that never
+    // returns to a check. Assert the ceiling directly, so a future unbounded
+    // await fails here instead of hanging CI.
     let ceiling = scenario_time_budget() + WALL_CLOCK_SLACK;
     assert!(
         report.wall_secs <= ceiling.as_secs_f64(),
@@ -338,10 +336,10 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         "enqueue p99 must be a real measurement",
     );
 
-    // The point of the scenario is in its name: these writes went into a queue
-    // that already had `backlog` rows in it, because a start-storm hits a live
-    // queue, not an empty one. Without this the harness could silently stop
-    // seeding and the test would still pass while measuring the easy case.
+    // These writes went into a queue that already held `backlog` rows. A
+    // start-storm hits a live queue, not an empty one. Without this check, the
+    // harness could silently stop seeding. The test would then pass while it
+    // measures the easy case.
     let mut conn =
         with_verify_deadline("connect", scenario_time_budget(), db::connect(&db.url)).await;
     let pending = with_verify_deadline(
@@ -361,25 +359,25 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
 
 /// The enqueue path honours the scenario wall-clock ceiling.
 ///
-/// Both awaits on that path — the pool checkout and `queue::enqueue` itself —
-/// are unbounded, so without a deadline a stalled server hangs the benchmark
-/// (and the gate above) until the outer CI workflow timeout, while
-/// `docs/performance.md` advertises a per-scenario cap. The claim path learned
-/// this two rounds earlier; this pins the same contract for writes.
+/// Both awaits on that path are unbounded: the pool checkout and
+/// `queue::enqueue`. Without a deadline, a stalled server hangs the benchmark
+/// and the gate above until the outer CI workflow timeout. But
+/// `docs/performance.md` advertises a per-scenario cap. The claim path already
+/// has this contract. This test pins it for writes.
 ///
 /// Deterministic rather than timing-dependent: it asks for far more rows than
 /// the budget can absorb, so the ceiling *must* bite. Without the deadline the
 /// run writes all of them — minutes of work — which is the bug.
 ///
-/// Existing-server mode only. The budget is *injected* rather than set in the
-/// environment: `HARVEST_BENCH_SCENARIO_SECS` is process-global and `cargo
-/// test` runs a binary's tests in parallel by default, so setting it here would
-/// hand every sibling scenario a one-second ceiling they never asked for and
-/// would report as truncated. The CI manifest happens to pass
-/// `--test-threads=1`, but a plain local `cargo test ... claim_budget_tests`
-/// does not, and a test that only holds under a particular harness flag is a
-/// trap. Injection removes the shared mutable state instead of scheduling
-/// around it — there is no window to leave open, on panic or otherwise.
+/// Existing-server mode only. The budget is *injected*, not set in the
+/// environment. `HARVEST_BENCH_SCENARIO_SECS` is process-global, and `cargo
+/// test` runs the tests of a binary in parallel by default. Setting it here
+/// gives every sibling scenario a one-second ceiling, so they report as
+/// truncated. The CI manifest passes `--test-threads=1`. A plain local
+/// `cargo test ... claim_budget_tests` does not. A test that holds only under
+/// one harness flag is a trap. Injection removes the shared mutable state
+/// instead of scheduling around it. So no window stays open, on panic or
+/// otherwise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
     let Some(db) = bench_db_or_skip().await else {
@@ -405,15 +403,14 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
     // The ceiling is only meaningful if the run actually *stopped*. `truncated`
     // alone would be satisfied by a run that set the flag and kept writing.
     //
-    // Measured against `wall_secs` — the span from the earliest writer resume
-    // to the latest writer finish — and deliberately *not* against the elapsed
-    // time of the call. `budget` bounds the measured writes only; connect,
+    // Measured against `wall_secs`, the span from the earliest writer resume
+    // to the latest writer finish. It is deliberately *not* the elapsed time
+    // of the call. `budget` bounds the measured writes only. Connect,
     // `TRUNCATE`, seed and `ANALYZE` run under `setup_time_budget()`, which is
-    // the whole scenario budget. Timing the call therefore compares an
-    // unbounded-by-`budget` setup against a one-second ceiling, and fails on a
-    // loaded machine for a reason that has nothing to do with the deadline
-    // being enforced — observed as a flake in the full gate suite, passing in
-    // isolation. The window has to be the same one the deadline governs.
+    // the whole scenario budget. Timing the call compares that setup against a
+    // one-second ceiling. On a loaded machine it fails for a reason unrelated
+    // to the deadline. That was a flake in the full gate suite that passed in
+    // isolation. The window must be the one that the deadline governs.
     let ceiling = budget + WALL_CLOCK_SLACK;
     assert!(
         report.wall_secs <= ceiling.as_secs_f64(),
@@ -436,11 +433,11 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
 ///
 /// The `*_with_budget` runners exist so a test can inject a tiny ceiling and
 /// assert the measured phase stops at it. Passing that same ceiling to
-/// `connect_and_seed` made the test depend on how fast the server connects,
-/// truncates, seeds and `ANALYZE`s: on a loaded runner or a remote server the
-/// one second above is not enough for setup, and the run panics with
-/// "benchmark setup stalled" before a single write is measured — the opposite
-/// of the determinism the test above is written for.
+/// `connect_and_seed` made the test depend on server speed for connect,
+/// truncate, seed and `ANALYZE`. On a loaded runner or a remote server, one
+/// second is not enough for setup. The run then panics with "benchmark setup
+/// stalled" before it measures a single write. That defeats the determinism
+/// that the test above is written for.
 ///
 /// A millisecond is unarguably too short for connect + seed, so this fails
 /// outright against the previous behaviour rather than only on a slow machine.
@@ -467,9 +464,11 @@ async fn injected_budget_bounds_the_measured_phase_not_setup() {
     );
 }
 
-/// Every accreted gate must still be *measurable* — a scenario that silently
-/// stops exercising its predicate (because a seeding column was renamed, say)
-/// would leave the per-gate cost table in `docs/performance.md` lying.
+/// Every accreted gate must still be *measurable*.
+///
+/// A scenario can silently stop exercising its predicate, for example after a
+/// seeding column rename. The per-gate cost table in `docs/performance.md`
+/// would then be wrong.
 ///
 /// Runs each gate at a small backlog and asserts it produced real claims.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -514,14 +513,14 @@ async fn every_accreted_gate_scenario_still_claims_tasks() {
 /// Each gate scenario must actually put its predicate on the execution path.
 ///
 /// [`every_accreted_gate_scenario_still_claims_tasks`] proves the rows are
-/// claimable, but that assertion cannot detect a scenario that stopped setting
-/// its trigger column: such a run still claims 100% of its operations — the
-/// claim just takes the cheap `IS NULL` leg. The published per-gate cost table
-/// would then be reporting the baseline under six different names.
+/// claimable. It cannot detect a scenario that stopped setting its trigger
+/// column. Such a run still claims 100% of its operations through the cheap
+/// `IS NULL` leg. The published per-gate cost table then reports the baseline
+/// under six different names.
 ///
-/// This test censuses the seeded rows and asserts each gate sets what it claims
-/// to, and — just as importantly — that it does *not* set the others, so a
-/// "seed everything always" regression is caught too.
+/// This test censuses the seeded rows. It asserts that each gate sets its own
+/// trigger column and does *not* set the others. So it also catches a "seed
+/// everything always" regression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_gate_scenario_actually_seeds_its_trigger_column() {
     let Some(db) = bench_db_or_skip().await else {
@@ -604,9 +603,9 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             "gate `{name}`: PAUSED ballast census wrong ({census:?})",
         );
 
-        // A build-routed claim only reaches the expensive `EXISTS` branch when a
-        // compat declaration exists; without it the worker's build would have to
-        // match by equality and the scenario would measure the cheap leg.
+        // A build-routed claim reaches the expensive `EXISTS` branch only when a
+        // compat declaration exists. Without it, the build of the worker must
+        // match by equality, and the scenario measures the cheap leg.
         assert_eq!(
             census.build_compat_rows,
             i64::from(expect_build),
@@ -617,12 +616,12 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
 
 /// `double_backlog` is only a valid control if it is genuinely equal-depth.
 ///
-/// The `paused_rows` attribution in `docs/performance.md` is reported against
-/// `double_backlog` rather than `baseline` specifically because claim latency is
-/// superlinear in table depth: comparing a 2x-deep scenario against a 1x-deep
-/// one charges the anti-join for the extra rows as well as for itself. That
-/// correction is worthless unless the two scenarios really do seed the same
-/// number of pending rows, which is what this asserts.
+/// `docs/performance.md` reports the `paused_rows` attribution against
+/// `double_backlog`, not `baseline`. Claim latency is superlinear in table
+/// depth. A 2x-deep scenario against a 1x-deep one charges the anti-join for
+/// the extra rows as well as for itself. That correction is worthless unless
+/// both scenarios seed the same number of pending rows. This test asserts
+/// that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_paused_rows_control_seeds_equal_total_depth() {
     let Some(db) = bench_db_or_skip().await else {
@@ -702,10 +701,11 @@ fn headline_scenario_matches_the_published_contract() {
 /// A benchmark database is defended by a live backend, not just by its name.
 ///
 /// The stale-database sweep reclaims anything with no server-visible
-/// connections. Between scenarios a run holds none of its own — each scenario
-/// opens a connection, seeds, drops it, builds a pool, drops that — so without
-/// a retained lease a concurrent run on another host sees zero backends and
-/// `DROP DATABASE ... WITH (FORCE)`s a live working set out from under it.
+/// connections. Between scenarios, a run holds no connection of its own. Each
+/// scenario opens a connection, seeds, drops it, builds a pool and drops that.
+/// Without a retained lease, a concurrent run on another host sees zero
+/// backends. It then runs `DROP DATABASE ... WITH (FORCE)` on a live working
+/// set.
 ///
 /// Scoped to the existing-server mode on purpose: that is the only mode where
 /// a foreign client can reach the database at all. On the testcontainer path
@@ -743,12 +743,12 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
         return;
     };
 
-    // `with_db_name` put the database in the path; read it back out with the
-    // parser that is its inverse. A naive `rsplit('/')` here would reintroduce
-    // the exact bug `with_db_name` exists to avoid: against an admin URL like
-    // `?sslrootcert=/etc/ssl/root.crt` the last slash sits inside the query, so
-    // the name would come back as `root.crt` and this test would fail against a
-    // perfectly healthy lease.
+    // `with_db_name` put the database in the path. Read it back with the
+    // inverse parser. A naive `rsplit('/')` reintroduces the bug that
+    // `with_db_name` avoids. In an admin URL like
+    // `?sslrootcert=/etc/ssl/root.crt`, the last slash is inside the query.
+    // The name then comes back as `root.crt`, and this test fails against a
+    // healthy lease.
     let datname = db_name_from_url(&bench.url).expect("bench url always carries a database path");
 
     let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
@@ -778,19 +778,19 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
 
 /// The lease survives a server that reaps idle sessions.
 ///
-/// The lease defends a running benchmark by *being* an idle backend, which is
-/// exactly what Postgres 14's `idle_session_timeout` kills — and setting it is
-/// an entirely reasonable thing to do on the shared cluster existing-server mode
-/// is designed for. Reaped mid-run, the lease leaves `BenchDb` holding a dead
-/// handle while a concurrent sweep sees zero backends, concludes the database is
-/// abandoned, and drops it. Both sides fail silently: nothing tells the victim,
-/// and the sweeper is reasoning correctly from the evidence it has.
+/// The lease defends a running benchmark by *being* an idle backend. The
+/// `idle_session_timeout` of Postgres 14 kills exactly that. Setting it is
+/// reasonable on the shared cluster that existing-server mode targets. If the
+/// lease is reaped mid-run, `BenchDb` holds a dead handle. A concurrent sweep
+/// then sees zero backends, concludes the database is abandoned, and drops it.
+/// Both sides fail silently. Nothing tells the victim, and the sweeper reasons
+/// correctly from its evidence.
 ///
-/// Deliberately session-scoped. The realistic trigger is a server- or role-level
-/// default, but setting one here would be shared mutable state on a server other
-/// tests are using concurrently — the same hazard as writing the scenario budget
-/// into the environment. A session-local `SET` reproduces exactly what the lease
-/// inherits, and reaches nothing else.
+/// Deliberately session-scoped. The realistic trigger is a server- or
+/// role-level default. Setting one here is shared mutable state on a server
+/// that other tests use concurrently. That is the same hazard as writing the
+/// scenario budget into the environment. A session-local `SET` reproduces
+/// exactly what the lease inherits, and reaches nothing else.
 ///
 /// Falsifiable in both directions: an unarmed session under the same timeout must
 /// actually die, or the armed one proves nothing.
@@ -916,18 +916,17 @@ async fn the_lease_survives_a_server_that_reaps_idle_sessions() {
 
 /// A process reclaims its **own** finished databases, not just other runs'.
 ///
-/// `run_token()` is constant for the life of a process, so an ownership-keyed
-/// self-exemption in the sweep meant a process could never clean up after
-/// itself: every [`db::setup_bench_db`] call left one migrated database — up to
-/// 100k rows — behind until some *other* process happened to sweep. This suite
-/// alone calls setup once per test, and the benchmark calls it a dozen times,
-/// so the leak was per-run and cumulative rather than exotic. Measured before
-/// the fix: one run of this suite left eight databases; after it, one.
+/// `run_token()` is constant for the life of a process. So an ownership-keyed
+/// self-exemption in the sweep meant a process never cleaned up after itself.
+/// Each [`db::setup_bench_db`] call left one migrated database of up to 100k
+/// rows. It stayed until some *other* process swept. This suite calls setup
+/// once per test, and the benchmark calls it a dozen times. So the leak was
+/// per-run and cumulative, not exotic. Before the fix, one run of this suite
+/// left eight databases. After it, one.
 ///
-/// The lease is what makes dropping the exemption safe, and this test pins both
-/// halves of that: the first database is reclaimed only *after* its `BenchDb` is
-/// dropped, so a still-live prior database is protected by its own backend
-/// rather than by its name.
+/// The lease makes dropping the exemption safe, and this test pins both
+/// halves. The first database is reclaimed only *after* its `BenchDb` is
+/// dropped. So its own backend protects a live prior database, not its name.
 ///
 /// Existing-server mode only, matching its siblings — the testcontainer path
 /// gets a private server per process and has nothing to sweep.
@@ -971,8 +970,8 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
     let first_name =
         db_name_from_url(&first.url).expect("bench url always carries a database path");
 
-    // While the first is still held, a second setup must leave it alone: its
-    // lease says "in use", and that is the only thing that should matter.
+    // While the first is held, a second setup must leave it alone. Its lease
+    // says "in use", and only that matters.
     let Ok(second) = db::setup_bench_db().await else {
         eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: no database");
         return;
@@ -1001,12 +1000,12 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
 
 /// A database that merely *shares our prefix* is never dropped.
 ///
-/// The sweep is the only destructive thing this harness does to a server it
-/// does not own, so what counts as "ours" has to be the full minted shape —
-/// `harvest_claim_bench_{pid}_{16 hex}_{seq}` — and not a prefix plus a
-/// plausible field or two. Checking only a numeric first field and the presence
-/// of a second meant a name like `harvest_claim_bench_123_production` parsed as
-/// pid `123`, token `production`, and an idle database nobody here minted
+/// The sweep is the only destructive action of this harness on a server it
+/// does not own. So "ours" must mean the full minted shape
+/// `harvest_claim_bench_{pid}_{16 hex}_{seq}`, not a prefix plus a plausible
+/// field or two. The old check read only a numeric first field and the
+/// presence of a second. So `harvest_claim_bench_123_production` parsed as pid
+/// `123`, token `production`. An idle database that nobody here minted then
 /// reached `pg_terminate_backend` and `DROP DATABASE`.
 ///
 /// The decoy below is deliberately in that vulnerable class: prefixed, numeric
@@ -1014,14 +1013,13 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
 ///
 /// # Why this is written so defensively
 ///
-/// The decoy has to sit **inside** the swept `harvest_claim_bench_%` prefix or
-/// it would not be a candidate and the test would prove nothing. That is also
-/// what makes it dangerous: once the fix lands, no sweep will ever reclaim it,
-/// so a panic between `CREATE DATABASE` and its `DROP` strands a database on a
-/// shared server permanently. So nothing here panics in that span — failures
-/// are collected into a value, cleanup runs unconditionally, and every
-/// assertion happens after it. (An earlier probe in this file learned that the
-/// hard way and left two orphans behind.)
+/// The decoy must sit **inside** the swept `harvest_claim_bench_%` prefix.
+/// Otherwise it is not a candidate, and the test proves nothing. That also
+/// makes it dangerous. With the fix, no sweep ever reclaims it. A panic
+/// between `CREATE DATABASE` and its `DROP` then strands a database on a
+/// shared server forever. So nothing here panics in that span. Failures go
+/// into a value, cleanup runs unconditionally, and every assertion comes after
+/// it. An earlier probe in this file panicked there and left two orphans.
 ///
 /// Existing-server mode only — the testcontainer path sweeps a private server.
 #[tokio::test]
@@ -1057,11 +1055,12 @@ async fn a_foreign_database_sharing_our_prefix_is_never_dropped() {
     };
 
     // Prefixed and numeric-then-arbitrary, so the old two-field check accepted
-    // it, yet never a name this harness could mint. Named unmistakably after
-    // this probe so it cannot collide with a database an operator cares about,
-    // and carrying the run token because a pid alone is not unique across hosts
-    // — the drop below is unconditional, so two pid-1 runs would delete each
-    // other's live decoy. See `sweep_probe_decoy_name` for both properties.
+    // it. Yet this harness can never mint it. The name clearly marks this
+    // probe, so it cannot collide with a database that an operator cares
+    // about. It carries the run token, because a pid alone is not unique
+    // across hosts. The drop below is unconditional, so two pid-1 runs would
+    // delete the live decoy of each other. See `sweep_probe_decoy_name` for
+    // both properties.
     let decoy = sweep_probe_decoy_name(std::process::id(), db::run_token());
 
     // A previous crashed run of this test could have stranded one.
@@ -1111,19 +1110,19 @@ async fn a_foreign_database_sharing_our_prefix_is_never_dropped() {
 ///
 /// A database is only defended once it has a backend in `pg_stat_activity`, and
 /// it cannot have one until it exists. Between `CREATE DATABASE` and the lease
-/// connection, a sweep running on another host sees a real database with zero
-/// connections and correctly concludes it is abandoned — no naming scheme fixes
-/// that. Setup therefore holds an advisory lock across the whole span, which is
-/// the same lock every sweep must take.
+/// connection, a sweep on another host sees a real database with zero
+/// connections. It correctly concludes that the database is abandoned. No
+/// naming scheme fixes that. So setup holds an advisory lock across the whole
+/// span. Every sweep must take the same lock.
 ///
-/// This proves the mechanism rather than trying to hit the window: hold the
-/// lock externally and assert setup blocks, then release it and assert setup
-/// completes. If the lock is ever dropped from the setup path, setup stops
-/// blocking and this fails.
+/// This proves the mechanism instead of trying to hit the window. It holds the
+/// lock externally and asserts that setup blocks. It then releases it and
+/// asserts that setup completes. If the setup path ever drops the lock, setup
+/// stops blocking and this fails.
 ///
-/// The holder connects to `db::SWEEP_LOCK_DB`, not to the admin URL's own
-/// database, because advisory locks are database-scoped: taking it anywhere
-/// else would only conflict when the two happen to coincide.
+/// The holder connects to `db::SWEEP_LOCK_DB`, not to the database of the
+/// admin URL. Advisory locks are database-scoped. Taken anywhere else, the
+/// lock conflicts only when the two databases happen to coincide.
 ///
 /// Existing-server mode only — the testcontainer path has no foreign clients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1184,17 +1183,17 @@ async fn setup_waits_for_a_peers_sweep_before_creating_its_database() {
 /// The sweep lock is taken in a fixed database, not in whichever one the admin
 /// URL happens to name.
 ///
-/// Postgres advisory locks are scoped to the session's database, not to the
-/// cluster: two sessions on different databases hold the same key at the same
-/// time without conflicting. If the lock rode the admin connection, two runs
-/// reaching the same server through different admin databases would not
-/// serialize at all — each would sweep while the other sat in its
-/// create-to-lease window, which is exactly the hole the lock exists to close.
+/// Postgres advisory locks are scoped to the database of the session, not to
+/// the cluster. Two sessions on different databases hold the same key at once
+/// without conflict. Suppose the lock rode the admin connection. Two runs that
+/// reach one server through different admin databases then never serialize.
+/// Each sweeps while the other is in its create-to-lease window. The lock
+/// exists to close exactly that hole.
 ///
-/// Falsifiable independently of how this suite is configured: the holder sits
-/// in `SWEEP_LOCK_DB` while the lock is requested through an admin URL naming a
-/// *different* database. Locking the passed URL's own database — the bug —
-/// finds no conflict and returns immediately.
+/// Falsifiable whatever the suite configuration. The holder sits in
+/// `SWEEP_LOCK_DB`. The lock request goes through an admin URL that names a
+/// *different* database. The bug locks the database of the passed URL, finds
+/// no conflict and returns at once.
 ///
 /// Existing-server mode only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1216,17 +1215,17 @@ async fn the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s() {
     };
 
     // A scratch database standing in for an operator whose admin URL points
-    // somewhere other than `SWEEP_LOCK_DB`. Named outside the bench prefix so
-    // the sweep never touches it, and carrying the run token: the drop below is
-    // unconditional, so a pid-only name lets two runs sharing a cluster from
-    // different PID namespaces — both pid 1 under containers — delete each
-    // other's live scratch mid-probe.
+    // somewhere other than `SWEEP_LOCK_DB`. The name is outside the bench
+    // prefix, so the sweep never touches it. It carries the run token, because
+    // the drop below is unconditional. Two runs can share a cluster from
+    // different PID namespaces, both pid 1 under containers. With a pid-only
+    // name, each deletes the live scratch of the other mid-probe.
     //
-    // The token means a strand is never reclaimed by a later same-pid run, but
-    // that was never a reliable cleanup: what actually prevents strands is that
-    // nothing between the create and the drop may panic (see below). Trading a
-    // coincidental cleanup for the removal of a destructive collision is the
-    // right way round, and both probe names are unmistakable to an operator.
+    // With the token, a later same-pid run never reclaims a strand. That was
+    // never a reliable cleanup. Strands are prevented because nothing between
+    // the create and the drop may panic (see below). Losing a coincidental
+    // cleanup to remove a destructive collision is the right trade. Both probe
+    // names are clear to an operator.
     let scratch = format!(
         "harvest_sweep_scope_probe_{}_{}",
         std::process::id(),
@@ -1246,11 +1245,11 @@ async fn the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s() {
         );
         return;
     }
-    // Nothing between the create above and the drop below may panic: `scratch`
-    // sits outside the swept `harvest_claim_bench_%` prefix precisely so a
-    // concurrent sweep cannot delete it mid-probe, which also means nothing
-    // would ever reclaim it. So the probe reports failures instead of
-    // `expect`ing them, and the assertions run after cleanup.
+    // Nothing between the create above and the drop below may panic.
+    // `scratch` sits outside the swept `harvest_claim_bench_%` prefix, so a
+    // concurrent sweep cannot delete it mid-probe. So nothing would ever
+    // reclaim it either. The probe reports failures instead of `expect`ing
+    // them, and the assertions run after cleanup.
     let scratch_url = with_db_name(&admin_url, &scratch)
         .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
     let outcome = probe_sweep_lock_scope(&scratch_url, &admin_url).await;
@@ -1326,14 +1325,14 @@ async fn probe_sweep_lock_scope(probe_admin_url: &str, admin_url: &str) -> Resul
 ///
 /// `tokio-postgres` applies the path first and the query second, assigning the
 /// same `Config::dbname`, so an admin URL carrying `?dbname=...` silently wins.
-/// Every connection this harness derives — the sweep lock, the lease, the
-/// migration connection — is built by `with_db_name`, and the benchmark issues
-/// `TRUNCATE` through them. The consequence of getting this wrong is that a
-/// benchmark run migrates and truncates the operator's *admin* database.
+/// `with_db_name` builds every connection that this harness derives: the sweep
+/// lock, the lease and the migration connection. The benchmark issues
+/// `TRUNCATE` through them. If this is wrong, a benchmark run migrates and
+/// truncates the *admin* database of the operator.
 ///
-/// Asserting `current_database()` is the point: this is the one claim that
-/// cannot be established by reading the URL, because the whole bug is that the
-/// URL reads correctly while the connection goes somewhere else.
+/// The test asserts `current_database()`. Reading the URL cannot establish
+/// this claim. In the bug, the URL reads correctly while the connection goes
+/// somewhere else.
 #[tokio::test]
 async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
     use diesel::QueryableByName;
@@ -1394,12 +1393,11 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
 
     // Clean up before asserting, so a failure does not also leak a database.
     //
-    // Version-neutral rather than `WITH (FORCE)`: that clause is PostgreSQL 13+
-    // and this cleanup ignores its result, so on 12 the decoy would survive
-    // silently — and unlike a stale bench database it carries no
-    // `BENCH_DB_PREFIX`, so the harness sweep can never reclaim it either. The
-    // name is minted a few lines above, which is what makes it safe to
-    // interpolate.
+    // Version-neutral, not `WITH (FORCE)`. That clause needs PostgreSQL 13+,
+    // and this cleanup ignores its result. So on 12 the decoy survives
+    // silently. Unlike a stale bench database, it carries no
+    // `BENCH_DB_PREFIX`, so the harness sweep never reclaims it either. The
+    // name is minted a few lines above, so it is safe to interpolate.
     db::drop_database_version_neutral(&mut admin, &decoy).await;
 
     let landed = landed.expect("the rewritten URL must be connectable");
@@ -1414,20 +1412,20 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
 // ---------------------------------------------------------------------------
 // Setup-deadline bound (issue #786).
 //
-// These need no database, but they are async: a `#[tokio::test]` in
+// These need no database, but they are async. A `#[tokio::test]` in
 // `claim_bench_support.rs` would reclassify that shared harness as a suite
-// (`ci_run_coverage::claim_bench_support_is_classified_as_a_harness_not_a_suite`),
-// and the guard's own remedy is to put the test in a file that already has a
+// (`ci_run_coverage::claim_bench_support_is_classified_as_a_harness_not_a_suite`).
+// The remedy of that guard is to put the test in a file that already has a
 // manifest row. This is that file.
 // ---------------------------------------------------------------------------
 
 /// A server that stops answering must not park the bench forever.
 ///
-/// `connect` and `seed` run before the measured phase's deadline exists, so
-/// nothing bounded them: a stalled server would hold the CI gate until the
-/// outer workflow timeout while the page advertises a per-scenario cap. The
-/// clock is paused, so a future that never resolves is decided by the
-/// deadline rather than by waiting out four real minutes.
+/// `connect` and `seed` run before the deadline of the measured phase exists.
+/// So nothing bounded them. A stalled server held the CI gate until the outer
+/// workflow timeout, while the page advertises a per-scenario cap. The clock
+/// is paused, so the deadline decides a future that never resolves. The test
+/// does not wait out four real minutes.
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "benchmark setup stalled")]
 async fn setup_deadline_refuses_to_wait_out_a_stalled_server() {
@@ -1445,9 +1443,9 @@ async fn setup_deadline_returns_a_step_that_finishes_in_time() {
 
 /// An already-elapsed deadline is a *failure*, not "no deadline".
 ///
-/// The remaining budget clamps to zero, and a zero timeout has to trip rather
-/// than be read as unbounded — the failure mode this whole change exists to
-/// remove. (It does not distinguish `saturating_duration_since` from plain
+/// The remaining budget clamps to zero. A zero timeout must trip, not read as
+/// unbounded, which is the failure mode that this change removes. (It does
+/// not distinguish `saturating_duration_since` from plain
 /// `Instant` subtraction: both saturate to zero since Rust 1.60.)
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "benchmark setup stalled")]
@@ -1461,11 +1459,11 @@ async fn setup_deadline_in_the_past_trips_immediately() {
 /// The *post*-measurement soundness checks must not park the gate either.
 ///
 /// `with_setup_deadline` closed the hole at the front of a scenario. The gate
-/// tests then reconnect *after* the measured phase to verify the run was sound
-/// (the backlog was not drained; the enqueue really did write into a non-empty
-/// queue), and those awaits sat outside every deadline: the measured phase had
-/// already consumed its own, so nothing bounded them. A server that stopped
-/// answering between the last claim and the verification would hold the CI gate
+/// tests then reconnect *after* the measured phase to verify the run. They
+/// check that the backlog was not drained and that the enqueue wrote into a
+/// non-empty queue. Those awaits sat outside every deadline, because the
+/// measured phase had already used its own. A server that stopped answering
+/// between the last claim and the verification held the CI gate. It held it
 /// until the outer workflow timeout.
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "post-measurement check stalled")]
@@ -1492,12 +1490,11 @@ async fn verify_deadline_returns_a_check_that_finishes_in_time() {
 
 /// The verify ceiling is *fresh*, not what the measured phase left over.
 ///
-/// This is the whole reason it takes a `Duration` rather than the measured
-/// phase's `Instant`. A scenario is allowed to consume its entire budget — that
-/// is the contract — so a deadline shared with the measurement would have zero
-/// left by the time verification starts, and every soundness check would "time
-/// out" against a perfectly healthy server. Simulated by burning the full
-/// scenario budget on the paused clock before verifying.
+/// That is why it takes a `Duration`, not the `Instant` of the measured phase.
+/// By contract, a scenario can consume its entire budget. A deadline shared
+/// with the measurement then has zero left when verification starts. Every
+/// soundness check would "time out" against a healthy server. The test burns
+/// the full scenario budget on the paused clock before it verifies.
 #[tokio::test(start_paused = true)]
 async fn verify_deadline_is_not_consumed_by_the_measured_phase() {
     tokio::time::sleep(scenario_time_budget() + Duration::from_secs(60)).await;
@@ -1561,24 +1558,23 @@ async fn provision_deadline_preserves_a_step_that_finishes_in_time() {
 
 /// Terminate-then-drop must evict a live backend, exactly as `WITH (FORCE)` did.
 ///
-/// The clause was doing real work: the sweep drops databases a crashed run left
-/// behind, and a plain `DROP DATABASE` against one that still has a backend
-/// attached fails with *"is being accessed by other users"*. Every cleanup site
-/// discards its result, so that failure is silent and the database leaks.
+/// The clause did real work. The sweep drops databases that a crashed run left
+/// behind. A plain `DROP DATABASE` on one with an attached backend fails with
+/// *"is being accessed by other users"*. Every cleanup site discards its
+/// result, so that failure is silent and the database leaks.
 ///
-/// Replacing the clause is therefore only safe if the replacement handles the
-/// same case — which is what this asserts, by holding a connection open across
-/// the drop. Its partner
-/// `no_cleanup_emits_the_postgres_13_only_force_clause` covers the half no CI
-/// server can reach: that the clause stays gone on a version old enough to
-/// reject it.
+/// So a replacement is safe only if it handles the same case. This test
+/// asserts that by holding a connection open across the drop. Its partner
+/// `no_cleanup_emits_the_postgres_13_only_force_clause` covers the half that
+/// no CI server can reach. It checks that the clause stays gone on a version
+/// old enough to reject it.
 ///
-/// Provisioned through [`db::setup_bench_db`] rather than
-/// `HARVEST_TEST_DATABASE_URL` so it runs in **both** modes. The checked CI
-/// manifest runs this suite Docker-backed and sets no such variable, so gating
-/// on it would have meant the one test proving terminate-then-drop still works
-/// never ran in CI at all. Any database can issue `CREATE`/`DROP DATABASE`, so
-/// the bench database serves as the admin session here.
+/// Provisioned through [`db::setup_bench_db`], not
+/// `HARVEST_TEST_DATABASE_URL`, so it runs in **both** modes. The checked CI
+/// manifest runs this suite Docker-backed and sets no such variable. Gating on
+/// it means that CI never runs the one test that proves terminate-then-drop.
+/// Any database can issue `CREATE`/`DROP DATABASE`, so the bench database
+/// serves as the admin session here.
 #[tokio::test]
 async fn version_neutral_drop_evicts_a_live_backend() {
     use diesel::QueryableByName;
@@ -1611,9 +1607,9 @@ async fn version_neutral_drop_evicts_a_live_backend() {
         .await
         .expect("create the victim database");
 
-    // Hold a connection open across the drop. Kept in scope deliberately — this
-    // is the condition under test, and dropping it early would make the
-    // assertion pass without exercising the terminate step at all.
+    // Hold a connection open across the drop. It stays in scope deliberately,
+    // because it is the condition under test. Dropping it early makes the
+    // assertion pass without exercising the terminate step.
     let victim_url = with_db_name(&bench.url, &victim).expect("the harness url is rewritable");
     let occupant = AsyncPgConnection::establish(&victim_url)
         .await
@@ -1661,8 +1657,8 @@ async fn version_neutral_drop_evicts_a_live_backend() {
 /// The provisioning session never sits on the database the operator named.
 ///
 /// Pure counterpart to `a_template1_backend_blocks_create_database_but_ours_does_not`
-/// below: that one proves the hazard is real against a live server, this one
-/// pins the decision that avoids it, cheaply and on every run.
+/// below. That test proves the hazard against a live server. This one pins the
+/// decision that avoids it, cheaply and on every run.
 #[test]
 fn provisioning_connects_through_the_fixed_database() {
     for admin_url in [
@@ -1684,16 +1680,15 @@ fn provisioning_connects_through_the_fixed_database() {
 
 /// A backend on `template1` blocks `CREATE DATABASE`; ours does not.
 ///
-/// `CREATE DATABASE` copies `template1` by default and Postgres refuses while
-/// any *other* session is attached to the template. The provisioning session is
-/// held across the whole sweep-lock wait, so an admin URL naming `template1`
-/// would turn every waiting client into a blocker for whichever client actually
-/// holds the lock.
+/// `CREATE DATABASE` copies `template1` by default. Postgres refuses while any
+/// *other* session is attached to the template. The provisioning session is
+/// held across the whole sweep-lock wait. So with an admin URL that names
+/// `template1`, every waiting client blocks the client that holds the lock.
 ///
-/// Both halves are asserted deliberately. The first shows the hazard is real
-/// rather than theoretical; the second is the regression guard — it opens its
-/// connection through [`db::admin_connection_url`], so reverting that to the
-/// operator's URL puts this backend back on `template1` and the create fails.
+/// Both halves are asserted deliberately. The first shows that the hazard is
+/// real, not theoretical. The second is the regression guard. It connects
+/// through [`db::admin_connection_url`]. Reverting that to the URL of the
+/// operator puts this backend back on `template1`, and the create fails.
 ///
 /// Existing-server mode only: it needs an admin URL an operator could plausibly
 /// have pointed at `template1`.
@@ -1773,19 +1768,18 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 /// anti-join rewrite in `queue::claim_task_query()` (issue #619 / Ledger perf
 /// pass).
 ///
-/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
-/// repeatable CI assertion — its output is read by a human reviewing the PR,
-/// not asserted on. See `cargo xtask perf queue-pause-claim`. It runs this
-/// exact test twice: once against the pre-fix shape of `queue.rs`, and once
-/// against the current tree. The two runs produce the paired
+/// `#[ignore]`d on purpose: a one-shot evidence-capture tool, not a
+/// repeatable CI assertion. A human who reviews the PR reads its output.
+/// Nothing asserts on it. See `cargo xtask perf queue-pause-claim`. It runs
+/// this exact test twice: once against the pre-fix shape of `queue.rs`, and
+/// once against the current tree. The two runs produce the paired
 /// `docs/perf-artifacts/queue-pause-claim-anti-join/` files the PR cites.
 ///
-/// Self-detects which shape it is currently measuring by inspecting
-/// `queue::claim_task_query()`'s own text (`paused_queues AS MATERIALIZED`
-/// present or absent), so a single invocation always writes to the
-/// correctly-labelled `before-*`/`after-*` files regardless of which revision
-/// happens to be checked out — there is no separate "old" copy of the query
-/// text to drift out of sync with the real function.
+/// It detects the shape it measures from the text of
+/// `queue::claim_task_query()`: `paused_queues AS MATERIALIZED` is present or
+/// absent. So each invocation writes to the correct `before-*`/`after-*`
+/// files, whatever revision is checked out. No separate "old" copy of the
+/// query text can drift from the real function.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
             cargo xtask perf queue-pause-claim"]
@@ -1837,10 +1831,10 @@ async fn zz_capture_queue_pause_claim_evidence() {
 
     let mut summary_lines: Vec<String> = vec![format!("label={label}")];
 
-    // One EXPLAIN capture per published backlog depth -- shows the cost is
-    // driven by candidate rows scanned (loops=N), not a fixed per-call
-    // overhead, corroborating the mechanism claim rather than just the
-    // headline number.
+    // One EXPLAIN capture per published backlog depth. It shows that
+    // candidate rows scanned (loops=N) drive the cost, not a fixed per-call
+    // overhead. That supports the mechanism claim, not only the headline
+    // number.
     for backlog in super::claim_bench_support::BACKLOG_SWEEP {
         let scenario = Scenario {
             backlog,
@@ -1853,12 +1847,11 @@ async fn zz_capture_queue_pause_claim_evidence() {
         let seeded = db::seed(&mut conn, scenario).await;
 
         let queues = db::queue_names(scenario);
-        // Pause the first polled queue: representative of an operator holding
-        // one queue, and it lets this same capture demonstrate the exclusion
-        // is still correct (that queue's rows never appear in a real claim)
-        // alongside the buffer cost -- see
+        // Pause the first polled queue, as an operator who holds one queue
+        // does. The capture then also shows that the exclusion is still
+        // correct: rows of that queue never appear in a real claim. See
         // `queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
-        // for the dedicated, permanent proof of that.
+        // for the dedicated, permanent proof.
         diesel::sql_query(format!(
             "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('{}', 'ledger-evidence-capture')",
             queues[0],
@@ -1896,9 +1889,9 @@ async fn zz_capture_queue_pause_claim_evidence() {
             sql = sql.replace(&format!("${}", i + 1), literal);
         }
 
-        // `EXPLAIN ANALYZE` really executes the statement -- including the
-        // UPDATE CTEs -- so it runs inside a transaction that is rolled back;
-        // otherwise producing the plan would itself consume a task.
+        // `EXPLAIN ANALYZE` executes the statement, UPDATE CTEs included. So
+        // it runs inside a transaction that is rolled back. Otherwise the plan
+        // itself consumes a task.
         diesel::sql_query("BEGIN")
             .execute(&mut conn)
             .await
@@ -1913,13 +1906,12 @@ async fn zz_capture_queue_pause_claim_evidence() {
             .await
             .expect("rollback");
 
-        // The transaction is already rolled back above regardless of whether
-        // `loaded` is `Ok` or `Err`, so panicking here on failure leaves no
-        // dangling transaction. A failure must abort the capture, not get
-        // serialized as plan text: the shell harness only checks for the
-        // trailing completion marker, so a swallowed EXPLAIN failure here
-        // would let a run with no real plan for this backlog depth pass as
-        // successfully reproduced evidence.
+        // The transaction is already rolled back, whether `loaded` is `Ok` or
+        // `Err`. So a panic here leaves no dangling transaction. A failure must
+        // abort the capture, not get serialized as plan text. The shell
+        // harness checks only for the trailing completion marker. A swallowed
+        // EXPLAIN failure lets a run with no real plan for this backlog depth
+        // pass as reproduced evidence.
         let plan_text = loaded
             .unwrap_or_else(|e| {
                 panic!(
@@ -1951,10 +1943,10 @@ async fn zz_capture_queue_pause_claim_evidence() {
         ));
     }
 
-    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
-    // function (not the literal-substituted EXPLAIN text above), so the
-    // committed snapshot reflects exactly the code path a live worker takes.
-    // Fresh connection + fresh seed at the published headline scale.
+    // A `pg_stat_statements` snapshot from the *real* production function
+    // `claim_task()`, not the literal-substituted EXPLAIN text above. So the
+    // committed snapshot shows exactly the code path of a live worker. Fresh
+    // connection and fresh seed at the published headline scale.
     let mut stats_conn = db::connect(&bench.url).await;
     // A failure here is caught downstream. If the extension genuinely could
     // not be created, the SELECT against `pg_stat_statements` below (guarded
@@ -1964,25 +1956,24 @@ async fn zz_capture_queue_pause_claim_evidence() {
         .execute(&mut stats_conn)
         .await;
     // Unlike the CREATE EXTENSION above, a failed reset here has NO
-    // downstream signal to catch it: `pg_stat_statements` is a per-cluster
-    // shared-memory table (only `CREATE EXTENSION` is per-database), so a
-    // stale, unreset entry from an EARLIER run of this exact harness -- every
-    // invocation creates a fresh `harvest_claim_bench_*` database with
-    // identical schema and literal query text -- would still be sitting
-    // there and could be picked up by the query below instead of (or mixed
-    // with) this run's real capture.
+    // downstream signal. `pg_stat_statements` is a per-cluster shared-memory
+    // table. Only `CREATE EXTENSION` is per-database. Each invocation creates
+    // a fresh `harvest_claim_bench_*` database with identical schema and
+    // literal query text. So a stale entry from an EARLIER run of this harness
+    // can still be there. The query below can then read it instead of, or
+    // mixed with, the real capture of this run.
     //
-    // Scoped to THIS database's dbid (`pg_stat_statements_reset(userid,
-    // dbid, queryid)`, all three params defaulting to 0 = "match all" when
-    // omitted; passing only `dbid` restricts the reset to it) rather than
-    // the argument-free cluster-wide form: this harness may share an
-    // external cluster with a concurrent capture (a second worktree, a CI
-    // job running the same script against the same HARVEST_TEST_DATABASE_URL
-    // host), and a cluster-wide reset would wipe that run's
-    // still-accumulating counters out from under it mid-claim-loop. The
-    // permission requirement is unchanged by scoping -- `EXECUTE` on this
-    // function is superuser-only by default regardless of which overload is
-    // called, so a role without it still needs an explicit grant.
+    // Scoped to the dbid of THIS database, not the argument-free cluster-wide
+    // form. The signature is `pg_stat_statements_reset(userid, dbid,
+    // queryid)`. Each parameter defaults to 0, which means "match all". So
+    // passing only `dbid` restricts the reset to it. This harness can share an
+    // external cluster with a concurrent capture. Examples are a second
+    // worktree, or a CI job that runs the same script against the same
+    // HARVEST_TEST_DATABASE_URL host. A cluster-wide reset wipes the live
+    // counters of that run mid-claim-loop. Scoping does not change the
+    // permission requirement. By default, `EXECUTE` on this function is
+    // superuser-only for every overload. So a role without it still needs an
+    // explicit grant.
     diesel::sql_query(
         "SELECT pg_stat_statements_reset(0, \
                 (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
@@ -2010,9 +2001,9 @@ async fn zz_capture_queue_pause_claim_evidence() {
     .await
     .expect("seed one active pause for the stat snapshot");
 
-    // Drive the real claim path repeatedly so pg_stat_statements accumulates
-    // real, attributed `calls`/buffer counters for the production query text
-    // -- not just the single literal-substituted EXPLAIN above.
+    // Drive the real claim path repeatedly. pg_stat_statements then gathers
+    // real, attributed `calls` and buffer counters for the production query
+    // text, not only for the single literal-substituted EXPLAIN above.
     let mut claimed = 0usize;
     let ceiling = seeded.claimable_rows + 10;
     loop {
@@ -2043,21 +2034,19 @@ async fn zz_capture_queue_pause_claim_evidence() {
         seeded.claimable_rows
     );
 
-    // A query failure here (extension not preloaded, view missing, ...) must
-    // fail the capture loudly rather than collapse into an empty snapshot
-    // that the shell harness's marker-only success check cannot distinguish
-    // from "ran fine, genuinely zero matching rows" -- see
-    // `setup_container_bench_db` for how the Docker-fallback container is
-    // configured to make this query actually succeed.
-    // Scoped to the CURRENT database's `dbid`, not just the query-text
-    // pattern: `pg_stat_statements` is per-cluster, and every database this
-    // harness ever creates shares the exact same schema and literal
-    // `claim_task_query()` text, so an unscoped match could otherwise pull
-    // in a stale row from a different (already-dropped) ephemeral bench
-    // database sharing this cluster -- belt-and-braces alongside the reset
-    // above, since the reset alone only protects against a PRIOR run of
-    // this same test, not concurrent runs against other databases on the
-    // same cluster.
+    // A query failure here must fail the capture loudly. Examples are an
+    // extension that is not preloaded or a missing view. An empty snapshot is
+    // not acceptable. The marker-only success check of the shell harness
+    // cannot tell it from "ran fine, zero matching rows". See
+    // `setup_container_bench_db` for how the Docker-fallback container makes
+    // this query succeed.
+    // Scoped to the `dbid` of the CURRENT database, not only the query-text
+    // pattern. `pg_stat_statements` is per-cluster. Every database that this
+    // harness creates shares the same schema and literal `claim_task_query()`
+    // text. So an unscoped match can pull a stale row from another, already
+    // dropped, bench database on this cluster. This backs up the reset above.
+    // The reset protects only against a PRIOR run of this test. It does not
+    // cover concurrent runs against other databases on the same cluster.
     let stats_rows: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
                 (shared_blks_hit + shared_blks_read) AS total_buffers \
@@ -2076,17 +2065,16 @@ async fn zz_capture_queue_pause_claim_evidence() {
          placeholder",
     );
 
-    // An empty result set here is not "genuinely zero matching statements"
-    // the way it might be for an ad-hoc query -- the `claimed + 1` real
-    // claim_task() calls immediately above are guaranteed to have executed
-    // the production claim_task_query() text, which always matches
+    // Unlike an ad-hoc query, an empty result here is not "zero matching
+    // statements". The `claimed + 1` real claim_task() calls above executed
+    // the production claim_task_query() text. That text always matches
     // `%harvest_task_queue%`. The `.expect()` on the query above already
     // guards a missing preload. A zero-row result here means the extension is
     // loaded but not tracking, or some other scoping problem. One example is
     // `pg_stat_statements.track = none`, which does not error but silently
     // returns nothing. Either way this must abort the capture. It must not
-    // fall back to a placeholder that the shell harness's marker-only success
-    // check would accept.
+    // fall back to a placeholder that the marker-only success check of the
+    // shell harness would accept.
     assert!(
         !stats_rows.is_empty(),
         "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \
@@ -2095,17 +2083,16 @@ async fn zz_capture_queue_pause_claim_evidence() {
          pg_stat_statements.track (must be 'all' or 'top', not 'none')",
     );
 
-    // Beyond "some row matched the pattern": find the specific row for the
-    // production claim_task_query() shape -- its `rate_limit_debit` CTE name
-    // is unique to this statement among everything else this harness runs
-    // (INSERT/UPDATE/TRUNCATE/ANALYZE, none of which share it), and is
-    // present in both the pre-fix and post-fix shapes of the query, so this
-    // check works for either capture label -- and assert its call count is
-    // exactly `claimed + 1` (the loop above's successful claims plus the
-    // final call that returned None and broke it). A capture that
-    // accidentally snapshotted buffers from an unrelated statement, or a
-    // stale entry the reset above somehow missed, fails loudly here instead
-    // of silently reporting someone else's numbers as this query's cost.
+    // Beyond "some row matched the pattern": find the row for the production
+    // claim_task_query() shape. Its `rate_limit_debit` CTE name is unique to
+    // this statement among all that this harness runs. No
+    // INSERT/UPDATE/TRUNCATE/ANALYZE shares it. Both the pre-fix and post-fix
+    // shapes contain it, so the check works for either capture label. Assert
+    // that its call count is exactly `claimed + 1`. That is the successful
+    // claims of the loop plus the final call that returned None. A capture
+    // that snapshotted buffers from an unrelated statement, or from a stale
+    // entry that the reset missed, fails loudly here. It cannot report the
+    // numbers of another statement as the cost of this query.
     let expected_calls =
         i64::try_from(claimed + 1).expect("claimed count fits in i64 at this test's scale");
     let claim_row = stats_rows
@@ -2164,20 +2151,20 @@ async fn zz_capture_queue_pause_claim_evidence() {
 /// `docs/performance.md` and `docs/performance-capability-labels.md`.
 ///
 /// Unlike [`zz_capture_queue_pause_claim_evidence`], this capture does not
-/// toggle a code fix: `queue::claim_task_query()` is unmodified end to end,
-/// because measurement found no query-shape fix that helps (see the
-/// dedicated doc page). It toggles *data* instead — every EXPLAIN /
-/// `pg_stat_statements` pair below is captured from the exact same query
-/// text at two seeded states of `harvest_task_queue.required_capabilities`:
+/// toggle a code fix. `queue::claim_task_query()` is unmodified end to end.
+/// Measurement found no query-shape fix that helps (see the dedicated doc
+/// page). It toggles *data* instead. Each EXPLAIN / `pg_stat_statements` pair
+/// below uses the same query text. The two seeded states of
+/// `harvest_task_queue.required_capabilities` are:
 ///
-/// * `no-capabilities` — every row's column is `NULL` (today's default seed
-///   shape, and every other `ClaimGate` scenario's shape too).
+/// * `no-capabilities` — the column is `NULL` on every row. That is the
+///   default seed shape, and the shape of every other `ClaimGate` scenario.
 /// * `capability-labels` — every row carries one `Exact` requirement that
-///   the claiming worker's `labels` satisfy. Deliberately made to match
-///   (not to exclude) so the claimable row count is **identical** between
-///   the two labels — that isolates the predicate's *evaluation* cost from
-///   any change in which rows are eligible, and lets the same-run drain
-///   loop assert equal claimed counts as a correctness sanity check.
+///   the `labels` of the claiming worker satisfy. It matches on purpose, so
+///   the claimable row count is **identical** for both labels. That isolates
+///   the *evaluation* cost of the predicate from any change in eligible rows.
+///   The same-run drain loop can then assert equal claimed counts as a
+///   correctness sanity check.
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
@@ -2213,10 +2200,9 @@ async fn zz_capture_capability_labels_claim_evidence() {
         total_buffers: i64,
     }
 
-    /// One `Exact` capability requirement the seeded worker's `labels` are
-    /// made to satisfy exactly -- so the predicate always evaluates `TRUE`
-    /// and every capability-labels row stays claimable, matching the
-    /// no-capabilities claimable count.
+    /// One `Exact` capability requirement that the `labels` of the seeded
+    /// worker satisfy exactly. The predicate always evaluates `TRUE`. So every
+    /// capability-labels row stays claimable, as in the no-capabilities case.
     const REQUIRED_CAPABILITIES_JSON: &str = r#"[{"Exact":{"key":"region","value":"us-east"}}]"#;
     const WORKER_LABELS_JSON: &str = r#"{"region":"us-east"}"#;
 
@@ -2237,11 +2223,11 @@ async fn zz_capture_capability_labels_claim_evidence() {
     let raw = autumn_harvest::queue::claim_task_query();
 
     // One EXPLAIN capture per published backlog depth, at both labels, from
-    // the SAME seeded backlog (the no-capabilities capture's EXPLAIN ANALYZE
-    // runs inside a rolled-back transaction, so the seeded rows survive
-    // unclaimed for the capability-labels mutation that follows) -- shows
-    // whether the added cost is a fixed per-call overhead or scales with
-    // candidate rows scanned.
+    // the SAME seeded backlog. The EXPLAIN ANALYZE of the no-capabilities
+    // capture runs inside a rolled-back transaction. So the seeded rows
+    // survive unclaimed for the capability-labels mutation that follows. It
+    // shows whether the added cost is fixed per call or scales with candidate
+    // rows scanned.
     for backlog in super::claim_bench_support::BACKLOG_SWEEP {
         let scenario = Scenario {
             backlog,
@@ -2253,25 +2239,22 @@ async fn zz_capture_capability_labels_claim_evidence() {
         let mut conn = db::connect(&bench.url).await;
         let seeded = db::seed(&mut conn, scenario).await;
 
-        // `db::seed()` analyzes `harvest_task_queue`/`harvest_workflow_executions`
-        // only (see its own doc comment) -- `harvest_workers` is left with
-        // whatever stats survived from the previous backlog depth's iteration,
-        // or none at all on the first. The `worker_info` CTE's
-        // `SELECT labels FROM harvest_workers WHERE worker_id = $1` lookup is a
-        // single-row equality match on a ~64-row table, small enough that the
-        // planner's choice between an index scan and a sequential scan is
-        // genuinely stats-sensitive rather than obviously index-scan-favored
-        // (confirmed: the committed backlog=10000 artifacts before this fix
-        // showed an Index Scan for no-capabilities and a Seq Scan for
-        // capability-labels on this exact node). Left asymmetric, the
-        // `no-capabilities` capture below would run against whatever
-        // stale/absent stats this connection happens to carry while
-        // `capability-labels` re-analyzes `harvest_workers` itself (it must,
-        // having just mutated `labels`) -- letting an access-path choice on an
-        // unrelated table leak into what is meant to be a pure
-        // `required_capabilities`-population comparison. Analyze it here, once
-        // per depth, before either label's capture, so both start from
-        // identical `harvest_workers` statistics.
+        // `db::seed()` analyzes only `harvest_task_queue` and
+        // `harvest_workflow_executions` (see its doc comment). `harvest_workers`
+        // keeps the stats of the previous backlog depth, or none on the first.
+        // The `worker_info` CTE looks up
+        // `SELECT labels FROM harvest_workers WHERE worker_id = $1`. That is a
+        // single-row equality match on a ~64-row table. At that size, the
+        // planner choice between an index scan and a sequential scan is
+        // stats-sensitive. The committed backlog=10000 artifacts before this
+        // fix confirm it. They showed an Index Scan for no-capabilities and a
+        // Seq Scan for capability-labels on this exact node. Left asymmetric,
+        // the `no-capabilities` capture runs against stale or absent stats.
+        // `capability-labels` re-analyzes `harvest_workers` itself, because it
+        // has just mutated `labels`. An access-path choice on an unrelated
+        // table then leaks into a pure `required_capabilities` comparison. So
+        // analyze it here, once per depth, before the capture of either label.
+        // Both then start from identical `harvest_workers` statistics.
         diesel::sql_query("ANALYZE harvest_workers")
             .execute(&mut conn)
             .await
@@ -2309,21 +2292,20 @@ async fn zz_capture_capability_labels_claim_evidence() {
                 // no-capabilities rows in place.
                 //
                 // The first cut of this capture did the latter, and it
-                // measured a confounded number: Postgres MVCC gives an
-                // UPDATE a brand-new tuple version, so mutating 10,000
-                // freshly-inserted rows left their *old*, now-dead NULL-caps
-                // versions physically resident in the heap alongside the new
-                // ones (nothing here runs a VACUUM) -- inflating the page
-                // count with bloat that has nothing to do with the
-                // predicate's real cost, and that never happens in
-                // production, where `required_capabilities` is set once at
-                // schedule time and never retroactively mutated. Verified
-                // directly: TRUNCATE+re-INSERT-with-capabilities measured
-                // 334 heap pages for this exact 10k-row/4-queue shape
-                // (+36.9% over the 244-page no-capabilities baseline);
-                // seed-then-UPDATE measured 578 pages on the identical rows
-                // (+136.9%) -- a ~3.7x inflation from the UPDATE artifact
-                // alone. This capture uses the honest, isolated number.
+                // measured a confounded number. Postgres MVCC gives an UPDATE
+                // a new tuple version. Mutating 10,000 fresh rows left their
+                // *old*, dead NULL-caps versions in the heap beside the new
+                // ones, because nothing here runs a VACUUM. That bloat
+                // inflated the page count. It is unrelated to the real cost
+                // of the predicate, and it never happens in production.
+                // Production sets `required_capabilities` once at schedule
+                // time and never mutates it later. Measured directly:
+                // TRUNCATE+re-INSERT-with-capabilities gave 334 heap pages
+                // for this 10k-row/4-queue shape. That is +36.9% over the
+                // 244-page no-capabilities baseline. Seed-then-UPDATE gave
+                // 578 pages on the identical rows (+136.9%). The UPDATE
+                // artifact alone inflates the overhead ~3.7x. This capture uses
+                // the honest, isolated number.
                 diesel::sql_query("TRUNCATE harvest_task_queue")
                     .execute(&mut conn)
                     .await
@@ -2363,10 +2345,10 @@ async fn zz_capture_capability_labels_claim_evidence() {
                     .expect("re-analyze after mutating worker labels");
             }
 
-            // `EXPLAIN ANALYZE` really executes the statement -- including
-            // the UPDATE CTEs -- so it runs inside a transaction that is
-            // rolled back; otherwise producing the plan would itself consume
-            // a task and shrink the backlog the other label measures against.
+            // `EXPLAIN ANALYZE` executes the statement, UPDATE CTEs included.
+            // So it runs inside a transaction that is rolled back. Otherwise
+            // the plan itself consumes a task. That shrinks the backlog that
+            // the other label measures against.
             diesel::sql_query("BEGIN")
                 .execute(&mut conn)
                 .await
@@ -2413,12 +2395,12 @@ async fn zz_capture_capability_labels_claim_evidence() {
         ));
     }
 
-    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
-    // function (not the literal-substituted EXPLAIN text above), at both
-    // labels, so the committed snapshot reflects exactly the code path a live
-    // worker takes -- and so the drain loop's claimed count is a correctness
-    // sanity check that the capability-labels mutation above did not change
-    // *which* rows are eligible, only the cost of deciding so.
+    // A `pg_stat_statements` snapshot at both labels from the *real*
+    // production function `claim_task()`, not the literal-substituted EXPLAIN
+    // text above. So the committed snapshot shows exactly the code path of a
+    // live worker. The claimed count of the drain loop is also a sanity check.
+    // It proves that the capability-labels mutation above changed only the
+    // cost of deciding eligibility, not *which* rows are eligible.
     let mut claimed_by_label: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for label in ["no-capabilities", "capability-labels"] {
@@ -2439,16 +2421,14 @@ async fn zz_capture_capability_labels_claim_evidence() {
 
         let headline = headline_scenario();
         let seeded = db::seed(&mut stats_conn, headline).await;
-        // Same fix as the backlog-sweep loop above: `db::seed()` never
-        // analyzes `harvest_workers`, and this loop's capability-labels
-        // branch is the only one that mutates it (`UPDATE harvest_workers
-        // SET labels = ...` below) -- so without this call the
-        // `no-capabilities` drain would run against whatever stale/absent
-        // `harvest_workers` stats this fresh connection happens to carry,
-        // while `capability-labels` re-analyzes the table itself after its
-        // mutation. Analyze it here, once per label, before either drain, so
-        // the `worker_info` CTE's single-row lookup on `harvest_workers`
-        // starts from identical statistics regardless of label.
+        // Same fix as the backlog-sweep loop above. `db::seed()` never
+        // analyzes `harvest_workers`. Only the capability-labels branch of
+        // this loop mutates it (`UPDATE harvest_workers SET labels = ...`
+        // below). Without this call, the `no-capabilities` drain runs against
+        // stale or absent `harvest_workers` stats. `capability-labels`
+        // re-analyzes the table itself after its mutation. So analyze it
+        // here, once per label, before either drain. The single-row lookup of
+        // the `worker_info` CTE then starts from identical statistics.
         diesel::sql_query("ANALYZE harvest_workers")
             .execute(&mut stats_conn)
             .await
@@ -2457,11 +2437,11 @@ async fn zz_capture_capability_labels_claim_evidence() {
         let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
 
         if label == "capability-labels" {
-            // Same fix as the backlog-sweep loop above: re-seed fresh with
-            // `required_capabilities` populated at INSERT time instead of
-            // UPDATE-ing the just-seeded rows, so the drain below starts
-            // from an unbloated table rather than one carrying dead NULL-caps
-            // tuple versions from an UPDATE that never happens in production.
+            // Same fix as the backlog-sweep loop above. Re-seed fresh with
+            // `required_capabilities` set at INSERT time, and do not UPDATE
+            // the seeded rows. So the drain below starts from an unbloated
+            // table. It carries no dead NULL-caps tuple versions from an
+            // UPDATE that never happens in production.
             diesel::sql_query("TRUNCATE harvest_task_queue")
                 .execute(&mut stats_conn)
                 .await
@@ -2495,20 +2475,20 @@ async fn zz_capture_capability_labels_claim_evidence() {
                 .execute(&mut stats_conn)
                 .await
                 .expect("re-analyze before the stat-snapshot drain");
-            // Mirrors the backlog-sweep loop's post-mutation re-analyze
-            // above: cheap, and keeps both loops' `harvest_workers`
-            // statistics symmetric even though this UPDATE only touches one
-            // row (row count is unaffected, but ANALYZE also refreshes
-            // per-column value statistics the planner may consult).
+            // Mirrors the post-mutation re-analyze of the backlog-sweep loop
+            // above. It is cheap and keeps the `harvest_workers` statistics
+            // of both loops symmetric. This UPDATE touches one row, so the
+            // row count does not change. But ANALYZE also refreshes the
+            // per-column value statistics that the planner may consult.
             diesel::sql_query("ANALYZE harvest_workers")
                 .execute(&mut stats_conn)
                 .await
                 .expect("re-analyze after mutating worker labels");
         }
 
-        // Drive the real claim path repeatedly so pg_stat_statements
-        // accumulates real, attributed `calls`/buffer counters for the
-        // production query text -- not just the single literal-substituted
+        // Drive the real claim path repeatedly. pg_stat_statements then
+        // gathers real, attributed `calls` and buffer counters for the
+        // production query text, not only for the single literal-substituted
         // EXPLAIN above.
         let mut claimed = 0usize;
         let ceiling = seeded.claimable_rows + 10;
@@ -2539,12 +2519,12 @@ async fn zz_capture_capability_labels_claim_evidence() {
             "label={label} stat-snapshot claim loop: claimed={claimed} of {} claimable",
             seeded.claimable_rows
         );
-        // Guard against a shared seeding/eligibility regression that makes
-        // BOTH labels claim the same wrong (e.g. partial, or zero) count --
-        // the equality check below this loop only compares the two labels
-        // against each other, which such a regression would still pass,
-        // letting an incomplete drain be published as an "equivalent
-        // 10,000-row measurement" (flagged by review on PR #1192).
+        // Guard against a shared seeding or eligibility regression. It makes
+        // BOTH labels claim the same wrong count, such as a partial or zero
+        // count. The equality check below this loop compares only the two
+        // labels with each other, so such a regression passes it. An
+        // incomplete drain is then published as an "equivalent 10,000-row
+        // measurement" (PR #1192).
         assert_eq!(
             claimed, seeded.claimable_rows,
             "label={label} claimed {claimed} of {} seeded-claimable rows -- \
@@ -2621,10 +2601,10 @@ async fn zz_capture_capability_labels_claim_evidence() {
         ));
     }
 
-    // Correctness sanity check: the capability-labels mutation was built to
-    // MATCH the claiming worker, not exclude it, so both labels must claim
-    // the identical number of rows -- proving the added predicate cost is
-    // isolated from any change in which rows are eligible.
+    // Correctness sanity check. The capability-labels mutation MATCHES the
+    // claiming worker and does not exclude it. So both labels must claim the
+    // same number of rows. That proves the added predicate cost is isolated
+    // from any change in eligible rows.
     assert_eq!(
         claimed_by_label.get("no-capabilities"),
         claimed_by_label.get("capability-labels"),
@@ -2749,7 +2729,7 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // primary-key and `activity_id` B-trees were seeded with independently
     // random keys instead. Page-split/traversal noise from those OTHER
     // indexes could then rival the effect this capture attributes to
-    // `schedule_to_close_at` itself. Codex review on PR #1339 caught this.
+    // `schedule_to_close_at` itself (PR #1339).
     // Reusing identical indexed values across labels makes
     // `schedule_to_close_at` the only input that actually varies between
     // them.
@@ -2763,16 +2743,14 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // freshly-`db::connect()`ed connection. A `TEMP` table is
     // connection-session-scoped, so it would not survive from the
     // `no-schedule-to-close` label's connection to the `schedule-to-close`
-    // label's. Codex review on PR #1339 caught this too, on this same
-    // finding. A plain table is visible to any connection against the same
-    // database, which is what a cross-connection snapshot needs.
+    // label's (PR #1339). A plain table is visible to any connection against
+    // the same database, which is what a cross-connection snapshot needs.
     //
     // Numbered by `ROW_NUMBER() OVER (ORDER BY ctid)`, not `id`. `ctid`
     // (physical tuple location) preserves original insertion order, for a
     // table that has only ever been bulk-loaded once with no intervening
     // updates or deletes. Ordering by the random primary key would scramble
-    // it instead. Codex review on PR #1339 caught that too, on this same
-    // finding, before the connection-scoping problem above.
+    // it instead (PR #1339).
     async fn snapshot_seed_for_schedule_to_close(conn: &mut AsyncPgConnection) {
         diesel::sql_query("DROP TABLE IF EXISTS zz_stc_seed_snapshot")
             .execute(conn)
@@ -2845,14 +2823,13 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // match, not exclude" design the capability-labels capture uses for its
     // requirement.
     //
-    // `NOW() + INTERVAL '1 hour'` was tried first, and is wrong. Codex
-    // review on PR #1339 (P2) pointed out that the drain below has no
-    // overall wall-clock bound. It already took ~15 minutes end to end in
-    // this pass's own environment. A slower machine or a remote database
-    // could plausibly exceed an hour and start excluding later rows
-    // mid-drain. That would turn `claimed < seeded.claimable_rows` into a
-    // hard failure of the equivalence assertion, instead of a clean
-    // capture.
+    // `NOW() + INTERVAL '1 hour'` was tried first, and is wrong (PR #1339).
+    // The drain below has no overall wall-clock bound. It already took
+    // ~15 minutes end to end in this pass's own environment. A slower
+    // machine or a remote database could plausibly exceed an hour and start
+    // excluding later rows mid-drain. That would turn
+    // `claimed < seeded.claimable_rows` into a hard failure of the
+    // equivalence assertion, instead of a clean capture.
     //
     // `'infinity'::timestamptz` was tried next, and is ALSO wrong -- for a
     // different reason, discovered by actually running this fix. It is a
@@ -3050,8 +3027,8 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         // buffer-count comparison this capture exists to make.
         //
         // This mirrors the same fix in
-        // `zz_capture_capability_labels_claim_evidence` (Codex review, PR
-        // #1339). It analyzes `harvest_workers` here, once per label,
+        // `zz_capture_capability_labels_claim_evidence` (PR #1339). It
+        // analyzes `harvest_workers` here, once per label,
         // before either the schedule-to-close re-seed or the drain starts.
         // Both labels then begin from identical `harvest_workers`
         // statistics.
@@ -3070,8 +3047,7 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
         // `reseed_with_schedule_to_close()` (this function's predecessor)
         // for the `schedule-to-close` label anyway. That only snapshotted
         // and reused THIS iteration's own already-independently-random
-        // seed -- a no-op for cross-label matching. Codex review on PR
-        // #1339 caught this.
+        // seed -- a no-op for cross-label matching (PR #1339).
         //
         // The fix: snapshot the `no-schedule-to-close` label's seed into a
         // table that outlives its connection. See
@@ -3944,8 +3920,7 @@ async fn zz_capture_sticky_routing_claim_evidence() {
     // random UUIDs for itself. This is the same fix
     // `snapshot_seed_for_schedule_to_close`/
     // `reseed_from_schedule_to_close_snapshot` applies to the
-    // schedule-to-close capture, for the identical reason (a Codex review
-    // finding on this PR).
+    // schedule-to-close capture, for the identical reason (#1438).
     //
     // Every claim is a non-HOT `UPDATE` that touches every index on
     // `harvest_task_queue`, not just the sticky-routing partial index.
@@ -4491,32 +4466,30 @@ async fn zz_capture_sticky_routing_claim_evidence() {
 /// gate rewrite in `queue::claim_task_query()` (issue #247 / Ledger perf
 /// pass).
 ///
-/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
-/// repeatable CI assertion — its output is read by a human reviewing the PR,
-/// not asserted on. See `cargo xtask perf concurrency-key-claim`. It runs
-/// this exact test twice: once against the pre-fix shape of `queue.rs`, and
-/// once against the current tree. The two runs produce the paired
+/// `#[ignore]`d on purpose: a one-shot evidence-capture tool, not a
+/// repeatable CI assertion. A human who reviews the PR reads its output.
+/// Nothing asserts on it. See `cargo xtask perf concurrency-key-claim`. It
+/// runs this exact test twice: once against the pre-fix shape of `queue.rs`,
+/// and once against the current tree. The two runs produce the paired
 /// `docs/perf-artifacts/concurrency-key-claim-predicate/` files the PR cites.
 ///
-/// Self-detects which shape it is currently measuring by inspecting
-/// `queue::claim_task_query()`'s own text (`concurrency_pending_keys AS
-/// MATERIALIZED` present or absent), so a single invocation always writes to
-/// the correctly-labelled `before-*`/`after-*` files regardless of which
-/// revision happens to be checked out — there is no separate "old" copy of
-/// the query text to drift out of sync with the real function.
+/// It detects the shape it measures from the text of
+/// `queue::claim_task_query()`: `concurrency_pending_keys AS MATERIALIZED` is
+/// present or absent. So each invocation writes to the correct
+/// `before-*`/`after-*` files, whatever revision is checked out. No separate
+/// "old" copy of the query text can drift from the real function.
 ///
-/// Unlike the queue-pause anti-join (issue #619), this predicate's cost is
-/// load-dependent: `docs/performance.md`'s existing per-gate table already
-/// shows +644% even with the RUNNING population deliberately kept at zero
-/// (`ClaimGate::ConcurrencyKey`'s seed carries no RUNNING contention — only a
-/// cap high enough to never block). This capture therefore takes two
-/// EXPLAIN measurements: the standard idle sweep across every published
-/// backlog depth (directly corroborating that existing published number),
-/// AND one additional hot-contention capture at the headline depth that
-/// seeds RUNNING rows sharing the same concurrency keys the PENDING backlog
-/// uses — demonstrating the mechanism claim in the `NOTE` above
-/// `claim_task_query` that the old predicate's cost compounds with the size
-/// of the RUNNING population sharing a candidate row's key.
+/// Unlike the queue-pause anti-join (issue #619), the cost of this predicate
+/// depends on load. The per-gate table in `docs/performance.md` already shows
+/// +644% with the RUNNING population kept at zero. The seed of
+/// `ClaimGate::ConcurrencyKey` carries no RUNNING contention, only a cap that
+/// never blocks. So this capture takes two EXPLAIN measurements. The first is
+/// the standard idle sweep across every published backlog depth. It supports
+/// the published number. The second is one hot-contention capture at the
+/// headline depth. It seeds RUNNING rows that share the concurrency keys of
+/// the PENDING backlog. That shows the mechanism claim in the `NOTE` above
+/// `claim_task_query`. The cost of the old predicate grows with the RUNNING
+/// population that shares the key of a candidate row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
             cargo xtask perf concurrency-key-claim"]
@@ -4604,9 +4577,9 @@ async fn zz_capture_concurrency_key_claim_evidence() {
     };
 
     // One EXPLAIN capture per published backlog depth at the standard, idle
-    // (non-blocking-cap) ClaimGate::ConcurrencyKey scenario — directly
-    // corroborates docs/performance.md's existing +644% published number,
-    // since that number was itself measured under this exact seed shape.
+    // (non-blocking-cap) ClaimGate::ConcurrencyKey scenario. It supports the
+    // published +644% in docs/performance.md, which used this exact seed
+    // shape.
     for backlog in super::claim_bench_support::BACKLOG_SWEEP {
         let scenario = Scenario {
             backlog,
@@ -4620,9 +4593,9 @@ async fn zz_capture_concurrency_key_claim_evidence() {
         let queues = db::queue_names(scenario);
         let sql = substitute_literals(&queues, scenario.gate);
 
-        // `EXPLAIN ANALYZE` really executes the statement -- including the
-        // UPDATE CTEs -- so it runs inside a transaction that is rolled back;
-        // otherwise producing the plan would itself consume a task.
+        // `EXPLAIN ANALYZE` executes the statement, UPDATE CTEs included. So
+        // it runs inside a transaction that is rolled back. Otherwise the plan
+        // itself consumes a task.
         diesel::sql_query("BEGIN")
             .execute(&mut conn)
             .await
@@ -4668,19 +4641,17 @@ async fn zz_capture_concurrency_key_claim_evidence() {
         ));
     }
 
-    // A second, hot-contention capture at the headline backlog depth only:
-    // seeds RUNNING rows re-using the SAME concurrency_key values the
-    // PENDING backlog just seeded (discovered via SELECT DISTINCT rather
-    // than reconstructing `claim_bench_support`'s internal key-format
-    // string, so this capture cannot drift out of sync with that private
-    // implementation detail), so the correlated-subquery form the old
-    // predicate used must walk a non-trivial RUNNING population per
-    // candidate row -- the shape that makes this predicate's cost
-    // load-dependent rather than fixed. The seeded cap
-    // (`ClaimGate::ConcurrencyKey`'s `NON_BLOCKING_CAP`) stays far above the
-    // added RUNNING count, so nothing is actually excluded by this
-    // contention -- it isolates the correlated-subquery cost, not a change
-    // in which rows are claimable.
+    // A second, hot-contention capture at the headline backlog depth only.
+    // It seeds RUNNING rows that reuse the SAME concurrency_key values as the
+    // PENDING backlog. So the correlated subquery of the old predicate must
+    // walk a non-trivial RUNNING population per candidate row. That shape
+    // makes the cost of this predicate load-dependent, not fixed. SELECT
+    // DISTINCT finds those keys. Rebuilding the internal key format of
+    // `claim_bench_support` instead could drift from that private detail.
+    // The seeded cap (`NON_BLOCKING_CAP` of `ClaimGate::ConcurrencyKey`) stays
+    // far above the added RUNNING count. So this contention excludes nothing.
+    // It isolates the correlated-subquery cost from any change in claimable
+    // rows.
     {
         const HOT_CONTENTION_ROWS: i64 = 2_000;
 
@@ -4778,12 +4749,12 @@ async fn zz_capture_concurrency_key_claim_evidence() {
         ));
     }
 
-    // A `pg_stat_statements` snapshot from the *real* `claim_task()`
-    // production function (not the literal-substituted EXPLAIN text above),
-    // so the committed snapshot reflects exactly the code path a live
-    // worker takes. Fresh connection + fresh seed at the published headline
-    // scale, idle (non-blocking-cap) concurrency-key scenario -- matching
-    // the other committed captures in this repo for direct comparability.
+    // A `pg_stat_statements` snapshot from the *real* production function
+    // `claim_task()`, not the literal-substituted EXPLAIN text above. So the
+    // committed snapshot shows exactly the code path of a live worker. Fresh
+    // connection and fresh seed at the published headline scale, with the
+    // idle (non-blocking-cap) concurrency-key scenario. That matches the
+    // other committed captures in this repo for direct comparison.
     let mut stats_conn = db::connect(&bench.url).await;
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut stats_conn)
@@ -4814,9 +4785,9 @@ async fn zz_capture_concurrency_key_claim_evidence() {
     let seeded = db::seed(&mut stats_conn, headline).await;
     let queues = db::queue_names(headline);
 
-    // Drive the real claim path repeatedly so pg_stat_statements accumulates
-    // real, attributed `calls`/buffer counters for the production query text
-    // -- not just the single literal-substituted EXPLAIN above.
+    // Drive the real claim path repeatedly. pg_stat_statements then gathers
+    // real, attributed `calls` and buffer counters for the production query
+    // text, not only for the single literal-substituted EXPLAIN above.
     let mut claimed = 0usize;
     let ceiling = seeded.claimable_rows + 10;
     loop {

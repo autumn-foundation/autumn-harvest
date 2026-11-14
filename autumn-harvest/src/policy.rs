@@ -321,14 +321,13 @@ impl Default for RetryPolicy {
 /// IMMEDIATE retry — not `None` (fall through to the policy delay). This is
 /// the opposite of what an operator setting the ceiling to zero might
 /// reasonably expect. There is no separate switch to turn `retry_after`
-/// honoring off entirely today; an author who never calls
-/// [`ActivityFailure::with_retry_after`](crate::failure::ActivityFailure::with_retry_after)
-/// is the only way to opt an activity out.
+/// honoring off entirely today. To opt an activity out, never call
+/// [`ActivityFailure::with_retry_after`](crate::failure::ActivityFailure::with_retry_after).
 ///
 /// This function does **not** consult `non_retryable` or the retry policy's
-/// `max_attempts` cap — callers must check those first (a non-retryable
-/// failure, or an attempt count that has already exhausted the policy, must
-/// never be resurrected by a delay hint).
+/// `max_attempts` cap. Callers must check those first. A delay hint must never
+/// resurrect a non-retryable failure, or an attempt count that has already
+/// exhausted the policy.
 #[must_use]
 pub fn resolve_retry_after_hint(
     retry_after: Option<Duration>,
@@ -414,9 +413,8 @@ pub enum CircuitOpenMode {
 impl CircuitBreakerPolicy {
     /// Construct a circuit-breaker policy.
     ///
-    /// `failure_threshold` is clamped to a minimum of 1 — a threshold of 0
-    /// would trip on the very first dispatch before any failure is observed,
-    /// which is never the intended behaviour.
+    /// `failure_threshold` is clamped to a minimum of 1. A threshold of 0
+    /// would trip on the very first dispatch, before any failure is observed.
     #[must_use]
     pub fn new(failure_threshold: u32, window: Duration, cooldown: Duration) -> Self {
         Self {
@@ -627,7 +625,7 @@ pub enum MapFailurePolicy {
     /// never dispatched.
     ///
     /// The failing instance's outcome wins even when later instances succeed.
-    /// Sibling instances already dispatched are **not** durably cancelled — the
+    /// Sibling instances already dispatched are **not** durably cancelled. The
     /// node settles every instance before the DAG terminates, so the recorded
     /// history stays replay-clean (issue #780).
     #[default]
@@ -755,10 +753,9 @@ pub enum Schedule {
     Manual,
     /// Timezone-aware cron expression.
     ///
-    /// Identical to `Cron` but the expression is evaluated in the declared
-    /// IANA timezone rather than UTC, so `"0 9 * * 1-5"` in
-    /// `"America/Los_Angeles"` fires at **9:00 AM Pacific year-round**,
-    /// regardless of DST transitions.
+    /// Identical to `Cron`, but the expression is evaluated in the declared
+    /// IANA timezone, not UTC. So `"0 9 * * 1-5"` in `"America/Los_Angeles"`
+    /// fires at **9:00 AM Pacific year-round**, regardless of DST transitions.
     ///
     /// ## DST disambiguation
     ///
@@ -769,8 +766,8 @@ pub enum Schedule {
     ///   gap). No spurious firing occurs at the wrong UTC time.
     /// - **Fall-back (clocks repeat an hour):** a cron expression whose
     ///   local-time resolution falls inside the repeated window fires exactly
-    ///   **once** — on the first occurrence of that local time (the pre-rollback
-    ///   instant). The repeated hour does not trigger a second firing.
+    ///   **once**. It fires on the first occurrence of that local time (the
+    ///   pre-rollback instant). The repeated hour does not trigger a second firing.
     ///
     /// ## Validation
     ///
@@ -876,8 +873,8 @@ impl OverlapPolicy {
     /// Parse an `overlap_policy` column value from the database.
     ///
     /// Unknown values fall back to [`Skip`](Self::Skip) to preserve the
-    /// append-only-schema invariant: a deployment using an older binary
-    /// reading a newer enum value degrades to the safe default.
+    /// append-only-schema invariant. An older binary that reads a newer enum
+    /// value degrades to the safe default.
     #[must_use]
     pub fn from_db(s: &str) -> Self {
         match s {
@@ -987,9 +984,9 @@ impl SkipPolicy {
 /// | `Unbounded` | **all** missed slots | none |
 ///
 /// Every dropped slot increments `harvest.schedule.skipped` with reason
-/// `catchup_window_exceeded`.  `SkipAll` never records a drop because it reuses
-/// the existing single-slot path with no history of what was skipped; use
-/// `MostRecent` when you want an audit trail.
+/// `catchup_window_exceeded`. `SkipAll` never records a drop. It reuses the
+/// existing single-slot path, which keeps no history of what was skipped. Use
+/// `MostRecent` for an audit trail.
 ///
 /// ## Examples
 ///
@@ -1096,11 +1093,11 @@ impl CatchupPolicy {
 
     /// Strictly parse an operator-supplied catchup policy from API input.
     ///
-    /// Unlike [`Self::from_db`] (which is lenient for backward compatibility and
-    /// degrades unknown modes to the legacy `catchup` bool), unknown modes are
-    /// rejected so bad API input surfaces as `400` rather than silently picking a
-    /// fallback. `"window"` reads its duration from `window_secs` (defaulting to
-    /// `0`, which fires only the slot at exactly `now`).
+    /// Unknown modes are rejected, so bad API input surfaces as `400`, not as a
+    /// silent fallback. [`Self::from_db`] is lenient instead, for backward
+    /// compatibility: it degrades unknown modes to the legacy `catchup` bool.
+    /// `"window"` reads its duration from `window_secs` (defaulting to `0`,
+    /// which fires only the slot at exactly `now`).
     ///
     /// # Errors
     ///
@@ -1137,10 +1134,10 @@ impl CatchupPolicy {
 pub struct WorkflowSchedule {
     /// The registered workflow name to start on each firing.
     pub workflow_name: String,
-    /// When this schedule was promoted from a `#[dag]` definition, the
-    /// original DAG name is stored here so the DAG management API can still
-    /// list, pause, and resume the schedule via `GET /dags` and
-    /// `PATCH /dags/{name}`.  `None` for pure workflow schedules.
+    /// The original DAG name, when this schedule was promoted from a `#[dag]`
+    /// definition. The DAG management API uses it to list, pause, and resume
+    /// the schedule via `GET /dags` and `PATCH /dags/{name}`. `None` for pure
+    /// workflow schedules.
     pub dag_name: Option<String>,
     /// Cron or interval schedule. `Schedule::Manual` is accepted but will
     /// never fire automatically — use the API to trigger it instead.
@@ -1258,10 +1255,10 @@ pub struct WorkflowSchedule {
     pub max_runs: Option<u32>,
     /// Bounded catchup policy for missed fire slots after scheduler downtime (issue #484).
     ///
-    /// When `Some`, this takes precedence over the `catchup` bool and selects
-    /// one of three modes: `MostRecent` (fire one, drop the rest), `Window(d)`
-    /// (fire slots within the last `d`), or `Unbounded` (fire all — same as
-    /// `catchup = true`).  `SkipAll` is equivalent to `catchup = false`.
+    /// When `Some`, this takes precedence over the `catchup` bool. It selects
+    /// `MostRecent` (fire one, drop the rest), `Window(d)` (fire slots within
+    /// the last `d`), or `Unbounded` (fire all, same as `catchup = true`).
+    /// `SkipAll` is equivalent to `catchup = false`.
     ///
     /// `None` (the default) preserves the existing `catchup` bool behaviour with
     /// no behavior change for unmodified schedules.
@@ -1269,9 +1266,10 @@ pub struct WorkflowSchedule {
     pub catchup_policy: Option<CatchupPolicy>,
     /// Default retry policy for runs started by this schedule (issue #523).
     ///
-    /// When `Some`, each run started by this schedule uses this as its retry policy
-    /// (unless the workflow type declares its own default or the start API provides
-    /// a per-start override). `None` (the default) disables schedule-level retry.
+    /// When `Some`, each run started by this schedule uses this retry policy.
+    /// A default declared on the workflow type, or a per-start override from
+    /// the start API, takes precedence. `None` (the default) disables
+    /// schedule-level retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
     /// Register this schedule on **every writable shard** rather than the single
@@ -1280,9 +1278,9 @@ pub struct WorkflowSchedule {
     /// `false` (the default) preserves today's behaviour exactly: a non-DAG
     /// schedule is pinned to `router.default_shard()` and a DAG schedule to its
     /// rendezvous shard. When `true`, the scheduler upserts one
-    /// `harvest_schedules` row per writable shard (one row per shard database,
-    /// so the `UNIQUE(workflow_name)` constraint is not violated) and each
-    /// shard's fire mints an execution on that shard.
+    /// `harvest_schedules` row per writable shard, and each shard's fire mints
+    /// an execution on that shard. There is one row per shard database, so the
+    /// `UNIQUE(workflow_name)` constraint is not violated.
     ///
     /// **Supported only for DAG schedules and the built-in synthetic liveness
     /// canary** (names starting with `__harvest_canary_probe`, issue #796, AC4).
@@ -1290,18 +1288,19 @@ pub struct WorkflowSchedule {
     /// failing/stale probe for that shard.
     ///
     /// For any other (plain, non-DAG) workflow this flag is **rejected at build
-    /// time** (`HarvestBuilderError::AllWritableShardsUnsupported`). The reason:
-    /// registration honours the flag for any schedule, but the fire path
-    /// (`scheduled_fire_encodes_shard`) only encodes the shard id into the minted
-    /// `ExecutionId` for DAGs and canaries — it derives that decision purely from
-    /// the workflow name and DAG-ness of the persisted `harvest_schedules` row,
-    /// which carries no `all_writable_shards` column. So a plain workflow opting
-    /// in would register on every writable shard yet mint every execution with
-    /// `ExecutionId::new()` (the router's default shard), producing duplicate
-    /// runs on the default shard and cross-shard write inconsistency. Making it
-    /// general-purpose would require persisting the flag as a `harvest_schedules`
-    /// column — a migration — which issue #796 (AC10) deliberately avoids; the
-    /// canary/DAG path stays migration-free via name-based shard encoding.
+    /// time** (`HarvestBuilderError::AllWritableShardsUnsupported`).
+    /// Registration honours the flag for any schedule. But the fire path
+    /// (`scheduled_fire_encodes_shard`) encodes the shard id into the minted
+    /// `ExecutionId` only for DAGs and canaries. It derives that decision from
+    /// the workflow name and DAG-ness of the persisted `harvest_schedules` row.
+    /// That row carries no `all_writable_shards` column. So a plain workflow
+    /// that opts in registers on every writable shard. Yet it mints every
+    /// execution with `ExecutionId::new()` (the router's default shard). That
+    /// produces duplicate runs on the default shard and cross-shard write
+    /// inconsistency. A general-purpose flag needs a `harvest_schedules`
+    /// column, which is a migration. Issue #796 (AC10) deliberately avoids
+    /// that. The canary/DAG path stays migration-free via name-based shard
+    /// encoding.
     #[serde(default)]
     pub all_writable_shards: bool,
 }
@@ -1374,10 +1373,10 @@ impl WorkflowSchedule {
     /// **Currently inert** — mirroring #243's [`with_execution_timeout`](Self::with_execution_timeout),
     /// the value set here is NOT persisted on `harvest_schedules` and NOT read by
     /// the scheduler tick. To give scheduled runs a chain cap, declare it on the
-    /// workflow type via `#[workflow(chain_execution_timeout = "…")]` (inherited
-    /// through `WorkflowInfo` at tick) and/or set the fleet-wide ceiling with
-    /// [`HarvestBuilder::max_workflow_chain_timeout`]. This builder method is kept
-    /// for API symmetry with #243's third surface.
+    /// workflow type via `#[workflow(chain_execution_timeout = "…")]`. The tick
+    /// inherits it through `WorkflowInfo`. You can also set the fleet-wide
+    /// ceiling with [`HarvestBuilder::max_workflow_chain_timeout`]. This builder
+    /// method is kept for API symmetry with #243's third surface.
     #[must_use]
     pub const fn with_chain_execution_timeout(mut self, timeout: Duration) -> Self {
         self.chain_execution_timeout = Some(timeout);
@@ -1449,9 +1448,9 @@ impl WorkflowSchedule {
     /// Identical inputs always produce the same offset, so backfills and restarts
     /// never re-roll the spread.
     ///
-    /// Validation at build time rejects values that would cause consecutive fires
-    /// to collide (`jitter >= period` for `Interval` schedules) or exceed the
-    /// 1-hour sane upper bound for `Cron` schedules.
+    /// Validation at build time rejects a value that makes consecutive fires
+    /// collide (`jitter >= period` for `Interval` schedules). It also rejects a
+    /// value over the 1-hour upper bound for `Cron` schedules.
     ///
     /// `Duration::ZERO` turns off the default cron jitter.
     #[must_use]
@@ -1486,8 +1485,8 @@ impl WorkflowSchedule {
     /// firing until the operator resumes via `POST /admin/schedules/{id}/resume`.
     ///
     /// Passing `None` disables auto-pause (the default). Passing `Some(0)` is
-    /// treated as disabled — a limit of zero would auto-pause on the very first
-    /// tick before any execution has a chance to run.
+    /// treated as disabled. A limit of zero would auto-pause on the very first
+    /// tick, before any execution has a chance to run.
     #[must_use]
     pub const fn with_consecutive_failure_limit(mut self, limit: u32) -> Self {
         self.consecutive_failure_limit = Some(limit);
@@ -1499,9 +1498,9 @@ impl WorkflowSchedule {
     /// When set, this takes precedence over the `catchup` bool.  See
     /// [`CatchupPolicy`] for the full semantics of each variant.
     ///
-    /// Calling this is the preferred way to configure catchup behaviour; the
-    /// `with_catchup(bool)` builder is still accepted for backward compatibility
-    /// but `with_catchup_policy` wins when both are set.
+    /// Calling this is the preferred way to configure catchup behaviour. The
+    /// `with_catchup(bool)` builder is still accepted for backward compatibility.
+    /// `with_catchup_policy` wins when both are set.
     ///
     /// # Example
     ///
@@ -1572,12 +1571,12 @@ impl WorkflowSchedule {
 
     /// Set a remaining-action budget for this schedule (issue #543).
     ///
-    /// An alias for [`with_max_runs`](Self::with_max_runs) — `max_runs`/`runs_started`
-    /// on `harvest_schedules` already implement the "declare a firing budget, decrement
-    /// exactly-once per actually-started run under the HA claim (#350), never consumed
-    /// by a suppressed firing" contract issue #543 asks for. This method exists so
-    /// callers can spell the intent as "N actions remaining" without needing to know
-    /// the underlying total-budget representation.
+    /// An alias for [`with_max_runs`](Self::with_max_runs). `max_runs`/`runs_started`
+    /// on `harvest_schedules` already implement the contract of issue #543. A
+    /// firing budget decrements exactly once per started run, under the HA claim
+    /// (#350). A suppressed firing never consumes it. This method lets callers
+    /// spell the intent as "N actions remaining" without knowing the underlying
+    /// total-budget representation.
     #[must_use]
     pub const fn with_limited_actions(self, limit: u32) -> Self {
         self.with_max_runs(limit)
@@ -1644,9 +1643,8 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
                 .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
         }
         // A zero (or non-positive) interval never advances, so a due catchup tick
-        // would spin forever (issue #484 / Codex #3223). Reject it at registration
-        // time; the runtime `next_run_after` also treats it as non-firing as a
-        // belt-and-braces guard.
+        // would spin forever (issue #484). Reject it at registration time. The
+        // runtime `next_run_after` also treats it as non-firing, as a second guard.
         Schedule::Interval(period) if period.is_zero() => {
             Err("interval schedule period must be greater than zero".to_string())
         }
@@ -1848,10 +1846,6 @@ mod tests {
     }
 
     // ── Retry-After hint clamp/resolve (issue #744) ────────────────────────────
-    //
-    // RED PHASE: `resolve_retry_after_hint` does not exist yet -- these tests
-    // fail to COMPILE against the missing `crate::policy` symbol until the
-    // green phase adds it.
 
     #[test]
     fn resolve_retry_after_hint_none_falls_through() {
@@ -1874,12 +1868,12 @@ mod tests {
 
     #[test]
     fn resolve_retry_after_hint_zero_ceiling_clamps_a_positive_hint_to_zero_not_none() {
-        // Confirmed edge case (issue #744 review): `ceiling = ZERO` is NOT a
+        // Confirmed edge case (issue #744): `ceiling = ZERO` is NOT a
         // "disable the feature" switch. A positive hint clamps down to
-        // Duration::ZERO (an immediate retry), it does NOT fall through to
-        // `None` (the policy delay) the way a genuinely absent/zero HINT
-        // would. Contrast with `resolve_retry_after_hint_zero_falls_through`
-        // above, which tests the opposite axis (hint == ZERO).
+        // Duration::ZERO (an immediate retry). It does NOT fall through to
+        // `None` (the policy delay), as an absent or zero HINT does.
+        // `resolve_retry_after_hint_zero_falls_through` tests the opposite axis
+        // (hint == ZERO).
         assert_eq!(
             resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::ZERO),
             Some(Duration::ZERO),
@@ -1924,11 +1918,11 @@ mod tests {
 
     #[test]
     fn resolve_retry_after_hint_100_randomized_hints_never_resolve_below_the_clamp() {
-        // Success-metric property test (issue #744): for 100 varied hint /
-        // ceiling combinations, the resolved delay is never less than
-        // `min(hint, ceiling)` when the hint is a positive duration -- i.e. a
-        // retry scheduled from this resolution can never fire earlier than
-        // the (possibly clamped) hinted time. Deterministic PRNG, no sleeping.
+        // Success-metric property test (issue #744). For 100 varied hint /
+        // ceiling combinations, a positive hint never resolves below
+        // `min(hint, ceiling)`. So a retry scheduled from this resolution never
+        // fires before the (possibly clamped) hinted time. Deterministic PRNG,
+        // no sleeping.
         fn mix(seed: &mut u64) -> u64 {
             *seed ^= *seed << 13;
             *seed ^= *seed >> 7;
@@ -1962,10 +1956,7 @@ mod tests {
 
     // ── Builder-level activity default floor (issue #620) ─────────────────────
     //
-    // RED PHASE: `resolve_effective_retry` / `resolve_effective_start_to_close`
-    // do not exist yet — these tests fail to COMPILE against the missing
-    // `crate::policy` symbols until the green phase adds them. The precedence
-    // the green phase must implement is:
+    // `resolve_effective_retry` / `resolve_effective_start_to_close` precedence:
     //   call-site override  →  activity default  →  builder default  →  None
     // i.e. `call.or(activity).or(builder)`.
 
@@ -2678,13 +2669,12 @@ mod tests {
     #[test]
     fn zero_interval_schedule_rejected() {
         // A zero interval never advances and would spin a catchup tick forever
-        // (issue #484 / Codex #3223); reject it at validation time.
+        // (issue #484). Reject it at validation time.
         let err = validate_schedule(&Schedule::Interval(Duration::ZERO)).unwrap_err();
         assert!(
             err.contains("greater than zero"),
             "error should explain the zero-interval rejection: {err}"
         );
-        // A positive interval remains valid.
         assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(1))).is_ok());
     }
 

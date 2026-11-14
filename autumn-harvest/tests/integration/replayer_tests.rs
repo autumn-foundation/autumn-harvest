@@ -142,8 +142,8 @@ fn patched_workflow_gated<'a>(
     })
 }
 
-/// Broken phase-3 workflow: the `patched("gate")` call was deleted BEFORE all
-/// marker-bearing executions drained — the stale `patch:gate` marker is left
+/// Broken phase-3 workflow: the `patched("gate")` call was deleted before all
+/// marker-bearing executions drained. The stale `patch:gate` marker stays
 /// unconsumed and must classify as `PatchMarkerMismatch`.
 fn patched_workflow_removed_gate<'a>(
     ctx: &'a WorkflowContext,
@@ -157,8 +157,8 @@ fn patched_workflow_removed_gate<'a>(
     })
 }
 
-/// Phase-2 workflow: all pre-patch runs have drained, so the branch is gone —
-/// `deprecate_patch("gate")` makes the recorded marker transparent and the
+/// Phase-2 workflow: all pre-patch runs have drained, so the branch is gone.
+/// `deprecate_patch("gate")` makes the recorded marker transparent, and the
 /// new code path runs unconditionally.
 fn patched_workflow_deprecated<'a>(
     ctx: &'a WorkflowContext,
@@ -173,9 +173,9 @@ fn patched_workflow_deprecated<'a>(
     })
 }
 
-/// Phase-2 workflow with a *residual* `patched()` call left in place: the
-/// deprecation memo keeps the residual call deterministic — phase-1 histories
-/// (marker present) stay on the new branch, phase-0 histories (no marker)
+/// Phase-2 workflow with a *residual* `patched()` call left in place. The
+/// deprecation memo keeps the residual call deterministic. Phase-1 histories
+/// (marker present) stay on the new branch. Phase-0 histories (no marker)
 /// stay on the old branch.
 fn patched_workflow_deprecated_residual<'a>(
     ctx: &'a WorkflowContext,
@@ -197,11 +197,11 @@ fn patched_workflow_deprecated_residual<'a>(
     })
 }
 
-/// Sandwich-flip regression handler (issue #687 review finding F1):
-/// `patched(id)` → `deprecate_patch(id)` → residual `patched(id)` in one
-/// body. On the live cycle the first call's marker exists only as a pending
-/// command; the this-cycle latch makes `deprecate_patch` (and the residual
-/// call's memo) see it, so live and replay passes agree: (true, true).
+/// Sandwich-flip regression handler (issue #687): `patched(id)`, then
+/// `deprecate_patch(id)`, then a residual `patched(id)` in one body. On the
+/// live cycle the first marker exists only as a pending command. The
+/// this-cycle latch makes `deprecate_patch` and the residual memo see it.
+/// So live and replay passes agree: (true, true).
 fn patched_workflow_sandwich<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -226,9 +226,8 @@ fn patched_workflow_sandwich<'a>(
 
 /// Workflow that calls `set_current_details` before, between, and after
 /// activities, including a trailing clear via an empty string (issue #593).
-/// It must replay against a history containing **only** the activity events
-/// -- `set_current_details` leaves zero footprint in `harvest_events`, so no
-/// history event corresponds to any of these calls.
+/// It must replay against a history that holds **only** the activity events.
+/// `set_current_details` leaves zero footprint in `harvest_events`.
 fn current_details_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -251,11 +250,10 @@ fn current_details_workflow<'a>(
 }
 
 /// Worker-session pipeline (issue #606): open a session, run one member
-/// activity through it, then release. Proves AC6 -- session identity comes
-/// from the deterministic `session:{seq}` marker and the physical host
-/// worker binding comes from the acquire activity's recorded output, so
-/// replay succeeds identically regardless of which (if any) worker is
-/// available, and regardless of which worker actually hosted the session.
+/// activity through it, then release. Proves AC6. Session identity comes from
+/// the deterministic `session:{seq}` marker. The host worker binding comes
+/// from the recorded output of the acquire activity. So replay succeeds
+/// whichever worker is available, and whichever worker hosted the session.
 fn session_pipeline_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -326,11 +324,10 @@ fn mutex_grant_key_a_workflow<'a>(
 }
 
 /// Hold "k", then re-acquire the same key. The self-deadlock guard must fire
-/// **synchronously** (before any positional history match), so the caught
-/// `MutexSelfDeadlock` branch replays deterministically rather than diverging —
-/// the P1 regression this pins (issue #691 review: a self-deadlock checked
-/// *after* the positional match returns the typed error live but nd-blocks on
-/// replay).
+/// **synchronously**, before any positional history match. So the caught
+/// `MutexSelfDeadlock` branch replays deterministically rather than diverging.
+/// This pins the regression from issue #691: a self-deadlock checked *after*
+/// the positional match returns the typed error live but nd-blocks on replay.
 fn mutex_self_deadlock_caught_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -377,11 +374,11 @@ fn sleep_until_workflow<'a>(
     })
 }
 
-/// Deadline-aware continue-as-new (issue #772): at the top of the run, check
-/// `should_continue_as_new()`; when it trips (event count OR the deadline
+/// Deadline-aware continue-as-new (issue #772). At the top of the run, check
+/// `should_continue_as_new()`. When it trips (event count OR the deadline
 /// fraction), fork a fresh run via `continue_as_new`. Otherwise do a unit of
-/// "work" and complete. Registered with a per-run `execution_timeout` on the
-/// replayer so the deadline branch is exercised.
+/// "work" and complete. The replayer sets a per-run `execution_timeout`, so
+/// the deadline branch runs.
 fn deadline_can_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -398,13 +395,12 @@ fn deadline_can_workflow<'a>(
     })
 }
 
-/// Deadline-aware decision probe (issue #772) whose `should_continue_as_new()`
-/// decision is made **observable through replay determinism**: the trip branch
-/// schedules the `checkpoint_now` activity, the no-trip branch schedules
-/// `keep_working`. Because the recorded history fixes which activity was
-/// scheduled, a *wrong* decision (a broken fraction comparison) schedules the
-/// other activity and diverges — so the 1000× bar actually falsifies a broken
-/// comparison rather than passing regardless of the decision.
+/// Deadline-aware decision probe (issue #772). Replay determinism makes its
+/// `should_continue_as_new()` decision **observable**. The trip branch
+/// schedules `checkpoint_now`, and the no-trip branch schedules
+/// `keep_working`. The recorded history fixes which activity was scheduled.
+/// A *wrong* decision (a broken fraction comparison) schedules the other
+/// activity and diverges. So the 1000× bar falsifies a broken comparison.
 fn deadline_branch_probe_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -422,7 +418,7 @@ fn deadline_branch_probe_workflow<'a>(
     })
 }
 
-/// Long-lived entity shape (issue #772 Finding 1): `should_continue_as_new()` at
+/// Long-lived entity shape (issue #772): `should_continue_as_new()` at
 /// the top, then a durable timer + complete. Used to prove a pre-#772 history
 /// (recorded with NO `SideEffectRecorded{Now}` at the check site) replays
 /// cleanly under the new deadline-aware binary instead of nd-blocking.
@@ -445,15 +441,15 @@ fn should_can_then_timer_workflow<'a>(
     })
 }
 
-/// Migration-path shape (issue #772, deadline-probe naming fix): the deadline
+/// Migration-path shape (issue #772, deadline-probe naming fix). The deadline
 /// check sits immediately before a **user** `ctx.system_now()` call, then a
-/// durable timer. In a pre-#772 history there is NO recorded deadline-probe
-/// `Now` at the check site — but there IS the user's own `system_now()` Now at
-/// the cursor. The deadline probe must NOT consume that user `Now`; it belongs
-/// to `ctx.system_now()`. Before the naming fix, the tolerant matcher treated
-/// any `SideEffectRecorded{Now, name: None}` at the cursor as its own read,
-/// stole the user's `Now`, and the subsequent `ctx.system_now()` then replayed
-/// against the following `TimerStarted` and reported false non-determinism.
+/// durable timer. A pre-#772 history has NO recorded deadline-probe `Now` at
+/// the check site. But it has the `Now` of the user's own `system_now()` at
+/// the cursor. The deadline probe must NOT consume that user `Now`. Before the
+/// naming fix, the tolerant matcher took any `SideEffectRecorded{Now, name:
+/// None}` at the cursor as its own read. It stole the user's `Now`. The next
+/// `ctx.system_now()` then replayed against the following `TimerStarted` and
+/// reported false non-determinism.
 fn should_can_then_user_now_then_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -495,10 +491,10 @@ fn await_external_wf<'a>(
 }
 
 /// Await an external workflow and branch on its typed terminal cause (issue
-/// #757): the branch decision is made observable through replay determinism —
-/// a `PaymentDeclined` failure schedules `compensate`, any other outcome
-/// schedules `finalize`. A wrong branch would schedule the other activity and
-/// diverge.
+/// #757). Replay determinism makes the branch decision observable. A
+/// `PaymentDeclined` failure schedules `compensate`, and any other outcome
+/// schedules `finalize`. A wrong branch schedules the other activity and
+/// diverges.
 fn await_external_branch_wf<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -575,12 +571,11 @@ fn cancellable_timer_workflow<'a>(
 }
 
 /// Arms a cancellable durable timer and then COMPLETES in the same task without
-/// awaiting it (Codex P1, issue #768). The live worker emits `[ArmTimer(idle)]`
-/// and then seals the execution; the terminal-cycle persist path
-/// (`plan_timer_lifecycle` with `skip_arm_inserts = true`) must still record the
-/// `TimerStarted` event (while skipping the never-firing `harvest_timers` row),
-/// or the positional `match_timer_arm` diverges strict replay when `start_timer`
-/// re-runs.
+/// awaiting it (issue #768). The live worker emits `[ArmTimer(idle)]` and then
+/// seals the execution. The terminal-cycle persist path (`plan_timer_lifecycle`
+/// with `skip_arm_inserts = true`) skips the never-firing `harvest_timers` row.
+/// It must still record the `TimerStarted` event. Otherwise the positional
+/// `match_timer_arm` diverges strict replay when `start_timer` re-runs.
 fn arm_timer_then_complete_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -592,12 +587,12 @@ fn arm_timer_then_complete_workflow<'a>(
     })
 }
 
-/// Duplicate ACTIVE arm (Codex P2, issue #768): calls `start_timer("idle", 300)`
-/// twice with no intervening cancel/reset, then awaits the fire. The durable row
-/// is deduped, so the recorded history has exactly ONE `TimerStarted("idle")`.
-/// On replay the first `start_timer` consumes it; the second must be an
-/// idempotent no-op that does NOT re-run the positional `match_timer_arm`
-/// (which would diverge against the trailing `TimerFired`).
+/// Duplicate ACTIVE arm (issue #768): calls `start_timer("idle", 300)` twice
+/// with no cancel or reset between, then awaits the fire. The durable row is
+/// deduped, so the recorded history has exactly ONE `TimerStarted("idle")`.
+/// On replay the first `start_timer` consumes it. The second must be an
+/// idempotent no-op that does NOT re-run the positional `match_timer_arm`.
+/// That match would diverge against the trailing `TimerFired`.
 fn duplicate_active_start_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -633,13 +628,13 @@ fn cancellable_timer_reset_workflow<'a>(
     })
 }
 
-/// Same-cycle cancel-then-await (Codex P2, issue #768): arm a timer, cancel it,
-/// then await its outcome in the SAME task. Must resolve `Cancelled` and must
-/// NOT re-arm — otherwise the "cancelled" timer re-arms and later fires
-/// (AC2/AC3 violation). Proves the fix is correct on the REPLAY path, not just
-/// live: `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`'s
-/// `match_timer_or_cancel` sees `NoMatch` and must fall back to the per-context
-/// cancelled state rather than re-arming.
+/// Same-cycle cancel-then-await (issue #768): arm a timer, cancel it, then
+/// await its outcome in the SAME task. It must resolve `Cancelled` and must
+/// NOT re-arm. A re-arm makes the "cancelled" timer fire later (AC2/AC3
+/// violation). This proves the fix on the REPLAY path, not just live.
+/// `cancel()` consumes the recorded `TimerCancelled`, so the
+/// `match_timer_or_cancel` of `await_fire` sees `NoMatch`. It must then fall
+/// back to the per-context cancelled state rather than re-arm.
 fn cancel_then_await_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -685,10 +680,10 @@ fn cancellable_timer_then_activity_workflow<'a>(
     })
 }
 
-/// Cancellable timer reset loop that ALSO captures a `new_uuid()` side effect in
-/// the SAME cycle as the initial arm and each reset (issue #768, FINDING 1). This
-/// drives the arm/reset + side-effect same-cycle interleaving path — the exact
-/// ordering the pre-fix worker got wrong — across a reset-heavy history.
+/// Cancellable timer reset loop that ALSO captures a `new_uuid()` side effect
+/// in the SAME cycle as the initial arm and each reset (issue #768). This
+/// drives the same-cycle interleaving of arm/reset and side effect across a
+/// reset-heavy history. The pre-fix worker got that ordering wrong.
 fn cancellable_reset_with_uuid_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -726,7 +721,7 @@ fn cancellable_timer_renamed_workflow<'a>(
 }
 
 /// Arms a cancellable timer, then captures a `new_uuid()` side effect in the
-/// SAME cycle, then awaits the fire (issue #768, FINDING 1). The live worker
+/// SAME cycle, then awaits the fire (issue #768). The live worker
 /// emits `[ArmTimer(idle), RecordSideEffect(Uuid)]`; the recorded history MUST
 /// interleave `TimerStarted` at the `ArmTimer` position (before
 /// `SideEffectRecorded`), or `match_timer_arm`'s positional check diverges on
@@ -959,9 +954,9 @@ fn jitter_timer_workflow<'a>(
     })
 }
 
-/// Workflow that branches on the operator force-fail cause (issue #765):
-/// a genuine success completes normally; an `OperatorForceFailed` activity
-/// error routes to a compensation activity; any other error propagates.
+/// Workflow that branches on the operator force-fail cause (issue #765). A
+/// genuine success completes normally. An `OperatorForceFailed` activity
+/// error routes to a compensation activity. Any other error propagates.
 fn force_failed_compensating_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -987,16 +982,16 @@ fn force_failed_compensating_workflow<'a>(
 }
 
 /// Workflow that branches on a contained **handler-panic** activity cause
-/// (issue #782): a panicking activity is contained and, after its retry budget
-/// is exhausted, records a terminal `ActivityFailed` carrying the distinct
-/// `HandlerPanic` `error_type` on the *existing* event variant (no new variant).
-/// The workflow observes that typed cause via `activity_error_type()` and
-/// advances to its own compensation activity — proving AC6 "replay contract
-/// unchanged": a history containing a `HandlerPanic`-typed `ActivityFailed`
-/// replays deterministically down the same branch. If the typed `error_type`
-/// did not survive replay the handler would fall through to `Err(e)` and
-/// complete early, diverging from the recorded compensation activity — so
-/// `ReplaySucceeded` is falsifiable evidence.
+/// (issue #782). The engine contains a panicking activity. After its retry
+/// budget runs out, it records a terminal `ActivityFailed` with the distinct
+/// `HandlerPanic` `error_type` on the *existing* event variant.
+/// The workflow reads that typed cause via `activity_error_type()` and runs
+/// its own compensation activity. This proves AC6 "replay contract
+/// unchanged": a history with a `HandlerPanic`-typed `ActivityFailed`
+/// replays deterministically down the same branch. If the typed
+/// `error_type` did not survive replay, the handler falls through to
+/// `Err(e)` and completes early. That diverges from the recorded compensation
+/// activity, so `ReplaySucceeded` is falsifiable evidence.
 fn handler_panic_compensating_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1026,12 +1021,11 @@ fn handler_panic_compensating_workflow<'a>(
 // ---------------------------------------------------------------------------
 
 /// Parent that spawns a child, then branches on the child's *typed* failure
-/// class (issue #767). The compensation branch is only taken for a typed
-/// `ValidationRejected` + `non_retryable` child failure, and it emits a
-/// **command** (the `issue_refund` activity) so the branch decision is
-/// observable in history — if the typed fields did not survive replay, the
-/// handler would take the `Err(e)` fall-through and complete early, diverging
-/// from the recorded history (falsifiable).
+/// class (issue #767). Only a typed `ValidationRejected` + `non_retryable`
+/// child failure takes the compensation branch. That branch emits a
+/// **command** (the `issue_refund` activity), so history shows the decision.
+/// If the typed fields did not survive replay, the handler takes the `Err(e)`
+/// fall-through and completes early. That diverges from the recorded history.
 fn parent_typed_child_failure_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1188,8 +1182,8 @@ fn canonical_history() -> (ExecutionId, Vec<WorkflowEvent>) {
 }
 
 /// History for `current_details_workflow`: two activities, no timer, and
-/// deliberately **no** event corresponding to any `set_current_details` call
-/// -- proving the call is zero-footprint by construction (issue #593).
+/// deliberately **no** event for any `set_current_details` call. This proves
+/// the call is zero-footprint by construction (issue #593).
 fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let id1 = ActivityExecId::new();
@@ -1257,8 +1251,8 @@ fn race_then_activity_workflow<'a>(
 }
 
 /// Issue #1126 replay-neutrality fixture: race two activities (branch 0 wins)
-/// and end at the race with no follow-on command — the exact history shape old
-/// code could record. Must pass both before AND after the same-cycle fix.
+/// and end at the race with no follow-on command. Old code could record this
+/// exact history shape. It must pass both before AND after the same-cycle fix.
 fn race_only_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1423,10 +1417,10 @@ fn build_replayer() -> WorkflowReplayer {
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
-/// an operator (issue #765): the forced failure rides the *existing*
-/// `ActivityFailed` variant (no new event variant), carrying the distinct
-/// `OperatorForceFailed` `error_type`; the workflow then ran its compensation
-/// activity on the live frontier.
+/// an operator (issue #765). The forced failure rides the *existing*
+/// `ActivityFailed` variant with the distinct `OperatorForceFailed`
+/// `error_type`. The workflow then ran its compensation activity on the live
+/// frontier.
 fn force_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let charge_id = ActivityExecId::new();
@@ -1471,8 +1465,8 @@ fn force_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
 }
 
 /// History for `session_pipeline_workflow`, parameterized by the recorded
-/// host worker id -- so the same shape can be replayed twice with two
-/// different hosts to prove AC6's "regardless of which worker" claim.
+/// host worker id. Two replays with two different hosts prove the AC6
+/// "regardless of which worker" claim.
 fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let session_uuid = uuid::Uuid::new_v4();
@@ -1514,10 +1508,9 @@ fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowE
         WorkflowEvent::ActivityScheduled {
             activity_id: release_id,
             name: "__harvest_session_release".into(),
-            // `Session::complete()` dispatches the release activity with the
-            // session id (as a string) for input -- the worker-side handler
-            // parses it back out to know which `harvest_sessions` row to
-            // mark COMPLETED.
+            // `Session::complete()` sends the session id as a string. The
+            // worker-side handler parses it to find the `harvest_sessions`
+            // row to mark COMPLETED.
             input: serde_json::json!(session_uuid.to_string()),
             queue: "gpu-workers".into(),
         },
@@ -1529,16 +1522,15 @@ fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowE
     (exec_id, events)
 }
 
-/// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
 /// The failure a replay **reproduced**, in whichever field the report carries it.
 ///
 /// Issue #952: a history that ends in a terminal `WorkflowFailed` and replays to
-/// a failure again reports `ReplaySucceeded` — the recorded run failed and the
-/// code failed the same way, which is what a determinism gate asks — and carries
-/// the error string in `ReplayReport::reproduced_failure`. A history with no
-/// terminal-failure tail (e.g. one truncated before its terminal event) still
-/// reports `ReplayStatus::WorkflowFailed`. Both shapes are a reproduced failure;
-/// anything else is a test failure.
+/// a failure again reports `ReplaySucceeded`. The recorded run failed and the
+/// code failed the same way, which is what a determinism gate asks. The report
+/// carries the error string in `ReplayReport::reproduced_failure`. A history
+/// with no terminal-failure tail (e.g. one truncated before its terminal event)
+/// still reports `ReplayStatus::WorkflowFailed`. Both shapes are a reproduced
+/// failure. Anything else is a test failure.
 fn reproduced_workflow_failure(report: &autumn_harvest::testing::ReplayReport) -> String {
     report
         .failure_message()
@@ -1563,9 +1555,9 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
 
 // ---------------------------------------------------------------------------
 // (a0) Operator force-fail replays deterministically down the workflow's own
-//      failure/compensation branch (issue #765 AC: the forced ActivityFailed
-//      is a plain, existing event — replay must recognize the distinct
-//      OperatorForceFailed cause and take the same branch every time).
+//      failure/compensation branch (issue #765). The forced ActivityFailed is
+//      a plain, existing event. Replay must recognize the distinct
+//      OperatorForceFailed cause and take the same branch every time.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1593,18 +1585,18 @@ async fn replay_force_failed_activity_takes_compensation_branch_deterministicall
 }
 
 // ---------------------------------------------------------------------------
-// (a0b) A contained activity HANDLER PANIC (issue #782) replays deterministically
-//       down the workflow's own compensation branch. The panic is contained by
-//       the engine into a terminal `ActivityFailed` carrying the distinct
-//       `HandlerPanic` error_type on the EXISTING event variant — AC6 requires
-//       the replay contract to be unchanged, i.e. such a history must replay
+// (a0b) A contained activity HANDLER PANIC (issue #782) replays
+//       deterministically down the workflow's own compensation branch. The
+//       engine contains the panic into a terminal `ActivityFailed` with the
+//       distinct `HandlerPanic` error_type on the EXISTING event variant. AC6
+//       requires an unchanged replay contract. Such a history must replay
 //       clean and drive the same branch every cycle.
 // ---------------------------------------------------------------------------
 
-/// History recorded by a run whose `risky_step` activity panicked: after its
-/// retry budget was exhausted the engine recorded a terminal `ActivityFailed`
-/// carrying the engine-reserved `HandlerPanic` `error_type` (issue #782, no new
-/// event variant); the workflow then ran its compensation activity on the live
+/// History recorded by a run whose `risky_step` activity panicked. After its
+/// retry budget ran out, the engine recorded a terminal `ActivityFailed` with
+/// the engine-reserved `HandlerPanic` `error_type` (issue #782, no new event
+/// variant). The workflow then ran its compensation activity on the live
 /// frontier.
 fn handler_panic_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
@@ -1808,11 +1800,11 @@ async fn replayer_succeeds_for_await_external_workflow() {
 }
 
 /// The falsifiable success metric (issue #757, mirroring the #476 1000-ordering
-/// bar): replay one representative await fixture across N = 1000 distinct
-/// fixtures (varying target id and output) — every pass must report
+/// bar). Replay one representative await fixture across N = 1000 distinct
+/// fixtures (varying target id and output). Every pass must report
 /// `ReplaySucceeded` with zero divergences. Each fixture pins the recorded
-/// output through the workflow's own return value, so a broken match would
-/// diverge rather than pass.
+/// output through the workflow's own return value. So a broken match diverges
+/// rather than passes.
 #[tokio::test]
 async fn replayer_await_external_workflow_1000_passes_deterministic() {
     let replayer = build_replayer();
@@ -1830,13 +1822,14 @@ async fn replayer_await_external_workflow_1000_passes_deterministic() {
     }
 }
 
-/// A concurrent await+activity history whose interleaving is derived from
-/// `ordering` (issue #757 review, P3-b): the schedule block (`ActivityScheduled`
-/// vs `ExternalAwaitRequested`) and the completion block (`ActivityCompleted` vs
-/// `ExternalAwaitResolved`) are each swapped by one bit of `ordering`, giving the
-/// four valid interleavings (schedules always precede completions, which the
-/// `futures::join!` batch guarantees). The `await_external_concurrent_workflow`
-/// handler consumes both via the stash triplets in every scan loop.
+/// A concurrent await+activity history whose interleaving derives from
+/// `ordering` (issue #757). One bit of `ordering` swaps the schedule block
+/// (`ActivityScheduled` vs `ExternalAwaitRequested`). Another swaps the
+/// completion block (`ActivityCompleted` vs `ExternalAwaitResolved`). That
+/// gives the four valid interleavings. Schedules always precede completions,
+/// which the `futures::join!` batch guarantees. The
+/// `await_external_concurrent_workflow` handler consumes both via the stash
+/// triplets in every scan loop.
 fn await_concurrent_history(
     target: ExecutionId,
     output: Value,
@@ -1883,12 +1876,12 @@ fn await_concurrent_history(
     (exec_id, events)
 }
 
-/// The falsifiable ORDERING bar (issue #757 review, P3-b, mirroring the #476
-/// 1000-ordering precedent): replay the concurrent await+activity fixture across
-/// N = 1000 passes, walking a deterministic index-derived permutation of the four
-/// valid interleavings of the await triplet relative to the activity's events
-/// (with varying data). Every pass must report `ReplaySucceeded` — a stash bug in
-/// any scan loop would diverge on the ordering it mishandles.
+/// The falsifiable ORDERING bar (issue #757, mirroring the #476 1000-ordering
+/// precedent). Replay the concurrent await+activity fixture across N = 1000
+/// passes. Each pass takes a deterministic index-derived permutation of the
+/// four valid interleavings of the await triplet and the activity events,
+/// with varying data. Every pass must report `ReplaySucceeded`. A stash bug in
+/// any scan loop diverges on the ordering it mishandles.
 #[tokio::test]
 async fn replayer_await_external_concurrent_1000_orderings_deterministic() {
     let replayer = build_replayer();
@@ -2041,11 +2034,11 @@ async fn replayer_await_external_concurrent_with_activity_deterministic() {
 
 #[tokio::test]
 async fn replayer_await_external_concurrent_with_timer_deterministic() {
-    // P2-e (issue #757 review): await concurrent with a durable timer in one
-    // `futures::join!` batch. Replay across BOTH interleaved orderings of the
-    // recorded terminal events (`TimerFired` vs `ExternalAwaitResolved`) must
-    // succeed — the await stash triplets threaded through `match_signal_or_timer`
-    // / `match_child_or_timer` keep the timer scan from diverging.
+    // Issue #757: await concurrent with a durable timer in one
+    // `futures::join!` batch. Replay must succeed across BOTH orderings of the
+    // recorded terminal events (`TimerFired` vs `ExternalAwaitResolved`). The
+    // await stash triplets threaded through `match_signal_or_timer` and
+    // `match_child_or_timer` keep the timer scan from diverging.
     let target = ExecutionId::new();
     let await_id = autumn_harvest::ExternalAwaitId::new();
     let output = serde_json::json!({ "value": 7 });
@@ -2102,9 +2095,9 @@ async fn replayer_await_external_concurrent_with_timer_deterministic() {
 
 #[tokio::test]
 async fn replayer_detects_await_external_target_mismatch() {
-    // A history recorded awaiting target X, replayed by a workflow that awaits a
-    // DIFFERENT target Y (a non-deterministic code change) must be classified as
-    // ExternalAwaitMismatch, not swallowed.
+    // A history recorded awaiting target X, replayed by a workflow that
+    // awaits a DIFFERENT target Y (a non-deterministic code change), must
+    // classify as ExternalAwaitMismatch. Replay must not swallow it.
     let recorded_target = ExecutionId::new();
     let (exec_id, events) =
         await_resolved_history(recorded_target, serde_json::json!({ "ok": true }));
@@ -2133,15 +2126,15 @@ async fn replayer_detects_await_external_target_mismatch() {
 // ---------------------------------------------------------------------------
 // (a1) Typed workflow failures (issue #767, AC6) replay deterministically.
 //
-//   Proof 1: a parent that branches on a *typed* `ChildWorkflowFailed`'s
-//   error_type/non_retryable replays down its compensation branch. The branch
-//   emits a command (issue_refund), so if the typed fields did NOT survive
-//   replay the parent would take the fall-through and complete early, diverging
-//   from history — ReplaySucceeded over multiple cycles proves the typed fields
+//   Proof 1: a parent that branches on the error_type/non_retryable of a
+//   *typed* `ChildWorkflowFailed` replays down its compensation branch. The
+//   branch emits a command (issue_refund). If the typed fields did NOT survive
+//   replay, the parent takes the fall-through and completes early, diverging
+//   from history. ReplaySucceeded over several cycles proves the typed fields
 //   are reproduced identically. This is the parent-side surface of AC6.
 //
 //   Proof 2: a run that ended in a typed `WorkflowFailed` round-trips through
-//   replay deterministically — the reproduced failure carries the identical
+//   replay deterministically. The reproduced failure carries the identical
 //   typed error_type/details/non_retryable on every cycle.
 // ---------------------------------------------------------------------------
 
@@ -2182,9 +2175,8 @@ async fn replay_typed_workflow_failed_round_trips_with_identical_typed_fields() 
                 events.clone(),
             ))
             .await;
-        // A self-failing workflow surfaces as `WorkflowFailed` (it did not
-        // complete successfully) — the *determinism* is the point: the same
-        // typed envelope is reproduced on every cycle.
+        // A self-failing workflow surfaces as `WorkflowFailed`. The point is
+        // *determinism*: every cycle reproduces the same typed envelope.
         let error = reproduced_workflow_failure(&report);
         reproduced.push(error);
     }
@@ -2253,10 +2245,10 @@ async fn replay_workflow_with_current_details_calls_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// (a3) Worker sessions replay with 100% fidelity regardless of which worker
-//      is available at replay time (issue #606 AC6 -- the headline claim:
-//      no new WorkflowEvent variant, session identity via MarkerRecorded,
-//      physical worker binding via the acquire activity's recorded output).
+// (a3) Worker sessions replay with 100% fidelity whichever worker is
+//      available at replay time (issue #606 AC6). No new WorkflowEvent
+//      variant: session identity comes via MarkerRecorded, and the physical
+//      worker binding comes via the recorded output of the acquire activity.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2281,11 +2273,10 @@ async fn replay_session_pipeline_workflow_succeeds() {
 
 #[tokio::test]
 async fn replay_session_pipeline_workflow_succeeds_regardless_of_recorded_host_worker() {
-    // Same fixture shape, a *different* recorded host worker id -- proving
-    // replay is worker-independent: the session's physical binding is
-    // recovered purely from the acquire activity's recorded output, with no
-    // engine-level knowledge of which worker is live (or exists at all) at
-    // replay time.
+    // Same fixture shape, a *different* recorded host worker id. This proves
+    // replay is worker-independent. The physical binding of the session comes
+    // only from the recorded output of the acquire activity. The engine needs
+    // no knowledge of which worker is live, or exists, at replay time.
     let replayer = build_replayer();
 
     for host in [
@@ -2460,9 +2451,9 @@ async fn replay_workflow_mutex_key_divergence_detected() {
 async fn mutex_self_deadlock_is_checked_before_positional_match() {
     // Only ONE MutexGranted is recorded (a self-deadlock never records a second
     // grant). The workflow acquires "k" (matches the grant), then re-acquires
-    // "k" — which must surface `MutexSelfDeadlock` SYNCHRONOUSLY, before the
-    // positional history match, so the caught branch replays deterministically
-    // rather than nd-blocking (issue #691 review, P1).
+    // "k". That must surface `MutexSelfDeadlock` SYNCHRONOUSLY, before the
+    // positional history match. So the caught branch replays deterministically
+    // rather than nd-blocking (issue #691).
     let (exec_id, events) = mutex_grant_history("k", 1);
     let replayer = build_replayer();
 
@@ -2484,17 +2475,17 @@ async fn mutex_self_deadlock_is_checked_before_positional_match() {
 
 // ── ctx.race() replay-neutrality fixtures (issue #1126) ─────────────────────
 // These prove the same-cycle fix does NOT change replay of RECORDED histories.
-// They must pass BOTH before and after the fix — they are replay-neutrality
-// coverage, NOT the RED reproducer (the RED case lives in context.rs and
-// exercises the LIVE resolving cycle).
+// They must pass BOTH before and after the fix. They are replay-neutrality
+// coverage, NOT the RED reproducer. The RED case lives in context.rs and
+// exercises the LIVE resolving cycle.
 
 #[tokio::test]
 async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
     // A recorded post-fix history: an activity race (2 branches, branch 0
     // "fetch_a" wins) followed by a follow-on activity ("next_step"). The loser
-    // ("fetch_b") was scheduled AND started but never got a terminal live; its
-    // synthetic `ActivityFailed` ("lost race to a sibling branch") is appended
-    // by the winner cycle. This full-fidelity history must replay cleanly.
+    // ("fetch_b") was scheduled AND started but got no live terminal. The
+    // winner cycle appends its synthetic `ActivityFailed` ("lost race to a
+    // sibling branch"). This full-fidelity history must replay cleanly.
     let exec_id = ExecutionId::new();
     let winner_id = ActivityExecId::new();
     let loser_id = ActivityExecId::new();
@@ -2582,11 +2573,12 @@ async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
 
 #[tokio::test]
 async fn replay_race_ending_at_race_no_follow_on_succeeds() {
-    // A pre-fix-shaped history where the workflow ENDS at the race (no follow-on
-    // command). Branch 0 ("fetch_a") wins; the loser's synthetic `ActivityFailed`
-    // is recorded BEFORE the winner marker (mirroring the existing
+    // A pre-fix-shaped history where the workflow ENDS at the race (no
+    // follow-on command). Branch 0 ("fetch_a") wins. The synthetic
+    // `ActivityFailed` of the loser is recorded BEFORE the winner marker. That
+    // mirrors the ordering of
     // `race_activity_verifies_previously_recorded_winner_without_new_commands`
-    // ordering) to prove that ordering also replays clean.
+    // and proves that ordering also replays clean.
     let exec_id = ExecutionId::new();
     let winner_id = ActivityExecId::new();
     let loser_id = ActivityExecId::new();
@@ -2752,9 +2744,9 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
 // ---------------------------------------------------------------------------
 
 /// Build a consistent recorded history for `sleep_until_workflow`: a frozen
-/// `system_now()` capture plus a whole-second timer whose duration equals
+/// `system_now()` capture plus a whole-second timer. The timer duration equals
 /// `remaining_secs_until(deadline, frozen_now)` computed inline from the same
-/// values, so the fixture is internally consistent by construction.
+/// values, so the fixture is consistent by construction.
 fn sleep_until_history(
     frozen_millis: i64,
     deadline_millis: i64,
@@ -2795,19 +2787,18 @@ fn sleep_until_history(
 }
 
 /// The falsifiable bar for issue #749: `sleep_until` histories replay
-/// deterministically across N = 1000 runs with zero divergences. Each iteration
-/// builds a *distinct* fixture — the frozen `system_now()` instant and the
-/// deadline offset both vary with `i`, including deliberate sub-second jitter
-/// that exercises the round-up path — so this is 1000 varied cases, not one
+/// deterministically across N = 1000 runs with zero divergences. Each
+/// iteration builds a *distinct* fixture. The frozen `system_now()` instant
+/// and the deadline offset both vary with `i`. Deliberate sub-second jitter
+/// exercises the round-up path. So these are 1000 varied cases, not one
 /// fixture cloned 1000 times.
 #[tokio::test]
 async fn sleep_until_replays_deterministically() {
     let base_frozen = 1_600_000_000_000_i64;
     let replayer = build_replayer();
     for i in 0..1000_i64 {
-        // Vary the frozen capture and the remaining offset deterministically;
-        // the `* 250ms` term walks the sub-second remainder through the round-up
-        // boundary (0, 250, 500, 750, 1000ms, ...).
+        // The `* 250ms` term walks the sub-second remainder through the
+        // round-up boundary (0, 250, 500, 750, 1000ms, ...).
         let frozen_millis = base_frozen + i * 37_000;
         let deadline_millis = frozen_millis + 3_600_000 + i * 250;
         let (_input, events, duration_secs) = sleep_until_history(frozen_millis, deadline_millis);
@@ -2890,11 +2881,11 @@ async fn sleep_until_duration_mismatch_surfaces_as_timer_nondeterminism() {
     );
 }
 
-/// A genuine *structural* divergence: the frozen `SideEffectRecorded { Now }`
-/// event is dropped from history (as if a code change removed the `system_now()`
-/// capture that `sleep_until` performs), so on replay the first history-consulting
-/// call diverges. Must surface as a classified non-determinism — NOT a panic,
-/// NOT `ReplaySucceeded`.
+/// A genuine *structural* divergence: history drops the frozen
+/// `SideEffectRecorded { Now }` event, as if a code change removed the
+/// `system_now()` capture of `sleep_until`. So on replay the first call that
+/// consults history diverges. It must surface as a classified
+/// non-determinism, NOT a panic and NOT `ReplaySucceeded`.
 #[tokio::test]
 async fn sleep_until_missing_side_effect_surfaces_as_nondeterminism() {
     let frozen_millis = 1_700_000_000_000_i64;
@@ -2968,10 +2959,10 @@ fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEve
 
 /// Build a history for `deadline_branch_probe_workflow` whose recorded activity
 /// pins the `should_continue_as_new()` decision: `checkpoint_now` when the run
-/// was expected to trip, `keep_working` otherwise. A broken fraction comparison
-/// schedules the *other* activity on replay and diverges — so a replay that
-/// succeeds actually proves the decision matched, not merely that the workflow
-/// completed.
+/// was expected to trip, `keep_working` otherwise. A broken fraction
+/// comparison schedules the *other* activity on replay and diverges. So a
+/// successful replay proves the decision matched, not merely that the
+/// workflow completed.
 fn deadline_branch_history(
     t0_millis: i64,
     consumed_secs: i64,
@@ -2997,9 +2988,9 @@ fn deadline_branch_history(
     events
 }
 
-/// Build a **pre-#772** history for `should_can_then_timer_workflow`: it fired a
-/// durable timer but — recorded under the old binary — carries NO
-/// `SideEffectRecorded{Now}` at the `should_continue_as_new()` call site.
+/// Build a **pre-#772** history for `should_can_then_timer_workflow`. It fired
+/// a durable timer, but the old binary recorded NO `SideEffectRecorded{Now}`
+/// at the `should_continue_as_new()` call site.
 fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
     let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
     vec![
@@ -3020,16 +3011,16 @@ fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
     ]
 }
 
-/// Build a **pre-#772** history for `should_can_then_user_now_then_timer_workflow`:
-/// recorded under the old binary (which had no deadline read), it carries the
-/// author's own `system_now()` capture (`{Now, name: None}`) at the
-/// `should_continue_as_new()` call site, followed by the durable timer. The
-/// probe must leave the user's `Now` for `ctx.system_now()`.
+/// Build a **pre-#772** history for `should_can_then_user_now_then_timer_workflow`.
+/// The old binary had no deadline read. The history carries the author's own
+/// `system_now()` capture (`{Now, name: None}`) at the
+/// `should_continue_as_new()` call site, then the durable timer. The probe
+/// must leave the user's `Now` for `ctx.system_now()`.
 fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
     let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
-    // The user's recorded wall clock, well within the 30s budget so that even
-    // if the (buggy) probe were to consume it, the deadline branch would not
-    // trip — isolating the failure to the stolen-`Now` divergence.
+    // The user's recorded wall clock, well within the 30s budget. Even a buggy
+    // probe that consumes it does not trip the deadline branch. That isolates
+    // the failure to the stolen-`Now` divergence.
     let user_now = t0 + chrono::Duration::seconds(1);
     vec![
         WorkflowEvent::WorkflowStarted {
@@ -3076,15 +3067,15 @@ async fn replay_deadline_crossed_history_yields_continue_as_new() {
     );
 }
 
-/// Issue #772 (Codex P2 — carry deadline metadata in JSON replays): a full
-/// history export / `harvest-replay` JSON fixture for a deadline-aware workflow
-/// must carry `execution_timeout` on the snapshot so the JSON path threads the
-/// deadline budget. The metadata lives ONLY on the snapshot here — the replayer
-/// has NO global `with_execution_timeout` — so `replay_from_json` must read it
-/// from the JSON. Before the fix, `replay_from_snapshot` supplied only the
-/// (absent) global timeout, so the recorded `SideEffectRecorded{Now}` deadline
-/// probe was left unconsumed and the deadline-aware history false-reported
-/// non-determinism.
+/// Issue #772 (carry deadline metadata in JSON replays): a history export or
+/// `harvest-replay` JSON fixture of a deadline-aware workflow must carry
+/// `execution_timeout` on the snapshot.
+/// Then the JSON path threads the deadline budget. Here the metadata lives
+/// ONLY on the snapshot. The replayer has NO global `with_execution_timeout`,
+/// so `replay_from_json` must read it from the JSON. Before the fix,
+/// `replay_from_snapshot` supplied only the absent global timeout. So the
+/// recorded `SideEffectRecorded{Now}` deadline probe stayed unconsumed, and
+/// the history false-reported non-determinism.
 #[tokio::test]
 async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
     // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ the deadline branch tripped
@@ -3124,11 +3115,11 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
     );
 }
 
-/// Issue #772 (Codex P2): backward compatibility. A snapshot JSON WITHOUT the
-/// new deadline fields still deserializes (serde `default` ⇒ `None`) — a legacy
-/// export produced before this field. Deserialization must succeed, and the
-/// replayer's global `with_execution_timeout` still enables the deadline branch
-/// (the documented fallback), so a deadline-aware history replays unchanged.
+/// Issue #772: backward compatibility. A snapshot JSON WITHOUT the new
+/// deadline fields still deserializes (serde `default` ⇒ `None`). This is a
+/// legacy export produced before these fields. The global
+/// `with_execution_timeout` of the replayer still enables the deadline branch
+/// (the documented fallback). So a deadline-aware history replays unchanged.
 #[tokio::test]
 async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout() {
     let events = deadline_can_history(1_700_000_000_000, 27);
@@ -3169,14 +3160,14 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
 
 /// The falsifiable bar for issue #772: the deadline-driven
 /// `should_continue_as_new()` **decision** replays deterministically across
-/// N = 1000 distinct fixtures with zero divergences — and each fixture pins the
-/// decision, so a broken fraction comparison is caught rather than passing
-/// regardless (Finding 3). Each iteration varies the frozen `system_now()`
-/// capture and execution-timeout budget, and **mixes trip (consumed ≥ 0.85 of
-/// budget) and not-yet (consumed ≤ 0.40 of budget) cases**, both well clear of
-/// the 0.8 boundary so only a genuinely broken comparison flips them. The
-/// recorded activity (`checkpoint_now` vs `keep_working`) fixes the expected
-/// decision: a wrong decision schedules the other activity and diverges.
+/// N = 1000 distinct fixtures with zero divergences. Each fixture pins the
+/// decision, so the test catches a broken fraction comparison. Each iteration
+/// varies the frozen `system_now()` capture and the execution-timeout budget.
+/// It **mixes trip cases (consumed ≥ 0.85 of budget) and not-yet cases
+/// (consumed ≤ 0.40 of budget)**. Both sit well clear of the 0.8 boundary, so
+/// only a broken comparison flips them. The recorded activity
+/// (`checkpoint_now` vs `keep_working`) fixes the expected decision. A wrong
+/// decision schedules the other activity and diverges.
 #[tokio::test]
 async fn deadline_triggered_can_replays_deterministically_1000x() {
     let base = 1_600_000_000_000_i64;
@@ -3209,14 +3200,15 @@ async fn deadline_triggered_can_replays_deterministically_1000x() {
     }
 }
 
-/// Finding 1: a pre-#772 in-flight history (a fired durable timer, NO recorded
-/// `SideEffectRecorded{Now}` at the `should_continue_as_new()` check) resumed
-/// under the new deadline-aware binary must replay cleanly — NOT diverge /
-/// nd-block — and must NOT emit a spurious `ContinueAsNew`. This is the
-/// canonical `should_continue_as_new()`-then-`ctx.timer()` shape (the shipped
-/// example's shape). Before the tolerant-clock-read fix, the deadline branch's
-/// strict `system_now` hit the recorded `TimerStarted` at the cursor and
-/// recorded a non-determinism error, wedging a healthy run on a routine upgrade.
+/// A pre-#772 in-flight history must replay cleanly under the new
+/// deadline-aware binary. It has a fired durable timer and NO recorded
+/// `SideEffectRecorded{Now}` at the `should_continue_as_new()` check. It must
+/// NOT diverge or nd-block, and must NOT emit a spurious `ContinueAsNew`. This
+/// is the canonical `should_continue_as_new()`-then-`ctx.timer()` shape of the
+/// shipped example. Before the tolerant-clock-read fix, the strict
+/// `system_now` of the deadline branch hit the recorded `TimerStarted` at the
+/// cursor. It recorded a non-determinism error and wedged a healthy run on a
+/// routine upgrade.
 #[tokio::test]
 async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
     let events = pre_772_timer_history(1_700_000_000_000);
@@ -3239,9 +3231,9 @@ async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
 /// `should_continue_as_new()` check sits immediately before a **user**
 /// `ctx.system_now()` call. The recorded `SideEffectRecorded{Now, name: None}`
 /// at the cursor belongs to `ctx.system_now()`, NOT the engine's deadline
-/// probe. Before the naming fix the tolerant matcher stole that `Now`,
-/// advanced the cursor, and the subsequent `ctx.system_now()` diverged against
-/// the following `TimerStarted` — reporting false non-determinism on upgrade.
+/// probe. Before the naming fix the tolerant matcher stole that `Now` and
+/// advanced the cursor. The next `ctx.system_now()` then diverged against the
+/// following `TimerStarted` and reported false non-determinism on upgrade.
 /// The probe now records/matches under a reserved sentinel name, so the user's
 /// `Now` is left untouched and the history replays cleanly.
 #[tokio::test]
@@ -3328,15 +3320,14 @@ async fn cancelled_timer_replays_succeeded() {
     );
 }
 
-/// Codex P2 (issue #768) — determinism gate: a same-task
-/// `start_timer; cancel; await_fire` replays cleanly against the history the
-/// FIXED worker produces (`[WorkflowStarted, TimerStarted, TimerCancelled]`).
-/// On replay `cancel()` consumes the recorded `TimerCancelled`, so `await_fire`
-/// sees `match_timer_or_cancel == NoMatch` and MUST resolve `Cancelled` from the
-/// per-context cancelled state rather than re-arming and parking — a re-arm here
-/// would suspend mid-replay (never reaching completion) and the run would never
-/// resolve, so `ReplaySucceeded` here is the direct proof the fix holds on
-/// replay, not just live.
+/// Determinism gate (issue #768): a same-task `start_timer; cancel;
+/// await_fire` replays cleanly against the history of the FIXED worker
+/// (`[WorkflowStarted, TimerStarted, TimerCancelled]`). On replay `cancel()`
+/// consumes the recorded `TimerCancelled`, so `await_fire` sees
+/// `match_timer_or_cancel == NoMatch`. It MUST resolve `Cancelled` from the
+/// per-context cancelled state rather than re-arm and park. A re-arm here
+/// suspends mid-replay, so the run never resolves. So `ReplaySucceeded` is the
+/// direct proof that the fix holds on replay, not just live.
 #[tokio::test]
 async fn cancel_then_await_same_cycle_replays_succeeded() {
     let events = vec![wf_started(), cancellable_ts(), cancellable_tc()];
@@ -3353,12 +3344,12 @@ async fn cancel_then_await_same_cycle_replays_succeeded() {
     );
 }
 
-/// Codex P2 (issue #768) — determinism gate for reset-after-cancel: a
-/// `cancel(); reset(); await_fire()` re-arms after the cancel, so the timer
-/// fires. Replays cleanly against the FIXED worker history
-/// `[WorkflowStarted, TimerStarted, TimerCancelled, TimerCancelled, TimerStarted,
-/// TimerFired]` and resolves `Fired` — proving the reset flips the per-context
-/// state back to Armed so `await_fire` does NOT short-circuit to `Cancelled`.
+/// Determinism gate for reset-after-cancel (issue #768): a `cancel(); reset();
+/// await_fire()` re-arms after the cancel, so the timer fires. It replays
+/// cleanly against the FIXED worker history `[WorkflowStarted, TimerStarted,
+/// TimerCancelled, TimerCancelled, TimerStarted, TimerFired]` and resolves
+/// `Fired`. This proves the reset flips the per-context state back to Armed.
+/// So `await_fire` does NOT short-circuit to `Cancelled`.
 #[tokio::test]
 async fn cancel_then_reset_then_await_replays_fired() {
     let events = vec![
@@ -3382,13 +3373,14 @@ async fn cancel_then_reset_then_await_replays_fired() {
     );
 }
 
-/// Codex P2 (issue #768) — determinism gate for a DUPLICATE ACTIVE arm: calling
-/// `start_timer("idle", 300)` twice with no cancel/reset between records exactly
-/// ONE `TimerStarted` (the durable row is deduped). Replaying the fixed-worker
-/// history `[WorkflowStarted, TimerStarted, TimerFired]` must succeed — the
-/// second `start_timer` must be an idempotent no-op that does NOT re-run the
-/// positional `match_timer_arm` against the trailing `TimerFired`. Without the
-/// fix the second arm diverges (a timer mismatch for history this worker wrote).
+/// Determinism gate for a DUPLICATE ACTIVE arm (issue #768). Two
+/// `start_timer("idle", 300)` calls with no cancel/reset between record
+/// exactly ONE `TimerStarted`, because the durable row is deduped. Replay of
+/// the fixed-worker history `[WorkflowStarted, TimerStarted, TimerFired]` must
+/// succeed. The second `start_timer` must be an idempotent no-op. It must NOT
+/// re-run the positional `match_timer_arm` against the trailing `TimerFired`.
+/// Without the fix the second arm diverges (a timer mismatch for history this
+/// worker wrote).
 #[tokio::test]
 async fn duplicate_active_start_timer_replays_succeeded() {
     let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
@@ -3709,12 +3701,12 @@ async fn cancellable_timer_loop_reuse_replays_succeeded() {
     );
 }
 
-/// Codex P1 (issue #768): a `start_timer` that arms a timer and then completes in
-/// the SAME task must record the `TimerStarted` event in its terminal history.
+/// Issue #768: a `start_timer` that arms a timer and then completes in the
+/// SAME task must record the `TimerStarted` event in its terminal history.
 /// The FIXED worker produces `[WorkflowStarted, TimerStarted(idle),
-/// WorkflowCompleted]`; replaying that against the same workflow code must
-/// succeed — `start_timer`'s positional `match_timer_arm` consumes the recorded
-/// `TimerStarted` at the cursor.
+/// WorkflowCompleted]`. Replay of that against the same workflow code must
+/// succeed. The positional `match_timer_arm` of `start_timer` consumes the
+/// recorded `TimerStarted` at the cursor.
 #[tokio::test]
 async fn arm_then_complete_replays_when_timer_started_recorded() {
     let events = vec![
@@ -3737,12 +3729,11 @@ async fn arm_then_complete_replays_when_timer_started_recorded() {
     );
 }
 
-/// Codex P1 (issue #768): proves the `TimerStarted` event is load-bearing — i.e.
-/// the consequence of the FINDING-6 bug. The BUGGY worker dropped the event,
-/// recording `[WorkflowStarted, WorkflowCompleted]`. Replaying that history
-/// against the same workflow code diverges: `start_timer`'s positional
-/// `match_timer_arm` expects `TimerStarted` at the cursor but finds the terminal
-/// `WorkflowCompleted` instead.
+/// Issue #768: proves the `TimerStarted` event is load-bearing. The BUGGY
+/// worker dropped the event and recorded `[WorkflowStarted,
+/// WorkflowCompleted]`. Replay of that history against the same workflow
+/// code diverges. The positional `match_timer_arm` of `start_timer` expects
+/// `TimerStarted` at the cursor but finds the terminal `WorkflowCompleted`.
 #[tokio::test]
 async fn arm_then_complete_diverges_without_recorded_timer_started() {
     let events = vec![
@@ -3797,11 +3788,11 @@ fn uuid_side_effect(seed: u64) -> WorkflowEvent {
     }
 }
 
-/// History recorded by `cancellable_reset_with_uuid_workflow`: an initial arm +
-/// its same-cycle side effect, then three events per reset (cancel + fresh arm +
-/// same-cycle side effect — the FINDING-1 interleaving), then a terminal
-/// fire-or-cancel. Bounded and O(K) with zero orphaned firings. `seed` makes the
-/// interleaved side-effect values distinct so the whole fixture is unique.
+/// History recorded by `cancellable_reset_with_uuid_workflow`: an initial arm
+/// and its same-cycle side effect. Then three events per reset: cancel, fresh
+/// arm, and the same-cycle side effect. Then a terminal fire-or-cancel.
+/// Bounded and O(K) with zero orphaned firings. `seed` makes the interleaved
+/// side-effect values distinct, so the whole fixture is unique.
 fn cancellable_reset_uuid_history(
     reset_count: u64,
     cancel_at_end: bool,
@@ -3831,13 +3822,14 @@ fn cancellable_reset_uuid_history(
 
 /// The falsifiable success-metric bar for issue #768: reset-heavy cancellable
 /// timer histories replay deterministically across N = 1000 GENUINELY DISTINCT
-/// fixtures, each with zero divergences and a bounded, O(K), zero-orphaned-firing
-/// history. Reset cadence spans a wide prime range and terminal outcome varies;
-/// every third fixture also interleaves a `new_uuid()` side effect in the SAME
-/// cycle as the initial arm and each reset — exercising the FINDING-1
-/// timer-lifecycle-event-in-emission-position ordering path (a distinct per-`i`
-/// seed makes those fixtures byte-unique). The plain fixtures pin the exact
-/// 2-events/reset bound; the interleaved fixtures pin the 3-events/reset bound.
+/// fixtures. Each has zero divergences and a bounded, O(K),
+/// zero-orphaned-firing history. Reset cadence spans a wide prime range, and
+/// the terminal outcome varies. Every third fixture also interleaves a
+/// `new_uuid()` side effect in the SAME cycle as the initial arm and each
+/// reset. That exercises the ordering path that puts a timer-lifecycle event
+/// in its emission position. A distinct per-`i` seed makes those fixtures
+/// byte-unique. The plain fixtures pin the exact 2-events/reset bound. The
+/// interleaved fixtures pin the 3-events/reset bound.
 #[tokio::test]
 async fn reset_1000_times_replays_with_bounded_history() {
     let replayer = build_replayer();
@@ -3890,8 +3882,8 @@ async fn reset_1000_times_replays_with_bounded_history() {
 }
 
 /// Removing a `cancel_timer` call while history still records the
-/// `TimerCancelled` leaves it unconsumed; the next command trips over it and
-/// the divergence is classified precisely as `TimerCancelMismatch` (AC).
+/// `TimerCancelled` leaves it unconsumed. The next command trips over it, and
+/// the divergence classifies precisely as `TimerCancelMismatch` (AC).
 #[tokio::test]
 async fn removed_cancel_surfaces_as_timer_cancel_mismatch() {
     let aid = ActivityExecId::new();
@@ -3952,7 +3944,7 @@ async fn renamed_timer_surfaces_as_timer_mismatch() {
     );
 }
 
-/// FINDING 1: a `start_timer` followed same-cycle by a `new_uuid()` side effect
+/// Issue #768: a `start_timer` followed same-cycle by a `new_uuid()` side effect
 /// records history in emission order `[TimerStarted(idle), SideEffectRecorded]`.
 /// This is the history the FIXED worker produces (timer-lifecycle events
 /// interleaved at their command position, not appended at the end of the batch).
@@ -3984,12 +3976,13 @@ async fn timer_arm_then_side_effect_correct_order_replays_succeeded() {
     );
 }
 
-/// FINDING 1 (bug proof): the PRE-FIX worker appended timer-lifecycle events at
-/// the END of the batch, recording `[SideEffectRecorded, TimerStarted]`. That
-/// wrong-order history nd-blocks the run on first resume — `match_timer_arm` is
-/// positional, `drain_early_signals` does not skip `SideEffectRecorded`, so the
-/// cursor lands on `SideEffectRecorded` and the timer arm diverges. This test
-/// pins that the buggy ordering is genuinely non-replayable.
+/// Bug proof (issue #768): the PRE-FIX worker appended timer-lifecycle events
+/// at the END of the batch and recorded `[SideEffectRecorded, TimerStarted]`.
+/// That wrong-order history nd-blocks the run on first resume.
+/// `match_timer_arm` is positional, and `drain_early_signals` does not skip
+/// `SideEffectRecorded`. So the cursor lands on `SideEffectRecorded`, and the
+/// timer arm diverges. This test pins that the buggy ordering is
+/// non-replayable.
 #[tokio::test]
 async fn timer_arm_then_side_effect_wrong_order_diverges() {
     let uuid_value = serde_json::json!("018f0000-0000-7000-8000-000000000000");
@@ -4117,9 +4110,8 @@ fn post_patch_history() -> Vec<WorkflowEvent> {
 
 /// The success-metric money test: the SAME phase-1 handler replays a
 /// pre-patch history down the old branch and a post-patch history down the
-/// new branch, with zero integer bookkeeping. The branch-selection proof is
-/// structural: had either replay taken the wrong branch, the wrong activity
-/// name would have diverged against the recorded one.
+/// new branch. It needs no integer bookkeeping. The branch-selection proof is
+/// structural. A replay down the wrong branch diverges on the activity name.
 #[tokio::test]
 async fn replay_pre_patch_and_post_patch_histories_take_opposite_branches() {
     let replayer = build_replayer();
@@ -4150,8 +4142,8 @@ async fn replay_pre_patch_and_post_patch_histories_take_opposite_branches() {
 }
 
 /// Deleting the `patched()` call before all marker-bearing runs drained leaves
-/// the recorded `patch:gate` marker unconsumed — the next command trips over
-/// it and the divergence classifies as `PatchMarkerMismatch`.
+/// the recorded `patch:gate` marker unconsumed. The next command trips over
+/// it, and the divergence classifies as `PatchMarkerMismatch`.
 #[tokio::test]
 async fn replay_removed_too_early_patch_call_classified_as_patch_marker_mismatch() {
     let replayer = build_replayer();
@@ -4223,8 +4215,8 @@ async fn replay_version_recorded_history_against_patched_handler_succeeds() {
 
 /// AC-3 lifecycle, deploy 2: once pre-patch runs have DRAINED, the phase-2
 /// handler (`deprecate_patch` + unconditional new code) replays phase-1
-/// (marker-bearing) histories cleanly. Phase-0 histories are deliberately
-/// NOT covered here: deprecation is only safe after they drained — replaying
+/// (marker-bearing) histories cleanly. This test deliberately does NOT cover
+/// phase-0 histories. Deprecation is only safe after they drained. Replay of
 /// one against unconditional new code diverges, as the lifecycle documents.
 #[tokio::test]
 async fn replay_deprecated_patch_phase2_handler_succeeds_for_phase1_history() {
@@ -4245,8 +4237,8 @@ async fn replay_deprecated_patch_phase2_handler_succeeds_for_phase1_history() {
 }
 
 /// AC-3 lifecycle proof with a residual `patched()` call: the deprecation
-/// memo keeps the residual call deterministic for BOTH generations —
-/// phase-1 histories keep the new branch, phase-0 histories keep the old one.
+/// memo keeps the residual call deterministic for BOTH generations. Phase-1
+/// histories keep the new branch, and phase-0 histories keep the old one.
 #[tokio::test]
 async fn replay_deprecate_patch_with_residual_patched_keeps_phase1_branch() {
     let replayer = build_replayer();
@@ -4311,7 +4303,7 @@ fn gate_free_noop_workflow<'a>(
 }
 
 /// Positive phase-3 proof: a history recorded by phase-2 code (deprecated
-/// gate → no marker) replays cleanly against gate-free phase-3 code, i.e.
+/// gate → no marker) replays cleanly against gate-free phase-3 code. So
 /// deleting the `deprecate_patch` call after marker-bearing runs drained is
 /// safe for the marker-less generation.
 #[tokio::test]
@@ -4334,10 +4326,10 @@ async fn replay_phase3_gate_free_code_replays_marker_less_phase2_history() {
 }
 
 /// A stale `patch:{id}` marker as the FINAL history event, replayed against
-/// code with no ctx calls left at all, surfaces loudly — but as the generic
-/// `EarlyCompletion` (unconsumed trailing history), not `PatchMarkerMismatch`:
-/// no subsequent command ever trips over the marker, the completed-history
-/// check reports it instead. Pinned so the classification is deliberate.
+/// code with no ctx calls left, surfaces loudly. But it classifies as the
+/// generic `EarlyCompletion` (unconsumed trailing history), not
+/// `PatchMarkerMismatch`. No later command trips over the marker, so the
+/// completed-history check reports it. This pins the classification.
 #[tokio::test]
 async fn replay_trailing_stale_patch_marker_classifies_as_early_completion() {
     let events = vec![
@@ -4371,13 +4363,13 @@ async fn replay_trailing_stale_patch_marker_classifies_as_early_completion() {
     );
 }
 
-/// Sandwich-flip money test (issue #687 review finding F1): the history a
-/// fixed live pass of the sandwich handler produces — `patched("gate")`
-/// records exactly one marker, `deprecate_patch` + residual `patched` add
-/// nothing, both booleans are true → new branch. That history must replay
-/// cleanly against the same handler: without the this-cycle latch the live
-/// pass would have taken the OLD branch (residual `patched` false) while
-/// every replay pass takes the new one — a permanent nd-block.
+/// Sandwich-flip money test (issue #687). A fixed live pass of the sandwich
+/// handler produces this history. `patched("gate")` records exactly one
+/// marker. `deprecate_patch` and the residual `patched` add nothing. Both
+/// booleans are true, so the new branch runs. That history must replay
+/// cleanly against the same handler. Without the this-cycle latch, the live
+/// pass takes the OLD branch (residual `patched` false). Every replay pass
+/// takes the new one, which is a permanent nd-block.
 #[tokio::test]
 async fn replay_patched_deprecate_patched_sandwich_is_replay_consistent() {
     let replayer = build_replayer();
@@ -4958,8 +4950,8 @@ async fn replay_interleaved_version_gate_and_activity_succeed() {
 /// the next command (an activity) to see a `MarkerRecorded(version:gate_old)`
 /// at the position where it expects `ActivityScheduled(step)`.
 /// The replayer must classify this as `VersionMarkerMismatch`, not a generic
-/// `ActivityScheduleMismatch`, so the error message clearly points to the
-/// version gate as the source of the problem.
+/// `ActivityScheduleMismatch`. Then the error message points to the version
+/// gate as the source of the problem.
 fn renamed_gate_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -5285,11 +5277,11 @@ fn child_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
-/// Falsifiable success-bar coverage for issue #601: replaying a recorded
-/// history whose workflow calls `spawn_child_workflow_fan_out_raw` must
-/// report `ReplaySucceeded` — mirroring the `set_current_details` precedent
-/// (issue #593) of locking the ACs' "replays deterministically" claim behind
-/// an actual `WorkflowReplayer` fixture rather than only unit tests.
+/// Falsifiable success-bar coverage for issue #601: replay of a recorded
+/// history whose workflow calls `spawn_child_workflow_fan_out_raw` must report
+/// `ReplaySucceeded`. This mirrors the `set_current_details` precedent (issue
+/// #593). It backs the "replays deterministically" claim of the ACs with a
+/// real `WorkflowReplayer` fixture, not only unit tests.
 #[tokio::test]
 async fn replayer_succeeds_for_workflow_spawning_a_child_fan_out() {
     let (exec_id, events) = child_fan_out_history();
@@ -5303,8 +5295,8 @@ async fn replayer_succeeds_for_workflow_spawning_a_child_fan_out() {
     );
 }
 
-/// The recorded history fanned out 2 children; the (simulated) redeployed
-/// code now fans out only 1 -- the `fan_out:{n}` count marker must catch the
+/// The recorded history fanned out 2 children. The (simulated) redeployed
+/// code now fans out only 1. The `fan_out:{n}` count marker must catch the
 /// divergence before any child is (re)spawned.
 #[tokio::test]
 async fn replayer_detects_child_fan_out_count_mismatch() {
@@ -5326,10 +5318,10 @@ async fn replayer_detects_child_fan_out_count_mismatch() {
     );
 }
 
-/// Workflow whose second fan-out child exceeds the default 2 MiB payload
-/// cap, so the fan-out fails before *any* child (or the `fan_out:{n}`
-/// marker) is ever recorded -- see `peek_fan_out_count`/
-/// `record_fan_out_marker`/`validate_child_payload_caps` in `context.rs`.
+/// Workflow whose second fan-out child exceeds the default 2 MiB payload cap.
+/// So the fan-out fails before *any* child (or the `fan_out:{n}` marker) is
+/// recorded. See `peek_fan_out_count`, `record_fan_out_marker` and
+/// `validate_child_payload_caps` in `context.rs`.
 fn child_fan_out_workflow_with_oversized_child<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -5351,7 +5343,7 @@ fn child_fan_out_workflow_with_oversized_child<'a>(
 }
 
 /// Plain (non-fan-out) single-child spawn whose input exceeds the default
-/// 2 MiB payload cap -- used to show the limitation below is general, not
+/// 2 MiB payload cap. It shows the limitation below is general, not
 /// introduced by fan-out.
 fn single_child_spawn_with_oversized_input<'a>(
     ctx: &'a WorkflowContext,
@@ -5366,23 +5358,22 @@ fn single_child_spawn_with_oversized_input<'a>(
     })
 }
 
-/// Post-review hardening for issue #601 (Codex finding, PR #901): a fan-out
-/// that fails on payload-cap overflow before any child is dispatched must
-/// never leave an orphaned `fan_out:{n}` marker in the persisted terminal
-/// history -- confirmed here by feeding the minimal, marker-free
-/// `[WorkflowStarted, WorkflowFailed]` history (what the fixed code
-/// actually persists for this failure -- see the `drain_commands().is_empty()`
-/// assertion in
+/// Hardening for issue #601 (PR #901): a fan-out that fails on payload-cap
+/// overflow before any child dispatch must not persist an orphaned
+/// `fan_out:{n}` marker. This test feeds the minimal, marker-free
+/// `[WorkflowStarted, WorkflowFailed]` history back through the replayer. The
+/// fixed code persists that history for this failure. See the
+/// `drain_commands().is_empty()` assertion in
 /// `child_fan_out_raw_oversized_child_rejects_before_dispatching_any_sibling`,
-/// `tests/child_fanout_tests.rs`) back through the replayer.
+/// `tests/child_fanout_tests.rs`.
 ///
 /// Issue #952 flipped this from the narrow "diverges at the marker, not at a
-/// phantom child" assertion to a full `ReplaySucceeded`: the trailing
+/// phantom child" assertion to a full `ReplaySucceeded`. The trailing
 /// `WorkflowFailed` is now transparent to the in-progress `peek_fan_out_count`
-/// match, so the replayed run re-derives the same payload-cap failure instead
-/// of reporting non-determinism. The property the old assertion protected --
-/// that no `fan_out:{n}` marker claiming a never-recorded child is persisted --
-/// is still covered by the `child_fanout_tests.rs` test named above.
+/// match. So the replayed run re-derives the same payload-cap failure instead
+/// of reporting non-determinism. The old assertion protected one property:
+/// no persisted `fan_out:{n}` marker claims a never-recorded child. The
+/// `child_fanout_tests.rs` test named above still covers it.
 #[tokio::test]
 async fn replayer_replays_a_payload_cap_fan_out_failure_cleanly() {
     let exec_id = ExecutionId::new();
@@ -5421,12 +5412,12 @@ async fn replayer_replays_a_payload_cap_fan_out_failure_cleanly() {
 /// Issue #952 AC1/AC2: the former
 /// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`.
 ///
-/// A workflow whose first live execution fails due to a config-dependent check
-/// -- the payload-size cap (#252), a missing payload store, a missing handler --
-/// *after* at least one Harvest primitive call has already touched the matcher
-/// now replays cleanly. `HistoryMatcher::new` marks the trailing terminal
-/// `WorkflowFailed` transparent, so the in-progress `match_child_workflow`
-/// observes "this run is failing" (`NoMatch`) instead of diverging, the
+/// A config-dependent check can fail the first live execution: the
+/// payload-size cap (#252), a missing payload store, a missing handler. Such
+/// a workflow now replays cleanly, even when a Harvest primitive call already
+/// touched the matcher. `HistoryMatcher::new` marks the trailing terminal
+/// `WorkflowFailed` transparent. So the in-progress `match_child_workflow`
+/// observes "this run is failing" (`NoMatch`) instead of diverging. The
 /// payload-cap check re-fires, and the replayed run reproduces the recorded
 /// failure.
 ///
@@ -5475,11 +5466,11 @@ async fn early_config_dependent_failure_replays_cleanly() {
 // scoped to the failing tail and never blesses genuine drift.
 // ---------------------------------------------------------------------------
 
-/// Dispatches `input["children"]` awaited children concurrently and fails in the
-/// same decision cycle from a sibling branch -- the "failed before suspending"
-/// shape from issue #952's second seam. The children are dispatched (their
-/// `StartChildWorkflow` commands are pushed) and the workflow then returns `Err`
-/// without ever suspending.
+/// Dispatches `input["children"]` awaited children concurrently and fails in
+/// the same decision cycle from a sibling branch. This is the "failed before
+/// suspending" shape from the second seam of issue #952. The children are
+/// dispatched (their `StartChildWorkflow` commands are pushed). The workflow
+/// then returns `Err` without ever suspending.
 fn dispatch_children_then_fail<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -5488,8 +5479,8 @@ fn dispatch_children_then_fail<'a>(
         let n = usize::try_from(input["children"].as_u64().unwrap_or(1)).unwrap_or(1);
         // `join_all`, not `try_join_all`: every slot is polled to completion, so
         // on replay EVERY recorded dispatch pair is matched positionally. A
-        // fail-fast variant would short-circuit on slot 0 and leave the rest
-        // unverified — the corpus below would then pass with the later pairs
+        // fail-fast variant short-circuits on slot 0 and leaves the rest
+        // unverified. The corpus below then passes with the later pairs
         // missing, reordered, or carrying the wrong input.
         let dispatch = async {
             let outcomes = futures::future::join_all((0..n).map(|slot| {
@@ -5562,11 +5553,11 @@ async fn failed_before_suspend_with_one_dispatched_child_replays_cleanly() {
 
 /// Shape 4: failed before suspending with N dispatched children.
 ///
-/// Falsifiable in both halves: dropping any recorded pair (or reordering them,
-/// or changing a recorded input) makes `join_all`'s later slots diverge
-/// positionally, and the reproduced-error assertion pins that the replayed run
-/// actually observed the abandoned-dispatch records rather than re-dispatching
-/// live at a transparent frontier.
+/// Falsifiable in both halves. Dropping, reordering or changing a recorded
+/// pair makes the later slots of `join_all` diverge positionally. The
+/// reproduced-error assertion pins that the replayed run observed the
+/// abandoned-dispatch records. It did not re-dispatch live at a transparent
+/// frontier.
 #[tokio::test]
 async fn failed_before_suspend_with_three_dispatched_children_replays_cleanly() {
     let report = replay_children_fixture(3).await;
@@ -5640,9 +5631,9 @@ fn marker_then_fail_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let _gated = ctx.patched("gate");
-        // A SECOND gate, recorded nowhere: this one lands past the end of the
-        // recorded history, i.e. inside the transparent terminal-failure tail —
-        // so the shape exercises the matcher relaxation, not just the report
+        // A SECOND gate, recorded nowhere. It lands past the end of the
+        // recorded history, inside the transparent terminal-failure tail. So
+        // the shape exercises the matcher relaxation, not just the report
         // mapping. Without the tail this is an `early completion mismatch`.
         let _new_gate = ctx.patched("gate_added_after_the_failure");
         Err("failed after the marker".to_string())
@@ -5729,12 +5720,12 @@ async fn failure_after_a_side_effect_replays_cleanly() {
     );
 }
 
-/// AC5: a history produced by a **pre-fix** deployment — a failing cycle whose
-/// dispatched children were silently dropped, so the whole record is
-/// `[WorkflowStarted, WorkflowFailed]` — is replayed through exactly the same
-/// matcher, with no stored event rewritten, re-tagged, or reinterpreted. The
-/// replayed code re-dispatches at the failing frontier and the sibling branch
-/// fails it again, so the gate no longer false-positives on it either.
+/// AC5: a history from a **pre-fix** deployment replays through exactly the
+/// same matcher. Its failing cycle silently dropped the dispatched children,
+/// so the whole record is `[WorkflowStarted, WorkflowFailed]`. No stored event
+/// is rewritten, re-tagged, or reinterpreted. The replayed code re-dispatches
+/// at the failing frontier, and the sibling branch fails it again. So the gate
+/// no longer false-positives on it either.
 #[tokio::test]
 async fn a_pre_fix_history_with_dropped_dispatches_replays_without_reinterpretation() {
     let events = vec![
@@ -5826,10 +5817,10 @@ async fn a_new_patch_gate_on_a_sealed_failed_history_replays_cleanly() {
     );
 }
 
-/// Issue #952 x #510: a redrive REOPENS a sealed run, and its abandoned-dispatch
-/// records must not become history the reopened run replays — otherwise the
-/// redriven cycle reads back "this child failed" and could never re-issue the
-/// dispatch the operator redrove it to complete.
+/// Issue #952 x #510: a redrive REOPENS a sealed run. Its abandoned-dispatch
+/// records must not become history the reopened run replays. Otherwise the
+/// redriven cycle reads back "this child failed". It then can never re-issue
+/// the dispatch the operator redrove it to complete.
 #[tokio::test]
 async fn a_redriven_history_re_dispatches_the_work_its_failing_cycle_abandoned() {
     let child_id = ExecutionId::new();
@@ -5868,10 +5859,10 @@ async fn a_redriven_history_re_dispatches_the_work_its_failing_cycle_abandoned()
             events,
         ))
         .await;
-    // The reopened run must NOT read the abandoned record back: slot 0 has to
-    // reach the live dispatch path (a strict replay reports that as a divergence,
-    // which is the expected verdict for a redriven history under the STRICT
-    // harness — what matters is that it is not the recorded synthetic failure).
+    // The reopened run must NOT read the abandoned record back. Slot 0 has to
+    // reach the live dispatch path. A strict replay reports that as a
+    // divergence, the expected verdict for a redriven history under the STRICT
+    // harness. What matters is that it is not the recorded synthetic failure.
     let observed = report
         .failure_message()
         .map(ToOwned::to_owned)
@@ -6337,13 +6328,13 @@ async fn replayer_replays_external_signal_failed_history() {
 // ---------------------------------------------------------------------------
 // External signal/cancel BY WORKFLOW_ID replay tests (issue #751)
 //
-// AC7 ("replay determinism preserved") for the by-id primitives: the
-// mechanism reuses `match_external_signal`/`match_external_cancel`, which
-// compare the whole `ExternalTarget` value (never the concrete resolved
-// `ExecutionId`) via `PartialEq` -- these fixtures exercise the
-// `ExternalTarget::WorkflowId { .. }` variant specifically, which the
-// pre-existing `external_signal_*_history` fixtures above never do (they
-// only cover `ExternalTarget::ExecutionId`).
+// AC7 ("replay determinism preserved") for the by-id primitives. The
+// mechanism reuses `match_external_signal`/`match_external_cancel`. They
+// compare the whole `ExternalTarget` value via `PartialEq`, never the
+// concrete resolved `ExecutionId`. These fixtures exercise the
+// `ExternalTarget::WorkflowId { .. }` variant. The older
+// `external_signal_*_history` fixtures above only cover
+// `ExternalTarget::ExecutionId`.
 // ---------------------------------------------------------------------------
 
 /// Build a history with a `WorkflowId`-targeted `ExternalSignalRequested` +
@@ -6460,10 +6451,10 @@ async fn replayer_detects_external_signal_by_id_target_mismatch() {
 }
 
 /// Build a history with a `WorkflowId`-targeted `ExternalCancelRequested` +
-/// `ExternalCancelDelivered`. There is no pre-existing `ExecutionId`-targeted
-/// analogue of this fixture anywhere in this file (the cancel primitive,
-/// issue #492, had no `WorkflowReplayer`-level replay test at all before
-/// issue #751) -- this closes that gap for both addressing modes at once.
+/// `ExternalCancelDelivered`. This file has no `ExecutionId`-targeted analogue
+/// of this fixture. The cancel primitive (issue #492) had no
+/// `WorkflowReplayer`-level replay test before issue #751. This closes that
+/// gap for both addressing modes at once.
 fn external_cancel_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let exec_id = ExecutionId::new();
     let cancel_id = autumn_harvest::types::ExternalCancelId::new();
@@ -7188,13 +7179,14 @@ fn signal_in_flight_fixture() -> Vec<WorkflowEvent> {
     ]
 }
 
-/// Lead 2 (issue #476 parity): a healthy in-flight signal-timeout workflow
-/// sampled by the deploy replay canary reaches the recorded-history frontier
-/// with the race still `InProgress` and then *suspends* — it must report
-/// `ReplaySucceeded`, not a false non-determinism. Mirrors the child-timeout
-/// twin's `child_timeout_in_flight_canary_replays_succeeded` and
-/// `check_strict_replay_no_match`'s canary-at-frontier exception, which the
-/// `InProgress` arm previously ignored.
+/// Issue #476 parity: the deploy replay canary samples a healthy in-flight
+/// signal-timeout workflow. It reaches the recorded-history frontier with the
+/// race still `InProgress` and then *suspends*. It must report
+/// `ReplaySucceeded`, not a false non-determinism. This mirrors the
+/// child-timeout twin `child_timeout_in_flight_canary_replays_succeeded`. It
+/// also mirrors the canary-at-frontier exception of
+/// `check_strict_replay_no_match`, which the `InProgress` arm previously
+/// ignored.
 #[tokio::test]
 async fn signal_timeout_in_flight_canary_replays_succeeded() {
     let exec_id = ExecutionId::new();
@@ -7213,15 +7205,15 @@ async fn signal_timeout_in_flight_canary_replays_succeeded() {
     );
 }
 
-/// Lead 2 update-transparency guard (mirrors the child twin's
+/// Update-transparency guard (mirrors the child twin
 /// `child_timeout_in_flight_woken_by_update_canary_replays_succeeded`): an
 /// in-flight signal-timeout race whose only trailing history is transparent
-/// update events. `match_signal_or_timer`'s `InProgress` scan skips updates via
-/// `scan_cursor += 1` WITHOUT consuming them, leaving the matcher cursor BEFORE
-/// them, so a raw `position() >= len()` frontier check reads `false` for a
-/// perfectly healthy suspend. The `at_frontier` check must use
-/// `has_non_lifecycle_unconsumed`, which treats update (and terminal-lifecycle)
-/// events as transparent, agreeing with the global unconsumed check.
+/// update events. The `InProgress` scan of `match_signal_or_timer` skips
+/// updates via `scan_cursor += 1` WITHOUT consuming them. The matcher cursor
+/// stays BEFORE them. So a raw `position() >= len()` frontier check reads
+/// `false` for a healthy suspend. The `at_frontier` check must use
+/// `has_non_lifecycle_unconsumed`. It treats update (and terminal-lifecycle)
+/// events as transparent, which agrees with the global unconsumed check.
 fn signal_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
     let update_id = UpdateId::new();
     vec![
@@ -7287,9 +7279,9 @@ async fn signal_timeout_in_flight_strict_still_reports_nondeterminism() {
 
 /// Mandatory guardrail: the canary-at-frontier exception must ONLY cover a
 /// genuinely-suspending in-flight race. A real code-vs-history divergence
-/// (here the recorded deadline timer has a different duration than the handler
-/// arms) resolves as `Diverged`, never `InProgress`, so it must STILL be
-/// reported as non-determinism even in canary mode.
+/// resolves as `Diverged`, never `InProgress`. Here the recorded deadline
+/// timer has a different duration than the handler arms. It must STILL be
+/// reported as non-determinism, even in canary mode.
 #[tokio::test]
 async fn signal_timeout_genuine_divergence_still_detected_in_canary() {
     // The handler arms `__signal_timeout:1:approval` with a 300s deadline;
@@ -7323,22 +7315,22 @@ async fn signal_timeout_genuine_divergence_still_detected_in_canary() {
 // issue #1048 (signal side): the InProgress canary-frontier guard false-fires
 // when the parked race has an interleaved *bookkeeping sibling* command.
 //
-// `match_signal_or_timer` rewinds the matcher cursor to the sibling's
-// unconsumed `SideEffectRecorded` (an interleaved-command allowlist member) so
-// the sibling's own matcher can consume it next. The inline guard reads
-// `has_non_lifecycle_unconsumed()` at that rewound (non-frontier) cursor —
-// BEFORE the joined `side_effect` future is polled — so it observes a
-// transient "not at frontier" and (in canary) fires a false non-determinism.
-// A healthy parked workflow is thus reported `NonDeterminismDetected` instead
-// of `ReplaySucceeded`.
+// `match_signal_or_timer` rewinds the matcher cursor to the unconsumed
+// `SideEffectRecorded` of the sibling (an interleaved-command allowlist
+// member). Then the matcher of the sibling can consume it next. The inline
+// guard reads `has_non_lifecycle_unconsumed()` at that rewound (non-frontier)
+// cursor. It does so BEFORE the joined `side_effect` future is polled. So it
+// observes a transient "not at frontier" and (in canary) fires a false
+// non-determinism. A healthy parked workflow is thus reported
+// `NonDeterminismDetected` instead of `ReplaySucceeded`.
 // ---------------------------------------------------------------------------
 
 /// Reachable #1048 trigger: `tokio::join!(wait_for_signal_timeout, side_effect)`.
 /// `side_effect` lowers to `RecordSideEffect`, so the suspension batch is the
-/// allowlisted `[StartTimer, WaitForSignal, RecordSideEffect]` (accepted by
-/// `extract_started_timer_for_suspension`) — a genuine parked history a canary
-/// samples, unlike the mixed `[StartTimer, WaitForSignal, ScheduleActivity]`
-/// batch the worker rejects.
+/// allowlisted `[StartTimer, WaitForSignal, RecordSideEffect]`.
+/// `extract_started_timer_for_suspension` accepts it. So this is a genuine
+/// parked history that a canary samples. The worker rejects the mixed
+/// `[StartTimer, WaitForSignal, ScheduleActivity]` batch.
 fn signal_or_deadline_with_bookkeeping_sibling_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -7381,10 +7373,10 @@ fn signal_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
     ]
 }
 
-/// AC1 (signal): a canary replay of a producible parked history where the
-/// signal-timeout race is in-flight concurrently with an interleaved
-/// bookkeeping sibling must report `ReplaySucceeded`, not
-/// `NonDeterminismDetected`. RED until the inline `InProgress` guard is removed.
+/// AC1 (signal): a canary replay of a producible parked history must report
+/// `ReplaySucceeded`, not `NonDeterminismDetected`. In that history the
+/// signal-timeout race is in flight beside an interleaved bookkeeping sibling.
+/// RED until the inline `InProgress` guard is removed.
 #[tokio::test]
 async fn signal_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeeded() {
     let exec_id = ExecutionId::new();
@@ -7407,18 +7399,18 @@ async fn signal_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succee
     );
 }
 
-/// No-over-suppression guardrail for issue #1048 (the black-hat risk): removing
-/// the inline `InProgress` guard must NOT let a GENUINE non-determinism that
-/// surfaces as `InProgress`-with-unconsumed-events pass as `ReplaySucceeded`
-/// under canary. This is distinct from the `Diverged` case
-/// (`signal_timeout_genuine_divergence_still_detected_in_canary`): here the race
-/// matcher resolves to `InProgress` and rewinds the cursor to a trailing
-/// interleaved-command event, but the workflow (`signal_or_deadline_workflow`,
-/// which only does the wait and NEVER schedules an activity) has no sibling that
-/// consumes it — so it is a genuine leftover. The executor's end-of-cycle
-/// authority (`history_has_unconsumed_events`, executor.rs:1183) must still
-/// catch it as `NonDeterminismDetected`, proving the deferral does not blind the
-/// canary to genuinely-unconsumed history.
+/// No-over-suppression guardrail for issue #1048 (the black-hat risk).
+/// Removal of the inline `InProgress` guard must NOT let a GENUINE
+/// non-determinism pass as `ReplaySucceeded` under canary. Here it surfaces
+/// as `InProgress` with unconsumed events. This differs from the `Diverged`
+/// case (`signal_timeout_genuine_divergence_still_detected_in_canary`). Here
+/// the race matcher resolves to `InProgress` and rewinds the cursor to a
+/// trailing interleaved-command event. The workflow
+/// (`signal_or_deadline_workflow`) only does the wait and NEVER schedules an
+/// activity. No sibling consumes the event, so it is a genuine leftover. The
+/// end-of-cycle authority of the executor (`history_has_unconsumed_events`,
+/// executor.rs:1183) must still catch it as `NonDeterminismDetected`. This
+/// proves the deferral does not blind the canary to unconsumed history.
 #[tokio::test]
 async fn signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canary() {
     let orphan = vec![
@@ -7434,8 +7426,8 @@ async fn signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canar
             duration_secs: 300,
         },
         // Genuine leftover: an interleaved-command-allowlist event the matcher
-        // rewinds to on `InProgress`, but which the plain wait workflow never
-        // dispatches — so nothing consumes it and it remains at the frontier.
+        // rewinds to on `InProgress`. The plain wait workflow never dispatches
+        // it, so nothing consumes it, and it stays at the frontier.
         WorkflowEvent::ActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "orphaned_activity".into(),
@@ -7599,11 +7591,11 @@ async fn child_timeout_both_branches_replay_succeeded_across_randomized_ordering
 }
 
 /// A child that FAILED before the deadline replays deterministically to the
-/// Err branch: the workflow maps the typed failure to a String and returns it
-/// via `?`, so — like every self-failing workflow — it surfaces as
-/// `ReplayStatus::WorkflowFailed` (it did not complete successfully), mirroring
-/// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`. The
-/// *determinism* is the point: the same failure is reproduced on every cycle.
+/// Err branch. The workflow maps the typed failure to a String and returns it
+/// via `?`. So, like every self-failing workflow, it surfaces as
+/// `ReplayStatus::WorkflowFailed`. This mirrors
+/// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`.
+/// The point is *determinism*: every cycle reproduces the same failure.
 #[tokio::test]
 async fn child_timeout_child_fails_before_deadline_replays_deterministically() {
     let child_id = ExecutionId::new();
@@ -7670,11 +7662,12 @@ fn child_in_flight_fixture() -> Vec<WorkflowEvent> {
     ]
 }
 
-/// Codex P2 (issue #779): a healthy in-flight child-timeout workflow sampled by
-/// the deploy replay canary reaches the recorded-history frontier with the race
-/// still `InProgress` and then *suspends* — it must report `ReplaySucceeded`,
-/// not a false non-determinism. Mirrors `check_strict_replay_no_match`'s
-/// canary-at-frontier exception, which the `InProgress` arm previously ignored.
+/// Issue #779: the deploy replay canary samples a healthy in-flight
+/// child-timeout workflow. It reaches the recorded-history frontier with the
+/// race still `InProgress` and then *suspends*. It must report
+/// `ReplaySucceeded`, not a false non-determinism. This mirrors the
+/// canary-at-frontier exception of `check_strict_replay_no_match`, which the
+/// `InProgress` arm previously ignored.
 #[tokio::test]
 async fn child_timeout_in_flight_canary_replays_succeeded() {
     let exec_id = ExecutionId::new();
@@ -7771,10 +7764,10 @@ async fn child_timeout_in_flight_strict_still_reports_nondeterminism() {
 }
 
 /// Mandatory guardrail: the canary-at-frontier exception must ONLY cover a
-/// genuinely-suspending in-flight race. A real code-vs-history divergence (here
-/// the handler passes a different child input than history recorded) resolves
-/// as `Diverged`, never `InProgress`, so it must STILL be reported as
-/// non-determinism even in canary mode.
+/// genuinely-suspending in-flight race. Here the handler passes a different
+/// child input than history recorded. That real divergence resolves as
+/// `Diverged`, never `InProgress`, so canary mode must STILL report it as
+/// non-determinism.
 #[tokio::test]
 async fn child_timeout_genuine_divergence_still_detected_in_canary() {
     let child_id = ExecutionId::new();
@@ -7806,11 +7799,11 @@ async fn child_timeout_genuine_divergence_still_detected_in_canary() {
 
 // ---------------------------------------------------------------------------
 // issue #1048 (child side, AC3 twin): the byte-identical InProgress
-// canary-frontier guard in `spawn_child_workflow_timeout` false-fires the same
-// way when the parked child-timeout race has an interleaved bookkeeping sibling
-// (`match_child_or_timer` rewinds the cursor to the sibling's
-// `SideEffectRecorded`, and the guard reads `has_non_lifecycle_unconsumed()`
-// there before the sibling is polled).
+// canary-frontier guard in `spawn_child_workflow_timeout` false-fires the
+// same way. The trigger is a parked child-timeout race with an interleaved
+// bookkeeping sibling. `match_child_or_timer` rewinds the cursor to the
+// sibling's `SideEffectRecorded`. The guard reads
+// `has_non_lifecycle_unconsumed()` there before the sibling is polled.
 // ---------------------------------------------------------------------------
 
 /// Reachable #1048 trigger for the child twin:
@@ -7838,9 +7831,9 @@ fn child_or_deadline_with_bookkeeping_sibling_workflow<'a>(
 }
 
 /// Parked child-timeout race + a trailing interleaved bookkeeping sibling
-/// (`SideEffectRecorded`): child started (idx 1), timer armed (idx 2), sibling
-/// recorded (idx 3); neither `ChildWorkflow*` terminal nor `TimerFired` is
-/// recorded.
+/// (`SideEffectRecorded`). The child started (idx 1), the timer armed (idx 2),
+/// and the sibling recorded (idx 3). Neither `ChildWorkflow*` terminal nor
+/// `TimerFired` is recorded.
 fn child_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
     let child_id = ExecutionId::new();
     let timer_id = TimerId::new("__child_timeout:1:process_order");
@@ -7863,10 +7856,10 @@ fn child_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
     ]
 }
 
-/// AC1 + AC3 (child): a canary replay of a producible parked history where the
-/// child-timeout race is in-flight concurrently with an interleaved bookkeeping
-/// sibling must report `ReplaySucceeded`. RED until the twin's inline `InProgress`
-/// guard is removed symmetrically with the signal side.
+/// AC1 + AC3 (child): a canary replay of a producible parked history must
+/// report `ReplaySucceeded`. In it the child-timeout race is in flight next to
+/// an interleaved bookkeeping sibling. RED until the twin's inline
+/// `InProgress` guard is removed symmetrically with the signal side.
 #[tokio::test]
 async fn child_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeeded() {
     let exec_id = ExecutionId::new();
@@ -7891,20 +7884,21 @@ async fn child_timeout_in_flight_with_bookkeeping_sibling_canary_replays_succeed
 
 /// No-over-suppression guardrail for issue #1048 — CHILD twin of
 /// `signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canary`
-/// (AC3 symmetry). Removing the byte-identical inline `InProgress` canary-frontier
-/// guard from `spawn_child_workflow_timeout` must NOT let a GENUINE
-/// non-determinism that surfaces as `InProgress`-with-unconsumed-events pass as
-/// `ReplaySucceeded` under canary. Distinct from the `Diverged` case
-/// (`child_timeout_genuine_divergence_still_detected_in_canary`): here
-/// `match_child_or_timer` resolves the race to `InProgress` and rewinds the
-/// cursor to a trailing interleaved-command-allowlist event (`ActivityScheduled`,
-/// replay.rs:4407), but the plain workflow (`child_or_deadline_workflow`, which
-/// only does the child-timeout wait and NEVER schedules an activity) has no
-/// sibling that consumes it — so it is a genuine leftover. The executor's
-/// end-of-cycle authority (`history_has_unconsumed_events`, executor.rs:1183)
-/// must still catch it as `NonDeterminismDetected`, proving the deferral to that
-/// authority does not blind the canary to genuinely-unconsumed history on the
-/// child matcher's distinct rewind path.
+/// (AC3 symmetry). The fix removes the byte-identical inline `InProgress`
+/// canary-frontier guard from `spawn_child_workflow_timeout`. That must NOT
+/// let a GENUINE non-determinism that surfaces as
+/// `InProgress`-with-unconsumed-events pass as `ReplaySucceeded` under
+/// canary. This differs from the `Diverged` case
+/// (`child_timeout_genuine_divergence_still_detected_in_canary`). Here
+/// `match_child_or_timer` resolves the race to `InProgress`. It rewinds the
+/// cursor to a trailing interleaved-command-allowlist event
+/// (`ActivityScheduled`, replay.rs:4407). The plain workflow
+/// (`child_or_deadline_workflow`) only does the child-timeout wait and NEVER
+/// schedules an activity. So no sibling consumes the event, and it is a
+/// genuine leftover. The executor's end-of-cycle authority
+/// (`history_has_unconsumed_events`, executor.rs:1183) must still catch it as
+/// `NonDeterminismDetected`. That proves the deferral does not blind the
+/// canary to unconsumed history on the child matcher's distinct rewind path.
 #[tokio::test]
 async fn child_timeout_in_flight_genuine_leftover_event_still_detected_in_canary() {
     let child_id = ExecutionId::new();
@@ -7922,9 +7916,9 @@ async fn child_timeout_in_flight_genuine_leftover_event_still_detected_in_canary
             timer_id,
             duration_secs: 300,
         },
-        // Genuine leftover: an interleaved-command-allowlist event the matcher
-        // rewinds to on `InProgress`, but which the plain child-timeout workflow
-        // never dispatches — so nothing consumes it and it remains at the frontier.
+        // Genuine leftover: the matcher rewinds to this allowlisted event on
+        // `InProgress`. The plain child-timeout workflow never dispatches it,
+        // so nothing consumes it and it remains at the frontier.
         WorkflowEvent::ActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "orphaned_activity".into(),
@@ -7972,9 +7966,9 @@ fn child_timeout_oversized_propagate_workflow<'a>(
     })
 }
 
-/// Same fresh over-cap child-timeout, but CATCHES the `PayloadTooLarge` and
-/// degrades gracefully, then completes. The live run records no child/timer
-/// events, so the terminal history is `WorkflowCompleted` — on replay the
+/// Same fresh over-cap child-timeout, but CATCHES the `PayloadTooLarge`,
+/// degrades gracefully, and completes. The live run records no child/timer
+/// events, so the terminal history is `WorkflowCompleted`. On replay the
 /// cursor sits on that event, NOT a recorded child start.
 fn child_timeout_oversized_catch_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -7991,10 +7985,10 @@ fn child_timeout_oversized_catch_workflow<'a>(
             .await
         {
             Ok(o) => o,
-            // Degrade gracefully on an oversized sub-orchestration input; any
-            // OTHER error (e.g. a genuine non-determinism) still propagates, so
-            // a spurious `Diverged` from mis-ordering the cap check would NOT be
-            // swallowed and this workflow would fail instead of completing.
+            // Degrade gracefully on an oversized sub-orchestration input. Any
+            // OTHER error (e.g. a genuine non-determinism) still propagates.
+            // So a spurious `Diverged` from a mis-ordered cap check fails this
+            // workflow instead of completing it.
             Err(HarvestError::PayloadTooLarge { .. }) => {
                 return Ok(serde_json::json!({"skipped_oversized": true}));
             }
@@ -8007,13 +8001,13 @@ fn child_timeout_oversized_catch_workflow<'a>(
     })
 }
 
-/// Codex P2 (issue #779): a fresh child-timeout over-cap input records NO
-/// child/timer events, so on replay the cursor sits on the next real event
-/// (here a caught-and-continued `WorkflowCompleted`). The payload-cap pre-check
-/// must run BEFORE `match_child_or_timer`, so replay reproduces the same
-/// `PayloadTooLarge` (which the workflow catches and continues) instead of
-/// diverging against the non-child event at the cursor. Before the fix this
-/// history replayed as a non-determinism / `WorkflowFailed`.
+/// Issue #779: a fresh child-timeout over-cap input records NO child/timer
+/// events. So on replay the cursor sits on the next real event (here a
+/// caught-and-continued `WorkflowCompleted`). The payload-cap pre-check must
+/// run BEFORE `match_child_or_timer`. Then replay reproduces the same
+/// `PayloadTooLarge`, which the workflow catches, instead of diverging against
+/// the non-child event at the cursor. Before the fix this history replayed as
+/// a non-determinism / `WorkflowFailed`.
 #[tokio::test]
 async fn child_timeout_oversized_input_caught_replays_succeeded() {
     let events = vec![
@@ -8089,12 +8083,13 @@ async fn child_timeout_oversized_input_propagated_replays_deterministically() {
 /// (`__child_timeout:1:oversized_child`). So it never takes credit for the
 /// `ChildWorkflowStarted` of the SECOND (seq 2) call at the cursor.
 ///
-/// RED (pre-fix, unfingerprinted `peek_child_start_at_cursor`): the first call's
-/// peek matched the second call's `ChildWorkflowStarted`, concluded it was already
-/// dispatched, skipped its own cap re-check, then diverged in
-/// `match_child_or_timer` (recorded `second_child` != requested `oversized_child`)
-/// — a spurious non-determinism instead of reproducing `PayloadTooLarge`, so the
-/// workflow failed. GREEN (timer-id fingerprint): the caught call reproduces
+/// RED (pre-fix, unfingerprinted `peek_child_start_at_cursor`): the first
+/// call's peek matched the second call's `ChildWorkflowStarted`. It concluded
+/// that it was already dispatched and skipped its own cap re-check. It then
+/// diverged in `match_child_or_timer` (recorded `second_child` != requested
+/// `oversized_child`). That spurious non-determinism, not a reproduced
+/// `PayloadTooLarge`, failed the workflow.
+/// GREEN (timer-id fingerprint): the caught call reproduces
 /// `PayloadTooLarge`, the second call resolves child-win, the run completes.
 fn child_timeout_caught_then_second_child_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -8116,9 +8111,9 @@ fn child_timeout_caught_then_second_child_workflow<'a>(
                 return Err("expected PayloadTooLarge on the oversized child".to_string());
             }
             Err(HarvestError::PayloadTooLarge { .. }) => { /* degrade gracefully */ }
-            // Any OTHER error (e.g. a spurious Diverged from the peek miscrediting
-            // the second call's child start) propagates and fails the run — so the
-            // RED state is NOT ReplaySucceeded.
+            // Any OTHER error (e.g. a spurious Diverged from the peek
+            // miscrediting the second call's child start) fails the run. So
+            // the RED state is NOT ReplaySucceeded.
             Err(other) => return Err(other.to_string()),
         }
         // Call 2 (seq 2): small input, recorded, child wins before the deadline.
@@ -8291,8 +8286,8 @@ async fn replayer_replays_signal_handler_workflow_with_reordered_signals() {
 }
 
 /// A history recording only the `cancel` signal (no `pause`) must also replay
-/// cleanly -- an unregistered-for-this-run signal name is simply never sent,
-/// which is a normal history, not a divergence.
+/// cleanly. A signal name that this run never receives is a normal history,
+/// not a divergence.
 #[tokio::test]
 async fn replayer_replays_signal_handler_workflow_with_only_one_signal() {
     let events = vec![
@@ -8492,9 +8487,9 @@ async fn replayer_succeeds_for_pre_marker_saga_history() {
     );
 }
 
-/// Failed-unwind workflow for the post-review P2-1 persisted shape: one saga
-/// step (in-memory forward, activity-backed compensation that terminally
-/// failed), the author catches `SagaCompensationFailed`, consumes the
+/// Failed-unwind workflow for the issue #801 persisted shape. One saga step
+/// runs an in-memory forward and an activity-backed compensation that fails
+/// terminally. The author catches `SagaCompensationFailed`, consumes the
 /// duplicate webhook signal, and completes normally.
 fn saga_failed_unwind_with_trailing_signal_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -8525,9 +8520,9 @@ fn saga_failed_unwind_with_trailing_signal_workflow<'a>(
     })
 }
 
-/// The exact history the P2-1 fix persists: the failure marker recorded PAST
-/// the drained trailing signal. This must replay deterministically with zero
-/// fresh samples — the money proof that the new marker position is
+/// The exact history the issue #801 fix persists: the failure marker recorded
+/// PAST the drained trailing signal. This must replay deterministically with
+/// zero fresh samples — the money proof that the new marker position is
 /// replay-consistent.
 #[tokio::test]
 async fn replayer_succeeds_for_failed_unwind_history_with_trailing_signal() {
@@ -8663,14 +8658,14 @@ async fn replayer_succeeds_for_cancel_and_compensate_history_with_marker() {
     );
 }
 
-/// Codex P2 (PR #973 review): the normal terminal shape for a **pre-#801**
-/// cancelled run is `[..., WorkflowCancelled]` with NO saga marker anywhere —
-/// the cancellation event itself is the last recorded event. A replay probe
-/// of that history against the cancel-and-compensate workflow must stay
-/// uncounted and command-free: the matcher's cancellation-transparency
-/// lookahead reports the frontier, but a `WorkflowReplayer` run is a pure
-/// read — it must never retroactively count an old history nor push a fresh
-/// marker command mid-replay.
+/// PR #973: the normal terminal shape for a **pre-#801** cancelled run is
+/// `[..., WorkflowCancelled]` with NO saga marker anywhere. The cancellation
+/// event itself is the last recorded event. A replay probe of that history
+/// against the cancel-and-compensate workflow must stay uncounted and
+/// command-free. The matcher's cancellation-transparency lookahead reports the
+/// frontier, but a `WorkflowReplayer` run is a pure read. It must never
+/// retroactively count an old history nor push a fresh marker command
+/// mid-replay.
 #[tokio::test]
 async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
     let history = vec![
@@ -8711,9 +8706,9 @@ async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
 }
 
 // ---------------------------------------------------------------------------
-// Replay-safe custom business metrics (issue #758, shipped as issue #532):
-// a counter incremented once in a workflow body is emitted exactly once on
-// the live execution and zero times across N >= 5 replay cycles.
+// Replay-safe custom business metrics (issue #758, shipped as issue #532).
+// A counter incremented once in a workflow body is emitted exactly once on
+// the live execution. It is emitted zero times across N >= 5 replay cycles.
 // ---------------------------------------------------------------------------
 
 /// Counting `MetricsRecorder` capturing every custom-metric emission.
@@ -8783,11 +8778,11 @@ fn signal_wait_workflow<'a>(
     })
 }
 
-/// AC2 (issue #684): a `WorkflowReplayer` replay of an already-terminal history
-/// drives the strict/canary path (`run_workflow_strict`/`run_workflow_canary`),
-/// NOT the live `drive_workflow` where `harvest.signal.unhandled` is emitted, so
-/// re-replaying a terminal history emits ZERO unhandled-signal samples — the
-/// counter can never double-count on replay by construction.
+/// AC2 (issue #684): a `WorkflowReplayer` replay of an already-terminal
+/// history drives the strict/canary path (`run_workflow_strict` /
+/// `run_workflow_canary`). It does NOT drive the live `drive_workflow`, which
+/// emits `harvest.signal.unhandled`. So a terminal-history replay emits ZERO
+/// unhandled-signal samples, and the counter cannot double-count on replay.
 #[tokio::test]
 async fn replay_of_terminal_history_never_emits_signal_unhandled() {
     let metrics = std::sync::Arc::new(SignalUnhandledCounter::default());
@@ -8833,8 +8828,8 @@ async fn replay_of_terminal_history_never_emits_signal_unhandled() {
 }
 
 /// One activity, then a single business-counter increment and one histogram
-/// sample (issue #758's "counter incremented once in workflow code" shape;
-/// the histogram proves suppression covers both metric kinds).
+/// sample. This is issue #758's "counter incremented once in workflow code"
+/// shape. The histogram proves suppression covers both metric kinds.
 fn business_counter_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -8872,9 +8867,9 @@ fn business_counter_loop_workflow<'a>(
     })
 }
 
-/// Recorded history for `business_counter_workflow` — note there is **no**
-/// event corresponding to the `ctx.metrics()` call: custom metrics leave the
-/// history byte-identical (issue #758's append-only AC by construction).
+/// Recorded history for `business_counter_workflow`. It has **no** event for
+/// the `ctx.metrics()` call. Custom metrics leave the history byte-identical
+/// (issue #758's append-only AC by construction).
 fn business_counter_history() -> Vec<WorkflowEvent> {
     let activity_id = ActivityExecId::new();
     vec![
@@ -8902,8 +8897,8 @@ fn business_counter_history() -> Vec<WorkflowEvent> {
 }
 
 /// AC (issue #758): a workflow that increments a counter once in its body,
-/// replayed across N (>= 5) cycles, produces **exactly 1** emission — 1 from
-/// the live run (asserted here via `WorkflowTestEnv`), 0 from the replays
+/// replayed across N (>= 5) cycles, produces **exactly 1** emission. The live
+/// run gives 1 (asserted here via `WorkflowTestEnv`). The replays give 0
 /// (asserted in `five_cycle_replay_emits_zero_workflow_metrics` below).
 #[tokio::test]
 async fn live_execution_emits_workflow_counter_exactly_once() {
@@ -8979,15 +8974,15 @@ async fn live_loop_hitting_increment_twice_emits_exactly_two() {
 }
 
 // ---------------------------------------------------------------------------
-// (issue #698 FIX 1) parent_execution_id must be threaded into the replay /
-//   canary tooling. `parent_execution_id` lives in NO WorkflowEvent (it is
-//   sourced only from the harvest_workflow_executions.parent_id column), so a
-//   pure-history replay builds the child's context with parent = None UNLESS the
-//   replayer is told the parent. A child that branches its COMMAND stream on
+// (issue #698) parent_execution_id must be threaded into the replay / canary
+//   tooling. `parent_execution_id` lives in NO WorkflowEvent. Its only source
+//   is the harvest_workflow_executions.parent_id column. So a pure-history
+//   replay builds the child's context with parent = None UNLESS the replayer
+//   is told the parent. A child can branch its COMMAND stream on
 //   ctx.info().parent_execution_id (a blessed AC2 "parent-aware child logic"
-//   use) then false-reports non-determinism in the deploy canary / its own
-//   WorkflowReplayer CI test. WorkflowReplayer::with_parent_execution_id closes
-//   that gap for the JSON-fixture path.
+//   use). It then false-reports non-determinism in the deploy canary or its
+//   own WorkflowReplayer CI test. WorkflowReplayer::with_parent_execution_id
+//   closes that gap for the JSON-fixture path.
 // ---------------------------------------------------------------------------
 
 /// A child workflow whose COMMAND stream depends on its spawning parent:
@@ -9083,14 +9078,14 @@ async fn parent_aware_child_diverges_when_parent_is_not_threaded() {
     }
 }
 
-/// (c) Issue #698 (Codex P2 @ testing.rs:306) — the DB `export_history` ->
-/// `HistoryExportDocument` -> JSON -> `replay_from_json` path (retention
-/// archives / offline replay). The `HistoryExportRequest` carries the row's
-/// `parent_id`, which `export_history` embeds at the TOP LEVEL of the document
-/// so it deserialises into `HistorySnapshot.parent_execution_id`. The child
-/// then replays clean through `replay_from_json` WITHOUT any manual
-/// `with_parent_execution_id` override — proving the parent survives the
-/// export-document round-trip, exactly like `execution_timeout`/`deadline_at`.
+/// (c) Issue #698: the DB `export_history` -> `HistoryExportDocument` -> JSON
+/// -> `replay_from_json` path (retention archives / offline replay). The
+/// `HistoryExportRequest` carries the row's `parent_id`. `export_history`
+/// embeds it at the TOP LEVEL of the document, so it deserialises into
+/// `HistorySnapshot.parent_execution_id`. The child then replays clean through
+/// `replay_from_json` WITHOUT any manual `with_parent_execution_id` override.
+/// That proves the parent survives the export-document round-trip, exactly
+/// like `execution_timeout`/`deadline_at`.
 #[tokio::test]
 async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
     use autumn_harvest::history_export::{
@@ -9136,11 +9131,11 @@ async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
     );
 }
 
-/// (d) The negative control for (c): when the export request carries no parent
-/// (`parent_execution_id: None`), the exported document deserialises to
-/// parent = `None`, so the child takes its `orphan_step` branch and diverges
-/// from the recorded `child_of_parent` schedule — proving the export document
-/// is the load-bearing carrier of the parent through this path.
+/// (d) The negative control for (c): when the export request carries no
+/// parent (`parent_execution_id: None`), the exported document deserialises
+/// to parent = `None`. So the child takes its `orphan_step` branch and
+/// diverges from the recorded `child_of_parent` schedule. That proves the
+/// export document is the load-bearing carrier of the parent on this path.
 #[tokio::test]
 async fn parent_aware_child_diverges_through_export_document_without_parent() {
     use autumn_harvest::history_export::{
@@ -9185,31 +9180,34 @@ async fn parent_aware_child_diverges_through_export_document_without_parent() {
 }
 
 // ---------------------------------------------------------------------------
-// (issue #698 FIX 2) workflow_id / workflow_type must be threaded into EVERY
+// (issue #698) workflow_id / workflow_type must be threaded into EVERY
 //   replay path. `ctx.info().workflow_type` (= the workflow_name column /
-//   handler key) and `ctx.info().workflow_id` (the business id column) live in
-//   NO WorkflowEvent — the LIVE worker sets them on the context via span_meta,
-//   but the strict/canary/export/JSON replay paths build the context without
-//   them, so a pure-history replay reports "" for both. A workflow that branches
-//   command-affecting logic on either — or, as here, embeds them in an activity
-//   INPUT (which the ctx.info() docs promise is replay-safe) — then false-reports
-//   non-determinism under export/DB/canary/JSON replay. These tests are the
-//   falsifiable bar: pre-fix they RED (divergence: recorded input carries the
-//   real identity, replay computes ""), post-fix they GREEN.
+//   handler key) and `ctx.info().workflow_id` (the business id column) live
+//   in NO WorkflowEvent. The LIVE worker sets them on the context via
+//   span_meta. The strict/canary/export/JSON replay paths build the context
+//   without them, so a pure-history replay reports "" for both. A workflow
+//   can branch command-affecting logic on either. It can also embed them in
+//   an activity INPUT, as here (the ctx.info() docs promise it is
+//   replay-safe). It then false-reports non-determinism under
+//   export/DB/canary/JSON replay. These tests are the falsifiable bar. Pre-fix
+//   they RED: the recorded input carries the real identity, and replay
+//   computes "". Post-fix they GREEN.
 //
-//   `workflow_type` uses mechanism 1 (apply the already-carried workflow_name);
-//   `workflow_id` uses mechanism 2 (an added HistorySnapshot/HistoryExportDocument
-//   field). The strict-input round-trip below is simultaneously the DIRECT
-//   assertion the census calls for: the activity input IS `ctx.info()`, so a clean
-//   strict replay proves the replay-path context reports the real values, not "".
+//   `workflow_type` uses mechanism 1 (apply the already-carried
+//   workflow_name). `workflow_id` uses mechanism 2 (an added
+//   HistorySnapshot/HistoryExportDocument field). The strict-input round-trip
+//   below is also the DIRECT assertion the census calls for. The activity
+//   input IS `ctx.info()`, so a clean strict replay proves that the
+//   replay-path context reports the real values, not "".
 // ---------------------------------------------------------------------------
 
 /// A workflow that embeds its own `ctx.info().workflow_type` and
 /// `ctx.info().workflow_id` into the input of a single activity. Under STRICT
-/// replay (the `WorkflowReplayer` default) the emitted activity input is compared
-/// byte-for-byte against the recorded `ActivityScheduled.input`, so a replay that
-/// computed the wrong (empty) identity diverges. This is the strongest, most
-/// direct assertion that the replay-path context reports the real identity.
+/// replay (the `WorkflowReplayer` default), the emitted activity input is
+/// compared byte-for-byte against the recorded `ActivityScheduled.input`. So
+/// a replay that computed the wrong (empty) identity diverges. This is the
+/// strongest, most direct assertion that the replay-path context reports the
+/// real identity.
 fn identity_into_activity_input<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -9262,14 +9260,14 @@ fn identity_taken_history(wf_type: &str, wf_id: &str) -> (ExecutionId, Vec<Workf
     (exec_id, events)
 }
 
-/// (e) THE MONEY TEST. A history recorded under a real workflow type
-/// (`identity_wf`) and business id (`cart-42`) is exported through the DB export
-/// document (the way retention / the HTTP export route does) and replayed via
-/// `replay_from_json` with NO manual override. The export document carries
-/// `workflow_name` (→ `workflow_type`, mechanism 1) and the new `workflow_id`
-/// field (mechanism 2), so both round-trip into the replay context and the strict
-/// activity-input comparison passes → `ReplaySucceeded`. Pre-fix the replay
-/// computed `("", "")` and diverged.
+/// (e) THE MONEY TEST. A history is recorded under a real workflow type
+/// (`identity_wf`) and business id (`cart-42`). It goes through the DB export
+/// document, the way retention and the HTTP export route do. It is replayed
+/// via `replay_from_json` with NO manual override. The export document
+/// carries `workflow_name` (→ `workflow_type`, mechanism 1) and the new
+/// `workflow_id` field (mechanism 2). Both round-trip into the replay context,
+/// and the strict activity-input comparison passes → `ReplaySucceeded`.
+/// Pre-fix the replay computed `("", "")` and diverged.
 #[tokio::test]
 async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() {
     use autumn_harvest::history_export::{
@@ -9315,10 +9313,10 @@ async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() 
 }
 
 /// (f) The negative control for `workflow_id` (mechanism 2): when the export
-/// request carries no `workflow_id`, the exported document deserialises to
-/// `workflow_id = ""`, so the replayed activity input `{"workflow_id": ""}`
-/// diverges from the recorded `"cart-42"` — proving the export document's
-/// `workflow_id` field is the load-bearing carrier through this path.
+/// request carries no `workflow_id`, the document deserialises to
+/// `workflow_id = ""`. So the replayed activity input `{"workflow_id": ""}`
+/// diverges from the recorded `"cart-42"`. That proves the export document's
+/// `workflow_id` field is the load-bearing carrier on this path.
 #[tokio::test]
 async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
     use autumn_harvest::history_export::{
@@ -9364,12 +9362,12 @@ async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
     }
 }
 
-/// (g) `workflow_type` load-bearing proof for the raw-events path (mechanism 1):
-/// `replay_from_events` applies the single registered handler's KEY as the
-/// context's `workflow_type`. The recorded activity input carries that same type
-/// (and an empty id, since a raw-events fixture has no business id), so a clean
-/// strict replay proves the handler key is applied as `ctx.info().workflow_type`
-/// rather than left "".
+/// (g) `workflow_type` load-bearing proof for the raw-events path (mechanism
+/// 1): `replay_from_events` applies the single registered handler's KEY as
+/// the context's `workflow_type`. The recorded activity input carries that
+/// same type, and an empty id, since a raw-events fixture has no business id.
+/// A clean strict replay proves the handler key is applied as
+/// `ctx.info().workflow_type` rather than left "".
 #[tokio::test]
 async fn workflow_type_is_applied_from_handler_key_on_raw_events_path() {
     let (_exec_id, events) = identity_taken_history("identity_wf", "");
@@ -9387,9 +9385,9 @@ async fn workflow_type_is_applied_from_handler_key_on_raw_events_path() {
 }
 
 /// (h) `workflow_id` global-override proof (mechanism 2, raw-events path):
-/// `WorkflowReplayer::with_workflow_id` supplies the business id a raw-events
-/// fixture cannot carry, so a workflow that embeds it in an activity input
-/// replays clean.
+/// `WorkflowReplayer::with_workflow_id` supplies the business id that a
+/// raw-events fixture cannot carry. So a workflow that embeds it in an
+/// activity input replays clean.
 #[tokio::test]
 async fn workflow_id_is_applied_from_replayer_global_on_raw_events_path() {
     let (_exec_id, events) = identity_taken_history("identity_wf", "cart-99");
@@ -9408,21 +9406,22 @@ async fn workflow_id_is_applied_from_replayer_global_on_raw_events_path() {
 }
 
 // ---------------------------------------------------------------------------
-// (issue #698, Codex P2 @ testing.rs:903) execution_id must be threadable into
-//   the raw `replay_from_events` path. `ctx.info().execution_id` is documented
-//   as replay-safe (the production / DB / snapshot / canary replay paths all
-//   recover the real id), but a raw-events fixture carries no HistorySnapshot to
-//   source it from, so `replay_from_events` mints a FRESH id. A workflow that
-//   recorded its own `ctx.info().execution_id` in a command-affecting value
-//   (here, an activity INPUT — which the docs promise is replay-safe) then
-//   false-reports non-determinism: the random replay id vs the recorded original
-//   run id. `WorkflowReplayer::with_execution_id` closes that last raw-path gap.
+// (issue #698) execution_id must be threadable into the raw
+//   `replay_from_events` path. `ctx.info().execution_id` is documented as
+//   replay-safe: the production / DB / snapshot / canary replay paths all
+//   recover the real id. A raw-events fixture carries no HistorySnapshot to
+//   source it from, so `replay_from_events` mints a FRESH id. A workflow can
+//   record its own `ctx.info().execution_id` in a command-affecting value
+//   (here, an activity INPUT, which the docs promise is replay-safe). It then
+//   false-reports non-determinism: the random replay id differs from the
+//   recorded run id. `WorkflowReplayer::with_execution_id` closes that last
+//   raw-path gap.
 // ---------------------------------------------------------------------------
 
-/// A workflow that embeds its own `ctx.info().execution_id` into the input of a
-/// single activity. Under STRICT replay the emitted input is compared
-/// byte-for-byte against the recorded `ActivityScheduled.input`, so a replay that
-/// computed a DIFFERENT `execution_id` diverges — the strongest, most direct
+/// A workflow that embeds its own `ctx.info().execution_id` into the input of
+/// a single activity. Under STRICT replay the emitted input is compared
+/// byte-for-byte against the recorded `ActivityScheduled.input`. So a replay
+/// that computed a DIFFERENT `execution_id` diverges. This is the most direct
 /// assertion that the raw-path context reports the supplied id.
 fn exec_id_into_activity_input<'a>(
     ctx: &'a WorkflowContext,
@@ -9468,10 +9467,10 @@ fn exec_id_taken_history(exec_id: ExecutionId) -> Vec<WorkflowEvent> {
     ]
 }
 
-/// (i) THE MONEY TEST for the raw-events `execution_id` gap: with the captured run
-/// id supplied via `with_execution_id`, the replayed activity input matches the
-/// recorded one → `ReplaySucceeded`. Pre-fix `replay_from_events` minted a fresh
-/// random id and this diverged.
+/// (i) THE MONEY TEST for the raw-events `execution_id` gap.
+/// `with_execution_id` supplies the captured run id, so the replayed activity
+/// input matches the recorded one → `ReplaySucceeded`. Pre-fix
+/// `replay_from_events` minted a fresh random id and this diverged.
 #[tokio::test]
 async fn execution_id_is_applied_from_replayer_global_on_raw_events_path() {
     let exec_id = ExecutionId::new();
@@ -9490,10 +9489,11 @@ async fn execution_id_is_applied_from_replayer_global_on_raw_events_path() {
     );
 }
 
-/// (j) The load-bearing negative control for (i): WITHOUT `with_execution_id`,
-/// `replay_from_events` mints a fresh random id, so the replayed activity input
-/// carries a DIFFERENT `execution_id` than the recorded one → divergence. This is
-/// exactly the false non-determinism the builder closes.
+/// (j) The load-bearing negative control for (i): WITHOUT
+/// `with_execution_id`, `replay_from_events` mints a fresh random id. So the
+/// replayed activity input carries a DIFFERENT `execution_id` than the
+/// recorded one → divergence. The builder closes exactly this false
+/// non-determinism.
 #[tokio::test]
 async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
     let exec_id = ExecutionId::new();
@@ -9519,10 +9519,10 @@ async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
 //
 // Four forward-scan matchers (`match_timer_strict`, `scan_activity_terminal`,
 // `match_signal`) falsely report `NonDeterminismDetected` when a *sibling*
-// terminal/command is interleaved at its recorded history position — even for an
-// IDEAL (correctly-ordered) history — because each scan `break`s at the sibling
-// event instead of tolerating it the way `match_signal_or_timer` (issue #476)
-// already does.
+// terminal/command is interleaved at its recorded history position. That
+// holds even for an IDEAL (correctly-ordered) history. Each scan `break`s at
+// the sibling event instead of tolerating it the way
+// `match_signal_or_timer` (issue #476) already does.
 //
 // Each test below feeds the replayer a correct, producible history and asserts
 // `ReplaySucceeded`. They are RED against current code: each currently fails
@@ -9577,10 +9577,11 @@ fn interleaved_activity_first_workflow<'a>(
 
 /// Manifestation #4 — two timers armed in one batch
 /// (`tokio::join!(ctx.timer("timer_a", …), ctx.timer("timer_b", …))`, `timer_a`
-/// polled/matched first) firing in REVERSED order: the sibling (foreign-id)
+/// polled/matched first) fire in REVERSED order. The sibling (foreign-id)
 /// `TimerFired(timer_b)` is recorded before the polled timer's own
 /// `TimerFired(timer_a)`. `match_timer_strict`'s scan for `TimerFired(timer_a)`
-/// currently **breaks at the unconsumed foreign `TimerFired(timer_b)`** → wedge.
+/// currently **breaks at the unconsumed foreign `TimerFired(timer_b)`** →
+/// wedge.
 fn interleaved_two_timers_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -9752,11 +9753,11 @@ async fn interleaved_sibling_signal_after_deadline_timer_fired_replays_succeeded
 /// Two CONCURRENT, DIFFERENTLY-named signal waits in one mixed batch: a plain
 /// `wait_for_signal("a")` (polled FIRST) joined with a
 /// `receive_signal_timeout::<Value>("b", 5s)` whose deadline fires BEFORE "a"
-/// arrives. `receive_signal_timeout` pre-increments `signal_timeout_seq`, so the
-/// race arms `__signal_timeout:1:b`; the recorded history is
+/// arrives. `receive_signal_timeout` pre-increments `signal_timeout_seq`, so
+/// the race arms `__signal_timeout:1:b`. The recorded history is
 /// `[WorkflowStarted, TimerStarted(__signal_timeout:1:b),
 /// TimerFired(__signal_timeout:1:b), SignalReceived(a)]` (b times out, then a
-/// arrives). This is the Codex P1 composition on PR #1084.
+/// arrives). This is the composition flagged on PR #1084.
 fn interleaved_two_signal_foreign_deadline_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -9795,16 +9796,16 @@ fn interleaved_two_signal_foreign_deadline_history() -> Vec<WorkflowEvent> {
 
 #[tokio::test]
 async fn interleaved_two_signal_race_foreign_deadline_timer_replays_succeeded() {
-    // Codex P1 (PR #1084 review of issue #1071): `match_signal("a")`'s
-    // reserved-`__signal_timeout` cross-without-rewind arm keyed only on the
-    // reserved PREFIX, so it crossed a FOREIGN signal's deadline timer
-    // (`__signal_timeout:1:b`) without rewinding — advancing the cursor past the
-    // sibling race's `TimerStarted`/`TimerFired`, so the "b" branch's
-    // `match_signal_or_timer` could no longer positionally re-anchor its own
-    // `TimerStarted` and strict replay diverged (`NonDeterminismDetected`,
-    // `EarlyCompletion`). The guard is now narrowed to the SAME signal name, so a
-    // foreign deadline timer falls through to the generic `TimerStarted` rewind
-    // arm and the sibling race re-matches.
+    // PR #1084 (issue #1071): `match_signal("a")`'s reserved-`__signal_timeout`
+    // cross-without-rewind arm keyed only on the reserved PREFIX. So it
+    // crossed a FOREIGN signal's deadline timer (`__signal_timeout:1:b`)
+    // without rewinding. It advanced the cursor past the sibling race's
+    // `TimerStarted`/`TimerFired`. The "b" branch's `match_signal_or_timer`
+    // could then no longer re-anchor its own `TimerStarted` positionally.
+    // Strict replay diverged (`NonDeterminismDetected`, `EarlyCompletion`).
+    // The guard now matches the SAME signal name only. So a foreign deadline
+    // timer falls through to the generic `TimerStarted` rewind arm, and the
+    // sibling race re-matches.
     let report = WorkflowReplayer::new()
         .register_fn(
             "interleaved_two_signal_foreign_deadline",
@@ -9876,20 +9877,20 @@ async fn interleaved_sibling_signal_stray_timer_started_still_diverges() {
 }
 
 // ---------------------------------------------------------------------------
-// #1071 review-fix coverage (PR follow-up): additional replayer manifestations
-// and divergence guards flagged by review. NONE of these change matcher LOGIC —
-// they broaden the empirical coverage of the sibling-tolerance fix and pin the
-// genuine-divergence boundaries it must NOT over-swallow.
+// #1071 follow-up coverage: more replayer manifestations and divergence
+// guards. NONE of these change matcher LOGIC — they broaden the empirical
+// coverage of the sibling-tolerance fix and pin the genuine-divergence boundaries it must NOT over-swallow.
 // ---------------------------------------------------------------------------
 
 /// Variant of manifestation #3 that exercises the GENUINE-user-timer path:
-/// `tokio::join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` with the signal
-/// wait polled FIRST and a plain user `ctx.timer("t", …)` (NOT the reserved
-/// `__signal_timeout` deadline id) as the sibling. This drives `match_signal`'s
-/// generic-`TimerStarted` rewind arm (which sets `first_interleaved_command`) +
-/// the new foreign-`TimerFired` cross + the sibling `match_timer_strict("t")`
-/// re-matching after the rewind — the path the reserved-`__signal_timeout`
-/// variant (`interleaved_sibling_signal_after_deadline_...`) does NOT cover.
+/// `tokio::join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))`. The signal
+/// wait is polled FIRST, and the sibling is a plain user `ctx.timer("t", …)`,
+/// NOT the reserved `__signal_timeout` deadline id. This drives
+/// `match_signal`'s generic-`TimerStarted` rewind arm (which sets
+/// `first_interleaved_command`). It also drives the new foreign-`TimerFired`
+/// cross and the sibling `match_timer_strict("t")` re-match after the rewind.
+/// The reserved-`__signal_timeout` variant
+/// (`interleaved_sibling_signal_after_deadline_...`) does NOT cover this path.
 fn signal_wait_with_user_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -9904,8 +9905,8 @@ fn signal_wait_with_user_timer_workflow<'a>(
     })
 }
 
-/// Test A (review §3a variant): a plain user `ctx.timer("t")` sibling whose fire
-/// is recorded before the awaited signal must replay. Complements the reserved
+/// Test A: a plain user `ctx.timer("t")` sibling whose fire is recorded
+/// before the awaited signal must replay. Complements the reserved
 /// `__signal_timeout` variant already covered by
 /// `interleaved_sibling_signal_after_deadline_timer_fired_replays_succeeded`.
 #[tokio::test]
@@ -9941,14 +9942,15 @@ async fn interleaved_sibling_signal_after_plain_user_timer_fired_replays_succeed
     );
 }
 
-/// Test B (review §3b): foreign-`TimerFired` genuine-divergence guard. Two timers
-/// are armed in one batch (`timer_a` matched first) but ONLY `timer_b` fires; the
-/// history also carries the terminal `WorkflowCompleted` that a fully-resolved
-/// run would reach. Crossing `TimerFired(timer_b)` non-consumingly must NOT let
-/// `timer_a` falsely resolve — so the workflow must NOT reach `WorkflowCompleted`,
-/// leaving that terminal unconsumed at the frontier → the replayer must flag a
-/// divergence, NOT `ReplaySucceeded`. This proves the foreign-`TimerFired` cross
-/// is transparent-only and never a false resolution of the polled timer.
+/// Test B: foreign-`TimerFired` genuine-divergence guard. Two timers are armed
+/// in one batch (`timer_a` matched first), but ONLY `timer_b` fires. The
+/// history also carries the terminal `WorkflowCompleted` that a fully
+/// resolved run would reach. Crossing `TimerFired(timer_b)` non-consumingly
+/// must NOT let `timer_a` falsely resolve. So the workflow must NOT reach
+/// `WorkflowCompleted`, and that terminal stays unconsumed at the frontier.
+/// The replayer must flag a divergence, NOT `ReplaySucceeded`. This proves the
+/// foreign-`TimerFired` cross is transparent-only and never a false
+/// resolution of the polled timer.
 #[tokio::test]
 async fn interleaved_sibling_multi_timer_wrong_one_fires_still_diverges() {
     let a = TimerId::new("timer_a");
@@ -9985,15 +9987,16 @@ async fn interleaved_sibling_multi_timer_wrong_one_fires_still_diverges() {
     );
 }
 
-/// Test C (review §2a, resolved EMPIRICALLY): a stray FOREIGN `TimerFired` where a
-/// signal was expected, with NO `TimerStarted` and NO signal
-/// (`[WorkflowStarted, TimerFired(orphan)]`), fed to the plain `signal_wait_workflow`.
-/// The #1071 fix makes `match_signal` cross a `TimerFired` non-consumingly, so the
-/// scan reaches end-of-history and `wait_for_signal` returns `NoMatch` (park) — but
-/// the stray, unconsumed `TimerFired` remains at the frontier, so the replayer must
-/// still flag a divergence rather than silently swallowing the stray event as
-/// `ReplaySucceeded`. (If this ever returns `ReplaySucceeded`, the tolerance is
-/// over-swallowing and it is a correctness bug.)
+/// Test C (resolved EMPIRICALLY): a stray FOREIGN `TimerFired` where a signal
+/// was expected, with NO `TimerStarted` and NO signal
+/// (`[WorkflowStarted, TimerFired(orphan)]`), fed to the plain
+/// `signal_wait_workflow`. The #1071 fix makes `match_signal` cross a
+/// `TimerFired` non-consumingly. So the scan reaches end-of-history and
+/// `wait_for_signal` returns `NoMatch` (park). The stray, unconsumed
+/// `TimerFired` remains at the frontier, so the replayer must still flag a
+/// divergence rather than swallow the stray event as `ReplaySucceeded`. If
+/// this ever returns `ReplaySucceeded`, the tolerance over-swallows, and that
+/// is a correctness bug.
 #[tokio::test]
 async fn interleaved_sibling_signal_stray_timer_fired_still_diverges() {
     let events = vec![
@@ -10032,22 +10035,23 @@ fn signal_wait_with_cancellable_await_fire_workflow<'a>(
     })
 }
 
-/// Test D (determinism-review finding 5.1 — KNOWN LIMITATION PIN): composing a
+/// Test D (KNOWN LIMITATION PIN): one shape is NOT supported. It composes a
 /// plain `wait_for_signal` with a cancellable-timer `await_fire()` in one
-/// `tokio::join!` is NOT a supported shape when the history records the
-/// cancellable timer's fire BEFORE the signal.
+/// `tokio::join!`, and the history records the cancellable timer's fire
+/// BEFORE the signal.
 ///
-/// Issue #768 already documents composing an armed cancellable-timer handle with
-/// a signal wait as a follow-up, not a supported composition. The #1071 fix
-/// broadens `match_signal`'s foreign-`TimerFired` cross: the plain
+/// Issue #768 already documents this composition (an armed cancellable-timer
+/// handle with a signal wait) as a follow-up, not a supported composition. The
+/// #1071 fix broadens `match_signal`'s foreign-`TimerFired` cross: the plain
 /// `wait_for_signal` wins by crossing the cancellable timer's `TimerFired`
-/// non-consumingly and advancing the cursor past it, which STRANDS that fire
+/// non-consumingly. It advances the cursor past that fire, which STRANDS it
 /// BEHIND the cursor. The cancellable timer's `await_fire` uses
-/// `match_timer_or_cancel`, which scans only FORWARD from the cursor, so it
-/// misses the behind-cursor fire and cannot resolve — diverging strict replay.
-/// On a live worker this self-heals (the arm re-fires), but a `WorkflowReplayer`
-/// strict replay surfaces the divergence. Use `ctx.receive_signal_timeout`
-/// (issue #476) for a supported signal-or-deadline shape.
+/// `match_timer_or_cancel`, which scans only FORWARD from the cursor. So it
+/// misses the behind-cursor fire, cannot resolve, and strict replay diverges.
+/// On a live worker this self-heals (the arm re-fires), but a
+/// `WorkflowReplayer` strict replay surfaces the divergence. Use
+/// `ctx.receive_signal_timeout` (issue #476) for a supported
+/// signal-or-deadline shape.
 ///
 /// This test PINS the actual strict-replay outcome so a future change to the
 /// composition's behavior is noticed.
@@ -10105,7 +10109,7 @@ fn timer_then_child_workflow<'a>(
     })
 }
 
-/// Test F (review §2c): an interleaved CHILD-WORKFLOW terminal must be crossed.
+/// Test F: an interleaved CHILD-WORKFLOW terminal must be crossed.
 /// `join!(ctx.timer("t"), ctx.spawn_child_workflow(...))` where the child
 /// completes BEFORE the timer fires:
 /// `[WorkflowStarted, TimerStarted(t), ChildWorkflowStarted, ChildWorkflowCompleted, TimerFired(t)]`.
@@ -10148,21 +10152,23 @@ async fn interleaved_sibling_child_workflow_terminal_before_timer_replays_succee
     );
 }
 
-// ─── Issue #614 (PR #1107 Codex review): STRICT replay honors with_history_policy ───
+// ─── Issue #614 (PR #1107): STRICT replay honors with_history_policy ───
 //
 // The merged #1107 fix threaded the runtime's history policy into the CANARY
-// replay path only; the STRICT paths (`replay_from_events` / `replay_from_snapshot`
-// → `run_workflow_strict` / `_advancing_clock`) still hardcoded
-// `WorkflowHistoryPolicy::default()`, so a caller that set `with_history_policy`
-// and then used a strict path had the setting silently ignored — a
-// `should_continue_as_new`-branching workflow then false-diverged. This block pins
-// the fix on the strict path: the same workflow + history that DIVERGES under the
-// default policy replays CLEAN once `with_history_policy(threshold = 2)` is set.
+// replay path only. The STRICT paths (`replay_from_events` /
+// `replay_from_snapshot` → `run_workflow_strict` / `_advancing_clock`) still
+// hardcoded `WorkflowHistoryPolicy::default()`. So a caller that set
+// `with_history_policy` and then used a strict path lost the setting
+// silently. A `should_continue_as_new`-branching workflow then
+// false-diverged. This block pins the fix on the strict path. The same
+// workflow + history that DIVERGES under the default policy replays CLEAN
+// once `with_history_policy(threshold = 2)` is set.
 
 /// Schedules `checkpoint` when `should_continue_as_new()` trips (via the
-/// history-size threshold), else `keep_going`. The recorded history fixes which
-/// activity was scheduled, so a wrong effective policy schedules the other
-/// activity and diverges — the decision is observable through replay determinism.
+/// history-size threshold), else `keep_going`. The recorded history fixes
+/// which activity was scheduled. So a wrong effective policy schedules the
+/// other activity and diverges. Replay determinism makes the decision
+/// observable.
 fn history_policy_branch_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -10360,8 +10366,8 @@ async fn replayer_succeeds_for_windowed_fan_out() {
 }
 
 /// AC6 (window-independence): the SAME recorded history replays to identical
-/// results whether the replaying code is configured with W=2, W=100, or the
-/// unbounded path — the window governs live dispatch only.
+/// results under W=2, W=100, or the unbounded path. The window governs live
+/// dispatch only.
 #[tokio::test]
 async fn replayer_windowed_fan_out_is_window_independent() {
     let (exec_id, events) = windowed_fan_out_history(&[2, 0, 3, 1]);
@@ -10489,9 +10495,9 @@ async fn replayer_windowed_fan_out_randomized_completion_order() {
     }
 }
 
-/// Build a genuinely WINDOWED-SHAPED recorded history (the shape a `W=2`
-/// fan-out actually records): `marker(count=4)` then, per wave, all of that
-/// wave's `ActivityScheduled` followed by that wave's `ActivityCompleted` —
+/// Build a genuinely WINDOWED-SHAPED recorded history, the shape a `W=2`
+/// fan-out records. It holds `marker(count=4)`, then per wave all of that
+/// wave's `ActivityScheduled` and then all its `ActivityCompleted`:
 /// `Sched0, Sched1, Comp0, Comp1, Sched2, Sched3, Comp2, Comp3`. This differs
 /// from [`windowed_fan_out_history`], which records the unbounded shape (all 4
 /// scheduled up front, then all completions).
@@ -10531,12 +10537,12 @@ fn windowed_shaped_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
-/// MAJOR-2 / AC6: a genuinely windowed-SHAPED recorded history (scheduled +
-/// completed wave-by-wave, `W=2`) replays clean under DIFFERENT windows (`W=1`,
-/// `W=4`, and the unbounded path) and produces byte-identical input-order
-/// results — proving the two-phase resume walks a windowed-shaped history
-/// correctly regardless of the replaying code's window. The pre-existing
-/// window-independence fixtures only exercise the unbounded-shaped history.
+/// AC6: a genuinely windowed-SHAPED recorded history (scheduled + completed
+/// wave-by-wave, `W=2`) replays clean under DIFFERENT windows (`W=1`, `W=4`,
+/// and the unbounded path). It produces byte-identical input-order results.
+/// That proves the two-phase resume walks a windowed-shaped history correctly
+/// whatever the replaying code's window. The pre-existing window-independence
+/// fixtures only exercise the unbounded-shaped history.
 #[tokio::test]
 async fn replayer_windowed_shaped_history_replays_under_any_window() {
     let (exec_id, events) = windowed_shaped_fan_out_history();
@@ -10589,14 +10595,14 @@ fn windowed_replay_w4<'a>(
     windowed_replay_body(ctx, 4)
 }
 
-/// MINOR: a fail-fast bounded fan-out history — `marker(count=4)`, a partial
-/// wave scheduled (`W=2` → slots 0,1 only), slot 1 `ActivityFailed`, terminal
-/// `WorkflowFailed` — replays **cleanly** (deterministically reproduces the
-/// failure), i.e. `ReplayStatus::WorkflowFailed`, never
-/// `NonDeterminismDetected`.
+/// A fail-fast bounded fan-out history replays **cleanly**: it reproduces the
+/// failure deterministically, as `ReplayStatus::WorkflowFailed`, never
+/// `NonDeterminismDetected`. The history is `marker(count=4)`, a partial wave
+/// scheduled (`W=2` → slots 0,1 only), slot 1 `ActivityFailed`, and terminal
+/// `WorkflowFailed`.
 ///
 /// Note: for a workflow that legitimately FAILS, "replays cleanly" surfaces as
-/// `WorkflowFailed` (the deterministic reproduction of the recorded failure) —
+/// `WorkflowFailed`, the deterministic reproduction of the recorded failure.
 /// `ReplaySucceeded` is reserved for a workflow that COMPLETES. This mirrors
 /// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`.
 #[tokio::test]
@@ -10669,9 +10675,9 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
 // Cross-type continue-as-new (issue #803)
 //
 // An entity that changes workflow type across lifecycle phases must replay to
-// the *identical* successor type every time, and a code change that redirects
-// the transition must surface as non-determinism rather than silently forking
-// the chain into a different phase.
+// the *identical* successor type every time. A code change that redirects the
+// transition must surface as non-determinism rather than silently fork the
+// chain into a different phase.
 // ---------------------------------------------------------------------------
 
 /// Phase 1 of a two-phase entity: does one unit of work, then graduates the run
@@ -10763,13 +10769,13 @@ fn cross_type_can_history() -> Vec<WorkflowEvent> {
 /// **Success metric (issue #803).** A type-changing history round-trips to the
 /// **identical** successor type on 100% of runs.
 ///
-/// "Identical" is asserted by *exclusion*, which is the strongest available
-/// formulation: on replay the successor type is not readable off the report
-/// (the context re-emits it from the caller), so instead each run pairs the
-/// recorded target with its two alternatives and requires that **exactly one**
-/// of the three handlers replays clean while both others are rejected as
-/// non-determinism. A guard that ignored the recorded type would let all three
-/// pass and fail this test immediately.
+/// "Identical" is asserted by *exclusion*, the strongest available
+/// formulation. On replay the successor type is not readable off the report,
+/// because the context re-emits it from the caller. So each run pairs the
+/// recorded target with its two alternatives. It requires that **exactly
+/// one** of the three handlers replays clean, and that both others are
+/// rejected as non-determinism. A guard that ignored the recorded type would
+/// let all three pass and fail this test immediately.
 ///
 /// The sweep also *varies* the recorded target across the three types rather
 /// than replaying one fixture 100 times, so the runs carry independent signal.
@@ -10828,10 +10834,10 @@ async fn cross_type_continue_as_new_replays_to_the_same_successor_type_every_run
     }
 }
 
-/// The successor type is genuinely pinned by history: the *same* fixture
-/// replayed against a handler that redirects the transition elsewhere is
-/// rejected as non-determinism (this is what makes the 100-run test above
-/// non-vacuous).
+/// The successor type is genuinely pinned by history: the *same* fixture,
+/// replayed against a handler that redirects the transition elsewhere, is
+/// rejected as non-determinism. That makes the 100-run test above
+/// non-vacuous.
 #[tokio::test]
 async fn cross_type_continue_as_new_redirect_is_detected_as_nondeterminism() {
     let report = WorkflowReplayer::new()
@@ -10856,9 +10862,9 @@ async fn cross_type_continue_as_new_redirect_is_detected_as_nondeterminism() {
     }
 }
 
-/// Removing the cross-type call (reverting to a same-type continuation) over a
-/// recorded cross-type history is likewise a detected divergence — `None` and
-/// `Some(t)` are distinct recorded intents.
+/// Removing the cross-type call (a same-type continuation) over a recorded
+/// cross-type history is likewise a detected divergence. `None` and `Some(t)`
+/// are distinct recorded intents.
 #[tokio::test]
 async fn reverting_to_same_type_over_a_cross_type_history_is_nondeterminism() {
     fn same_type_phase<'a>(
@@ -10918,7 +10924,7 @@ async fn cross_type_continue_as_new_round_trips_through_json() -> Result<(), ser
 }
 
 /// AC3 (append-only): a history written by a **pre-#803** build carries no
-/// `new_workflow_type` key at all and must still replay identically against a
+/// `new_workflow_type` key. It must still replay identically against a
 /// same-type handler, so in-flight executions survive the upgrade.
 #[tokio::test]
 async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json::Error> {
@@ -10961,10 +10967,10 @@ async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json
 //
 // Success-metric half two: each of the ≥ 6 mixed compositions replays
 // deterministically across 1,000 randomized event-arrival orderings with 0
-// divergences. The winner of a mixed race is decided strictly by RECORDED
-// HISTORY ORDER (fixed by the `race_winner:{seq}` marker), never by wall-clock
-// timing on the replaying worker, so any recorded interleaving must reproduce
-// the identical outcome on every cycle.
+// divergences. RECORDED HISTORY ORDER decides the winner of a mixed race
+// (fixed by the `race_winner:{seq}` marker). Wall-clock timing on the
+// replaying worker never decides it. So any recorded interleaving must
+// reproduce the identical outcome on every cycle.
 
 fn mixed_started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
@@ -11097,9 +11103,9 @@ fn mixed_join_activity_and_timer<'a>(
     })
 }
 
-/// Build the recorded history for a two-branch mixed race whose branch-`0`
-/// dispatch event, branch-`1` dispatch event and the winning terminal appear in
-/// the given order, with the winner marker fixing the outcome.
+/// Build the recorded history for a two-branch mixed race. The branch-`0`
+/// dispatch event, the branch-`1` dispatch event and the winning terminal
+/// appear in the given order. The winner marker fixes the outcome.
 struct MixedFixture {
     /// Events between `WorkflowStarted` and `WorkflowCompleted`.
     body: Vec<WorkflowEvent>,
@@ -11599,25 +11605,26 @@ async fn mixed_compositions_each_replay_succeeded() {
 /// history, staying inside the space of histories the engine can actually
 /// record.
 ///
-/// Two things in a mixed-batch history are NOT arrival order and must be held
-/// fixed, or the permutation manufactures a history no worker could ever write
-/// and the resulting "divergence" is the replay engine correctly rejecting it:
+/// Two things in a mixed-batch history are NOT arrival order and stay fixed.
+/// Otherwise the permutation manufactures a history no worker could write,
+/// and the "divergence" is the replay engine correctly rejecting it:
 ///
 /// - **The dispatch block.** Every branch's `ActivityScheduled` / `TimerStarted`
 ///   / `ChildWorkflowStarted` is written by `build_suspension_events` in command
 ///   emission order — one atomic batch, always in branch order. Reordering it is
 ///   a *code* change (the workflow declared its branches differently), which
 ///   replay is supposed to flag.
-/// - **Which branch terminal is first.** The winner is decided by recorded
-///   history order and pinned by the `race_winner:{seq}` marker, so moving a
-///   different branch's terminal ahead of it describes a different race, not a
-///   different arrival order.
+/// - **Which branch terminal is first.** Recorded history order decides the
+///   winner, and the `race_winner:{seq}` marker pins it. So moving a different
+///   branch's terminal ahead of it describes a different race, not a different
+///   arrival order.
 ///
 /// What genuinely varies, and is what this permutes:
 ///
-/// - where each losing branch's in-flight **progress** event (`ActivityStarted`)
-///   lands — before the winner's terminal, or after it, straddling the matcher
-///   cursor (the issue #1126 `consume_race_loser_frontier` case), and
+/// - where each losing branch's in-flight **progress** event
+///   (`ActivityStarted`) lands. It lands before the winner's terminal, or
+///   after it, straddling the matcher cursor (the issue #1126
+///   `consume_race_loser_frontier` case), and
 /// - the relative order of the losing branches' teardown terminals, which the
 ///   worker appends once the winner is known.
 fn permute_mixed_history(events: &[WorkflowEvent], seed: u64) -> Vec<WorkflowEvent> {
@@ -11704,13 +11711,13 @@ fn permute_mixed_history(events: &[WorkflowEvent], seed: u64) -> Vec<WorkflowEve
 /// Issue #950 success metric: >= 6 mixed compositions each replay
 /// deterministically across **1,000 randomized event-arrival orderings** with
 /// **0 divergences** (the #476/#779 precedent). Each iteration picks a
-/// composition and a recorded winner, then permutes that history's arrival
-/// order via [`permute_mixed_history`] — where each losing branch's in-flight
-/// progress event lands relative to the winner's terminal, and the order the
-/// losers are torn down in.
+/// composition and a recorded winner. It then permutes that history's arrival
+/// order via [`permute_mixed_history`]. The permutation moves each losing
+/// branch's in-flight progress event relative to the winner's terminal, and
+/// the order in which the losers are torn down.
 ///
-/// Every iteration replays the permuted history **twice** and requires the two
-/// reports to agree: "replays deterministically" is a statement about
+/// Every iteration replays the permuted history **twice** and requires the
+/// two reports to agree. "Replays deterministically" is a statement about
 /// reproducibility, which a single replay per ordering cannot establish.
 #[tokio::test]
 async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
@@ -11762,10 +11769,10 @@ async fn mixed_compositions_replay_succeeded_across_randomized_orderings() {
         divergences.len(),
         divergences.join("\n")
     );
-    // Guard the sweep against silently degenerating: it must cover every
-    // composition, AND the permutation must actually produce more orderings than
-    // there are hand-written fixtures (otherwise "randomized orderings" would be
-    // an empty claim).
+    // Guard the sweep against silently degenerating. It must cover every
+    // composition. The permutation must also produce more orderings than
+    // there are hand-written fixtures. Otherwise "randomized orderings" would
+    // be an empty claim.
     assert_eq!(
         covered.len(),
         matrix.len(),
@@ -11799,10 +11806,10 @@ async fn mixed_join_replays_succeeded_for_both_arrival_orders() {
 
 /// `join!` of a **plain** signal wait and an activity — the wait-all form AC1
 /// advertises, and the one shape `match_signal` (not `match_race_signal`)
-/// resolves. `futures::join!` polls in declaration order, so the
-/// `WaitForSignal` command is pushed first and the batch records only the
-/// sibling's `ActivityScheduled`; on the next drive `wait_for_signal` is polled
-/// first and its scan starts ON that interleaved event.
+/// resolves. `futures::join!` polls in declaration order. So the
+/// `WaitForSignal` command is pushed first, and the batch records only the
+/// sibling's `ActivityScheduled`. On the next drive `wait_for_signal` is
+/// polled first, and its scan starts ON that interleaved event.
 fn mixed_join_signal_and_activity<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -11914,7 +11921,8 @@ async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_first() 
     );
 }
 
-/// A CHILD sibling, not an activity — the other half of the P1.
+/// A CHILD sibling, not an activity: the other half of the `match_signal`
+/// interleaved-sibling defect.
 #[tokio::test]
 async fn mixed_join_signal_and_child_replays() {
     let child_id = ExecutionId::new();
@@ -11990,8 +11998,8 @@ async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() 
     );
 }
 
-/// `join!` of a signal wait, a durable TIMER and an activity — the three-way
-/// AC1 composition, signal polled first so the persisted batch records
+/// `join!` of a signal wait, a durable TIMER and an activity: the three-way
+/// AC1 composition. The signal is polled first, so the persisted batch records
 /// `TimerStarted` + `ActivityScheduled` and nothing for the signal wait.
 fn mixed_join_signal_timer_and_activity<'a>(
     ctx: &'a WorkflowContext,
@@ -12020,9 +12028,9 @@ fn mixed_join_signal_timer_and_activity<'a>(
 /// (#768) returned `Diverged`. It nd-blocked an advertised AC1 composition on
 /// its very first wake, immediately after #950 made the batch persistable.
 ///
-/// The timer here belongs to THIS decision (the sibling branch emits
-/// `StartTimer("t")` in the same cycle and `match_timer_strict` claims the
-/// event), which is what separates it from the orphan timer that
+/// The timer here belongs to THIS decision. The sibling branch emits
+/// `StartTimer("t")` in the same cycle, and `match_timer_strict` claims the
+/// event. That separates it from the orphan timer that
 /// `interleaved_sibling_signal_stray_timer_started_still_diverges` pins.
 #[tokio::test]
 async fn mixed_join_signal_and_timer_parks_before_either_branch_resolves() {
@@ -12052,9 +12060,9 @@ async fn mixed_join_signal_and_timer_parks_before_either_branch_resolves() {
     );
 }
 
-/// The three-way shape Codex named verbatim: signal + timer + activity, sampled
-/// at the frontier where the batch has just been persisted and no branch has
-/// resolved.
+/// The three-way shape from issue #950: signal + timer + activity. It is
+/// sampled at the frontier where the batch has just been persisted and no
+/// branch has resolved.
 #[tokio::test]
 async fn mixed_join_signal_timer_and_activity_parks_at_the_persistence_frontier() {
     let activity_id = ActivityExecId::new();
@@ -12144,14 +12152,14 @@ fn solo_wait_for_signal<'a>(
 /// A deploy that REPLACES a recorded activity with a lone
 /// `wait_for_signal` must still be caught, not silently parked forever.
 ///
-/// The history was recorded by code that ran an activity; the new code runs only
-/// a signal wait. `match_signal` now crosses the stale `ActivityScheduled`
-/// instead of diverging on it (issue #950, so a mixed batch's sibling does not
-/// false-diverge), which raised the question of whether this stale-command case
-/// still fails loudly. It does: the stale events are never claimed by anything,
-/// so the executor's suspend-time `history_has_unconsumed_events` guard fires.
-/// The divergence moves from the matcher to the end of the cycle; it does not
-/// disappear.
+/// The history was recorded by code that ran an activity. The new code runs
+/// only a signal wait. `match_signal` now crosses the stale
+/// `ActivityScheduled` instead of diverging on it (issue #950), so a mixed
+/// batch's sibling does not false-diverge. That raised the question of
+/// whether this stale-command case still fails loudly. It does: nothing ever
+/// claims the stale events, so the executor's suspend-time
+/// `history_has_unconsumed_events` guard fires. The divergence moves from the
+/// matcher to the end of the cycle; it does not disappear.
 #[tokio::test]
 async fn solo_signal_wait_over_a_stale_recorded_activity_still_diverges() {
     let activity_id = ActivityExecId::new();
@@ -12212,7 +12220,7 @@ async fn solo_signal_wait_over_a_stale_recorded_activity_is_not_a_healthy_canary
 
 /// An in-flight mixed race sampled at the recorded-history frontier (both
 /// branches dispatched, neither resolved) is a healthy suspend, not a false
-/// non-determinism — the canary case #779 pinned for its own shape.
+/// non-determinism. It is the canary case that #779 pinned for its own shape.
 #[tokio::test]
 async fn mixed_in_flight_race_at_the_frontier_replays_succeeded() {
     let activity_id = ActivityExecId::new();

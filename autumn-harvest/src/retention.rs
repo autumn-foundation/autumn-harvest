@@ -52,12 +52,12 @@ const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
 /// Default idle window before an inert per-tenant rate-limit bucket is
 /// collected (issue #1127): 7 days.
 ///
-/// Long enough that a weekly-cadence tenant keeps its bucket across a quiet
-/// weekend, short enough that a one-off tenant's row does not outlive its
-/// usefulness by months. The collector is on by default because unbounded
-/// growth is a *bug*, not a tuning preference — a fix that every deployment
-/// has to opt into fixes nothing for the deployments that do not know they
-/// have the problem. Every swept row is provably inert (see
+/// Seven days lets a weekly-cadence tenant keep its bucket across a quiet
+/// weekend. It is short enough that the row of a one-off tenant does not
+/// outlive its usefulness by months. The
+/// collector is on by default because unbounded growth is a *bug*, not a
+/// tuning preference. An opt-in fix fixes nothing for the deployments that do
+/// not know they have the problem. Every swept row is provably inert (see
 /// [`crate::queue::sweep_idle_rate_limit_buckets`]), and
 /// [`RetentionConfig::without_rate_limit_bucket_gc`] turns it off outright.
 pub const DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
@@ -101,9 +101,9 @@ pub const MIN_PAYLOAD_ORPHAN_GRACE: Duration = Duration::from_hours(1);
 
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
-/// A `result`/`error` value larger than this is replaced with a typed
-/// `_harvest_omitted` marker rather than stored verbatim, keeping each summary
-/// row small (~< 1 KiB target for the common case).
+/// A typed `_harvest_omitted` marker replaces a larger `result`/`error`
+/// value. This keeps each summary row small (~< 1 KiB target for the common
+/// case).
 pub const DEFAULT_SUMMARY_PAYLOAD_CAP: usize = 4096;
 
 /// JSON key inserted into a summary `result` when the real payload was omitted
@@ -132,8 +132,8 @@ pub enum SummaryRetention {
 ///
 /// When set on [`RetentionConfig`], the history-retention janitor demotes each
 /// hard-deleted terminal execution into a compact `harvest_execution_summaries`
-/// row (written in the same transaction as the delete) instead of losing it
-/// entirely. Captured `result`/`error` payloads are opt-in and byte-bounded.
+/// row. The same transaction as the delete writes it. Captured
+/// `result`/`error` payloads are opt-in and byte-bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SummaryPolicy {
     /// Summary retention horizon (own GC pass; `Unbounded` = keep forever).
@@ -263,14 +263,14 @@ pub fn cap_result_payload(
     // Offload detection relies on the offloader storing a ROOT envelope
     // (`extract_offload_ref` inspects the top-level value; `search_attrs` is
     // never offloadable). A future nested-envelope offload change MUST recurse
-    // this check, or a summary could store a value referencing a blob that
-    // #524's GC later reclaims, leaving a dangling summary→blob reference.
+    // this check. Otherwise a summary can reference a blob that the GC of #524
+    // later reclaims, which leaves a dangling summary→blob reference.
     if crate::payload_store::extract_offload_ref(&output).is_some() {
         return Some(omitted_marker("offloaded", None));
     }
-    // Fail SAFE on a (near-impossible) serialize failure of an already-parsed
-    // JSONB value: emit an omitted marker rather than storing an unmeasured
-    // payload verbatim, consistent with the oversized-payload path below.
+    // Fail SAFE on a (near-impossible) serialize failure of a parsed JSONB
+    // value. Emit an omitted marker, not an unmeasured verbatim payload, like
+    // the oversized-payload path below.
     let len = match serde_json::to_vec(&output) {
         Ok(bytes) => bytes.len(),
         Err(_) => return Some(omitted_marker("too_large", None)),
@@ -335,18 +335,16 @@ pub enum ArchiveFetchError {
 
 /// Trait for pre-retention workflow history cold storage archivers.
 ///
-/// Implementations of this trait are invoked by the retention janitor to ship
-/// a completed workflow execution's event history to cold storage *before* it
-/// is permanently deleted from the database.
+/// The retention janitor calls it to ship the event history of a completed
+/// execution to cold storage *before* the permanent delete.
 ///
 /// Payload fields in the document are in their stored form. With a payload
 /// codec on, they are codec envelopes (ciphertext). Issue #1983.
 pub trait HistoryArchiver: Send + Sync + 'static {
     /// Ship the history export document to cold storage.
     ///
-    /// If this returns `Err`, the retention janitor skips deleting the
-    /// workflow execution and its associated events on this tick, retrying
-    /// on the next tick to prevent data loss.
+    /// On `Err`, the retention janitor keeps the execution and its events this
+    /// tick. It retries on the next tick, so no data is lost.
     fn archive(&self, doc: &crate::history_export::HistoryExportDocument) -> ArchiverFuture<'_>;
 
     /// Read back the archived document for `execution_id` (issue #1983).
@@ -449,9 +447,9 @@ pub struct RetentionConfig {
     pub archival_timeout_secs: u64,
     /// Tiered/summary retention policy (issue #752).
     ///
-    /// When `Some`, a terminal execution hard-deleted by the history janitor is
-    /// first demoted into a compact `harvest_execution_summaries` row (written
-    /// in the same transaction as the delete). `None` (the default) is
+    /// When `Some`, the history janitor first demotes each hard-deleted
+    /// terminal execution into a compact `harvest_execution_summaries` row, in
+    /// the same transaction as the delete. `None` (the default) is
     /// byte-for-byte identical to pre-#752 behavior: hard delete, no summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SummaryPolicy>,
@@ -459,10 +457,10 @@ pub struct RetentionConfig {
     /// collected (issue #1127). `None` disables the sweep entirely.
     ///
     /// `harvest_rate_limit_buckets` rows are auto-registered `ON CONFLICT DO
-    /// NOTHING` and, before this, were never deleted — so the two
-    /// caller-keyed families (`dyn-rate:{expr}:{resolved}`, issue #699, and
-    /// `start-throttle:{workflow}:{key}`, issue #607) grew one row per tenant
-    /// forever. Defaults to [`DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS`].
+    /// NOTHING`. Before this, nothing deleted them. So the two caller-keyed
+    /// families grew one row per tenant forever: `dyn-rate:{expr}:{resolved}`
+    /// (issue #699) and `start-throttle:{workflow}:{key}` (issue #607).
+    /// Defaults to [`DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS`].
     pub rate_limit_bucket_retention_secs: Option<u64>,
     /// Age after which a terminal `harvest_task_queue` row is deleted (issue
     /// #1811). `None` disables the janitor.
@@ -483,12 +481,11 @@ pub struct RetentionConfig {
     /// Partition maintenance for the opt-in partitioned `harvest_events`
     /// layout (issue #958).
     ///
-    /// Applies only when the shard's `harvest_events` is actually partitioned
-    /// — the janitor probes the layout each tick, so a deployment that has not
-    /// opted in pays nothing and behaves byte-for-byte as before. This is what
-    /// makes partition creation and reclamation engine-automated: no operator
-    /// cron pre-creates future partitions, and no operator script drops expired
-    /// ones.
+    /// Applies only when the `harvest_events` of the shard is partitioned. The
+    /// janitor probes the layout each tick. A deployment that has not opted in
+    /// pays nothing and behaves byte-for-byte as before. So the engine
+    /// automates partition creation and reclamation. No operator cron
+    /// pre-creates future partitions, and no operator script drops expired ones.
     pub partitions: PartitionMaintenanceConfig,
 }
 
@@ -502,8 +499,8 @@ pub struct PartitionMaintenanceConfig {
     /// How many cohorts ahead of "now" to keep pre-created.
     pub lookahead_cohorts: u32,
     /// Maximum partitions dropped per tick. Each drop takes a brief
-    /// `ACCESS EXCLUSIVE` lock on the parent, so a bounded budget keeps a
-    /// backlog from holding the append path off; successive ticks converge.
+    /// `ACCESS EXCLUSIVE` lock on the parent. A bounded budget stops a backlog
+    /// from holding the append path off. Successive ticks converge.
     pub max_drops_per_tick: usize,
     /// Maximum partitions *evaluated* per tick, dropped or not.
     ///
@@ -722,10 +719,10 @@ impl RetentionConfig {
     /// `with_summary_retention(SummaryPolicy::for_days(days))`.
     ///
     /// The summary horizon should **exceed** the history horizon
-    /// ([`with_max_age`](Self::with_max_age)) to be useful: a summary is created
-    /// only when the history is deleted, so a summary window at or below the
-    /// history window means the summary is GC'd almost immediately. A mismatch
-    /// logs a one-time warning at [`RetentionRuntime::spawn`].
+    /// ([`with_max_age`](Self::with_max_age)). A summary is created only when
+    /// the history is deleted. With a summary window at or below the history
+    /// window, the GC takes the summary almost immediately. A mismatch logs a
+    /// one-time warning at [`RetentionRuntime::spawn`].
     #[must_use]
     pub const fn with_summary_retention_days(mut self, days: u64) -> Self {
         self.summary = Some(SummaryPolicy::for_days(days));
@@ -903,11 +900,11 @@ impl RetentionConfig {
     /// The smallest effective retention age across the global `max_age` and all
     /// per-type overrides (issue #737).
     ///
-    /// This is the SQL candidate pre-filter age: the smallest age yields the
-    /// cutoff closest to "now", which is a correct *superset* of every
-    /// deletable row (any row deletable under a type-specific age `age(T)`
-    /// satisfies `completed_at < now - age(T) <= now - min_age`). The scanner
-    /// then applies the exact per-type age to each candidate in Rust.
+    /// This is the SQL candidate pre-filter age. The smallest age yields the
+    /// cutoff closest to "now", a correct *superset* of every deletable row.
+    /// Any row deletable under a type-specific age `age(T)` satisfies
+    /// `completed_at < now - age(T) <= now - min_age`. The scanner then applies
+    /// the exact per-type age to each candidate in Rust.
     ///
     /// Returns `None` iff the global `max_age` is unset *and* there are no
     /// type or tenant overrides.
@@ -981,9 +978,9 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
-        // Each per-type override is validated against the same bounds as the
-        // global max_age; an out-of-range override fails the build rather than
-        // silently clamping (issue #737, AC5).
+        // Each per-type override has the same bounds as the global max_age. An
+        // out-of-range override fails the build, not a silent clamp (issue
+        // #737, AC5).
         for (name, secs) in &self.overrides {
             let age = Duration::from_secs(*secs);
             if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
@@ -1022,9 +1019,9 @@ impl RetentionConfig {
             ));
         }
         // The rate-limit bucket GC window has its own, higher floor (issue
-        // #1127): below it a bucket could go GC-eligible without the ensure
-        // path having locked it, reopening the stranding race. Fails the build
-        // rather than clamping, matching every other horizon here.
+        // #1127). Below it, a bucket can go GC-eligible before the ensure path
+        // locks it. That reopens the stranding race. Fails the build, not a
+        // clamp, like every other horizon here.
         if let Some(window) = self.rate_limit_bucket_retention()
             && !(MIN_RATE_LIMIT_BUCKET_RETENTION..=MAX_MAX_AGE).contains(&window)
         {
@@ -1096,26 +1093,25 @@ impl RetentionConfig {
             // even if the history horizon was later removed (issue #752).
             || self.summary_gc_active()
             // Partition maintenance is work in its own right, not a rider on
-            // history retention (issue #958). Without this, a deployment that
-            // turned every retention horizon off — `audit_retention_days = 0`,
+            // history retention (issue #958). A deployment can turn every
+            // retention horizon off: `audit_retention_days = 0`,
             // `schedule_decision_retention_days = 0`, no history or summary
-            // age — would leave `partitions.enabled` reading `true` while the
-            // runtime never spawned to honour it. On an opted-in partitioned
+            // age. Without this, `partitions.enabled` reads `true` while the
+            // runtime never spawns to honour it. On an opted-in partitioned
             // shard the lookahead window then expires, every subsequent append
             // lands in the DEFAULT partition, and no cohort is ever reclaimed.
             //
             // Note what this does NOT do: partition *creation* is not
             // reclamation, so it must keep running even for an operator who
-            // deliberately retains everything forever. The only deployments
-            // this newly spawns for are those that had switched every horizon
-            // off — which is exactly the broken case; the stock config
-            // (`audit_retention_days: 90`) already spawned.
+            // deliberately retains everything forever. This newly spawns only
+            // for deployments that switched every horizon off, the broken case.
+            // The stock config (`audit_retention_days: 90`) already spawned.
             || self.partitions.enabled
             // Issue #1127: the bucket GC is work in its own right too. Without
-            // this, a deployment that turned every other horizon off would
-            // leave `rate_limit_bucket_retention_secs` reading as configured
-            // while the runtime never spawned to honour it, and the table would
-            // keep growing one row per tenant key.
+            // this, a deployment with every other horizon off reads
+            // `rate_limit_bucket_retention_secs` as configured. The runtime
+            // never spawns to honour it, and the table keeps growing one row
+            // per tenant key.
             || self.rate_limit_bucket_gc_active()
             // Issue #1811: the terminal-task janitor is work in its own right.
             // Without this clause, a config with every other pass off never
@@ -1128,10 +1124,8 @@ impl RetentionConfig {
 
 /// The result of a single execution tick of the retention job on a specific shard.
 ///
-/// **Why does this exist?**
-/// Provides observability into the retention job's performance and impact. It captures
-/// how many records were evaluated, how many were deleted, and any errors encountered,
-/// allowing operators to monitor the health of the background cleanup process.
+/// Operators read it to monitor the background cleanup: records evaluated,
+/// records deleted, and errors.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RetentionTickResult {
     /// The ID of the shard this retention tick operated on.
@@ -1164,17 +1158,17 @@ pub struct RetentionTickResult {
     ///
     /// `None` on an unpartitioned shard — which is every deployment that has
     /// not opted in. When `Some`, [`crate::partition::SweepOutcome::blocked`]
-    /// is the operator's answer to "why has space not come back?": it names
+    /// answers the operator question "why has space not come back?". It names
     /// each cohort that was considered and the reason it was left alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_maintenance: Option<crate::partition::MaintenanceOutcome>,
     /// Idle rate-limit-bucket GC outcome for this shard this tick (issue
     /// #1127).
     ///
-    /// `None` when the GC is disabled — deliberately distinct from
+    /// `None` when the GC is disabled. That is deliberately distinct from
     /// `Some(collected: 0)` ("it ran and everything was live or pinned") and
-    /// from `Some(error: ...)` ("it could not run"), which a bare counter
-    /// collapses into one indistinguishable zero. Same shape and same reason as
+    /// from `Some(error: ...)` ("it could not run"). A bare counter collapses
+    /// all three into one zero. Same shape and same reason as
     /// `partition_maintenance`. Reported through `GET /admin/retention`, so "is
     /// the table still growing, and why?" has an answer that needs no metrics
     /// pipeline.
@@ -1257,9 +1251,9 @@ pub struct RateLimitBucketGcOutcome {
     /// A preview reports what a real pass *would* collect and deletes nothing,
     /// so a non-zero `collected` here is a forecast, not work done.
     pub dry_run: bool,
-    /// Why this shard's pass did not run, when it did not. A shard that keeps
-    /// reporting an error is exactly what an operator needs to see, and without
-    /// this it would be indistinguishable from a shard with nothing to do.
+    /// Why the pass of this shard did not run, when it did not. An operator
+    /// needs to see a shard that keeps reporting an error. Without this, it
+    /// looks the same as a shard with nothing to do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1311,10 +1305,8 @@ pub struct RetentionStatus {
 
 /// A thread-safe monitor for observing the background retention process.
 ///
-/// **Why does this exist?**
-/// Enables the background retention job to asynchronously report its progress and results,
-/// while allowing external components (like administrative APIs or telemetry systems)
-/// to safely query the latest status without blocking or tearing.
+/// The background job reports its results here. Admin APIs and telemetry read
+/// the latest status without blocking or tearing.
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
@@ -1383,9 +1375,9 @@ impl RetentionMonitor {
     /// Record this shard's partition-maintenance outcome (issue #958) without
     /// disturbing the history-retention counters already reported for the tick.
     ///
-    /// Maintenance runs after the candidate loop — a cohort only becomes
-    /// droppable once the loop has archived and deleted its executions — so it
-    /// cannot ride along in the same `update`.
+    /// Maintenance runs after the candidate loop. A cohort becomes droppable
+    /// only once the loop has archived and deleted its executions. So it cannot
+    /// ride along in the same `update`.
     #[cfg(feature = "db")]
     fn update_partitions(&self, shard: ShardId, outcome: crate::partition::MaintenanceOutcome) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1422,10 +1414,10 @@ impl RetentionMonitor {
     /// disturbing the history-retention counters already reported this tick.
     ///
     /// A separate updater for the same reason as
-    /// [`Self::update_partitions`]: the GC pass runs outside the
-    /// history-retention phase gate (a deployment with no history horizon must
-    /// still collect buckets), so it cannot ride along in that phase's
-    /// `update`.
+    /// [`Self::update_partitions`]. The GC pass runs outside the
+    /// history-retention phase gate: a deployment with no history horizon must
+    /// still collect buckets. So it cannot ride along in the `update` of that
+    /// phase.
     #[cfg(feature = "db")]
     fn update_rate_limit_buckets(&self, shard: ShardId, outcome: RateLimitBucketGcOutcome) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1765,12 +1757,11 @@ async fn run_partition_maintenance_pass(
     }
     let mut sweep_opts = config.partitions.sweep_options();
     // `dry_run` means "do not destroy data". It must NOT stop partition
-    // CREATION: `ensure_partitions` and `drain_default` delete nothing,
-    // and a deployment running retention in dry-run — a common posture
-    // during rollout — would otherwise stop extending the lookahead
-    // window and, after a few days, send every append to the DEFAULT
-    // partition indefinitely. Only the sweep is suppressed, by giving it
-    // a zero drop budget.
+    // CREATION: `ensure_partitions` and `drain_default` delete nothing.
+    // Dry-run retention is a common posture during rollout. Without this,
+    // such a deployment stops extending the lookahead window. After a few days,
+    // every append goes to the DEFAULT partition indefinitely. Only the
+    // sweep is suppressed, by giving it a zero drop budget.
     if config.dry_run {
         sweep_opts.max_drops = 0;
         sweep_opts.straggler_grace = None;
@@ -1805,10 +1796,9 @@ async fn run_partition_maintenance_pass(
             result = crate::replication::fenced_checkout(pool) => match result {
                 Ok(conn) => conn,
                 Err(error) => {
-                    // Never silent: a shard that cannot be reached gets no
-                    // lookahead partitions and no reclamation, and the
-                    // operator has to be able to tell that apart from
-                    // "nothing to do".
+                    // Never silent. An unreachable shard gets no lookahead
+                    // partitions and no reclamation. The operator must tell
+                    // that apart from "nothing to do".
                     tracing::warn!(
                         shard = %shard,
                         error = %error,
@@ -1936,11 +1926,10 @@ async fn run_partition_maintenance_pass(
             }
             Ok(outcome) => {
                 // `blocked` is in the condition deliberately. The
-                // steady-state failure — nothing created (the window is
-                // already covered), nothing dropped, everything blocked —
-                // is exactly the state an operator needs to see, and
-                // logging only on progress would make it the one state
-                // that produces no output at all.
+                // steady-state failure is nothing created (the window is
+                // already covered), nothing dropped, everything blocked.
+                // An operator needs to see that state. A log only on
+                // progress makes it the one state with no output at all.
                 if !outcome.created.is_empty()
                     || !outcome.sweep.dropped.is_empty()
                     || !outcome.sweep.blocked.is_empty()
@@ -2060,12 +2049,12 @@ impl std::fmt::Debug for RetentionHooks {
 impl RetentionRuntime {
     /// Returns `None` when nothing in `config` is enabled.
     ///
-    /// A config can be enabled for a reason other than a history horizon —
-    /// partition maintenance (issue #958) or the idle rate-limit-bucket GC
-    /// (issue #1127) each spawn the runtime on their own — so `max_age` being
-    /// unset is an ordinary, fully-supported state here: the history-retention
-    /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
-    /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
+    /// A config can be enabled for a reason other than a history horizon.
+    /// Partition maintenance (issue #958), the idle rate-limit-bucket GC
+    /// (issue #1127) and the terminal-task janitor (issue #1811) each spawn
+    /// the runtime on their own. So an unset `max_age` is an ordinary,
+    /// fully-supported state here. The history-retention phase is gated on
+    /// `loosest_cutoff_age()` and is simply skipped.
     #[must_use]
     pub fn spawn(
         pools: ShardedDbPool,
@@ -2121,11 +2110,11 @@ impl RetentionRuntime {
         if !config.enabled() {
             return None;
         }
-        // Foot-gun warning (issue #752): a BOUNDED summary horizon at or below
-        // the global history horizon means a demoted summary is GC'd almost as
-        // soon as it is created, so tiering buys nothing. Non-fatal — the
-        // operator may genuinely want a tiny summary window — but worth a
-        // one-time startup warning.
+        // Foot-gun warning (issue #752). With a BOUNDED summary horizon at or
+        // below the global history horizon, the GC takes a demoted summary
+        // almost at once, so tiering buys nothing. Non-fatal, because the
+        // operator may want a tiny summary window. It gets a one-time startup
+        // warning.
         if let (Some(summary_age), Some(max_age)) = (config.summary_age(), config.max_age())
             && summary_age <= max_age
         {
@@ -2258,30 +2247,29 @@ impl RetentionRuntime {
                     // Workflow-history retention: runs when the global max_age OR
                     // any per-workflow-type override is configured (issue #737).
                     // Resolve the loosest cutoff age up front. `None` here means
-                    // either no retention age is configured (the common case) OR —
-                    // fail-safe — the configured loosest age is unrepresentable as a
-                    // `chrono::Duration` (unreachable for validated ages, which are
-                    // bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range). In the
-                    // latter case we skip the workflow-history retention phase this
-                    // tick and retain everything, rather than falling back to a zero
-                    // cutoff that would make `loose_cutoff == now` and over-select
-                    // nearly every completed row. The audit/schedule purges below
-                    // still run.
+                    // no retention age is configured, the common case. As a
+                    // fail-safe, it also means the loosest age is unrepresentable
+                    // as a `chrono::Duration`. That is unreachable for validated
+                    // ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. In the
+                    // fail-safe case the workflow-history phase is skipped this
+                    // tick and everything is retained. A zero cutoff would make
+                    // `loose_cutoff == now` and over-select nearly every completed
+                    // row. The audit/schedule purges below still run.
                     if config
                         .loosest_cutoff_age()
                         .and_then(|age| chrono::Duration::from_std(age).ok())
                         .is_some()
                     {
-                        // Phase-active gate (issue #737): the `and_then(from_std)`
-                        // above is the fail-safe guard from commit 34ddb62 — if the
+                        // Phase-active gate (issue #737). The `and_then(from_std)`
+                        // above is the fail-safe guard from commit 34ddb62. If the
                         // loosest configured age is unrepresentable as a
-                        // `chrono::Duration` (unreachable for validated ages) we skip
-                        // the whole workflow-history phase this tick rather than
-                        // over-selecting. Compute `now` once so every shard's SQL
-                        // predicate and per-candidate resolution use one consistent
-                        // clock. The exact per-type cutoffs are pushed into the SELECT
-                        // inside `run_shard_tick` (PR #990 review) — there is no
-                        // single "loose cutoff" SQL bind any more.
+                        // `chrono::Duration` (unreachable for validated ages), the
+                        // whole workflow-history phase is skipped this tick. It does
+                        // not over-select. Compute `now` once, so the SQL predicate
+                        // of every shard and each per-candidate resolution share one
+                        // clock. `run_shard_tick` pushes the exact per-type cutoffs
+                        // into the SELECT (PR #990). There is no single "loose
+                        // cutoff" SQL bind any more.
                         let now = Utc::now();
                         // A single pool names its shard through the default pin,
                         // as `begin_fenced_tick` does (issue #1823).
@@ -2348,10 +2336,10 @@ impl RetentionRuntime {
                                         result.duration_ms as f64 / 1000.0,
                                     );
                                     // Per-workflow-type deletion counter (issue
-                                    // #737, AC8). Real deletes only — the metric
-                                    // confirms ACTUAL deletion (it reads 0 for a
-                                    // long-retained type until its own age), so a
-                                    // dry-run's would-delete counts are excluded.
+                                    // #737, AC8). Real deletes only. The metric
+                                    // confirms ACTUAL deletion: it reads 0 for a
+                                    // long-retained type until its own age. So
+                                    // dry-run would-delete counts are excluded.
                                     if !config.dry_run {
                                         for (name, count) in &ok.deleted_by_workflow {
                                             metrics.record_retention_deleted(name, *count);
@@ -2373,10 +2361,10 @@ impl RetentionRuntime {
                     // above this loop runs the identical pass immediately,
                     // outside the loop's own schedule entirely.
                     //
-                    // Deliberately OUTSIDE the history-retention phase gate above:
-                    // a partitioned deployment must keep its write window covered
-                    // even with no history-retention age configured, or an append
-                    // would eventually reach an uncovered cohort.
+                    // Deliberately OUTSIDE the history-retention phase gate above.
+                    // A partitioned deployment must keep its write window covered
+                    // with no history-retention age configured. Otherwise an
+                    // append eventually reaches an uncovered cohort.
                     //
                     // Deliberately AFTER the candidate loop: a cohort only becomes
                     // droppable once the loop has archived (#345), summarized
@@ -2480,18 +2468,18 @@ impl RetentionRuntime {
                     // per-tenant token buckets so `harvest_rate_limit_buckets`
                     // stops growing one row per caller-supplied key forever.
                     //
-                    // Deliberately OUTSIDE the history-retention phase gate: bucket
-                    // growth is driven by *dispatch* traffic, not by how long
-                    // finished histories are kept, so a deployment that retains
+                    // Deliberately OUTSIDE the history-retention phase gate.
+                    // *Dispatch* traffic drives bucket growth, not how long
+                    // finished histories are kept. A deployment that retains
                     // history forever still has to collect buckets.
                     //
-                    // Shard-local and best-effort, exactly like the audit/schedule/
-                    // summary purges above: a shard that fails is reported and
-                    // retried next tick rather than failing the whole tick, because
-                    // reclamation here is independent of everything else the
-                    // janitor just did. Reported, not merely logged — otherwise
-                    // `GET /admin/retention` would keep serving the last successful
-                    // tick's count and a permanently-failing shard would look
+                    // Shard-local and best-effort, like the audit/schedule/
+                    // summary purges above. A failed shard is reported and
+                    // retried next tick; the whole tick does not fail. This
+                    // reclamation is independent of everything else the janitor
+                    // just did. Reported, not only logged. Otherwise
+                    // `GET /admin/retention` keeps serving the count of the last
+                    // successful tick. A permanently-failing shard would then look
                     // exactly like an idle one.
                     //
                     // Under `dry_run` the pass still runs, as a read-only PREVIEW:
@@ -2730,26 +2718,27 @@ struct CandidateExecution {
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     legal_hold_until: Option<DateTime<Utc>>,
     /// Deadline-aware replay budget (issue #772), carried into the pre-deletion
-    /// archive document so a completed/continued run whose history recorded a
-    /// `SideEffectRecorded{Now}` deadline probe replays cleanly from cold storage
-    /// (the archive is the last surviving copy; the row is deleted moments after).
+    /// archive document. A completed/continued run can record a
+    /// `SideEffectRecorded{Now}` deadline probe. This budget lets that run
+    /// replay cleanly from cold storage. The archive is the last surviving
+    /// copy; the row is deleted moments after.
     #[diesel(sql_type = Nullable<Interval>) ]
     execution_timeout: Option<chrono::Duration>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     deadline_at: Option<DateTime<Utc>>,
     /// Spawning-parent id (issue #698), carried into the pre-deletion archive
-    /// document (mirrors `execution_timeout`/`deadline_at`) so a parent-aware
-    /// child's archived history round-trips its `parent_execution_id` and
-    /// replays cleanly from cold storage instead of false-reporting
+    /// document like `execution_timeout`/`deadline_at`. The archived history of
+    /// a parent-aware child then round-trips its `parent_execution_id`. It
+    /// replays cleanly from cold storage and does not false-report
     /// non-determinism. `parent_id` lives in no `WorkflowEvent`, so the archive
     /// is the last surviving copy of it before the row is deleted.
     #[diesel(sql_type = Nullable<SqlUuid>) ]
     parent_id: Option<uuid::Uuid>,
     /// Task queue (issue #798), carried into the pre-deletion archive document
-    /// (mirrors `context_headers`/`parent_id`) so a workflow that branches on
-    /// `ctx.queue_name()` replays cleanly from cold storage instead of running
-    /// under `""`. The live worker sets it from the claimed task row, so it lives
-    /// in no `WorkflowEvent` and the archive is its last surviving copy.
+    /// like `context_headers`/`parent_id`. A workflow that branches on
+    /// `ctx.queue_name()` then replays cleanly from cold storage, not under
+    /// `""`. The live worker sets it from the claimed task row. So it lives in
+    /// no `WorkflowEvent`, and the archive is its last surviving copy.
     #[diesel(sql_type = Text)]
     queue_name: String,
     /// Start source and predecessor (issue #2082), carried into the archive
@@ -2970,24 +2959,25 @@ async fn run_shard_tick(
     let mut has_failed = false;
 
     // Per-type effective cutoff pushed into the candidate SELECT (issue #737,
-    // PR #990 review). Instead of a single loose cutoff (`now - min(all ages)`)
-    // followed by a Rust per-candidate skip — which selects, claims, and re-skips
-    // a long-retained type's not-yet-eligible rows every tick, consuming batch
-    // budget and starving newer already-expired rows of a shorter policy — we
-    // build one (name, cutoff) pair per override and let the SQL COALESCE resolve
-    // each row's own effective cutoff. Only genuinely-eligible rows are ever
-    // selected, so mixed-policy deployments never starve.
+    // PR #990). The rejected design is a single loose cutoff
+    // (`now - min(all ages)`) and then a Rust per-candidate skip. That selects,
+    // claims, and re-skips the not-yet-eligible rows of a long-retained type
+    // every tick. It consumes batch budget and starves newer expired rows of a
+    // shorter policy. Instead, build one (name, cutoff) pair per override. The
+    // SQL COALESCE resolves the effective cutoff of each row. Only
+    // genuinely-eligible rows are selected, so mixed-policy deployments never
+    // starve.
     //
     // `override_cut_names[i]` ↔ `override_cuts[i]` are kept in lockstep (unnest
     // requires equal-length arrays). A non-overridden type falls through COALESCE
-    // to `global_fallback` (the global `max_age` cutoff) or, when no global age is
-    // set, to `'-infinity'` — meaning it is never selected.
+    // to `global_fallback`, the global `max_age` cutoff. With no global age, it
+    // falls to `'-infinity'`, so it is never selected.
     let mut override_cut_names: Vec<String> = Vec::new();
     let mut override_cuts: Vec<DateTime<Utc>> = Vec::new();
     for (name, secs) in config.workflow_overrides() {
-        // Fail safe: an unrepresentable override age (unreachable for validated
-        // ages, bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range) is omitted so
-        // its rows are never selected under a too-aggressive cutoff. With a global
+        // Fail safe: omit an unrepresentable override age. That is unreachable
+        // for validated ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. Its
+        // rows are then never selected under a too-aggressive cutoff. With a global
         // `max_age` set they then fall back to it; without one they fall back to
         // `'-infinity'` (never selected). Retaining is the correct failure mode.
         if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
@@ -3028,17 +3018,16 @@ async fn run_shard_tick(
 
     // Reclaim `harvest_completion_deliveries` rows that resolved to
     // `DELIVERED` *after* their owning execution was already collected
-    // (issue #921 review, Codex P2, follow-up). A PENDING/INFLIGHT/FAILED
-    // row is deliberately kept when its owner is collected below (the
-    // delivery may still need to retry or await redrive), but if that same
-    // row *later* succeeds, nothing else ever revisits it -- the candidate
-    // loop only ever iterates over still-live executions, so an orphaned
-    // row (whose `workflow_exec_id` no longer names an existing execution)
-    // would otherwise carry its frozen result/error PII with no retention
-    // bound at all. Scoped to `DELIVERED` only, matching the per-candidate
-    // delete's existing "not finished yet" rule for PENDING/INFLIGHT/FAILED
-    // rows. Runs once per shard tick (not per candidate) since it is a
-    // table-wide reclaim, not scoped to this tick's candidate batch.
+    // (issue #921). A PENDING/INFLIGHT/FAILED row is deliberately kept when
+    // its owner is collected below. The delivery may still need to retry or
+    // await redrive. If that row *later* succeeds, nothing else revisits it.
+    // The candidate loop iterates over still-live executions only. An
+    // orphaned row has a `workflow_exec_id` that names no existing
+    // execution. Without this, it carries its frozen result/error PII with
+    // no retention bound. Scoped to `DELIVERED` only, like the existing
+    // "not finished yet" rule of the per-candidate delete for
+    // PENDING/INFLIGHT/FAILED rows. Runs once per shard tick, not per
+    // candidate, because it is a table-wide reclaim.
     //
     // Issue #1823: a table-wide delete can run long. It asserts the fence in
     // its own transaction, so a bump waits for it even when the tick's guard
@@ -3077,19 +3066,19 @@ async fn run_shard_tick(
                 // The claim asserts the fence in its own transaction (issue
                 // #1823). See the reclaim above.
                 crate::replication::assert_fence_group(conn, fence_key).await?;
-                // Push each row's exact per-type effective cutoff into the
-                // predicate (issue #737, PR #990 review): the correlated
-                // `unnest` subquery resolves the override cutoff for this row's
-                // workflow_name, falling through COALESCE to the global cutoff
-                // ($3) or, when there is no global age, to `'-infinity'` — so a
-                // non-overridden never-delete type is never selected. Only
-                // genuinely-eligible rows are returned, so a long-retained
-                // type's not-yet-eligible backlog can neither consume the batch
-                // budget nor starve newer expired rows of a shorter policy.
+                // Push the exact per-type effective cutoff of each row into the
+                // predicate (issue #737, PR #990). The correlated `unnest`
+                // subquery resolves the override cutoff for the workflow_name of
+                // the row. COALESCE falls through to the global cutoff ($3). With
+                // no global age, it falls to `'-infinity'`, so a non-overridden
+                // never-delete type is never selected. Only genuinely-eligible
+                // rows are returned. The not-yet-eligible backlog of a
+                // long-retained type can neither consume the batch budget nor
+                // starve newer expired rows of a shorter policy.
                 //
-                // Two query-string variants keep the bind numbering unambiguous:
-                // with a global age the fallback is bound as $3; without one it
-                // is the `'-infinity'` literal and the cursor/limit binds shift
+                // Two query-string variants keep the bind numbering unambiguous.
+                // With a global age, the fallback is bound as $3. Without one, it
+                // is the `'-infinity'` literal, and the cursor/limit binds shift
                 // down by one.
                 let sql = candidate_scan_sql(global_fallback.is_some());
                 // Bind order maps to $1..$N regardless of textual position. The
@@ -3182,13 +3171,13 @@ async fn run_shard_tick(
             // Future policies (#747 legal hold, #752 tiered summary) hook in
             // here.
             //
-            // Legal hold (issue #747) is the FIRST gate — it precedes archival
-            // (#345 hook below) AND delete, and precedes the metric emission, so
+            // Legal hold (issue #747) is the FIRST gate. It precedes archival
+            // (#345 hook below), delete, and the metric emission. So
             // `harvest.retention.deleted` never increments for a held id. An
-            // active hold (`legal_hold_active`) exempts this execution's history
-            // from retention entirely, until the hold is released or expires.
-            // Evaluated against the tick's `now` (the same clock the SELECT cutoff
-            // uses) so the decision is consistent with candidate selection.
+            // active hold (`legal_hold_active`) exempts the history of this
+            // execution from retention until the hold is released or expires.
+            // Evaluated against the `now` of the tick, the clock of the SELECT
+            // cutoff, so the decision matches candidate selection.
             if legal_hold_active(candidate.legal_hold_set_at, candidate.legal_hold_until, now) {
                 routine_skip_candidate(
                     &mut conn,
@@ -3201,10 +3190,10 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             }
-            // NB (PR #990 review): the candidate SELECT now pushes each row's
-            // exact per-type cutoff into SQL, so the two skip branches below
+            // NB (PR #990): the candidate SELECT pushes the exact per-type
+            // cutoff of each row into SQL. So the two skip branches below
             // (`effective_max_age == None` and `completed_at >= resolved_cutoff`)
-            // are effectively unreachable — no not-yet-eligible or never-delete
+            // are effectively unreachable. No not-yet-eligible or never-delete
             // row is ever selected. They are kept as cheap defense-in-depth. The
             // `should_skip_candidate` chain-link check below still needs the
             // RESOLVED per-type cutoff, which is derived here.
@@ -3271,10 +3260,9 @@ async fn run_shard_tick(
                 continue;
             }
 
-            // NOTE: pass the per-type `resolved_cutoff` (not the loose cutoff)
-            // to should_skip_candidate — its continue-as-new chain-link check
-            // compares `completed_at >= $cutoff` and must see this type's own
-            // cutoff to be correct.
+            // Pass the per-type `resolved_cutoff`, not the loose cutoff. The
+            // continue-as-new chain-link check of should_skip_candidate compares
+            // `completed_at >= $cutoff`. It is correct only with the cutoff of this type.
             if should_skip_candidate(&mut conn, &candidate, resolved_cutoff).await? {
                 let skipped_age = now
                     .signed_duration_since(completed_at)
@@ -3298,17 +3286,18 @@ async fn run_shard_tick(
                 continue;
             }
 
-            // Best-effort pre-archival legal-hold re-read (issue #747 BLOCKER 1):
+            // Best-effort pre-archival legal-hold re-read (issue #747):
             // a hold placed between candidate selection and now must not be
-            // archived to cold storage. This NARROWS (does not fully close) the
-            // archival window — a hold landing DURING the multi-second archival
-            // network call below may still be archived, then skipped at
-            // delete-time by the authoritative FOR UPDATE re-check in
-            // `delete_candidate_execution`. That residual is acceptable: the row
-            // is preserved in place (never deleted), so archiving an
-            // about-to-be-held copy leaks a cold-storage copy but loses no data.
-            // We deliberately do NOT hold a row lock across the archival network
-            // call. Runs before dry-run too, so a held row is never counted.
+            // archived to cold storage. This NARROWS the archival window but
+            // does not fully close it. A hold that lands DURING the
+            // multi-second archival network call below can still be archived.
+            // The authoritative FOR UPDATE re-check in
+            // `delete_candidate_execution` then skips it at delete time. That
+            // residual is acceptable. The row is preserved in place, never
+            // deleted. The archive of an about-to-be-held copy leaks a
+            // cold-storage copy but loses no data. No row lock is held across
+            // the archival network call, deliberately. Runs before dry-run
+            // too, so a held row is never counted.
             match read_candidate_hold(&mut conn, candidate.id).await {
                 Ok((set_at, until)) if legal_hold_active(set_at, until, now) => {
                     routine_skip_candidate(
@@ -3354,9 +3343,9 @@ async fn run_shard_tick(
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
                             workflow_name: candidate.workflow_name.clone(),
-                            // Issue #698: carry the business `workflow_id` (already
-                            // on the retention candidate) so a parent-aware /
-                            // id-branching workflow's archived history round-trips
+                            // Issue #698: carry the business `workflow_id` of the
+                            // retention candidate. The archived history of a
+                            // parent-aware / id-branching workflow then round-trips
                             // `ctx.info().workflow_id` into the JSON replay path.
                             workflow_id: Some(candidate.workflow_id.clone()),
                             // Issue #798: carry the execution's task queue so a
@@ -3379,13 +3368,14 @@ async fn run_shard_tick(
                                 None,
                                 &mut crate::payload_codec::LossyDecodeOutcome::default(),
                             ),
-                            // Issue #772 (Finding A): the archive is the LAST
-                            // surviving copy before the row is deleted. A terminal
+                            // Issue #772: the archive is the LAST surviving copy
+                            // before the row is deleted. A terminal
                             // (completed/continued) run can carry a recorded
                             // `SideEffectRecorded{Now}` deadline probe before its
-                            // next command; carrying the row's execution_timeout /
-                            // live deadline_at lets the archived document replay
-                            // cleanly instead of false-reporting non-determinism.
+                            // next command. With the execution_timeout / live
+                            // deadline_at of the row, the archived document
+                            // replays cleanly. It does not false-report
+                            // non-determinism.
                             execution_timeout: candidate.execution_timeout,
                             deadline_at: candidate.deadline_at,
                             // Issue #698: carry the spawning-parent id (mirrors
@@ -3620,22 +3610,23 @@ async fn run_shard_tick(
     Ok(outcome)
 }
 
-/// Outcome of a candidate-deletion attempt (issue #747 BLOCKER 1). A hold that
-/// commits AFTER candidate selection but before this delete transaction must be
-/// honored, so the delete tx re-checks the legal-hold columns under a row lock
-/// as its first statement and aborts the delete when the hold is active.
+/// Outcome of a candidate-deletion attempt (issue #747).
+///
+/// A hold can commit AFTER candidate selection but before this delete
+/// transaction. It must be honored. So the first statement of the delete tx
+/// re-checks the legal-hold columns under a row lock. An active hold aborts
+/// the delete.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDeleteOutcome {
     /// The execution (and its dependent rows) were deleted. `summarized` is
-    /// `true` when a `harvest_execution_summaries` row was written in the same
-    /// transaction (issue #752); `false` when summary retention is disabled or
+    /// `true` when the same transaction wrote a `harvest_execution_summaries`
+    /// row (issue #752). It is `false` when summary retention is disabled, or
     /// the row was already summarized (idempotent ON CONFLICT no-op).
     Deleted { summarized: bool },
-    /// A legal hold was found active under the delete-tx row lock; the delete
-    /// was aborted and NOTHING was touched (no `payload_refs`, no blobs, no
-    /// execution row, no summary). The caller treats this exactly like a
-    /// routine skip.
+    /// An active legal hold was found under the delete-tx row lock. The delete
+    /// was aborted, and NOTHING was touched: no `payload_refs`, no blobs, no
+    /// execution row, no summary. The caller treats this like a routine skip.
     SkippedHeld,
     /// A shard-rebalance staging vacate was found in flight under the
     /// delete-tx row lock (`staging_vacated_state` set). The delete was
@@ -3835,34 +3826,33 @@ async fn delete_candidate_execution(
         // exists for this row. It is not enough to know THIS call
         // inserted one.
         let mut preserve_child_lineage_for_migration_tombstone = false;
-        // ── Authoritative legal-hold re-check under a row lock (issue #747
-        // BLOCKER 1) ─────────────────────────────────────────────────────
-        // The candidate SELECT read the hold columns then committed and
-        // released its lock BEFORE archival + delete, so a hold placed via
-        // `set_legal_hold` in that window would otherwise be missed and the
-        // held execution deleted. Reading the hold columns FOR UPDATE here,
-        // as the FIRST statement of the delete transaction, closes that
-        // window absolutely: it serializes against `set_legal_hold`'s own
-        // locking read/update, so a hold committed before this SELECT is
-        // seen (→ abort the delete), and a hold committing after must wait
-        // for this delete tx to finish — by which point the row is gone and
-        // the operator's `set_legal_hold` observes a missing row (404). If
+        // ── Authoritative legal-hold re-check under a row lock (issue #747) ──
+        //
+        // The candidate SELECT read the hold columns, then committed and
+        // released its lock BEFORE archival + delete. A hold placed via
+        // `set_legal_hold` in that window would otherwise be missed, and the
+        // held execution deleted. This FOR UPDATE read of the hold columns is
+        // the FIRST statement of the delete transaction. It closes that
+        // window absolutely. It serializes against the locking read/update
+        // of `set_legal_hold`. A hold committed before this SELECT is seen
+        // (→ abort the delete). A hold that commits after must wait for this
+        // delete tx to finish. By then the row is gone, and the
+        // `set_legal_hold` of the operator observes a missing row (404). If
         // the hold is active, abort the delete entirely: do NOT touch
         // payload_refs or blobs.
         //
         // Tiered/summary retention (issue #752): when a summary policy is
         // set, the SAME FOR UPDATE row lock loads the demotion source
-        // columns (identity, timing, shard, search-attrs, and — opt-in —
-        // result/error payload) so the summary INSERT is atomic with the
-        // legal-hold re-check and the delete. There is never a window where
-        // both the execution and its summary are absent, and a rollback
+        // columns. Those are identity, timing, shard, search-attrs, and the
+        // opt-in result/error payload. So the summary INSERT is atomic with
+        // the legal-hold re-check and the delete. There is never a window
+        // where both the execution and its summary are absent. A rollback
         // (e.g. a delete error below) discards the summary too, so no
         // orphan can result. The summary INSERT happens AFTER the hold
         // re-check (a held row is never summarized) and BEFORE the deletes.
-        // The row read and hold re-check are unconditional (issue #1317
-        // review, P1): whether a summary gets written now has TWO
-        // independent triggers, not one. Summary retention being
-        // configured is the original (#752) trigger.
+        // The row read and hold re-check are unconditional (issue #1317).
+        // A summary write now has TWO independent triggers, not one.
+        // Configured summary retention is the original (#752) trigger.
         //
         // The other trigger is new. `migrated_from_shards` non-empty means
         // this row was itself the TARGET of a shard-rebalance migration at
@@ -4022,11 +4012,11 @@ async fn delete_candidate_execution(
                     parent_id,
                     // Issue #964: the residence history must outlive the
                     // execution row. Sealed source copies are NOT collected
-                    // with it -- retention deliberately never purges a
-                    // `MIGRATED` row, since that would destroy the forwarding
-                    // pointer -- so a summary that lost this array would make a
-                    // later erasure read "never migrated" and report success
-                    // over copies it never touched.
+                    // with it. Retention deliberately never purges a
+                    // `MIGRATED` row, because that destroys the forwarding
+                    // pointer. A summary without this array makes a later
+                    // erasure read "never migrated". The erasure then reports
+                    // success over copies it never touched.
                     migrated_from_shards,
                 };
                 // ON CONFLICT DO NOTHING makes the demotion idempotent
@@ -4046,19 +4036,19 @@ async fn delete_candidate_execution(
         // does not dangle to a gone row. Tiered/summary retention (issue
         // #752): when a summary policy is set, this null-out is SKIPPED so
         // the child→parent lineage survives deletion. A terminal child is
-        // independently retention-eligible and may be summarized in a LATER
-        // transaction than its parent; if we nulled its `parent_id` here,
-        // its own demotion would capture a NULL parent and the #495 PII-erase
-        // cascade (which reaches a demoted child summary via
-        // `harvest_execution_summaries.parent_id`) could never find it.
-        // Preserving the link makes the cascade order-independent regardless
-        // of whether the parent or child is processed first. The retained
-        // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
-        // `should_skip_candidate` only reads `parent_id` downward).
+        // independently retention-eligible. It can be summarized in a LATER
+        // transaction than its parent. A null `parent_id` here makes its own
+        // demotion capture a NULL parent. The #495 PII-erase cascade reaches
+        // a demoted child summary via `harvest_execution_summaries.parent_id`,
+        // so it could never find that child. The preserved link makes the
+        // cascade order-independent, whether the parent or child goes first.
+        // The retained `parent_id` on a to-be-deleted terminal child is
+        // harmless (no FK; `should_skip_candidate` only reads `parent_id`
+        // downward).
         //
         // The forced migration-target tombstone above is a THIRD trigger
         // for a surviving summary row, besides `summary` being configured
-        // (issue #1317 review, P1 follow-up). `summary.is_none()` alone
+        // (issue #1317). `summary.is_none()` alone
         // does not see it, so this null-out ran even when a summary row
         // for this exact candidate had just been inserted. A later #495
         // erase of that summary would then find no child to cascade to.
@@ -4083,16 +4073,15 @@ async fn delete_candidate_execution(
         }
 
         // `task_type = 'CALLBACK'` dead letters (issue #605) are
-        // excluded here (issue #921 review, Codex P2): a CALLBACK
-        // dead-letter row only ever exists for a delivery that reached
-        // `FAILED`, and the completion-deliveries delete just below
-        // deliberately keeps every non-`DELIVERED` (i.e. `FAILED`)
-        // delivery row around for redrive -- deleting its DLQ entry
-        // here would drop it from the `GET /dead-letters` / aggregate
-        // discovery surface while the delivery row itself (and its
-        // redrive path) still exists, breaking the advertised "find
-        // failures via DLQ" operator workflow for any callback failure
-        // that outlives the owning workflow's retention window. A
+        // excluded here (issue #921). A CALLBACK dead-letter row exists
+        // only for a delivery that reached `FAILED`. The
+        // completion-deliveries delete just below deliberately keeps
+        // every non-`DELIVERED` (i.e. `FAILED`) delivery row for redrive.
+        // A delete of its DLQ entry here drops it from the
+        // `GET /dead-letters` / aggregate discovery surface. The delivery
+        // row and its redrive path still exist. That breaks the advertised
+        // "find failures via DLQ" operator workflow for a callback failure
+        // that outlives the retention window of the owning workflow. A
         // redrive already deletes its own DLQ row on success, so this
         // exclusion cannot leak an entry whose delivery was resolved.
         diesel::delete(
@@ -4207,8 +4196,8 @@ pub(crate) async fn purge_expired_summaries(
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
         // Unrepresentable age (unreachable for validated horizons, bounded by
-        // MAX_MAX_AGE ≪ chrono's range): fail safe toward RETAINING — GC
-        // nothing this tick rather than deleting everything under a zero cutoff.
+        // MAX_MAX_AGE ≪ the chrono range). Fail safe toward RETAINING: GC
+        // nothing this tick. A zero cutoff would delete everything.
         return Ok(counts);
     };
     let cutoff = now - chrono_age;
@@ -4250,9 +4239,9 @@ pub(crate) async fn purge_expired_summaries(
             *counts.entry(r.workflow_name).or_insert(0) += 1;
         }
         // Terminate when a batch came back short OR empty. Compare against the
-        // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
-        // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
-        // an `n == 0` early break is required or the loop would spin forever.
+        // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`.
+        // A `batch_size` of 0 makes the LIMIT 1, and `n < 0` is impossible. So
+        // the loop needs the `n == 0` early break, or it spins forever.
         if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
             break;
         }
@@ -4481,12 +4470,15 @@ pub async fn list_execution_summaries(
 }
 
 /// Common bookkeeping for a "routine skip" of a retention candidate (issue
-/// #737): release the candidate's retention lease so a later tick can revisit
-/// it, advance the scan cursor when the tick has not already failed, and drop
-/// the id from the lease guard's active set. Used by every non-deleting,
-/// non-failing per-candidate decision (never-delete type, not-old-enough for
-/// its type, and the pre-existing dependency-based `should_skip_candidate`).
-/// It must NOT freeze the cursor and must NOT set `has_failed`.
+/// #737).
+///
+/// It releases the retention lease of the candidate, so a later tick can
+/// revisit it. It advances the scan cursor when the tick has not already
+/// failed. It drops the id from the active set of the lease guard. Every
+/// non-deleting, non-failing per-candidate decision uses it: never-delete
+/// type, not-old-enough for its type, and the pre-existing dependency-based
+/// `should_skip_candidate`. It must NOT freeze the cursor and must NOT set
+/// `has_failed`.
 #[cfg(feature = "db")]
 async fn routine_skip_candidate(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -4505,7 +4497,6 @@ async fn routine_skip_candidate(
     .await
     .map_err(database_error)?;
 
-    // Advance cursor for routine skips.
     if !has_failed {
         outcome.next_cursor = Some(candidate_cursor);
     }
@@ -4605,9 +4596,9 @@ struct CountRow {
 
 /// Returns `true` when a per-execution legal hold is currently ACTIVE.
 ///
-/// This is the **single source of truth** for the active-hold predicate, shared
-/// by the retention-skip gate, the PII-erasure gate (issue #495), the
-/// describe/list surfaces, and the set/release core functions. A hold is active
+/// This is the **single source of truth** for the active-hold predicate. The
+/// retention-skip gate, the PII-erasure gate (issue #495), the describe/list
+/// surfaces, and the set/release core functions share it. A hold is active
 /// when it was placed (`set_at IS NOT NULL`) and has not auto-expired
 /// (`until IS NULL`, i.e. indefinite, or `until > now`).
 ///
@@ -4760,16 +4751,16 @@ mod legal_hold_db {
         actor: &str,
         now: DateTime<Utc>,
     ) -> HarvestResult<LegalHoldOutcome> {
-        // Empty reason normalizes to NULL (issue #747 MINOR 4) so a blank hold
-        // stores `NULL` rather than `Some("")`, keeping the erase-rejection
-        // message and describe field clean.
+        // Empty reason normalizes to NULL (issue #747). A blank hold stores
+        // `NULL`, not `Some("")`, so the erase-rejection message and describe
+        // field stay clean.
         let stored_reason = (!reason.is_empty()).then_some(reason);
 
-        // The read + update run in one transaction (issue #747 MINOR 1) so the
-        // `FOR UPDATE` lock in `load_hold_for_update` actually serializes the
-        // read-modify-write against a concurrent set/release (and against the
-        // retention delete-tx re-check), rather than releasing at statement end
-        // in autocommit mode.
+        // The read + update run in one transaction (issue #747). So the
+        // `FOR UPDATE` lock in `load_hold_for_update` serializes the
+        // read-modify-write against a concurrent set/release and against the
+        // retention delete-tx re-check. In autocommit mode it would release
+        // at statement end.
         Box::pin(
             conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
                 let (set_at, until, cur_reason, cur_actor, migrated_to_shard) =
@@ -4804,12 +4795,12 @@ mod legal_hold_db {
                     .await
                     .map_err(database_error)?;
 
-                // Report held/newly_held ACCURATELY (issue #747 MAJOR): a
+                // Report held/newly_held ACCURATELY (issue #747). A
                 // `hold_until` already in the past writes the columns but places
-                // no ACTIVE hold, so a direct core/CLI caller never gets a false
-                // `held: true`. (The HTTP handler rejects a past `hold_until`
-                // with 400 before reaching here — this is the belt-and-braces
-                // core-layer guard.)
+                // no ACTIVE hold. So a direct core/CLI caller never gets a false
+                // `held: true`. The HTTP handler rejects a past `hold_until`
+                // with 400 before this point. This is the belt-and-braces
+                // core-layer guard.
                 let active = legal_hold_active(Some(now), hold_until, now);
 
                 Ok(LegalHoldOutcome {
@@ -5246,12 +5237,11 @@ mod tests {
         );
     }
 
-    // A Codex review finding on this fix (issue #1266). The exempted shard
-    // must travel back out as its own list, not merely be dropped from the
-    // expected-cursor one. `purge_old_audit_records` needs it to keep
-    // protecting an exempted shard's own unacknowledged rows while its
-    // cursor stays live. `decommission_cursor`, not this config change, is
-    // what is meant to release them.
+    // Issue #1266: the exempted shard must travel back out as its own list,
+    // not merely be dropped from the expected-cursor one.
+    // `purge_old_audit_records` needs it to keep protecting the unacknowledged
+    // rows of an exempted shard while the cursor of that shard stays live.
+    // `decommission_cursor`, not this config change, is meant to release them.
     #[cfg(feature = "db")]
     #[test]
     fn group_shards_by_pool_returns_the_exempted_shard_as_its_own_list() {
@@ -5522,18 +5512,18 @@ mod tests {
             },
             ..Default::default()
         }
-        // Issue #1127: the idle rate-limit bucket GC is on by default and is
-        // itself an enabling reason, so "nothing enabled" now has to switch it
-        // off too. Issue #1811 adds the terminal-task janitor, which is the same.
+        // Issue #1127: the idle rate-limit bucket GC is on by default. It is
+        // itself an enabling reason, so "nothing enabled" must switch it off
+        // too. Issue #1811 adds the terminal-task janitor, which is the same.
         .without_rate_limit_bucket_gc()
         .without_terminal_task_gc();
         // No purging, partition maintenance, bucket GC or task janitor.
         assert!(!config.enabled());
 
         // …but partition maintenance ALONE is (issue #958). An opted-in
-        // partitioned shard whose horizons are all off still needs its
-        // lookahead window extended, or every append ends up in the DEFAULT
-        // partition and nothing is ever reclaimed.
+        // partitioned shard with all horizons off still needs its lookahead
+        // window extended. Otherwise every append ends up in the DEFAULT
+        // partition, and nothing is ever reclaimed.
         let partitions_only = RetentionConfig {
             audit_retention_days: 0,
             schedule_decision_retention_days: 0,
@@ -5714,8 +5704,8 @@ mod tests {
 
     #[test]
     fn a_zero_window_is_rejected_rather_than_collecting_everything_now() {
-        // `Some(0)` would leave the GC ACTIVE with a cutoff of "now", i.e.
-        // collect every full, unpinned bucket immediately — reopening the
+        // `Some(0)` would leave the GC ACTIVE with a cutoff of "now". It would
+        // collect every full, unpinned bucket immediately. That reopens the
         // stranding race the touch interval closes. It must fail the build, not
         // be treated as "disabled".
         let zero = RetentionConfig::default().with_rate_limit_bucket_retention(Duration::ZERO);
@@ -6082,7 +6072,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn test_run_shard_tick_cursor_frozen_on_skip() {
-        // Build mock candidates
         let candidate_ok = CandidateExecution {
             id: uuid::Uuid::new_v4(),
             workflow_name: "test".to_string(),

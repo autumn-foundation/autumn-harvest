@@ -57,7 +57,6 @@ async fn setup_single_database() -> (String, Option<ContainerAsync<Postgres>>) {
             .await
             .expect("failed to create test database");
 
-        // Derive the database URL by replacing the database component.
         let database_url = {
             let base = admin_url.trim_end_matches('/');
             let without_db = base.rsplit_once('/').map_or(base, |(before, _)| before);
@@ -130,7 +129,6 @@ async fn setup_sharded_databases() -> ((String, String), Option<ContainerAsync<P
         .await
         .expect("failed to create shard 1 database");
 
-    // Derive the base URL (without database name) to construct shard URLs.
     let base_url = {
         let base = admin_url.trim_end_matches('/');
         let without_db = base.rsplit_once('/').map_or(base, |(before, _)| before);
@@ -752,9 +750,8 @@ async fn workflow_search_attr_predicate_uses_gin_index() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect for EXPLAIN");
-    // Force the planner to consider the GIN index even though the test table
-    // is tiny; otherwise the seq scan will always win on cost and obscure the
-    // index plan we want to assert on.
+    // Force the planner to consider the GIN index on the tiny test table.
+    // Otherwise the seq scan always wins on cost and hides the asserted plan.
     conn.batch_execute("SET enable_seqscan = off")
         .await
         .expect("disable seqscan should succeed");
@@ -1463,9 +1460,9 @@ async fn workflow_search_attr_predicate_invalid_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// A comparison predicate narrows on the `?` key-existence operator, which hits
-/// the existing `idx_harvest_we_search` GIN index — proving the index path
-/// rather than a full per-row scan (issue #506 AC).
+/// A comparison predicate narrows on the `?` key-existence operator (issue #506).
+/// This proves the index path: it hits the existing `idx_harvest_we_search` GIN
+/// index, not a full per-row scan.
 #[tokio::test]
 async fn workflow_search_attr_predicate_comparison_uses_gin_index() {
     let (database_url, _container) = setup_single_database().await;

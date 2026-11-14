@@ -2,49 +2,47 @@
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 //! Transactional workflow start — issue #763.
 //!
-//! Proves `WorkflowHandleClient::start_workflow_transactional` closes the
-//! dual-write gap between an embedding app's own domain write and starting a
-//! workflow to react to it: the `WorkflowStarted` event, the execution row,
-//! and the initial dispatchable task-queue row all live only inside whatever
-//! transaction is open on the caller's connection, so they commit or roll
-//! back together with the caller's own domain write.
+//! Proves that `WorkflowHandleClient::start_workflow_transactional` closes the
+//! dual-write gap between an embedding app's own domain write and a workflow
+//! start that reacts to it. The `WorkflowStarted` event, the execution row and
+//! the initial dispatchable task-queue row live only inside the transaction
+//! open on the caller's connection. So they commit or roll back together with
+//! the caller's own domain write.
 //!
 //! Structure, cheapest-and-most-decisive first:
 //!   1. Atomicity (AC2) — commit makes everything visible; rollback leaves
-//!      nothing, including the fault-injection sweep (AC5) and a dedicated
-//!      test for the two-phase `TerminateExisting` pre-check-cancel
-//!      interaction with an *outer* rollback.
+//!      nothing. This includes the fault-injection sweep (AC5). A dedicated
+//!      test covers the two-phase `TerminateExisting` pre-check-cancel under
+//!      an *outer* rollback.
 //!   2. Start-semantics parity (AC3) — `WorkflowInfo` defaults (execution
-//!      timeout, SLA, concurrency key — the issue text names all three
-//!      explicitly), id-reuse / conflict policy, idempotency-key dedup
-//!      (including its interaction with a rollback), input-schema validation
-//!      aborting without writing, the debounce/batch/throttle rejection (all
-//!      three disjuncts, independently), and the admission-gate (issue #618)
-//!      interaction.
+//!      timeout, SLA, concurrency key; the issue names all three). It also
+//!      covers id-reuse / conflict policy and idempotency-key dedup, with its
+//!      rollback interaction. Input-schema validation aborts without a write.
+//!      Each debounce/batch/throttle disjunct is rejected independently. The
+//!      admission-gate (issue #618) interaction is covered too.
 //!   3. Sharding (AC4) — lands on the shard backing the connection, and a
 //!      single-shard deployment needs no `.with_shard(...)` call at all.
 //!   4. Connection discipline — what happens when the caller passes a bare
-//!      (non-transaction-wrapped) connection, since the atomicity guarantee
-//!      is entirely dependent on the caller actually opening a transaction.
+//!      connection with no transaction. The atomicity guarantee depends
+//!      entirely on the caller opening a transaction.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (each test creates its own fresh, uniquely-named
-//! database); otherwise a fresh testcontainers Postgres is booted per test
-//! with the full migration bundle.
+//! against it directly. Each test then creates its own fresh, uniquely-named
+//! database. Otherwise each test boots a fresh testcontainers Postgres with
+//! the full migration bundle.
 //!
-//! `--test-threads=1` (see `docs/transactional-start.md`'s "Testing" section
-//! for the exact run command) is a *hard requirement*, not caution: every
-//! test in this file builds its own `WorkflowHandleClient`/`ShardedDbPool`,
-//! and `ShardedDbPool::single()`/`::from_map()` write to the process-wide
-//! `GLOBAL_SHARDED_POOL`/`GLOBAL_SHARD_ROUTER` statics as a side effect of
-//! construction (read by `DeferredTriggerStart::spawn()`, used from
-//! `TransactionalStartOutcome::finish()`, and by background scanners).
-//! Running this file's tests in parallel within one process would have them
-//! clobber each other's global pool/router registration. The admission-gate
-//! test below additionally arms the process-global `GLOBAL_ADMISSION_GATE_CACHE`
-//! for its duration — safe under `--test-threads=1` because it always
-//! disarms the gate before returning, matching every other gate-mutating
-//! test in this crate.
+//! `--test-threads=1` is a *hard requirement*, not caution. The "Testing"
+//! section of `docs/transactional-start.md` gives the exact run command.
+//! Every test here builds its own `WorkflowHandleClient`/`ShardedDbPool`.
+//! `ShardedDbPool::single()`/`::from_map()` write to the process-wide
+//! `GLOBAL_SHARDED_POOL`/`GLOBAL_SHARD_ROUTER` statics on construction.
+//! `DeferredTriggerStart::spawn()` reads them, and
+//! `TransactionalStartOutcome::finish()` uses that. Background scanners read
+//! them too. Parallel tests in one process would clobber each other's
+//! global pool and router. The admission-gate test also arms the
+//! process-global `GLOBAL_ADMISSION_GATE_CACHE` while it runs. That is safe
+//! under `--test-threads=1`, because it always disarms the gate before it
+//! returns, like every other gate-mutating test in this crate.
 
 use autumn_harvest::admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope, set_global_admission_gate_cache,
@@ -82,11 +80,10 @@ struct OrderInput {
     amount_cents: i64,
 }
 
-/// Carries a `WorkflowInfo`-declared execution timeout, SLA, and a per-key
-/// concurrency policy so the transactional-start default-resolution path
-/// (AC3) has something real to resolve. The real issue #763 text names all
-/// three (`execution_timeout`, `sla`, concurrency key) explicitly — `sla`
-/// was a coverage gap flagged in review (C1) until it was declared here.
+/// Carries a `WorkflowInfo`-declared execution timeout, SLA, and per-key
+/// concurrency policy. The transactional-start default-resolution path (AC3)
+/// then has something real to resolve. Issue #763 names all three
+/// (`execution_timeout`, `sla`, concurrency key).
 #[workflow(
     execution_timeout = "1h",
     sla = "30m",
@@ -123,38 +120,35 @@ fn order_input_schema() -> serde_json::Value {
     })
 }
 
-/// Configured with a debounce policy — must be rejected by the transactional
-/// start guard (a deferred admission cannot return an `ExecutionId`
-/// synchronously) rather than silently doing the wrong thing.
+/// Configured with a debounce policy. The transactional start guard must
+/// reject it, because a deferred admission cannot return an `ExecutionId`
+/// synchronously.
 #[workflow(debounce(key = "input.order_id", window = "10s"))]
 async fn t763_debounced_workflow(_ctx: &WorkflowContext, _input: OrderInput) -> Result<(), String> {
     Ok(())
 }
 
-/// Configured with a batch policy — one of the three independent disjuncts in
-/// `validate_transactional_start_request`'s deferred-admission guard
-/// (`debounce.is_some() || batch.is_some() || throttle.is_some()`). Review
-/// finding H4: only the `debounce` disjunct had a test; a copy-paste error or
-/// refactor silently dropping this or the throttle check would otherwise go
-/// undetected.
+/// Configured with a batch policy. It covers one of the three independent
+/// disjuncts in the deferred-admission guard of
+/// `validate_transactional_start_request`
+/// (`debounce.is_some() || batch.is_some() || throttle.is_some()`). Without
+/// it, a refactor that dropped this or the throttle check would go unseen.
 #[workflow]
 async fn t763_batched_workflow(_ctx: &WorkflowContext, _input: OrderInput) -> Result<(), String> {
     Ok(())
 }
 
-/// Configured with a throttle policy — the third disjunct of the same guard
-/// (see `t763_batched_workflow`'s doc comment, review finding H4).
+/// Configured with a throttle policy, the third disjunct of the same guard
+/// (see `t763_batched_workflow`).
 #[workflow]
 async fn t763_throttled_workflow(_ctx: &WorkflowContext, _input: OrderInput) -> Result<(), String> {
     Ok(())
 }
 
-/// A dedicated target for the admission-gate behavioral test (review finding
-/// M6) — kept structurally isolated from every other fixture so a
-/// `GateScope::WorkflowName` gate armed against it can never affect an
-/// unrelated test in this suite, even though `--test-threads=1` already
-/// serializes every test here (see the module doc comment's "Execution" note
-/// below the `--test-threads=1` explanation).
+/// A dedicated target for the admission-gate behavioral test. No other
+/// fixture shares it, so a `GateScope::WorkflowName` gate armed against it
+/// cannot affect an unrelated test. `--test-threads=1` already serializes
+/// every test here (see the module doc's "Execution" note).
 #[workflow]
 async fn t763_gate_target_workflow(
     _ctx: &WorkflowContext,
@@ -201,10 +195,10 @@ fn rewrite_pg_db(base: &str, db: &str) -> String {
     format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
 }
 
-/// Creates one fresh, uniquely-named database (either off
-/// `HARVEST_TEST_DATABASE_URL` or inside a fresh testcontainers Postgres),
-/// migrated with the full bundle, plus a throwaway `t763_orders` domain
-/// table simulating the embedding app's own write.
+/// Creates one fresh, uniquely-named database, migrated with the full bundle.
+/// It lives off `HARVEST_TEST_DATABASE_URL` or in a fresh testcontainers
+/// Postgres. It adds a throwaway `t763_orders` table for the embedding app's
+/// own domain write.
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest763_{}", uuid::Uuid::new_v4().simple());
@@ -267,9 +261,9 @@ async fn connect(database_url: &str) -> AsyncPgConnection {
         .expect("failed to connect fresh Postgres client")
 }
 
-/// A single-shard client, matching AC4's "single-shard deployment needs no
-/// caller changes beyond passing the connection" — `.with_shard(...)` is
-/// never called in any test using this helper.
+/// A single-shard client. No test that uses it calls `.with_shard(...)`, as in
+/// AC4: "single-shard deployment needs no caller changes beyond passing the
+/// connection".
 fn single_shard_client(database_url: &str) -> WorkflowHandleClient {
     WorkflowHandleClient::single(build_pool(database_url), database_url.to_string())
         .with_workflows(all_test_workflows())
@@ -315,9 +309,9 @@ struct ExecIdRow {
     exec_id: Uuid,
 }
 
-/// Reads back the (patched-in) `exec_id` column on the `t763_orders` domain
-/// row — used by the domain-first ordering tests to prove the row ends up
-/// referencing the REAL exec id, never a leftover placeholder.
+/// Reads back the patched-in `exec_id` column on the `t763_orders` domain row.
+/// The domain-first ordering tests use it to prove the row references the
+/// REAL exec id, never a leftover placeholder.
 async fn order_row_exec_id(conn: &mut AsyncPgConnection, order_id: &str) -> Uuid {
     diesel::sql_query("SELECT exec_id FROM t763_orders WHERE id = $1")
         .bind::<Text, _>(order_id)
@@ -341,12 +335,10 @@ async fn execution_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> 
         .state
 }
 
-/// Reads back the persisted `shard_id` column on `harvest_workflow_executions`
-/// — used to prove a start actually PERSISTED the shard it claims to be on
-/// (issue #763 Codex review, "Default transactional starts to the actual
-/// shard"), since `ExecutionId::shard()` alone only proves what got ENCODED
-/// into the id, not what `StartWorkflowParams::shard_id()` chose to write to
-/// the row.
+/// Reads back the persisted `shard_id` column on `harvest_workflow_executions`.
+/// It proves that a start PERSISTED the shard it claims (issue #763).
+/// `ExecutionId::shard()` alone proves only the shard ENCODED in the id. It
+/// does not prove what `StartWorkflowParams::shard_id()` wrote to the row.
 async fn persisted_shard_id(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
     #[derive(diesel::QueryableByName)]
     struct ShardIdRow {
@@ -373,11 +365,10 @@ async fn workflow_started_event_count(conn: &mut AsyncPgConnection, exec_id: Exe
     .n
 }
 
-/// Counts `WorkflowCancelled` events for an execution — used to prove
-/// `execution::inline_cancel` genuinely ran during a `TerminateExisting`
-/// collision, even though the row's FINAL `state` column is subsequently
-/// overwritten to `CONTINUED_AS_NEW` by the `replace_execution` call that
-/// immediately follows it inside the same active-conflict branch (see
+/// Counts `WorkflowCancelled` events for an execution. It proves that
+/// `execution::inline_cancel` ran during a `TerminateExisting` collision. The
+/// `replace_execution` call that follows in the same active-conflict branch
+/// then overwrites the row's FINAL `state` to `CONTINUED_AS_NEW` (see
 /// `finish_after_commit_dispatches_diagnostics_for_a_terminate_existing_collision`).
 async fn workflow_cancelled_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     diesel::sql_query(
@@ -404,10 +395,9 @@ async fn task_queue_row_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId
 }
 
 /// Reads back the `queue_name` column on the initial dispatchable
-/// `harvest_task_queue` row for a transactionally-started workflow — used by
-/// the "Carry the default queue on the handle client" review-finding tests
-/// below to prove which queue a start with no explicit
-/// `TransactionalStartOptions::queue_name` override actually resolved to.
+/// `harvest_task_queue` row of a transactionally-started workflow. The
+/// default-queue tests below use it. It shows which queue a start resolved
+/// to with no `TransactionalStartOptions::queue_name` override.
 async fn task_queue_row_queue_name(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct QueueNameRow {
@@ -429,10 +419,9 @@ async fn task_queue_row_queue_name(conn: &mut AsyncPgConnection, exec_id: Execut
 struct ExecutionColumns {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     execution_timeout: Option<chrono::Duration>,
-    // `sla`/`sla_deadline_at` (issue #487) — the second and third defaults
-    // AC3's own issue text names explicitly alongside `execution_timeout`;
-    // see `honors_workflow_info_execution_timeout_and_concurrency_key_defaults`
-    // below (review finding C1).
+    // `sla`/`sla_deadline_at` (issue #487): the second and third defaults that
+    // AC3's issue text names alongside `execution_timeout`. See
+    // `honors_workflow_info_execution_timeout_and_concurrency_key_defaults`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     sla: Option<chrono::Duration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
@@ -455,10 +444,10 @@ async fn load_execution_columns(
     .expect("execution columns query")
 }
 
-/// The per-key concurrency policy (issue #247) is enforced by the initial
-/// dispatchable `WORKFLOW` task-queue row (`concurrency_key`/`concurrency_cap`
-/// columns, consulted by the claim-time advisory lock) — not by any column on
-/// `harvest_workflow_executions` itself.
+/// The initial dispatchable `WORKFLOW` task-queue row enforces the per-key
+/// concurrency policy (issue #247). Its `concurrency_key`/`concurrency_cap`
+/// columns feed the claim-time advisory lock. No column on
+/// `harvest_workflow_executions` does.
 async fn load_task_concurrency(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -492,12 +481,10 @@ async fn commit_makes_workflow_and_domain_row_atomically_visible() {
     let client = single_shard_client(&database_url);
     let order_id = "order-commit-1".to_string();
 
-    // `outcome` (not just its `exec_id`) escapes the closure so `finish()` can
-    // be called *after* the transaction has actually committed, matching the
-    // documented usage contract exactly ("call this only after the caller's
-    // outer transaction has committed"). `deferred` is empty for this fixture
-    // (a plain fresh start, no `Terminate`-resolving collision), so `finish()`
-    // is a documented no-op here; see
+    // `outcome`, not just its `exec_id`, escapes the closure. So `finish()`
+    // runs *after* the commit, as its contract requires ("call this only after
+    // the caller's outer transaction has committed"). `deferred` is empty for
+    // this plain fresh start, so `finish()` is a documented no-op here. See
     // `finish_after_commit_dispatches_diagnostics_for_a_terminate_existing_collision`
     // for a case where it does real work.
     let outcome: TransactionalStartOutcome = Box::pin(
@@ -594,28 +581,25 @@ async fn rollback_leaves_neither_domain_row_nor_workflow() {
     assert_eq!(task_queue_row_count(&mut fresh, exec_id).await, 0);
 }
 
-/// Fault-injection sweep (AC5, success metric): randomizes the "crash point"
-/// (equivalent, from Postgres's ACID guarantee, to a literal process kill —
-/// the client connection drops or issues no COMMIT, so the backend aborts the
-/// open transaction exactly as it would for an actual crash) across >= 500
-/// iterations, and after each iteration asserts the domain row, the execution
-/// row, the `WorkflowStarted` event, AND the initial dispatchable task-queue
-/// row are either ALL present or ALL absent — never a partial, orphaned state
-/// in any of the four artifacts, in either direction.
+/// Fault-injection sweep (AC5, success metric) over >= 500 iterations.
 ///
-/// Ordering is deliberately NOT independently randomized here. An earlier
-/// revision of this test carried a `domain_write_first` flag. It computed a
-/// value but never took a different code path. The reason a second ordering
-/// does not belong in *this* loop is structural, not an oversight.
+/// Each iteration picks a random "crash point". Postgres ACID makes it equal
+/// to a literal process kill. The client drops or sends no COMMIT, so the
+/// backend aborts the open transaction as for a real crash. After each
+/// iteration, the test checks four artifacts: the domain row, the execution
+/// row, the `WorkflowStarted` event, and the initial dispatchable task-queue
+/// row. They must be ALL present or ALL absent. No partial or orphaned state
+/// is allowed, in either direction.
+///
+/// Ordering is deliberately NOT randomized here, for a structural reason.
 /// `place_order_after` in
 /// `docs/transactional-start.md`/`examples/transactional_start_order.rs` is
 /// the API's own canonical usage pattern. In it the domain write references
-/// `outcome.exec_id` as a foreign key, which can only exist *after* the start
+/// `outcome.exec_id` as a foreign key, which exists only *after* the start
 /// call returns it. `atomicity_holds_when_domain_row_is_written_before_the_start`
-/// below covers the one *legitimate* alternative ordering (a domain row
-/// written first with a placeholder, patched with the real id once the start
-/// call returns it) as its own focused, deterministic test rather than folding
-/// a synthetic reordering into this randomized loop.
+/// below covers the one *legitimate* alternative ordering. There a domain row
+/// goes in first with a placeholder, and the real id patches it once the
+/// start returns. That test is focused and deterministic.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn fault_injection_zero_orphans_across_five_hundred_randomized_crash_points() {
@@ -645,13 +629,12 @@ async fn fault_injection_zero_orphans_across_five_hundred_randomized_crash_point
 
         let mut conn = connect(&database_url).await;
         let mut observed_exec_id: Option<ExecutionId> = None;
-        // Captures the outcome so `finish()` can be called *after* the
-        // transaction resolves — never from inside the still-open closure,
-        // matching `TransactionalStartOutcome::finish`'s documented contract
-        // exactly ("call this only after the caller's outer transaction has
-        // committed"). Left `None` on every crash path (the closure returns
-        // `Err` before reaching the point where this is set), so `finish()`
-        // is correctly never called for a rolled-back attempt — dropping the
+        // Holds the outcome so `finish()` runs *after* the transaction
+        // resolves, never inside the open closure. That is the documented
+        // contract of `TransactionalStartOutcome::finish` ("call this only
+        // after the caller's outer transaction has committed"). Every crash
+        // path returns `Err` before this is set, so it stays `None` and
+        // `finish()` never runs for a rolled-back attempt. Dropping the
         // outcome there is the documented-safe no-op.
         let mut pending_finish: Option<TransactionalStartOutcome> = None;
 
@@ -693,10 +676,9 @@ async fn fault_injection_zero_orphans_across_five_hundred_randomized_crash_point
         }))
         .await;
 
-        // Strictly after the transaction has resolved, and only on the
-        // committed path — `pending_finish` is `Some` exactly when
-        // `crash_point == 0` (no crash) and the transaction therefore
-        // committed.
+        // Run only after the transaction resolves, on the committed path.
+        // `pending_finish` is `Some` exactly when `crash_point == 0`, so the
+        // transaction committed.
         if result.is_ok()
             && let Some(outcome) = pending_finish
         {
@@ -724,14 +706,10 @@ async fn fault_injection_zero_orphans_across_five_hundred_randomized_crash_point
                 events_present,
                 "iteration {i}: workflow row exists without its WorkflowStarted event"
             );
-            // AC2/AC5's atomicity promise names the "initial dispatchable
-            // task-queue row" as a fourth artifact staged in the same
-            // transaction — review finding H2: an earlier revision of this
-            // loop watched only the domain row, the execution row, and the
-            // WorkflowStarted event, so a future regression that moved task
-            // enqueueing outside the transaction boundary would have gone
-            // undetected here even though the two simpler one-shot tests
-            // above already check it.
+            // AC2/AC5 name the initial dispatchable task-queue row as a fourth
+            // artifact staged in the same transaction. Watch it here too. A
+            // regression that moved task enqueueing outside the transaction would
+            // otherwise go unseen in this loop.
             assert!(
                 task_present,
                 "iteration {i}: workflow row exists without its dispatchable task-queue row"
@@ -765,13 +743,12 @@ async fn fault_injection_zero_orphans_across_five_hundred_randomized_crash_point
 }
 
 /// The one legitimate alternative to "start first, then insert a domain row
-/// referencing `outcome.exec_id`": a domain row inserted FIRST with a
-/// placeholder foreign key, then patched with the real `exec_id` once the
-/// start call returns it — all inside the same transaction (review finding
-/// H1's replacement for the dead `domain_write_first` flag). Proves atomicity
-/// holds for this ordering too, with its own focused, deterministic
-/// commit/rollback coverage rather than folding a synthetic reordering into
-/// the randomized loop above.
+/// referencing `outcome.exec_id`".
+///
+/// A domain row goes in FIRST with a placeholder foreign key. The real
+/// `exec_id` patches it once the start call returns, all inside the same
+/// transaction. This proves atomicity for this ordering, with focused,
+/// deterministic commit and rollback coverage.
 #[tokio::test]
 async fn atomicity_holds_when_domain_row_is_written_before_the_start() {
     let (database_url, _container) = setup_database().await;
@@ -833,11 +810,10 @@ async fn atomicity_holds_when_domain_row_is_written_before_the_start() {
     assert_eq!(patched_exec_id, exec_id.as_uuid());
 }
 
-/// The mirror-image rollback for the domain-write-first ordering above: a
+/// The mirror-image rollback for the domain-write-first ordering above. A
 /// forced failure *after* the start call but *before* the patch-in UPDATE
-/// must leave neither the placeholder domain row nor the workflow — the
-/// placeholder row was staged inside the same still-open transaction as the
-/// start, so both roll back together.
+/// must leave neither the placeholder row nor the workflow. Both were staged
+/// in the same open transaction, so both roll back together.
 #[tokio::test]
 async fn rollback_after_domain_first_write_leaves_neither_placeholder_nor_workflow() {
     let (database_url, _container) = setup_database().await;
@@ -920,9 +896,8 @@ async fn honors_workflow_info_execution_timeout_and_concurrency_key_defaults() {
         cols.execution_timeout.is_some(),
         "the declared #[workflow(execution_timeout = \"1h\")] must be applied"
     );
-    // AC3's own issue text names `sla` explicitly alongside `execution_timeout`
-    // and concurrency key — review finding C1: this was previously untested
-    // even though `resolve_transactional_start_defaults` computes it.
+    // AC3's issue text names `sla` alongside `execution_timeout` and the
+    // concurrency key. `resolve_transactional_start_defaults` computes it.
     assert!(
         cols.sla.is_some(),
         "the declared #[workflow(sla = \"30m\")] must be applied"
@@ -981,36 +956,33 @@ async fn plain_workflow_with_no_declared_policies_gets_no_defaults() {
     assert!(concurrency_cap.is_none());
 }
 
-/// Codex review (issue #763), "Carry the default queue on the handle
-/// client": the falsifying proof. `resolve_transactional_queue_name` used to
-/// fall back to the process-global `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE`
-/// static when a start supplied no explicit `TransactionalStartOptions::queue_name`
-/// — a static that is write-once-if-unset and first-writer-wins for the whole
-/// process, so it goes stale the moment a SECOND, differently-configured
-/// runtime is built in the same process after an earlier one already
-/// initialized it (exactly the finding's named "second runtime after an
-/// earlier one initialized the global" scenario).
+/// Issue #763: the falsifying proof that the handle client carries the
+/// default queue.
 ///
-/// This test reproduces that scenario directly: it pre-poisons the global
-/// with a queue name that belongs to nobody real (`stale-global-queue`,
-/// simulating an unrelated earlier runtime), then builds a client carrying
-/// its OWN, different queue list via `.with_queues(...)` (mirroring how the
-/// plugin's production wiring in `autumn-harvest-plugin/src/plugin.rs` now
-/// threads `runtime.api_runtime().queues()` through). A start with no
-/// explicit per-call override must land on the CLIENT's own configured queue
-/// — never the stale global, and never the literal `"default"`.
+/// `resolve_transactional_queue_name` used to fall back to the process-global
+/// `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE` static when a start
+/// gave no `TransactionalStartOptions::queue_name`. That static is
+/// write-once-if-unset and first-writer-wins for the whole process. So it
+/// goes stale when a SECOND, differently-configured runtime starts in the
+/// same process after an earlier one initialized it.
 ///
-/// Under the pre-fix code this assertion fails (it resolves to
-/// `stale-global-queue`, the poisoned global), which is exactly why this is
-/// the decisive regression test for the fix rather than merely exercising
-/// the new code path.
+/// This test reproduces that scenario. It pre-poisons the global with a
+/// queue name that belongs to nobody (`stale-global-queue`), as an unrelated
+/// earlier runtime would. It then builds a client with its OWN queue list via
+/// `.with_queues(...)`. The production wiring in
+/// `autumn-harvest-plugin/src/plugin.rs` threads
+/// `runtime.api_runtime().queues()` the same way. A start with no per-call
+/// override must land on the CLIENT's queue. It must never land on the stale
+/// global or on the literal `"default"`.
+///
+/// The pre-fix code fails this assertion: it resolves to the poisoned
+/// `stale-global-queue`. That makes this the decisive regression test.
 #[tokio::test]
 async fn queue_defaults_to_the_clients_own_configured_queue_not_a_stale_process_global() {
     let (database_url, _container) = setup_database().await;
 
-    // Simulate an earlier, unrelated runtime having already initialized the
-    // process-global default queue static to a value that belongs to no real
-    // worker fleet in this test.
+    // Simulate an earlier, unrelated runtime that already set the
+    // process-global default queue static to a queue no worker serves.
     {
         let mut lock = autumn_harvest::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE
             .write()
@@ -1057,13 +1029,12 @@ async fn queue_defaults_to_the_clients_own_configured_queue_not_a_stale_process_
     );
 }
 
-/// Companion to the test above: with no `.with_queues(...)` call at all (the
-/// plain `single_shard_client` helper every other test in this file uses),
-/// a start with no explicit per-call override must still fall through to the
-/// literal `"default"` — the same final fallback the HTTP
-/// `POST /workflows/{name}/start` route uses. Guards the innermost fallback
-/// tier against an accidental future regression now that the process-global
-/// fallback tier has been removed entirely.
+/// Companion to the test above. With no `.with_queues(...)` call, as in the
+/// plain `single_shard_client` helper, a start with no per-call override
+/// must fall through to the literal `"default"`. The HTTP
+/// `POST /workflows/{name}/start` route uses the same final fallback. This
+/// guards the innermost fallback tier, now that the process-global tier is
+/// gone.
 #[tokio::test]
 async fn queue_falls_back_to_the_literal_default_with_no_configured_queues() {
     let (database_url, _container) = setup_database().await;
@@ -1178,17 +1149,16 @@ async fn conflict_policy_use_existing_attaches_without_a_second_workflow_started
 }
 
 /// `WorkflowIdConflictPolicy::TerminateExisting` against a still-active prior
-/// (no worker is running in this test, so the first start never progresses
-/// past `RUNNING`) forces `inline_cancel`, which durably cancels the prior
-/// AND populates `TransactionalStartOutcome::deferred.checks` with a real,
-/// non-empty entry (`(exec_id, workflow_name)`) — unlike every other test in
-/// this suite, whose `deferred` is always empty. Calling `finish()`
-/// *strictly after* the transaction commits must not panic or hang, proving
-/// both that the documented post-commit usage genuinely works end to end,
-/// and — as a regression guard — that it correctly resolves a pool
-/// connection for a *single-shard* client (`self.shard == ShardId::UNENCODED`,
-/// which `ShardedDbPool::exact_pool_for` cannot resolve; see
-/// `TransactionalStartOutcome::finish`'s use of `pool_for` instead).
+/// forces `inline_cancel`. No worker runs here, so the first start stays
+/// `RUNNING`. `inline_cancel` durably cancels the prior. It also fills
+/// `TransactionalStartOutcome::deferred.checks` with a real
+/// `(exec_id, workflow_name)` entry. Every other test here has an empty
+/// `deferred`. A `finish()` call *strictly after* the commit must not panic
+/// or hang. That proves the documented post-commit usage works end to end.
+/// It also guards pool resolution for a *single-shard* client
+/// (`self.shard == ShardId::UNENCODED`). `ShardedDbPool::exact_pool_for`
+/// cannot resolve that, so `TransactionalStartOutcome::finish` uses
+/// `pool_for` instead.
 #[tokio::test]
 async fn finish_after_commit_dispatches_diagnostics_for_a_terminate_existing_collision() {
     let (database_url, _container) = setup_database().await;
@@ -1240,17 +1210,17 @@ async fn finish_after_commit_dispatches_diagnostics_for_a_terminate_existing_col
     );
     assert_ne!(first.exec_id, second.exec_id);
 
-    // `execution::inline_cancel` genuinely ran on the prior — a durable
-    // `WorkflowCancelled` event was appended — proving `deferred.checks` is
-    // non-empty for this outcome (asserted structurally as "does not panic"
-    // below, since the field is private to the crate's own module). The
-    // row's FINAL `state` column is then sealed to `CONTINUED_AS_NEW` by the
-    // `replace_execution` call that unconditionally follows `inline_cancel`
-    // in the same `ActiveConflictBehavior::Terminate` branch (see
-    // `execution.rs`; this is the general terminate-and-replace mechanism
-    // shared with the `TerminateIfRunning` reuse policy, not something
-    // `start_workflow_transactional` introduces) — so the *event log* records
-    // the cancellation while the *state column* reads CONTINUED_AS_NEW.
+    // `execution::inline_cancel` ran on the prior and appended a durable
+    // `WorkflowCancelled` event. So `deferred.checks` is non-empty for this
+    // outcome. The field is private to the crate, so the test asserts it
+    // structurally as "does not panic" below. The `replace_execution` call
+    // that always follows `inline_cancel` in the same
+    // `ActiveConflictBehavior::Terminate` branch then seals the row's FINAL
+    // `state` to `CONTINUED_AS_NEW`. That is the general terminate-and-replace
+    // mechanism in `execution.rs`, shared with the `TerminateIfRunning` reuse
+    // policy. `start_workflow_transactional` does not introduce it. So the
+    // *event log* records the cancellation, while the *state column* reads
+    // CONTINUED_AS_NEW.
     assert_eq!(
         workflow_cancelled_event_count(&mut fresh, first.exec_id).await,
         1,
@@ -1261,33 +1231,33 @@ async fn finish_after_commit_dispatches_diagnostics_for_a_terminate_existing_col
         "CONTINUED_AS_NEW"
     );
 
-    // The whole point of this test: call `finish()` strictly after the
-    // transaction that produced it has already committed (proven above by
-    // `second`/the cancellation both being independently visible from a
-    // fresh connection), with a genuinely non-empty `deferred.checks`.
+    // Call `finish()` strictly after its transaction committed, with a
+    // non-empty `deferred.checks`. A fresh connection sees both `second` and
+    // the cancellation above, which proves the commit.
     second.finish().await;
 }
 
-/// Regression guard for the `WorkflowIdConflictPolicy::TerminateExisting`
-/// path's atomicity. Unlike the HTTP start route (which runs a separate,
-/// unlocked pre-check step for the native `TerminateIfRunning` reuse policy
-/// before its own locked start transaction), `start_workflow_transactional`
-/// has no such separate step: the ENTIRE collision resolution for the prior
-/// execution — `execution::inline_cancel` followed by `replace_execution` —
-/// runs inside `start_or_load_workflow_execution_collect`'s own nested
-/// `conn.transaction()` call, on the SAME caller-owned `conn` (`diesel_async`
-/// issues a `SAVEPOINT`, not a fresh `BEGIN`, when `conn` is already inside
-/// an open transaction) — so none of it is independently durable. If the
-/// caller's OUTER transaction subsequently rolls back (a downstream failure
-/// *after* `start_workflow_transactional` has already returned `Ok`), that
-/// whole resolution must roll back right along with the creation of the
-/// fresh one — leaving the prior back in `RUNNING`, with no successor ever
-/// having existed. A version of `inline_cancel`/`replace_execution` that
-/// instead opened a genuinely independent top-level transaction (bypassing
-/// the caller's own `conn`) would durably strand the prior sealed
-/// `CONTINUED_AS_NEW` (with a stray `WorkflowCancelled` event in its
-/// history) with no successor even after this outer rollback; this test
-/// catches that class of regression.
+/// Regression guard for the atomicity of the
+/// `WorkflowIdConflictPolicy::TerminateExisting` path.
+///
+/// The HTTP start route runs a separate, unlocked pre-check step for the
+/// native `TerminateIfRunning` reuse policy before its locked start
+/// transaction. `start_workflow_transactional` has no such step. The ENTIRE
+/// collision resolution for the prior, `execution::inline_cancel` and then
+/// `replace_execution`, runs inside the nested `conn.transaction()` of
+/// `start_or_load_workflow_execution_collect`. It uses the SAME caller-owned
+/// `conn`. `diesel_async` issues a `SAVEPOINT`, not a fresh `BEGIN`, when
+/// `conn` is already in an open transaction. So none of it is independently
+/// durable. Suppose the caller's OUTER transaction later rolls back, after
+/// `start_workflow_transactional` returned `Ok`. The whole resolution must
+/// then roll back with the fresh execution. The prior is back in `RUNNING`,
+/// and no successor ever existed.
+///
+/// An `inline_cancel`/`replace_execution` that opened its own top-level
+/// transaction would bypass the caller's `conn`. It would durably strand the
+/// prior sealed `CONTINUED_AS_NEW`, with a stray `WorkflowCancelled` event and
+/// no successor, even after the outer rollback. This test catches that class
+/// of regression.
 #[tokio::test]
 async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancellation_too() {
     let (database_url, _container) = setup_database().await;
@@ -1320,10 +1290,10 @@ async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancella
     let mut fresh = connect(&database_url).await;
     assert_eq!(execution_state(&mut fresh, first_exec_id).await, "RUNNING");
 
-    // Now attempt a TerminateExisting collision, but fail the OUTER
-    // transaction *after* `start_workflow_transactional` has already
-    // returned `Ok` — i.e. after the internal pre-check-cancel SAVEPOINT
-    // has been released and the fresh execution row has been staged.
+    // Attempt a TerminateExisting collision, then fail the OUTER transaction
+    // *after* `start_workflow_transactional` returned `Ok`. By then the
+    // internal pre-check-cancel SAVEPOINT is released, and the fresh
+    // execution row is staged.
     let mut conn2 = connect(&database_url).await;
     let result: Result<(), HarvestError> = Box::pin(conn2.transaction::<(), HarvestError, _>({
         let client = client.clone();
@@ -1344,9 +1314,8 @@ async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancella
             );
             assert_ne!(outcome.exec_id, first_exec_id);
 
-            // Simulate a downstream failure in the caller's own code, *after*
-            // the start (and the cancellation it performed) has already been
-            // staged in this same outer transaction.
+            // Simulate a downstream failure in the caller's own code. The start and
+            // its cancellation are already staged in this outer transaction.
             Err(HarvestError::Config(
                 "simulated failure after terminate-existing collision".into(),
             ))
@@ -1376,41 +1345,35 @@ async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancella
     );
 }
 
-/// Regression guard for a Codex review finding on PR #1148 ("Require a real
-/// outer transaction"): the module doc comment's Section 4 above explicitly
-/// documents (and the two tests immediately above already exercise, always
-/// via an outer `conn.transaction()` wrapper) that
-/// `start_workflow_transactional` permits a caller to pass a genuinely
-/// *bare*, non-transaction-wrapped `conn`. The non-keyed branch tells
-/// `start_or_load_workflow_execution_collect` `in_outer_transaction = true`,
-/// which lets a `TerminateExisting`/`TerminateIfRunning` pre-check
-/// cancellation defer its follow-up dispatch on the assumption that
-/// *something* will revert the cancellation if the replacement start
-/// subsequently fails. On a genuinely bare connection there was previously
-/// nothing to make that true: a replacement-start failure (forced here via
-/// an oversized input, so `execution::replace_execution`'s payload-cap check
-/// fails *after* `execution::inline_cancel` has already durably cancelled
-/// the prior in the same statement sequence) would leave the prior
-/// permanently cancelled with no successor and no way to recover the lost
-/// follow-up dispatch — the whole call returns `Err`, so there is no
-/// `TransactionalStartOutcome.deferred` to recover it from either.
+/// Regression guard (PR #1148): a pre-check cancel on a bare connection must
+/// not strand the prior.
+///
+/// Section 4 of the module doc permits a *bare* `conn` with no transaction
+/// wrapper. The two tests above always use an outer `conn.transaction()`. The
+/// non-keyed branch passes `in_outer_transaction = true` to
+/// `start_or_load_workflow_execution_collect`. That lets a
+/// `TerminateExisting`/`TerminateIfRunning` pre-check cancellation defer its
+/// follow-up dispatch. It assumes that *something* reverts the cancellation
+/// if the replacement start fails. On a bare connection, nothing did. Here an
+/// oversized input fails the payload-cap check of
+/// `execution::replace_execution`. That happens *after*
+/// `execution::inline_cancel` durably cancelled the prior in the same
+/// statement sequence. The prior then stayed cancelled, with no successor.
+/// The lost follow-up dispatch had no recovery path. The call returns `Err`,
+/// so no `TransactionalStartOutcome.deferred` holds it either.
 ///
 /// The fix wraps the whole non-keyed call to
 /// `start_or_load_workflow_execution_collect` in its own nested
-/// `conn.transaction()` (mirroring the keyed branch,
-/// `start_workflow_transactional_idempotent`, which already did this
-/// before this PR) — `diesel_async` issues a genuine top-level `BEGIN` when
-/// `conn` has no already-open transaction, so the cancel-then-replace
-/// sequence becomes atomic on its own, without requiring the caller to have
-/// opened one. This test proves that atomicity holds on a bare connection,
-/// not just on one already wrapped by the caller.
+/// `conn.transaction()`. The keyed branch,
+/// `start_workflow_transactional_idempotent`, already did this. On a `conn`
+/// with no open transaction, `diesel_async` issues a real top-level `BEGIN`.
+/// So the cancel-then-replace sequence is atomic on its own. This test proves
+/// that atomicity on a bare connection.
 ///
 /// **This is Harvest's own *internal* multi-statement atomicity — not the
 /// same thing as dual-write atomicity with a caller's own domain write.**
 /// See `bare_connection_commits_the_start_immediately_no_dual_write_atomicity`
-/// immediately below for the boundary of that distinction (the subject of a
-/// later Codex finding on this same fix, "Require an outer transaction for
-/// atomic starts").
+/// immediately below for the boundary of that distinction.
 #[tokio::test]
 async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_replacement_failure()
 {
@@ -1421,9 +1384,8 @@ async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_re
     let client = single_shard_client(&database_url).with_max_workflow_input_bytes(100);
     let workflow_id = "order-bare-conn-terminate-1";
 
-    // Start the first execution normally, via a transaction wrapper (how it
-    // starts is irrelevant to what this test proves — only the SECOND call
-    // below, on a genuinely bare connection, matters).
+    // Start the first execution normally, in a transaction wrapper. Only the
+    // SECOND call below, on a bare connection, matters to this test.
     let mut setup_conn = connect(&database_url).await;
     let first: TransactionalStartOutcome = Box::pin(
         setup_conn.transaction::<TransactionalStartOutcome, HarvestError, _>({
@@ -1449,10 +1411,8 @@ async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_re
     let mut fresh = connect(&database_url).await;
     assert_eq!(execution_state(&mut fresh, first_exec_id).await, "RUNNING");
 
-    // The whole point of this test: a BARE connection with no
-    // `conn.transaction()` wrapper at all — exactly what the module doc's
-    // Section 4 documents as permitted, and what this call is documented to
-    // make safe entirely on its own.
+    // A BARE connection with no `conn.transaction()` wrapper. Section 4 of
+    // the module doc permits it, and this call must make it safe on its own.
     let mut bare_conn = connect(&database_url).await;
     let oversized_input = serde_json::json!({
         "order_id": workflow_id,
@@ -1499,39 +1459,34 @@ async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_re
     );
 }
 
-/// Codex review (issue #763), "Require an outer transaction for atomic
-/// starts": documents and proves the precise boundary of the atomicity
-/// guarantee for a genuinely bare (non-transaction-wrapped) connection.
+/// Issue #763: proves the exact boundary of the atomicity guarantee on a
+/// bare connection with no transaction wrapper.
 ///
-/// The test immediately above proves Harvest's own *internal*
-/// multi-statement sequence (a `TerminateExisting` collision's
-/// cancel-then-replace pair) stays atomic as a unit on a bare connection —
-/// but that is a narrower guarantee than this call's headline promise
-/// ("commits or rolls back atomically with the caller's own domain write").
-/// On a bare connection, `diesel-async`'s nested-transaction machinery has
-/// nothing to nest *into*: it issues a real, top-level `BEGIN ... COMMIT` of
-/// its own that fully completes *before* `start_workflow_transactional`
-/// returns (confirmed against `diesel-async 0.9.2`'s own transaction manager,
-/// which branches on `TransactionManagerStatus::transaction_depth()` —
-/// `None` on a bare connection issues `BEGIN`/`COMMIT`; `Some(_)` on an
-/// already-open transaction issues `SAVEPOINT`/`RELEASE SAVEPOINT` instead).
-/// There is nothing left "open" for a caller write performed afterward on
-/// that same connection to share a rollback boundary with.
+/// The test above proves that Harvest's own *internal* multi-statement
+/// sequence stays atomic on a bare connection. That sequence is the
+/// cancel-then-replace pair of a `TerminateExisting` collision. It is a
+/// narrower guarantee than the headline promise of this call ("commits or
+/// rolls back atomically with the caller's own domain write"). On a bare
+/// connection, the nested-transaction machinery of `diesel-async` has nothing
+/// to nest *into*. It issues its own top-level `BEGIN ... COMMIT`, which
+/// completes *before* `start_workflow_transactional` returns. The transaction
+/// manager of `diesel-async 0.9.2` confirms this. It branches on
+/// `TransactionManagerStatus::transaction_depth()`. `None` on a bare
+/// connection issues `BEGIN`/`COMMIT`. `Some(_)` on an open transaction
+/// issues `SAVEPOINT`/`RELEASE SAVEPOINT` instead. So nothing stays open for
+/// a later caller write on that connection to share a rollback boundary with.
 ///
-/// This proves that boundary concretely: after calling
-/// `start_workflow_transactional` on a bare connection, the started
-/// execution's row and `WorkflowStarted` event are ALREADY visible from a
-/// completely independent connection — durably committed — even though this
-/// test itself never issues an explicit `COMMIT`. A caller's own domain
-/// write, made afterward on that same bare connection, subsequently failing
-/// does NOT roll the workflow start back — proving a bare connection does
-/// not provide dual-write atomicity. See "Connection discipline" in
-/// `docs/transactional-start.md` for the corrected usage guidance (the fix
-/// for this finding was a documentation correction — see the doc comment on
-/// `WorkflowHandleClient::start_workflow_transactional` — not a runtime
-/// behavior change: rejecting bare connections outright would break the
-/// legitimate narrower use case the test above already relies on and
-/// documents).
+/// This test proves that boundary. After `start_workflow_transactional` on a
+/// bare connection, an independent connection ALREADY sees the execution row
+/// and `WorkflowStarted` event. They are durably committed, though the test
+/// never issues a `COMMIT`. A later failing domain write on that same bare
+/// connection does NOT roll the start back. So a bare connection gives no
+/// dual-write atomicity. See "Connection discipline" in
+/// `docs/transactional-start.md` for the usage guidance. The fix was a
+/// documentation correction on
+/// `WorkflowHandleClient::start_workflow_transactional`, not a runtime
+/// change. Rejecting bare connections would break the narrower use case that
+/// the test above relies on.
 #[tokio::test]
 async fn bare_connection_commits_the_start_immediately_no_dual_write_atomicity() {
     let (database_url, _container) = setup_database().await;
@@ -1551,11 +1506,10 @@ async fn bare_connection_commits_the_start_immediately_no_dual_write_atomicity()
         .expect("bare-connection start must succeed");
     assert!(outcome.created);
 
-    // Not a single explicit COMMIT has been issued by this test on
-    // `bare_conn` -- yet the workflow start is already fully durable, visible
-    // from a completely independent connection. There is nothing left
-    // "pending" for a caller write made afterward on `bare_conn` to share an
-    // atomic rollback boundary with.
+    // This test has issued no COMMIT on `bare_conn`. Yet the start is already
+    // durable and visible from an independent connection. Nothing stays
+    // "pending" for a later caller write on `bare_conn` to share a rollback
+    // boundary with.
     let mut fresh = connect(&database_url).await;
     assert_eq!(execution_row_count(&mut fresh, workflow_id).await, 1);
     assert_eq!(
@@ -1567,12 +1521,11 @@ async fn bare_connection_commits_the_start_immediately_no_dual_write_atomicity()
         "RUNNING"
     );
 
-    // Simulate the caller's OWN domain write, on the SAME bare connection,
-    // subsequently failing -- a primary-key violation on a second insert of
-    // the same row is the simplest reliable way to force one. If a bare
-    // connection provided dual-write atomicity, this failure would have to
-    // roll the workflow start back too; it does not, because the start
-    // already committed before this test ever touched `bare_conn` again.
+    // Simulate the caller's OWN domain write failing on the SAME bare
+    // connection. A primary-key violation from a second insert of the same
+    // row forces it reliably. With dual-write atomicity, this failure would
+    // roll the start back too. It does not, because the start already
+    // committed before the test touched `bare_conn` again.
     diesel::sql_query("INSERT INTO t763_orders (id, exec_id) VALUES ($1, $2)")
         .bind::<Text, _>(workflow_id.to_string())
         .bind::<SqlUuid, _>(outcome.exec_id.as_uuid())
@@ -1604,15 +1557,16 @@ async fn bare_connection_commits_the_start_immediately_no_dual_write_atomicity()
     );
 }
 
-/// Codex review (issue #763), "Validate transactional idempotency keys":
-/// unlike the plain HTTP start route
-/// (`autumn-harvest-plugin::api::validate_start_idempotency_key`), the
-/// transactional-start client accepted ANY string as an idempotency key with
-/// no trim/empty/length validation — an accidental empty or whitespace-only
-/// key became a real `(workflow_name, "")` claim in `harvest_start_idempotency`
-/// that would silently dedupe every OTHER unrelated transactional start for
-/// the same workflow against each other. This proves an empty key is now
-/// rejected before anything is written, matching the HTTP route.
+/// Issue #763: transactional idempotency keys are validated.
+///
+/// The plain HTTP start route validates keys
+/// (`autumn-harvest-plugin::api::validate_start_idempotency_key`). The
+/// transactional-start client accepted ANY string, with no trim, empty or
+/// length check. An empty or whitespace-only key became a real
+/// `(workflow_name, "")` claim in `harvest_start_idempotency`. That claim
+/// silently deduped every OTHER unrelated transactional start of the same
+/// workflow. This proves that an empty key is now rejected before any write,
+/// as on the HTTP route.
 #[tokio::test]
 async fn empty_idempotency_key_is_rejected_writes_nothing() {
     let (database_url, _container) = setup_database().await;
@@ -1661,9 +1615,8 @@ async fn empty_idempotency_key_is_rejected_writes_nothing() {
     );
 }
 
-/// Sibling to the empty-key case: a whitespace-only key must be treated the
-/// same as empty (rejected), not accepted as a distinct, non-empty-looking
-/// key that happens to be all spaces.
+/// Sibling to the empty-key case: a whitespace-only key is rejected like an
+/// empty one. It is not a distinct key that happens to be all spaces.
 #[tokio::test]
 async fn whitespace_only_idempotency_key_is_rejected_writes_nothing() {
     let (database_url, _container) = setup_database().await;
@@ -1702,11 +1655,10 @@ async fn whitespace_only_idempotency_key_is_rejected_writes_nothing() {
     );
 }
 
-/// A key that survives trimming but is absurdly long must be rejected with a
-/// clean, typed error — not left to abort the caller's own transaction with a
-/// raw Postgres error when the `(workflow_name, idempotency_key)` composite
-/// PRIMARY KEY on `harvest_start_idempotency` exceeds btree's index tuple
-/// size limit.
+/// A key that survives trimming but is absurdly long gets a clean, typed
+/// error. Otherwise the `(workflow_name, idempotency_key)` composite PRIMARY
+/// KEY on `harvest_start_idempotency` exceeds the btree index tuple size
+/// limit. The raw Postgres error then aborts the caller's own transaction.
 #[tokio::test]
 async fn oversized_idempotency_key_is_rejected_writes_nothing() {
     let (database_url, _container) = setup_database().await;
@@ -1886,13 +1838,12 @@ async fn idempotency_key_deduplicates_two_committed_starts() {
     assert_eq!(total, 1, "exactly one execution row must exist");
 }
 
-/// Review finding M3: the idempotency-key **reservation itself** — not just
-/// the execution it protects — must be undone by an outer rollback, exactly
-/// like every other write this API stages
-/// (`start_or_load_workflow_execution_idempotent` reserves the claim and
-/// performs the start inside one transaction nested on the caller's own
-/// `conn`). A caller retry after a genuine crash/rollback must NOT find its
-/// key permanently "burned" with no execution to show for it.
+/// An outer rollback must undo the idempotency-key **reservation itself**,
+/// not just the execution it protects, like every other write this API
+/// stages. `start_or_load_workflow_execution_idempotent` reserves the claim
+/// and starts the run in one transaction nested on the caller's `conn`. A
+/// caller retry after a crash or rollback must NOT find its key permanently
+/// "burned" with no execution.
 #[tokio::test]
 async fn idempotency_key_is_not_burned_by_a_rolled_back_start() {
     let (database_url, _container) = setup_database().await;
@@ -1933,9 +1884,8 @@ async fn idempotency_key_is_not_burned_by_a_rolled_back_start() {
         "the rolled-back attempt must have left no execution row behind"
     );
 
-    // Retry with the SAME idempotency key, in a NEW transaction that
-    // actually commits — must succeed as a fresh start, not be permanently
-    // rejected as an already-consumed key.
+    // Retry with the SAME key in a NEW transaction that commits. It must
+    // succeed as a fresh start, not fail as an already-consumed key.
     let mut conn2 = connect(&database_url).await;
     let retry: TransactionalStartOutcome = Box::pin(
         conn2.transaction::<TransactionalStartOutcome, HarvestError, _>({
@@ -1971,35 +1921,30 @@ async fn idempotency_key_is_not_burned_by_a_rolled_back_start() {
 }
 
 // ---------------------------------------------------------------------------
-// Committed-replay probe ordering & configured window (PR review findings).
+// Committed-replay probe ordering and configured window.
 //
-// A code-review pass on this PR found two real bugs in `start_workflow_transactional`:
+// These tests pin two bugs in `start_workflow_transactional`:
 // (1) the idempotency-key dedup check ran *after* the fresh-start-only
-//     validation (schema, debounce/batch/throttle rejection), so a retry of
-//     an already-committed keyed start could be spuriously rejected by a
-//     rule that only makes sense for a genuinely fresh admission if that
-//     rule had changed (or newly applied) since the original delivery; and
-// (2) the reserve step hardcoded `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h)
-//     instead of the client's configured
-//     `WorkflowHandleClient::with_start_idempotency_window`, silently
-//     ignoring an operator's shorter (or longer) configured window.
+//     validation (schema, debounce/batch/throttle rejection). Suppose such a
+//     rule changed after the delivery. A retry of an already-committed keyed
+//     start could then fail on a rule that applies only to a fresh admission.
+// (2) the reserve step hardcoded `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h).
+//     It ignored the configured
+//     `WorkflowHandleClient::with_start_idempotency_window`.
 //
-// Both mirror the already-established issue #808 invariant the HTTP start
-// route enforces (`probe_committed_start_replay` runs before every
-// fresh-start-only rejection, and reads `api_state.start_idempotency_window()`
-// rather than the hardcoded default) -- these tests prove the in-process
-// `start_workflow_transactional` path now matches it.
+// The HTTP start route already enforces both through the issue #808
+// invariant. `probe_committed_start_replay` runs before every
+// fresh-start-only rejection. It reads `api_state.start_idempotency_window()`,
+// not the hardcoded default. These tests prove the in-process path matches.
 // ---------------------------------------------------------------------------
 
-/// Finding (1): a retry of an already-committed keyed start must dedupe even
-/// when the target workflow's published input schema has *tightened* since
-/// the original delivery. Two separate clients simulate the drift: the first
-/// (used for the original delivery) has no schema attached to
-/// `t763_plain_workflow`; the second (used for the retry) attaches a schema
-/// the very same raw input would fail if validation genuinely ran. Both
-/// point at the same database and register the same handler function under
-/// the same name, so the `(workflow_name, idempotency_key)` dedup key
-/// resolves identically for both.
+/// Bug (1): a retry of an already-committed keyed start must dedupe, even
+/// when the workflow's published input schema has *tightened* since the
+/// original delivery. Two clients simulate the drift. The first, for the
+/// original delivery, has no schema on `t763_plain_workflow`. The second, for
+/// the retry, attaches a schema that the same raw input fails. Both use the
+/// same database and register the same handler under the same name. So the
+/// `(workflow_name, idempotency_key)` dedup key resolves identically.
 #[tokio::test]
 async fn committed_replay_dedupes_despite_a_schema_that_tightened_since_the_original_delivery() {
     let (database_url, _container) = setup_database().await;
@@ -2078,10 +2023,10 @@ async fn committed_replay_dedupes_despite_a_schema_that_tightened_since_the_orig
     );
 }
 
-/// Finding (1), the debounce disjunct: a retry of an already-committed keyed
-/// start must dedupe even when the target workflow has *gained* a debounce
-/// policy since the original delivery -- the debounce/batch/throttle
-/// deferred-admission rejection only applies to a genuinely fresh start.
+/// Bug (1), the debounce disjunct. A retry of an already-committed keyed
+/// start must dedupe, even when the workflow has *gained* a debounce policy
+/// since the original delivery. The deferred-admission rejection applies only
+/// to a fresh start.
 #[tokio::test]
 async fn committed_replay_dedupes_despite_a_debounce_policy_gained_since_the_original_delivery() {
     let (database_url, _container) = setup_database().await;
@@ -2151,24 +2096,21 @@ async fn committed_replay_dedupes_despite_a_debounce_policy_gained_since_the_ori
     assert_eq!(execution_row_count(&mut fresh, order_id).await, 1);
 }
 
-/// Finding (2): the idempotency dedup window must be the CLIENT's configured
+/// Bug (2): the idempotency dedup window must be the CLIENT's configured
 /// [`WorkflowHandleClient::with_start_idempotency_window`], not the hardcoded
-/// `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h). Proven by backdating the
-/// reservation 5 minutes -- past a short 60-second configured window, but
-/// still well inside the 24h default -- and asserting the retry is treated
-/// as EXPIRED (a genuinely fresh execution), which could only happen if the
-/// short window is actually consulted; under the pre-fix hardcoded default
-/// this same backdate would still be "live" and the retry would wrongly
-/// dedupe.
+/// `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h). The test backdates the
+/// reservation 5 minutes. That is past a short 60-second configured window,
+/// but well inside the 24h default. The retry must then count as EXPIRED and
+/// start a fresh execution. Only the short window gives that result. Under
+/// the pre-fix default the reservation is still "live", and the retry wrongly
+/// dedupes.
 ///
-/// The two calls use **different `workflow_id`s** (mirroring
-/// `idempotency_key_deduplicates_two_committed_starts`) so the ONLY possible
-/// source of a dedupe is the idempotency-key reservation itself, never the
-/// orthogonal `workflow_id`-based reuse-policy collision (which would
-/// legitimately attach to a still-non-terminal first execution regardless of
-/// the idempotency window, since no worker runs in this test to complete
-/// it) -- that confound would otherwise mask whichever window is actually
-/// consulted.
+/// The two calls use **different `workflow_id`s**, as in
+/// `idempotency_key_deduplicates_two_committed_starts`. So only the
+/// idempotency-key reservation can cause a dedupe. The `workflow_id`-based
+/// reuse-policy collision cannot. It would attach to the non-terminal first
+/// execution whatever the window, because no worker runs here to complete
+/// it. That confound would mask which window the code consults.
 #[tokio::test]
 async fn keyed_retry_honors_the_clients_configured_idempotency_window_not_the_hardcoded_default() {
     let (database_url, _container) = setup_database().await;
@@ -2204,11 +2146,10 @@ async fn keyed_retry_honors_the_clients_configured_idempotency_window_not_the_ha
     .expect("first keyed start must succeed");
     assert!(first.created);
 
-    // Backdate the reservation 5 minutes -- past the configured 60-second
-    // window, but still well inside the hardcoded 24h default. If the
-    // hardcoded default were still consulted (the bug this test guards
-    // against), the retry below would wrongly dedupe to `first` even though
-    // it targets a completely different `workflow_id`.
+    // Backdate the reservation 5 minutes: past the configured 60-second
+    // window, but well inside the hardcoded 24h default. If the code used the
+    // hardcoded default, the retry would wrongly dedupe to `first`, though it
+    // targets a different `workflow_id`.
     let mut admin = connect(&database_url).await;
     diesel::sql_query(
         "UPDATE harvest_start_idempotency SET created_at = now() - interval '5 minutes' \
@@ -2338,10 +2279,10 @@ async fn debounced_workflow_is_rejected_because_admission_cannot_be_deferred() {
     );
 }
 
-/// Review finding H4: the deferred-admission guard is
-/// `debounce.is_some() || batch.is_some() || throttle.is_some()` — a single
-/// disjunct test (debounce, above) cannot catch a refactor that silently
-/// drops the batch or throttle arm. This covers the batch disjunct.
+/// The deferred-admission guard is
+/// `debounce.is_some() || batch.is_some() || throttle.is_some()`. The
+/// debounce test above cannot catch a refactor that drops the batch or
+/// throttle arm. This covers the batch disjunct.
 #[tokio::test]
 async fn batched_workflow_is_rejected_because_admission_cannot_be_deferred() {
     let (database_url, _container) = setup_database().await;
@@ -2374,9 +2315,8 @@ async fn batched_workflow_is_rejected_because_admission_cannot_be_deferred() {
     assert_eq!(execution_row_count(&mut fresh, "order-batched-1").await, 0);
 }
 
-/// Review finding H4, throttle disjunct — see
-/// `batched_workflow_is_rejected_because_admission_cannot_be_deferred`'s doc
-/// comment.
+/// The throttle disjunct; see
+/// `batched_workflow_is_rejected_because_admission_cannot_be_deferred`.
 #[tokio::test]
 async fn throttled_workflow_is_rejected_because_admission_cannot_be_deferred() {
     let (database_url, _container) = setup_database().await;
@@ -2446,19 +2386,19 @@ async fn unregistered_workflow_name_is_rejected() {
     );
 }
 
-/// Review finding M6: the transactional-start path threads the resolved
-/// gate decision through `GateMode::CheckCached` (see
-/// `docs/transactional-start.md`'s "Start-semantics parity" table) — this is
-/// the one behavioral test in the suite that actually arms a gate and
-/// proves (a) a matching `GateScope::WorkflowName` gate blocks the
-/// transactional start with `HarvestError::AdmissionBlocked`, writing
-/// nothing; (b) an UNRELATED workflow name is unaffected by the same
-/// still-armed gate, proving the scope is honored and not accidentally
-/// fleet-wide; and (c) disarming the gate immediately restores normal
-/// admission. Uses the dedicated `t763_gate_target_workflow` fixture, never
-/// used by any other test in this suite, so this is the ONLY test whose
-/// outcome depends on the process-global `GLOBAL_ADMISSION_GATE_CACHE` —
-/// see the module doc comment's "Execution" note.
+/// The transactional-start path threads the resolved gate decision through
+/// `GateMode::CheckCached`. See the "Start-semantics parity" table in
+/// `docs/transactional-start.md`. This is the one test here that arms a gate.
+/// It proves three things.
+/// (a) A matching `GateScope::WorkflowName` gate blocks the transactional
+/// start with `HarvestError::AdmissionBlocked` and writes nothing.
+/// (b) The same armed gate does not affect an UNRELATED workflow name. So the
+/// scope holds, and the gate is not fleet-wide.
+/// (c) Disarming the gate restores normal admission at once.
+/// It uses the dedicated `t763_gate_target_workflow` fixture, which no other
+/// test uses. So it is the ONLY test whose outcome depends on the
+/// process-global `GLOBAL_ADMISSION_GATE_CACHE`. See the module doc's
+/// "Execution" note.
 #[tokio::test]
 async fn admission_gate_blocks_a_matching_workflow_name_and_spares_others() {
     let (database_url, _container) = setup_database().await;
@@ -2522,9 +2462,9 @@ async fn admission_gate_blocks_a_matching_workflow_name_and_spares_others() {
         1
     );
 
-    // With the gate disarmed, the previously-blocked workflow name now
-    // starts normally — and reuses the SAME order_id, directly proving the
-    // earlier blocked attempt left no partial/conflicting state behind.
+    // With the gate disarmed, the blocked workflow name starts normally. It
+    // reuses the SAME order_id, which proves the blocked attempt left no
+    // partial or conflicting state.
     let now_allowed = start("t763_gate_target_workflow", "order-gate-blocked-1").await;
     assert!(
         now_allowed.is_ok(),
@@ -2563,7 +2503,6 @@ async fn lands_on_the_shard_backing_the_connection_never_the_other_shard() {
     )
     .with_workflows(all_test_workflows());
 
-    // The caller's connection is to SHARD 1's database.
     let mut shard1_conn = connect(&url_shard1).await;
     let outcome = Box::pin(shard1_conn.transaction::<_, HarvestError, _>({
         let client = client.clone();
@@ -2603,11 +2542,11 @@ async fn lands_on_the_shard_backing_the_connection_never_the_other_shard() {
     );
 }
 
-/// A multi-shard client cannot infer which shard the caller's connection
-/// belongs to, so omitting `.with_shard(...)` must be rejected rather than
-/// silently minting an execution id whose *encoded* shard disagrees with
-/// wherever the row actually landed (which would make it unreachable by any
-/// later exec-id-routed lookup — signal, cancel, describe, ...).
+/// A multi-shard client cannot infer the shard of the caller's connection. So
+/// it must reject a start with no `.with_shard(...)`. Otherwise it would mint
+/// an execution id whose *encoded* shard disagrees with where the row landed.
+/// Any later exec-id-routed lookup (signal, cancel, describe, ...) would then
+/// miss the row.
 #[tokio::test]
 async fn multi_shard_client_without_with_shard_is_rejected_writes_nothing() {
     let (url_shard0, _container_a) = setup_database().await;
@@ -2674,9 +2613,9 @@ async fn multi_shard_client_without_with_shard_is_rejected_writes_nothing() {
 async fn single_shard_deployment_needs_no_with_shard_call() {
     let (database_url, _container) = setup_database().await;
     let mut conn = connect(&database_url).await;
-    // `single_shard_client` never registers more than one shard, and this
-    // test never calls `.with_shard(...)` — mirroring AC4's "single-shard
-    // deployment needs no caller changes beyond passing the connection".
+    // `single_shard_client` registers one shard, and this test never calls
+    // `.with_shard(...)`. That matches AC4: "single-shard deployment needs no
+    // caller changes beyond passing the connection".
     let client = single_shard_client(&database_url);
 
     let outcome = Box::pin(conn.transaction::<_, HarvestError, _>({
@@ -2702,32 +2641,30 @@ async fn single_shard_deployment_needs_no_with_shard_call() {
         1
     );
     // An un-pinned transactional start mints its `ExecutionId` with the
-    // caller's client's CONCRETELY resolved default shard (issue #763 Codex
-    // review, "Default transactional starts to the actual shard") — never the
-    // bare `UNENCODED` sentinel, even in the single-shard case. This client's
-    // router is `ShardRouter::single()`, whose `default_shard()` is
-    // `ShardId::new(0)`, so this is byte-for-byte the "pre-sharding runtime"
-    // shard for a single-shard deployment. The point is that a single-shard
-    // deployment whose one shard is numbered something OTHER than 0 (see
+    // concretely resolved default shard of the client (issue #763). It is
+    // never the bare `UNENCODED` sentinel, even for a single shard. This
+    // client's router is `ShardRouter::single()`, whose `default_shard()` is
+    // `ShardId::new(0)`. So this is byte-for-byte the "pre-sharding runtime"
+    // shard of a single-shard deployment. A single-shard deployment whose one
+    // shard is NOT 0 now encodes ITS shard (see
     // `unpinned_start_on_a_non_default_single_shard_client_encodes_that_shard_not_zero`
-    // below) now correctly encodes ITS shard instead of leaving the id
-    // unencoded and letting the row's persisted `shard_id` column silently
-    // default to 0 regardless — a single-shard deployment still needs no
-    // shard-aware code at all, matching AC4.
+    // below). It no longer leaves the id unencoded, with the row's persisted
+    // `shard_id` silently defaulting to 0. A single-shard deployment still
+    // needs no shard-aware code, as AC4 requires.
     assert_eq!(outcome.exec_id.shard(), ShardId::new(0));
 }
 
-/// Codex review (issue #763), "Default transactional starts to the actual
-/// shard": a client built from a genuinely single-shard `ShardedDbPool`/
-/// `ShardRouter` pair whose one shard is NOT numbered 0 (carved out of a
-/// larger topology, or simply configured that way) must have an un-pinned
-/// start encode THAT shard — both in the returned `exec_id` and in the row's
-/// persisted `shard_id` column — never the bare `UNENCODED` sentinel and
-/// never a hardcoded 0. Before the fix, `StartWorkflowParams::shard_id()`
-/// (which persists the column every shard-scoped admission gate and the
-/// idempotency purge scanner reads) hardcoded 0 for an unencoded id
-/// regardless of the actual configured default shard, silently mislabeling
-/// this write's shard.
+/// Issue #763: an un-pinned start encodes the actual default shard.
+///
+/// The client is built from a single-shard `ShardedDbPool`/`ShardRouter` pair
+/// whose one shard is NOT 0. That shard may be carved out of a larger
+/// topology, or just configured that way. An un-pinned start must encode
+/// THAT shard, in the returned `exec_id` and in the row's persisted
+/// `shard_id` column. It must never use the bare `UNENCODED` sentinel or a
+/// hardcoded 0. Before the fix, `StartWorkflowParams::shard_id()` hardcoded 0
+/// for an unencoded id, whatever the configured default shard. That column
+/// feeds every shard-scoped admission gate and the idempotency purge
+/// scanner. So the write was silently mislabeled.
 #[tokio::test]
 async fn unpinned_start_on_a_non_default_single_shard_client_encodes_that_shard_not_zero() {
     let (database_url, _container) = setup_database().await;
@@ -2754,9 +2691,9 @@ async fn unpinned_start_on_a_non_default_single_shard_client_encodes_that_shard_
                         "order_id": "order-single-nondefault-shard-1",
                         "amount_cents": 1
                     }),
-                    // Deliberately NO `.with_shard(...)` — the whole point is
-                    // that `pools.len() == 1` lets the caller omit it, and
-                    // the fallback must still resolve to shard 5, not 0.
+                    // Deliberately NO `.with_shard(...)`. `pools.len() == 1`
+                    // lets the caller omit it, and the fallback must still
+                    // resolve to shard 5, not 0.
                     TransactionalStartOptions::new(),
                 )
                 .await

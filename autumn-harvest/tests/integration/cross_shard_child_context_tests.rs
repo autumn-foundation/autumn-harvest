@@ -1,16 +1,14 @@
 //! Workflow-context coverage for opt-in cross-shard child placement (issue #956).
 //!
-//! Pure unit tests — no database. They drive real workflow handlers through
+//! Pure unit tests with no database. They drive real workflow handlers through
 //! `run_workflow` and inspect the emitted `StartChildWorkflow` /
-//! `SpawnDetachedChildWorkflow` commands, which is where placement becomes
-//! observable: the child's `ExecutionId` encodes the shard it will be created
-//! on, so `child_id.shard()` *is* the placement decision.
+//! `SpawnDetachedChildWorkflow` commands. The child's `ExecutionId` encodes its
+//! shard, so `child_id.shard()` *is* the placement decision.
 //!
-//! The router is supplied per-context via `WorkflowContext::with_shard_router`
-//! rather than `install_global_router`, deliberately: the process-global router
-//! is shared with every other test in this binary (several `db`-gated modules
-//! install `ShardRouter::single()` concurrently), so a global install here would
-//! be a cross-module flake.
+//! Each test supplies its router with `WorkflowContext::with_shard_router`, not
+//! `install_global_router`. Every test in this binary shares the process-global
+//! router. Several `db`-gated modules install `ShardRouter::single()`
+//! concurrently, so a global install here would be a cross-module flake.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -517,18 +515,16 @@ fn shard_unavailable_renders_its_shard_and_reason() {
     assert!(rendered.contains("pool checkout timed out"), "{rendered}");
 }
 
-/// **Regression (review finding).** A *sequential* loop of placed spawns must
-/// spread across shards, not collapse onto one.
+/// **Regression.** A *sequential* loop of placed spawns must spread across
+/// shards, not collapse onto one.
 ///
-/// A fresh `WorkflowContext` is built per decision cycle, and in a sequential
-/// `spawn(...).await` loop each child is the only **fresh** dispatch in its own
-/// cycle — every earlier child replays from history. A placement counter that
-/// only advanced on a fresh dispatch therefore restarted at 1 every cycle and
-/// handed `"{parent}#1"` to every child in the loop, putting the entire loop on
-/// one shard while the fan-out helper (whose children are all fresh in one
-/// cycle) looked perfectly uniform. Counting *invocations* instead makes the Nth
-/// spawn's key depend on its position in the workflow rather than on which cycle
-/// dispatched it.
+/// Each decision cycle builds a fresh `WorkflowContext`. In a sequential
+/// `spawn(...).await` loop, each child is the only **fresh** dispatch in its own
+/// cycle, and every earlier child replays from history. A counter that advanced
+/// only on a fresh dispatch restarted at 1 every cycle. It handed `"{parent}#1"`
+/// to every child and put the whole loop on one shard. The fan-out helper hid
+/// this, because all its children are fresh in one cycle. Counting *invocations*
+/// makes the Nth spawn's key depend on its position, not on its cycle.
 #[tokio::test]
 async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
     fn three_sequential<'a>(
@@ -613,8 +609,8 @@ async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
 }
 
 /// The Nth placed spawn's shard must not depend on which decision cycle
-/// dispatched it — the property that makes the sequential loop above work, and
-/// the restart-stability contract AC2 asks for.
+/// dispatched it. The sequential loop above relies on this property. AC2 asks
+/// for it as the restart-stability contract.
 #[tokio::test]
 async fn a_placed_childs_shard_does_not_depend_on_which_cycle_dispatched_it() {
     fn two_sequential<'a>(
@@ -771,13 +767,12 @@ fn recorded_pinned_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
 /// AC6 + AC8: a topology change made *after* dispatch must not fail a parent
 /// that is merely replaying.
 ///
-/// Replay needs no placement at all — the child ids are recorded and reused
-/// verbatim, which is exactly what makes AC6's byte-identical replay true. When
-/// the preflight ran unconditionally, removing a pinned shard from the topology
-/// raised `Config`; the handler ABI stringifies that into a terminal `Failed`,
-/// so a routine operator edit permanently failed every parent that had ever
-/// placed a fan-out — including parents whose children had all already
-/// completed, as here.
+/// Replay needs no placement. It reuses the recorded child ids verbatim, which
+/// makes AC6's byte-identical replay true. When the preflight ran
+/// unconditionally, removing a pinned shard from the topology raised `Config`.
+/// The handler ABI stringifies that into a terminal `Failed`. So a routine operator
+/// edit permanently failed every parent that had placed a fan-out. That
+/// includes parents whose children had all completed, as here.
 #[tokio::test]
 async fn a_topology_change_after_dispatch_never_fails_a_replaying_fan_out_parent() {
     let (exec_id, history) = recorded_pinned_fan_out_history();
@@ -813,9 +808,9 @@ async fn a_topology_change_after_dispatch_never_fails_a_replaying_collect_all_pa
 }
 
 /// The other half of the same contract: gating the preflight on `fresh_dispatch`
-/// must not have disabled it. A *fresh* pinned fan-out against a router that
-/// cannot resolve the pin still fails terminally, rather than half-dispatching
-/// or silently falling back to the parent's shard (AC8).
+/// must not disable it. A *fresh* pinned fan-out fails terminally when the
+/// router cannot resolve the pin. It must not half-dispatch or silently fall
+/// back to the parent's shard (AC8).
 #[tokio::test]
 async fn a_fresh_pinned_fan_out_is_still_rejected_when_the_pin_cannot_resolve() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));

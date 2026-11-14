@@ -101,9 +101,9 @@ fn throttled_info(rate: &str, burst: f64) -> WorkflowInfo {
     }
 }
 
-/// A plain, NON-throttled workflow. The batch route runs `_collect` immediately
-/// (no defer) for such a workflow, so its Phase-1 idempotent-retry pre-check —
-/// the code #1053 makes reuse-policy-aware — is exercised synchronously. Used by
+/// A plain, NON-throttled workflow. The batch route runs `_collect` for it at
+/// once, with no defer. So its Phase-1 idempotent-retry pre-check runs
+/// synchronously. #1053 makes that pre-check reuse-policy-aware. Used by
 /// `batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_create`.
 fn plain_info() -> WorkflowInfo {
     let mut info = throttled_info("100/m", 1.0);
@@ -112,10 +112,10 @@ fn plain_info() -> WorkflowInfo {
     info
 }
 
-/// A workflow with BOTH a throttle policy and a debounce policy configured
-/// (code-review fix, issue #607): the batch-start endpoint must reject items
-/// for this workflow with a clear mutual-exclusion error instead of silently
-/// wasting a reserved throttle token on a debounce rejection.
+/// A workflow with BOTH a throttle policy and a debounce policy (issue #607).
+/// The batch-start endpoint must reject its items with a clear mutual-exclusion
+/// error. It must not silently waste a reserved throttle token on a debounce
+/// rejection.
 fn throttled_and_debounced_info(rate: &str, burst: f64) -> WorkflowInfo {
     let mut info = throttled_info(rate, burst);
     info.name = "conflicting_policies";
@@ -147,12 +147,11 @@ fn build_app(pool: &DbPool, info: WorkflowInfo) -> HarvestApiApp {
     harvest_api_router(api_state)
 }
 
-/// Like `build_app`, but also returns the `HarvestApiState` handle so a test
-/// can arm an admission gate (issue #377) after the app is built -- needed
-/// to reproduce the gate-vs-pending-throttle-retry interaction (code review,
-/// issue #607). `HarvestApiState` is `Clone` over shared `Arc` internals
-/// (including the gate cache), so mutating this handle affects the router
-/// built from its clone.
+/// Like `build_app`, but also returns the `HarvestApiState` handle. A test can
+/// then arm an admission gate (issue #377) after the app is built. That
+/// reproduces the gate-vs-pending-throttle-retry interaction (issue #607).
+/// `HarvestApiState` is `Clone` over shared `Arc` internals (including the gate
+/// cache), so mutating this handle affects the router built from its clone.
 fn build_app_with_state(pool: &DbPool, info: WorkflowInfo) -> (HarvestApiApp, HarvestApiState) {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -236,8 +235,8 @@ async fn raw_connect(url: &str) -> diesel_async::AsyncPgConnection {
 /// Insert a due, workflow-kind (non-DAG), `interval`-scheduled row so a
 /// backfill request has real slots to plan. `workflow_input` is fixed for
 /// the whole schedule, so every planned slot resolves to the *same*
-/// throttle key -- deliberately, so a single schedule can exercise pacing
-/// across a burst of backfilled slots.
+/// throttle key. That is deliberate: one schedule exercises pacing across a
+/// burst of backfilled slots.
 async fn insert_workflow_schedule(
     conn: &mut diesel_async::AsyncPgConnection,
     wf_name: &str,
@@ -340,11 +339,10 @@ async fn insert_workflow_schedule_with_max_active(
 }
 
 /// Directly seed a `harvest_rate_limit_buckets` row with zero tokens and zero
-/// refill, so the very first admission attempt against `(wf_name,
-/// resolved_key)` finds the bucket already empty and defers immediately --
-/// without first needing to consume (and thereby start a real execution for)
-/// a token, which would confound a test that wants to isolate "a pending
-/// throttle row with no corresponding execution" from "a genuinely-started
+/// refill. The first admission attempt against `(wf_name, resolved_key)` then
+/// finds the bucket empty and defers at once. It does not first consume a
+/// token, which would start a real execution. That would confound a test that
+/// isolates "a pending throttle row with no execution" from "a started
 /// execution".
 async fn seed_empty_bucket(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -363,11 +361,11 @@ async fn seed_empty_bucket(
     .expect("seed empty bucket");
 }
 
-/// Directly seed a prior `harvest_workflow_executions` row (shard 0 — the
-/// single-shard `ShardRouter::default()` used by these tests) in a given
-/// terminal/active `state`, so the reuse-policy matrix has a real prior to
-/// resolve against. Used to prove the throttle admission-gate bypass is
-/// reuse-policy-aware (Codex P1, PR #1051).
+/// Directly seed a prior `harvest_workflow_executions` row in a given
+/// terminal/active `state`. It goes on shard 0, the single shard of the
+/// `ShardRouter::default()` these tests use. The reuse-policy matrix then has a
+/// real prior to resolve against. Used to prove the throttle admission-gate
+/// bypass is reuse-policy-aware (PR #1051).
 async fn seed_execution(
     conn: &mut diesel_async::AsyncPgConnection,
     wf_name: &str,
@@ -449,8 +447,8 @@ async fn schedule_backfill_skips_oversized_input_before_deferring() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     // burst = 1 drains on the first (only) slot, so the oversized input
-    // hits an empty bucket and -- absent the fix -- would be durably
-    // deferred rather than skipped.
+    // hits an empty bucket. Without the fix, it would be durably deferred,
+    // not skipped.
     let app = build_app(&pool, throttled_info("100/m", 1.0));
     let mut conn = raw_connect(&url).await;
 
@@ -515,10 +513,10 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     let app = build_app(&pool, throttled_info("100/m", 1.0));
     let mut conn = raw_connect(&url).await;
 
-    // Pre-empty the bucket so the very first planned slot defers immediately,
-    // rather than consuming the sole token and becoming a real (RUNNING)
-    // execution -- isolating "a pending row with no execution" from
-    // `query_running_count`'s own, already-correct RUNNING/PAUSED count.
+    // Pre-empty the bucket so the first planned slot defers at once. It does
+    // not consume the sole token and become a real (RUNNING) execution. That
+    // isolates "a pending row with no execution" from the correct
+    // RUNNING/PAUSED count of `query_running_count`.
     seed_empty_bucket(&mut conn, "sync_tenant", "acme").await;
 
     let schedule_id = insert_workflow_schedule_with_max_active(
@@ -644,9 +642,8 @@ async fn repeated_backfill_call_does_not_double_count_an_already_pending_throttl
         "the first, genuinely-fresh deferral must spend one run-budget slot"
     );
 
-    // Repeat the exact same window: the single planned slot resolves to the
-    // exact same deterministic workflow_id, which already has a pending
-    // throttle row from the first call.
+    // Repeat the same window. The single planned slot resolves to the same
+    // deterministic workflow_id, which has a pending row from the first call.
     let (status2, body2) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/backfill"),
@@ -842,9 +839,9 @@ async fn manual_trigger_refunds_its_token_when_the_start_fails() {
     .await
     .expect("remove forcing trigger");
 
-    // A second manual trigger for the same key: with burst = 1 and no
-    // refund, the sole token would already be spent from the first
-    // (failed) attempt, so this would durably defer instead of firing.
+    // A second manual trigger for the same key. With burst = 1 and no refund,
+    // the first (failed) attempt already spent the sole token. So this would
+    // durably defer instead of firing.
     let (status2, body2) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/trigger"),
@@ -957,9 +954,9 @@ async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
         expires_at: None,
     }]);
 
-    // Retry with the exact same explicit workflow_id: must NOT be blocked by
-    // the gate (it resolves to the same already-pending row, not a fresh
-    // admission), and must NOT create a second pending row.
+    // Retry with the same explicit workflow_id. It resolves to the pending row,
+    // not a fresh admission. So the gate must NOT block it, and it must NOT
+    // create a second pending row.
     let (status2, body2) = post_json(
         &app,
         "/workflows/sync_tenant/start",
@@ -992,17 +989,18 @@ async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
     );
 }
 
-/// Codex P1 (PR #1051): the throttle admission-gate bypass must be
-/// reuse-policy-AWARE. A retry carrying an explicit `workflow_id` whose
-/// resolved reuse policy CREATES a fresh execution — `allow_duplicate_failed_only`
-/// over a FAILED/CANCELLED prior, or `terminate_if_running` — is a genuinely
-/// fresh admission and must be blocked by an armed gate, NOT slip through the
+/// PR #1051: the throttle admission-gate bypass must be reuse-policy-AWARE.
+///
+/// Take a retry with an explicit `workflow_id` whose resolved reuse policy
+/// CREATES a fresh execution. Examples are `allow_duplicate_failed_only` over a
+/// FAILED/CANCELLED prior, or `terminate_if_running`. That retry is a fresh
+/// admission, so an armed gate must block it. It must NOT slip through the
 /// token-empty `Deferred` path and persist a gate-less pending throttle row.
 ///
 /// Before the fix, the committed-prior bypass treated ANY non-sealed prior as
-/// an idempotent retry, so these two policies (which replace the prior with a
-/// fresh run) deferred `202` under an armed gate and wrote a pending row that
-/// later fired gate-less — a fresh replacement start slipping the gate.
+/// an idempotent retry. These two policies replace the prior with a fresh run.
+/// They deferred `202` under an armed gate and wrote a pending row. That row
+/// later fired gate-less, so a fresh replacement start slipped the gate.
 #[tokio::test]
 async fn armed_gate_blocks_fresh_creating_start_under_reuse_policy_on_empty_bucket() {
     let (url, _container) = setup_database().await;
@@ -1074,8 +1072,8 @@ async fn armed_gate_blocks_fresh_creating_start_under_reuse_policy_on_empty_buck
     );
 
     // --- No over-block: allow_duplicate over the SAME FAILED prior ATTACHES ---
-    // (does NOT create), so it is NOT a fresh admission and the reuse-policy-aware
-    // predicate must still bypass the gate — proving the fix discriminates in
+    // (does NOT create). So it is NOT a fresh admission, and the reuse-policy-aware
+    // predicate must still bypass the gate. This proves the fix discriminates in
     // both directions, not a blanket "any prior -> block". The gate blocked
     // Scenario A before any mutation, so "failed-job" is still FAILED here.
     let (status_c, body_c) = post_json(
@@ -1133,10 +1131,10 @@ async fn distinct_tenants_throttle_independently_over_http() {
     );
 }
 
-/// A workflow with both a resolving throttle and a resolving debounce policy
-/// must be rejected per-item over the batch-start route with a clear
-/// mutual-exclusion error — not silently mishandled (reserving, then wasting, a
-/// throttle token on a debounce rejection). Code-review fix, issue #607.
+/// The batch-start route must reject, per item, a workflow with both a
+/// resolving throttle and a resolving debounce policy (issue #607). It needs a
+/// clear mutual-exclusion error. It must not reserve, then waste, a throttle
+/// token on a debounce rejection.
 #[tokio::test]
 async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policies() {
     let (url, _container) = setup_database().await;
@@ -1167,9 +1165,8 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
         results[0]["error"],
         json!("start throttle is mutually exclusive with debounce")
     );
-    // No throttle token was wasted: the bucket for this key is untouched (the
-    // guard fires before reserve_or_defer is ever called), so no pending row
-    // should exist either.
+    // No throttle token was wasted. The guard fires before reserve_or_defer,
+    // so the bucket for this key is untouched and no pending row exists.
     let (backlog_status, backlog) = get_json(&app, "/admin/start-throttle").await;
     assert_eq!(backlog_status, StatusCode::OK);
     assert_eq!(
@@ -1187,9 +1184,8 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
 /// rejected once a gate activated. Yet the idempotency shortcut of
 /// `reserve_or_defer` in Phase 2 resolves it to the same pending row and
 /// creates no new admission.
-/// Verifies the gate bypass now also recognizes a pending throttle row for
-/// batch items, while a genuinely fresh `workflow_id` in the same batch call
-/// is still blocked.
+/// Verifies that the gate bypass also recognizes a pending throttle row for
+/// batch items. A fresh `workflow_id` in the same batch call is still blocked.
 #[tokio::test]
 async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
     let (url, _container) = setup_database().await;
@@ -1291,59 +1287,61 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
     );
 }
 
-/// issue #1053 item 1 / issue #1085 heal. Guards the batch route's Phase-1
-/// admission-gate BYPASS DECISION end-to-end: the gate is bypassed for a batch
-/// item that would ATTACH to an existing run, and enforced for one that would
-/// CREATE a fresh run.
+/// issue #1053 item 1 / issue #1085 heal. Guards the Phase-1 admission-gate
+/// BYPASS DECISION of the batch route end-to-end. The gate is bypassed for a
+/// batch item that would ATTACH to an existing run. It is enforced for one that
+/// would CREATE a fresh run.
 ///
 /// #1053 swapped the bypass pre-check's bare `has_execution` existence boolean
 /// for `!start_will_create_new_execution(prior_state, AllowDuplicate, Unspecified)`, mirroring
-/// the single-start route (#1051). VERIFIED against the #1073 diff: the OLD
-/// `has_execution` check used the *same* non-sealed-prior filter
-/// (`state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`) the predicate query applies,
-/// and the batch route hardcodes `AllowDuplicate` (`BatchStartItem` has no
-/// reuse-policy field). So for the batch route the predicate and the old
-/// bare-existence heuristic are BEHAVIORALLY IDENTICAL for every prior state —
-/// both attach for any present non-sealed prior, both create for `None`/sealed.
-/// The predicate-vs-bare-existence *implementation* distinction is therefore NOT
-/// black-box observable through this route today; it is a structural/defensive
-/// change (per #1073's own comment) that becomes observable only if a per-item
-/// reuse policy is ever added. The genuine predicate distinction is unit-tested
-/// directly in `execution::start_will_create_tests`; this integration test does
-/// NOT (and cannot) prove it, so it asserts the property it actually can — the
-/// end-to-end bypass DECISION OUTCOME — via a case that splits by will-create:
+/// the single-start route (#1051). VERIFIED against the #1073 diff. The OLD
+/// `has_execution` check used the *same* non-sealed-prior filter as the
+/// predicate query: `state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`. The batch
+/// route hardcodes `AllowDuplicate`, because `BatchStartItem` has no
+/// reuse-policy field. So on the batch route, the predicate and the old
+/// bare-existence heuristic are BEHAVIORALLY IDENTICAL for every prior state.
+/// Both attach for any present non-sealed prior, both create for `None`/sealed.
+///
+/// So the predicate-vs-bare-existence *implementation* distinction is NOT
+/// black-box observable through this route today. Per #1073's own comment, it
+/// is a structural/defensive change. It becomes observable only if a per-item
+/// reuse policy is added. `execution::start_will_create_tests` unit-tests the
+/// real predicate distinction. This integration test does NOT (and cannot)
+/// prove it. It asserts what it can: the end-to-end bypass DECISION OUTCOME.
+/// It uses a case that splits by will-create:
 ///
 ///  - COMPLETED prior occupies the uniqueness slot →
 ///    `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate, Unspecified)` is
 ///    `false` (ATTACH) → the item BYPASSES the gate, reaches Phase 2, and
 ///    attaches to the prior.
-///  - TERMINATED prior is SEALED — excluded from the partial uniqueness index
-///    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')` — so the Phase-1
-///    `prior_state` query (same filter) sees `None` and
+///  - TERMINATED prior is SEALED. The partial uniqueness index
+///    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')` excludes it. So
+///    the Phase-1 `prior_state` query (same filter) sees `None`.
 ///    `start_will_create_new_execution(None, AllowDuplicate, Unspecified)` is `true` (fresh
-///    CREATE) → the item does NOT bypass; it FACES the armed gate and is BLOCKED.
+///    CREATE). The item does NOT bypass. It FACES the armed gate and is BLOCKED.
 ///
-/// The TERMINATED-prior gate block is the load-bearing assertion: it proves the
-/// gate is enforced exactly for an item that would create a NEW admission — the
-/// substance of #1053/#1073. (It does not, and cannot, distinguish the predicate
-/// from the old bare-existence heuristic — both block a sealed prior.)
+/// The TERMINATED-prior gate block is the load-bearing assertion. It proves
+/// that the gate applies exactly to an item that would create a NEW admission.
+/// That is the substance of #1053/#1073. It does not, and cannot, tell the
+/// predicate from the old bare-existence heuristic. Both block a sealed prior.
 ///
 /// #1085 heal: the original assertion checked `status != "rejected"` for the
-/// COMPLETED item, which conflated the batch route's benign attach-to-existing
-/// report (`started.created == false` → `status: "rejected"` + a *duplicate*
-/// message + the prior's `execution_id`, a long-standing #1053-independent
-/// convention meaning "no NEW row inserted") with a Phase-1 gate block
-/// (`error = "admission blocked by gate …"`, `execution_id: null`). It was
-/// compile-checked only in #1073 (the plugin suite spins a testcontainers
-/// Postgres, Docker-only in CI), so the wrong runtime expectation never ran.
-/// Both an attach and a gate block report `status: "rejected"`; the two are
-/// distinguished by error content + `execution_id` presence.
+/// COMPLETED item. That conflated two reports. One is the benign
+/// attach-to-existing report of the batch route: `started.created == false` →
+/// `status: "rejected"` + a *duplicate* message + the prior's `execution_id`.
+/// That long-standing convention, independent of #1053, means "no NEW row
+/// inserted". The other is a Phase-1 gate block
+/// (`error = "admission blocked by gate …"`, `execution_id: null`). #1073 only
+/// compile-checked the test. The plugin suite spins a testcontainers Postgres,
+/// Docker-only in CI. So the wrong runtime expectation never ran. Both an attach
+/// and a gate block report `status: "rejected"`. Error content and
+/// `execution_id` presence tell them apart.
 ///
-/// The SUBSTANTIVE batch residual (a bypass-prior force-terminated between the
-/// unlocked read and the deferred fire) is closed BEHAVIORALLY by the item-2
-/// core test `throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate`,
-/// since a throttled batch item defers through the SAME `fire_claimed_throttle_row`
-/// scanner.
+/// The SUBSTANTIVE batch residual is a bypass-prior force-terminated between
+/// the unlocked read and the deferred fire. The item-2 core test
+/// `throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate` closes
+/// it BEHAVIORALLY. A throttled batch item defers through the SAME
+/// `fire_claimed_throttle_row` scanner.
 #[tokio::test]
 async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_create() {
     let (url, _container) = setup_database().await;
@@ -1352,14 +1350,14 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     let mut conn = raw_connect(&url).await;
 
     // Two priors for the SAME workflow_name, distinct workflow_ids:
-    //  - a COMPLETED prior occupies the uniqueness slot, so an AllowDuplicate
+    //  - a COMPLETED prior occupies the uniqueness slot. An AllowDuplicate
     //    start ATTACHES to it (start_will_create_new_execution(Some("COMPLETED"),
     //    AllowDuplicate, Unspecified) == false) -> the batch item BYPASSES the gate.
-    //  - a TERMINATED prior is SEALED: excluded from the partial uniqueness index
-    //    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`, so the batch's
-    //    Phase-1 prior_state query (same filter) sees None and
+    //  - a TERMINATED prior is SEALED. The partial uniqueness index
+    //    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')` excludes it.
+    //    So the Phase-1 prior_state query (same filter) sees None.
     //    start_will_create_new_execution(None, AllowDuplicate, Unspecified) == true (fresh
-    //    create) -> the item does NOT bypass; it FACES the gate.
+    //    create). The item does NOT bypass. It FACES the gate.
     seed_execution(&mut conn, "plain_job", "batch-attach-job", "COMPLETED").await;
     seed_execution(
         &mut conn,
@@ -1409,13 +1407,13 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     );
 
     // -- item[0]: COMPLETED prior -> BYPASS + attach (NOT a gate block) --------
-    // The item bypassed the Phase-1 gate, reached Phase 2, and attached to the
-    // COMPLETED prior under AllowDuplicate. The batch route reports an attach
-    // (`started.created == false`) with `status: "rejected"` + a *duplicate*
-    // message + the prior's `execution_id` -- a long-standing, #1053-independent
-    // convention meaning "no NEW row inserted", NOT a gate block. Distinguish the
-    // two by error content + the presence of an execution_id, not by the
-    // `status` string (both an attach and a gate block report `"rejected"`).
+    // The item bypassed the Phase-1 gate. It reached Phase 2 and attached to
+    // the COMPLETED prior under AllowDuplicate. The batch route reports an attach
+    // (`started.created == false`) with `status: "rejected"`. It adds a
+    // *duplicate* message and the prior's `execution_id`. That long-standing
+    // convention, independent of #1053, means "no NEW row inserted". It is NOT a
+    // gate block. Both report `"rejected"`, so the `status` string cannot tell
+    // them apart. Use the error content and the presence of an execution_id.
     let attach = &body["results"][0];
     let attach_err = attach["error"].as_str().unwrap_or_default();
     assert!(
@@ -1434,10 +1432,10 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     );
 
     // -- item[1]: TERMINATED prior -> would create fresh -> BLOCKED by gate ----
-    // TERMINATED is released from the uniqueness index, so start_or_load_collect
-    // would CREATE a fresh run. Because that is a NEW admission, the bypass
-    // pre-check does NOT bypass and the item faces the armed gate: Phase 1 rejects
-    // it with `error = "admission blocked by gate …"` and `execution_id: null`.
+    // TERMINATED leaves the uniqueness index. So start_or_load_collect would
+    // CREATE a fresh run. That is a NEW admission, so the bypass pre-check does
+    // NOT bypass, and the item faces the armed gate. Phase 1 rejects it with
+    // `error = "admission blocked by gate …"` and `execution_id: null`.
     // This is the load-bearing contrast to item[0]: the gate is bypassed exactly
     // for an item that attaches and enforced for one that would create.
     let blocked = &body["results"][1];
@@ -1468,11 +1466,11 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
 
 /// Issue #607: an atomic batch is an all-or-nothing
 /// synchronous insert with no way to represent a `Deferred` outcome. Before
-/// this fix, `atomic=true` items skipped the throttle admission check
-/// entirely, letting a client bypass a workflow's rate policy simply by
-/// submitting an atomic batch instead of a plain start. Verifies an atomic
-/// item for a throttled workflow is rejected outright, in pre-validation --
-/// before any token is ever reserved or pending row written.
+/// this fix, `atomic=true` items skipped the throttle admission check. So a
+/// client could bypass the rate policy of a workflow with an atomic batch
+/// instead of a plain start. Verifies that pre-validation rejects an atomic
+/// item for a throttled workflow outright. No token is reserved and no pending
+/// row is written.
 #[tokio::test]
 async fn atomic_batch_rejects_item_for_a_throttled_workflow() {
     let (url, _container) = setup_database().await;
@@ -1522,10 +1520,9 @@ async fn atomic_batch_rejects_item_for_a_throttled_workflow() {
     );
 }
 
-/// A non-atomic (best-effort) batch is unaffected by the atomic-rejection fix
-/// above: a throttled item still goes through the normal admission path and
-/// is durably deferred when the bucket is empty, exactly like a standalone
-/// start.
+/// The atomic-rejection fix does not affect a non-atomic (best-effort) batch.
+/// A throttled item still takes the normal admission path. Like a standalone
+/// start, it is durably deferred when the bucket is empty.
 #[tokio::test]
 async fn non_atomic_batch_still_throttles_normally() {
     let (url, _container) = setup_database().await;
@@ -1577,11 +1574,10 @@ async fn non_atomic_batch_still_throttles_normally() {
     );
 }
 
-/// Code-review fix (issue #607, items 1 & 2): `context_headers`/`priority`
-/// submitted on `POST /workflows/{name}/start` must round-trip onto the
-/// resulting execution/task, on BOTH the immediate path (this test) and the
-/// throttle-deferred path (below) -- previously both were silently hardcoded
-/// to `None`/default regardless of what the caller sent.
+/// Issue #607, items 1 & 2: `context_headers`/`priority` submitted on
+/// `POST /workflows/{name}/start` must round-trip onto the execution/task.
+/// That holds on BOTH the immediate path (this test) and the throttle-deferred
+/// path (below). Before, both were silently hardcoded to `None`/default.
 #[tokio::test]
 async fn context_headers_and_priority_round_trip_on_immediate_start() {
     let (url, _container) = setup_database().await;
@@ -1603,11 +1599,10 @@ async fn context_headers_and_priority_round_trip_on_immediate_start() {
     assert_eq!(status, StatusCode::CREATED, "immediate start: {body:?}");
     let exec_id = body["execution_id"].as_str().expect("execution_id");
 
-    // context_headers persisted onto the execution row. NOT verified via the
-    // GET /workflows/{id} describe response: WorkflowExecution.context_headers
-    // is deliberately `#[serde(skip)]`d from every management-API response
-    // (raw header values may carry auth tokens/tenant secrets) -- verify the
-    // stored column directly instead.
+    // context_headers persisted onto the execution row. Check the stored column,
+    // not the GET /workflows/{id} describe response. Every management-API
+    // response deliberately skips WorkflowExecution.context_headers with
+    // `#[serde(skip)]`. Raw header values may carry auth tokens/tenant secrets.
     let mut conn = pool.get().await.expect("conn");
     #[derive(diesel::QueryableByName)]
     struct CtxRow {
@@ -1651,10 +1646,9 @@ async fn context_headers_and_priority_round_trip_on_immediate_start() {
     );
 }
 
-/// Same round-trip guarantee on the throttle-deferred path: the deferred
-/// start's `context_headers`/`priority` must survive the
-/// defer -> `DebounceStartOptions` -> scanner-fire round trip, not just the
-/// immediate path.
+/// Same round-trip guarantee on the throttle-deferred path. The
+/// `context_headers`/`priority` of a deferred start must survive the
+/// defer -> `DebounceStartOptions` -> scanner-fire round trip.
 #[tokio::test]
 async fn context_headers_and_priority_round_trip_on_deferred_start() {
     let (url, _container) = setup_database().await;
@@ -1703,7 +1697,6 @@ async fn context_headers_and_priority_round_trip_on_deferred_start() {
     .expect("fire due");
     assert_eq!(fired, 1, "the deferred start must fire this tick");
 
-    // Find the execution that was created for ctx-deferred-job.
     #[derive(diesel::QueryableByName)]
     struct ExecRow {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -1748,11 +1741,11 @@ async fn context_headers_and_priority_round_trip_on_deferred_start() {
     );
 }
 
-/// Code-review fix (issue #607, item 9): every batch-start result -- `started`,
-/// `rejected`, and `deferred` alike -- must include the `workflow_id` the item
-/// resolved to (caller-supplied, or server-generated when omitted), so a
-/// caller can poll/cancel/correlate the eventual run even for a deferred item
-/// that has no `execution_id` yet.
+/// Issue #607, item 9: every batch-start result (`started`, `rejected` and
+/// `deferred`) must include the resolved `workflow_id` of its item. It is
+/// caller-supplied, or server-generated when omitted. A caller can then
+/// poll/cancel/correlate the run, even for a deferred item with no
+/// `execution_id` yet.
 #[tokio::test]
 async fn batch_start_results_include_workflow_id_for_every_outcome() {
     let (url, _container) = setup_database().await;
@@ -1810,9 +1803,9 @@ async fn batch_start_results_include_workflow_id_for_every_outcome() {
          the eventual run: {deferred:?}"
     );
 
-    // The pre-validation rejection (unregistered workflow name) never resolves
-    // a workflow_id at all (no explicit id was given, and none is generated
-    // for an item rejected before Phase 1) -- workflow_id is correctly absent.
+    // The pre-validation rejection (unregistered workflow name) resolves no
+    // workflow_id. The item gave no explicit id, and an item rejected before
+    // Phase 1 gets no generated one. So workflow_id is correctly absent.
     let rejected = results
         .iter()
         .find(|r| r["status"] == json!("rejected"))
@@ -1823,20 +1816,19 @@ async fn batch_start_results_include_workflow_id_for_every_outcome() {
     );
 }
 
-/// Code-review fix (issue #607): a best-effort batch item for a throttled
-/// workflow whose input exceeds the effective byte cap must be rejected
-/// immediately, not durably deferred. Without the fix, an oversized item
-/// hitting an *empty* bucket would be written to `harvest_start_throttle`
-/// as `Deferred` -- a row that can never successfully fire (the throttle
-/// scanner's own cap enforcement rejects it every tick, forever) -- rather
-/// than failing fast with a clear per-item error and zero pending rows.
+/// Issue #607: a best-effort batch item for a throttled workflow whose input
+/// exceeds the effective byte cap must be rejected at once, not deferred.
+/// Without the fix, an oversized item hitting an *empty* bucket went into
+/// `harvest_start_throttle` as `Deferred`. That row can never fire: the cap
+/// check of the throttle scanner rejects it every tick, forever. The item
+/// must fail fast with a clear per-item error and zero pending rows.
 #[tokio::test]
 async fn batch_start_rejects_oversized_item_before_deferring() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
-    // burst = 1 -> the bucket is drained by the first (normal-sized) item,
-    // so the second (oversized) item would hit an empty bucket and -- absent
-    // the fix -- be durably deferred instead of rejected.
+    // burst = 1 -> the first (normal-sized) item drains the bucket. So the
+    // second (oversized) item hits an empty bucket. Without the fix, it would
+    // be durably deferred instead of rejected.
     let app = build_app(&pool, throttled_info("100/m", 1.0));
 
     let (drain_status, _) = post_json(

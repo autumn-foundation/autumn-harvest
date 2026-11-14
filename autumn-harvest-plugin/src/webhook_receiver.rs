@@ -14,42 +14,33 @@
 //!
 //! # Who verifies what
 //!
-//! Every generated route's handler takes
-//! `Result<autumn_web::webhook::SignedWebhook, autumn_web::AutumnError>` as
-//! its extractor argument -- signature, timestamp, and (if the endpoint
-//! configures it) replay-duplicate verification have **already run**, inside
-//! axum's extractor phase, before this module's handler code executes at
-//! all. This module never parses a raw, unverified request body. See
-//! `docs/getting-started/12-webhooks.md` for the `[security.webhooks]`
-//! configuration side.
+//! Each generated handler takes
+//! `Result<autumn_web::webhook::SignedWebhook, autumn_web::AutumnError>`.
+//! Signature, timestamp and optional replay checks **already run** in axum's
+//! extractor phase, before the handler code. This module never parses a raw,
+//! unverified request body. See `docs/getting-started/12-webhooks.md` for the
+//! `[security.webhooks]` configuration.
 //!
 //! # Dispatch
 //!
-//! After verification, parsing, and the mapping function run, dispatch
-//! delegates to the same primitives the plain management API uses --
-//! [`crate::api::start_workflow`] / [`crate::api::signal_with_start_workflow`]
-//! -- so schema validation, the admission gate, debounce/batch/SLA/execution-
-//! timeout resolution all apply identically to a webhook-triggered start.
-//! [`reshape_dispatch_response`] then reshapes the delegate's own response
-//! into the issue's `{"status", "workflow_exec_id", "workflow_id"}` envelope,
-//! classifies the outcome for `harvest.webhook.received`/`.rejected`, and
-//! writes this module's own `webhook.trigger` audit row (the delegate's
-//! `workflow.start`/`workflow.signal_with_start` audit row is a separate,
-//! additional record -- this one exists so an operator can find "which
-//! webhook path triggered this" without cross-referencing route strings).
+//! Dispatch delegates to the management API handlers
+//! [`crate::api::start_workflow`] and [`crate::api::signal_with_start_workflow`].
+//! So schema validation, the admission gate, debounce, batch, SLA and
+//! execution timeout apply identically to a webhook start.
+//! [`reshape_dispatch_response`] reshapes the delegate response into the
+//! issue's `{"status", "workflow_exec_id", "workflow_id"}` envelope. It also
+//! classifies the outcome for `harvest.webhook.received`/`.rejected`. It
+//! writes a `webhook.trigger` audit row in addition to the delegate's own
+//! row. That row lets an operator find the webhook path that triggered a run.
 //!
-//! Delegating to the plain management-API handlers (rather than calling
-//! `execution.rs` primitives directly) avoids re-implementing admission-gate,
-//! debounce, batch, and schema-validation logic a second time, but couples
-//! [`reshape_dispatch_response`] to those handlers' HTTP response *shape*
-//! (status code + JSON body) rather than their typed return values --
-//! several of the outcome-classification bugs this module has had were
-//! instances of that coupling (a `202` debounce admission or an ordinary
-//! delegate-side `4xx` rejection being misread as an internal error). Status
-//! codes are classified defensively (`is_client_error()` before falling
-//! through to "anything else is internal") precisely because of that
-//! coupling; a future response-shape change on the delegate side needs the
-//! classification here re-checked by hand.
+//! The delegation avoids a second copy of the admission, debounce, batch and
+//! schema logic. But it couples [`reshape_dispatch_response`] to the HTTP
+//! response *shape* (status code and JSON body), not to typed return values.
+//! Several past classification bugs came from that coupling. A `202` debounce
+//! admission or a delegate `4xx` was misread as an internal error. So the
+//! classification checks `is_client_error()` before it treats a status as
+//! internal. A change to the delegate response shape needs a manual re-check
+//! here.
 
 use autumn_harvest::audit::{
     self, HEADER_IDEMPOTENCY_KEY, OP_WEBHOOK_TRIGGER, STATUS_FAILED, STATUS_SUCCEEDED,
@@ -78,18 +69,14 @@ pub use autumn_web::webhook::{WebhookConfig, WebhookConfigError, WebhookEndpoint
 
 /// Build the app-level routes for a set of registered webhook triggers.
 ///
-/// `registered_dags` (e.g. from `HarvestBuilder::dag_infos()`) is scanned so
-/// a trigger targeting a registered DAG can be rejected with a specific,
-/// actionable message instead of either silently passing (a unified DAG gets
-/// an auto-registered shadow `WorkflowInfo`, so it would otherwise satisfy
-/// the plain "is this a registered workflow" check below and only fail at
-/// the first live request) or falling through to the generic "not
-/// registered" message (a classic DAG, which has no shadow `WorkflowInfo` at
-/// all). Only unified DAGs (`workflow_handler.is_some()`) are excluded here,
-/// matching exactly which DAG names `HarvestApiState::is_registered_dag`
-/// rejects at request time in `start_workflow`/`signal_with_start_workflow`
-/// -- a classic DAG has no shadow `WorkflowInfo`, so it already fails the
-/// plain registered-workflow check on its own.
+/// The scan of `registered_dags` (e.g. from `HarvestBuilder::dag_infos()`)
+/// rejects a trigger that targets a unified DAG with a specific message. A unified
+/// DAG has an auto-registered shadow `WorkflowInfo`. Without this scan it
+/// passes the registered-workflow check and fails only on the first live
+/// request. Only unified DAGs (`workflow_handler.is_some()`) are excluded
+/// here. They are exactly the DAG names that `HarvestApiState::is_registered_dag`
+/// rejects at request time. A classic DAG has no shadow `WorkflowInfo`, so
+/// the registered-workflow check already rejects it.
 ///
 /// For an embedder mounting webhooks without `HarvestPlugin`, see
 /// [`build_webhook_router`] -- this function's `Vec<autumn_web::Route>`
@@ -98,11 +85,10 @@ pub use autumn_web::webhook::{WebhookConfig, WebhookConfigError, WebhookEndpoint
 /// # Panics
 ///
 /// Panics when [`validate_webhook_triggers`] rejects the set (duplicate or
-/// malformed binding paths), when a trigger targets a registered DAG (start
-/// a DAG via `POST /dags/{name}/trigger` instead), or when a trigger targets
-/// a workflow that is not registered on the builder -- a mount conflict or
-/// dangling target must fail at `HarvestPlugin::build` time, not on the
-/// first live request.
+/// malformed binding paths). Also panics when a trigger targets a registered
+/// DAG (use `POST /dags/{name}/trigger`) or an unregistered workflow. A mount
+/// conflict or dangling target must fail at `HarvestPlugin::build` time, not
+/// on the first live request.
 #[must_use]
 pub fn build_webhook_routes(
     triggers: &[WebhookTriggerInfo],
@@ -175,7 +161,7 @@ pub fn build_webhook_routes(
 /// entry in `webhook_config.endpoints`. `SignedWebhook` installs a verifier
 /// per configured endpoint, not per trigger, so an uncovered path would
 /// otherwise 500 on every request. Failing here at build time instead is the
-/// point (Codex review, PR #1720).
+/// point (PR #1720).
 pub fn build_webhook_router(
     triggers: &[WebhookTriggerInfo],
     registered_workflows: &[WorkflowInfo],
@@ -364,10 +350,9 @@ fn error_response(
 }
 
 /// Classify a `SignedWebhook` extraction failure's HTTP status into a
-/// [`WebhookOutcome`]. A `409 Conflict` (autumn-web's own replay-protection
-/// layer rejecting a duplicate delivery ID) is a benign redelivery signal,
-/// not a verification failure -- everything else genuinely failed
-/// verification.
+/// [`WebhookOutcome`]. A `409 Conflict` is the autumn-web replay layer
+/// rejecting a duplicate delivery ID. It is a benign redelivery, not a
+/// verification failure. Every other status is a verification failure.
 fn outcome_for_verify_status(status: axum::http::StatusCode) -> WebhookOutcome {
     if status == axum::http::StatusCode::CONFLICT {
         WebhookOutcome::IdempotentReplay
@@ -379,15 +364,13 @@ fn outcome_for_verify_status(status: axum::http::StatusCode) -> WebhookOutcome {
 /// Normalizes a resolved webhook delivery id: blank/whitespace-only is
 /// treated as "no delivery id resolved", not a genuine (if empty) id.
 ///
-/// autumn-web's own JSON-body `"id"` fallback (`resolve_delivery_id` /
-/// `json_string_field`) has no non-empty guard the way its header-based
-/// lookup does, so a naive/generic sender's `{"id": ""}` payload resolves
-/// `Some("")` rather than `None`. Left unnormalized, every such delivery
-/// would collide on the same namespaced idempotency key
-/// (`{path}:{signal_name}:`), silently dropping all but the first unrelated
-/// event for a `SignalsWithStart` target (Codex review, PR #918). A genuine,
-/// non-blank id is returned untouched (not trimmed) -- only the
-/// all-whitespace case is treated as missing.
+/// The autumn-web JSON-body `"id"` fallback (`resolve_delivery_id` /
+/// `json_string_field`) has no non-empty guard, unlike its header lookup.
+/// So a `{"id": ""}` payload resolves `Some("")`, not `None`. Without this
+/// step, all such deliveries share one idempotency key
+/// (`{path}:{signal_name}:`). A `SignalsWithStart` target then silently
+/// drops all but the first unrelated event (PR #918). A non-blank id is
+/// returned untouched, not trimmed.
 fn normalize_delivery_id(raw: Option<&str>) -> Option<String> {
     raw.map(str::to_string).filter(|d| !d.trim().is_empty())
 }
@@ -426,16 +409,14 @@ async fn handle_webhook(
         }
     };
 
-    // Deliberately NOT `map_error(e).into_response()` (which would map this
-    // to a `400`): when `[security.webhooks].replay_protection` is enabled,
-    // the `SignedWebhook` extractor above has already reserved this
-    // delivery's replay key, and autumn-web's `webhook_replay_cleanup_middleware`
-    // (wired automatically into every app's router) only releases a reserved
-    // key when the response is a `5xx`. "The harvest runtime has not started
-    // yet" is a transient boot-window condition, not a bad request. A `400`
-    // here would permanently consume the delivery id. The automatic retry of
-    // the provider arrives after the app finishes booting. It would then 409
-    // as a false duplicate forever and never dispatch (Codex review, PR #918).
+    // Deliberately NOT `map_error(e).into_response()`, which gives a `400`.
+    // With `[security.webhooks].replay_protection` on, the extractor already
+    // reserved this delivery's replay key. The autumn-web
+    // `webhook_replay_cleanup_middleware` releases a reserved key only on a
+    // `5xx`. A runtime that has not started is a transient boot-window
+    // condition, not a bad request. A `400` would consume the delivery id
+    // for good. The provider retry after boot would then get a false
+    // duplicate `409` forever and never dispatch (PR #918).
     let metrics = match api_state.trigger_metrics() {
         Ok(metrics) => metrics,
         Err(e) => {
@@ -525,21 +506,18 @@ async fn handle_webhook(
         match target {
             WebhookTarget::Starts { workflow } => {
                 // Strip any upstream `Idempotency-Key` header before delegating.
-                // Issue #808 made `start_workflow` read this header as a
-                // *workflow-start* dedup key, but many webhook providers (Stripe
-                // et al.) send their OWN `Idempotency-Key` on deliveries -- that is
-                // the PROVIDER's key, not a Harvest start key. If it reached #808's
-                // key logic it would (a) collapse two DIFFERENT bindings/events that
-                // happen to reuse a provider key into one execution, and (b) trip
-                // #808's `idempotency_key` + throttle/debounce/batch mutual-exclusion
-                // `400`, breaking webhook starts for any throttled/debounced/batched
-                // target. Webhook starts already dedupe via the mapper's
-                // `workflow_id` (reuse policy on `(workflow_name, workflow_id)`), so
-                // removing the raw header restores that -- and only that -- dedup.
-                // `from_webhook` already sets the body `idempotency_key` to `None`;
-                // the header is the sole remaining source, so removing it fully
-                // disables #808 dedup for webhook-delegated starts. Use the same
-                // header-name constant the handler reads so the two cannot drift.
+                // Issue #808 made `start_workflow` read it as a start dedup key.
+                // Many providers (Stripe et al.) send their OWN key, which is not
+                // a Harvest start key. In #808's logic it would (a) merge two
+                // DIFFERENT bindings or events that reuse a provider key into one
+                // execution. It would also (b) trip the #808 `400` for a key with
+                // throttle, debounce or batch, which breaks those targets.
+                // Webhook starts already dedupe on the mapper's `workflow_id`
+                // (reuse policy on `(workflow_name, workflow_id)`). `from_webhook`
+                // sets the body `idempotency_key` to `None`, so the header is the
+                // last source. So its removal fully disables #808 dedup for webhook
+                // starts. The handler reads the same header-name constant, so the
+                // two cannot drift.
                 let mut start_headers = headers.clone();
                 start_headers.remove(HEADER_IDEMPOTENCY_KEY);
                 // A lost fence session stops the dispatch with a `503`.
@@ -565,30 +543,24 @@ async fn handle_webhook(
                 signal_name,
             } => {
                 // Namespace the idempotency key by this binding (path +
-                // signal_name) rather than passing the raw provider delivery id
-                // straight through: `signal_with_start`'s dedupe is scoped to
-                // `(workflow_name, workflow_id, idempotency_key)` only -- it does
-                // not know about webhook endpoints or signal names. Two
-                // different `#[webhook(signals = ...)]` bindings that target the
-                // same (workflow_name, workflow_id) pair (e.g. two providers
-                // signalling one shared entity workflow) would otherwise collide
-                // whenever their raw delivery ids happen to match (a real risk
-                // for naive/generic senders using small sequential ids, or the
-                // same event redelivered to two configured paths) -- the second
-                // delivery would be misread as an idempotent replay of the
-                // first and its signal silently dropped. `path` alone already
-                // disambiguates every binding (`validate_webhook_triggers`
-                // forbids duplicate paths); `signal_name` is included for
-                // defense-in-depth. A same-binding redelivery of the same event
-                // still maps to the same key, so exactly-once dedup for the
-                // common case is unchanged.
+                // signal_name), not the raw provider delivery id. The
+                // `signal_with_start` dedupe key is only
+                // `(workflow_name, workflow_id, idempotency_key)`. Two bindings
+                // can target one (workflow_name, workflow_id) pair, for example
+                // two providers that signal one entity workflow. With raw ids,
+                // they collide whenever their delivery ids match. Small
+                // sequential ids make that a real risk, and so does one event
+                // redelivered to two configured paths. The second delivery then
+                // reads as a replay and its signal is silently dropped. `path`
+                // alone disambiguates each binding, because
+                // `validate_webhook_triggers` forbids duplicate paths.
+                // `signal_name` adds defense in depth. A same-binding redelivery
+                // still maps to the same key, so dedup is unchanged.
                 //
-                // Unlike the `Starts` path above, the raw upstream `Idempotency-Key`
-                // header cannot leak into #808 dedup here: `signal_with_start_workflow`
-                // reads its exactly-once key exclusively from the request BODY
-                // (`request.idempotency_key`), never the header, so the namespaced
-                // key below is authoritative regardless of any provider header. No
-                // header stripping is needed on this path.
+                // The upstream `Idempotency-Key` header cannot leak into #808
+                // dedup here. `signal_with_start_workflow` reads its key only
+                // from the request BODY (`request.idempotency_key`), never the
+                // header. So this path needs no header stripping.
                 let namespaced_idempotency_key = ctx
                     .delivery_id
                     .as_deref()
@@ -706,9 +678,9 @@ struct DispatchAuditCtx<'a> {
     api_state: &'a HarvestApiState,
     headers: &'a axum::http::HeaderMap,
     route: &'a str,
-    /// The mapping function's deterministic `WorkflowId` -- used as a
-    /// `target_id` fallback when the delegate never produced an execution
-    /// (e.g. a debounce/batch admission, or a delegate-side rejection).
+    /// The mapping function's deterministic `WorkflowId`. It is the
+    /// `target_id` fallback when the delegate produced no execution, as after
+    /// a debounce or batch admission or a delegate rejection.
     workflow_id: &'a str,
     delivery_id: Option<&'a str>,
 }
@@ -730,14 +702,12 @@ struct DispatchIds {
     signal_delivered: Option<bool>,
 }
 
-/// Rewrite a successful `start_workflow`/`signal_with_start_workflow` response
-/// into the issue's `{"status", "workflow_exec_id", "workflow_id"}` envelope;
-/// pass a debounced/batched `202 Accepted` admission and any delegate error
-/// response through unchanged (both already carry a structured JSON body).
-/// Writes the `webhook.trigger` audit row for every dispatch attempt that
-/// reaches this point -- i.e. passed signature verification, JSON parsing,
-/// and the mapping function -- whether the delegate ultimately accepted or
-/// rejected it.
+/// Rewrite a successful delegate response into the issue's
+/// `{"status", "workflow_exec_id", "workflow_id"}` envelope.
+/// A `202 Accepted` admission and a delegate error pass through unchanged.
+/// Both already carry a structured JSON body. Each call writes the
+/// `webhook.trigger` audit row, whether the delegate accepted or rejected
+/// the request.
 async fn reshape_dispatch_response(
     metrics: &dyn MetricsRecorder,
     path: &str,
@@ -746,9 +716,8 @@ async fn reshape_dispatch_response(
 ) -> axum::response::Response {
     let status = response.status();
 
-    // A debounce/batch admission gate deferred the actual start -- there is
-    // no execution yet to reshape the body against, but this is a genuine,
-    // successful admission, not an internal error.
+    // A debounce or batch gate deferred the start. There is no execution
+    // yet, but this is a successful admission, not an internal error.
     if status == axum::http::StatusCode::ACCEPTED {
         record_outcome(metrics, path, WebhookOutcome::Accepted);
         write_dispatch_audit(&audit_ctx, STATUS_SUCCEEDED, None, None).await;
@@ -821,12 +790,11 @@ async fn reshape_dispatch_response(
         }
     };
 
-    // `201 Created` is unambiguous (`Accepted`). A `200 OK` is ambiguous:
-    // `signal_delivered == Some(true)` means a live execution just received a
-    // genuinely new signal (still a first-time `Accepted` from the sender's
-    // point of view), vs. `Some(false)`/`None` (a `Starts` target, whose
-    // `200 OK` is always a redelivery of an already-started deterministic
-    // `WorkflowId`) meaning a deduped redelivery.
+    // `201 Created` is unambiguous (`Accepted`). A `200 OK` is ambiguous.
+    // `signal_delivered == Some(true)` means a live execution got a new
+    // signal, which is a first-time `Accepted` for the sender.
+    // `Some(false)` or `None` means a deduped redelivery. A `Starts` target
+    // returns `200 OK` only for an already-started `WorkflowId`.
     let outcome =
         if status == axum::http::StatusCode::CREATED || parsed.signal_delivered == Some(true) {
             WebhookOutcome::Accepted
@@ -858,19 +826,16 @@ async fn reshape_dispatch_response(
 }
 
 /// Write the `webhook.trigger` audit row for one dispatch attempt (issue
-/// #344's audit AC). Best-effort: a failure to acquire a connection or
-/// insert the row is logged and swallowed rather than turned into a second
-/// error response layered on top of the dispatch outcome already decided --
-/// the sender already has its real HTTP response, and a broken audit sink
-/// must not un-deliver it.
+/// #344's audit AC). This is best-effort. A connection or insert failure is
+/// logged and swallowed, not turned into a second error response. The
+/// sender already has its real response, and a broken audit sink must not
+/// un-deliver it.
 ///
-/// When `exec_id` is known (any dispatch that produced or attached to an
-/// execution), the row is written to that execution's own shard via
-/// [`crate::api::db_conn_for_execution`], matching every other execution-
-/// scoped audit write in this codebase. When there is no execution yet (a
-/// debounced/batched admission, or a delegate-side rejection before an
-/// execution was created), the row is written to the default shard,
-/// mirroring the debounce/batch admission-audit writes in `api.rs`.
+/// With a known `exec_id`, the row goes to that execution's shard via
+/// [`crate::api::db_conn_for_execution`], like every execution-scoped audit
+/// write. With no execution yet (an admission or an early delegate
+/// rejection), the row goes to the default shard. This matches the
+/// debounce and batch admission audit writes in `api.rs`.
 async fn write_dispatch_audit(
     audit_ctx: &DispatchAuditCtx<'_>,
     status: &'static str,
@@ -1125,13 +1090,11 @@ mod tests {
         }
     }
 
-    /// `write_dispatch_audit` is exercised transitively by every case below --
-    /// with no storage pool installed (a fresh no-DB [`HarvestApiState`]),
-    /// `storage_pool()`/`db_conn_for_execution` return `Err`, so the audit
-    /// write is a logged no-op rather than a panic. This lets the pure
-    /// outcome-classification logic in [`reshape_dispatch_response`] be
-    /// tested here without Docker/testcontainers; the actual audit *row*
-    /// content is covered by `webhook_receiver_integration.rs`.
+    /// Every case below runs `write_dispatch_audit` transitively. A fresh
+    /// no-DB [`HarvestApiState`] has no storage pool, so the audit write is
+    /// a logged no-op, not a panic. So the outcome logic in
+    /// [`reshape_dispatch_response`] runs here without Docker.
+    /// `webhook_receiver_integration.rs` covers the audit *row* content.
     #[tokio::test]
     async fn reshape_passes_a_debounced_202_through_unchanged_as_accepted() {
         let m = RecordingMetrics::default();

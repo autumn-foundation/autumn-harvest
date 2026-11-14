@@ -29,13 +29,12 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 ///
 /// # Cancellation interaction
 ///
-/// **Cancellation does not auto-compensate.** When an operator calls
-/// `cancel_workflow_execution`, a `WorkflowCancelled` event is appended to
-/// history and the executor replays the workflow function with a context where
-/// [`WorkflowContext::is_cancelled`] returns `true`.  The `Saga` struct never
-/// observes this directly; its compensation stack is left intact.  The workflow
-/// author must check for cancellation and invoke [`compensate_all`](Self::compensate_all)
-/// explicitly:
+/// **Cancellation does not auto-compensate.** `cancel_workflow_execution`
+/// appends a `WorkflowCancelled` event to history. The executor then replays
+/// the workflow function, and [`WorkflowContext::is_cancelled`] returns `true`.
+/// The `Saga` struct never observes this directly; its compensation stack is
+/// left intact. The workflow author must check for cancellation and invoke
+/// [`compensate_all`](Self::compensate_all) explicitly:
 ///
 /// ```rust,ignore
 /// // Recommended pattern — check for cancellation after each step or at the end.
@@ -51,11 +50,11 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 ///
 /// # Idempotency contract
 ///
-/// Compensation closures are re-registered on **every** workflow replay.  If a
-/// worker crashes mid-[`compensate_all`](Self::compensate_all), the next worker
-/// replays the workflow function from scratch, re-registers all compensations,
-/// and calls `compensate_all()` again — including compensations that already ran
-/// before the crash.
+/// Compensation closures are re-registered on **every** workflow replay. A
+/// worker can crash mid-[`compensate_all`](Self::compensate_all). The next
+/// worker then replays from scratch, re-registers all compensations, and calls
+/// `compensate_all()` again. That includes compensations that ran before the
+/// crash.
 ///
 /// **Compensation activities must therefore be idempotent.**
 ///
@@ -75,33 +74,35 @@ type Compensation<'ctx> = Box<dyn FnOnce() -> BoxFuture<'ctx, HarvestResult<()>>
 ///
 /// # Observability (issue #801)
 ///
-/// Every **non-empty** unwind (a [`compensate_all`](Self::compensate_all)
-/// call or an automatic step-failure rollback with at least one pending
-/// compensation) emits the counter `harvest.saga.compensated{workflow, queue}`
-/// **exactly once per real compensation sequence**, and an unwind that
-/// finishes with at least one compensation error additionally emits
-/// `harvest.saga.compensation_failed{workflow, queue}` — the alertable
-/// dangling-state signal, fired even when the author catches
+/// A **non-empty** unwind is a [`compensate_all`](Self::compensate_all) call
+/// or a step-failure rollback with at least one pending compensation. Each one
+/// emits `harvest.saga.compensated{workflow, queue}` **exactly once per real
+/// compensation sequence**. An unwind with at least one compensation error
+/// also emits `harvest.saga.compensation_failed{workflow, queue}`. That is the
+/// alertable dangling-state signal. It fires even when the author catches
 /// [`HarvestError::SagaCompensationFailed`] and completes normally.
 ///
-/// Exactly-once across replays is keyed to durable `MarkerRecorded` dedup
-/// markers (`saga_compensated:{seq}` at unwind start, in the same command
-/// batch as the first compensation's own dispatch; `saga_compensation_failed:{seq}`
-/// at failed-unwind end). Replays — the only resume mechanism Harvest has —
-/// observe the marker and stay silent, while pre-#801 marker-less histories
-/// replay untouched and uncounted (the matcher's tolerant `Absent` arm never
-/// moves the cursor). No new `WorkflowEvent` variant and no migration are
-/// involved; the markers are opaque names on the existing `MarkerRecorded`
-/// variant, exactly like `fan_out:{n}` / `race:{seq}` / `patch:{id}`.
+/// Durable `MarkerRecorded` dedup markers give exactly-once across replays.
+/// `saga_compensated:{seq}` goes at unwind start, in the same command batch
+/// as the first compensation's own dispatch. `saga_compensation_failed:{seq}`
+/// goes at failed-unwind end. Replay is the only resume mechanism Harvest has.
+/// A replay observes the marker and stays silent. Pre-#801 marker-less
+/// histories replay untouched and uncounted, because the tolerant `Absent`
+/// arm of the matcher never moves the cursor. The markers need no new
+/// `WorkflowEvent` variant and no migration. They are opaque names on the
+/// existing `MarkerRecorded` variant, like `fan_out:{n}` / `race:{seq}` /
+/// `patch:{id}`.
 ///
-/// Accepted edges (documented in `docs/saga.md`): an unwind entered with
-/// unconsumed non-marker events at the cursor is conservatively uncounted; a
-/// **pure in-memory** unwind (zero durable footprint) that crash-resumes
-/// within one decision cycle can re-count (at-least-once) — the metric
-/// mirror of the "compensations re-run wholesale" idempotency contract; and
-/// a history recorded by #801+ code does not replay under pre-#801 builds
-/// (roll forward, never back — the same forward-compat rule as every marker
-/// feature).
+/// Accepted edges (documented in `docs/saga.md`):
+///
+/// * An unwind entered with unconsumed non-marker events at the cursor is
+///   conservatively uncounted.
+/// * A **pure in-memory** unwind (zero durable footprint) that crash-resumes
+///   within one decision cycle can re-count (at-least-once). This mirrors the
+///   "compensations re-run wholesale" idempotency contract.
+/// * A history recorded by #801+ code does not replay under pre-#801 builds.
+///   Roll forward, never back: the same forward-compat rule as every marker
+///   feature.
 ///
 /// ## Examples
 ///
@@ -204,19 +205,19 @@ impl<'ctx> Saga<'ctx> {
     /// Register a compensation **without** running a forward step (issue #780).
     ///
     /// [`step`](Self::step) couples "run the forward action" to "register its
-    /// undo". The declarative DAG unwind already knows from recorded history
-    /// which nodes succeeded, so it must register their compensations without
-    /// re-executing them — that is what this method is for.
+    /// undo". The declarative DAG unwind knows from recorded history which
+    /// nodes succeeded. This method registers their compensations without
+    /// re-executing them.
     ///
     /// The closure is **stored, not invoked**: it runs only when an unwind is
     /// invoked ([`compensate_all`](Self::compensate_all),
     /// [`compensate_all_after`](Self::compensate_all_after), or a
     /// [`step`](Self::step) failure), in LIFO registration order.
     ///
-    /// The same idempotency and replay-determinism contracts as
-    /// [`step`](Self::step) apply: compensations are re-registered on every
-    /// replay, so the compensating **activity** must be idempotent and the
-    /// closure body itself must contain no non-deterministic side effect.
+    /// The idempotency and replay-determinism contracts of
+    /// [`step`](Self::step) apply. Compensations are re-registered on every
+    /// replay. So the compensating **activity** must be idempotent, and the
+    /// closure body must contain no non-deterministic side effect.
     pub(crate) fn push_compensation<C, Fut>(&mut self, compensate: C)
     where
         C: FnOnce() -> Fut + Send + 'ctx,
@@ -229,11 +230,10 @@ impl<'ctx> Saga<'ctx> {
     /// Run all pending compensations in reverse registration order, reporting
     /// `original` as the error that triggered the unwind (issue #780).
     ///
-    /// Identical to [`compensate_all`](Self::compensate_all) except that the
-    /// caller supplies the original error rather than the fixed
-    /// `"manual compensation requested"` string — so a DAG unwind's
-    /// [`HarvestError::SagaCompensationFailed`] carries the real
-    /// `"one or more DAG tasks failed"` cause.
+    /// Unlike [`compensate_all`](Self::compensate_all), the caller supplies the
+    /// original error, not the fixed `"manual compensation requested"` string.
+    /// So the [`HarvestError::SagaCompensationFailed`] of a DAG unwind carries
+    /// the real `"one or more DAG tasks failed"` cause.
     ///
     /// # Errors
     ///
@@ -254,20 +254,18 @@ impl<'ctx> Saga<'ctx> {
 
     /// Run all pending compensations in reverse registration order.
     ///
-    /// Call this explicitly when the workflow needs to abort after successful
-    /// forward steps — either because a later step failed outside the saga, or
-    /// because the workflow was cancelled (see [`Saga`] for the recommended
-    /// cancel-and-compensate pattern).
+    /// Call this to abort after successful forward steps: a later step failed
+    /// outside the saga, or the workflow was cancelled. See [`Saga`] for the
+    /// recommended cancel-and-compensate pattern.
     ///
     /// **Cancellation:** `compensate_all` does **not** detect cancellation
     /// automatically.  The author is responsible for calling it after checking
     /// [`WorkflowContext::is_cancelled`].
     ///
-    /// **Idempotency under replay:** if the worker crashes after some but not
-    /// all compensations have run, the next worker will call `compensate_all`
-    /// again on a fresh replay, re-running *all* compensations from the
-    /// beginning of the stack.  Compensation activities must therefore be
-    /// idempotent.
+    /// **Idempotency under replay:** a worker can crash after some but not all
+    /// compensations ran. The next worker calls `compensate_all` again on a
+    /// fresh replay and re-runs *all* compensations from the stack start.
+    /// Compensation activities must therefore be idempotent.
     ///
     /// # Errors
     ///
@@ -298,9 +296,9 @@ impl<'ctx> Saga<'ctx> {
             return Ok(());
         }
 
-        // Counted at unwind start (the earliest outage signal), deduped
-        // across replays by the durable `saga_compensated:{seq}` marker —
-        // recorded in the same command batch as the first compensation's own
+        // Counted at unwind start, the earliest outage signal. The durable
+        // `saga_compensated:{seq}` marker dedupes it across replays. The marker
+        // is recorded in the same command batch as the first compensation's own
         // dispatch, so a crash at any point mid-unwind resumes silent. The
         // returned observation carries the unwind's disposition; the failure
         // observe below follows it (invariant: failed ≤ compensated).
@@ -414,10 +412,9 @@ mod tests {
             _ => panic!("Expected WorkflowFailed error"),
         }
 
-        // Both compensations should have run
         assert!(*comp1.lock().await);
         assert!(*comp2.lock().await);
-        // And pending count should be 0 because compensations were popped
+        // Pending count is 0 because compensations were popped.
         assert_eq!(saga.pending_compensation_count(), 0);
     }
 
@@ -498,9 +495,8 @@ mod tests {
     // ── Issue #780 — register-only compensation + caller-supplied original ──
 
     /// T21 — `push_compensation` registers a compensation WITHOUT running a
-    /// forward step (the DAG unwind already knows which nodes succeeded from
-    /// recorded history, so it must not re-execute them). The closure is stored,
-    /// not invoked.
+    /// forward step. The DAG unwind knows from history which nodes succeeded,
+    /// so it must not re-execute them. The closure is stored, not invoked.
     #[tokio::test]
     async fn push_compensation_registers_without_a_forward_step() {
         let ctx = WorkflowContext::new_test();

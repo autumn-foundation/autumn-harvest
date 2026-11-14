@@ -1,11 +1,10 @@
 //! `GET /admin/concurrency` workflow attribution — issue #811 AC7 (second half).
 //!
-//! The counter half of AC7 is covered by unit tests; this covers the **admin
-//! read**, which had no test at all: the handler's cross-shard merge, the
-//! `(key, task_type)` grouping, the per-key `workflows` attribution, its
-//! dedup + sort, and the registry lookup whose `map_or_else` fallback must
-//! report `defer` for a workflow that declares no policy (or is not
-//! registered at all).
+//! Unit tests cover the counter half of AC7. This file covers the **admin
+//! read**: the cross-shard merge, the `(key, task_type)` grouping, and the
+//! per-key `workflows` attribution with its dedup and sort. It also covers
+//! the registry lookup. Its `map_or_else` fallback must report `defer` for
+//! a workflow with no policy or no registration.
 //!
 //! Runs against a real Postgres 16 container (or `HARVEST_TEST_DATABASE_URL`).
 
@@ -143,9 +142,8 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// Start a run through the real primitive so BOTH the execution row and the
-/// task row (which is where the resolved concurrency key actually lives) are
-/// created exactly as production creates them.
+/// Start a run through the real primitive, so BOTH the execution row and the
+/// task row match production. The task row holds the resolved concurrency key.
 async fn seed_run(pool: &DbPool, wf: &str, wf_id: &str, key: &str, limit: u32) {
     let mut conn = pool.get().await.expect("pool conn");
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -202,11 +200,11 @@ async fn seed_run(pool: &DbPool, wf: &str, wf_id: &str, key: &str, limit: u32) {
     .expect("seed start should succeed");
 }
 
-/// Two registered workflow types share one concurrency key -- one declaring
-/// `cancel_running`, one declaring no policy at all -- plus a third type that
-/// is not in the registry. The admin read must group them under one key,
-/// attribute each by name, sort the `workflows` array, and resolve `defer`
-/// for both the policy-less and the unregistered type.
+/// Three workflow types share one concurrency key. One declares
+/// `cancel_running`, one declares no policy, and one is not registered.
+/// The admin read must group them under one key and attribute each by name.
+/// It must sort the `workflows` array and resolve `defer` for the
+/// policy-less and the unregistered type.
 #[tokio::test]
 async fn admin_concurrency_attributes_each_workflow_and_its_effective_strategy() {
     let (url, _container) = setup_database().await;
@@ -331,8 +329,8 @@ async fn admin_concurrency_dedups_repeated_workflow_names_on_one_key() {
 ///
 /// Latest-wins is a workflow-*start* admission control: the supersede runs
 /// inside the start primitive and sheds workflow *executions*. An activity task
-/// that carries a concurrency key is gated purely at claim time (issue #247)
-/// and always defers — nothing sheds an in-flight activity for a newcomer. So
+/// that carries a concurrency key is gated only at claim time (issue #247).
+/// It always defers — nothing sheds an in-flight activity for a newcomer. So
 /// resolving the owning workflow's declared strategy onto the
 /// `task_type = "activity"` row would advertise behaviour the engine does not
 /// enforce for that group.
