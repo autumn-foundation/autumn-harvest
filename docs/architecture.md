@@ -198,7 +198,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 2. **Heartbeat.** The flusher writes `last_heartbeat_at` and `heartbeat_details` under the claim.
 3. **Orphan reclaim.** The worker's liveness row goes stale. `requeue_orphan` sets the row to `PENDING` and clears `worker_id`. It does not change `attempt`.
 4. **Re-claim.** A worker claims the row again. The new claim has a higher `attempt`.
-5. **Complete.** The owner locks the execution row, then writes the terminal row state with a fenced write. That write locks the task row and tests the claim in one statement. Only when it applies does the owner append the terminal event.
+5. **Complete.** The owner locks the execution row, then the task row, in one of two ways. The worker's completion and failure write the terminal row state first: that fenced write locks the row and tests the claim, and the terminal event follows only when it applies. `run_transactional` and the in-worker timeouts call `lock_claim_for_update`, append the event after `Held`, then write the row with `require_applied`.
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 

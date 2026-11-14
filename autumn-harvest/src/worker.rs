@@ -6398,8 +6398,8 @@ async fn lock_workflow_execution_row_only(
 
 /// Lock an activity row under the claim that the `task` snapshot carries.
 ///
-/// Every activity owner write checks this first (issue #1789). A snapshot
-/// with no `worker_id` holds no claim, so it reads as lost.
+/// For an owner write that is not itself a fenced write of the row. A
+/// snapshot with no `worker_id` holds no claim, so it reads as lost.
 async fn lock_activity_claim(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -6656,8 +6656,9 @@ async fn read_lost_start(
     };
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
     // The lost start can still be committing, holding the task row lock. Wait
-    // for it so the history read below sees the outcome. The start holds only
-    // `FOR NO KEY UPDATE`, which `FOR KEY SHARE` would not wait for.
+    // for it so the history read below sees the outcome. A start with a
+    // handler holds only `FOR NO KEY UPDATE`, which `FOR KEY SHARE` would not
+    // wait for.
     {
         use crate::schema::harvest_task_queue::dsl;
         dsl::harvest_task_queue
@@ -6879,6 +6880,25 @@ pub async fn append_activity_started_for_test(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<ActivityExecId>> {
     append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, true)
+        .await
+        .map(|started| started.map(|s| s.activity_id))
+}
+
+/// [`append_activity_started_for_test`] for a start that runs no handler.
+///
+/// # Errors
+///
+/// Returns the error of the start transaction.
+#[doc(hidden)]
+pub async fn append_activity_started_without_handler_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<ActivityExecId>> {
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, false)
         .await
         .map(|started| started.map(|s| s.activity_id))
 }

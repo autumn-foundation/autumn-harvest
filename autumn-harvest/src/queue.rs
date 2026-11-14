@@ -5793,7 +5793,8 @@ const fn claim_write(updated: bool) -> ClaimWrite {
 
 /// Lock the claimed row `FOR UPDATE` and report whether `claim` is current.
 ///
-/// Call it after the execution row lock, as every activity write path does.
+/// Call it after the execution row lock. A path whose first write is
+/// fenced does not need it: that write is the lock.
 /// While the transaction lives, no other writer can move the claim.
 ///
 /// # Errors
@@ -6058,8 +6059,8 @@ pub(crate) async fn take_timed_out_claim(
 /// It also sets `handler_started_at`, from which the enforcer measures the
 /// attempt duration. `clock_timestamp()`, not `NOW()`: the start transaction
 /// can wait on the execution row lock first.
-/// Call it in the transaction that appends `ActivityStarted`, after
-/// [`lock_claim_for_update`] returns [`ClaimLock::Held`]. A WASM activity
+/// In the start transaction it runs before the `ActivityStarted` append and
+/// is the claim lock: `LeaseLost` means the claim is lost. A WASM activity
 /// calls it after its module resolves instead. The claim fence then makes it
 /// wait for a timeout in flight, and change nothing after one.
 ///
