@@ -75,7 +75,7 @@
 //! `idx_harvest_we_quota_reconcile_name_id` (see
 //! `quota_reconcile_candidate_query`'s doc comment). The scan reads at most
 //! `batch_size` rows per registered workflow name. The existing
-//! `idx_harvest_we_state` index covers only `RUNNING`, not `PAUSED`, so it
+//! `idx_harvest_we_canary_order` index covers only `RUNNING`, not `PAUSED`, so it
 //! cannot serve this query on its own; the dedicated index closes that gap.
 //!
 //! # Multiple workers on one shard: redundant, not coordinated
