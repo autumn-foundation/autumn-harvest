@@ -29980,7 +29980,7 @@ mod tests {
     /// Regression test (PR #902): a payload-cap failure on a fresh branch must
     /// leave no durable trace of the race. The `race:{seq}` open marker must
     /// not be queued. Nothing else in this cycle would be recorded to match it
-    /// on a later replay: no branch's ScheduleActivity or StartChildWorkflow.
+    /// on a later replay: no branch's `ScheduleActivity` or `StartChildWorkflow`.
     #[tokio::test]
     async fn race_rejects_oversized_second_branch_without_queuing_open_marker() {
         let ctx = WorkflowContext::new_test().with_payload_caps(
