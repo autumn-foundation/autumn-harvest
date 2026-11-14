@@ -6398,8 +6398,8 @@ async fn lock_workflow_execution_row_only(
 
 /// Lock an activity row under the claim that the `task` snapshot carries.
 ///
-/// Every activity owner write checks this first (issue #1789). A snapshot
-/// with no `worker_id` holds no claim, so it reads as lost.
+/// For an owner write that is not itself a fenced write of the row. A
+/// snapshot with no `worker_id` holds no claim, so it reads as lost.
 async fn lock_activity_claim(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -6655,15 +6655,16 @@ async fn read_lost_start(
         return Ok(None);
     };
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-    // The lost start can still be committing. Its transaction holds the task
-    // row lock until it ends. A key-share lock waits for that, so the history
-    // read below sees the outcome. The lock goes at the end of the statement.
+    // The lost start can still be committing, holding the task row lock. Wait
+    // for it so the history read below sees the outcome. A start with a
+    // handler holds only `FOR NO KEY UPDATE`, which `FOR KEY SHARE` would not
+    // wait for.
     {
         use crate::schema::harvest_task_queue::dsl;
         dsl::harvest_task_queue
             .find(task.id)
             .select(dsl::id)
-            .for_key_share()
+            .for_share()
             .first::<uuid::Uuid>(&mut conn)
             .await
             .optional()
@@ -6825,19 +6826,19 @@ async fn append_activity_started_if_pending(
             else {
                 return Ok(None);
             };
-            // Claim-epoch start fence (issue #1789). A stale owner must not
-            // start an attempt that a later claim now holds.
-            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                return Ok(None);
-            }
-            // This claim starts its handler now (issue #1809). Only such an
-            // attempt can time out against the downstream, so only its
-            // timeout feeds the circuit breaker. A fail-fast short circuit
-            // calls no handler, so it sets no marker.
+            // A fail-fast short circuit runs no handler, so it sets no marker.
+            // Only a marked attempt's timeout feeds the circuit breaker.
             if handler_runs {
-                queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
-                    .await?
-                    .require_applied(task.id)?;
+                let Some(claim) = queue::TaskClaim::of(task) else {
+                    return Ok(None);
+                };
+                if queue::mark_claim_handler_started(conn, &claim).await?
+                    == queue::ClaimWrite::LeaseLost
+                {
+                    return Ok(None);
+                }
+            } else if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                return Ok(None);
             }
 
             let started_event = WorkflowEvent::ActivityStarted {
@@ -6879,6 +6880,25 @@ pub async fn append_activity_started_for_test(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<ActivityExecId>> {
     append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, true)
+        .await
+        .map(|started| started.map(|s| s.activity_id))
+}
+
+/// [`append_activity_started_for_test`] for a start that runs no handler.
+///
+/// # Errors
+///
+/// Returns the error of the start transaction.
+#[doc(hidden)]
+pub async fn append_activity_started_without_handler_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<ActivityExecId>> {
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, false)
         .await
         .map(|started| started.map(|s| s.activity_id))
 }
@@ -15681,9 +15701,20 @@ async fn finalize_activity_completion_write(
                 if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
                     return Ok(queue::ClaimWrite::LeaseLost);
                 }
-                // A lost lease is a no-op, not an error (issue #1789). The later
-                // claim owns the outcome of this activity.
-                if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                // A lost lease is a no-op, not an error. The later claim owns the
+                // outcome of this activity.
+                let Some(claim) = queue::TaskClaim::of(task) else {
+                    log_lease_lost(task, "activity completion");
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                };
+                let row_output = match (&encoded_row_output, stored) {
+                    (Some(encoded), _) => encoded.clone(),
+                    (None, Some(stored)) => stored.to_recorded_value(),
+                    (None, None) => output.clone(),
+                };
+                if queue::complete_claimed_task(conn, &claim, row_output).await?
+                    == queue::ClaimWrite::LeaseLost
+                {
                     log_lease_lost(task, "activity completion");
                     return Ok(queue::ClaimWrite::LeaseLost);
                 }
@@ -15726,10 +15757,6 @@ async fn finalize_activity_completion_write(
                     llm_calls,
                 )
                 .await?;
-                let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
-                queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
-                    .await?
-                    .require_applied(task.id)?;
                 // Worker sessions (issue #606): a session member activity's
                 // completion pushes the session's lease forward, so a
                 // long-running but still-legitimate pipeline isn't reclaimed by
@@ -15833,14 +15860,20 @@ async fn finalize_activity_failure_write(
                 if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
                     return Ok(queue::ClaimWrite::LeaseLost);
                 }
-                // A lost lease is a no-op, not an error (issue #1789).
-                if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+                // A lost lease is a no-op, not an error.
+                let Some(claim) = queue::TaskClaim::of(task) else {
                     log_lease_lost(task, "activity failure");
-                    // If the task reached COMPLETED before the handler returned
-                    // (e.g. via run_transactional) and the handler then returned
-                    // Err, the error is discarded — the workflow already observed
-                    // ActivityCompleted.  Emit a warning so the misuse is visible.
-                    if state.as_deref() == Some("COMPLETED") {
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                };
+                if queue::fail_claimed_task(conn, &claim, &error).await?
+                    == queue::ClaimWrite::LeaseLost
+                {
+                    log_lease_lost(task, "activity failure");
+                    // A handler that returns Err after run_transactional
+                    // committed loses its error: the workflow already saw
+                    // ActivityCompleted.
+                    let state = queue::task_status_for_claim(conn, &claim).await?;
+                    if state.is_some_and(|(state, _, _)| state == "COMPLETED") {
                         tracing::warn!(
                             task_id = %task.id,
                             activity_name = %activity_name,
@@ -15860,9 +15893,6 @@ async fn finalize_activity_failure_write(
                     codecs,
                 )
                 .await?;
-                queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
-                    .await?
-                    .require_applied(task.id)?;
                 queue::wake_workflow_task(conn, exec_id).await?;
                 Ok(queue::ClaimWrite::Applied)
             })

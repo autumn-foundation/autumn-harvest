@@ -21,9 +21,10 @@ use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{
-    DbPool, append_activity_started_for_test, fail_task_and_execution_with_history,
-    finalize_activity_completion, finalize_activity_failure, observe_task_cancellation,
-    preload_failure_history, requeue_workflow_task_after_event_id_conflict,
+    DbPool, append_activity_started_for_test, append_activity_started_without_handler_for_test,
+    fail_task_and_execution_with_history, finalize_activity_completion, finalize_activity_failure,
+    observe_task_cancellation, preload_failure_history,
+    requeue_workflow_task_after_event_id_conflict,
 };
 use chrono::Utc;
 use diesel::prelude::*;
@@ -1277,4 +1278,172 @@ async fn stale_event_id_conflict_redrive_leaves_a_peer_claim_alone() {
         "{after:?}"
     );
     assert_eq!(after.attempt, 2, "{after:?}");
+}
+
+// ---------------------------------------------------------------------------
+// One task-row lock per write
+// ---------------------------------------------------------------------------
+
+fn record_statements(
+    conn: &mut AsyncPgConnection,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use diesel::connection::InstrumentationEvent;
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&log);
+    conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            sink.lock().expect("statement log").push(query.to_string());
+        }
+    });
+    log
+}
+
+/// The separate claim lock: `queue::lock_claim_for_update`.
+fn claim_locks(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    log.lock()
+        .expect("statement log")
+        .iter()
+        .filter(|q| {
+            q.starts_with(r#"SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state""#)
+                && q.contains("FOR UPDATE")
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_start_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+
+    let log = record_statements(&mut conn);
+    let started = append_activity_started_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start");
+
+    assert_eq!(started, Some(fx.activity_id));
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_completion_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_completion(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        fx.activity_id,
+        serde_json::json!({"done": true}),
+        None,
+        &codecs,
+    )
+    .await
+    .expect("complete");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "COMPLETED");
+    assert_eq!(
+        completed_outputs(&events(&mut conn, fx.exec_id).await),
+        vec![serde_json::json!({"done": true})]
+    );
+}
+
+#[tokio::test]
+async fn a_failure_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_failure(&mut conn, &a, fx.exec_id, fx.activity_id, "boom", &codecs)
+        .await
+        .expect("fail");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "FAILED");
+    assert_eq!(count_failed(&events(&mut conn, fx.exec_id).await), 1);
+}
+
+#[tokio::test]
+async fn stale_start_without_a_handler_appends_nothing() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    requeue_orphan(&mut conn, &a).await;
+    let _b = claim(&mut conn, &fx, &fx.worker_b).await;
+
+    let started = append_activity_started_without_handler_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("a stale start is a no-op, not an error");
+
+    assert_eq!(started, None);
+    assert_eq!(
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_start_without_a_handler_keeps_its_claim_lock_and_sets_no_marker() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+
+    let log = record_statements(&mut conn);
+    let started = append_activity_started_without_handler_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start");
+
+    assert_eq!(started, Some(fx.activity_id));
+    assert_eq!(claim_locks(&log).len(), 1);
+    let marker: Option<i32> = harvest_task_queue::table
+        .find(fx.task_id)
+        .select(harvest_task_queue::handler_started_attempt)
+        .first(&mut conn)
+        .await
+        .expect("marker");
+    assert_eq!(marker, None);
 }

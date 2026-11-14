@@ -263,6 +263,16 @@ per workflow, each while the transaction holds the execution row lock.
 `fail_claimed_task` reads the state of a lost claim for a warning, so a
 merge needs one more read on that rare path.
 
+> **Follow-up (PR #2683):** the start with a handler, the completion and
+> the failure now use their fenced write as the lock. `read_lost_start`
+> takes `FOR SHARE`, not `FOR KEY SHARE`, because the fenced write holds
+> only `FOR NO KEY UPDATE`. One census run of each build: claim locks fall
+> from 8,640 to 0, statements from 304,425 to 295,544 (-2.9%), execution
+> time from 19,053 ms to 18,242 ms (-4.3%). Six alternating pairs show no
+> throughput change: median ratio 0.998, faster in 3 of 6, range 0.96 to
+> 1.02. The box is not bound by these statements. Raw output:
+> [`perf-artifacts/activity-claim-lock/`](perf-artifacts/activity-claim-lock/).
+
 **3. `harvest_task_queue` has 20 indexes and `harvest_workflow_executions`
 has 39.** A task row moves between states on each claim and each
 completion, so most of its updates are not HOT. `ExecInsertIndexTuples`

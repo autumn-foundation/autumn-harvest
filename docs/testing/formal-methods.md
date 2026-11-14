@@ -105,7 +105,7 @@ one task row and these actions:
 | Action | Code |
 |---|---|
 | `Claim` | `queue::claim_task`. Sets `RUNNING` and `worker_id`, adds 1 to `attempt`. |
-| `Start` | The start fence, `lock_claim_for_update`. |
+| `Start` | The start fence: `mark_claim_handler_started` when a handler runs, `lock_claim_for_update` when none does. |
 | `SelfRelease` | A pause release, capability-miss release, rate-limit deferral or retry-budget deferral. Subtracts 1 from `attempt`. |
 | `Heartbeat` | `record_heartbeat`. A lost lease cancels the activity. |
 | `OrphanReclaim` | `requeue_orphan`. Keeps `attempt`. Has no guard on the worker, because a live worker can look dead. |
