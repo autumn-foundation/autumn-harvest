@@ -1743,7 +1743,7 @@ async fn send_outside_diesel_transaction(
 }
 
 /// The start of the Postgres message for SQLSTATE `25P02`.
-const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
+pub(crate) const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
 
 /// True when the failed `probe` aborted a raw `BEGIN` block on `conn`.
 ///
@@ -1839,6 +1839,116 @@ struct GateRow {
     /// `txid_status()` of each staged id, in order.
     #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Nullable<Text>>)]
     statuses: Vec<Option<String>>,
+    /// The number of wakes that the read sent, or `NULL` when it sent none.
+    /// Only [`GATE_AND_SEND_SQL`] fills it.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    sent: Option<i64>,
+}
+
+/// The commit-state read of [`tick`].
+///
+/// `txid_status` raises an error for an id that this server has not assigned
+/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
+/// No such transaction has completed, so the guard reports it in progress.
+macro_rules! gate_columns_sql {
+    () => {
+        "SELECT current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at, \
+                pg_notification_queue_usage() AS queue_usage, \
+                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
+                                  THEN txid_status(t.x) ELSE 'in progress' END \
+                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
+                      ORDER BY t.n) AS statuses"
+    };
+}
+
+/// The commit-state read alone. A tick runs it after [`GATE_AND_SEND_SQL`]
+/// fails, so a failed send still leaves a good read.
+const GATE_SQL: &str = concat!(gate_columns_sql!(), ", NULL::bigint AS sent");
+
+/// The commit-state read that also sends the wakes when every note is ready.
+///
+/// `$2` and `$3` are the server of every held note, `$4` and `$5` the
+/// channels and payloads of the wakes. The statement sends them only when
+/// the server is that server and no status is aborted or in progress. That is
+/// the case where [`tick`] sends every wake after the read. A `NULL` in `$2`
+/// turns the send off.
+///
+/// The send is a scalar subquery in a `CASE` branch. Postgres runs such a
+/// subquery only when the branch is taken.
+/// `a_rolled_back_write_sends_no_wake` and
+/// `a_committed_and_an_open_note_send_only_the_committed_wake` prove that an
+/// aborted or open note sends nothing. `array_position` reads a `NULL` status as no match, where
+/// `= ANY` would give `NULL`.
+const GATE_AND_SEND_SQL: &str = concat!(
+    "WITH g AS MATERIALIZED (",
+    gate_columns_sql!(),
+    ") SELECT g.database, g.started_at, g.queue_usage, g.statuses, \
+       CASE WHEN g.database = $2 AND g.started_at = $3 \
+                 AND array_position(g.statuses, 'aborted') IS NULL \
+                 AND array_position(g.statuses, 'in progress') IS NULL \
+            THEN (SELECT count(pg_notify(w.c, w.p)) \
+                  FROM unnest($4::text[], $5::text[]) AS w(c, p)) \
+       END AS sent \
+     FROM g"
+);
+
+/// The wakes that a tick sends with its read, and the server they need.
+///
+/// A tick can send in its read only when every held note names one server.
+/// The wakes are those of every note but the owner notes, which need a
+/// lookup first. `None` when no such wake exists.
+fn wakes_with_the_read(held: &[Staged]) -> Option<(Fingerprint, Vec<(String, String)>)> {
+    let first = held.first()?;
+    if held
+        .iter()
+        .any(|staged| staged.fingerprint != first.fingerprint)
+    {
+        return None;
+    }
+    let notes: Vec<Note> = held
+        .iter()
+        .filter(|staged| !matches!(staged.note, Note::Owner { .. }))
+        .map(|staged| staged.note.clone())
+        .collect();
+    let wakes = coalesce(notes);
+    if wakes.is_empty() {
+        return None;
+    }
+    Some(((*first.fingerprint).clone(), wakes))
+}
+
+/// Read the commit state, and send `wakes` in the same statement when every
+/// note is ready.
+async fn read_gate(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+    wakes: Option<(Fingerprint, Vec<(String, String)>)>,
+) -> Result<GateRow, diesel::result::Error> {
+    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz};
+    let (server, wakes) = wakes.map_or((None, Vec::new()), |(fp, w)| (Some(fp), w));
+    let (channels, payloads): (Vec<String>, Vec<String>) = wakes.into_iter().unzip();
+    diesel::sql_query(GATE_AND_SEND_SQL)
+        .bind::<Array<BigInt>, _>(txids)
+        .bind::<Nullable<Text>, _>(server.as_ref().map(|fp| fp.database.as_str()))
+        .bind::<Nullable<Timestamptz>, _>(server.as_ref().map(|fp| fp.started_at))
+        .bind::<Array<Text>, _>(channels)
+        .bind::<Array<Text>, _>(payloads)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
+}
+
+/// Read the commit state alone. See [`GATE_SQL`].
+async fn read_gate_only(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+) -> Result<GateRow, diesel::result::Error> {
+    diesel::sql_query(GATE_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
 }
 
 /// The notes a sender task holds.
@@ -1957,27 +2067,28 @@ fn age_out(sink: &SinkShared, held: &mut Vec<Staged>) {
 /// A note staged against another server is dropped and counted, because its
 /// transaction id means nothing here.
 ///
-/// `txid_status` raises an error for an id that this server has not assigned
-/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
-/// No such transaction has completed, so the guard reports it in progress.
+/// In the common tick every note is ready, and the read also sends the wakes.
+/// See [`GATE_AND_SEND_SQL`]. Otherwise the read sends nothing, and the tick
+/// sends the ready wakes in a second statement. When the combined statement
+/// fails, the tick reads again with no send. A failure of the second send
+/// counts its wakes as lost.
+///
+/// A wake is a hint, so a rare duplicate is safe. When the connection drops
+/// after the combined statement commits, the read again fails, and the next
+/// tick sends the same wakes once more. A runtime that stops during the
+/// statement counts each held note as lost, even when its wake went out.
 ///
 /// Returns `false` when the commit state cannot be read. The notes then stay
 /// held for the next tick.
 async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<Staged>) -> bool {
     let txids: Vec<i64> = held.iter().filter_map(|staged| staged.txid).collect();
-    let gate = diesel::sql_query(
-        "SELECT current_database()::text AS database, \
-                pg_postmaster_start_time() AS started_at, \
-                pg_notification_queue_usage() AS queue_usage, \
-                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
-                                  THEN txid_status(t.x) ELSE 'in progress' END \
-                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
-                      ORDER BY t.n) AS statuses",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
-    .cache_prepared()
-    .get_result::<GateRow>(conn)
-    .await;
+    let gate = match read_gate(conn, txids.clone(), wakes_with_the_read(held)).await {
+        Ok(gate) => Ok(gate),
+        Err(error) => {
+            tracing::debug!(error = %error, "harvest: notify read with its send failed");
+            read_gate_only(conn, txids).await
+        }
+    };
     let gate = match gate {
         Ok(gate) => gate,
         Err(error) => {
@@ -1985,6 +2096,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
             return false;
         }
     };
+    let sent_with_the_read = gate.sent;
     let fingerprint = Fingerprint {
         database: gate.database,
         started_at: gate.started_at,
@@ -2040,7 +2152,13 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(ready_notes);
     let count = wakes.len();
-    if count > 0 {
+    // The read sent these wakes only when every note was ready on this
+    // server. The classification above then found each note ready.
+    debug_assert!(
+        sent_with_the_read.is_none_or(|sent| usize::try_from(sent).ok() == Some(count)),
+        "the read sent the wakes of the tick"
+    );
+    if count > 0 && sent_with_the_read.is_none() {
         send_counted(sink, count, send_wakes(conn, wakes)).await;
     }
     if !owner_notes.is_empty() {
@@ -3971,5 +4089,71 @@ mod tests {
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 0);
         send_counted(&sink, 2, async { Err::<(), String>("refused".into()) }).await;
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 2);
+    }
+
+    fn staged(database: &str, note: Note) -> Staged {
+        Staged {
+            txid: Some(7),
+            fingerprint: Arc::new(Fingerprint {
+                database: database.into(),
+                started_at: DateTime::<Utc>::UNIX_EPOCH,
+            }),
+            queued_at: Instant::now(),
+            note,
+        }
+    }
+
+    fn pending_task_note(channel: &str) -> Note {
+        Note::Task {
+            channel: channel.into(),
+            task_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn the_read_sends_the_merged_wakes_of_one_server() {
+        let held = vec![
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q2")),
+        ];
+        let (server, wakes) = wakes_with_the_read(&held).expect("one server");
+        assert_eq!(server.database, "a");
+        let notes = held.iter().map(|s| s.note.clone()).collect();
+        assert_eq!(wakes, coalesce(notes), "the same coalescing as a tick");
+        assert_eq!(wakes.len(), 2);
+    }
+
+    #[test]
+    fn the_read_sends_nothing_for_two_servers_or_owner_notes_only() {
+        assert!(wakes_with_the_read(&[]).is_none());
+        let mixed = vec![
+            staged("a", pending_task_note("q1")),
+            staged("b", pending_task_note("q1")),
+        ];
+        assert!(wakes_with_the_read(&mixed).is_none());
+        let owner = vec![staged(
+            "a",
+            Note::Owner {
+                exec_id: Uuid::new_v4(),
+                evict: false,
+                writer: None,
+                channel: String::new(),
+            },
+        )];
+        assert!(wakes_with_the_read(&owner).is_none());
+    }
+
+    #[test]
+    fn the_combined_read_sends_only_in_its_case_branch() {
+        assert!(GATE_AND_SEND_SQL.starts_with("WITH g AS MATERIALIZED ("));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'aborted') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'in progress') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("g.database = $2 AND g.started_at = $3"));
+        assert_eq!(GATE_AND_SEND_SQL.matches("pg_notify(").count(), 1);
+        assert!(
+            !GATE_SQL.contains("pg_notify("),
+            "the plain read sends nothing"
+        );
     }
 }

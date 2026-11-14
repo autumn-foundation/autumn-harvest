@@ -459,7 +459,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .expect_err("signal should be rejected after cancellation commits");
     assert!(matches!(error, HarvestError::Cancelled(message) if message.contains("racing cancel")));
 
-    let pending = signal::load_pending_signals(&mut locker, exec_id)
+    let pending = signal::load_pending_signals(&locker, exec_id)
         .await
         .expect("pending signal query should succeed");
     assert!(
@@ -481,6 +481,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -731,6 +732,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -912,6 +914,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -1087,6 +1090,7 @@ async fn activity_without_cancellation_check_completes_normally() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),

@@ -2571,6 +2571,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     shard_assignments: &[crate::types::ShardId],
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    use crate::cached_stmt::CachePreparedDsl as _;
     use crate::models::CompletionTriggerOutboxDb;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
     use crate::types::Priority;
@@ -2647,6 +2648,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             outbox_dsl::created_at.asc(),
         ))
         .limit(retry_limit)
+        // The predicate is constant text, and the index on `(target_shard,
+        // next_attempt_at, created_at)` is not partial. So the statement
+        // stays cached.
+        .cache_prepared()
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
         .map_err(crate::error::database_error)?;

@@ -1,0 +1,21 @@
+-- medium: pending=100000, dead_letters=100000, buckets=1000, 20 ticks x 2 workers
+calls=40 buffers=4597704 | SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, CASE WHEN tq.sticky_worker_id IS NOT NULL AND tq.sticky_until IS NOT N
+calls=40 buffers=271770 | SELECT concurrency_key AS key, task_type, MAX(concurrency_cap)::INT4 AS max_concurrent, COUNT(*) FILTER (WHERE state = $2 AND worker_id IS N
+calls=40 buffers=74377 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS 
+calls=40 buffers=64556 | WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), seek AS ( SELECT q.queue_name, c.scheduled_at, c.cre
+calls=40 buffers=50059 | WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), walk AS ( SELECT COALESCE(( SELECT ($3 - c.relallvis
+calls=40 buffers=12920 | SELECT COUNT(*) FROM "harvest_dead_letters"
+calls=40 buffers=720 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+calls=40 buffers=560 | SELECT key, COALESCE(CASE WHEN harvest_rate_limit_buckets.override_expires_at > NOW() THEN harvest_rate_limit_buckets.override_refill_rate E
+calls=40 buffers=240 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+calls=24 buffers=144 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+calls=16 buffers=96 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=40 buffers=0 | BEGIN
+calls=40 buffers=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+calls=80 buffers=0 | COMMIT
+calls=40 buffers=0 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+calls=40 buffers=0 | SELECT queue_name FROM harvest_queue_pauses ORDER BY queue_name ASC
+calls=40 buffers=0 | SET LOCAL enable_bitmapscan = off
+calls=80 buffers=0 | SET LOCAL enable_sort = off
+calls=40 buffers=0 | SET LOCAL jit = off
+calls=40 buffers=0 | SET LOCAL plan_cache_mode = force_generic_plan

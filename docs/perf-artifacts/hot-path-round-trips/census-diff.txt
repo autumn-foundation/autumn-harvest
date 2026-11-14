@@ -1,0 +1,34 @@
+totals base ['328863', '13564', '3498', '21601'] new ['307677', '9387', '2826', '21550']
+ 14073->     0 calls     78->    0 plans | SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S
+ 11524->  1611 calls     78->   90 plans | SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+  5760->  1440 calls      0->    0 plans | SAVEPOINT diesel_savepoint_1
+  5760->  1440 calls      0->    0 plans | RELEASE SAVEPOINT diesel_savepoint_1
+  6231->  3531 calls   1542->   76 plans | SELECT to_regclass($1) IS NOT NULL AS present
+  1440->     0 calls     78->    0 plans | SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key
+  1440->     0 calls     78->    0 plans | SELECT lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 ORDER BY lock_key
+  1146->     0 calls   1146->    0 plans | SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id
+   382->     0 calls    382->    0 plans | SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON 
+   627->   578 calls    627->  578 plans | SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = $2 AND workflow_id LIKE $1
+ 21600-> 21600 calls    254->  316 plans | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_even
+  1562->  1572 calls    148->  177 plans | SELECT "harvest_task_queue"."id" FROM "harvest_task_queue" WHERE ((("harvest_task_queue"."id" = $1) AND ((("harvest_task_queue"."state" = $2
+   382->   418 calls     13->   15 plans | SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e 
+   382->   418 calls    175->  291 plans | SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks
+   382->   418 calls    382->  418 plans | SELECT NOW() AS as_of
+   382->   418 calls    382->   90 plans | SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER
+   382->   418 calls    382->   15 plans | SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present
+   382->   418 calls    382->   15 plans | SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2
+   382->   418 calls    382->   90 plans | INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, $5, clock_timestamp
+   382->   418 calls    382->   90 plans | SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve
+   382->   418 calls    382->   90 plans | DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()
+   382->   418 calls    382->  418 plans | UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) 
+   382->   418 calls    382->  418 plans | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea
+   383->   419 calls      0->    0 plans | SET LOCAL lock_timeout = '1s'
+ 17662-> 17698 calls    538->  598 plans | SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv
+   764->   836 calls    764->  836 plans | SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."targ
+  1146->  1254 calls    534->  270 plans | SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."
+ 18520-> 18771 calls      0->    0 plans | BEGIN
+ 28647-> 28906 calls      0->    0 plans | COMMIT
+     0->   418 calls      0->   90 plans | SELECT s.id, s.workflow_exec_id, s.host_worker_id, s.queue_name, s.state, s.created_at, s.expires_at, s.broken_at, s.broken_reason, s.comple
+     0->  1254 calls      0->  270 plans | SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp FROM harvest_events e JOIN LATERAL ( SELECT $3 AS runni
+     0->  1440 calls      0->   90 plans | SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM harvest_m
+     0-> 14215 calls      0->   90 plans | WITH g AS MATERIALIZED (SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage()

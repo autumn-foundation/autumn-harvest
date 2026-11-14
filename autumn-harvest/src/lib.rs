@@ -593,6 +593,8 @@ pub mod test_generator;
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
+/// Forecast when each throttled start runs, from bursts or real schedules.
+pub mod throttle_forecast;
 /// Per-execution timeline read model (issue #739).
 pub mod timeline;
 #[cfg(any(test, feature = "testing"))]
@@ -640,6 +642,8 @@ pub mod run_defaults;
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Schedule herd forecast: which cron schedules fire at the same moment.
+pub mod schedule_herd;
 /// Operator overrides for code-declared schedules (issues #2385 and #2386).
 #[cfg(feature = "db")]
 pub mod schedule_override;

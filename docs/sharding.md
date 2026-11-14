@@ -1417,7 +1417,7 @@ The `harvest.shard.stranded_pending` gauge (emitted by the stranded-work sampler
 harvest_shard_stranded_pending{shard="1"} > 0
 ```
 
-A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check the fleet's *effective* coverage with `GET /admin/config` → `worker.shard_assignments` (see [Verify coverage](#verify-coverage--dont-assume-it-issue-961)).
+A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × WorkerConfig::gauge_sample_interval` (30 s by default), check the fleet's *effective* coverage with `GET /admin/config` → `worker.shard_assignments` (see [Verify coverage](#verify-coverage--dont-assume-it-issue-961)).
 
 ### Pre-flip checklist
 

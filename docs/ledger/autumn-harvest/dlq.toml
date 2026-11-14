@@ -25,11 +25,11 @@ measured = "docs/performance-dead-letter-indexes.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["dead_letter_count"]
-driver = "per_request"
+driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters"]
-measured = "unmeasured"
+measured = "docs/performance-gauge-sample-interval.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["dead_letter_with_codecs"]

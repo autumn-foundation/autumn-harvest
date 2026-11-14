@@ -136,7 +136,7 @@ async fn signal_with_start_starts_fresh_when_no_prior_execution_exists() {
     assert_eq!(out.exec_id, exec_id, "returns the new exec id");
     assert_eq!(out.state, "RUNNING");
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 1, "one signal queued");
     assert_eq!(signals[0].signal_name, "webhook");
 }
@@ -165,7 +165,7 @@ async fn signal_with_start_appends_signal_to_history_before_first_dispatch() {
     // observable on the first dispatch, before any other event. So the test
     // checks that *one* of the two holds.
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     let in_history = history
         .events
         .iter()
@@ -225,7 +225,7 @@ async fn allow_duplicate_signals_running_execution_and_returns_existing_id() {
     assert!(out.signal_delivered);
     assert_eq!(out.exec_id, first);
 
-    let signals = load_pending_signals(&mut conn, first).await.unwrap();
+    let signals = load_pending_signals(&conn, first).await.unwrap();
     assert_eq!(signals.len(), 2, "seed + new signal both queued");
 }
 
@@ -271,7 +271,7 @@ async fn allow_duplicate_attaches_to_paused_prior_and_buffers_signal() {
         .unwrap();
     assert_eq!(state, "PAUSED", "the paused execution must not be sealed");
 
-    let signals = load_pending_signals(&mut conn, first).await.unwrap();
+    let signals = load_pending_signals(&conn, first).await.unwrap();
     assert_eq!(signals.len(), 2, "seed + buffered signal both queued");
 }
 
@@ -303,7 +303,7 @@ async fn allow_duplicate_with_completed_prior_starts_fresh_and_delivers_signal()
     assert_ne!(out.exec_id, first, "new exec id, not the COMPLETED prior");
     assert_eq!(out.exec_id, new_id);
 
-    let pending = load_pending_signals(&mut conn, new_id).await.unwrap();
+    let pending = load_pending_signals(&conn, new_id).await.unwrap();
     assert_eq!(pending.len(), 1, "exactly one signal queued on the new run");
 }
 
@@ -468,7 +468,7 @@ async fn idempotency_key_dedupes_signal_within_the_same_execution() {
     );
     assert_eq!(out2.exec_id, out1.exec_id);
 
-    let signals = load_pending_signals(&mut conn, out1.exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, out1.exec_id).await.unwrap();
     assert_eq!(signals.len(), 1, "exactly one signal row");
 }
 
@@ -505,7 +505,7 @@ async fn different_idempotency_keys_deliver_independent_signals() {
     assert!(out2.signal_delivered);
     assert_eq!(out2.exec_id, out1.exec_id);
 
-    let signals = load_pending_signals(&mut conn, out1.exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, out1.exec_id).await.unwrap();
     assert_eq!(signals.len(), 2, "both unique keys delivered");
 }
 

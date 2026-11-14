@@ -813,7 +813,7 @@ async fn a_pause_committed_after_the_claim_releases_it_and_restores_the_attempt(
     assert_eq!(claimed, Some(task));
     pause(&mut conn, &act).await;
 
-    let released = activity_pause::release_claim_if_activity_paused(&mut conn, task, "w1")
+    let released = activity_pause::release_claim_if_activity_paused(&conn, task, "w1")
         .await
         .expect("re-check");
     assert!(
@@ -845,10 +845,9 @@ async fn the_post_claim_recheck_only_releases_this_workers_own_claim() {
     claim_one(&mut conn, &q).await;
     pause(&mut conn, &act).await;
 
-    let released =
-        activity_pause::release_claim_if_activity_paused(&mut conn, task, "someone-else")
-            .await
-            .expect("re-check");
+    let released = activity_pause::release_claim_if_activity_paused(&conn, task, "someone-else")
+        .await
+        .expect("re-check");
     assert!(
         !released,
         "a re-check from a worker that does not own the claim must be a no-op"

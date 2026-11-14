@@ -403,7 +403,7 @@ pub async fn the_search_attribute_follows_the_op<B: Backend>(backend: &mut B) {
     let v2 = adopt(store.as_ref(), &kind, &prompt(PROMPT_V2), Some(v1)).await;
     assert_eq!(v2.to_string(), "v2");
     let named = |ids: &[String]| ids.iter().any(|listed| listed == id.as_str());
-    assert!(named(&backend.listed("v1").await), "op 1 ran on v1");
+    assert!(listed_under(backend, "v1", &id).await, "op 1 ran on v1");
     assert!(
         !named(&backend.listed("v2").await),
         "an activation alone does not list the agent"
@@ -411,8 +411,31 @@ pub async fn the_search_attribute_follows_the_op<B: Backend>(backend: &mut B) {
 
     backend.send(&id, &AgentOp::message("two")).await;
     backend.settle(&id, &segments(2)).await;
-    assert!(named(&backend.listed("v2").await), "op 2 ran on v2");
+    assert!(listed_under(backend, "v2", &id).await, "op 2 ran on v2");
     assert!(!named(&backend.listed("v1").await));
+}
+
+/// Whether the agent `id` lists under `version` within a few seconds.
+///
+/// `settle` reads the state that a query replays. The agent writes its
+/// search attributes in a later step of the same op. So a listing read at
+/// once can run ahead of that write.
+async fn listed_under<B: Backend>(backend: &mut B, version: &str, id: &AgentId) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if backend
+            .listed(version)
+            .await
+            .iter()
+            .any(|listed| listed == id.as_str())
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// AC 5: a stored version that no longer validates fails the op. The error

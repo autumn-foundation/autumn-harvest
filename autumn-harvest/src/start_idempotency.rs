@@ -404,6 +404,7 @@ mod pure_tests {
 #[cfg(feature = "db")]
 mod db_impl {
     use super::{StartIdempotencyReservation, reserve_start_idempotency_stmt};
+    use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
     use diesel::OptionalExtension;
@@ -707,6 +708,7 @@ mod db_impl {
         .bind::<diesel::sql_types::Integer, _>(shard_id)
         .bind::<diesel::sql_types::Double, _>(window_secs)
         .bind::<diesel::sql_types::BigInt, _>(batch_limit)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(database_error)?;
@@ -758,6 +760,7 @@ mod db_impl {
             let probe: Present = diesel::sql_query(
                 "SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present",
             )
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(database_error)?;

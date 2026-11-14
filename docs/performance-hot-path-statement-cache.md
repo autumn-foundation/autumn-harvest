@@ -285,6 +285,8 @@ lookup by workflow name and id, and that lookup is not cached. See
 
 Each item below is a measured cost that this change leaves in place.
 Issue #2653 tracks the first one. Issue #2654 tracks the others.
+[`performance-hot-path-round-trips.md`](performance-hot-path-round-trips.md)
+records what issue #2654 fixed and what it kept.
 
 **1. A NOTIFY does not cut a settle sleep.** After an empty poll that a
 NOTIFY caused, a claim loop sleeps 50 to 75 ms (issue #2422). A NOTIFY

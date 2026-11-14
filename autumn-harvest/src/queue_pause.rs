@@ -297,7 +297,7 @@ pub const QUEUE_PAUSE_CLAIM_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM harvest
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 #[cfg(feature = "db")]
 pub async fn release_claim_if_queue_paused(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
@@ -361,7 +361,7 @@ pub const fn release_claim_query() -> &'static str {
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 #[cfg(feature = "db")]
 pub async fn release_claim(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
@@ -414,7 +414,7 @@ pub const fn try_lock_queue_for_claim_query() -> &'static str {
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 #[cfg(feature = "db")]
 pub async fn try_lock_queue_for_claim(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<bool> {
     use crate::cached_stmt::CachePreparedDsl as _;
@@ -427,11 +427,13 @@ pub async fn try_lock_queue_for_claim(
     }
 
     let (key1, key2) = queue_lock_keys(queue_name);
+    // A shared reference lets the claim pipeline this lock with its rechecks.
+    let mut shared = conn;
     let row: AcquiredRow = diesel::sql_query(try_lock_queue_for_claim_query())
         .bind::<diesel::sql_types::Integer, _>(key1)
         .bind::<diesel::sql_types::Integer, _>(key2)
         .cache_prepared()
-        .get_result(conn)
+        .get_result(&mut shared)
         .await
         .map_err(crate::error::database_error)?;
     Ok(row.acquired)

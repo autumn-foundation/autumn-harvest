@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::context::WorkflowCommand;
 use crate::error::{HarvestError, HarvestResult, database_error};
 pub use crate::event::ForkEffects;
@@ -891,8 +892,11 @@ pub(crate) async fn is_pinned_by_recorded_fork(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<bool> {
+    // The retention gate runs this read twice per candidate. The text is
+    // constant, so it stays prepared.
     let open: Vec<Uuid> = diesel::sql_query(OPEN_FORK_DESCENDANTS_SQL)
         .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .cache_prepared()
         .load::<ForkIdRow>(conn)
         .await
         .map_err(database_error)?

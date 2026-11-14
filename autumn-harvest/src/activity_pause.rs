@@ -270,7 +270,7 @@ pub const fn release_claim_if_activity_paused_query() -> &'static str {
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 #[cfg(feature = "db")]
 pub async fn release_claim_if_activity_paused(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {

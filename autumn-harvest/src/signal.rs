@@ -886,17 +886,19 @@ pub async fn has_pending_signals(
 /// the query fails.
 #[cfg(feature = "db")]
 pub async fn load_pending_signals(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<Vec<HarvestSignal>> {
     use crate::schema::harvest_signals::dsl;
 
+    // A shared reference lets the wake ingest pipeline this read.
+    let mut shared = conn;
     dsl::harvest_signals
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(diesel::dsl::not(dsl::consumed))
         .order((dsl::received_at.asc(), dsl::id.asc()))
         .select(HarvestSignal::as_select())
-        .load(conn)
+        .load(&mut shared)
         .await
         .map_err(crate::error::database_error)
 }

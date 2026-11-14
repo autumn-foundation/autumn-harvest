@@ -563,6 +563,59 @@ async fn a_registered_pool_wakes_after_commit_and_not_before() {
     wake_of(&mut listener, exec_id).await;
 }
 
+/// A tick holds a committed note and an open one. The read sends nothing,
+/// because one note is open. The second statement sends the committed wake.
+/// The open wake comes only after its commit.
+#[tokio::test]
+async fn a_committed_and_an_open_note_send_only_the_committed_wake() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await,
+        "the sender must become ready"
+    );
+    let mut open_conn = pool.get().await.expect("pool connection");
+    let mut done_conn = pool.get().await.expect("pool connection");
+    let open_exec = insert_execution(&mut open_conn).await;
+    let done_exec = insert_execution(&mut done_conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    Box::pin(open_conn.transaction::<(), HarvestError, _>(async |conn| {
+        store::append_events(conn, open_exec, &[started()], 0).await?;
+        store::append_events(&mut done_conn, done_exec, &[started()], 0).await?;
+        loop {
+            match listener
+                .wait_for_notification_timeout(WAIT)
+                .await
+                .expect("payload parses")
+            {
+                WorkflowEventWaitOutcome::Notification(p)
+                    if p.workflow_exec_id == done_exec.as_uuid() =>
+                {
+                    break;
+                }
+                WorkflowEventWaitOutcome::Notification(p) => {
+                    assert_ne!(
+                        p.workflow_exec_id,
+                        open_exec.as_uuid(),
+                        "no wake may arrive before commit"
+                    );
+                }
+                other => panic!("no wake for the committed write: {other:?}"),
+            }
+        }
+        Ok(())
+    }))
+    .await
+    .expect("append");
+
+    wake_of(&mut listener, open_exec).await;
+}
+
 // ── A stamped write sends no stage probe (issue #2125) ─────────────────
 
 async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {

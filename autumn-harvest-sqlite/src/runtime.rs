@@ -257,6 +257,15 @@ pub enum ExecutionOutcome {
     Terminated(String),
 }
 
+/// What one drive pass did. See [`SqliteRuntime::poll_once_reporting`].
+#[derive(Debug)]
+pub struct PassReport {
+    /// A run moved in this pass.
+    pub progressed: bool,
+    /// The first error of one run in this pass. The other runs still moved.
+    pub error: Option<SqliteError>,
+}
+
 /// The result of a start-boundary reuse-policy decision (issue #1068) — returned by
 /// [`SqliteRuntime::start_workflow_with_reuse_policy`](crate::SqliteRuntime::start_workflow_with_reuse_policy).
 ///
@@ -656,6 +665,63 @@ impl SqliteRuntime {
     /// The SQLite plugin sets it from `harvest.scheduler_enabled`.
     pub const fn set_schedules_enabled(&mut self, enabled: bool) {
         self.schedules_enabled = enabled;
+    }
+
+    /// The earliest time, in epoch milliseconds, at which a drive has due
+    /// work. `None` when nothing is due at a known time.
+    ///
+    /// A fleet host opens a closed tenant at this time. These are the
+    /// sources:
+    ///
+    /// - the unfired timers and pending activity retries of running runs;
+    /// - the deadlines and backoffs of running runs;
+    /// - the slots of unpaused schedules.
+    ///
+    /// A slot counts only while schedules are on. A backoff counts only
+    /// while it is in the future. See
+    /// [`next_wake_since`](Self::next_wake_since) for a backoff that ended
+    /// after the last drive.
+    ///
+    /// ```rust,ignore
+    /// let mut rt = SqliteRuntime::open(&path)?;
+    /// rt.start_workflow("nap_then_mail", json!(5))?;
+    /// rt.poll_once().await?;
+    /// assert!(rt.next_wake_at()?.is_some());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_at(&self) -> SqliteResult<Option<i64>> {
+        self.next_wake_since((self.now_fn)().timestamp_millis())
+    }
+
+    /// As [`next_wake_at`](Self::next_wake_at), for a caller that knows
+    /// when the last drive started, in epoch milliseconds.
+    ///
+    /// A backoff that ended after `consumed` still counts: no drive has
+    /// started its run yet. A driver that stops between two drives passes
+    /// the start of the last one, so it keeps such a deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_since(&self, consumed: i64) -> SqliteResult<Option<i64>> {
+        crate::wake::next_wake_after(&self.conn, consumed, self.schedules_enabled, i64::MIN)
+    }
+
+    /// As [`next_wake_since`](Self::next_wake_since), but only the deadlines
+    /// after `after`, in epoch milliseconds. `after` is also the start of
+    /// the last drive.
+    ///
+    /// A deadline that a drive cannot clear stays in the past. This read
+    /// then still finds the next healthy deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_after(&self, after: i64) -> SqliteResult<Option<i64>> {
+        crate::wake::next_wake_after(&self.conn, after, self.schedules_enabled, after)
     }
 
     /// Set the app state that `ctx.state::<T>()` returns (issue #2467).
@@ -3103,9 +3169,26 @@ impl SqliteRuntime {
     /// error variants a single execution can produce. A fleet pass never
     /// returns `ExecutionNotFound`, because it drives only stored executions.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
+        let report = self.poll_once_reporting().await?;
+        report.error.map_or(Ok(report.progressed), Err)
+    }
+
+    /// One drive pass, as [`poll_once`](Self::poll_once). It reports the
+    /// progress and the first error of one run apart.
+    ///
+    /// A pass can move a healthy run while another run fails. `poll_once`
+    /// then returns the error alone. A driver that waits for an idle pass
+    /// reads the progress here, so a failing run never hides due work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the pass cannot run at all, such as a
+    /// failed read of the running runs. The error of one run goes in
+    /// [`PassReport::error`].
+    pub async fn poll_once_reporting(&mut self) -> SqliteResult<PassReport> {
         let mut skip = HashSet::new();
-        let (progress, first_error) = self.poll_once_pass(&mut skip, true).await?;
-        first_error.map_or(Ok(progress), Err)
+        let (progressed, error) = self.poll_once_pass(&mut skip, true).await?;
+        Ok(PassReport { progressed, error })
     }
 
     /// One fleet-wide driving pass, shared by [`poll_once`](Self::poll_once)
@@ -3162,6 +3245,12 @@ impl SqliteRuntime {
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
+                    // The error path can still seal the run, as for an
+                    // unsupported command. A sealed run changed state and
+                    // can wake its parent, so the pass made progress.
+                    if store::execution_state(&self.conn, exec)? != "RUNNING" {
+                        progress = true;
+                    }
                     skip.insert(exec);
                     record_fleet_error(exec, err, &mut first_error);
                 }

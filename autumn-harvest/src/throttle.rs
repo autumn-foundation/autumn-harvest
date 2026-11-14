@@ -99,6 +99,8 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
 use chrono::{DateTime, Utc};
 
 /// Prefix for the per-key token bucket stored in `harvest_rate_limit_buckets`,
@@ -1561,6 +1563,7 @@ async fn fire_due_on_conn(
     // Tolerate a missing table (mixed-schema fixtures / un-migrated deployment).
     let exists: Present =
         diesel::sql_query("SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present")
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -1575,6 +1578,7 @@ async fn fire_due_on_conn(
     let has_rows: Present = diesel::sql_query(
         "SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present",
     )
+    .cache_prepared()
     .get_result(conn)
     .await
     .map_err(crate::error::database_error)?;

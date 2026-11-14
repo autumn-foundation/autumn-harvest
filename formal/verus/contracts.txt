@@ -325,6 +325,16 @@ pub proof fn theorem_a_tick_is_never_due_again_at_once(every: i64, now: i64) req
 pub open spec fn messages(current: Option < i64 >, every_ms: Option < i64 >, nows: Seq < i64 >) -> Option < i64, > decreases nows.len(), { if nows.len() == 0 { current } else { messages(spec_next_heartbeat(current, every_ms, nows [0], false), every_ms, nows.drop_first()) } }
 pub proof fn theorem_messages_never_starve_the_heartbeat(at: i64, every: i64, nows: Seq < i64 >) ensures messages(Some(at), Some(every), nows) == Some(at), decreases nows.len(),
 
+## formal/verus/src/claim_recheck.rs
+pub enum RecheckVerdict { Keep, Released, Release, }
+pub open spec fn spec_recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict { if released { RecheckVerdict::Released } else if acquired { RecheckVerdict::Keep } else { RecheckVerdict::Release } }
+pub fn recheck_verdict(acquired: bool, released: bool) -> (r: RecheckVerdict) ensures r == spec_recheck_verdict(acquired, released), r is Keep <==> acquired &&! released, r is Release <==>! acquired &&! released, r is Released <==> released,
+pub open spec fn sequential_keeps(acquired: bool, paused: Seq < bool >) -> bool { acquired && forall | i: int | 0 <= i < paused.len() ==>! paused [i] }
+pub open spec fn pipelined_releases(paused: Seq < bool >) -> Seq < bool > decreases paused.len(), { if paused.len() == 0 { Seq::empty() } else { let head = paused [0]; let rest = pipelined_releases(paused.drop_first()); if head { seq ! [true].add(Seq::new(rest.len(), | i: int | false)) } else { seq ! [false].add(rest) } } }
+pub open spec fn any_release(released: Seq < bool >) -> bool { exists | i: int | 0 <= i < released.len() && released [i] }
+proof fn lemma_pipeline_releases_iff_a_hold(paused: Seq < bool >) ensures pipelined_releases(paused).len() == paused.len(), any_release(pipelined_releases(paused)) <==> any_release(paused), decreases paused.len(),
+pub proof fn theorem_the_pipeline_keeps_what_the_sequence_keeps(acquired: bool, paused: Seq < bool >,) ensures (spec_recheck_verdict(acquired, any_release(pipelined_releases(paused))) is Keep) <==> sequential_keeps(acquired, paused),
+
 ## formal/verus/src/depth_cap.rs
 pub open spec fn capped(n: int, cap: int) -> int { if n > cap { cap } else { n } }
 pub open spec fn step(total: int, shard_depth: int, cap: int) -> int { capped(capped(total, cap) + capped(shard_depth, cap), cap) }

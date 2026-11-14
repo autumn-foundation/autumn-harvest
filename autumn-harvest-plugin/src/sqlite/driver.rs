@@ -44,6 +44,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::wake::WakeReport;
+
 /// The most commands the driver runs before each drive pass.
 ///
 /// Without a bound, a steady stream of starts or signals keeps the queue
@@ -434,6 +436,9 @@ pub enum Command {
     },
     /// Run a [`Job`] on the runtime (issue #2471).
     Run(Job),
+    /// Answer at the next idle point: after a pass that made no progress.
+    /// A wake sweep sends it to run a woken tenant until it blocks.
+    Settle { reply: oneshot::Sender<()> },
     /// Stop the loop. `reply` fires once the runtime is dropped, so the
     /// writer lock is free.
     Shutdown { reply: Option<oneshot::Sender<()>> },
@@ -526,7 +531,7 @@ impl Driver {
         let stop = CancellationToken::new();
         let task = tokio::spawn(async move {
             let reply = DRIVER_TASK
-                .scope((), drive(runtime, receiver, tick, &stop, &retention))
+                .scope((), drive(runtime, receiver, tick, &stop, &retention, None))
                 .await;
             // `drive` owned the runtime, so the lock is released by now.
             if let Some(reply) = reply {
@@ -544,7 +549,8 @@ impl Driver {
     /// The loop runs with `key` as [`HarvestTenant::current`]. It stops when
     /// `stop` fires, after the command or pass in flight. The caller hands
     /// the task to the fleet, which waits for it before the tenant closes.
-    /// `on_exit` runs when the task ends or is aborted.
+    /// `on_exit` runs when the task ends or is aborted. `wake` gets the
+    /// next wake time of the file at each idle point and at the stop.
     ///
     /// [`HarvestTenant::current`]: super::HarvestTenant::current
     pub(crate) fn spawn_tenant(
@@ -554,6 +560,7 @@ impl Driver {
         key: FleetDbKey,
         stop: CancellationToken,
         on_exit: Box<dyn FnOnce() + Send>,
+        wake: Option<WakeReport>,
     ) -> (mpsc::Sender<Command>, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
         let task = tokio::spawn(super::fleet::scoped(key, async move {
@@ -561,7 +568,7 @@ impl Driver {
             // return and on an abort alike.
             let _exit = OnExit(Some(on_exit));
             let reply = DRIVER_TASK
-                .scope((), drive(runtime, receiver, tick, &stop, &retention))
+                .scope((), drive(runtime, receiver, tick, &stop, &retention, wake))
                 .await;
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -623,20 +630,41 @@ fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
 /// returns.
 ///
 /// A periodic retention runs its first pass at once, then on its interval.
+/// `wake` reports the next wake time at each idle point, and once at the
+/// return, before the runtime drops.
 async fn drive(
     mut runtime: SqliteRuntime,
+    receiver: mpsc::Receiver<Command>,
+    tick: Duration,
+    stop: &CancellationToken,
+    retention: &Retention,
+    mut wake: Option<WakeReport>,
+) -> Option<oneshot::Sender<()>> {
+    let reply = drive_loop(&mut runtime, receiver, tick, stop, retention, wake.as_mut()).await;
+    if let Some(wake) = &wake {
+        wake.exit(&runtime);
+    }
+    drop(runtime);
+    reply
+}
+
+/// The body of [`drive`].
+async fn drive_loop(
+    runtime: &mut SqliteRuntime,
     mut receiver: mpsc::Receiver<Command>,
     tick: Duration,
     stop: &CancellationToken,
     retention: &Retention,
+    mut wake: Option<&mut WakeReport>,
 ) -> Option<oneshot::Sender<()>> {
+    let mut settles: Vec<oneshot::Sender<()>> = Vec::new();
     let mut last_error: Option<String> = None;
     let mut next_purge = retention.periodic().then(Instant::now);
     let mut purging = false;
     loop {
         if purging || next_purge.is_some_and(|at| Instant::now() >= at) || retention.take_request()
         {
-            purging = retention.step(&mut runtime);
+            purging = retention.step(runtime);
             if !purging {
                 next_purge = retention
                     .periodic()
@@ -650,26 +678,38 @@ async fn drive(
             match receiver.try_recv() {
                 Ok(Command::Shutdown { reply }) => return reply,
                 Err(mpsc::error::TryRecvError::Disconnected) => return None,
-                Ok(command) => handle(&mut runtime, command).await,
+                Ok(Command::Settle { reply }) => settles.push(reply),
+                Ok(command) => {
+                    touch(wake.as_deref_mut());
+                    handle(runtime, command).await;
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
             }
         }
-        let progressed = match runtime.poll_once().await {
-            Ok(progressed) => {
-                last_error = None;
-                progressed
-            }
-            Err(error) => {
-                // A broken run fails every pass. Log it once per change, and
-                // wait for the tick, so it cannot spin the task.
+        let pass_started = chrono::Utc::now().timestamp_millis();
+        // A pass can move a healthy run while another run fails. The
+        // progress then still counts, so a woken tenant never settles over
+        // due work.
+        let (progressed, error) = match runtime.poll_once_reporting().await {
+            Ok(pass) => (pass.progressed, pass.error),
+            Err(error) => (false, Some(error)),
+        };
+        match error {
+            None => last_error = None,
+            Some(error) => {
+                // A broken run fails every pass. Log it once per change. A
+                // pass with no progress waits for the tick, so a broken run
+                // cannot spin the task.
                 let text = error.to_string();
                 if last_error.as_deref() != Some(text.as_str()) {
                     tracing::warn!(error = %text, "harvest-sqlite drive pass failed");
                     last_error = Some(text);
                 }
-                false
             }
-        };
+        }
+        if progressed {
+            touch(wake.as_deref_mut());
+        }
         // A retention pass in progress takes its next step after a yield.
         if progressed || purging {
             // A pass can finish without awaiting anything: the store is
@@ -680,15 +720,34 @@ async fn drive(
             tokio::task::yield_now().await;
             continue;
         }
+        // The idle point: the last pass made no progress.
+        if let Some(wake) = wake.as_deref_mut() {
+            wake.idle(runtime, pass_started);
+        }
+        for settle in std::mem::take(&mut settles) {
+            let _ = settle.send(());
+        }
         tokio::select! {
             () = stop.cancelled() => return None,
             command = receiver.recv() => match command {
                 None => return None,
                 Some(Command::Shutdown { reply }) => return reply,
-                Some(command) => handle(&mut runtime, command).await,
+                // The next turn runs a pass, then answers at its idle point.
+                Some(Command::Settle { reply }) => settles.push(reply),
+                Some(command) => {
+                    touch(wake.as_deref_mut());
+                    handle(runtime, command).await;
+                }
             },
             () = tokio::time::sleep(tick) => {}
         }
+    }
+}
+
+/// Mark the wake report dirty: work ran since the last idle point.
+fn touch(wake: Option<&mut WakeReport>) {
+    if let Some(wake) = wake {
+        wake.touch();
     }
 }
 
@@ -790,8 +849,9 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             let _ = reply.send(routed);
         }
         Command::Run(job) => run_job(runtime, job),
-        // `drive` takes a shutdown before it calls `handle`.
-        Command::Shutdown { .. } => {}
+        // `drive_loop` takes a shutdown and a settle before it calls
+        // `handle`.
+        Command::Shutdown { .. } | Command::Settle { .. } => {}
     }
 }
 
@@ -1197,6 +1257,102 @@ mod tests {
             .list_executions(&autumn_harvest_sqlite::ExecutionFilter::new())
             .expect("runs");
         assert!(runs.executions.is_empty(), "no slot fires");
+    }
+
+    /// Sleeps on a durable timer of `secs` seconds.
+    #[workflow]
+    async fn napping(ctx: &WorkflowContext, secs: u64) -> Result<(), String> {
+        ctx.timer("nap", secs)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// `Settle` answers at the next idle point. A tenant driver then reports
+    /// its next wake time, and writes it again when it stops.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settled_tenant_driver_reports_its_next_wake() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pool = autumn_web::db::create_pool(&autumn_web::config::DatabaseConfig {
+            url: Some(format!(
+                "sqlite://{}",
+                dir.path().join("control.db").display()
+            )),
+            ..autumn_web::config::DatabaseConfig::default()
+        })
+        .expect("pool")
+        .expect("a url gives a pool");
+        let book = Arc::new(
+            super::super::wake::WakeBook::open(pool, None)
+                .await
+                .expect("wake table"),
+        );
+        let registry = Registry {
+            workflows: vec![napping_info()],
+            ..Registry::empty()
+        };
+        let runtime = Driver::open(&dir.path().join("t.harvest.db"), &registry).expect("open");
+        let retention = Arc::new(Retention::new(&registry.retention));
+        let key = FleetDbKey::Slot(7);
+        let stop = CancellationToken::new();
+        let report = super::super::wake::WakeReport::new(Arc::clone(&book), key.clone());
+        book.flush().await.expect("flush");
+        let first = chrono::Utc::now().timestamp_millis();
+        let due = |at: i64| {
+            let book = Arc::clone(&book);
+            async move { book.due_names(at).await.expect("due") }
+        };
+        assert_eq!(due(first).await, vec![key.name()], "a start records now");
+        let (sender, task) = Driver::spawn_tenant(
+            runtime,
+            Duration::from_millis(250),
+            retention,
+            key.clone(),
+            stop.clone(),
+            Box::new(|| {}),
+            Some(report),
+        );
+        let before = chrono::Utc::now().timestamp_millis();
+        let (reply, started) = oneshot::channel();
+        sender
+            .send(Command::Start {
+                workflow_name: "napping".to_owned(),
+                input: serde_json::json!(600),
+                options: StartOptions::new(),
+                reply,
+            })
+            .await
+            .expect("send");
+        started.await.expect("reply").expect("start");
+        let (reply, settled) = oneshot::channel();
+        sender.send(Command::Settle { reply }).await.expect("send");
+        tokio::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .expect("the driver settles")
+            .expect("reply");
+
+        // The idle point recorded the timer. A flush writes it.
+        book.flush().await.expect("flush");
+        assert!(due(before + 599_000).await.is_empty(), "not due yet");
+        assert_eq!(due(before + 700_000).await, vec![key.name()]);
+
+        // A start with no settle, then a stop. The stop records either now
+        // or the new 60 s timer, and the sweep flush writes it.
+        let (reply, started) = oneshot::channel();
+        sender
+            .send(Command::Start {
+                workflow_name: "napping".to_owned(),
+                input: serde_json::json!(60),
+                options: StartOptions::new(),
+                reply,
+            })
+            .await
+            .expect("send");
+        started.await.expect("reply").expect("start");
+        stop.cancel();
+        task.await.expect("the driver stops");
+        book.flush().await.expect("flush");
+        assert_eq!(due(before + 61_000 + 10_000).await, vec![key.name()]);
     }
 
     /// An unknown workflow in a code schedule fails the open, and names it.

@@ -277,6 +277,7 @@ fn build_worker_with(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),

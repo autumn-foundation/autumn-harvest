@@ -230,6 +230,7 @@ fn make_worker(
     ));
     Worker::new(
         WorkerRuntimeConfig {
+            gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
             codec_rotation_batch_size: 0,
             scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             dr: autumn_harvest::replication::DrConfig::default(),

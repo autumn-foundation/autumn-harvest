@@ -289,6 +289,7 @@ fn shared_state_with(log: Arc<ActivityLog>) -> autumn_harvest::context::SharedSt
 
 fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),

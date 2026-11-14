@@ -9982,6 +9982,132 @@
     },
     {
       "method": "GET",
+      "path": "/admin/schedules/herd",
+      "category": "schedule",
+      "read_only": true,
+      "description": "Forecast schedule herds: the moments when many active cron schedules start runs together. Walks each active schedule over the window, applies its jitter, and groups the fires into buckets. Paused, auto-paused and exhausted schedules are listed as inactive. Interval schedules are listed as unanchored, because their fire times depend on their last run. Each schedule stops at its end_at and at the end of its max_runs budget. Calendar exclusions are not applied. Does not trigger any executions.",
+      "params": [
+        {
+          "name": "from",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "RFC 3339 UTC start of the window. Defaults to now."
+        },
+        {
+          "name": "hours",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "Length of the window in hours. Defaults to 24, clamped to [1, 744]."
+        },
+        {
+          "name": "bucket_secs",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "Bucket width in seconds. Defaults to 60, clamped to [1, 86400]."
+        },
+        {
+          "name": "min_herd",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "Fewest distinct schedules in one bucket that count as a herd. Defaults to 2, at least 2."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "Most herds to list. Defaults to 50, clamped to [1, 500]."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "from",
+            "type": "string",
+            "description": "RFC 3339 start of the window."
+          },
+          {
+            "name": "until",
+            "type": "string",
+            "description": "RFC 3339 end of the window (exclusive)."
+          },
+          {
+            "name": "bucket_secs",
+            "type": "integer",
+            "description": "Effective bucket width in seconds."
+          },
+          {
+            "name": "min_herd",
+            "type": "integer",
+            "description": "Effective fewest schedules that make a herd."
+          },
+          {
+            "name": "fires",
+            "type": "integer",
+            "description": "Number of runs that start inside the window over every active schedule. A start is the slot plus its jitter, so a slot just before from can count and a slot just before until can fall outside."
+          },
+          {
+            "name": "spot_count",
+            "type": "integer",
+            "description": "Number of herds before limit applies."
+          },
+          {
+            "name": "spots",
+            "type": "array",
+            "description": "Herds, largest first, at most limit of them. Each has at, size and schedules (each {id, name})."
+          },
+          {
+            "name": "offenders",
+            "type": "array",
+            "description": "Every schedule in a herd, the one in the most herds first. Each has id, name, spots and jitter_secs."
+          },
+          {
+            "name": "unanchored",
+            "type": "array",
+            "description": "Interval schedules ({id, name}). Not forecast."
+          },
+          {
+            "name": "inactive",
+            "type": "array",
+            "description": "Paused, exhausted and unparsable schedules ({id, name}). Not forecast."
+          },
+          {
+            "name": "truncated",
+            "type": "array",
+            "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget at the window cannot be projected: too many slots before the window, or an overdue next_run_at whose catch-up policy decides the budget. It also lists a schedule whose jitter carries a run to or past its next slot, since its catch-up policy then decides which later slots run. Such a schedule is not forecast."
+          },
+          {
+            "name": "status",
+            "type": "string",
+            "description": "complete, or partial when a shard did not answer."
+          },
+          {
+            "name": "unavailable_shards",
+            "type": "array",
+            "description": "Shards that did not answer."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid from timestamp or query parameter."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/schedules/decisions",
       "category": "schedule",
       "read_only": true,

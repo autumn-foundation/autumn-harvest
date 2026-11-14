@@ -1,0 +1,55 @@
+-- claimable_pending_demand_by_queue, new query, medium fixture
+SET
+SET
+                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=2768848.17..5537695.89 rows=1 width=112) (actual time=105.328..233.521 rows=740 loops=1)
+   Group Key: tq.queue_name, tq.required_capabilities, tq.required_build_id, (CASE WHEN ((tq.sticky_worker_id IS NOT NULL) AND (tq.sticky_until IS NOT NULL) AND (tq.sticky_until > now())) THEN tq.sticky_worker_id ELSE NULL::text END), tq.activity_name
+   Buffers: shared hit=114533 read=432
+   ->  Incremental Sort  (cost=2768848.17..5537695.85 rows=2 width=104) (actual time=105.141..223.514 rows=91615 loops=1)
+         Sort Key: tq.queue_name, tq.required_capabilities, tq.required_build_id, (CASE WHEN ((tq.sticky_worker_id IS NOT NULL) AND (tq.sticky_until IS NOT NULL) AND (tq.sticky_until > now())) THEN tq.sticky_worker_id ELSE NULL::text END), tq.activity_name
+         Presorted Key: tq.queue_name
+         Full-sort Groups: 20  Sort Method: quicksort  Average Memory: 27kB  Peak Memory: 27kB
+         Pre-sorted Groups: 20  Sort Method: quicksort  Average Memory: 2726kB  Peak Memory: 2726kB
+         Buffers: shared hit=114533 read=432
+         ->  Nested Loop Anti Join  (cost=0.57..5537695.76 rows=1 width=104) (actual time=0.073..181.652 rows=91615 loops=1)
+               Join Filter: ((tq.task_type = 'activity'::text) AND (ap.activity_name = tq.activity_name))
+               Buffers: shared hit=114528 read=432
+               ->  Merge Anti Join  (cost=0.57..5537670.75 rows=1 width=121) (actual time=0.067..144.317 rows=91615 loops=1)
+                     Merge Cond: (tq.queue_name = qp.queue_name)
+                     Buffers: shared hit=114528 read=432
+                     ->  Index Scan using idx_harvest_tq_claim_seek on harvest_task_queue tq  (cost=0.42..5536476.37 rows=91179 width=121) (actual time=0.057..132.597 rows=91615 loops=1)
+                           Index Cond: (scheduled_at <= now())
+                           Filter: (((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 2))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 5)) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR ((SubPlan 3) < concurrency_cap)))
+                           Rows Removed by Filter: 3323
+                           Buffers: shared hit=114527 read=432
+                           SubPlan 2
+                             ->  Index Only Scan using idx_harvest_we_paused on harvest_workflow_executions e  (cost=0.27..27.59 rows=488 width=16) (actual time=0.078..0.145 rows=500 loops=1)
+                                   Heap Fetches: 0
+                                   Buffers: shared hit=1 read=4
+                           SubPlan 5
+                             ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..74.00 rows=333 width=32) (actual time=0.026..1.039 rows=1000 loops=1)
+                                   Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+                                   Buffers: shared hit=14
+                           SubPlan 3
+                             ->  Aggregate  (cost=43.38..43.39 rows=1 width=8) (actual time=0.079..0.079 rows=1 loops=245)
+                                   Buffers: shared hit=19013
+                                   ->  Bitmap Heap Scan on harvest_task_queue inner_q  (cost=4.36..43.37 rows=1 width=0) (actual time=0.035..0.074 rows=49 loops=245)
+                                         Recheck Cond: ((concurrency_key = tq.concurrency_key) AND (state = 'RUNNING'::text))
+                                         Filter: ((worker_id IS NOT NULL) AND (task_type = tq.task_type))
+                                         Rows Removed by Filter: 26
+                                         Heap Blocks: exact=18523
+                                         Buffers: shared hit=19013
+                                         ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.36 rows=10 width=0) (actual time=0.007..0.007 rows=76 loops=245)
+                                               Index Cond: (concurrency_key = tq.concurrency_key)
+                                               Buffers: shared hit=490
+                     ->  Index Only Scan using harvest_queue_pauses_pkey on harvest_queue_pauses qp  (cost=0.15..53.15 rows=600 width=32) (actual time=0.008..0.009 rows=0 loops=1)
+                           Heap Fetches: 0
+                           Buffers: shared hit=1
+               ->  Seq Scan on harvest_activity_pauses ap  (cost=0.00..16.00 rows=600 width=32) (actual time=0.000..0.000 rows=0 loops=91615)
+ Planning:
+   Buffers: shared hit=1334 read=56 dirtied=2
+ Planning Time: 5.499 ms
+ Execution Time: 233.995 ms
+(48 rows)
+

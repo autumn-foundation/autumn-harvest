@@ -641,10 +641,15 @@ pub async fn refresh_session_lease(
 ///
 /// `$1` is the worker-stale threshold in seconds (BIGINT), matching
 /// [`crate::poison_pill::orphaned_running_tasks_query`]'s convention.
+///
+/// The result names the columns of [`crate::models::HarvestSession`], so the
+/// scan stays a cached statement. Its only bind is the threshold.
 #[cfg(feature = "db")]
 #[must_use]
 pub const fn broken_session_candidates_query() -> &'static str {
-    "SELECT s.* FROM harvest_sessions s \
+    "SELECT s.id, s.workflow_exec_id, s.host_worker_id, s.queue_name, s.state, \
+            s.created_at, s.expires_at, s.broken_at, s.broken_reason, s.completed_at \
+     FROM harvest_sessions s \
      LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id \
      LEFT JOIN harvest_workflow_executions e ON e.id = s.workflow_exec_id \
      WHERE s.state = 'ACTIVE' \
@@ -892,11 +897,13 @@ pub async fn enforce_broken_sessions(
     // Issue #1243: forwarded to the member-failure write below.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    use crate::cached_stmt::CachePreparedDsl as _;
     use diesel_async::RunQueryDsl;
 
     let candidates: Vec<crate::models::HarvestSession> =
         diesel::sql_query(broken_session_candidates_query())
             .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;

@@ -181,7 +181,7 @@ async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_resto
     // re-check is reached with when a claim's snapshot predates the pause.
     pause(&mut conn, exec_id).await;
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(
@@ -215,7 +215,7 @@ async fn an_ordinary_claim_is_not_released_when_the_workflow_is_not_paused() {
     let task_id = enqueue_workflow_task(&mut conn, &q, exec_id, None).await;
     assert_eq!(claim_one(&mut conn, &q).await, Some(task_id));
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(
@@ -249,7 +249,7 @@ async fn an_activity_task_of_a_paused_workflow_is_not_held_by_this_recheck() {
         "a workflow pause must not collaterally hold the execution's activity tasks"
     );
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(

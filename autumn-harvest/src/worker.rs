@@ -84,7 +84,7 @@ pub type DbPool = deadpool::managed::Pool<
 /// write-once `GLOBAL_DEFAULT_WORKFLOW_QUEUE`.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
+pub use crate::builder::{DEFAULT_GAUGE_SAMPLE_INTERVAL, DEFAULT_MAX_CONCURRENT_CLAIMS};
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -190,6 +190,9 @@ pub struct WorkerRuntimeConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
+    /// Interval of the database gauge samplers (issue #2668). The value
+    /// must not be zero. See [`crate::builder::WorkerConfig::gauge_sample_interval`].
+    pub gauge_sample_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
     /// Grace period for an activity handler to unwind cooperatively after
@@ -365,6 +368,11 @@ impl WorkerRuntimeConfig {
                 crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
             )));
         }
+        if self.gauge_sample_interval.is_zero() {
+            return Err(HarvestError::Config(
+                "gauge_sample_interval is 0; the gauge samplers would spin".into(),
+            ));
+        }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
             return Err(HarvestError::Config(format!(
                 "cancellation_grace_period of {}s exceeds the maximum of {}s",
@@ -496,6 +504,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_claims: cfg.max_concurrent_claims,
             claim_slots_per_shard: cfg.claim_slots_per_shard,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
+            gauge_sample_interval: cfg.gauge_sample_interval,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
@@ -12315,102 +12324,116 @@ async fn persist_scheduled_activities(
     // a *fresh* dispatch: the activities scheduled here cannot have completed
     // yet. So, unlike the child-completion or activity-completion races, no
     // other in-band check catches it.
-    let (deferred, had_wake_requested, synthesized_outcome) =
-        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            // Issue #2251: the owner fence comes first.
-            crate::replication::assert_decision_fence(conn).await?;
-            // Cancellable/renewable timer bookkeeping (issue #768): resolve the
-            // ArmTimer/CancelTimer row mutations FIRST. Then build the event
-            // list in command emission order. Markers, detached-spawn events,
-            // interleaved TimerStarted/TimerCancelled and ActivityScheduled
-            // events all sit at their actual command positions. So the
-            // sequential replay cursor sees the command emission order. Armed
-            // timers are observed on the next wake, and the deadline is unused
-            // here.
-            let (mut timer_events, _min_fires_at) =
-                plan_timer_lifecycle(conn, exec_id, commands).await?;
-            let mut act_iter = activity_events.into_iter();
-            let events = build_suspension_events(commands, &mut timer_events, |cmd| {
-                if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
-                    act_iter.next()
-                } else {
-                    None
-                }
-            });
-            let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-            store::append_events_offloaded_with_codecs(
-                conn,
-                exec_id,
-                &events,
-                next_event_id,
-                offloader,
-                registry.payload_codecs(),
-            )
-            .await?;
-            detached_spawns.persist(conn, commands).await?;
-            // Lazily register any dynamic per-key rate-limit buckets (issue
-            // #699) in the enqueue transaction. The fail-closed claim/dispatch
-            // gate then always finds a bucket row, else the task would stall
-            // forever. ON CONFLICT DO NOTHING preserves operator overrides and
-            // is idempotent across replays and re-dispatch. The plan hands the
-            // buckets over sorted by key, which keeps the rare stale-bucket row
-            // lock deadlock-free (issue #1127). See `ActivityEnqueuePlan`.
-            for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
-                queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+    //
+    // With no caller transaction, the body opens its own. Inside one, it takes
+    // a savepoint only when the caller can recover from one of its errors. See
+    // [`suspension_needs_savepoint`].
+    let body = async |conn: &mut AsyncPgConnection| -> HarvestResult<_> {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
+        // Cancellable/renewable timer bookkeeping (issue #768): resolve the
+        // ArmTimer/CancelTimer row mutations FIRST. Then build the event list
+        // in command emission order. Markers, detached-spawn events,
+        // interleaved TimerStarted/TimerCancelled and ActivityScheduled events
+        // all sit at their actual command positions. So the sequential replay
+        // cursor sees the command emission order. Armed timers are observed on
+        // the next wake, and the deadline is unused here.
+        let (mut timer_events, _min_fires_at) =
+            plan_timer_lifecycle(conn, exec_id, commands).await?;
+        let mut act_iter = activity_events.into_iter();
+        let events = build_suspension_events(commands, &mut timer_events, |cmd| {
+            if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
+                act_iter.next()
+            } else {
+                None
             }
-            // One multi-row INSERT for the whole fan-out, not one per
-            // activity (Ledger perf pass). A decision that schedules N
-            // activities in one suspension used to cost N single-row
-            // INSERT statements here. See `queue::enqueue_batch`'s doc
-            // comment for the mechanism and the rare sticky-pin
-            // follow-up it still issues per row.
-            let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
-            let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
-                conn,
-                exec_id,
-                commands,
-                &mut race_next_event_id,
-                registry,
-            )
-            .await?;
-
-            // Issue #2000: a fork resolves each activity from its record
-            // here. It runs before the session check, which skips each
-            // settled activity.
-            let fork = crate::fork::serve_recorded_activities(
-                conn,
-                exec_id,
-                is_fork,
-                &scheduled_activity_ids(scheduled_activities),
-                &mut race_next_event_id,
-                registry,
-            )
-            .await?;
-            // Worker sessions (issue #606): fail any member activity whose
-            // session already left ACTIVE. The workflow then observes
-            // SessionBroken on its next decision cycle. It does not hang on a
-            // task hard-pinned to a dead host.
-            let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
-                conn,
-                exec_id,
-                scheduled_activities,
-                &activity_task_ids,
-                &fork.settled,
-                &mut race_next_event_id,
-                registry.payload_codecs(),
-            )
-            .await?;
-            let served_from_fork = fork.served;
-
-            let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok((
-                deferred,
-                had_wake_requested,
-                synthesized_broken_session_failure || served_from_fork,
-            ))
-        }))
+        });
+        let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
+        store::append_events_offloaded_with_codecs(
+            conn,
+            exec_id,
+            &events,
+            next_event_id,
+            offloader,
+            registry.payload_codecs(),
+        )
         .await?;
+        detached_spawns.persist(conn, commands).await?;
+        // Lazily register any dynamic per-key rate-limit buckets (issue #699)
+        // in the enqueue transaction. The fail-closed claim/dispatch gate then
+        // always finds a bucket row, else the task would stall forever. ON
+        // CONFLICT DO NOTHING preserves operator overrides and is idempotent
+        // across replays and re-dispatch. The plan hands the buckets over
+        // sorted by key, which keeps the rare stale-bucket row lock
+        // deadlock-free (issue #1127). See `ActivityEnqueuePlan`.
+        for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
+            queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+        }
+        // One multi-row INSERT for the whole fan-out, not one per
+        // activity (Ledger perf pass). A decision that schedules N
+        // activities in one suspension used to cost N single-row
+        // INSERT statements here. See `queue::enqueue_batch`'s doc
+        // comment for the mechanism and the rare sticky-pin
+        // follow-up it still issues per row.
+        let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
+        let mut race_next_event_id = next_event_id.saturating_add(events_len);
+        let (deferred, _race_loser_events) = apply_race_loser_cancellations(
+            conn,
+            exec_id,
+            commands,
+            &mut race_next_event_id,
+            registry,
+        )
+        .await?;
+
+        // Issue #2000: a fork resolves each activity from its record
+        // here. It runs before the session check, which skips each
+        // settled activity.
+        let fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            is_fork,
+            &scheduled_activity_ids(scheduled_activities),
+            &mut race_next_event_id,
+            registry,
+        )
+        .await?;
+        // Worker sessions (issue #606): fail any member activity whose
+        // session already left ACTIVE. The workflow then observes
+        // SessionBroken on its next decision cycle. It does not hang on a
+        // task hard-pinned to a dead host.
+        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+            conn,
+            exec_id,
+            scheduled_activities,
+            &activity_task_ids,
+            &fork.settled,
+            &mut race_next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
+        let served_from_fork = fork.served;
+
+        let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+        Ok((
+            deferred,
+            had_wake_requested,
+            synthesized_broken_session_failure || served_from_fork,
+        ))
+    };
+    let in_transaction = {
+        use diesel_async::TransactionManager as _;
+        diesel_async::AnsiTransactionManager::transaction_manager_status_mut(conn)
+            .transaction_depth()
+            .map_err(crate::error::database_error)?
+            .is_some()
+    };
+    let (deferred, had_wake_requested, synthesized_outcome) =
+        if in_transaction && !suspension_needs_savepoint(commands, is_fork) {
+            body(conn).await?
+        } else {
+            Box::pin(conn.transaction::<_, HarvestError, _>(body)).await?
+        };
 
     for start in deferred {
         start.spawn();
@@ -12424,6 +12447,27 @@ async fn persist_scheduled_activities(
     }
 
     Ok(())
+}
+
+/// Whether the suspension body of [`persist_scheduled_activities`] needs a
+/// savepoint.
+///
+/// The caller recovers from two errors and then commits the persist
+/// transaction: a full tenant quota and an unavailable shard (see
+/// `recover_from_child_quota_exceeded`). Two steps of this body can raise
+/// them: a detached child spawn, and the cancel of a losing child of a race.
+/// The cancel of a child on a moving shard raises the shard error. A fork
+/// reads the history of its source here. The savepoint stays for a fork, so
+/// a new error path in that read stays safe. The savepoint discards the events that the body
+/// appended before such an error. Every other error rolls back the whole
+/// persist transaction, so it needs no savepoint.
+fn suspension_needs_savepoint(commands: &[WorkflowCommand], is_fork: bool) -> bool {
+    is_fork
+        || commands.iter().any(|cmd| match cmd {
+            WorkflowCommand::SpawnDetachedChildWorkflow { .. } => true,
+            WorkflowCommand::CancelRaceLosers { children, .. } => !children.is_empty(),
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15101,19 +15145,27 @@ pub async fn ingest_due_timers_and_signals(
 ) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
 
-    let due_timers = dsl::harvest_timers
-        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::fired.eq(false))
-        // Use the database clock here so timer replay stays consistent with the
-        // queue claim path, which also uses Postgres NOW().
-        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
-        .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
-        .select(HarvestTimer::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+    // The two reads are independent, so they go in one pipeline. The server
+    // runs them in this order, each with its own snapshot.
+    let shared: &AsyncPgConnection = conn;
+    let due_timers = async {
+        let mut shared = shared;
+        dsl::harvest_timers
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::fired.eq(false))
+            // Use the database clock here so timer replay stays consistent with the
+            // queue claim path, which also uses Postgres NOW().
+            .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
+            .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
+            .select(HarvestTimer::as_select())
+            .load(&mut shared)
+            .await
+            .map_err(crate::error::database_error)
+    };
+    let pending_signals = signal::load_pending_signals(shared, exec_id);
+    let (due_timers, pending_signals) = futures::future::join(due_timers, pending_signals).await;
+    let due_timers: Vec<HarvestTimer> = due_timers?;
+    let pending_signals = pending_signals?;
 
     if due_timers.is_empty() && pending_signals.is_empty() {
         return Ok((vec![], vec![]));
@@ -22725,8 +22777,27 @@ pub async fn fail_execution_on_error<T>(
     if crate::tx_retry::classify_conflict(&error).is_some() {
         return Err(error);
     }
-    fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
+    if let Err(fail_error) =
+        fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await
+    {
+        // A failed statement with no savepoint aborts the persist transaction.
+        // The failure write then fails too, and the caller rolls back. So the
+        // first error is the cause to report.
+        if is_aborted_transaction(&fail_error) {
+            return Err(error);
+        }
+        return Err(fail_error);
+    }
     Err(error)
+}
+
+/// True when `error` is the reply to a statement in an aborted transaction
+/// (SQLSTATE `25P02`). Diesel exposes no SQLSTATE, so this reads the message.
+/// With a localized `lc_messages` it returns false. The caller then reports
+/// the failure-write error.
+fn is_aborted_transaction(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::Database(message)
+        if message.contains(crate::notify::ABORTED_BLOCK_MESSAGE))
 }
 
 /// Lower/upper bounds for the randomized reschedule delay after a child
@@ -32730,11 +32801,11 @@ fn spawn_schedule_overdue_sampler(
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads `available_permits()` of the two dispatch `Semaphore`s against the
-/// *live* dispatch target, on the same cadence as the queue/DLQ samplers.
-/// It emits the `harvest.worker.slots_in_use` /
-/// `harvest.worker.slots_available` gauges, labelled by `slot_type`. This is
-/// a pure in-memory read — no DB access, no new lock contention. Skipped
-/// entirely when no metrics recorder is configured.
+/// *live* dispatch target, on `poll_interval`. It emits the
+/// `harvest.worker.slots_in_use` / `harvest.worker.slots_available` gauges,
+/// labelled by `slot_type`. This is a pure in-memory read — no DB access, no
+/// new lock contention. Skipped entirely when no metrics recorder is
+/// configured.
 ///
 /// `*_slot_target` is always present (issue #548). Without a slot tuner, it
 /// equals the static `max_concurrent_*` and never changes. So the output of
@@ -34386,6 +34457,152 @@ fn spawn_pause_auto_resumer(
     })
 }
 
+/// What the database gauge samplers read (issue #2668).
+struct GaugeSamplerInputs {
+    /// One pool for each shard. The fleet-wide gauges sum over them.
+    pools: Vec<DbPool>,
+    /// The DLQ shard label and pool of each DLQ sampler.
+    dlq_pools: Vec<(u16, DbPool)>,
+    /// The pools of the stranded-work sampler. `None` without a sharded pool.
+    stranded: Option<crate::shard::ShardedDbPool>,
+    /// The queues that this worker polls.
+    queues: Vec<String>,
+    /// The activities with a circuit breaker. They skip the rate-limit gate.
+    circuit_breaker_activities: Vec<String>,
+    /// The required capabilities of each activity that declares them.
+    activity_requirements: std::collections::HashMap<String, serde_json::Value>,
+    /// The soft `continue_as_new` threshold of the history-oversized gauge.
+    soft_threshold: u64,
+    /// How recent a heartbeat must be for a worker to cover a shard.
+    stranded_freshness: Duration,
+}
+
+/// The tasks that [`spawn_gauge_samplers`] starts.
+struct GaugeSamplerHandles {
+    queue_depth: tokio::task::JoinHandle<()>,
+    concurrency: tokio::task::JoinHandle<()>,
+    rate_limit: tokio::task::JoinHandle<()>,
+    dlq_depth: Vec<tokio::task::JoinHandle<()>>,
+    queue_pause: tokio::task::JoinHandle<()>,
+    history_oversized: tokio::task::JoinHandle<()>,
+    workflow_active: tokio::task::JoinHandle<()>,
+    stranded_work: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl GaugeSamplerHandles {
+    /// Every handle, for a test that joins them all.
+    fn into_vec(self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = vec![
+            self.queue_depth,
+            self.concurrency,
+            self.rate_limit,
+            self.queue_pause,
+            self.history_oversized,
+            self.workflow_active,
+        ];
+        handles.extend(self.dlq_depth);
+        handles.extend(self.stranded_work);
+        handles
+    }
+}
+
+/// Spawn every sampler that reads the database for a gauge, on
+/// `gauge_sample_interval` (issue #2668).
+///
+/// Each one reads the database on every worker. The fleet-wide samplers read
+/// every shard. On `poll_interval` these
+/// samplers used most of the buffers of a large deployment. Prometheus
+/// scrapes a gauge each 15 to 60 s, so a slower sample loses no reading.
+///
+/// The schedule-overdue sampler keeps its adaptive cadence, so it detects a
+/// late schedule within its grace. The replication sampler keeps its own
+/// knob. Samplers that read no table keep `poll_interval`.
+///
+/// The stranded-work sampler starts only with a sharded pool and a metrics
+/// recorder. Each other sampler returns at once when no recorder is set. The
+/// concurrency sampler also stays on for a DEBUG subscriber.
+fn spawn_gauge_samplers(
+    config: &WorkerRuntimeConfig,
+    inputs: GaugeSamplerInputs,
+    cancel: &CancellationToken,
+    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+) -> GaugeSamplerHandles {
+    let interval = config.gauge_sample_interval;
+    let GaugeSamplerInputs {
+        pools,
+        dlq_pools,
+        stranded,
+        queues,
+        circuit_breaker_activities,
+        activity_requirements,
+        soft_threshold,
+        stranded_freshness,
+    } = inputs;
+    let stranded_work = stranded
+        .filter(|_| telemetry.metrics.is_enabled())
+        .map(|sharded| {
+            spawn_stranded_work_sampler(
+                sharded,
+                stranded_freshness,
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+                circuit_breaker_activities.clone(),
+                activity_requirements,
+            )
+        });
+    GaugeSamplerHandles {
+        queue_depth: spawn_queue_depth_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            queues.clone(),
+            interval,
+            circuit_breaker_activities,
+        ),
+        concurrency: spawn_concurrency_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            queues,
+            interval,
+        ),
+        rate_limit: spawn_rate_limit_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        dlq_depth: dlq_pools
+            .into_iter()
+            .map(|(shard_id, pool)| {
+                spawn_dlq_depth_sampler(pool, cancel.clone(), telemetry.clone(), shard_id, interval)
+            })
+            .collect(),
+        queue_pause: spawn_queue_pause_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        history_oversized: spawn_history_oversized_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            soft_threshold,
+            interval,
+        ),
+        workflow_active: spawn_workflow_active_sampler(
+            pools,
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        stranded_work,
+    }
+}
+
 /// Periodically sample RUNNING executions over the soft `continue_as_new`
 /// history threshold and emit the count per workflow type as a gauge (issue
 /// #493, AC2).
@@ -34495,6 +34712,9 @@ fn spawn_history_oversized_sampler(
 /// Query the count of RUNNING executions per workflow type that have
 /// accumulated more than `soft_threshold` events.
 ///
+/// `SUSPENDED` is not a stored state (see `replay_sample.rs`), so the
+/// predicate names `RUNNING` only (issue #2668).
+///
 /// Returns `(workflow_name, count)` pairs; omits workflow types with zero
 /// oversized executions.
 async fn sample_history_oversized_counts(
@@ -34512,7 +34732,7 @@ async fn sample_history_oversized_counts(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT wf.workflow_name, COUNT(*)::bigint AS oversized_count \
          FROM harvest_workflow_executions wf \
-         WHERE wf.state IN ('RUNNING', 'SUSPENDED') \
+         WHERE wf.state = 'RUNNING' \
          AND (SELECT COUNT(*) FROM harvest_events he WHERE he.workflow_exec_id = wf.id) > $1 \
          GROUP BY wf.workflow_name",
     )
@@ -38929,84 +39149,60 @@ impl Worker {
         #[cfg(not(feature = "db"))]
         let sampler_pools: Vec<DbPool> = vec![pool.clone()];
 
-        let queue_depth_sampler = spawn_queue_depth_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.queues.clone(),
-            self.config.poll_interval,
-            self.registry
-                .circuit_breakers()
-                .tracked_activity_names()
-                .to_vec(),
+        // DLQ depth gauge: one sampler per shard assignment, so each shard that
+        // this worker owns is reported. With no assignment, one sampler reads
+        // shard 0. A sharded pool gives each sampler its shard pool (fix #5).
+        let mut dlq_pools: Vec<(u16, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| {
+                let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                let shard_pool = self
+                    .config
+                    .sharded_pool
+                    .as_ref()
+                    .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
+                (shard_id, shard_pool)
+            })
+            .collect();
+        if dlq_pools.is_empty() {
+            dlq_pools.push((0, pool.clone()));
+        }
+        // Every sampler that reads the database for a gauge runs on
+        // `gauge_sample_interval` (issue #2668).
+        let gauges = spawn_gauge_samplers(
+            &self.config,
+            GaugeSamplerInputs {
+                pools: sampler_pools.clone(),
+                dlq_pools,
+                stranded: self.config.sharded_pool.clone(),
+                queues: self.config.queues.clone(),
+                circuit_breaker_activities: self
+                    .registry
+                    .circuit_breakers()
+                    .tracked_activity_names()
+                    .to_vec(),
+                activity_requirements: self.registry.activity_requirements_json(),
+                soft_threshold: self.registry.history_policy().continue_as_new_threshold(),
+                // The heartbeat sets the freshness window, so the liveness
+                // check agrees with the heartbeat.
+                stranded_freshness: self.config.worker_heartbeat_interval.saturating_mul(2),
+            },
+            &self.shutdown,
+            self.registry.telemetry(),
         );
-        let concurrency_sampler = spawn_concurrency_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.queues.clone(),
-            self.config.poll_interval,
-        );
-        // DLQ depth gauge — one sampler per shard assignment so every shard
-        // this worker owns is reported.  Single-shard deployments get one
-        // sampler for shard 0; multi-shard workers (rare) get one per entry.
-        // Each sampler uses the per-shard pool when a ShardedDbPool is available
-        // so it queries the correct database (fix #5).
-        let dlq_depth_samplers: Vec<_> = {
-            let assignments = &self.config.shard_assignments;
-            let shards: &[_] = if assignments.is_empty() {
-                &[]
-            } else {
-                assignments.as_slice()
-            };
-            let mut handles: Vec<_> = shards
-                .iter()
-                .map(|shard| {
-                    let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
-                    #[cfg(feature = "db")]
-                    let shard_pool = self
-                        .config
-                        .sharded_pool
-                        .as_ref()
-                        .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
-                    #[cfg(not(feature = "db"))]
-                    let shard_pool = pool.clone();
-                    spawn_dlq_depth_sampler(
-                        shard_pool,
-                        self.shutdown.clone(),
-                        self.registry.telemetry().clone(),
-                        shard_id,
-                        self.config.poll_interval,
-                    )
-                })
-                .collect();
-            if handles.is_empty() {
-                handles.push(spawn_dlq_depth_sampler(
-                    pool.clone(),
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    0u16,
-                    self.config.poll_interval,
-                ));
-            }
-            handles
-        };
-        let rate_limit_sampler = spawn_rate_limit_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        );
-        // Issue #619: surface operator queue holds on dashboards.
-        #[cfg(feature = "db")]
-        let queue_pause_sampler = Some(spawn_queue_pause_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        ));
-        #[cfg(not(feature = "db"))]
-        let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
+        let GaugeSamplerHandles {
+            queue_depth: queue_depth_sampler,
+            concurrency: concurrency_sampler,
+            rate_limit: rate_limit_sampler,
+            dlq_depth: dlq_depth_samplers,
+            queue_pause,
+            history_oversized: history_oversized_sampler,
+            workflow_active: workflow_active_sampler,
+            stranded_work: stranded_work_sampler,
+        } = gauges;
+        let queue_pause_sampler = Some(queue_pause);
         // Issue #1429: no database read, so this runs on every build.
         let dispatch_metrics_sampler = spawn_dispatch_metrics_sampler(
             self.shutdown.clone(),
@@ -39295,21 +39491,6 @@ impl Worker {
                 ))
             })
             .collect();
-        let history_oversized_sampler = spawn_history_oversized_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.registry.history_policy().continue_as_new_threshold(),
-            self.config.poll_interval,
-        );
-        // Active-workflow population gauge (issue #770): the live in-progress
-        // count per (workflow, state). Self-no-ops when metrics are disabled.
-        let workflow_active_sampler = spawn_workflow_active_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        );
         // Adaptive slot-tuner control loop (issue #548), spawned only when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
         // below, it is NOT gated on `metrics.is_enabled()`. It is a
@@ -39426,8 +39607,8 @@ impl Worker {
             };
 
         // Worker slot-occupancy gauges (issue #531): an in-memory read of the
-        // two dispatch semaphores against their configured maxima. It runs on
-        // the cadence of the other samplers. Like stranded_work_sampler, it
+        // two dispatch semaphores against their configured maxima, on
+        // `poll_interval`. It reads no table. Like stranded_work_sampler, it
         // starts only when metrics are enabled.
         let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
             spawn_worker_slot_sampler(
@@ -39504,37 +39685,6 @@ impl Worker {
             drop(dr_targets);
             None
         };
-
-        // Stranded-work sampler (issue #522): emits a gauge per shard showing
-        // how many claimable tasks have no live covering worker. Iterates ALL
-        // shards visible through the pool (not just assigned shards) so an
-        // uncovered writable shard is caught regardless of which worker runs
-        // this sampler. Only started when a sharded pool is available and
-        // metrics are enabled.
-        #[cfg(feature = "db")]
-        let stranded_work_sampler = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .filter(|_| self.registry.telemetry().metrics.is_enabled())
-            .map(|sp| {
-                spawn_stranded_work_sampler(
-                    sp.clone(),
-                    // Reuse the heartbeat interval as freshness window so the
-                    // worker-liveness check is consistent with the heartbeat.
-                    self.config.worker_heartbeat_interval.saturating_mul(2),
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    self.config.poll_interval,
-                    self.registry
-                        .circuit_breakers()
-                        .tracked_activity_names()
-                        .to_vec(),
-                    self.registry.activity_requirements_json(),
-                )
-            });
-        #[cfg(not(feature = "db"))]
-        let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
 
         // Overdue-schedule gauge sampler (issue #696): emits
         // `harvest.schedule.overdue` per schedule across every shard pool so a
@@ -46427,6 +46577,172 @@ mod tests {
         );
     }
 
+    // ── Issue #2668: the database gauge samplers use their own interval ───
+    //
+    // Each gauge sampler reads the database on every worker. On
+    // `poll_interval` the two population samplers used 77% of the buffers at
+    // 1M runs, and the stranded-work query was 80% at 10,000 pending rows.
+    // These tests count real connections, as the #1428 tests above do.
+
+    /// A recorder that reads as enabled and records nothing.
+    struct EnabledMetrics;
+
+    impl crate::telemetry::MetricsRecorder for EnabledMetrics {}
+
+    fn enabled_telemetry() -> Arc<crate::telemetry::TelemetryConfig> {
+        let telemetry = crate::telemetry::TelemetryConfig {
+            metrics: Arc::new(EnabledMetrics),
+            ..crate::telemetry::TelemetryConfig::default()
+        };
+        assert!(telemetry.metrics.is_enabled());
+        Arc::new(telemetry)
+    }
+
+    /// A runtime config with a 50 ms poll interval and a 3 s gauge
+    /// interval. No other setting uses 3 s, so a test proves that the
+    /// samplers read this field and not a constant.
+    fn gauge_cadence_config() -> WorkerRuntimeConfig {
+        let mut cfg = default_runtime_config();
+        cfg.poll_interval = Duration::from_millis(50);
+        cfg.gauge_sample_interval = Duration::from_secs(3);
+        cfg
+    }
+
+    /// Every gauge sampler input points at the one counting pool.
+    fn counting_gauge_inputs(pool: &DbPool) -> GaugeSamplerInputs {
+        GaugeSamplerInputs {
+            pools: vec![pool.clone()],
+            dlq_pools: vec![(0, pool.clone())],
+            stranded: Some(crate::shard::ShardedDbPool::single(pool.clone())),
+            queues: vec!["default".to_string()],
+            circuit_breaker_activities: Vec::new(),
+            activity_requirements: std::collections::HashMap::new(),
+            soft_threshold: 100,
+            stranded_freshness: Duration::from_secs(10),
+        }
+    }
+
+    /// The samplers that `spawn_gauge_samplers` starts with every input set.
+    /// They are queue depth, concurrency, rate limit, one DLQ shard, queue
+    /// pause, history oversized, workflow active and stranded work.
+    const GAUGE_SAMPLERS: usize = 8;
+
+    /// Issue #2668: with metrics on, every database gauge sampler waits for
+    /// the gauge interval. None opens a connection on a poll tick. Each opens
+    /// one within three poll ticks after the interval ends.
+    #[tokio::test(start_paused = true)]
+    async fn gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval() {
+        let cfg = gauge_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_gauge_samplers(
+            &cfg,
+            counting_gauge_inputs(&listener.pool),
+            &cancel,
+            &enabled_telemetry(),
+        )
+        .into_vec();
+        assert_eq!(handles.len(), GAUGE_SAMPLERS);
+
+        // The samplers start their sleep in the first tick. So this stops
+        // two poll ticks before the first sample.
+        let ticks_in_interval =
+            usize::try_from(cfg.gauge_sample_interval.as_millis() / cfg.poll_interval.as_millis())
+                .expect("tick count fits usize");
+        advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
+        let touches_before = listener.touch_count();
+
+        // Move past the first sample, then stop the clock. A sampler on a
+        // longer interval then opens no connection, so the count stays short.
+        advance_sampler_ticks(cfg.poll_interval, 3).await;
+        // The accept is real loopback I/O. A yield polls I/O and does not
+        // advance the paused clock. Each failed connect frees the one pool
+        // slot for the next sampler. Wait under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() < GAUGE_SAMPLERS && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        let touches_after = listener.touch_count();
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        assert_eq!(
+            touches_before, 0,
+            "no gauge sampler may query on a poll_interval tick"
+        );
+        assert!(
+            touches_after >= GAUGE_SAMPLERS,
+            "each gauge sampler must query once the gauge interval ends; \
+             saw {touches_after} of {GAUGE_SAMPLERS}"
+        );
+    }
+
+    /// Issue #2668: the stranded-work sampler needs a sharded pool and a
+    /// recorder. Without either, the helper does not start it.
+    #[tokio::test(start_paused = true)]
+    async fn the_stranded_work_sampler_needs_a_sharded_pool_and_a_recorder() {
+        let cfg = gauge_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+
+        let mut no_pool = counting_gauge_inputs(&listener.pool);
+        no_pool.stranded = None;
+        let without_pool = spawn_gauge_samplers(&cfg, no_pool, &cancel, &enabled_telemetry());
+        assert!(without_pool.stranded_work.is_none());
+
+        let disabled = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let without_recorder = spawn_gauge_samplers(
+            &cfg,
+            counting_gauge_inputs(&listener.pool),
+            &cancel,
+            &disabled,
+        );
+        assert!(without_recorder.stranded_work.is_none());
+
+        cancel.cancel();
+        for handle in without_pool
+            .into_vec()
+            .into_iter()
+            .chain(without_recorder.into_vec())
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+    }
+
+    /// Issue #2668: a cancel during the long sleep ends every gauge sampler
+    /// at once. A shutdown never waits for the gauge interval.
+    #[tokio::test(start_paused = true)]
+    async fn gauge_samplers_stop_on_cancel_during_the_sleep() {
+        let cfg = gauge_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_gauge_samplers(
+            &cfg,
+            counting_gauge_inputs(&listener.pool),
+            &cancel,
+            &enabled_telemetry(),
+        )
+        .into_vec();
+        advance_sampler_ticks(cfg.poll_interval, 1).await;
+
+        cancel.cancel();
+        for handle in handles {
+            // A failed cancel leaves the sampler in its sleep. The idle
+            // runtime then moves the paused clock to the 1 ms deadline
+            // first, so the timeout fails the test.
+            let joined = tokio::time::timeout(Duration::from_millis(1), handle).await;
+            assert!(
+                joined.is_ok(),
+                "a sampler must end on cancel without waiting for its sleep"
+            );
+        }
+        listener.stop();
+    }
+
     #[test]
     fn a_two_connection_pool_serving_one_shard_is_sufficient() {
         use crate::types::ShardId;
@@ -46549,6 +46865,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             fairness_keys: false,
+            gauge_sample_interval: DEFAULT_GAUGE_SAMPLE_INTERVAL,
         }
     }
 
@@ -46580,6 +46897,33 @@ mod tests {
             vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
             "a duplicate shard must not reach the per-shard monitor fan-out, \
              which spawns one control-loop set per assignment entry",
+        );
+    }
+
+    /// Issue #2668: the conversion copies the gauge interval and keeps it
+    /// apart from the poll interval.
+    #[test]
+    fn runtime_config_carries_the_gauge_sample_interval() {
+        let worker_config = crate::builder::WorkerConfig::default()
+            .with_gauge_sample_interval(Duration::from_secs(42));
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.gauge_sample_interval,
+            Duration::from_secs(42)
+        );
+        assert_eq!(runtime_config.poll_interval, DEFAULT_WORKER_POLL_INTERVAL);
+    }
+
+    /// Issue #2668: a runtime config that skips the builder can still hold
+    /// a zero interval. `validate` rejects it, so `Worker::new` fails.
+    #[test]
+    fn validate_rejects_a_zero_gauge_sample_interval() {
+        let mut cfg = default_runtime_config();
+        cfg.gauge_sample_interval = Duration::ZERO;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("gauge_sample_interval"),
+            "the error must name the knob: {err}"
         );
     }
 
@@ -47484,6 +47828,7 @@ mod tests {
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
+            gauge_sample_interval: Duration::from_secs(20),
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
             shard_notification_database_urls: Vec::new(),
@@ -47545,6 +47890,7 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(runtime_cfg.gauge_sample_interval, Duration::from_secs(20));
         assert_eq!(
             runtime_cfg.cancellation_grace_period,
             Duration::from_secs(10)
@@ -50585,6 +50931,72 @@ mod tests {
             "a child + ordinary (non-`__child_timeout:`) timer must NOT match the \
              child-timeout race"
         );
+    }
+
+    // ── the savepoint of the suspension persist ─────────────────────────────
+
+    #[test]
+    fn a_plain_fan_out_needs_no_savepoint() {
+        let commands = vec![
+            mixed_schedule_activity("a"),
+            mixed_schedule_activity("b"),
+            mixed_start_timer("t", 5),
+        ];
+        assert!(!suspension_needs_savepoint(&commands, false));
+        assert!(!suspension_needs_savepoint(&[], false));
+    }
+
+    #[test]
+    fn a_detached_spawn_or_a_fork_keeps_the_savepoint() {
+        let spawn = WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id: ExecutionId::new(),
+            workflow_name: "audit".to_string(),
+            input: serde_json::json!({}),
+            parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+        };
+        let commands = vec![mixed_schedule_activity("a"), spawn];
+        assert!(suspension_needs_savepoint(&commands, false));
+        assert!(suspension_needs_savepoint(
+            &[mixed_schedule_activity("a")],
+            true
+        ));
+    }
+
+    /// The cancel of a losing child can raise the shard error that the
+    /// caller recovers from. A race with no losing child needs no savepoint.
+    #[test]
+    fn a_race_with_a_losing_child_keeps_the_savepoint() {
+        let losers = |children: Vec<ExecutionId>| WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
+            activities: vec![crate::types::ActivityExecId::new()],
+            children,
+            timers: vec![],
+        };
+        assert!(suspension_needs_savepoint(
+            &[
+                mixed_schedule_activity("a"),
+                losers(vec![ExecutionId::new()])
+            ],
+            false
+        ));
+        assert!(!suspension_needs_savepoint(
+            &[mixed_schedule_activity("a"), losers(vec![])],
+            false
+        ));
+    }
+
+    #[test]
+    fn only_the_aborted_transaction_reply_counts_as_aborted() {
+        assert!(is_aborted_transaction(&HarvestError::Database(
+            "current transaction is aborted, commands ignored until end of transaction block"
+                .to_string()
+        )));
+        assert!(!is_aborted_transaction(&HarvestError::Database(
+            "duplicate key value violates unique constraint".to_string()
+        )));
+        assert!(!is_aborted_transaction(&HarvestError::Config(
+            "current transaction is aborted".to_string()
+        )));
     }
 
     // ── extract_mixed_suspension_batch (issue #950) ──────────────────────────
