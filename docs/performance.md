@@ -62,6 +62,12 @@ saturated-activity gate.
   claim does not spill. At 100K, 8 claimers sustain 573 claims/s against 1.2 before. The
   full scan that the rest of this page measures now runs only as a
   fallback. See [the seek window](#the-seek-window-issue-1971).
+* **Since issue #2680, a claim with the seek window sends two statements.**
+  The window form runs first, and the full statement runs only when a
+  deeper scan could find a row: 8 of 10,128 claims on the e2e bench.
+  Postgres initializes every CTE subplan at startup, so the single
+  statement paid for 110 plan nodes that never ran. See
+  [the claim window split](performance-claim-window-split.md).
 * **A worker now runs up to `max_concurrent_claims` claims at once (default
   2).** One serial loop kept 0.94 claims in flight and capped throughput. On
   assay #14's workload, two loops raise throughput 21% to 35%, and four

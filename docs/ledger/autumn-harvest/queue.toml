@@ -92,7 +92,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-claim-window-split.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_workflow_task_of_execution"]

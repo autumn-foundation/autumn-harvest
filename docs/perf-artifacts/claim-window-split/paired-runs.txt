@@ -1,0 +1,12 @@
+base_1 rate=103.63 inflight=28.5 latency_ms=275 gate=**no**
+new_1 rate=107.91 inflight=28.4 latency_ms=263 gate=**no**
+new_2 rate=109.89 inflight=28.3 latency_ms=258 gate=**no**
+base_2 rate=96.46 inflight=28.8 latency_ms=299 gate=yes
+base_3 rate=92.45 inflight=29.0 latency_ms=314 gate=yes
+new_3 rate=104.35 inflight=28.5 latency_ms=273 gate=**no**
+new_4 rate=102.56 inflight=28.6 latency_ms=279 gate=**no**
+base_4 rate=92.02 inflight=29.0 latency_ms=315 gate=yes
+base_5 rate=85.71 inflight=29.1 latency_ms=340 gate=yes
+new_5 rate=104.17 inflight=28.5 latency_ms=274 gate=**no**
+new_6 rate=100.50 inflight=28.6 latency_ms=285 gate=**no**
+base_6 rate=90.23 inflight=29.0 latency_ms=321 gate=yes
