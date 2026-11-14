@@ -335,6 +335,19 @@ pub open spec fn any_release(released: Seq < bool >) -> bool { exists | i: int |
 proof fn lemma_pipeline_releases_iff_a_hold(paused: Seq < bool >) ensures pipelined_releases(paused).len() == paused.len(), any_release(pipelined_releases(paused)) <==> any_release(paused), decreases paused.len(),
 pub proof fn theorem_the_pipeline_keeps_what_the_sequence_keeps(acquired: bool, paused: Seq < bool >,) ensures (spec_recheck_verdict(acquired, any_release(pipelined_releases(paused))) is Keep) <==> sequential_keeps(acquired, paused),
 
+## formal/verus/src/claim_window.rs
+pub enum WindowStep { Claimed, Empty, Fallback, }
+pub open spec fn spec_window_step(claimed: bool, fallback: bool) -> WindowStep { if claimed { WindowStep::Claimed } else if fallback { WindowStep::Fallback } else { WindowStep::Empty } }
+pub fn window_step(claimed: bool, fallback: bool) -> (r: WindowStep) ensures r == spec_window_step(claimed, fallback), r is Claimed <==> claimed, r is Fallback <==>! claimed && fallback, r is Empty <==>! claimed &&! fallback,
+pub struct Snapshot { pub window: Option < int >, pub deep: Option < int >, pub full: Option < int >, pub contended: bool, pub bounds: bool, pub deep_bounds: bool, pub ageing: bool, }
+pub open spec fn deep_candidate(s: Snapshot) -> Option < int > { if s.window is None && s.contended { s.deep } else { None } }
+pub open spec fn full_statement(s: Snapshot) -> Option < int > { if s.window is Some { s.window } else if deep_candidate(s) is Some { deep_candidate(s) } else if (s.bounds && (! s.contended || s.deep_bounds)) || s.ageing { s.full } else { None } }
+pub open spec fn window_flag(s: Snapshot) -> bool { s.window is None && (s.contended || s.bounds || s.ageing) }
+pub open spec fn split_claim(first: Snapshot, second: Snapshot) -> Option < int > { match spec_window_step(first.window is Some, window_flag(first)) { WindowStep::Claimed => first.window, WindowStep::Empty => None, WindowStep::Fallback => full_statement(second), } }
+proof fn lemma_a_clear_flag_means_no_row(s: Snapshot) requires s.window is None, ! window_flag(s), ensures full_statement(s) is None,
+proof fn lemma_a_set_flag_took_no_row(s: Snapshot) requires window_flag(s), ensures s.window is None,
+pub proof fn theorem_the_split_claim_takes_the_full_statement_row(first: Snapshot, second: Snapshot,) ensures split_claim(first, first) == full_statement(first), window_flag(first) ==> split_claim(first, second) == full_statement(second), ! window_flag(first) ==> split_claim(first, second) == full_statement(first),
+
 ## formal/verus/src/depth_cap.rs
 pub open spec fn capped(n: int, cap: int) -> int { if n > cap { cap } else { n } }
 pub open spec fn step(total: int, shard_depth: int, cap: int) -> int { capped(capped(total, cap) + capped(shard_depth, cap), cap) }
