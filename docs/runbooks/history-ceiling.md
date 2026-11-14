@@ -36,7 +36,7 @@ The SQLite backend enforces the two hard caps with the same defaults (issue
 ### Via the gauge metric
 
 The worker emits `harvest.workflow.history_oversized{workflow=<name>}` once
-per `WorkerConfig::population_sample_interval` (15 s by default, issue #2668).
+per `WorkerConfig::gauge_sample_interval` (15 s by default, issue #2668).
 The gauge value is the count of RUNNING executions whose event count exceeds
 `continue_as_new_threshold` (default 10 000).
 

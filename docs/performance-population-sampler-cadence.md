@@ -39,8 +39,9 @@ The issue records two rejected rewrites. An early-exit oversized check costs
 
 ## 🔧 Change
 
-- `WorkerConfig::population_sample_interval`, default 15 s, drives both
-  samplers. Every other sampler keeps `poll_interval`.
+- `WorkerConfig::gauge_sample_interval`, default 15 s, drives both
+  samplers. The follow-up in `performance-gauge-sample-interval.md` moves
+  the other database gauge samplers.
 - The gauge semantics do not change. Each worker still emits the fleet-wide
   value.
 - The oversized predicate names `RUNNING` only. `SUSPENDED` is not a stored
@@ -60,7 +61,7 @@ The change does not alter the cost per call. It alters the call count.
 That is 30 times fewer calls. At 1M executions the buffer touches per worker
 per hour go from about 1.37 billion to about 46 million.
 
-`population_samplers_wait_for_the_population_interval_not_the_poll_interval`
+`gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval`
 in `autumn-harvest/src/worker.rs` proves the new cadence. It counts real
 loopback connections. With a 50 ms poll interval, both samplers open no
 connection for 15 s, then open one. The test fails when the samplers use
@@ -69,7 +70,7 @@ connection for 15 s, then open one. The test fails when the samplers use
 ## 🔬 Reproduce
 
 ```sh
-cargo test -p autumn-harvest --lib -- worker::tests::population_samplers
+cargo test -p autumn-harvest --lib -- worker::tests::gauge_samplers
 ```
 
 The fixture SQL and the worker-driven harness are in issue #2668.

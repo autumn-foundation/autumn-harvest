@@ -362,6 +362,8 @@ fn build_worker(
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id = worker_id.to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
+    // The stranded-work gauge samples on its own interval (issue #2668).
+    runtime_config.gauge_sample_interval = runtime_config.poll_interval;
     runtime_config.shutdown_timeout = Duration::from_secs(2);
     runtime_config.sharded_pool = Some(sharded_pool.clone());
     Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"))
@@ -816,6 +818,7 @@ async fn shutdown_completes_when_a_shard_pool_is_exhausted_after_monitors_have_t
             // reclaimer, session reconciler, pause auto-resumer, and
             // quota reconciler.
             cfg.poll_interval = Duration::from_millis(100);
+            cfg.gauge_sample_interval = cfg.poll_interval;
             cfg.worker_heartbeat_interval = Duration::from_millis(500);
         },
     );
@@ -1413,6 +1416,8 @@ async fn single_shard_deployment_is_unchanged() {
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id = "w-single".to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
+    // The stranded-work gauge samples on its own interval (issue #2668).
+    runtime_config.gauge_sample_interval = runtime_config.poll_interval;
     runtime_config.shutdown_timeout = Duration::from_secs(2);
     // Deliberately NO sharded_pool — the legacy single-shard shape.
     let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker builds"));
@@ -1657,6 +1662,8 @@ fn build_worker_with(
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id = worker_id.to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
+    // The stranded-work gauge samples on its own interval (issue #2668).
+    runtime_config.gauge_sample_interval = runtime_config.poll_interval;
     runtime_config.shutdown_timeout = Duration::from_secs(2);
     runtime_config.sharded_pool = Some(sharded_pool.clone());
     tweak(&mut runtime_config);

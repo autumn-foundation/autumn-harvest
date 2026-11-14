@@ -1,0 +1,45 @@
+-- concurrency_key_stats
+Finalize GroupAggregate  (cost=9469.85..9487.67 rows=67 width=33) (actual time=20.568..23.984 rows=56 loops=1)
+  Group Key: concurrency_key, task_type
+  Buffers: shared hit=4753 read=2041
+  ->  Gather Merge  (cost=9469.85..9485.50 rows=120 width=33) (actual time=20.560..23.961 rows=56 loops=1)
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=4753 read=2041
+        ->  Partial GroupAggregate  (cost=8469.82..8471.62 rows=60 width=33) (actual time=9.310..9.379 rows=19 loops=3)
+              Group Key: concurrency_key, task_type
+              Buffers: shared hit=4753 read=2041
+              ->  Sort  (cost=8469.82..8469.97 rows=60 width=28) (actual time=9.305..9.321 rows=394 loops=3)
+                    Sort Key: concurrency_key, task_type
+                    Sort Method: quicksort  Memory: 113kB
+                    Buffers: shared hit=4753 read=2041
+                    Worker 0:  Sort Method: quicksort  Memory: 25kB
+                    Worker 1:  Sort Method: quicksort  Memory: 25kB
+                    ->  Parallel Seq Scan on harvest_task_queue  (cost=0.05..8468.05 rows=60 width=28) (actual time=2.532..9.102 rows=394 loops=3)
+                          Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
+                          Rows Removed by Filter: 69606
+                          Buffers: shared hit=4677 read=2041
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.364 ms
+Execution Time: 24.024 ms
+
+-- sample_rate_limit_buckets
+Seq Scan on harvest_rate_limit_buckets  (cost=0.00..29.00 rows=91 width=34) (actual time=0.007..0.075 rows=100 loops=1)
+  Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
+  Rows Removed by Filter: 900
+  Buffers: shared hit=14
+Planning Time: 0.069 ms
+Execution Time: 0.088 ms
+
+-- dead_letter_count
+Aggregate  (cost=3042.29..3042.30 rows=1 width=8) (actual time=12.426..12.426 rows=1 loops=1)
+  Buffers: shared hit=323
+  ->  Index Only Scan using idx_harvest_dl_failed_at on harvest_dead_letters  (cost=0.29..2792.29 rows=100000 width=0) (actual time=0.015..7.844 rows=100000 loops=1)
+        Heap Fetches: 0
+        Buffers: shared hit=323
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.078 ms
+Execution Time: 12.467 ms
+

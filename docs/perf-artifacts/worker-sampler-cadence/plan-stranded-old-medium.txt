@@ -1,0 +1,35 @@
+-- claimable_pending_demand_by_queue, old query, medium fixture: EXPLAIN only, since ANALYZE ran past 300 s
+SET
+SET
+                                                                                                                                                                                                                                                                                       QUERY PLAN                                                                                                                                                                                                                                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=2559134.37..5118268.28 rows=1 width=112)
+   Group Key: tq.queue_name, tq.required_capabilities, tq.required_build_id, (CASE WHEN ((tq.sticky_worker_id IS NOT NULL) AND (tq.sticky_until IS NOT NULL) AND (tq.sticky_until > now())) THEN tq.sticky_worker_id ELSE NULL::text END), tq.activity_name
+   ->  Incremental Sort  (cost=2559134.37..5118268.23 rows=2 width=104)
+         Sort Key: tq.queue_name, tq.required_capabilities, tq.required_build_id, (CASE WHEN ((tq.sticky_worker_id IS NOT NULL) AND (tq.sticky_until IS NOT NULL) AND (tq.sticky_until > now())) THEN tq.sticky_worker_id ELSE NULL::text END), tq.activity_name
+         Presorted Key: tq.queue_name
+         ->  Nested Loop Anti Join  (cost=0.57..5118268.14 rows=1 width=104)
+               Join Filter: ((tq.task_type = 'activity'::text) AND (ap.activity_name = tq.activity_name))
+               ->  Nested Loop Left Join  (cost=0.57..5118243.14 rows=1 width=121)
+                     Join Filter: (e.id = tq.workflow_exec_id)
+                     Filter: ((tq.task_type <> 'workflow'::text) OR (tq.workflow_exec_id IS NULL) OR (e.id IS NULL) OR (e.state <> 'PAUSED'::text))
+                     ->  Merge Anti Join  (cost=0.57..5116006.14 rows=1 width=137)
+                           Merge Cond: (tq.queue_name = qp.queue_name)
+                           ->  Index Scan using idx_harvest_tq_claim_seek on harvest_task_queue tq  (cost=0.42..5114789.75 rows=92939 width=137)
+                                 Index Cond: (scheduled_at <= now())
+                                 Filter: (((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 3)) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR ((SubPlan 1) < concurrency_cap)))
+                                 SubPlan 3
+                                   ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..74.00 rows=333 width=32)
+                                         Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+                                 SubPlan 1
+                                   ->  Aggregate  (cost=43.38..43.39 rows=1 width=8)
+                                         ->  Bitmap Heap Scan on harvest_task_queue inner_q  (cost=4.36..43.37 rows=1 width=0)
+                                               Recheck Cond: ((concurrency_key = tq.concurrency_key) AND (state = 'RUNNING'::text))
+                                               Filter: ((worker_id IS NOT NULL) AND (task_type = tq.task_type))
+                                               ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.36 rows=10 width=0)
+                                                     Index Cond: (concurrency_key = tq.concurrency_key)
+                           ->  Index Only Scan using harvest_queue_pauses_pkey on harvest_queue_pauses qp  (cost=0.15..53.15 rows=600 width=32)
+                     ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..1362.00 rows=50000 width=24)
+               ->  Seq Scan on harvest_activity_pauses ap  (cost=0.00..16.00 rows=600 width=32)
+(28 rows)
+

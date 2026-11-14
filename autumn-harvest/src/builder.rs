@@ -83,14 +83,13 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 /// [`WorkerConfig::with_max_concurrent_claims`].
 pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
-/// Default interval of the two population samplers: 15 s (issue #2668).
+/// Default interval of the database gauge samplers: 15 s (issue #2668).
 ///
-/// The samplers feed `harvest.workflow.history_oversized` and
-/// `harvest.workflow.active`. Each sample counts the whole active population
-/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so no scrape
-/// reads most samples at the poll interval. See
-/// [`WorkerConfig::population_sample_interval`].
-pub const DEFAULT_POPULATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+/// Each sampler reads the database on every worker. Prometheus scrapes a
+/// gauge each 15 to 60 s, so no scrape reads most samples at the poll
+/// interval. See
+/// [`WorkerConfig::gauge_sample_interval`].
+pub const DEFAULT_GAUGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The largest valid [`WorkerConfig::claim_slots_per_shard`]: 1024.
 ///
@@ -2842,9 +2841,9 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
-        if self.worker_config.population_sample_interval.is_zero() {
+        if self.worker_config.gauge_sample_interval.is_zero() {
             return Err(HarvestBuilderError::InvalidWorkerConfig(
-                "population_sample_interval must be greater than zero".to_string(),
+                "gauge_sample_interval must be greater than zero".to_string(),
             ));
         }
         // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
@@ -4187,18 +4186,20 @@ pub struct WorkerConfig {
     /// floor value that would understate the loss. Only used when the worker is
     /// fenced; see [`Self::dr_fencing`]. Default: 1 hour.
     pub replication_watermark_retain: Duration,
-    /// How often the two population samplers run (issue #2668).
+    /// How often the database gauge samplers run (issue #2668).
     ///
-    /// They feed `harvest.workflow.history_oversized` and
-    /// `harvest.workflow.active`. Each sample counts the whole active
-    /// population of each shard, on every worker. At 1M executions on the
-    /// poll interval, the samplers used 77% of the buffers.
+    /// Each sampler reads the database on every worker, and most read every
+    /// shard. They feed the queue depth and age, concurrency, rate-limit, DLQ,
+    /// queue-pause, stranded-work, history-oversized and active-workflow
+    /// gauges. On the poll interval they used most of the buffers of a large
+    /// deployment.
     ///
     /// A lower value gives a fresher gauge at a higher database cost. The
-    /// first sample comes one interval after the worker starts. Every other
-    /// sampler keeps the poll interval. The value must not be zero. Default: 15
-    /// seconds ([`DEFAULT_POPULATION_SAMPLE_INTERVAL`]).
-    pub population_sample_interval: Duration,
+    /// first sample comes one interval after the worker starts. The
+    /// schedule-overdue and replication samplers keep their own cadence.
+    /// Samplers that read no table keep the poll interval. The value must
+    /// not be zero. Default: 15 seconds ([`DEFAULT_GAUGE_SAMPLE_INTERVAL`]).
+    pub gauge_sample_interval: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
     /// Defaults to `harvest_dr`, matching the setup SQL in
@@ -4622,7 +4623,7 @@ impl Default for WorkerConfig {
             dr_fencing: crate::replication::DrFencing::Auto,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
-            population_sample_interval: DEFAULT_POPULATION_SAMPLE_INTERVAL,
+            gauge_sample_interval: DEFAULT_GAUGE_SAMPLE_INTERVAL,
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
@@ -4918,9 +4919,9 @@ impl WorkerConfig {
         self
     }
 
-    /// Set the interval of the two population samplers (issue #2668).
+    /// Set the interval of the database gauge samplers (issue #2668).
     ///
-    /// See [`WorkerConfig::population_sample_interval`]. A zero interval
+    /// See [`WorkerConfig::gauge_sample_interval`]. A zero interval
     /// fails `HarvestBuilder::build`.
     ///
     /// ## Examples
@@ -4930,12 +4931,12 @@ impl WorkerConfig {
     /// use autumn_harvest::builder::WorkerConfig;
     ///
     /// let config =
-    ///     WorkerConfig::default().with_population_sample_interval(Duration::from_secs(60));
-    /// assert_eq!(config.population_sample_interval, Duration::from_secs(60));
+    ///     WorkerConfig::default().with_gauge_sample_interval(Duration::from_secs(60));
+    /// assert_eq!(config.gauge_sample_interval, Duration::from_secs(60));
     /// ```
     #[must_use]
-    pub const fn with_population_sample_interval(mut self, interval: Duration) -> Self {
-        self.population_sample_interval = interval;
+    pub const fn with_gauge_sample_interval(mut self, interval: Duration) -> Self {
+        self.gauge_sample_interval = interval;
         self
     }
 
@@ -5844,36 +5845,35 @@ mod tests {
         );
     }
 
-    /// Issue #2668: the population samplers default to 15 s, not to the
-    /// 500 ms poll interval.
+    /// Issue #2668: the database gauge samplers default to 15 s, not to
+    /// the 500 ms poll interval.
     #[test]
-    fn population_sample_interval_defaults_to_15s() {
+    fn gauge_sample_interval_defaults_to_15s() {
         assert_eq!(
-            WorkerConfig::default().population_sample_interval,
+            WorkerConfig::default().gauge_sample_interval,
             Duration::from_secs(15)
         );
-        assert_eq!(DEFAULT_POPULATION_SAMPLE_INTERVAL, Duration::from_secs(15));
+        assert_eq!(DEFAULT_GAUGE_SAMPLE_INTERVAL, Duration::from_secs(15));
     }
 
     #[test]
-    fn with_population_sample_interval_sets_the_field() {
-        let config =
-            WorkerConfig::default().with_population_sample_interval(Duration::from_secs(60));
-        assert_eq!(config.population_sample_interval, Duration::from_secs(60));
+    fn with_gauge_sample_interval_sets_the_field() {
+        let config = WorkerConfig::default().with_gauge_sample_interval(Duration::from_secs(60));
+        assert_eq!(config.gauge_sample_interval, Duration::from_secs(60));
     }
 
-    /// Issue #2668: a zero interval spins both samplers, so the builder
-    /// rejects it.
+    /// Issue #2668: a zero interval spins every gauge sampler, so the
+    /// builder rejects it.
     #[test]
-    fn population_sample_interval_zero_is_rejected() {
+    fn gauge_sample_interval_zero_is_rejected() {
         let result = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_population_sample_interval(Duration::ZERO))
+            .worker(WorkerConfig::default().with_gauge_sample_interval(Duration::ZERO))
             .try_build();
         let Err(HarvestBuilderError::InvalidWorkerConfig(message)) = result else {
             panic!("expected InvalidWorkerConfig but got {result:?}");
         };
         assert!(
-            message.contains("population_sample_interval"),
+            message.contains("gauge_sample_interval"),
             "the error must name the knob: {message}"
         );
     }

@@ -86,7 +86,7 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use crate::builder::{DEFAULT_MAX_CONCURRENT_CLAIMS, DEFAULT_POPULATION_SAMPLE_INTERVAL};
+pub use crate::builder::{DEFAULT_GAUGE_SAMPLE_INTERVAL, DEFAULT_MAX_CONCURRENT_CLAIMS};
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -195,9 +195,9 @@ pub struct WorkerRuntimeConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
-    /// Interval of the two population samplers (issue #2668). The value
-    /// must not be zero. See [`crate::builder::WorkerConfig::population_sample_interval`].
-    pub population_sample_interval: Duration,
+    /// Interval of the database gauge samplers (issue #2668). The value
+    /// must not be zero. See [`crate::builder::WorkerConfig::gauge_sample_interval`].
+    pub gauge_sample_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
     /// Grace period for an activity handler to unwind cooperatively after
@@ -375,9 +375,9 @@ impl WorkerRuntimeConfig {
                 crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
             )));
         }
-        if self.population_sample_interval.is_zero() {
+        if self.gauge_sample_interval.is_zero() {
             return Err(HarvestError::Config(
-                "population_sample_interval is 0; the population samplers would spin".into(),
+                "gauge_sample_interval is 0; the gauge samplers would spin".into(),
             ));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
@@ -513,7 +513,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_claims: cfg.max_concurrent_claims,
             claim_slots_per_shard: cfg.claim_slots_per_shard,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
-            population_sample_interval: cfg.population_sample_interval,
+            gauge_sample_interval: cfg.gauge_sample_interval,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
@@ -32820,7 +32820,7 @@ fn spawn_schedule_overdue_sampler(
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads the two dispatch `Semaphore`s' `available_permits()` against the
-/// *live* dispatch target on the same cadence as the queue/DLQ samplers and
+/// *live* dispatch target on `poll_interval` and
 /// emits the `harvest.worker.slots_in_use` / `harvest.worker.slots_available`
 /// gauges, labelled by `slot_type`. This is a pure in-memory read — no DB
 /// access, no new lock contention. Skipped entirely when no metrics recorder
@@ -34467,33 +34467,150 @@ fn spawn_pause_auto_resumer(
     })
 }
 
-/// Spawn the two population samplers on `population_sample_interval`
-/// (issue #2668).
-///
-/// The history-oversized sampler (#493) and the active-workflow sampler
-/// (#770) each count the whole active population of each shard. On
-/// `poll_interval` they used 77% of the buffers at 1M executions. So they
-/// use their own interval, and no other sampler does. Returns the history
-/// sampler first, then the active sampler.
-fn spawn_population_samplers(
-    config: &WorkerRuntimeConfig,
+/// What the database gauge samplers read (issue #2668).
+struct GaugeSamplerInputs {
+    /// One pool for each shard. The fleet-wide gauges sum over them.
     pools: Vec<DbPool>,
+    /// The DLQ shard label and pool of each DLQ sampler.
+    dlq_pools: Vec<(u16, DbPool)>,
+    /// The pools of the stranded-work sampler. `None` without a sharded pool.
+    stranded: Option<crate::shard::ShardedDbPool>,
+    /// The queues that this worker polls.
+    queues: Vec<String>,
+    /// The activities with a circuit breaker. They skip the rate-limit gate.
+    circuit_breaker_activities: Vec<String>,
+    /// The required capabilities of each activity that declares them.
+    activity_requirements: std::collections::HashMap<String, serde_json::Value>,
+    /// The soft `continue_as_new` threshold of the history-oversized gauge.
+    soft_threshold: u64,
+    /// How recent a heartbeat must be for a worker to cover a shard.
+    stranded_freshness: Duration,
+}
+
+/// The tasks that [`spawn_gauge_samplers`] starts.
+struct GaugeSamplerHandles {
+    queue_depth: tokio::task::JoinHandle<()>,
+    concurrency: tokio::task::JoinHandle<()>,
+    rate_limit: tokio::task::JoinHandle<()>,
+    dlq_depth: Vec<tokio::task::JoinHandle<()>>,
+    queue_pause: tokio::task::JoinHandle<()>,
+    history_oversized: tokio::task::JoinHandle<()>,
+    workflow_active: tokio::task::JoinHandle<()>,
+    stranded_work: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl GaugeSamplerHandles {
+    /// Every handle, for a test that joins them all.
+    fn into_vec(self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = vec![
+            self.queue_depth,
+            self.concurrency,
+            self.rate_limit,
+            self.queue_pause,
+            self.history_oversized,
+            self.workflow_active,
+        ];
+        handles.extend(self.dlq_depth);
+        handles.extend(self.stranded_work);
+        handles
+    }
+}
+
+/// Spawn every sampler that reads the database for a gauge, on
+/// `gauge_sample_interval` (issue #2668).
+///
+/// Each one reads the database on every worker. The fleet-wide samplers read
+/// every shard. On `poll_interval` these
+/// samplers used most of the buffers of a large deployment. Prometheus
+/// scrapes a gauge each 15 to 60 s, so a slower sample loses no reading.
+///
+/// The schedule-overdue sampler keeps its adaptive cadence, so it detects a
+/// late schedule within its grace. The replication sampler keeps its own
+/// knob. Samplers that read no table keep `poll_interval`.
+///
+/// The stranded-work sampler starts only with a sharded pool and a metrics
+/// recorder. Each other sampler returns at once when no recorder is set. The
+/// concurrency sampler also stays on for a DEBUG subscriber.
+fn spawn_gauge_samplers(
+    config: &WorkerRuntimeConfig,
+    inputs: GaugeSamplerInputs,
     cancel: &CancellationToken,
     telemetry: &Arc<crate::telemetry::TelemetryConfig>,
-    soft_threshold: u64,
-) -> [tokio::task::JoinHandle<()>; 2] {
-    let interval = config.population_sample_interval;
-    // Each sampler returns at once when no metrics recorder is set.
-    [
-        spawn_history_oversized_sampler(
+) -> GaugeSamplerHandles {
+    let interval = config.gauge_sample_interval;
+    let GaugeSamplerInputs {
+        pools,
+        dlq_pools,
+        stranded,
+        queues,
+        circuit_breaker_activities,
+        activity_requirements,
+        soft_threshold,
+        stranded_freshness,
+    } = inputs;
+    let stranded_work = stranded
+        .filter(|_| telemetry.metrics.is_enabled())
+        .map(|sharded| {
+            spawn_stranded_work_sampler(
+                sharded,
+                stranded_freshness,
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+                circuit_breaker_activities.clone(),
+                activity_requirements,
+            )
+        });
+    GaugeSamplerHandles {
+        queue_depth: spawn_queue_depth_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            queues.clone(),
+            interval,
+            circuit_breaker_activities,
+        ),
+        concurrency: spawn_concurrency_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            queues,
+            interval,
+        ),
+        rate_limit: spawn_rate_limit_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        dlq_depth: dlq_pools
+            .into_iter()
+            .map(|(shard_id, pool)| {
+                spawn_dlq_depth_sampler(pool, cancel.clone(), telemetry.clone(), shard_id, interval)
+            })
+            .collect(),
+        queue_pause: spawn_queue_pause_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        history_oversized: spawn_history_oversized_sampler(
             pools.clone(),
             cancel.clone(),
             telemetry.clone(),
             soft_threshold,
             interval,
         ),
-        spawn_workflow_active_sampler(pools, cancel.clone(), telemetry.clone(), interval),
-    ]
+        workflow_active: spawn_workflow_active_sampler(
+            pools,
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        ),
+        stranded_work,
+    }
 }
 
 /// Periodically sample the count of in-flight (RUNNING) executions per
@@ -39050,84 +39167,60 @@ impl Worker {
         #[cfg(not(feature = "db"))]
         let sampler_pools: Vec<DbPool> = vec![pool.clone()];
 
-        let queue_depth_sampler = spawn_queue_depth_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.queues.clone(),
-            self.config.poll_interval,
-            self.registry
-                .circuit_breakers()
-                .tracked_activity_names()
-                .to_vec(),
+        // DLQ depth gauge: one sampler per shard assignment, so each shard that
+        // this worker owns is reported. With no assignment, one sampler reads
+        // shard 0. A sharded pool gives each sampler its shard pool (fix #5).
+        let mut dlq_pools: Vec<(u16, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| {
+                let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                let shard_pool = self
+                    .config
+                    .sharded_pool
+                    .as_ref()
+                    .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
+                (shard_id, shard_pool)
+            })
+            .collect();
+        if dlq_pools.is_empty() {
+            dlq_pools.push((0, pool.clone()));
+        }
+        // Every sampler that reads the database for a gauge runs on
+        // `gauge_sample_interval` (issue #2668).
+        let gauges = spawn_gauge_samplers(
+            &self.config,
+            GaugeSamplerInputs {
+                pools: sampler_pools.clone(),
+                dlq_pools,
+                stranded: self.config.sharded_pool.clone(),
+                queues: self.config.queues.clone(),
+                circuit_breaker_activities: self
+                    .registry
+                    .circuit_breakers()
+                    .tracked_activity_names()
+                    .to_vec(),
+                activity_requirements: self.registry.activity_requirements_json(),
+                soft_threshold: self.registry.history_policy().continue_as_new_threshold(),
+                // The heartbeat sets the freshness window, so the liveness
+                // check agrees with the heartbeat.
+                stranded_freshness: self.config.worker_heartbeat_interval.saturating_mul(2),
+            },
+            &self.shutdown,
+            self.registry.telemetry(),
         );
-        let concurrency_sampler = spawn_concurrency_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.queues.clone(),
-            self.config.poll_interval,
-        );
-        // DLQ depth gauge — one sampler per shard assignment so every shard
-        // this worker owns is reported.  Single-shard deployments get one
-        // sampler for shard 0; multi-shard workers (rare) get one per entry.
-        // Each sampler uses the per-shard pool when a ShardedDbPool is available
-        // so it queries the correct database (fix #5).
-        let dlq_depth_samplers: Vec<_> = {
-            let assignments = &self.config.shard_assignments;
-            let shards: &[_] = if assignments.is_empty() {
-                &[]
-            } else {
-                assignments.as_slice()
-            };
-            let mut handles: Vec<_> = shards
-                .iter()
-                .map(|shard| {
-                    let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
-                    #[cfg(feature = "db")]
-                    let shard_pool = self
-                        .config
-                        .sharded_pool
-                        .as_ref()
-                        .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
-                    #[cfg(not(feature = "db"))]
-                    let shard_pool = pool.clone();
-                    spawn_dlq_depth_sampler(
-                        shard_pool,
-                        self.shutdown.clone(),
-                        self.registry.telemetry().clone(),
-                        shard_id,
-                        self.config.poll_interval,
-                    )
-                })
-                .collect();
-            if handles.is_empty() {
-                handles.push(spawn_dlq_depth_sampler(
-                    pool.clone(),
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    0u16,
-                    self.config.poll_interval,
-                ));
-            }
-            handles
-        };
-        let rate_limit_sampler = spawn_rate_limit_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        );
-        // Issue #619: surface operator queue holds on dashboards.
-        #[cfg(feature = "db")]
-        let queue_pause_sampler = Some(spawn_queue_pause_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        ));
-        #[cfg(not(feature = "db"))]
-        let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
+        let GaugeSamplerHandles {
+            queue_depth: queue_depth_sampler,
+            concurrency: concurrency_sampler,
+            rate_limit: rate_limit_sampler,
+            dlq_depth: dlq_depth_samplers,
+            queue_pause,
+            history_oversized: history_oversized_sampler,
+            workflow_active: workflow_active_sampler,
+            stranded_work: stranded_work_sampler,
+        } = gauges;
+        let queue_pause_sampler = Some(queue_pause);
         // Issue #1429: no database read, so this runs on every build.
         let dispatch_metrics_sampler = spawn_dispatch_metrics_sampler(
             self.shutdown.clone(),
@@ -39418,13 +39511,6 @@ impl Worker {
                 ))
             })
             .collect();
-        let [history_oversized_sampler, workflow_active_sampler] = spawn_population_samplers(
-            &self.config,
-            sampler_pools.clone(),
-            &self.shutdown,
-            self.registry.telemetry(),
-            self.registry.history_policy().continue_as_new_threshold(),
-        );
         // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
         // below, this is NOT gated on `metrics.is_enabled()` — it is a
@@ -39544,8 +39630,8 @@ impl Worker {
             };
 
         // Worker slot-occupancy gauges (issue #531): a pure in-memory read of the
-        // two dispatch semaphores against their configured maxima, on the same
-        // cadence as the other samplers. Only started when metrics are enabled,
+        // two dispatch semaphores against their configured maxima, on
+        // `poll_interval`. It reads no table. Only started when metrics are enabled,
         // matching the stranded_work_sampler opt-in pattern.
         let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
             spawn_worker_slot_sampler(
@@ -39622,37 +39708,6 @@ impl Worker {
             drop(dr_targets);
             None
         };
-
-        // Stranded-work sampler (issue #522): emits a gauge per shard showing
-        // how many claimable tasks have no live covering worker. Iterates ALL
-        // shards visible through the pool (not just assigned shards) so an
-        // uncovered writable shard is caught regardless of which worker runs
-        // this sampler. Only started when a sharded pool is available and
-        // metrics are enabled.
-        #[cfg(feature = "db")]
-        let stranded_work_sampler = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .filter(|_| self.registry.telemetry().metrics.is_enabled())
-            .map(|sp| {
-                spawn_stranded_work_sampler(
-                    sp.clone(),
-                    // Reuse the heartbeat interval as freshness window so the
-                    // worker-liveness check is consistent with the heartbeat.
-                    self.config.worker_heartbeat_interval.saturating_mul(2),
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    self.config.poll_interval,
-                    self.registry
-                        .circuit_breakers()
-                        .tracked_activity_names()
-                        .to_vec(),
-                    self.registry.activity_requirements_json(),
-                )
-            });
-        #[cfg(not(feature = "db"))]
-        let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
 
         // Overdue-schedule gauge sampler (issue #696): emits
         // `harvest.schedule.overdue` per schedule across every shard pool so a
@@ -46555,10 +46610,11 @@ mod tests {
         );
     }
 
-    // ── Issue #2668: the population samplers use their own interval ──────
+    // ── Issue #2668: the database gauge samplers use their own interval ───
     //
-    // Each population sampler counts the whole active population of a
-    // shard. On `poll_interval` they used 77% of the buffers at 1M runs.
+    // Each gauge sampler reads the database on every worker. On
+    // `poll_interval` the two population samplers used 77% of the buffers at
+    // 1M runs, and the stranded-work query was 80% at 10,000 pending rows.
     // These tests count real connections, as the #1428 tests above do.
 
     /// A recorder that reads as enabled and records nothing.
@@ -46575,48 +46631,68 @@ mod tests {
         Arc::new(telemetry)
     }
 
-    /// A runtime config with a 50 ms poll interval and a 3 s population
+    /// A runtime config with a 50 ms poll interval and a 3 s gauge
     /// interval. No other setting uses 3 s, so a test proves that the
     /// samplers read this field and not a constant.
-    fn population_cadence_config() -> WorkerRuntimeConfig {
+    fn gauge_cadence_config() -> WorkerRuntimeConfig {
         let mut cfg = default_runtime_config();
         cfg.poll_interval = Duration::from_millis(50);
-        cfg.population_sample_interval = Duration::from_secs(3);
+        cfg.gauge_sample_interval = Duration::from_secs(3);
         cfg
     }
 
-    /// Issue #2668: with metrics on, the population samplers wait for the
-    /// population interval. They open no connection on a poll tick. They
-    /// open one within three poll ticks after the interval ends.
+    /// Every gauge sampler input points at the one counting pool.
+    fn counting_gauge_inputs(pool: &DbPool) -> GaugeSamplerInputs {
+        GaugeSamplerInputs {
+            pools: vec![pool.clone()],
+            dlq_pools: vec![(0, pool.clone())],
+            stranded: Some(crate::shard::ShardedDbPool::single(pool.clone())),
+            queues: vec!["default".to_string()],
+            circuit_breaker_activities: Vec::new(),
+            activity_requirements: std::collections::HashMap::new(),
+            soft_threshold: 100,
+            stranded_freshness: Duration::from_secs(10),
+        }
+    }
+
+    /// The samplers that `spawn_gauge_samplers` starts with every input set.
+    /// They are queue depth, concurrency, rate limit, one DLQ shard, queue
+    /// pause, history oversized, workflow active and stranded work.
+    const GAUGE_SAMPLERS: usize = 8;
+
+    /// Issue #2668: with metrics on, every database gauge sampler waits for
+    /// the gauge interval. None opens a connection on a poll tick. Each opens
+    /// one within three poll ticks after the interval ends.
     #[tokio::test(start_paused = true)]
-    async fn population_samplers_wait_for_the_population_interval_not_the_poll_interval() {
-        let cfg = population_cadence_config();
+    async fn gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval() {
+        let cfg = gauge_cadence_config();
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_population_samplers(
+        let handles = spawn_gauge_samplers(
             &cfg,
-            vec![listener.pool.clone()],
+            counting_gauge_inputs(&listener.pool),
             &cancel,
             &enabled_telemetry(),
-            100,
-        );
+        )
+        .into_vec();
+        assert_eq!(handles.len(), GAUGE_SAMPLERS);
 
         // The samplers start their sleep in the first tick. So this stops
         // two poll ticks before the first sample.
-        let ticks_in_interval = usize::try_from(
-            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis(),
-        )
-        .expect("tick count fits usize");
+        let ticks_in_interval =
+            usize::try_from(cfg.gauge_sample_interval.as_millis() / cfg.poll_interval.as_millis())
+                .expect("tick count fits usize");
         advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
         let touches_before = listener.touch_count();
 
-        // Move past the first sample, then stop the clock. A longer
-        // interval than the configured one then opens no connection.
+        // Move past the first sample, then stop the clock. A sampler on a
+        // longer interval then opens no connection, so the count stays short.
         advance_sampler_ticks(cfg.poll_interval, 3).await;
         // The accept is real loopback I/O. A yield polls I/O and does not
-        // advance the paused clock. Wait under a deadline in real time.
+        // advance the paused clock. Each failed connect frees the one pool
+        // slot for the next sampler. Wait under a deadline in real time.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+        while listener.touch_count() < GAUGE_SAMPLERS && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
         let touches_after = listener.touch_count();
@@ -46628,28 +46704,62 @@ mod tests {
 
         assert_eq!(
             touches_before, 0,
-            "the population samplers must not query on a poll_interval tick"
+            "no gauge sampler may query on a poll_interval tick"
         );
         assert!(
-            touches_after > 0,
-            "the population samplers must query once the population interval ends"
+            touches_after >= GAUGE_SAMPLERS,
+            "each gauge sampler must query once the gauge interval ends; \
+             saw {touches_after} of {GAUGE_SAMPLERS}"
         );
     }
 
-    /// Issue #2668: a cancel during the long sleep ends both samplers at
-    /// once. A shutdown never waits for the population interval.
+    /// Issue #2668: the stranded-work sampler needs a sharded pool and a
+    /// recorder. Without either, the helper does not start it.
     #[tokio::test(start_paused = true)]
-    async fn population_samplers_stop_on_cancel_during_the_sleep() {
-        let cfg = population_cadence_config();
+    async fn the_stranded_work_sampler_needs_a_sharded_pool_and_a_recorder() {
+        let cfg = gauge_cadence_config();
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_population_samplers(
+
+        let mut no_pool = counting_gauge_inputs(&listener.pool);
+        no_pool.stranded = None;
+        let without_pool = spawn_gauge_samplers(&cfg, no_pool, &cancel, &enabled_telemetry());
+        assert!(without_pool.stranded_work.is_none());
+
+        let disabled = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let without_recorder = spawn_gauge_samplers(
             &cfg,
-            vec![listener.pool.clone()],
+            counting_gauge_inputs(&listener.pool),
+            &cancel,
+            &disabled,
+        );
+        assert!(without_recorder.stranded_work.is_none());
+
+        cancel.cancel();
+        for handle in without_pool
+            .into_vec()
+            .into_iter()
+            .chain(without_recorder.into_vec())
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+    }
+
+    /// Issue #2668: a cancel during the long sleep ends every gauge sampler
+    /// at once. A shutdown never waits for the gauge interval.
+    #[tokio::test(start_paused = true)]
+    async fn gauge_samplers_stop_on_cancel_during_the_sleep() {
+        let cfg = gauge_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_gauge_samplers(
+            &cfg,
+            counting_gauge_inputs(&listener.pool),
             &cancel,
             &enabled_telemetry(),
-            100,
-        );
+        )
+        .into_vec();
         advance_sampler_ticks(cfg.poll_interval, 1).await;
 
         cancel.cancel();
@@ -46788,7 +46898,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             fairness_keys: false,
-            population_sample_interval: DEFAULT_POPULATION_SAMPLE_INTERVAL,
+            gauge_sample_interval: DEFAULT_GAUGE_SAMPLE_INTERVAL,
         }
     }
 
@@ -46823,15 +46933,15 @@ mod tests {
         );
     }
 
-    /// Issue #2668: the conversion copies the population interval and
-    /// keeps it apart from the poll interval.
+    /// Issue #2668: the conversion copies the gauge interval and keeps it
+    /// apart from the poll interval.
     #[test]
-    fn runtime_config_carries_the_population_sample_interval() {
+    fn runtime_config_carries_the_gauge_sample_interval() {
         let worker_config = crate::builder::WorkerConfig::default()
-            .with_population_sample_interval(Duration::from_secs(42));
+            .with_gauge_sample_interval(Duration::from_secs(42));
         let runtime_config = WorkerRuntimeConfig::from(worker_config);
         assert_eq!(
-            runtime_config.population_sample_interval,
+            runtime_config.gauge_sample_interval,
             Duration::from_secs(42)
         );
         assert_eq!(runtime_config.poll_interval, DEFAULT_WORKER_POLL_INTERVAL);
@@ -46840,12 +46950,12 @@ mod tests {
     /// Issue #2668: a runtime config that skips the builder can still hold
     /// a zero interval. `validate` rejects it, so `Worker::new` fails.
     #[test]
-    fn validate_rejects_a_zero_population_sample_interval() {
+    fn validate_rejects_a_zero_gauge_sample_interval() {
         let mut cfg = default_runtime_config();
-        cfg.population_sample_interval = Duration::ZERO;
+        cfg.gauge_sample_interval = Duration::ZERO;
         let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string().contains("population_sample_interval"),
+            err.to_string().contains("gauge_sample_interval"),
             "the error must name the knob: {err}"
         );
     }
@@ -47753,7 +47863,7 @@ mod tests {
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
-            population_sample_interval: Duration::from_secs(20),
+            gauge_sample_interval: Duration::from_secs(20),
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
             shard_notification_database_urls: Vec::new(),
@@ -47815,10 +47925,7 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
-        assert_eq!(
-            runtime_cfg.population_sample_interval,
-            Duration::from_secs(20)
-        );
+        assert_eq!(runtime_cfg.gauge_sample_interval, Duration::from_secs(20));
         assert_eq!(
             runtime_cfg.cancellation_grace_period,
             Duration::from_secs(10)

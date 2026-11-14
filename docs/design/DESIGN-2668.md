@@ -1,5 +1,10 @@
 # Design — Issue #2668: population samplers run on the poll interval
 
+> **Superseded in part.** `docs/design/DESIGN-gauge-sample-interval.md`
+> renamed the knob to `gauge_sample_interval` before its release. It also moved
+> every other database gauge sampler onto that interval. This record keeps the
+> old names.
+
 Two worker samplers count the whole active population of each shard. They
 run on `poll_interval`, 500 ms by default, on every worker. At 1M
 executions they use 77% of the buffers of the workload.

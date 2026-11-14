@@ -1071,7 +1071,7 @@ pub(crate) fn runtime_config(
     workflow_task_timeout: Duration,
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
-        population_sample_interval: autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+        gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
@@ -2127,8 +2127,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -2371,8 +2370,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -2546,8 +2544,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -2693,8 +2690,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -2876,8 +2872,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -3124,8 +3119,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -3397,8 +3391,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -3600,8 +3593,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -8150,8 +8142,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -8388,8 +8379,7 @@ async fn workflow_schedule_pause_and_resume() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                population_sample_interval:
-                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),

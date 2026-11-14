@@ -496,6 +496,8 @@ mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
 #[cfg(feature = "db")]
+mod worker_sampler_cadence_perf;
+#[cfg(feature = "db")]
 mod worker_saturation_metrics_tests;
 mod worker_session_tests;
 #[cfg(feature = "db")]
