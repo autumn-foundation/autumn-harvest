@@ -25,6 +25,8 @@ use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
+mod claim_window;
+
 // ---------------------------------------------------------------------------
 // TaskType
 // ---------------------------------------------------------------------------
@@ -3089,7 +3091,7 @@ async fn claim_task_one_statement(
             Some(_) => owned_claim_query_for(kind, fence.is_some(), fairness),
             None => claim_query_for(kind, fence.is_some(), fairness),
         };
-        let result: Vec<TaskQueueItem> = CachedClaimQuery {
+        let query = |sql| CachedClaimQuery {
             sql,
             ageing,
             worker_id,
@@ -3098,15 +3100,43 @@ async fn claim_task_one_statement(
             aging_secs: aging_secs_i64,
             circuit_breaker_activities,
             ineligible_activities,
-            fence,
+            fence: fence.clone(),
             by_id: None,
             owned: owned.map(|o| (o.holder.as_str(), o.mask())),
-        }
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+        };
+        // A claim with the seek window sends its window form first (issue
+        // #2680). The full statement runs only when the window form cannot
+        // decide. Ageing and fair claims skip the window, so they send the
+        // full statement alone, as before.
+        let windowed = !ageing && fairness == ClaimFairness::Off;
+        let task = if windowed {
+            let window = window_claim_query_for(kind, fence.is_some(), owned.is_some());
+            let row: Option<WindowClaimRow> = query(window)
+                .load::<WindowClaimRow>(conn)
+                .await
+                .map_err(crate::error::database_error)?
+                .into_iter()
+                .next();
+            let (task, fallback) = row.map_or((None, false), |r| (r.task, r.fallback));
+            match claim_window::window_step(task.is_some(), fallback) {
+                claim_window::WindowStep::Claimed | claim_window::WindowStep::Empty => task,
+                claim_window::WindowStep::Fallback => {
+                    let result: Vec<TaskQueueItem> = query(sql)
+                        .load(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    result.into_iter().next()
+                }
+            }
+        } else {
+            let result: Vec<TaskQueueItem> = query(sql)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            result.into_iter().next()
+        };
 
-        let Some(task) = result.into_iter().next() else {
+        let Some(task) = task else {
             return Ok(Some(ClaimOutcome::Empty));
         };
 
@@ -3404,6 +3434,68 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
         Some(TaskType::Activity) => 4,
     } + usize::from(fenced);
     &FAIR[slot]
+}
+
+/// The window form of each default claim statement (issue #2680).
+///
+/// `owned` picks the owned gate. An activity-only claim never carries it.
+/// See [`claim_window::window_claim_sql`] for the transformation and why the
+/// window form claims the row that the full statement would claim.
+#[must_use]
+pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static WINDOW: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut variants = Vec::with_capacity(12);
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for owned in [false, true] {
+                    let full = if owned {
+                        owned_claim_query_for(kind, fenced, ClaimFairness::Off)
+                    } else {
+                        claim_query_for(kind, fenced, ClaimFairness::Off)
+                    };
+                    variants.push(claim_window::window_claim_sql(full));
+                }
+            }
+        }
+        variants
+    });
+    let slot = match kind {
+        None => 0,
+        Some(TaskType::Workflow) => 4,
+        Some(TaskType::Activity) => 8,
+    } + 2 * usize::from(fenced)
+        + usize::from(owned);
+    &WINDOW[slot]
+}
+
+/// The one row of a window claim statement (issue #2680).
+///
+/// The task columns are `NULL` when the statement claimed no row. The `id`
+/// column tells the two cases apart: a claimed row always has one.
+struct WindowClaimRow {
+    task: Option<TaskQueueItem>,
+    fallback: bool,
+}
+
+impl diesel::deserialize::QueryableByName<diesel::pg::Pg> for WindowClaimRow {
+    fn build<'a>(
+        row: &impl diesel::row::NamedRow<'a, diesel::pg::Pg>,
+    ) -> diesel::deserialize::Result<Self> {
+        let fallback = diesel::row::NamedRow::get::<diesel::sql_types::Bool, bool>(
+            row,
+            claim_window::WINDOW_FALLBACK_COLUMN,
+        )?;
+        let id = diesel::row::NamedRow::get::<
+            diesel::sql_types::Nullable<diesel::sql_types::Uuid>,
+            Option<Uuid>,
+        >(row, "id")?;
+        let task = match id {
+            Some(_) => Some(TaskQueueItem::build(row)?),
+            None => None,
+        };
+        Ok(Self { task, fallback })
+    }
 }
 
 pub use crate::decision_owner::OwnedClaim;
