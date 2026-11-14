@@ -1278,3 +1278,114 @@ async fn stale_event_id_conflict_redrive_leaves_a_peer_claim_alone() {
     );
     assert_eq!(after.attempt, 2, "{after:?}");
 }
+
+// ---------------------------------------------------------------------------
+// One task-row lock per write
+// ---------------------------------------------------------------------------
+
+fn record_statements(
+    conn: &mut AsyncPgConnection,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use diesel::connection::InstrumentationEvent;
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&log);
+    conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            sink.lock().expect("statement log").push(query.to_string());
+        }
+    });
+    log
+}
+
+/// The separate claim lock: `queue::lock_claim_for_update`.
+fn claim_locks(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    log.lock()
+        .expect("statement log")
+        .iter()
+        .filter(|q| {
+            q.starts_with(r#"SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state""#)
+                && q.contains("FOR UPDATE")
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_start_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+
+    let log = record_statements(&mut conn);
+    let started = append_activity_started_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start");
+
+    assert_eq!(started, Some(fx.activity_id));
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_completion_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_completion(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        fx.activity_id,
+        serde_json::json!({"done": true}),
+        None,
+        &codecs,
+    )
+    .await
+    .expect("complete");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "COMPLETED");
+    assert_eq!(
+        completed_outputs(&events(&mut conn, fx.exec_id).await),
+        vec![serde_json::json!({"done": true})]
+    );
+}
+
+#[tokio::test]
+async fn a_failure_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_failure(&mut conn, &a, fx.exec_id, fx.activity_id, "boom", &codecs)
+        .await
+        .expect("fail");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "FAILED");
+    assert_eq!(count_failed(&events(&mut conn, fx.exec_id).await), 1);
+}
