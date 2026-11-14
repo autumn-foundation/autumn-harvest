@@ -889,12 +889,12 @@ pub use crate::overlay_log::SqliteConnector;
 #[doc(hidden)]
 pub use crate::overlay_log::SqliteOverlayLog;
 pub use crate::query::{DEFAULT_QUERY_TIMEOUT, ReplayInput};
+pub use crate::retention::{PURGE_BATCH, PurgePolicy, PurgeReport};
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, RunState,
     SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
     StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
-pub use crate::retention::{PURGE_BATCH, PurgePolicy, PurgeReport};
 pub use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{

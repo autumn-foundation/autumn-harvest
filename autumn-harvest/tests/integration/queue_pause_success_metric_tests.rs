@@ -171,7 +171,7 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
         // shared env-provided database, rows of a previous run would reach
         // these assertions. "Zero tasks may transition to FAILED" would count
         // *prior* failures. CI gets a fresh testcontainer and never needs this.
-    // The scrub keeps the env-DB path re-runnable.
+        // The scrub keeps the env-DB path re-runnable.
         conn.batch_execute(&format!(
             "DELETE FROM harvest_queue_pauses; \
              DELETE FROM harvest_dead_letters WHERE queue_name = '{TEST_QUEUE}'; \
