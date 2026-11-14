@@ -221,8 +221,8 @@ fn squash(text: &str) -> String {
 
 /// The window form of one full claim statement (issue #2680).
 ///
-/// `full` is the final text of a default claim with the seek window: any
-/// kind, with or without the DR fence, with or without the owned gate. The
+/// `full` is the final text of a default claim with the seek window. It can
+/// be of any kind, with or without the DR fence and the owned gate. The
 /// window form binds the same parameters. It returns the columns of the full
 /// statement, then [`WINDOW_FALLBACK_COLUMN`]. It always returns one row.
 /// The task columns are `NULL` when it claimed no row.
