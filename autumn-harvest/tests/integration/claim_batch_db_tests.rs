@@ -168,10 +168,9 @@ async fn a_batch_takes_every_free_row_up_to_its_size_then_none() {
     }
     let first = claim(&mut conn, &queue, "w-all", None, ClaimBatch::Eight).await;
     assert_eq!(priorities(&first), [4, 3, 2, 1, 0]);
-    assert!(
-        claim(&mut conn, &queue, "w-all", None, ClaimBatch::Eight)
-            .await
-            .is_empty()
+    assert_eq!(
+        claim(&mut conn, &queue, "w-all", None, ClaimBatch::Eight).await,
+        Vec::new()
     );
     assert_eq!(running_count(&mut conn, &queue).await, 5);
 }
@@ -218,10 +217,9 @@ async fn a_batch_never_takes_two_rows_of_one_capped_key() {
     }
     let first = claim(&mut conn, &queue, "w-cap", None, ClaimBatch::Eight).await;
     assert_eq!(priorities(&first), [9]);
-    assert!(
-        claim(&mut conn, &queue, "w-cap", None, ClaimBatch::Eight)
-            .await
-            .is_empty(),
+    assert_eq!(
+        claim(&mut conn, &queue, "w-cap", None, ClaimBatch::Eight).await,
+        Vec::new(),
         "the key is at its cap"
     );
     assert_eq!(running_count(&mut conn, &queue).await, 1);
