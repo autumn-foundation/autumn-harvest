@@ -188,6 +188,9 @@ pub struct WorkerRuntimeConfig {
     /// `None` takes no slot. See
     /// [`crate::builder::WorkerConfig::with_claim_slots_per_shard`].
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
+    /// The most rows that one claim statement takes. `None` takes one. See
+    /// [`crate::builder::WorkerConfig::with_claim_batch_max`].
+    pub claim_batch_max: Option<std::num::NonZeroU8>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Interval of the database gauge samplers (issue #2668). The value
@@ -503,6 +506,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_activities: cfg.max_concurrent_activities,
             max_concurrent_claims: cfg.max_concurrent_claims,
             claim_slots_per_shard: cfg.claim_slots_per_shard,
+            claim_batch_max: cfg.claim_batch_max,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             gauge_sample_interval: cfg.gauge_sample_interval,
             shutdown_timeout: cfg.shutdown_timeout,
@@ -17719,6 +17723,41 @@ fn ineligible_activities(
 /// with capability requirements. `held` holds the types that a cost signal
 /// holds (autumn#1720). They carry the marker already. The common case has
 /// no saturated type and no held type, and allocates nothing.
+/// The permits per kind for one claim of `loops` claim loops.
+///
+/// A kind with no free permit takes no part, since the claim does not admit
+/// it. The batch must fit every admitted kind, so the result is the smallest
+/// share, capped at `max`. `formal/verus/src/claim_batch.rs` proves that each
+/// loop takes at most its share.
+const fn claim_batch_share(workflow: usize, activity: usize, loops: usize, max: usize) -> usize {
+    let loops = if loops == 0 { 1 } else { loops };
+    if workflow == 0 && activity == 0 {
+        return 1;
+    }
+    let workflow_share = if workflow == 0 {
+        usize::MAX
+    } else {
+        (workflow - 1) / loops + 1
+    };
+    let activity_share = if activity == 0 {
+        usize::MAX
+    } else {
+        (activity - 1) / loops + 1
+    };
+    let rows = if workflow_share < activity_share {
+        workflow_share
+    } else {
+        activity_share
+    };
+    if rows <= max {
+        rows
+    } else if max == 0 {
+        1
+    } else {
+        max
+    }
+}
+
 fn claim_exclusions<'a>(
     ineligible: &'a [String],
     held: &[String],
@@ -36540,22 +36579,34 @@ const fn decider_gate(admission: PollAdmission) -> PollAdmission {
 /// The permits one Postgres poll holds across its claim (issue #1787).
 ///
 /// The poll takes one real permit of each kind it may claim, before the
-/// claim. Nothing else can take a held permit. A slot tuner shrink therefore
-/// cannot leave a claimed row without a permit while its timeout runs. The
-/// claimed row's permit moves into the spawned task. The other permit goes
-/// back when this value drops.
+/// claim. A batch claim takes one per row of its batch. Nothing else can take
+/// a held permit. A slot tuner shrink therefore cannot leave a claimed row
+/// without a permit while its timeout runs. Each claimed row's permit moves
+/// into its spawned task. The other permits go back when this value drops.
 #[derive(Debug)]
 struct PollPermits {
-    workflow: Option<tokio::sync::OwnedSemaphorePermit>,
-    activity: Option<tokio::sync::OwnedSemaphorePermit>,
+    workflow: Vec<tokio::sync::OwnedSemaphorePermit>,
+    activity: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl PollPermits {
     /// Take one free permit of each kind that `admission` allows.
+    #[cfg(test)]
     fn acquire(
         admission: PollAdmission,
         workflow: &Arc<Semaphore>,
         activity: &Arc<Semaphore>,
+    ) -> Self {
+        Self::acquire_up_to(admission, workflow, activity, 1)
+    }
+
+    /// Take up to `per_kind` free permits of each kind that `admission`
+    /// allows.
+    fn acquire_up_to(
+        admission: PollAdmission,
+        workflow: &Arc<Semaphore>,
+        activity: &Arc<Semaphore>,
+        per_kind: usize,
     ) -> Self {
         use crate::queue::TaskType;
         let take = |kind: TaskType, semaphore: &Arc<Semaphore>| {
@@ -36564,11 +36615,14 @@ impl PollPermits {
                 PollAdmission::Any => true,
                 PollAdmission::Only(only) => only == kind,
             };
-            if admitted {
-                Arc::clone(semaphore).try_acquire_owned().ok()
-            } else {
-                None
+            let mut permits = Vec::new();
+            while admitted && permits.len() < per_kind {
+                match Arc::clone(semaphore).try_acquire_owned() {
+                    Ok(permit) => permits.push(permit),
+                    Err(_) => break,
+                }
             }
+            permits
         };
         Self {
             workflow: take(TaskType::Workflow, workflow),
@@ -36579,18 +36633,27 @@ impl PollPermits {
     /// What the held permits allow this poll to claim.
     fn admission(&self) -> PollAdmission {
         poll_admission(
-            usize::from(self.workflow.is_some()),
-            usize::from(self.activity.is_some()),
+            usize::from(!self.workflow.is_empty()),
+            usize::from(!self.activity.is_empty()),
         )
+    }
+
+    /// The rows this poll may claim in one statement: the fewest permits of
+    /// an admitted kind. A row of either kind then has a permit.
+    fn rows(&self) -> usize {
+        match (self.workflow.len(), self.activity.len()) {
+            (0, held) | (held, 0) => held,
+            (workflow, activity) => workflow.min(activity),
+        }
     }
 
     /// Take the permit for the `task_type` of a claimed row.
     fn take(&mut self, task_type: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
         use crate::queue::TaskType;
         if task_type == TaskType::Workflow.as_str() {
-            self.workflow.take()
+            self.workflow.pop()
         } else if task_type == TaskType::Activity.as_str() {
-            self.activity.take()
+            self.activity.pop()
         } else {
             None
         }
@@ -41838,7 +41901,16 @@ impl Worker {
         started: std::time::Instant,
         claimed: &HarvestResult<Option<TaskQueueItem>>,
     ) {
-        let kind = claim_kind(claimed);
+        self.record_claim_kind(shard, started, claim_kind(claimed));
+    }
+
+    /// [`Self::record_claim`] for a claim of `kind`.
+    fn record_claim_kind(
+        &self,
+        shard: Option<crate::types::ShardId>,
+        started: std::time::Instant,
+        kind: ClaimKind,
+    ) {
         let elapsed = started.elapsed().as_secs_f64();
         for label in self.pool_labels(shard).iter() {
             self.registry
@@ -42526,7 +42598,12 @@ impl Worker {
         // workflow permit.
         let owned = self.owned_claim(shard);
         let decider_runs = owned.is_some() && self.decider_runs_on(shard);
-        let mut permits = PollPermits::acquire(
+        let batch_rows = if owned.is_none() || decider_runs {
+            self.claim_batch_rows(decider_runs)
+        } else {
+            1
+        };
+        let mut permits = PollPermits::acquire_up_to(
             if decider_runs {
                 self.activity_admission_now()
             } else {
@@ -42534,6 +42611,7 @@ impl Worker {
             },
             &self.workflow_semaphore,
             &self.activity_semaphore,
+            batch_rows,
         );
         let admission = permits.admission();
         self.record_gate_refusal(if decider_runs {
@@ -42658,6 +42736,22 @@ impl Worker {
             return false;
         }
 
+        if let Some(batch) = queue::ClaimBatch::at_most(permits.rows()) {
+            return self
+                .poll_batch(
+                    role,
+                    pool,
+                    &mut conn,
+                    shard,
+                    kind,
+                    batch,
+                    &mut permits,
+                    circuit_breaker_activities,
+                    &exclusions,
+                )
+                .await;
+        }
+
         // --- Default (unweighted) path: original single ANY($2) query ---
         let claim_started = std::time::Instant::now();
         let claimed = self
@@ -42710,6 +42804,121 @@ impl Worker {
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to claim task");
+                false
+            }
+        }
+    }
+
+    /// The permits per kind that one claim may hold: its share of the free
+    /// permits, capped at [`WorkerRuntimeConfig::claim_batch_max`]. `1` when
+    /// a claim must take one row.
+    ///
+    /// Each claim loop takes its share, so one loop does not hold the
+    /// permits of a peer loop across its claim.
+    fn claim_batch_rows(&self, activities_only: bool) -> usize {
+        let Some(max) = self.config.claim_batch_max else {
+            return 1;
+        };
+        let one_row = !self.config.queue_weights.is_empty()
+            || self.config.fairness_keys
+            || self.config.priority_aging_secs.is_some_and(|secs| secs > 0)
+            || self.registry.adaptive_limits.any_policy()
+            || self.registry.cost_hold().is_some()
+            || !self.shard_dispatch.is_empty()
+            || self.global_dispatch.get().is_some_and(Option::is_some);
+        if one_row {
+            return 1;
+        }
+        let workflow = if activities_only {
+            0
+        } else {
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow)
+        };
+        let activity =
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity);
+        claim_batch_share(
+            workflow,
+            activity,
+            self.config.max_concurrent_claims,
+            usize::from(max.get()),
+        )
+    }
+
+    /// One batch claim of [`Self::poll_once_as`]. Each claimed row takes one
+    /// held permit and is dispatched.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_batch(
+        &self,
+        role: PollRole,
+        pool: &DbPool,
+        conn: &mut AsyncPgConnection,
+        shard: Option<crate::types::ShardId>,
+        kind: Option<queue::TaskType>,
+        batch: queue::ClaimBatch,
+        permits: &mut PollPermits,
+        circuit_breaker_activities: &[String],
+        exclusions: &[String],
+    ) -> bool {
+        let slots = self.claim_slots();
+        let claim_started = std::time::Instant::now();
+        let claimed = self
+            .claim_with_conflict_retry(conn, async |conn| {
+                queue::claim_task_batch_with_slots(
+                    conn,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    circuit_breaker_activities,
+                    exclusions,
+                    shard,
+                    kind,
+                    slots,
+                    batch,
+                )
+                .await
+            })
+            .await;
+        let claim_kind = match &claimed {
+            Ok(queue::SlottedBatch::NoSlot) => {
+                self.record_claim_slot_miss(shard);
+                return false;
+            }
+            Ok(queue::SlottedBatch::Claimed(tasks)) => {
+                if tasks
+                    .iter()
+                    .any(|task| task.task_type == TaskType::Workflow.as_str())
+                {
+                    ClaimKind::Workflow
+                } else {
+                    ClaimKind::Activity
+                }
+            }
+            Ok(queue::SlottedBatch::Empty) => ClaimKind::Empty,
+            Err(_) => ClaimKind::Error,
+        };
+        self.record_claim_kind(shard, claim_started, claim_kind);
+        match claimed {
+            Ok(queue::SlottedBatch::Claimed(tasks)) => {
+                for task in tasks {
+                    tracing::debug!(
+                        task_id = %task.id,
+                        task_type = %task.task_type,
+                        queue = %task.queue_name,
+                        "claimed task (batch)"
+                    );
+                    let permit = permits.take(&task.task_type);
+                    self.dispatch_task(task, pool, shard, None, permit, None);
+                }
+                true
+            }
+            Ok(queue::SlottedBatch::Empty | queue::SlottedBatch::NoSlot) => {
+                if role == PollRole::Leader {
+                    self.emit_throttle_metrics(conn).await;
+                }
+                false
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to claim tasks");
                 false
             }
         }
@@ -46866,6 +47075,7 @@ mod tests {
             max_concurrent_activities: 20,
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             claim_slots_per_shard: None,
+            claim_batch_max: None,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -47865,6 +48075,7 @@ mod tests {
             max_concurrent_activities: 15,
             max_concurrent_claims: 3,
             claim_slots_per_shard: None,
+            claim_batch_max: None,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
@@ -59656,6 +59867,95 @@ mod tests {
         assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
         let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
         assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A batch poll holds up to its size of each admitted kind, and admits the
+    /// fewest that it holds.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_batch_poll_holds_up_to_its_size_of_each_kind() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(3));
+        let activity = Arc::new(Semaphore::new(8));
+        let mut permits = PollPermits::acquire_up_to(PollAdmission::Any, &workflow, &activity, 4);
+        assert_eq!(workflow.available_permits(), 0);
+        assert_eq!(activity.available_permits(), 4);
+        assert_eq!(permits.rows(), 3, "a row of either kind has a permit");
+        let kept: Vec<_> = (0..3)
+            .map(|_| {
+                permits
+                    .take(TaskType::Workflow.as_str())
+                    .expect("a held permit")
+            })
+            .collect();
+        assert!(permits.take(TaskType::Workflow.as_str()).is_none());
+        assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Activity));
+        drop(permits);
+        assert_eq!(activity.available_permits(), 8, "unused permits go back");
+
+        let only = PollPermits::acquire_up_to(
+            PollAdmission::Only(TaskType::Activity),
+            &workflow,
+            &activity,
+            8,
+        );
+        assert_eq!(only.rows(), 8);
+        assert_eq!(workflow.available_permits(), 0);
+        drop(kept);
+        assert_eq!(workflow.available_permits(), 3);
+    }
+
+    #[test]
+    fn a_batch_takes_its_share_of_the_admitted_kinds() {
+        use super::claim_batch_share;
+        assert_eq!(claim_batch_share(8, 16, 2, 8), 4, "the smaller share");
+        assert_eq!(claim_batch_share(0, 16, 2, 8), 8, "a kind with no permit");
+        assert_eq!(claim_batch_share(0, 16, 2, 4), 4, "capped at the max");
+        assert_eq!(claim_batch_share(5, 15, 2, 8), 3, "a share rounds up");
+        assert_eq!(claim_batch_share(1, 16, 2, 8), 1);
+        assert_eq!(claim_batch_share(0, 0, 2, 8), 1);
+        assert_eq!(
+            claim_batch_share(9, 9, 0, 8),
+            8,
+            "no loop count reads as one"
+        );
+    }
+
+    #[test]
+    fn a_worker_batches_only_with_the_knob_and_no_one_row_feature() {
+        let build = |edit: fn(&mut WorkerRuntimeConfig)| {
+            let mut cfg = default_runtime_config();
+            cfg.max_concurrent_claims = 2;
+            edit(&mut cfg);
+            Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![]))).expect("valid config")
+        };
+        assert_eq!(build(|_| {}).claim_batch_rows(false), 1, "off by default");
+        let on = |cfg: &mut WorkerRuntimeConfig| cfg.claim_batch_max = std::num::NonZeroU8::new(8);
+        assert_eq!(
+            build(on).claim_batch_rows(false),
+            5,
+            "half of ten workflow permits"
+        );
+        assert_eq!(
+            build(on).claim_batch_rows(true),
+            8,
+            "half of twenty, capped"
+        );
+        let one_row: [fn(&mut WorkerRuntimeConfig); 3] = [
+            |cfg| cfg.fairness_keys = true,
+            |cfg| cfg.priority_aging_secs = Some(30),
+            |cfg| {
+                cfg.queue_weights.insert("default".to_owned(), 2);
+            },
+        ];
+        for edit in one_row {
+            let mut cfg = default_runtime_config();
+            cfg.claim_batch_max = std::num::NonZeroU8::new(8);
+            edit(&mut cfg);
+            let worker = Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![])))
+                .expect("valid config");
+            assert_eq!(worker.claim_batch_rows(false), 1);
+        }
     }
 
     /// A permit that frees while a gated poll claims must still wake the idle

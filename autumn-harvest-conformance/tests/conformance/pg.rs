@@ -92,6 +92,7 @@ fn worker_config(queue: &str) -> WorkerRuntimeConfig {
         max_concurrent_activities: 4,
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         claim_slots_per_shard: None,
+        claim_batch_max: None,
         poll_interval: POLL,
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),

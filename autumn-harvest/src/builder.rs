@@ -3983,6 +3983,10 @@ pub struct WorkerConfig {
     ///
     /// Default: `None`, no cap. See [`Self::with_claim_slots_per_shard`].
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
+    /// The most rows that one claim statement takes.
+    ///
+    /// Default: `None`, one row per claim. See [`Self::with_claim_batch_max`].
+    pub claim_batch_max: Option<std::num::NonZeroU8>,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4572,6 +4576,7 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             claim_slots_per_shard: None,
+            claim_batch_max: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -5244,6 +5249,32 @@ impl WorkerConfig {
         self
     }
 
+    /// Let one claim statement take up to `rows` rows.
+    ///
+    /// A claim loop then takes up to its share of the free slots in one
+    /// statement: 2, 4 or 8 rows. A claim with queue weights, fairness keys,
+    /// priority ageing, an owned workflow claim, an adaptive limit at its
+    /// edge or a cost hold still takes one row. `0` and `1` set `None`, one
+    /// row per claim.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_claim_batch_max(8);
+    /// assert_eq!(config.claim_batch_max.map(std::num::NonZeroU8::get), Some(8));
+    /// ```
+    #[must_use]
+    pub const fn with_claim_batch_max(mut self, rows: u8) -> Self {
+        self.claim_batch_max = if rows < 2 {
+            None
+        } else {
+            std::num::NonZeroU8::new(rows)
+        };
+        self
+    }
+
     /// Cap the claims that run at once on one shard, across the fleet.
     ///
     /// Each claim first takes one of `slots` advisory locks of its shard. A
@@ -5792,6 +5823,18 @@ mod tests {
         );
         let off = capped.with_claim_slots_per_shard(0);
         assert_eq!(off.claim_slots_per_shard, None);
+    }
+
+    #[test]
+    fn claim_batch_max_defaults_off_and_one_row_is_off() {
+        let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
+        assert_eq!(rows(WorkerConfig::default()), None);
+        assert_eq!(
+            rows(WorkerConfig::default().with_claim_batch_max(8)),
+            Some(8)
+        );
+        assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
+        assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(0)), None);
     }
 
     #[test]

@@ -35,4 +35,5 @@ mod refine_rule;
 mod notify_settle;
 mod claim_recheck;
 mod claim_window;
+mod claim_batch;
 mod restore_target;
