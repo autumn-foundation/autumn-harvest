@@ -825,6 +825,18 @@ fn refusal(
 }
 
 /// `PATCH /admin/workflow-types/{workflow_name}/run-defaults`.
+///
+/// Clone-class note: this setup, the body-unwrap error, and three retry
+/// tristate fields repeat, near-verbatim, in
+/// `activity_defaults_api::patch_activity_defaults` and its
+/// `ActivityDefaultsPatchRequest`. Both routes patch an admin defaults
+/// override. Both audit a bad body as this route's 400, not axum's
+/// plain-text 422.
+///
+/// Two instances only. Commit 45f6da8 added both files in one commit.
+/// It carries no other shared edit, so neither a co-change nor a
+/// missed-fix exists to cite. The merge bar needs rule of three or a
+/// missed-fix. Neither applies yet, so the duplication stays.
 pub async fn patch_run_defaults(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
