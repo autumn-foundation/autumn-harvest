@@ -3,11 +3,11 @@
 //! This module contains the **pure** orchestration logic that maps an operator
 //! request `(dag_name, run_exec_id, from_nodes)` onto a single
 //! `reset_to_event_id` that the existing workflow-reset primitive (#148) can
-//! consume. It adds no new core engine primitive: it reads the registered
-//! [`DagDefinition`] for topology and walks the source workflow's recorded
-//! [`WorkflowEvent`] history to find the earliest [`WorkflowEvent::ActivityScheduled`]
-//! whose activity binding matches the requested nodes (and any node downstream
-//! of them under the DAG's declared edges).
+//! consume. It adds no new core engine primitive. It reads the registered
+//! [`DagDefinition`] for topology. It walks the source workflow's recorded
+//! [`WorkflowEvent`] history for the earliest [`WorkflowEvent::ActivityScheduled`]
+//! whose activity binding matches a requested node. A node downstream of them
+//! under the declared DAG edges also matches.
 //!
 //! ## Node identity
 //!
@@ -20,12 +20,12 @@
 //! ## Level-granular semantics
 //!
 //! The computed `reset_to_event_id` is `earliest_reexecute_schedule - 1`. The
-//! caller passes it through the #148 reset-validity validator. When the failed
-//! node shares a *parallel* level with siblings that were scheduled before it,
-//! that boundary lands mid-level and the validator rejects it: the management
-//! API surfaces a `409 Conflict` with a remediation hint to widen `from_nodes`
-//! to include the siblings. Widening moves the cut to the clean boundary before
-//! the whole level, re-executing the failed node and its same-level siblings
+//! caller passes it through the #148 reset-validity validator. The failed node
+//! can share a *parallel* level with siblings that were scheduled before it.
+//! Then that boundary lands mid-level, and the validator rejects it. The
+//! management API returns a `409 Conflict` with a hint to widen `from_nodes` to
+//! include the siblings. A wider set moves the cut to the clean boundary before
+//! the whole level. The failed node and its same-level siblings then re-execute
 //! together. Upstream nodes are always carried over.
 //!
 //! ## v1 interaction: signal/timer gate nodes (issue #746)
@@ -46,16 +46,16 @@
 //!   and a gate contributes none, so it never moves the cut. On replay the gate
 //!   re-resolves from carried-over history (its recorded `SignalReceived` /
 //!   race-`TimerFired`) when the cut lands after it. A gate in the re-execute
-//!   closure appears in `nodes_to_re_execute` (never `nodes_carried_over`, since
-//!   it has no schedule event to be "carried") — a benign enumeration quirk that
-//!   does not affect the reset point.
+//!   closure appears in `nodes_to_re_execute`. It never appears in
+//!   `nodes_carried_over`, because it has no schedule event to carry. This
+//!   benign enumeration quirk does not affect the reset point.
 //! * **A gate whose signal name equals an activity name rejects the whole DAG.**
-//!   Because a gate's node identity is its signal name, a gate named `approval`
-//!   alongside an activity `approval` is a genuine name collision that
-//!   name-based matching cannot disambiguate, so the resolver returns
-//!   [`DagRetryResolveError::AmbiguousNodes`] for the whole DAG (same treatment
-//!   as any duplicate activity name). Give gates signal names distinct from
-//!   activity names to keep a DAG retryable.
+//!   A gate's node identity is its signal name. So a gate named `approval`
+//!   beside an activity `approval` is a genuine name collision. Name-based
+//!   matching cannot resolve it. The resolver returns
+//!   [`DagRetryResolveError::AmbiguousNodes`] for the whole DAG, as for any
+//!   duplicate activity name. Give gates signal names distinct from activity
+//!   names to keep a DAG retryable.
 //!
 //! ## Interaction: declarative node compensation (issue #780)
 //!
@@ -64,12 +64,12 @@
 //! resolver would CARRY OVER, so a retry of a compensated run would resume on
 //! rolled-back state. Such a run is therefore rejected outright with
 //! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
-//! instead. Detection uses TWO signals — a `saga_compensat*` marker, or an
-//! `ActivityScheduled` whose recorded input is a **compensation envelope** for a
-//! node dispatched in the same run — because a DAG unwind at a drained
-//! signal frontier records no marker. Both read only the run's own history,
-//! never the registered definition, so they survive a compensator being renamed
-//! or removed and a later definition reusing its name (see
+//! instead. Detection uses TWO signals, because a DAG unwind at a drained
+//! signal frontier records no marker. One is a `saga_compensat*` marker. The
+//! other is an `ActivityScheduled` whose recorded input is a **compensation
+//! envelope** for a node dispatched in the same run. Both read only the run's
+//! own history, never the registered definition. So they survive a renamed or
+//! removed compensator, and a later definition that reuses its name (see
 //! [`ran_compensation_unwind`]). The envelope signal reads a payload-bearing
 //! field, so callers must supply INFLATED, codec-decoded history. A run that
 //! failed WITHOUT compensators (and every pre-#780 history) triggers neither and
@@ -127,11 +127,12 @@ pub enum DagRetryResolveError {
         /// The full sorted list of declared node names, for the error body.
         declared: Vec<String>,
     },
-    /// The DAG reuses the same activity name across multiple nodes. Because the
-    /// retry resolver maps node name -> task -> events purely by name, any
-    /// duplicate name makes the reset-point and node enumeration ambiguous, so
-    /// retry-from-node is rejected for the whole DAG in v1 (not just when the
-    /// duplicated node is named directly).
+    /// The DAG reuses the same activity name across multiple nodes.
+    ///
+    /// The retry resolver maps node name -> task -> events purely by name. So
+    /// any duplicate name makes the reset point and node enumeration ambiguous.
+    /// In v1, retry-from-node is rejected for the whole DAG, not only when the
+    /// request names the duplicated node.
     AmbiguousNodes {
         /// The activity names that are reused across more than one node.
         nodes: Vec<String>,
@@ -165,8 +166,8 @@ pub enum DagRetryResolveError {
 ///
 /// Matching by prefix covers both `saga_compensated:{seq}` and
 /// `saga_compensation_failed:{seq}`. Either one proves an unwind was
-/// **attempted** — not that anything was rolled back, which is why the marker
-/// is only half of signal 1 (see [`dispatched_after`]).
+/// **attempted**, not that anything was rolled back. So the marker is only
+/// half of signal 1 (see [`dispatched_after`]).
 const SAGA_UNWIND_MARKER_PREFIX: &str = "saga_compensat";
 
 /// The reserved key issue #780's compensation envelope is built around. The
@@ -178,14 +179,14 @@ const COMPENSATION_ENVELOPE_KEY: &str = "dag_compensate";
 /// Is this `ActivityScheduled.input` an issue #780 compensation envelope?
 ///
 /// Structural, not merely key-presence: the envelope has exactly the three keys
-/// `dag_compensate` / `input` / `output`, with a string `dag_compensate`. That
-/// makes an accidental collision with a *forward* node's input essentially
-/// impossible — a forward input is either the `{conf, dag_task}` wrapper, a raw
-/// bound upstream output, or a mapped cell, none of which have this shape.
+/// `dag_compensate` / `input` / `output`, with a string `dag_compensate`. So an
+/// accidental collision with a *forward* node's input is essentially
+/// impossible. A forward input is the `{conf, dag_task}` wrapper, a raw bound
+/// upstream output, or a mapped cell. None of them has this shape.
 ///
-/// The failure direction is safe anyway: a false positive marks a retryable run
-/// non-retryable (the operator starts a fresh run), whereas a false negative is
-/// the double-spend this guard exists to prevent.
+/// The failure direction is safe anyway. A false positive marks a retryable run
+/// non-retryable, and the operator starts a fresh run. A false negative is the
+/// double-spend this guard exists to prevent.
 #[must_use]
 fn is_compensation_envelope(input: &serde_json::Value) -> bool {
     let Some(object) = input.as_object() else {
@@ -202,18 +203,18 @@ fn is_compensation_envelope(input: &serde_json::Value) -> bool {
 /// Names of activities **dispatched** in this history — every distinct
 /// `ActivityScheduled.name`.
 ///
-/// This is the exact set the issue #780 unwind can compensate, because the
-/// unwind's own guard is `dispatched_forward`: a node is compensated only if it
-/// actually dispatched forward work, and dispatching records an
-/// `ActivityScheduled` under the node's activity name.
+/// This is the exact set the issue #780 unwind can compensate. The unwind's own
+/// guard is `dispatched_forward`: a node is compensated only if it dispatched
+/// forward work. A dispatch records an `ActivityScheduled` under the node's
+/// activity name.
 ///
 /// Deliberately **not** keyed on completion. A `CollectAll` mapped node whose
-/// cells all failed still settles `TaskStatus::Succeeded` at the DAG level (each
-/// cell failure is folded into the cells array and never flips the node's
-/// status), so it is genuinely compensated while recording no
-/// `ActivityCompleted` under its name. Corroborating on completion would miss
-/// exactly that envelope. An empty mapped fan-out is excluded for free — it sets
-/// `dispatched_forward = false`, dispatches nothing, and is never compensated.
+/// cells all failed still settles `TaskStatus::Succeeded` at the DAG level. Each
+/// cell failure folds into the cells array and never flips the node's status.
+/// So the node is genuinely compensated, but records no `ActivityCompleted`
+/// under its name. A check on completion misses exactly that envelope. An empty
+/// mapped fan-out is excluded for free. It sets `dispatched_forward = false`,
+/// dispatches nothing, and is never compensated.
 #[must_use]
 pub fn dispatched_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
     events
@@ -228,15 +229,15 @@ pub fn dispatched_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
 /// Is this `ActivityScheduled.input` a compensation envelope whose compensated
 /// node was actually **dispatched in this run**?
 ///
-/// The history-only corroboration for signal 2 — see [`ran_compensation_unwind`]
-/// for why it is drawn from history rather than the current definition, and
-/// [`dispatched_activity_names`] for why dispatch (not completion) is the right
-/// bar.
+/// This is the history-only corroboration for signal 2.
+/// [`ran_compensation_unwind`] explains why it reads history, not the current
+/// definition. [`dispatched_activity_names`] explains why dispatch, not
+/// completion, is the right bar.
 ///
-/// Doubles as the **forward-dispatch exclusion** used by every name-keyed
-/// history reader ([`node_outcome`], and `dag_graph`'s `latest_scheduled`): a
-/// dispatch this returns `true` for is a compensator's, never a forward node's,
-/// so it must not contribute a node's outcome or timing. See
+/// It is also the **forward-dispatch exclusion** of every name-keyed history
+/// reader: [`node_outcome`], and `dag_graph`'s `latest_scheduled`. A dispatch
+/// for which this returns `true` is a compensator's, never a forward node's.
+/// So it must not contribute a node's outcome or timing. See
 /// [`is_compensation_dispatch`].
 #[must_use]
 pub fn compensates_a_dispatched_node(
@@ -256,19 +257,19 @@ pub fn compensates_a_dispatched_node(
 ///
 /// 1. A `saga_compensat*` [`WorkflowEvent::MarkerRecorded`] **corroborated by an
 ///    activity dispatch recorded after it** ([`dispatched_after`]). The marker
-///    alone proves only that an unwind was *attempted*: `Saga::run_compensations`
-///    records it before running the first compensation, so a compensator
-///    rejected pre-dispatch leaves a marker that rolled nothing back. Requiring
-///    a dispatch after it is what makes this signal mean "something was actually
-///    undone". It is positional, so it still answers correctly for a run whose
-///    payloads were **erased** (issue #495) — the one case the envelope signal
-///    cannot see.
+///    alone proves only that an unwind was *attempted*.
+///    `Saga::run_compensations` records it before the first compensation. So a
+///    compensator rejected pre-dispatch leaves a marker that rolled nothing
+///    back. The required later dispatch makes this signal mean "something was
+///    actually undone". It is positional. So it still answers correctly for a
+///    run whose payloads were **erased** (issue #495). The envelope signal
+///    cannot see that case.
 ///
-///    Not guaranteed for a DAG: issue #801's matcher deliberately leaves an
-///    unwind uncounted when the history sits at a **drained signal frontier**,
-///    so a DAG run that received an unsolicited signal records no marker even
-///    though its compensators dispatched (`docs/saga.md`, "a stray signal
-///    silences unwind observability").
+///    It is not guaranteed for a DAG. Issue #801's matcher deliberately leaves
+///    an unwind uncounted when the history sits at a **drained signal
+///    frontier**. So a DAG run that received an unsolicited signal records no
+///    marker, although its compensators dispatched (`docs/saga.md`, "a stray
+///    signal silences unwind observability").
 /// 2. An [`WorkflowEvent::ActivityScheduled`] whose recorded `input` is a
 ///    **compensation envelope** whose `dag_compensate` names a node that was
 ///    **actually dispatched in this run** ([`compensates_a_dispatched_node`]).
@@ -279,23 +280,23 @@ pub fn compensates_a_dispatched_node(
 ///    `store::load_history_inflated`). Left raw, an oversized envelope appears
 ///    as an `_harvest_offload_envelope` reference (issue #524) — or a codec
 ///    envelope (issue #608) — and this signal misses. It cannot be recovered
-///    here: an offloaded input is indistinguishable from a large ordinary
-///    forward input, so treating it as a compensation signal would reject every
-///    legitimate retry of a big-payload compensating DAG.
+///    here. An offloaded input is indistinguishable from a large ordinary
+///    forward input. As a compensation signal, it would reject every legitimate
+///    retry of a big-payload compensating DAG.
 ///
 /// Signal 2 corroborates against **recorded history, never the definition**.
-/// Shape alone is reachable by accident — a mapped cell or an `input_from`
-/// binding hands a node the raw upstream output, which is arbitrary user data,
-/// and an `input_from_all` alias set could even be named
-/// `dag_compensate`/`input`/`output` outright — so shape alone would 409 a
-/// retryable run, including one whose DAG declares no compensators at all.
+/// Shape alone is reachable by accident. A mapped cell or an `input_from`
+/// binding hands a node the raw upstream output, which is arbitrary user data.
+/// An `input_from_all` alias set can even be named
+/// `dag_compensate`/`input`/`output` outright. So shape alone would 409 a
+/// retryable run, even one whose DAG declares no compensators.
 ///
-/// The bar is **dispatch**, not completion, because that is precisely the
-/// unwind's own guard (`dispatched_forward`) — so a genuine envelope always
-/// satisfies it. Completion would be too strict: a `CollectAll` mapped node
-/// whose cells all failed still settles `TaskStatus::Succeeded` at the DAG level
-/// and is genuinely compensated, yet records no `ActivityCompleted` under its
-/// name. See [`dispatched_activity_names`].
+/// The bar is **dispatch**, not completion, because that is the unwind's own
+/// guard (`dispatched_forward`). So a genuine envelope always satisfies it.
+/// Completion is too strict. A `CollectAll` mapped node whose cells all failed
+/// still settles `TaskStatus::Succeeded` at the DAG level. It is genuinely
+/// compensated, but records no `ActivityCompleted` under its name. See
+/// [`dispatched_activity_names`].
 ///
 /// Drawing it from history is what makes signal 2 survive every way the current
 /// definition can drift from the run that produced the history:
@@ -310,17 +311,16 @@ pub fn compensates_a_dispatched_node(
 /// survives here, in either direction.
 /// `DagBuildError::CompensatorNameCollidesWithNode` is a *per-definition-version*
 /// guarantee — no compensator shares a node's name in the build that declared it
-/// — and nothing constrains names across versions. An earlier revision of this
-/// function also accepted a dispatch whose *name* was a currently-declared
-/// compensator; that was dropped because it is redundant (every unwind this
-/// engine produces writes the envelope, and only dispatched nodes are
-/// compensated) while being exactly the cross-version false-positive vector
-/// above.
+/// — and nothing constrains names across versions. An earlier revision also
+/// accepted a dispatch whose *name* was a currently declared compensator. That
+/// check was dropped. It is redundant, because every unwind of this engine
+/// writes the envelope, and only dispatched nodes are compensated. It was also
+/// exactly the cross-version false-positive vector above.
 ///
-/// Residual, documented and safe-direction: a forward dispatch whose user input
-/// is exactly the three envelope keys *and* whose `dag_compensate` string
-/// happens to name a node dispatched in the same run is still a false positive.
-/// That marks a retryable run non-retryable (start a fresh run) — the opposite
+/// One residual false positive remains, and it is safe. A forward dispatch can
+/// have exactly the three envelope keys as user input. Its `dag_compensate`
+/// string can name a node dispatched in the same run. That marks a retryable
+/// run non-retryable, so the operator starts a fresh run. That is the opposite
 /// direction from the double-spend this guard exists to prevent.
 ///
 /// Pure and cheap: a bounded number of passes over the events.
@@ -360,22 +360,22 @@ fn first_unwind_marker_index(events: &[WorkflowEvent]) -> Option<usize> {
 
 /// Did the run dispatch **any** activity after the unwind started?
 ///
-/// This is what turns an unwind-start marker from "an unwind was attempted"
-/// into "something was actually rolled back". `Saga::run_compensations` records
-/// the marker *before* running the first compensation closure, so a compensator
-/// whose dispatch is rejected pre-dispatch (`execute_activity_raw` returns
-/// `PayloadTooLarge` before `push_command` — an oversized
-/// `{dag_compensate, input, output}` envelope with no payload offloading) leaves
-/// the marker with nothing beside it. The terminal persist path produces the
-/// same shape: it replays `RecordMarker` but not `ScheduleActivity`.
+/// This turns an unwind-start marker from "an unwind was attempted" into
+/// "something was actually rolled back". `Saga::run_compensations` records the
+/// marker *before* the first compensation closure runs. A compensator can be
+/// rejected pre-dispatch. An example is an oversized
+/// `{dag_compensate, input, output}` envelope with no payload offloading:
+/// `execute_activity_raw` returns `PayloadTooLarge` before `push_command`. That
+/// leaves the marker with nothing beside it. The terminal persist path produces
+/// the same shape: it replays `RecordMarker` but not `ScheduleActivity`.
 ///
-/// Reading it positionally rather than by name or payload is deliberate. It
-/// needs no decoded payload, so it still answers correctly for a run whose
-/// payloads were **erased** (issue #495 tombstones `input` but never removes or
-/// reorders the event) — a case the envelope signal alone cannot see.
+/// The positional read, not by name or payload, is deliberate. It needs no
+/// decoded payload. So it still answers correctly for a run whose payloads were
+/// **erased**. Issue #495 tombstones `input`, but never removes or reorders
+/// the event. The envelope signal alone cannot see that case.
 ///
-/// Any `ActivityScheduled` after the marker is a compensation dispatch: the
-/// unwind runs only once the forward level walk has returned, so every forward
+/// Any `ActivityScheduled` after the marker is a compensation dispatch. The
+/// unwind runs only after the forward level walk returns, so every forward
 /// dispatch precedes it.
 fn dispatched_after(events: &[WorkflowEvent], marker_index: usize) -> bool {
     let started = started_activity_ids(events);
@@ -391,22 +391,22 @@ fn dispatched_after(events: &[WorkflowEvent], marker_index: usize) -> bool {
 /// Activity ids a worker actually CLAIMED — every `ActivityStarted`.
 ///
 /// This is the engine's proof that a body ran. The worker appends
-/// `ActivityStarted` in a setup phase **before** invoking the handler, and a
-/// failed append aborts the dispatch, so *body executed implies an
-/// `ActivityStarted` exists*. Its absence therefore proves the body never ran.
+/// `ActivityStarted` in a setup phase **before** it invokes the handler. A
+/// failed append aborts the dispatch. So *body executed implies an
+/// `ActivityStarted` exists*, and its absence proves the body never ran.
 ///
-/// Load-bearing for both signals: an operator cancel landing mid-unwind fails
-/// every open task row (`queue::fail_open_tasks_for_execution`) **without
-/// appending any event**, so a compensator dispatched-but-not-yet-claimed
-/// leaves an `ActivityScheduled` in history having rolled back nothing.
-/// Treating that schedule as proof would `409` a safe retry and send the
-/// operator to a fresh run that re-runs an upstream node whose side effect is
-/// still live.
+/// Both signals rely on this. An operator cancel mid-unwind fails every open
+/// task row (`queue::fail_open_tasks_for_execution`) **without an event**. So
+/// a compensator that was dispatched but not yet claimed leaves an
+/// `ActivityScheduled` in history, and it rolled back nothing. If that
+/// schedule counted as proof, a safe retry would get a `409`. The operator
+/// would then start a fresh run that re-runs an upstream node whose side
+/// effect is still live.
 ///
-/// Deliberately NOT keyed on a terminal event. A worker that appended
-/// `ActivityStarted` and then crashed mid-body may or may not have landed the
-/// rollback; that is genuinely ambiguous, so it is treated as compensated (the
-/// conservative direction). `ActivityStarted` is the earliest point at which a
+/// Deliberately NOT keyed on a terminal event. A worker can append
+/// `ActivityStarted` and then crash mid-body. It may or may not have landed
+/// the rollback. That is genuinely ambiguous, so it counts as compensated, the
+/// conservative direction. `ActivityStarted` is the earliest point at which a
 /// rollback side effect could have occurred.
 ///
 /// Survives issue #495 erasure: neither `activity_id` nor `worker_id` is a
@@ -429,10 +429,11 @@ pub struct DagRetryPlan {
     /// The 0-based event id to reset the source execution to (carry over
     /// events `0..=reset_to_event_id`).
     pub reset_to_event_id: i64,
-    /// Every node that will (re-)execute on the fork, sorted. This is computed
-    /// from the actual cut — it includes the failed node, its declared
-    /// downstream, and any node whose scheduling falls after the cut — so the
-    /// operator gets no surprises.
+    /// Every node that will (re-)execute on the fork, sorted.
+    ///
+    /// It comes from the actual cut, so the operator gets no surprises. It
+    /// includes the failed node, its declared downstream, and any node whose
+    /// scheduling falls after the cut.
     pub nodes_to_re_execute: Vec<String>,
     /// Every node whose recorded result is preserved (scheduled at or before
     /// the cut), sorted.
@@ -498,14 +499,15 @@ pub fn downstream_closure(def: &DagDefinition, from_nodes: &BTreeSet<String>) ->
         .collect()
 }
 
-/// Expand the requested nodes to the re-execute set under **level-granular**
-/// semantics (issue #366, operator choice): every node in the same execution
-/// level as a requested node, plus the downstream closure of that whole level.
+/// Expand the requested nodes to the re-execute set with **level-granular**
+/// semantics.
 ///
-/// This lands the reset cut on the clean boundary before the failed node's
-/// parallel level, so the failed node and its same-level siblings re-run
-/// together — and an operator never has to name an already-succeeded sibling to
-/// move the boundary earlier.
+/// The set is every node in an execution level of a requested node, plus the
+/// downstream closure of that whole level (issue #366, operator choice). The
+/// reset cut lands on the clean boundary before the failed node's parallel
+/// level. So the failed node and its same-level siblings re-run together. An
+/// operator never has to name an already-succeeded sibling to move the
+/// boundary earlier.
 #[must_use]
 fn level_granular_reexecute_set(
     def: &DagDefinition,
@@ -542,15 +544,15 @@ fn level_granular_reexecute_set(
 /// rather than a forward node's dispatch?
 ///
 /// Every name-keyed history reader must exclude these. Issue #780 introduced a
-/// new class of `ActivityScheduled` event, and while
+/// new class of `ActivityScheduled` event.
 /// `DagBuildError::CompensatorNameCollidesWithNode` keeps a compensator
-/// distinguishable from a forward node *within one definition version*, that is
-/// a per-version guarantee: a later definition may introduce a forward node
-/// named after an older definition's compensator. Reading the old compensation
-/// dispatch as that node's outcome or timing reports a node that never
-/// executed.
+/// distinguishable from a forward node *within one definition version*. That
+/// is only a per-version guarantee. A later definition may introduce a forward
+/// node named after an older definition's compensator. If the old compensation
+/// dispatch counts as that node's outcome or timing, it reports a node that
+/// never executed.
 ///
-/// `succeeded` comes from [`succeeded_activity_names`] over the same history —
+/// `dispatched` comes from [`dispatched_activity_names`] over the same history —
 /// hoist it out of per-node loops. The check is history-only, so unlike a
 /// definition-derived one it cannot drift across versions in either direction.
 #[must_use]
@@ -560,26 +562,24 @@ pub fn is_compensation_dispatch(input: &serde_json::Value, dispatched: &BTreeSet
 
 /// Determine the outcome of a single node (by activity name) on the source run.
 ///
-/// Compensator dispatches are excluded ([`is_compensation_dispatch`]), so a
-/// forward node introduced under a name an older definition used for a
-/// compensator reports `NotAttempted` rather than inheriting the compensation's
-/// outcome.
+/// Compensator dispatches are excluded ([`is_compensation_dispatch`]). A
+/// forward node can reuse the name of an older definition's compensator. It
+/// then reports `NotAttempted`, not the compensation's outcome.
 ///
-/// `dispatched` is [`dispatched_activity_names`] over the same `events` --
-/// callers that classify more than one node from the same history must
-/// compute it once and pass it in, rather than each call recomputing an
-/// identical `BTreeSet` (issue #690 follow-up; the same redundancy class as
-/// `dag_graph::latest_scheduled`'s pre-hoist shape).
+/// `dispatched` is [`dispatched_activity_names`] over the same `events`. A
+/// caller that classifies many nodes from one history must compute it once
+/// and pass it in. That avoids an identical `BTreeSet` per call (issue #690
+/// follow-up). It is the same redundancy class as the pre-hoist shape of
+/// `dag_graph::latest_scheduled`.
 #[must_use]
 pub fn node_outcome(
     events: &[WorkflowEvent],
     node: &str,
     dispatched: &BTreeSet<&str>,
 ) -> NodeOutcome {
-    // Find the activity_id of the *latest* ActivityScheduled with this name.
-    // If a node was scheduled more than once (e.g. a re-dispatched attempt with
-    // a fresh activity_id), the latest attempt is the one whose terminal state
-    // is authoritative — the earlier attempts are superseded.
+    // Use the *latest* ActivityScheduled with this name. A node can be
+    // scheduled more than once, such as a re-dispatched attempt with a fresh
+    // activity_id. The terminal state of the latest attempt is authoritative.
     let mut scheduled_id = None;
     for event in events.iter().rev() {
         if let WorkflowEvent::ActivityScheduled {
@@ -633,12 +633,12 @@ pub fn node_outcome(
 /// `reexecute`, if any.
 ///
 /// Unlike [`node_outcome`], this deliberately carries **no** issue #780
-/// compensation-dispatch exclusion, because it is unreachable for a run that has
-/// any: [`resolve_retry_plan`] rejects such a run with
-/// [`DagRetryResolveError::CompensatedRun`] before computing a cut, and it does
-/// so using the *same* [`compensates_a_succeeded_node`] predicate the exclusion
-/// would apply. A compensation dispatch that could shift this cut is exactly one
-/// that already 409'd.
+/// compensation-dispatch exclusion. No run with such a dispatch reaches it.
+/// [`resolve_retry_plan`] rejects such a run with
+/// [`DagRetryResolveError::CompensatedRun`] before it computes a cut. It uses
+/// the *same* [`compensates_a_dispatched_node`] predicate that the exclusion
+/// would apply. A compensation dispatch that could shift this cut is exactly
+/// one that already 409'd.
 ///
 /// That is an ordering invariant, not a local property — keep the
 /// `ran_compensation_unwind` check first in [`resolve_retry_plan`].
@@ -675,12 +675,12 @@ pub fn resolve_retry_plan(
         return Err(DagRetryResolveError::EmptyFromNodes);
     }
 
-    // Issue #780 interaction: a run that already unwound its compensations has
-    // had its succeeded upstream side effects ROLLED BACK. The level-granular
-    // cut below deliberately CARRIES those nodes over, so the fork would resume
-    // as if their effects still existed — a double-spend of the compensation.
-    // Checked before any node validation so the operator gets the state answer
-    // ("this run is not retryable") rather than a node-shaped one.
+    // Issue #780: a run that already unwound its compensations had its
+    // succeeded upstream side effects ROLLED BACK. The level-granular cut
+    // below deliberately CARRIES those nodes over. So the fork would resume as
+    // if their effects still existed, a double-spend of the compensation. This
+    // runs before node validation, so the operator gets the state answer
+    // ("this run is not retryable"), not a node-shaped one.
     if ran_compensation_unwind(events) {
         return Err(DagRetryResolveError::CompensatedRun);
     }
@@ -705,12 +705,12 @@ pub fn resolve_retry_plan(
     }
 
     // (a.1) Reject DAGs that reuse an activity name across nodes. The retry
-    // resolver maps node name -> task -> events purely by activity name, so any
-    // duplicate name — whether named directly in `from_nodes` or reached through
-    // level/downstream expansion — makes `earliest_schedule_index` and the
-    // carried/re-execute enumeration ambiguous (it could match an unrelated
-    // earlier occurrence and move the cut too far back). v1 requires unique node
-    // names for retry; reject the whole DAG otherwise.
+    // resolver maps node name -> task -> events purely by activity name. A
+    // duplicate name can come from `from_nodes` or from level/downstream
+    // expansion. Either way it makes `earliest_schedule_index` and the
+    // carried/re-execute enumeration ambiguous. It can match an unrelated
+    // earlier occurrence and move the cut too far back. v1 requires unique
+    // node names for retry, so reject the whole DAG otherwise.
     let duplicated: Vec<String> = {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for task in def.tasks() {
@@ -762,9 +762,9 @@ pub fn resolve_retry_plan(
         earliest_schedule_index(events, &reexecute).ok_or(DagRetryResolveError::NoSchedulePoint)?;
     let reset_to_event_id = i64::try_from(first_idx).unwrap_or(i64::MAX) - 1;
 
-    // Honest enumeration computed from the actual cut: a node is "carried over"
-    // iff its scheduling is at or before the cut; everything else (declared)
-    // will be re-evaluated by the replayed DAG handler.
+    // Enumerate from the actual cut. A node is "carried over" iff its
+    // scheduling is at or before the cut. The replayed DAG handler
+    // re-evaluates every other declared node.
     let cut = reset_to_event_id;
     let mut carried: BTreeSet<String> = BTreeSet::new();
     for (idx, event) in events.iter().enumerate() {
@@ -1000,15 +1000,14 @@ mod tests {
         );
     }
 
-    /// Issue #780 introduced a *new class* of `ActivityScheduled` event — the
-    /// compensator dispatch — that name-keyed history readers had never seen
-    /// before. Within one definition version
-    /// `CompensatorNameCollidesWithNode` keeps it distinguishable, but that is a
-    /// per-version guarantee: a later definition may introduce a **forward**
-    /// node named after an older definition's compensator. `node_outcome` would
-    /// then report that never-executed node's outcome from the old compensation
-    /// dispatch — surfacing in the run-graph view (#690) and in this resolver's
-    /// per-node validation.
+    /// Issue #780 introduced a *new class* of `ActivityScheduled` event, the
+    /// compensator dispatch. Name-keyed history readers had never seen it.
+    /// `CompensatorNameCollidesWithNode` keeps it distinguishable within one
+    /// definition version. That is only a per-version guarantee. A later
+    /// definition may introduce a **forward** node named after an older
+    /// definition's compensator. Without the exclusion, `node_outcome` reports
+    /// an outcome for that never-executed node from the old dispatch. That
+    /// shows in the run-graph view (#690) and in per-node validation here.
     ///
     /// The exclusion is history-only (the same corroboration
     /// `ran_compensation_unwind` uses), so it needs no definition and cannot
@@ -1125,10 +1124,10 @@ mod tests {
             failed(ic),
         ];
         let plan = resolve_retry_plan(&def, &events, &["c".to_string()]).expect("plan");
-        // Level-granular: retrying c widens to its whole level {b, c, d} + e, so
-        // the cut lands before the level's earliest scheduling (schedB at 3) ->
-        // reset to 2 (a clean boundary right after compA). No dead-end even though
-        // b and d succeeded first.
+        // Level-granular: a retry of c widens to its whole level {b, c, d} + e.
+        // So the cut lands before the level's earliest scheduling (schedB at 3),
+        // and the reset is to 2, a clean boundary right after compA. There is no
+        // dead end, although b and d succeeded first.
         assert_eq!(plan.reset_to_event_id, 2);
         assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
         assert_eq!(
@@ -1144,10 +1143,10 @@ mod tests {
 
     #[test]
     fn resolve_fanout_failed_node_first_in_level_cuts_before_whole_level() {
-        // Level-granular success: when the failed node is the first scheduled in
-        // its parallel level, the cut lands on the clean boundary before the
-        // whole level, so the failed node and its same-level siblings re-execute
-        // together (the operator's chosen semantics). Upstream `a` is preserved.
+        // Level-granular success: the failed node is the first scheduled in its
+        // parallel level. The cut lands on the clean boundary before the whole
+        // level. So the failed node and its same-level siblings re-execute
+        // together, as the operator chose. Upstream `a` is preserved.
         let def = fanout_dag();
         let (ia, ib, ic, id) = (
             ActivityExecId::new(),
@@ -1207,9 +1206,9 @@ mod tests {
 
     #[test]
     fn resolve_rejects_dag_with_duplicate_name_even_for_unique_target() {
-        // Codex P2: retrying a *unique* failed node (c) must still be rejected
-        // when the DAG reuses an activity name elsewhere (b), because name-based
-        // matching could move the cut to the unrelated occurrence.
+        // A retry of a *unique* failed node (c) must still be rejected when the
+        // DAG reuses an activity name elsewhere (b). Name-based matching could
+        // move the cut to the unrelated occurrence.
         let def = duplicate_name_elsewhere_dag();
         let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
         let events = vec![
@@ -1228,20 +1227,20 @@ mod tests {
         );
     }
 
-    /// `earliest_schedule_index` carries no compensation-dispatch exclusion,
-    /// relying instead on an **ordering invariant**: `resolve_retry_plan` runs
-    /// `ran_compensation_unwind` first, and that check uses the very same
-    /// predicate the exclusion would. So a compensation dispatch that could
-    /// shift the cut has already produced a `409`.
+    /// `earliest_schedule_index` carries no compensation-dispatch exclusion.
+    /// It relies on an **ordering invariant** instead. `resolve_retry_plan` runs
+    /// `ran_compensation_unwind` first, and that check uses the same predicate
+    /// as the exclusion. So a compensation dispatch that could shift the cut has
+    /// already produced a `409`.
     ///
-    /// Pinned rather than left as a comment, because reordering the checks would
-    /// silently reopen it: the cut would land on the compensator's dispatch
-    /// instead of the forward node's.
+    /// A test pins this, not only a comment. A reorder of the checks would
+    /// silently reopen the gap. The cut would then land on the compensator's
+    /// dispatch, not on the forward node's.
     #[test]
     fn a_compensation_dispatch_can_never_shift_the_cut_because_the_run_409s_first() {
-        // `undo_a` is a FORWARD node here, and it is in the re-execute closure —
-        // so an old compensation dispatch of that name would be a candidate cut
-        // point if it were ever reached.
+        // `undo_a` is a FORWARD node here, in the re-execute closure. So an old
+        // compensation dispatch of that name is a candidate cut point if the
+        // code ever reaches it.
         let def = {
             let mut builder = DagBuilder::new();
             let na = builder.activity(a);
@@ -1307,10 +1306,10 @@ mod tests {
             completed(ia),
             scheduled("b", ib),
             failed(ib),
-            // The unwind's dedup marker. The compensator dispatch that follows
-            // deliberately carries NO envelope (`scheduled` sets `input: Null`)
-            // and `linear_dag` declares no compensators, so signal 2 cannot
-            // fire — this isolates signal 1.
+            // The unwind's dedup marker. The next compensator dispatch
+            // deliberately carries NO envelope (`scheduled` sets `input: Null`).
+            // `linear_dag` declares no compensators. So signal 2 cannot fire,
+            // and this isolates signal 1.
             marker("saga_compensated:1"),
             scheduled("undo_a", iu),
             activity_started(iu),
@@ -1359,18 +1358,19 @@ mod tests {
     /// rolled nothing back, so the run stays retryable.
     ///
     /// `Saga::run_compensations` records `saga_compensated:{seq}` *before* it
-    /// runs the first compensation closure, so a compensator whose dispatch is
-    /// rejected **pre-dispatch** — `execute_activity_raw` returns
-    /// `PayloadTooLarge` before `push_command`, e.g. an oversized
-    /// `{dag_compensate, input, output}` envelope with no payload offloading —
-    /// leaves the marker in history with no `ActivityScheduled` beside it.
+    /// runs the first compensation closure. A compensator can be rejected
+    /// **pre-dispatch**. An example is an oversized
+    /// `{dag_compensate, input, output}` envelope with no payload offloading:
+    /// `execute_activity_raw` returns `PayloadTooLarge` before `push_command`.
+    /// That leaves the marker in history with no `ActivityScheduled` beside it.
     /// (The terminal persist path replays `RecordMarker` but not
     /// `ScheduleActivity`, so it produces the same shape.)
     ///
-    /// Treating that marker as proof of rollback inverts the guard: it would
-    /// 409 a **safe** retry and send the operator to a fresh run, re-running
-    /// node `a` whose side effect is still live — a duplicate side effect,
-    /// the mirror image of the double-spend this guard exists to prevent.
+    /// If that marker counts as proof of rollback, the guard inverts. A
+    /// **safe** retry gets a 409, and the operator starts a fresh run. That
+    /// re-runs node `a`, whose side effect is still live. The result is a
+    /// duplicate side effect, the mirror image of the double-spend this guard
+    /// exists to prevent.
     #[test]
     fn a_marker_only_unwind_that_dispatched_nothing_stays_retryable() {
         let def = linear_compensating_dag();
@@ -1393,12 +1393,12 @@ mod tests {
         );
     }
 
-    /// A DAG unwind does not ALWAYS leave a marker: a run that received an
-    /// unsolicited signal ends its history at a drained-signal frontier, which
-    /// issue #801's matcher deliberately leaves uncounted — no
-    /// `saga_compensated:{seq}` marker, no counters — even though the
-    /// compensators still dispatch and still replay (documented in
-    /// `docs/saga.md`, "a stray signal silences unwind observability").
+    /// A DAG unwind does not ALWAYS leave a marker. A run that received an
+    /// unsolicited signal ends its history at a drained-signal frontier. Issue
+    /// #801's matcher deliberately leaves that uncounted: no
+    /// `saga_compensated:{seq}` marker, no counters. The compensators still
+    /// dispatch and still replay (`docs/saga.md`, "a stray signal silences
+    /// unwind observability").
     ///
     /// Detecting the unwind by marker ALONE therefore leaves such a fully
     /// rolled-back run retryable, which is exactly the double-spend
@@ -1489,11 +1489,10 @@ mod tests {
         assert!(!is_compensation_envelope(&Value::Null));
     }
 
-    /// POST-PR REVIEW P1 (Codex on #1153): the retry endpoint passes the
-    /// **currently registered** `DagDefinition`, not the one that produced the
-    /// history. A deployment that renamed (or removed) a compensator after a
-    /// marker-less unwind ran would make the name-based signal blind, and the
-    /// already-rolled-back run would become retryable again.
+    /// The retry endpoint passes the **currently registered** `DagDefinition`,
+    /// not the one that produced the history (#1153). A deployment can rename or
+    /// remove a compensator after a marker-less unwind ran. That blinds a
+    /// name-based signal, and the rolled-back run becomes retryable again.
     ///
     /// The compensation ENVELOPE is the durable, definition-independent signal:
     /// it is recorded in the dispatch's own `ActivityScheduled.input` and never
@@ -1544,14 +1543,14 @@ mod tests {
     /// **This resolver requires INFLATED history** — the caller must resolve
     /// payload offloading (issue #524) before calling it.
     ///
-    /// When a compensation envelope exceeds the offload threshold,
+    /// A compensation envelope can exceed the offload threshold. Then
     /// `append_events_offloaded` replaces the WHOLE `ActivityScheduled.input`
     /// with an `_harvest_offload_envelope` reference (`input` is in
-    /// `PAYLOAD_FIELD_KEYS`), so the structural envelope signal cannot see the
-    /// three compensation keys. That is unfixable *here*: an offloaded input is
-    /// indistinguishable from a large ordinary forward input, so treating it as
-    /// a compensation signal would reject every legitimate retry of a
-    /// big-payload compensating DAG.
+    /// `PAYLOAD_FIELD_KEYS`). So the structural envelope signal cannot see the
+    /// three compensation keys. That is unfixable *here*. An offloaded input is
+    /// indistinguishable from a large ordinary forward input. As a compensation
+    /// signal, it would reject every legitimate retry of a big-payload
+    /// compensating DAG.
     ///
     /// This test pins the blindness so the obligation stays with the endpoint,
     /// which loads via `store::load_history_inflated`. Do not "simplify" that
@@ -1628,10 +1627,10 @@ mod tests {
     /// payload happens to have the envelope's exact three keys.
     ///
     /// A mapped cell or an `input_from` binding hands a node the raw upstream
-    /// output, which is arbitrary user data — so `{"dag_compensate": <string>,
+    /// output, which is arbitrary user data. So `{"dag_compensate": <string>,
     /// "input": …, "output": …}` is reachable by accident. Shape alone would
-    /// then 409 a perfectly retryable run, and (worse) would do so for a DAG
-    /// that declares no compensators at all and therefore cannot have unwound.
+    /// then 409 a perfectly retryable run. Worse, it would do so for a DAG that
+    /// declares no compensators, and so cannot have unwound.
     ///
     /// The corroboration is the dispatch's *name*: every forward dispatch is
     /// named after a declared node, and
@@ -1671,10 +1670,10 @@ mod tests {
         assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
     }
 
-    /// The corroboration must NOT cost the rename-resilience it was added for:
-    /// a genuine compensation dispatch is still detected after **every**
-    /// compensator has been removed from the definition, because its name is
-    /// still absent from the forward node set.
+    /// The corroboration must NOT cost the rename-resilience it was added for.
+    /// A genuine compensation dispatch is still detected after **every**
+    /// compensator is removed from the definition. Its name is still absent
+    /// from the forward node set.
     #[test]
     fn a_genuine_unwind_is_detected_even_after_all_compensators_were_removed() {
         // The current definition declares NO compensators — they were all
@@ -1722,8 +1721,8 @@ mod tests {
     /// The mirror of the envelope case: an OLD definition's forward node can
     /// share a name with a compensator the CURRENT definition introduces. A
     /// name-only check against the current compensator set then reports
-    /// `CompensatedRun` for a run that never unwound at all — blocking a
-    /// legitimate retry with a 409.
+    /// `CompensatedRun` for a run that never unwound. That blocks a legitimate
+    /// retry with a 409.
     #[test]
     fn an_old_forward_node_named_like_a_current_compensator_is_not_an_unwind() {
         // Current definition declares `undo_a` as `a`'s compensator...
@@ -1812,11 +1811,11 @@ mod tests {
     }
 
     /// A `CollectAll` mapped node whose cells ALL failed still settles
-    /// `TaskStatus::Succeeded` at the DAG level — per-cell failures are folded
-    /// into the cells array and never flip the node's status — so the unwind
-    /// genuinely compensates it. But history holds no `ActivityCompleted` under
-    /// that node's name, so corroborating on *completion* would miss the
-    /// envelope and leave a rolled-back run retryable.
+    /// `TaskStatus::Succeeded` at the DAG level. Per-cell failures fold into the
+    /// cells array and never flip the node's status. So the unwind genuinely
+    /// compensates it. But history holds no `ActivityCompleted` under that
+    /// node's name. A check on *completion* misses the envelope, and a
+    /// rolled-back run stays retryable.
     ///
     /// The corroboration is therefore **dispatch**, which is exactly what the
     /// unwind itself guards on (`dispatched_forward`).
@@ -1885,17 +1884,17 @@ mod tests {
 
     /// A compensator that was SCHEDULED but never CLAIMED rolled nothing back.
     ///
-    /// An operator cancel landing mid-unwind fails every open task row
-    /// (`queue::fail_open_tasks_for_execution`) without appending any event, so
-    /// the compensator's `ActivityScheduled` is in history but no worker ever
-    /// ran its body. Treating the schedule alone as proof would `409` a
-    /// perfectly safe retry and send the operator to a fresh run, re-running an
+    /// An operator cancel mid-unwind fails every open task row
+    /// (`queue::fail_open_tasks_for_execution`) without an event. So the
+    /// compensator's `ActivityScheduled` is in history, but no worker ran its
+    /// body. If the schedule alone counted as proof, a safe retry would get a
+    /// `409`. The operator would then start a fresh run that re-runs an
     /// upstream node whose side effect is still live.
     ///
-    /// `ActivityStarted` is the correct bar: the worker appends it in a setup
-    /// phase BEFORE invoking the handler, and a failed append aborts the run —
-    /// so a body that executed always has one. Its absence therefore proves the
-    /// body never ran.
+    /// `ActivityStarted` is the correct bar. The worker appends it in a setup
+    /// phase BEFORE it invokes the handler, and a failed append aborts the run.
+    /// So a body that executed always has one, and its absence proves the body
+    /// never ran.
     #[test]
     fn a_scheduled_but_never_started_compensator_stays_retryable() {
         let def = linear_compensating_dag();
@@ -1923,8 +1922,8 @@ mod tests {
     }
 
     /// The mirror of the test above: once the compensator has STARTED, a
-    /// rollback may have landed, so the run must stay non-retryable — including
-    /// when the worker crashed mid-body and never recorded a terminal.
+    /// rollback may have landed. So the run must stay non-retryable. That holds
+    /// also when the worker crashed mid-body and recorded no terminal.
     #[test]
     fn a_started_compensator_with_no_terminal_still_blocks_retry() {
         let def = linear_compensating_dag();
@@ -1963,14 +1962,14 @@ mod tests {
     ///   `{"_harvest_erased": true}`, not the three-key envelope; and
     /// * signal 1 has nothing to anchor on for a run that unwound at a
     ///   **drained signal frontier** (issue #801), which records no marker at
-    ///   all. (With a marker present signal 1 still fires: the marker's *name*
-    ///   is not a payload field and the "dispatch after it" check reads no
-    ///   payload — that intersection is the whole gap.)
+    ///   all. (With a marker, signal 1 still fires. The marker's *name* is not a
+    ///   payload field, and the "dispatch after it" check reads no payload. So
+    ///   that intersection is the whole gap.)
     ///
     /// So a fully rolled-back run looks retryable here. Erasure is
-    /// irreversible, so no amount of inflating or decoding recovers it; the
-    /// guard has to live in `api::retry_dag_run_inner`, which has the execution
-    /// row and can test it in O(1).
+    /// irreversible, so no inflation or decode recovers it. The guard has to
+    /// live in `api::retry_dag_run_inner`, which has the execution row and can
+    /// test it in O(1).
     #[test]
     fn an_erased_marker_less_unwind_is_invisible_and_must_be_refused_by_the_caller() {
         let def = linear_compensating_dag();
@@ -1986,9 +1985,9 @@ mod tests {
             completed(ia),
             scheduled("b", ib),
             failed(ib),
-            // The compensator DID dispatch and DID roll `a` back — but the run
-            // sat at a drained signal frontier, so no marker was recorded, and
-            // erasure has since replaced the envelope with a tombstone.
+            // The compensator DID dispatch and DID roll `a` back. But the run
+            // sat at a drained signal frontier, so it recorded no marker. Erasure
+            // has since replaced the envelope with a tombstone.
             WorkflowEvent::ActivityScheduled {
                 activity_id: iu,
                 name: "undo_a".to_string(),
@@ -2008,8 +2007,8 @@ mod tests {
     }
 
     /// REGRESSION GUARD: a compensating DAG that failed BEFORE any compensator
-    /// dispatched (e.g. the first node itself failed, so nothing succeeded)
-    /// left nothing rolled back and stays retryable.
+    /// dispatched rolled nothing back, so it stays retryable. An example is a
+    /// failed first node, so nothing succeeded.
     #[test]
     fn resolve_allows_a_compensating_dag_whose_unwind_never_dispatched() {
         let def = linear_compensating_dag();
@@ -2146,9 +2145,9 @@ mod tests {
     fn resolve_upstream_retry_crossing_a_gate_computes_cut_from_activity_schedules() {
         // Retry from `c`, whose downstream closure crosses the gate ("approval")
         // and reaches `b`. `c` failed, so the gate/`b` never ran. The reset point
-        // is derived purely from activity schedules — the gate contributes no
-        // schedule event and does not move the cut — and the gate appears in
-        // nodes_to_re_execute (never carried_over), a benign enumeration quirk.
+        // comes purely from activity schedules. The gate has no schedule event,
+        // so it does not move the cut. The gate appears in nodes_to_re_execute,
+        // never in carried_over, a benign enumeration quirk.
         let def = gate_dag();
         let (ia, ic) = (ActivityExecId::new(), ActivityExecId::new());
         // 0 started, 1 schedA, 2 compA, 3 schedC, 4 failC (gate & b never reached)
@@ -2177,8 +2176,8 @@ mod tests {
     #[test]
     fn resolve_rejects_gate_signal_name_colliding_with_an_activity_name() {
         // A gate whose signal name equals an activity name is a genuine node-name
-        // collision the resolver cannot disambiguate → AmbiguousNodes for the
-        // whole DAG, even when retrying an unrelated node.
+        // collision that the resolver cannot resolve. So the whole DAG gets
+        // AmbiguousNodes, even for a retry of an unrelated node.
         let mut builder = DagBuilder::new();
         let na = builder.activity(a);
         // Gate signal "a" collides with the activity `a`'s node name "a".

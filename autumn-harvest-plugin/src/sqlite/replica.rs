@@ -1407,7 +1407,6 @@ fn unique() -> String {
     )
 }
 
-/// `path` with `suffix` appended to its file name.
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
@@ -1419,7 +1418,6 @@ fn staging_of(path: &Path) -> PathBuf {
     suffixed(path, &format!(".restoring-{}", unique()))
 }
 
-/// The SQLite sidecars of `path`.
 fn sidecars(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     SIDECARS.iter().map(move |suffix| suffixed(path, suffix))
 }

@@ -4,9 +4,9 @@
 #![cfg(feature = "testing")]
 //!
 //! Covers: `IdempotencyKey` type, `ActivityContext::idempotency_key()`,
-//! `ActivityContext::attempt()`, subkey derivation, HTTP-header safety,
-//! collision resistance, and the duplicate-dispatch / crash-retry scenario
-//! that is the core safety motivation for the feature.
+//! `ActivityContext::attempt()`, subkey derivation, HTTP-header safety and
+//! collision resistance. It also covers the duplicate-dispatch / crash-retry
+//! scenario, which is the core safety reason for the feature.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -375,11 +375,10 @@ fn subkey_slash_in_name_does_not_collide_with_nested_subkey() {
     // The slash is rejected by the validator, so the collision is impossible
     // at the API level.
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
-    // Nested: key -> "a" -> "b"
     let nested = key.subkey("a").subkey("b");
-    // A flat name that *looks* like the path "a/b" would panic — test that
-    // the flat and nested forms are provably distinct by ensuring the nested
-    // path prefix includes the intermediate segment.
+    // A flat name that *looks* like the path "a/b" would panic. The nested
+    // path prefix includes the intermediate segment, so the flat and nested
+    // forms are distinct.
     assert!(
         nested.as_str().contains("/a/"),
         "nested path must include both segments"

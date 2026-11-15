@@ -2,9 +2,9 @@
 //! [`migrate`] step that brings a pre-existing database file up to the current
 //! shape.
 //!
-//! Deliberately **not** the Postgres migration DDL: the dialect differs (TEXT for
-//! UUIDs/JSON, INTEGER for sequence numbers and epoch timestamps) and this
-//! backend persists only what a single-writer, embedded runtime needs. The DDL
+//! Deliberately **not** the Postgres migration DDL. The dialect differs: TEXT for
+//! UUIDs/JSON, INTEGER for sequence numbers and epoch timestamps. This backend
+//! persists only what a single-writer, embedded runtime needs. The DDL
 //! is applied idempotently (`CREATE TABLE IF NOT EXISTS`) on every
 //! [`SqliteRuntime::open`](crate::SqliteRuntime::open), so re-opening an existing
 //! file is safe.
@@ -15,19 +15,19 @@
 //!   [`WorkflowEvent`](autumn_harvest::WorkflowEvent) log, keyed `(exec_id, seq)`;
 //!   `event_json` is `serde_json::to_string(&WorkflowEvent)`. This is the
 //!   *canonical, replayable* history. Each event's JSON encoding is byte-identical
-//!   to the Postgres backend's (the shared adjacently-tagged `serde` form), which
-//!   is what makes a history produced here replay unchanged on the core
-//!   `WorkflowReplayer` (and, in principle, a Postgres hub).
+//!   to the Postgres backend's: the shared adjacently-tagged `serde` form. So a
+//!   history produced here replays unchanged on the core `WorkflowReplayer`, and in
+//!   principle on a Postgres hub.
 //! - `harvest_tasks` — the activity task queue (the `FOR UPDATE SKIP LOCKED`
 //!   analog; single writer — see [`queue`](crate::queue)).
 //! - `harvest_timers` — durable timers with an absolute epoch `fire_at` and a
-//!   monotonic `arm_seq`. `arm_seq` is the deterministic tie-breaker when several
-//!   timers share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
-//!   ctx.timer("b", 1))`): due timers fire in `(fire_at, arm_seq)` order, so the
-//!   `TimerFired` events land in the same order as the `TimerStarted` events. The
-//!   core `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at
-//!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
-//!   (issue #1069 P2).
+//!   monotonic `arm_seq`. `arm_seq` breaks ties when several timers share one
+//!   `fire_at`, as in `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`. Due
+//!   timers fire in `(fire_at, arm_seq)` order. So the `TimerFired` events land in
+//!   the order of the `TimerStarted` events. The core
+//!   `HistoryMatcher::match_timer` scans for its own `TimerFired`. It STOPS at an
+//!   unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
+//!   (issue #1069).
 //! - `harvest_signals` — staged inbound signals. The next drive appends each one
 //!   to history (issue #2020). Each row records the epoch-millisecond the signal
 //!   arrived (`received_at`, issue #1069 P2). Millisecond precision keeps an
@@ -490,19 +490,19 @@ use rusqlite::Connection;
 use crate::error::SqliteResult;
 
 /// Bring an existing database file up to the current [`SCHEMA`] shape by adding
-/// any columns introduced after it was created — run on every
-/// [`SqliteRuntime::open`](crate::SqliteRuntime::open), right after the idempotent
-/// `CREATE TABLE IF NOT EXISTS` batch.
+/// any columns introduced after it was created.
 ///
-/// The base schema is applied with `CREATE TABLE IF NOT EXISTS`, so a table that
-/// already exists is left with its *original* column set — a database created
-/// before a column was added would otherwise be missing it, and a fresh `INSERT`
-/// (which lists the new column) would fail with "no such column". This step is the
-/// backend's minimal, forward-only migration. It is **additive**: it adds columns
-/// and indexes, and never drops or renames. It is **idempotent**: each column is
-/// added only when absent, so it is safe to run on every open, a fresh database
-/// included. It keeps every existing row. The one row update is the issue #2028
-/// back-fill, which only sets a NULL key.
+/// [`SqliteRuntime::open`](crate::SqliteRuntime::open) runs it right after the
+/// idempotent `CREATE TABLE IF NOT EXISTS` batch. That batch leaves an existing
+/// table with its *original* column set. A database created before a column was
+/// added would lack it. A fresh `INSERT` that lists the new column would then fail
+/// with "no such column".
+///
+/// This step is the backend's minimal, forward-only migration. It is **additive**:
+/// it adds columns and indexes, and never drops or renames. It is **idempotent**:
+/// each column is added only when absent, so it is safe to run on every open, a
+/// fresh database included. It keeps every existing row. The one row update is
+/// the issue #2028 back-fill, which only sets a NULL key.
 ///
 /// Current migrations:
 /// - **issue #2024** — `harvest_tasks.heartbeat_details` and
@@ -771,9 +771,9 @@ fn back_fill_promise_keys(conn: &Connection) -> SqliteResult<()> {
 /// Run `add_column_sql` iff `table` does not already have a column named `column`.
 /// Returns `true` when it added the column.
 ///
-/// `table`/`column` are backend-internal string LITERALS (never caller input), so
-/// interpolating them into the `PRAGMA table_info(...)` probe is safe — a `PRAGMA`
-/// takes its table name as a bare identifier, not a bindable parameter.
+/// `table`/`column` are backend-internal string LITERALS, never caller input. So
+/// the `PRAGMA table_info(...)` probe can interpolate them safely. A `PRAGMA` takes
+/// its table name as a bare identifier, not a bindable parameter.
 fn add_column_if_absent(
     conn: &Connection,
     table: &str,

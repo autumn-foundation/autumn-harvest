@@ -1,9 +1,9 @@
 //! Broker-agnostic inbound-message types (issue #944).
 //!
-//! Everything here is deliberately free of any broker client type so the
-//! binding/dispatch layer stays adapter-independent: Kafka, SQS, and any
-//! follow-up adapter (NATS, `RabbitMQ`, Pub/Sub, Kinesis) all lower their
-//! native message onto [`InboundMessage`].
+//! No type here uses a broker client, so the binding and dispatch layer stays
+//! adapter-independent. Kafka, SQS and any follow-up adapter (NATS,
+//! `RabbitMQ`, Pub/Sub, Kinesis) lower their native message onto
+//! [`InboundMessage`].
 
 use std::collections::BTreeMap;
 
@@ -15,23 +15,22 @@ use std::collections::BTreeMap;
 ///
 /// * **Kafka** — `topic` / `partition` / `offset`, or the message key when the
 ///   binding is configured to dedupe by key instead.
-/// * **SQS** — the broker-assigned `MessageId` (falling back to a FIFO
-///   `MessageDeduplicationId` only when the broker gave us no message id at
-///   all; see [`coordinate_id`](crate::connector::sqs::coordinate_id) for why
-///   that order and not the reverse).
+/// * **SQS** — the broker-assigned `MessageId`. A FIFO
+///   `MessageDeduplicationId` is the fallback only when the broker gives no
+///   message id. See [`coordinate_id`](crate::connector::sqs::coordinate_id)
+///   for why that order and not the reverse.
 ///
 /// They are stable across a *redelivery*, not across a *reincarnation* of the
-/// stream. Kafka's offset restarts at zero when a topic is deleted and
-/// recreated, and means nothing across a cutover to a different cluster — so
-/// the old coordinates return while their claims are still live, and fresh
-/// records are classified as replays. Neither is observable here (Kafka
-/// exposes no topic incarnation to a consumer), so it is the operator's to
-/// declare: see
+/// stream. Kafka's offset restarts at zero when a topic is recreated. It means
+/// nothing across a cutover to a different cluster. In both cases the old
+/// coordinates return while their claims are still live, so fresh records
+/// are classified as replays. Kafka exposes no topic incarnation to a
+/// consumer, so the operator must declare it: see
 /// [`SourceBinding::key_incarnation`](crate::connector::binding::SourceBinding::key_incarnation).
 ///
-/// The variants are deliberately *not* `#[non_exhaustive]`: a new adapter that
-/// cannot express its coordinates in one of these shapes should use
-/// [`Self::Opaque`] rather than growing the enum.
+/// The variants are deliberately *not* `#[non_exhaustive]`. A new adapter that cannot
+/// express its coordinates in one of these shapes uses [`Self::Opaque`]
+/// instead of growing the enum.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessageCoordinates {
     /// Kafka's natural per-partition monotonic coordinate.
@@ -95,11 +94,11 @@ pub struct InboundMessage {
     /// The broker's **partition key** for this message, when it has one
     /// (Kafka's record key; `None` for SQS, which has no such concept).
     ///
-    /// This is the field the documented ordering remedy relies on: a broker
-    /// that partitions by key guarantees per-key order *within* a partition,
-    /// so mapping the key to a stable `workflow_id` funnels one key's
-    /// messages into one entity workflow, which then serializes them itself.
-    /// Raw bytes, since a key need not be UTF-8.
+    /// The documented ordering remedy relies on this field. A broker that
+    /// partitions by key keeps per-key order *within* a partition. Mapping the
+    /// key to a stable `workflow_id` sends one key's messages to one entity
+    /// workflow, which serializes them itself. Raw bytes, since a key need
+    /// not be UTF-8.
     pub key: Option<Vec<u8>>,
     /// Broker-supplied headers/attributes, if the adapter exposes them.
     pub headers: BTreeMap<String, String>,
@@ -190,10 +189,9 @@ impl MessageCtx {
 
     /// The broker's partition key as UTF-8, when it has one and it decodes.
     ///
-    /// The convenience form of [`Self::key`] for the overwhelmingly common
-    /// case of a string key. Returns `None` both when the broker supplied no
-    /// key and when the key is not valid UTF-8 — a mapping function that
-    /// needs to distinguish the two should read [`Self::key`] directly.
+    /// The convenience form of [`Self::key`] for a string key. Returns `None`
+    /// when the broker supplied no key and when the key is not valid UTF-8.
+    /// To tell the two apart, read [`Self::key`] directly.
     ///
     /// ```
     /// # use autumn_harvest_plugin::connector::{InboundMessage, MessageCoordinates, MessageCtx, MessageHandle};

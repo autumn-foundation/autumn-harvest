@@ -43,7 +43,7 @@
 //! ```
 //!
 //! With none of those and no Docker daemon, the suite prints a skip notice and
-//! exits 0 — `cargo bench` on a laptop without Postgres is not a failure.
+//! exits 0. `cargo bench` on a laptop without Postgres is not a failure.
 //!
 //! # Why not criterion
 //!
@@ -51,13 +51,13 @@
 //! signal, a completed execution. Criterion's statistical machinery re-runs the
 //! measured closure thousands of times, which for all three database scenarios
 //! would end up timing an empty queue. Same reason `benches/claim_bench.rs`
-//! (issue #786) is hand-rolled. Replay is the one criterion-shaped scenario and
-//! `benches/replay_bench.rs` still benches it that way; this suite reports its
-//! throughput from the *same* history builder so the two cannot drift.
+//! (issue #786) is hand-rolled. Replay is the one criterion-shaped scenario.
+//! `benches/replay_bench.rs` still benches it that way. This suite reports its
+//! throughput from the *same* history builder, so the two cannot drift.
 //!
-//! A partial run is a first-class mode: `HARVEST_BENCH_SCENARIOS` and
-//! `HARVEST_BENCH_SHARDS` narrow the matrix, so a reader reproducing one
-//! published headline does not have to sit through all twelve cells.
+//! A partial run is a first-class mode. `HARVEST_BENCH_SCENARIOS` and
+//! `HARVEST_BENCH_SHARDS` narrow the matrix. A reader who reproduces one
+//! published headline need not run all twelve cells.
 //!
 //! # Scope
 //!
@@ -68,11 +68,10 @@
 //! and the only performance gate CI does run — is issue #786's
 //! `benches/claim_bench.rs` and `docs/performance.md`.
 
-// The harness is shared with `benches/replay_bench.rs` (the history builder) and
-// with the docs-drift guard, so the published numbers, the #135 budget bench and
-// the doc can never be produced by three different definitions of the same
-// thing. It lives under `tests/` because that is where a shared harness lives in
-// this repo (see `claim_bench_support.rs`, issue #786).
+// `benches/replay_bench.rs` (the history builder) and the docs-drift guard share
+// this harness. So the published numbers, the #135 budget bench and the doc use
+// one definition. A shared harness lives under `tests/` in this repo (see
+// `claim_bench_support.rs`, issue #786).
 #[path = "../tests/integration/capacity_bench_support.rs"]
 mod capacity_bench_support;
 #[path = "../tests/integration/claim_bench_support.rs"]
@@ -164,9 +163,8 @@ async fn run() {
         return;
     }
 
-    // After the sweep, not before: the Postgres version is only known once
-    // something has been provisioned, and on the testcontainer path there is no
-    // environment variable to read it from ahead of time.
+    // After the sweep, not before: the Postgres version is known only after
+    // provisioning. On the testcontainer path no environment variable holds it.
     print_environment(
         reports
             .iter()
@@ -222,10 +220,9 @@ async fn run() {
 /// one and printing a notice otherwise.
 ///
 /// Each cell runs in its own task, so a panic in one becomes a `JoinError`
-/// rather than unwinding out of `main`. Without this a single unlucky
-/// database error aborts the whole sweep, discards every cell already
-/// measured, and skips teardown for the databases the remaining cells would
-/// have created.
+/// rather than unwinding out of `main`. Without this, one database error
+/// aborts the whole sweep and discards every cell already measured. It also
+/// skips teardown for the databases the remaining cells would have created.
 ///
 /// `await_cell` adds a hard wall-clock ceiling on top. `SCENARIO_BUDGET_SECS`
 /// is only a *cooperative* deadline; the scenario checks it between its own
@@ -379,9 +376,8 @@ fn print_environment(capacity_ran: bool) {
 ///
 /// Replay is in-memory and cannot legitimately move with shard count, so any
 /// spread across the three cells is the reference box, not the engine. Nothing
-/// else in the report compares those cells *against each other* — and each one
-/// on its own always looks fine — so without this the control cannot actually
-/// signal anything.
+/// else in the report compares those cells *against each other*. Each one on
+/// its own always looks fine, so without this the control signals nothing.
 fn print_replay_control(reports: &[ScenarioReport]) {
     let readings: Vec<f64> = reports
         .iter()

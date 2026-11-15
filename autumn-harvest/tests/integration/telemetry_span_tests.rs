@@ -2,9 +2,9 @@
 
 //! Integration tests for ADR-0001 OpenTelemetry span emission (issue #136).
 //!
-//! Verifies that all 8 named span kinds are emitted when a workflow with
-//! two activities, one signal, one timer, and one child workflow runs to
-//! completion.  Uses a real Postgres container via testcontainers so that
+//! A workflow with two activities, one signal, one timer and one child
+//! workflow runs to completion. All 8 named span kinds must be emitted.
+//! Uses a real Postgres container via testcontainers so that
 //! the worker-side spans (activity.schedule, signal.deliver, timer.fire,
 //! `child_workflow.start`) are also exercised.
 //!
@@ -310,7 +310,6 @@ fn all_adr_0001_span_kinds_are_emitted() {
 
             let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
-            // Start workflow execution.
             let mut conn = AsyncPgConnection::establish(&db_url)
                 .await
                 .expect("connect");
@@ -369,7 +368,6 @@ fn all_adr_0001_span_kinds_are_emitted() {
             .expect("start workflow");
             drop(conn);
 
-            // Spawn worker.
             let registry = build_registry();
             let pool = build_pool(&db_url);
             let worker = Arc::new(

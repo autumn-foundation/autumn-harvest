@@ -1,14 +1,14 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`
-//! — the per-row body of `sweep_codec_reencryption_once` (issue #948), the
-//! background sweep that lazily migrates `harvest_events` payloads off a
-//! retired codec key. Folded into `enforce_timeouts_once` and run on the
-//! scanner's tick interval (500ms by default) for every shard on which a
-//! keyed codec is registered and rotation has not yet converged — so this is
-//! a real, recurring batch job on any deployment that rotates keys, not a
-//! one-off migration script.
+//! Deterministic (non-criterion) instruction/allocation-count profiling harness.
 //!
-//! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
+//! It profiles `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`.
+//! That is the per-row body of `sweep_codec_reencryption_once` (issue #948). The
+//! sweep lazily migrates `harvest_events` payloads off a retired codec key. It is
+//! folded into `enforce_timeouts_once` and runs on the scanner's tick interval
+//! (500ms by default). It runs for every shard with a registered keyed codec
+//! whose rotation has not yet converged. So this is a real, recurring batch job
+//! on any deployment that rotates keys, not a one-off migration script.
+//!
+//! Wall-clock timing is unreliable on this (shared-vCPU) machine. So this
 //! binary is driven directly under `valgrind --tool=callgrind` (instruction
 //! counts) and `valgrind --tool=dhat` (allocation counts/bytes), which are
 //! deterministic across runs.
@@ -26,19 +26,20 @@
 //!
 //! # Workload
 //!
-//! A batch of `CODEC_ROTATION_BATCH` (default 200, matching
-//! `codec_rotation::CODEC_ROTATION_DEFAULT_BATCH`) serialized workflow
-//! events — alternating `ActivityScheduled` (an `input` field) and
-//! `ActivityCompleted` (an `output` field), each carrying a realistic
-//! nested-object JSON payload (an order-checkout-shaped record, a few hundred
-//! bytes), every one still encoded under a retired key. This is the batch
-//! shape the very first sweep tick after a key rotation sees: every row the
-//! scanner fetches still needs conversion, which is exactly where this
-//! function's CPU/allocation cost is paid — the already-converted steady
-//! state that dominates a shard's *lifetime* is a cheap map-lookup precheck
-//! (`has_non_active_key` returning `false`) that this harness also exercises
-//! once per row before the conversion, mirroring the real per-row order in
-//! `sweep_codec_reencryption_once`.
+//! A batch of `CODEC_ROTATION_BATCH` serialized workflow events. The default is
+//! 200, matching `codec_rotation::CODEC_ROTATION_DEFAULT_BATCH`. Events
+//! alternate `ActivityScheduled` (an `input` field) and `ActivityCompleted` (an
+//! `output` field). Each carries a realistic nested-object JSON payload (an
+//! order-checkout-shaped record, a few hundred bytes). Every one is still
+//! encoded under a retired key.
+//!
+//! This is the batch shape the very first sweep tick after a key rotation sees.
+//! Every row the scanner fetches still needs conversion, which is exactly where
+//! this function's CPU/allocation cost is paid. The already-converted steady
+//! state dominates a shard's *lifetime*. It is a cheap map-lookup precheck
+//! (`has_non_active_key` returning `false`). This harness also runs that
+//! precheck once per row before the conversion. That mirrors the real per-row
+//! order in `sweep_codec_reencryption_once`.
 //!
 //! `CODEC_ROTATION_PROFILE_REPS` (default 25) repeats the whole batch, for a
 //! default of 5,000 row conversions.
@@ -57,7 +58,7 @@ use serde_json::{Value, json};
 /// A cheap, deterministic stand-in for an embedder-supplied encryption codec
 /// (the same shape `tests/integration/codec_rotation_db_tests.rs` uses). The
 /// profiled cost here is the crate's own envelope/JSON/base64 machinery
-/// around the codec, not the codec algorithm itself — a real cipher adds
+/// around the codec, not the codec algorithm itself. A real cipher adds
 /// fixed per-call work on top without changing that machinery's share.
 #[derive(Debug)]
 struct XorCodec(u8);
@@ -115,10 +116,11 @@ fn fixed_timestamp() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// One serialized event, encoded under `key_id`: `ActivityScheduled` (an
-/// `input` field) for even `i`, `ActivityCompleted` (an `output` field) for
-/// odd `i` — the two most common payload-bearing event kinds in a workflow's
-/// history.
+/// One serialized event, encoded under `key_id`.
+///
+/// Even `i` gives `ActivityScheduled` (an `input` field), and odd `i` gives
+/// `ActivityCompleted` (an `output` field). They are the two most common
+/// payload-bearing event kinds in a workflow's history.
 fn event_under(codecs: &PayloadCodecs, key_id: &str, i: usize) -> Value {
     let restore = codecs.active_key_id();
     codecs.set_active_key(key_id).expect("activate for fixture");

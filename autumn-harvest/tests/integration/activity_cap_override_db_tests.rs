@@ -504,7 +504,6 @@ const FAN_OUT: usize = 6;
 
 /// Each step waits for this flag when its input asks it to wait.
 static RELEASE: AtomicBool = AtomicBool::new(false);
-/// The steps that run now.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// The most steps that ran at one time.
 static PEAK: AtomicUsize = AtomicUsize::new(0);

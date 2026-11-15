@@ -8,10 +8,10 @@
 //!
 //! **Launder.** This workflow body contains no `HashMap` token anywhere, so
 //! every DET substring rule and every HVG rule is inert by construction. Even
-//! written inline it would escape HVG011/DET010: those track a `for … in` over
-//! a bound hash ident, and the re-iteration here is a two-adaptor chain
-//! (`.into_iter().collect()`) on an unnamed temporary, which
-//! `iterated_hash_local` rejects by design ("longer chains are never flagged").
+//! inline it would escape HVG011/DET010, which track a `for … in` over a bound
+//! hash ident. The re-iteration here is a two-adaptor chain
+//! (`.into_iter().collect()`) on an unnamed temporary. `iterated_hash_local`
+//! rejects that by design ("longer chains are never flagged").
 //!
 //! **Expected trace hops.** `wf_collect_into_hashmap_then_reiterate` ⇒
 //! `harvest_verify_corpus_helpers::normalize` ⇒ `collect` into

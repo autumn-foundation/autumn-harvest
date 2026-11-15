@@ -1,15 +1,15 @@
 //! The issue #619 **success metric**, driven end to end by a real worker.
 //!
-//! > During a pause window **zero** activity tasks transition to `FAILED`/DLQ,
-//! > and **100%** of held tasks resume to a successful terminal outcome after
-//! > thaw (verified by an integration test that pauses, induces downstream
-//! > failures, holds, then resumes).
+//! > During a pause window, **zero** activity tasks transition to `FAILED`/DLQ.
+//! > After thaw, **100%** of held tasks resume to a successful terminal
+//! > outcome. An integration test verifies this: it pauses, induces downstream
+//! > failures, holds, then resumes.
 //!
 //! The story this test tells is the one the feature exists for:
 //!
 //! 1. A downstream dependency goes **down**. Real activity attempts fail and
-//!    burn retry budget — proving the retry machinery is genuinely live and
-//!    that, left alone, this backlog *would* march to `FAILED`/DLQ.
+//!    burn retry budget. That proves the retry machinery is live. Left alone,
+//!    this backlog *would* march to `FAILED`/DLQ.
 //! 2. The operator **pauses** the queue. From this instant nothing further is
 //!    claimed: no attempt burns, nothing fails, nothing dead-letters.
 //! 3. The hold lasts several worker poll cycles with the worker still running
@@ -56,10 +56,11 @@ static DOWNSTREAM_UP: AtomicBool = AtomicBool::new(false);
 /// held.
 static ATTEMPTS_RUN: AtomicUsize = AtomicUsize::new(0);
 
-/// The queue every workflow in this test uses. It is a fixed constant because
-/// the worker binds its queues at construction time; cross-run isolation on a
-/// shared env-provided database comes from the scrub in [`setup_db_url`]
-/// instead (CI gets a fresh testcontainer and needs neither).
+/// The queue every workflow in this test uses.
+///
+/// It is a fixed constant because the worker binds its queues at construction
+/// time. On a shared env-provided database, the scrub in [`setup_db_url`]
+/// isolates runs. CI gets a fresh testcontainer and needs neither.
 const TEST_QUEUE: &str = "qp-success-metric";
 
 const WORKFLOWS: usize = 6;
@@ -128,9 +129,9 @@ fn registry() -> Arc<HandlerRegistry> {
     let act = ActivityInfo {
         name: "call_downstream",
         module: "queue_pause_success_metric_tests",
-        // Generous budget with a short backoff: the pre-pause outage must burn
-        // SOME attempts (proving retries are live) without exhausting them, so
-        // the post-thaw run has budget left to succeed.
+        // Generous budget with a short backoff. The pre-pause outage must burn
+        // SOME attempts, which proves retries are live. Budget must remain for
+        // the post-thaw run to succeed.
         default_retry_policy: Some(RetryPolicy::fixed(20, Duration::from_millis(200))),
         default_start_to_close: None,
         default_heartbeat_timeout: None,
@@ -166,11 +167,11 @@ async fn connect(url: &str) -> AsyncPgConnection {
 async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let mut conn = connect(&url).await;
-        // Every fixture this test owns is keyed by a fixed queue/workflow name,
-        // so a shared env-provided database would carry a previous run's rows
-        // into this one's assertions ("zero tasks may transition to FAILED"
-        // would count a *prior* run's failures). CI gets a fresh testcontainer
-        // and never needs this; scrubbing keeps the env-DB path re-runnable.
+        // Every fixture here is keyed by a fixed queue or workflow name. On a
+        // shared env-provided database, rows of a previous run would reach
+        // these assertions. "Zero tasks may transition to FAILED" would count
+        // *prior* failures. CI gets a fresh testcontainer and never needs this.
+        // The scrub keeps the env-DB path re-runnable.
         conn.batch_execute(&format!(
             "DELETE FROM harvest_queue_pauses; \
              DELETE FROM harvest_dead_letters WHERE queue_name = '{TEST_QUEUE}'; \
@@ -327,9 +328,8 @@ async fn pause_holds_a_failing_backlog_and_every_task_succeeds_after_thaw() {
         start_one(&url, n).await;
     }
 
-    // Wait until real attempts have run and failed — this is what proves the
-    // retry machinery is live and that this backlog would otherwise march to
-    // FAILED/DLQ if left alone.
+    // Wait until real attempts have run and failed. That proves the retry
+    // machinery is live, so this backlog would otherwise march to FAILED/DLQ.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while AtomicUsize::load(&ATTEMPTS_RUN, Ordering::SeqCst) < WORKFLOWS
         && std::time::Instant::now() < deadline
@@ -354,10 +354,10 @@ async fn pause_holds_a_failing_backlog_and_every_task_succeeds_after_thaw() {
     )
     .await
     .expect("pause");
-    // Read the counter AFTER the pause commits. An attempt already in flight
-    // when the pause landed may still finish (AC2: a pause holds dispatch, it
-    // does not abort running work), so this is the honest baseline for
-    // "nothing NEW was claimed".
+    // Read the counter AFTER the pause commits. An attempt in flight at the
+    // pause may still finish, because a pause holds dispatch and does not
+    // abort running work (AC2). So this is the baseline for "nothing NEW was
+    // claimed".
     tokio::time::sleep(Duration::from_millis(500)).await;
     let attempts_at_hold = AtomicUsize::load(&ATTEMPTS_RUN, Ordering::SeqCst);
 
@@ -446,10 +446,11 @@ async fn pause_holds_a_failing_backlog_and_every_task_succeeds_after_thaw() {
     handle.abort();
 }
 
-/// The shared `build_runtime_worker` helper binds the `"default"` queue; this
-/// test needs the worker to poll its own uniquely-named queue so a sibling
-/// suite sharing an env-provided database cannot claim its tasks (and so the
-/// pause under test is scoped to work this test owns).
+/// Builds a runtime worker that polls the unique queue of this test.
+///
+/// The shared `build_runtime_worker` helper binds the `"default"` queue. A
+/// sibling suite on a shared env-provided database could claim tasks there.
+/// A unique queue also scopes the pause to work this test owns.
 fn build_runtime_worker_on_queue(
     worker_id: &str,
     registry: Arc<HandlerRegistry>,

@@ -226,7 +226,7 @@ async fn weighted_claim_distribution_tracks_3_to_1_ratio() {
                 } else {
                     latency_claims += 1;
                 }
-                // Mark it as completed so the row doesn't block re-claims.
+                // Mark it as completed so the row does not block re-claims.
                 queue::complete_task(
                     &mut conn,
                     &TaskClaim::of(&task).expect("a claimed task"),
@@ -336,10 +336,10 @@ async fn no_starvation_low_weight_queue_drains_to_completion() {
 /// Verifies that `record_task_dispatched` is wired into `dispatch_task`
 /// in the worker and records the correct queue names.
 ///
-/// We use the lower-level `claim_task` + manual counter approach here since
-/// we can't run a full worker loop in a unit test, but we verify the
+/// A unit test cannot run a full worker loop. So this test uses the
+/// lower-level `claim_task` + manual counter approach. It verifies that the
 /// `record_task_dispatched` trait method is callable and tracks per-queue
-/// counts — the wiring in `dispatch_task` is verified by the clippy/build check.
+/// counts. The clippy/build check verifies the wiring in `dispatch_task`.
 #[tokio::test]
 async fn dispatch_counter_records_per_queue_claims() {
     let (mut conn, _container) = setup_test_db().await;

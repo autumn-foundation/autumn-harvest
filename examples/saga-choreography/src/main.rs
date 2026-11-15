@@ -18,10 +18,6 @@
 use autumn_harvest::prelude::*;
 use serde_json::{Value, json};
 
-// ---------------------------------------------------------------------------
-// Onboarding workflow — waits for provisioning then listens for cancellation
-// ---------------------------------------------------------------------------
-
 /// Per-tenant onboarding: provisions resources then waits for either a
 /// completion signal or a `cancel_onboarding` cancellation signal.
 ///
@@ -37,7 +33,6 @@ use serde_json::{Value, json};
 pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let tenant_id = input["tenant_id"].as_str().unwrap_or("unknown").to_owned();
 
-    // Simulate a slow provisioning activity.
     ctx.execute_activity_raw(
         "provision_tenant_resources",
         json!({ "tenant_id": tenant_id }),
@@ -45,7 +40,6 @@ pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Va
     )
     .await?;
 
-    // Wait for either a completion or a cancellation signal.
     let signal = ctx.wait_for_signal("onboarding_outcome").await?;
     let cancelled = signal["cancelled"].as_bool().unwrap_or(false);
 
@@ -62,10 +56,6 @@ pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Va
     Ok(json!({ "tenant_id": tenant_id, "result": "completed" }))
 }
 
-// ---------------------------------------------------------------------------
-// Tenant-cancel workflow — signals all in-flight onboardings
-// ---------------------------------------------------------------------------
-
 /// Fan-out cancellation: given a list of onboarding execution IDs, signal
 /// each one with `cancel_onboarding` so they abort gracefully.
 ///
@@ -75,9 +65,8 @@ pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Va
 ///
 /// # Errors
 ///
-/// Returns an error for a signal-delivery failure other than the target
-/// already being terminal or unknown. Those two outcomes are not errors;
-/// this workflow treats them as a no-op instead of propagating them.
+/// Returns an error for a signal-delivery failure other than a terminal or
+/// unknown target.
 #[workflow(
     owner = "platform",
     runbook = "https://wiki.acme.com/cancel-runbook",

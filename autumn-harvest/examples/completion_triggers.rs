@@ -102,8 +102,8 @@ fn main() {
         InputMapping::Projection(path) => project_json_path(&source_output, path),
         // Issue #748: the engine assembles a terminal-outcome envelope from the
         // recorded execution row (state, source identity, output on COMPLETED,
-        // error/cancel reason otherwise). Here we illustrate the shape for this
-        // simulated COMPLETED source; `projection` plucks one field from it.
+        // error/cancel reason otherwise). This arm builds that shape for the
+        // simulated COMPLETED source. `projection` plucks one field from it.
         InputMapping::Outcome { projection } => {
             let envelope = json!({
                 "terminal_state": "COMPLETED",

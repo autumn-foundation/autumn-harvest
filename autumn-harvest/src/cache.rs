@@ -1,20 +1,18 @@
 //! LRU cache for suspended workflow states.
 //!
 //! When a workflow suspends, its full event history and the next DB event-id
-//! are cached keyed by execution UUID. On the next task for that execution, the
-//! worker fetches only *delta* events (new timer firings and signals appended
-//! since the last suspension) and prepends the cached snapshot, avoiding a full
-//! history reload from Postgres.
+//! are cached keyed by execution UUID. The next task for that execution fetches
+//! only *delta* events: timer firings and signals appended since the last
+//! suspension. It prepends the cached snapshot and skips a full history reload
+//! from Postgres.
 //!
-//! This is the in-process companion to the Postgres-level sticky routing
-//! mechanism: sticky routing keeps follow-up tasks on the owning worker
-//! (issue #235); this cache ensures that when a task does land on the
-//! owning worker the benefit is a cheap delta load rather than a full load.
+//! This is the in-process companion to Postgres-level sticky routing. Sticky
+//! routing keeps follow-up tasks on the owning worker (issue #235). This cache
+//! makes a task on the owning worker a cheap delta load, not a full load.
 //!
-//! The cache uses a fixed maximum size with LRU eviction — when the cache is
-//! full, the least-recently-used entry is evicted. Evicted entries cause the
-//! next task to fall back to a full history load (cold path), which is always
-//! correct — it is just slower.
+//! The cache has a fixed maximum size with LRU eviction. An evicted entry makes
+//! the next task fall back to a full history load (cold path). That is always
+//! correct, only slower.
 //!
 //! An entry can also hold the suspended workflow itself (issue #1798). A warm
 //! task then resumes the parked future with the delta events and does not
@@ -33,16 +31,16 @@ use crate::resident::Residency;
 
 /// Cached state for a suspended workflow execution.
 ///
-/// The worker inserts an entry here after each suspension and uses it on the
-/// next task for the same execution to avoid a full history reload.
+/// The worker inserts an entry after each suspension. The next task for the
+/// same execution uses it to avoid a full history reload.
 #[derive(Debug, Clone)]
 pub struct CachedWorkflowState {
     /// All events present in the history at the point of the last suspension.
     ///
     /// On a cache hit the worker fetches only events with
-    /// `event_id >= next_event_id` (the delta since the last suspension),
-    /// then prepends this snapshot to reconstruct the full history for the
-    /// executor without reading the old events from Postgres again.
+    /// `event_id >= next_event_id`, the delta since the last suspension. It
+    /// prepends this snapshot to rebuild the full history for the executor,
+    /// with no second read of the old events from Postgres.
     pub events: Vec<WorkflowEvent>,
 
     /// The `next_event_id` at the time of the last suspension.
@@ -452,10 +450,6 @@ impl std::fmt::Debug for WorkflowCache {
         d.finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

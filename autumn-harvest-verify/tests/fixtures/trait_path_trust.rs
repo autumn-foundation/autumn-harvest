@@ -1,32 +1,32 @@
-//! Fixture (review round 5): a body-less impl from a dependency, reached
+//! Fixture: a body-less impl from a dependency, reached
 //! through a STANDARD trait that rustc prints fully qualified.
 //!
 //! Compiled standalone with, from this directory:
-//!   rustc --crate-type lib --edition 2024 --crate-name trait_path_dep_stub \
-//!         -o libtrait_path_dep_stub.rlib trait_path_dep_stub.rs
-//!   rustc --crate-type lib --edition 2024 --emit=mir \
-//!         --extern trait_path_dep_stub=libtrait_path_dep_stub.rlib \
-//!         -o trait_path_trust.mir trait_path_trust.rs
-//!   rm libtrait_path_dep_stub.rlib
 //!
-//! The stub is compiled WITHOUT `--emit=mir`, so `From<Clock> for String` has
-//! no body in the analyzed set — exactly like a dependency outside a
-//! `--package` scope.
+//!     rustc --crate-type lib --edition 2024 --crate-name trait_path_dep_stub \
+//!           -o libtrait_path_dep_stub.rlib trait_path_dep_stub.rs
+//!     rustc --crate-type lib --edition 2024 --emit=mir \
+//!           --extern trait_path_dep_stub=libtrait_path_dep_stub.rlib \
+//!           -o trait_path_trust.mir trait_path_trust.rs
+//!     rm libtrait_path_dep_stub.rlib
+//!
+//! The stub is compiled WITHOUT `--emit=mir`. So `From<Clock> for String` has no
+//! body in the analyzed set, like a dependency outside a `--package` scope.
 //!
 //! The `shadow` module exists only to make rustc print paths in full. rustc
 //! trims a def-path to its last segment when that segment names exactly one
-//! item it can see, so re-using `String`, `Into` and `From` as names inside a
-//! module (which shadows nothing at the crate root, and so changes no name
-//! resolution here) is enough to make the dump spell
-//! `std::convert::Into` and `std::string::String` out. Verified in the dump:
+//! item it can see. So the module re-uses `String`, `Into` and `From` as names.
+//! That shadows nothing at the crate root and changes no name resolution here.
+//! It is enough to make the dump spell `std::convert::Into` and
+//! `std::string::String` out. Verified in the dump:
 //!
 //!   _4 = <Clock as std::convert::Into<std::string::String>>::into(move _5)
 //!   _4 = <std::string::String as std::convert::From<&str>>::from(const "charge")
 //!
 //! The first is the finding: `std::` appears only in the TRAIT and in the
-//! trait's generic argument; the body that runs belongs to `Clock`, whose
+//! trait's generic argument. The body that runs belongs to `Clock`, whose
 //! declared receiver (`_5: Clock`) carries no trusted root at all. The second is
-//! the control that the stricter rule must not break: there `std::` roots the
+//! the control, which the stricter rule must not break. There `std::` roots the
 //! qualified SELF type, so the call really is std's.
 #![allow(dead_code, unused_variables)]
 

@@ -1,8 +1,8 @@
 //! HTTP integration tests for `GET /api/harvest/workflows/{id}/logs` (issue #790).
 //!
 //! Tests run against a real Postgres instance (testcontainers, or an existing
-//! database via `HARVEST_TEST_DATABASE_URL`) and exercise the wiring the core
-//! DB tests in `autumn-harvest/tests/integration/workflow_logs_tests.rs` cannot:
+//! database via `HARVEST_TEST_DATABASE_URL`). They exercise what the core DB
+//! tests in `autumn-harvest/tests/integration/workflow_logs_tests.rs` cannot:
 //! routing, admin gating, param validation, response shape, and pagination.
 //!
 //! Scenarios covered:
@@ -112,10 +112,9 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
 /// Build the same router WITHOUT `set_admin_auth_boundary(true)`, so the
 /// per-route `require_admin` layer is LIVE.
 ///
-/// `build_app` mirrors the sibling suites and sets the boundary, which means
-/// "the embedder's own auth middleware already ran" and makes `require_admin`
-/// a deliberate no-op — so it can never prove the gate. This builder is the
-/// one that can.
+/// `build_app` mirrors the sibling suites and sets the boundary. The boundary
+/// means "the embedder's own auth middleware already ran", so `require_admin`
+/// is a deliberate no-op there. Only this builder can prove the gate.
 fn build_app_without_admin_boundary(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -161,13 +160,12 @@ async fn get_json_with_admin(app: &HarvestApiApp, uri: &str, admin: bool) -> (St
 
 /// Start a real execution row so the route's existence check passes.
 ///
-/// The caller's `workflow_id` is suffixed with a fresh UUID so every call
-/// yields a genuinely NEW execution. Without that, the default `AllowDuplicate`
-/// reuse policy attaches to the prior run's row when the suite is re-run
-/// against a persistent database (`HARVEST_TEST_DATABASE_URL`) — the execution
-/// then already holds that test's log rows, so an assertion on how many rows a
-/// write actually inserted reads 0 rather than the fresh count. CI's
-/// per-test container hides this; a local re-run does not.
+/// The caller's `workflow_id` gets a fresh UUID suffix, so every call yields a
+/// genuinely NEW execution. Suppose the suite re-runs against a persistent
+/// database (`HARVEST_TEST_DATABASE_URL`). The default `AllowDuplicate` reuse
+/// policy then attaches to the prior run's row, which already holds the log
+/// rows of that test. A count of rows that a write inserted then reads 0, not
+/// the fresh count. CI's per-test container hides this; a local re-run does not.
 ///
 /// Returns the execution id the start RESOLVED to, not the minted one.
 async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
@@ -245,9 +243,9 @@ fn messages(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The headline success metric (AC3 + the issue's success metric): an operator
-/// reads **100%** of a run's author-emitted lines from ONE call, in emission
-/// order, with zero external log-aggregation correlation.
+/// The headline success metric (AC3 and the issue's metric). An operator reads
+/// **100%** of a run's author-emitted lines from ONE call, in emission order.
+/// No external log-aggregation correlation is needed.
 #[tokio::test]
 async fn single_call_returns_every_line_in_emission_order() {
     let db = setup_database().await;
@@ -435,9 +433,9 @@ fn urlencoding_min(value: &str) -> String {
     value.replace('+', "%2B")
 }
 
-/// AC6/AC7: a run that logged nothing — including every run on a deployment
-/// with the durable sink DISABLED — is a 200 with an empty list, never a 404
-/// and never an error. Nothing is wrong with such a run.
+/// AC6/AC7: a run that logged nothing is a 200 with an empty list, never a 404
+/// and never an error. Every run on a deployment with the durable sink DISABLED
+/// is such a run. Nothing is wrong with it.
 #[tokio::test]
 async fn a_run_that_never_logged_returns_an_empty_list_not_an_error() {
     let db = setup_database().await;
@@ -525,9 +523,9 @@ async fn cap_marker_surfaces_truncated_independently_of_the_level_filter() {
 /// reads.
 ///
 /// `security.rs::eris_unauthenticated_workflow_logs_is_blocked` pins the 401 on
-/// an app with no storage at all; this test adds what that one cannot — the
-/// execution genuinely EXISTS and genuinely HAS log lines, so the 401 is proven
-/// to be authorization rather than a 404 (or a missing route) in disguise.
+/// an app with no storage at all. Here the execution genuinely EXISTS and HAS
+/// log lines. So the 401 is proven to be authorization, not a 404 (or a missing
+/// route) in disguise.
 #[tokio::test]
 async fn route_is_admin_gated_even_for_an_existing_execution_with_lines() {
     let db = setup_database().await;
@@ -548,7 +546,7 @@ async fn route_is_admin_gated_even_for_an_existing_execution_with_lines() {
         "a rejected read must not leak the line content: {body}"
     );
 
-    // The SAME execution through an authorized app returns the lines — so the
+    // The SAME execution through an authorized app returns the lines. So the
     // 401 above was the gate, not a broken route or a missing execution.
     let authorized = build_app(&pool);
     let (status, body) = get_json(&authorized, &format!("/workflows/{exec_id}/logs")).await;
@@ -559,9 +557,11 @@ async fn route_is_admin_gated_even_for_an_existing_execution_with_lines() {
 /// The documented default per-execution line cap (`WorkflowLogPolicy::default`).
 const SCALE_TOTAL_LINES: i64 = 1_000;
 
-/// The issue's **success metric**, at the **documented scale**: an operator
-/// reads a full 1,000-line run — the default `max_lines` cap — with a p95 read
-/// latency well under 200 ms, and every page boundary behaves as documented.
+/// The issue's **success metric**, at the **documented scale**.
+///
+/// An operator reads a full 1,000-line run (the default `max_lines` cap). The
+/// p95 read latency stays well under 200 ms, and every page boundary behaves
+/// as documented.
 ///
 /// The other tests use 25-line fixtures, which cannot observe:
 ///
@@ -573,9 +573,9 @@ const SCALE_TOTAL_LINES: i64 = 1_000;
 /// * the **latency target** at the volume the cap actually permits.
 ///
 /// Latency is asserted as a *generous* ceiling, not a benchmark: CI runners are
-/// noisy and a flaky perf assertion is worse than none. It is here to catch an
-/// order-of-magnitude regression (an accidental full-table scan, an N+1, a
-/// dropped index), which is the failure this bound can honestly detect.
+/// noisy and a flaky perf assertion is worse than none. The bound catches an
+/// order-of-magnitude regression: an accidental full-table scan, an N+1, a
+/// dropped index. That is the failure it can honestly detect.
 #[tokio::test]
 async fn a_full_thousand_line_run_reads_within_the_documented_bounds() {
     let db = setup_database().await;
@@ -643,8 +643,8 @@ async fn a_full_thousand_line_run_reads_within_the_documented_bounds() {
     );
 
     // ── The full read, in one call, in emission order ───────────────────────
-    // Timed: 11 samples, assert the p95 (the 11th-highest-is-the-max here, so
-    // take index 10 of the sorted list => the max, a strictly harder bar).
+    // Timed: 11 samples. The p95 check takes index 10 of the sorted list, the
+    // max. That bar is strictly harder than a true p95.
     let mut elapsed_ms: Vec<u128> = Vec::new();
     let mut last_body = Value::Null;
     for _ in 0..11 {

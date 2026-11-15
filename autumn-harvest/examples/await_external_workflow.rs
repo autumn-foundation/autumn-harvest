@@ -4,8 +4,8 @@
 //! Demonstrates `ctx.await_external_workflow::<T>(target)` — the third verb of
 //! the external-workflow family (signal #244 / cancel #492 / **await #757**).
 //! A fan-in coordinator awaits the terminal outcome of three **independently
-//! started** sibling workflows (they are NOT children of the coordinator — no
-//! parent/child linkage is created) and aggregates their typed results.
+//! started** sibling workflows and aggregates their typed results. They are NOT
+//! children of the coordinator, and no parent/child linkage is created.
 //!
 //! Each await is a single line:
 //!
@@ -19,9 +19,9 @@
 //!
 //! * Target `COMPLETED` → resolves with the **deserialized output**.
 //! * Target `FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED` → returns a typed
-//!   `Err` carrying the target's terminal cause (an OUTCOME — distinct from
-//!   cancel, where an already-terminal target is a no-op success). Branch on it
-//!   with `err.workflow_error_type()` / `err.workflow_details()`.
+//!   `Err` with the target's terminal cause. It is an OUTCOME. For cancel, an
+//!   already-terminal target is a no-op success. Branch on it with
+//!   `err.workflow_error_type()` / `err.workflow_details()`.
 //! * Target `RUNNING`/`PAUSED` → the coordinator parks durably and resolves
 //!   within one outbox poll after the target reaches any terminal state.
 //! * Self-await → immediate `HarvestError::ExternalAwaitFailed { reason_code:
@@ -61,12 +61,12 @@ fn parse_target(s: &str) -> HarvestResult<ExecutionId> {
 }
 
 /// Fan-in coordinator: await three independently-started legs by id and
-/// aggregate their typed totals. Each straightforward await is a single line
-/// (`?`), because the coordinator returns `Result<_, HarvestError>` — so the
-/// typed error from `await_external_workflow` propagates directly, with no
-/// `map_err(|e| e.to_string())` boilerplate. The whole aggregation is
-/// deterministic and replay-safe (each leg's output is frozen into the
-/// coordinator's own history).
+/// aggregate their typed totals.
+///
+/// The coordinator returns `Result<_, HarvestError>`, so each await is one
+/// line with `?`. The typed error propagates with no `map_err` boilerplate.
+/// The aggregation is replay-safe, because each leg's output is frozen into
+/// the coordinator's own history.
 #[workflow]
 async fn fan_in_coordinator(ctx: &WorkflowContext, input: FanInInput) -> Result<u64, HarvestError> {
     let leg_a = parse_target(&input.leg_a)?;
@@ -104,8 +104,8 @@ fn main() {
     //       .worker(WorkerConfig::default())
     //       .build();
     //
-    // Start the three legs (any workflow, any shard), then start the coordinator
-    // passing their execution ids:
+    // Start the three legs (any workflow, any shard). Then start the
+    // coordinator with their execution ids:
     //   POST /api/harvest/workflows/fan_in_coordinator/start
     //   { "input": { "leg_a": "<uuid>", "leg_b": "<uuid>", "leg_c": "<uuid>" } }
     println!("await_external_workflow example — see source for usage.");

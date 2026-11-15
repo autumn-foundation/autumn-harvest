@@ -605,7 +605,6 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>, owner: u32) 
         };
         match listener.accept().await {
             Ok((stream, _)) => {
-                // Every caller is identified before it is served.
                 if !peer_is_owner(&stream, owner) {
                     drop(permit);
                     continue;

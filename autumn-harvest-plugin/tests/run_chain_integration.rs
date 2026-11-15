@@ -10,12 +10,12 @@
 //!       `WorkflowContinuedAsNew` events) resolves best-effort with
 //!       `head_unknown = true` and no 500.
 //!   (7) A legacy chain queried from its TAIL reconstructs every predecessor via
-//!       shared-`workflow_id` CAN-event linkage (issue #701, Codex P2).
+//!       shared-`workflow_id` CAN-event linkage (issue #701).
 //!   (8) An id-reuse run sharing the `workflow_id` but not CAN-linked is excluded.
 //!
-//! The pure ordering / `head_unknown` math is unit-tested in
-//! `autumn-harvest/src/run_chain.rs`; these tests verify the HTTP wiring plus
-//! the DB gather (indexed back-link query + legacy forward-walk).
+//! Unit tests in `autumn-harvest/src/run_chain.rs` cover the pure ordering and
+//! `head_unknown` math. These tests verify the HTTP wiring and the DB gather
+//! (indexed back-link query + legacy forward-walk).
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
@@ -123,9 +123,9 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 }
 
 /// Seed one execution row in a chosen state, then overwrite its lifecycle
-/// timestamps and the continue-as-new back-link columns directly. Each run is
-/// started under a distinct `workflow_id` so `start_or_load_workflow_execution`
-/// never trips the active-run uniqueness index; the run-chain gather resolves by
+/// timestamps and the continue-as-new back-link columns directly. Each run has
+/// a distinct `workflow_id`, so `start_or_load_workflow_execution` never trips
+/// the active-run uniqueness index. The run-chain gather resolves by
 /// `id`/`first_exec_id`, not `workflow_id`, so distinct ids are fine.
 async fn seed_run(
     conn: &mut AsyncPgConnection,
@@ -238,14 +238,15 @@ async fn insert_continue_event(
         .unwrap();
 }
 
-/// Overwrite a seeded row's `workflow_id` to a shared value. `seed_run` starts
-/// each run under a distinct `workflow_id` to dodge the active-run uniqueness
-/// index; a real continue-as-new chain shares one `workflow_id`, and the legacy
-/// backward reconstruction (issue #701, Codex P2) resolves by it — so tests that
-/// exercise reconstruction set the members to a shared id afterward. Safe against
-/// the partial unique index `(workflow_name, workflow_id) WHERE state NOT IN
-/// ('CONTINUED_AS_NEW','TERMINATED')` as long as at most one non-excluded row
-/// shares the id (a legacy chain has exactly one live/terminal tail).
+/// Overwrite a seeded row's `workflow_id` to a shared value.
+///
+/// `seed_run` gives each run a distinct `workflow_id` to dodge the active-run
+/// uniqueness index. A real continue-as-new chain shares one `workflow_id`. The
+/// legacy backward reconstruction (issue #701) resolves by it. So tests of that
+/// reconstruction set a shared id afterward. The partial unique index is
+/// `(workflow_name, workflow_id) WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`.
+/// The update is safe while at most one non-excluded row shares the id. A
+/// legacy chain has exactly one live or terminal tail.
 async fn set_workflow_id(conn: &mut AsyncPgConnection, exec_id: ExecutionId, workflow_id: &str) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set(harvest_workflow_executions::workflow_id.eq(workflow_id))
@@ -299,9 +300,10 @@ async fn run_chain_malformed_id_returns_400() {
     );
 }
 
-/// (3) A fully post-feature 4-run chain (3 `CONTINUED_AS_NEW` + 1 `RUNNING` tail,
-/// each successor carrying `continued_from_exec_id` + `first_exec_id`) resolves
-/// to the SAME ordered chain from the head, a middle run, and the tail.
+/// (3) A fully post-feature 4-run chain resolves to the SAME ordered chain from
+/// the head, a middle run, and the tail. It has 3 `CONTINUED_AS_NEW` runs and a
+/// `RUNNING` tail. Each successor carries `continued_from_exec_id` and
+/// `first_exec_id`.
 #[tokio::test]
 async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
     let (url, _container) = setup_database().await;
@@ -435,7 +437,7 @@ async fn run_chain_standalone_run_is_single_entry() {
 /// survive. The seed query `WHERE id = head OR first_exec_id = head` returns
 /// `{head, tail}` (middle gone). The assembler must flag `head_unknown = true`
 /// (tail names an absent predecessor) and must NOT synthesize a false
-/// `head -> tail` continuation — never a 500. (issue #701, Codex P2)
+/// `head -> tail` continuation — never a 500 (issue #701).
 #[tokio::test]
 async fn run_chain_post_feature_chain_with_deleted_middle_flags_gap() {
     let (url, _container) = setup_database().await;
@@ -559,10 +561,10 @@ async fn run_chain_legacy_chain_flags_head_unknown() {
     assert_eq!(runs[2]["outcome"], "running");
 }
 
-/// (6) A pure legacy chain queried from a MIDDLE run. The gather can only walk
-/// FORWARD via `WorkflowContinuedAsNew` events (legacy rows have no back-links to
-/// reach the origin), so it resolves the runs from the middle onward and flags
-/// `head_unknown = true` — documented graceful degradation, never a 500.
+/// (6) A pure legacy chain queried from a MIDDLE run. Legacy rows have no
+/// back-links to the origin. So the gather walks only FORWARD via
+/// `WorkflowContinuedAsNew` events and resolves the runs from the middle onward.
+/// It flags `head_unknown = true`: documented graceful degradation, never a 500.
 #[tokio::test]
 async fn run_chain_legacy_middle_run_flags_head_unknown() {
     let (url, _container) = setup_database().await;
@@ -632,13 +634,13 @@ async fn run_chain_legacy_middle_run_flags_head_unknown() {
     assert_eq!(runs[1]["outcome"], "running");
 }
 
-/// (7) The Codex P2 money test (issue #701): a pre-feature legacy chain queried
-/// from its live/final TAIL. The tail carries no back-link metadata and no
-/// forward `WorkflowContinuedAsNew` event of its own, so the indexed gather only
-/// finds the tail. Legacy backward reconstruction walks the shared `workflow_id`
-/// candidates via CAN-event linkage back to the origin, returning every
-/// predecessor in order with `head_unknown = true` — AC4 (backward navigation
-/// from the latest run returns every predecessor) and AC5 (graceful degradation).
+/// (7) The money test of issue #701: a pre-feature legacy chain queried from its
+/// live/final TAIL. The tail carries no back-link metadata and no forward
+/// `WorkflowContinuedAsNew` event of its own, so the indexed gather only finds
+/// the tail. Legacy backward reconstruction walks the shared `workflow_id`
+/// candidates via CAN-event linkage back to the origin. It returns every
+/// predecessor in order with `head_unknown = true`. This covers AC4 (backward
+/// navigation returns every predecessor) and AC5 (graceful degradation).
 #[tokio::test]
 async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
     let (url, _container) = setup_database().await;
@@ -647,10 +649,9 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let t0 = Utc::now() - Duration::seconds(400);
-    // Legacy rows: continued_from + first_exec_id both NULL. Seeded under
-    // distinct ids to dodge the uniqueness index, then joined to a shared
-    // workflow_id — exactly the shape a real pre-feature continue-as-new chain
-    // has on disk.
+    // Legacy rows: continued_from + first_exec_id both NULL. They are seeded
+    // under distinct ids to dodge the uniqueness index, then joined to a shared
+    // workflow_id. A real pre-feature continue-as-new chain has that shape on disk.
     let run0 = seed_run(
         &mut conn,
         "legacy-tail-0",
@@ -693,7 +694,7 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
     set_workflow_id(&mut conn, run1, shared).await;
     set_workflow_id(&mut conn, run2, shared).await;
 
-    // Query the TAIL — the exact scenario Codex flagged.
+    // Query the TAIL, the exact scenario of issue #701.
     let (status, body) = get_json(&app, &format!("/workflows/{run2}/run-chain")).await;
     assert_eq!(status, StatusCode::OK, "legacy tail query must not 500");
     assert_eq!(
@@ -722,11 +723,11 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
     assert_eq!(runs[2]["outcome"], "completed");
 }
 
-/// (8) id-reuse safety (issue #701, Codex P2): a legacy chain plus an unrelated
-/// run that reused the SAME `workflow_id` but is NOT linked into the chain by a
-/// `WorkflowContinuedAsNew` event (its own CAN event points at a different
-/// successor). Backward reconstruction must exclude the unrelated run — linkage
-/// is by CAN event, never by raw `workflow_id` membership.
+/// (8) id-reuse safety (issue #701): a legacy chain plus an unrelated run that
+/// reused the SAME `workflow_id`. No `WorkflowContinuedAsNew` event links that
+/// run into the chain. Its own CAN event points at a different successor.
+/// Backward reconstruction must exclude it. Linkage is by CAN event, never by
+/// raw `workflow_id` membership.
 #[tokio::test]
 async fn run_chain_legacy_id_reuse_not_contaminated() {
     let (url, _container) = setup_database().await;
@@ -768,10 +769,10 @@ async fn run_chain_legacy_id_reuse_not_contaminated() {
     insert_continue_event(&mut conn, run0, 100, run1).await;
     insert_continue_event(&mut conn, run1, 100, run2).await;
 
-    // An unrelated run that reused the same workflow_id. Kept CONTINUED_AS_NEW
-    // (so it is excluded from the active-run uniqueness index and coexists with
-    // the tail) and given its OWN CAN event pointing at a successor that is NOT a
-    // member of our chain — the strongest id-reuse shape.
+    // An unrelated run that reused the same workflow_id. It stays
+    // CONTINUED_AS_NEW, so the active-run uniqueness index excludes it and it
+    // coexists with the tail. Its OWN CAN event points at a successor outside the
+    // chain. That is the strongest id-reuse shape.
     let unrelated = seed_run(
         &mut conn,
         "reuse-unrelated",

@@ -3,14 +3,14 @@
 //!
 //! Workflow-level retry (#523) starts each attempt as a **fresh execution** with
 //! a new `exec_id`, linked to its predecessor via `retry_of_exec_id`. The result
-//! wait already follows that chain (#842), but the *interactive and mutating*
-//! operations did not: a caller still holding the original handle would cancel a
-//! sealed `FAILED` predecessor while the retry kept running, drop a signal onto
-//! it, or be told the run is not running by a query/update.
+//! wait already follows that chain (#842). The *interactive and mutating*
+//! operations did not. A caller with the original handle could cancel a sealed
+//! `FAILED` predecessor while the retry kept running, or drop a signal onto it.
+//! A query/update could tell it the run was not running.
 //!
-//! These tests pin the "logical handle" contract: the original `exec_id` names
-//! the logical run, and every mutating/interactive operation is routed to the
-//! **live attempt** — the deepest execution reachable by following
+//! These tests pin the "logical handle" contract. The original `exec_id` names
+//! the logical run. Every mutating/interactive operation is routed to the
+//! **live attempt**: the deepest execution reachable by following
 //! `retry_of_exec_id` successors from `FAILED` rows.
 
 use std::any::TypeId;
@@ -50,9 +50,9 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
-/// (creating a fresh per-test database off it so tests in this binary never
-/// share state), else fall back to testcontainers.
+/// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`,
+/// else fall back to testcontainers. The URL path creates a fresh per-test
+/// database, so tests in this binary never share state.
 async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -130,10 +130,9 @@ impl CallCounter {
 /// Records which attempt numbers actually started executing, so a test can
 /// prove a cancelled chain never spawned a further attempt.
 ///
-/// `started` de-duplicates by execution id rather than by history length: a
-/// workflow body is re-driven on every replay cycle, and gating on
-/// `history_event_count()` would miscount an attempt whose first task already
-/// ingested a staged signal.
+/// `started` de-duplicates by execution id, not by history length. A workflow
+/// body is re-driven on every replay cycle. Gating on `history_event_count()`
+/// miscounts an attempt whose first task already ingested a staged signal.
 #[derive(Debug, Default)]
 struct AttemptLog {
     seen: Mutex<Vec<usize>>,
@@ -285,9 +284,10 @@ const fn fast_retry_policy(max_attempts: u32) -> RetryPolicy {
     }
 }
 
-/// A retry policy whose backoff is long enough that the successor's workflow
-/// task stays `PENDING` with a future `scheduled_at` for the whole test — the
-/// "queued retry" state AC2 names.
+/// A retry policy with a long backoff, for the "queued retry" state AC2 names.
+///
+/// The successor's workflow task stays `PENDING` with a future `scheduled_at`
+/// for the whole test.
 const fn slow_retry_policy(max_attempts: u32) -> RetryPolicy {
     RetryPolicy {
         max_attempts,
@@ -408,8 +408,9 @@ async fn delayed_pending_workflow_tasks(conn: &mut AsyncPgConnection, exec_id: E
         .expect("count delayed pending workflow tasks")
 }
 
-/// Wait until the retry successor of `original` exists and is still QUEUED —
-/// its workflow task is `PENDING` with a future `scheduled_at`, so the body has
+/// Wait until the retry successor of `original` exists and is still QUEUED.
+///
+/// Its workflow task is `PENDING` with a future `scheduled_at`, so the body has
 /// not run. Requires a long-backoff retry policy (see `slow_retry_policy`).
 async fn wait_for_queued_retry(conn: &mut AsyncPgConnection, original: ExecutionId) -> ExecutionId {
     for _ in 0..600 {
@@ -564,13 +565,14 @@ async fn cancelled_chain_never_spawns_a_further_attempt() {
     chain.stop().await;
 }
 
-/// AC2's second half — "prevent a queued retry from starting" — for the state
-/// that phrase actually names: a retry whose backoff has NOT elapsed, so its
-/// workflow task is still `PENDING` with a future `scheduled_at`.
+/// AC2's second half: "prevent a queued retry from starting".
 ///
-/// `cancelled_chain_never_spawns_a_further_attempt` cannot prove this: there the
-/// retry is already claimed and parked on a 3600 s timer, so it would never fail
-/// again and would never spawn attempt 3 with or without the cancel.
+/// The phrase names a retry whose backoff has NOT elapsed. Its workflow task is
+/// still `PENDING` with a future `scheduled_at`.
+///
+/// `cancelled_chain_never_spawns_a_further_attempt` cannot prove this. There the
+/// retry is already claimed and parked on a 3600 s timer. It never fails again
+/// and never spawns attempt 3, with or without the cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_removes_a_queued_retrys_delayed_task() {
     let (url, container) = setup().await;
@@ -802,11 +804,11 @@ async fn keyed_signal_dedupes_on_the_routed_live_attempt() {
 
 // ── AC1: the whole signal mailbox is forwarded across the retry boundary ──
 
-/// A retry replays an **empty** history and re-executes every step from zero, so
-/// a signal the failed attempt already observed is one the retry must observe
-/// again — else a workflow that replays back to `wait_for_signal` blocks forever
-/// on a signal its caller was already told had landed. So every row moves and
-/// `consumed` is re-armed, not just the unconsumed ones.
+/// A retry replays an **empty** history and re-executes every step from zero.
+/// So the retry must observe again each signal the failed attempt observed.
+/// Else a workflow that replays back to `wait_for_signal` blocks forever on a
+/// signal its caller was told had landed. So every row moves and `consumed` is
+/// re-armed, not just the unconsumed ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_whole_signal_mailbox_is_forwarded_and_re_armed() {
     let (url, _container) = setup().await;
@@ -937,9 +939,9 @@ async fn the_worker_forwards_the_mailbox_when_it_schedules_a_retry() {
 /// An update submitted against the ORIGINAL execution id must be admitted on
 /// the live retry attempt rather than rejected as not-running.
 ///
-/// Driven through `WorkflowHandle::execute_update_in_process` — the real
-/// production entry point — so the routing inside it is what is under test, not
-/// a hand-resolved target the test pre-computed for itself.
+/// Driven through `WorkflowHandle::execute_update_in_process`, the real
+/// production entry point. So the test covers the routing inside it, not a
+/// target the test resolved for itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_routes_to_the_live_retry_attempt() {
     let chain = parked_chain("route-update-001").await;
@@ -1021,9 +1023,11 @@ async fn handle_cancel_routes_to_the_live_retry_attempt() {
     chain.stop().await;
 }
 
-/// `WorkflowHandle::terminate` likewise — and terminate is the sharpest case,
-/// because it is idempotent on any terminal state, so an unrouted terminate
-/// silently reports success while the live attempt keeps running.
+/// `WorkflowHandle::terminate` routes likewise.
+///
+/// Terminate is the sharpest case, because it is idempotent on any terminal
+/// state. An unrouted terminate silently reports success while the live
+/// attempt keeps running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handle_terminate_routes_to_the_live_retry_attempt() {
     let chain = parked_chain("route-handle-terminate-001").await;
@@ -1055,9 +1059,9 @@ async fn handle_terminate_routes_to_the_live_retry_attempt() {
 // ── AC5: pause/resume — the REVERSIBLE containment lever ──────────────────
 
 /// Pause is the first rung of the containment ladder
-/// (`docs/runbooks/contain-runaway-execution.md`), and it accepts only a
-/// `RUNNING`/`PAUSED` row — so unrouted it 409s against the sealed `FAILED`
-/// predecessor, leaving an operator holding the logical handle only the
+/// (`docs/runbooks/contain-runaway-execution.md`). It accepts only a
+/// `RUNNING`/`PAUSED` row. Unrouted, it returns 409 for the sealed `FAILED`
+/// predecessor. An operator with the logical handle then has only the
 /// destructive levers. Resume must round-trip it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pause_and_resume_route_to_the_live_retry_attempt() {
@@ -1169,21 +1173,23 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
     );
 }
 
-/// Codex review (PR #1200): `RETRY_CHAIN_MAX_DEPTH` is a defensive backstop, not
-/// an enforced invariant — `RetryPolicy` accepts an arbitrary `u32`
-/// `max_attempts` and the builder's ceiling is optional, so a chain deeper than
-/// the bound is expressible. Exhausting the walk must FAIL CLOSED: the deepest
-/// row reached may itself be `FAILED` with a live successor beyond the bound, so
-/// returning it would silently route every signal / cancel / terminate / query /
-/// update / result to a stale attempt — the exact bug #843 exists to fix.
+/// PR #1200: `RETRY_CHAIN_MAX_DEPTH` is a defensive backstop, not an enforced
+/// invariant.
+///
+/// `RetryPolicy` accepts an arbitrary `u32` `max_attempts`, and the builder's
+/// ceiling is optional. So a chain deeper than the bound is expressible.
+/// Exhausting the walk must FAIL CLOSED. The deepest row reached may itself be
+/// `FAILED` with a live successor beyond the bound. Returning it silently
+/// routes every signal / cancel / terminate / query / update / result to a
+/// stale attempt. That is the exact bug #843 exists to fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
     let (url, _container) = setup().await;
     let mut conn = connect(&url).await;
 
-    // Build a chain strictly deeper than the bound, every link `FAILED` so the
-    // walk never short-circuits, and the deepest row `RUNNING` (a live attempt
-    // that the bounded walk provably cannot reach).
+    // Build a chain strictly deeper than the bound. Every link is `FAILED`, so
+    // the walk never short-circuits. The deepest row is `RUNNING`: a live
+    // attempt that the bounded walk provably cannot reach.
     let depth = autumn_harvest::execution::RETRY_CHAIN_MAX_DEPTH + 2;
     let mut previous: Option<ExecutionId> = None;
     let mut head: Option<ExecutionId> = None;
@@ -1228,9 +1234,8 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
         "expected a RetryChainMaxDepthExceeded error naming the depth, got {error:?}"
     );
 
-    // Falsifier: the live attempt genuinely IS beyond the bound, so the pre-fix
-    // behaviour (return the deepest row reached) would have handed back a
-    // `FAILED` row that still has a live successor.
+    // Falsifier: the live attempt IS beyond the bound. The pre-fix behaviour
+    // returned the deepest row reached: a `FAILED` row with a live successor.
     let live_state: String = harvest_workflow_executions::table
         .find(live.as_uuid())
         .select(harvest_workflow_executions::state)

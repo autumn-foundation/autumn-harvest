@@ -170,7 +170,6 @@ fn parse_version(text: &str) -> Result<OverlayVersion, AutumnError> {
         })
 }
 
-/// The HTTP error of a store error.
 fn store_error(error: &OverlayStoreError) -> AutumnError {
     let message = error.to_string();
     match error {
@@ -488,7 +487,6 @@ fn check_kind(kind: &str) -> Result<(), AutumnError> {
     Ok(())
 }
 
-/// The error of a bad request body.
 fn bad_body(rejection: &JsonRejection) -> AutumnError {
     AutumnError::bad_request_msg(format!(
         "invalid request body: {}",
@@ -496,7 +494,6 @@ fn bad_body(rejection: &JsonRejection) -> AutumnError {
     ))
 }
 
-/// The move of an activate request.
 async fn activate_move(
     api_state: &HarvestApiState,
     kind: &str,
@@ -665,7 +662,6 @@ fn policy_view(kind: &str, state: PolicyState) -> PolicyView {
     }
 }
 
-/// The settings that `entry` changed.
 fn entry_changes(entry: &PolicyLogEntry) -> Vec<PolicyChange> {
     let old = entry.before().cloned().unwrap_or_default();
     let new = entry.after().cloned().unwrap_or_default();
@@ -796,7 +792,6 @@ pub async fn list_policy_changes(
     Ok(Json(PolicyChangeList { kind, changes }))
 }
 
-/// The change of a set request.
 async fn set_policy_change(
     api_state: &HarvestApiState,
     kind: &str,

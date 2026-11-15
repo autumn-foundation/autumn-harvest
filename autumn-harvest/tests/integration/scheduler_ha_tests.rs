@@ -2,9 +2,9 @@
 //! HA scheduler tests — issue #350.
 //!
 //! Verifies that concurrent scheduler ticks on the same Postgres instance are
-//! safe: exactly one replica claims and fires each due schedule slot, and the
-//! `harvest.schedule.fire_attempts` metric is emitted with the correct outcome
-//! labels so operators can observe contention in production.
+//! safe. Exactly one replica claims and fires each due schedule slot. The
+//! `harvest.schedule.fire_attempts` metric carries the correct outcome labels,
+//! so operators can observe contention in production.
 //!
 //! The tests use a real Postgres container (testcontainers) to exercise the
 //! claim path end-to-end.
@@ -208,9 +208,10 @@ fn metrics_recorder_has_fire_attempt_method() {
     assert_eq!(got[1].outcome, "lost_race");
 }
 
-/// A due schedule whose claim token is live (`fire_claimed_until` in the future)
-/// must NOT be fired by a second tick — the claim is respected and no execution
-/// is created.
+/// A second tick must NOT fire a due schedule whose claim token is live.
+///
+/// The token is live while `fire_claimed_until` is in the future. The claim is
+/// respected and no execution is created.
 #[tokio::test]
 async fn test_live_claim_prevents_double_fire() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -339,9 +340,11 @@ async fn test_expired_claim_is_overridden_for_crash_recovery() {
     );
 }
 
-/// Two concurrent `tick_once` calls against the same Postgres must produce
-/// exactly one `harvest_workflow_executions` row — even when both replicas
-/// observe the same due schedule row before either has fired it.
+/// Two concurrent `tick_once` calls against one Postgres create exactly one
+/// `harvest_workflow_executions` row.
+///
+/// This holds even when both replicas observe the same due schedule row before
+/// either has fired it.
 ///
 /// This is the core AC for issue #350: N replicas, one schedule row, one fire.
 #[tokio::test]

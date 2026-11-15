@@ -325,8 +325,9 @@ async fn execute_admitted_update_replays_completed_result_without_rerunning() {
     assert!(result.is_ok());
     // Should get the recorded output, not the handler's output
     assert_eq!(result.unwrap()["approved"], serde_json::json!(true));
-    // handler_ran stays false because the closure is a different one; the key assertion
-    // is that the returned value matches the recorded history, not the live handler.
+    // `handler_ran` stays false because the closure is a different one. The key
+    // assertion is that the value matches the recorded history, not the live
+    // handler.
     let _ = handler_ran; // suppress unused warning
 }
 

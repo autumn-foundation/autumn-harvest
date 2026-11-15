@@ -1,10 +1,10 @@
 //! Stratified in-flight history sampling for the replay-drift gate (issue #798).
 //!
-//! Replay determinism is harvest's load-bearing production invariant: a code
-//! change that alters the command sequence of a `#[workflow]` function
-//! terminally fails every in-flight execution whose recorded history no longer
-//! matches. This module carries the **pure** vocabulary shared by the three
-//! parties in the gate loop, so the wire shape cannot drift between them:
+//! Replay determinism is the load-bearing production invariant of harvest. A
+//! change to the command sequence of a `#[workflow]` function terminally fails
+//! every in-flight execution whose recorded history no longer matches. This module
+//! holds the **pure** vocabulary of the three parties in the gate loop, so the
+//! wire shape cannot drift between them:
 //!
 //! 1. the management API (`GET /admin/history/export-sample`) — which *produces*
 //!    a stratified, cross-shard sample of currently non-terminal executions,
@@ -18,25 +18,23 @@
 //!
 //! # Why "in flight" is a narrower set than it looks
 //!
-//! Issue #798 specifies a default state set of `RUNNING,SUSPENDED,PAUSED`, but
-//! `SUSPENDED` is **not a persisted state** — the `harvest_workflow_executions`
-//! state `CHECK` constraint forbids it, and a workflow parked on a timer,
-//! signal, activity, or child workflow keeps `state = 'RUNNING'` with a
-//! detached `worker_id`. [`normalize_sample_states`] therefore accepts
-//! `SUSPENDED` as a documented **alias for `RUNNING`**, so the issue's literal
-//! default resolves to the correct non-terminal set, [`IN_FLIGHT_STATES`].
+//! Issue #798 specifies a default state set of `RUNNING,SUSPENDED,PAUSED`.
+//! `SUSPENDED` is **not a persisted state**: the `harvest_workflow_executions`
+//! state `CHECK` constraint forbids it. A workflow parked on a timer, signal,
+//! activity, or child workflow keeps `state = 'RUNNING'` with a detached
+//! `worker_id`. [`normalize_sample_states`] accepts `SUSPENDED` as a documented
+//! **alias for `RUNNING`**, so the literal default of the issue resolves to
+//! [`IN_FLIGHT_STATES`].
 //!
-//! Terminal states are rejected outright rather than silently sampled: the gate
-//! exists to protect runs that still need to resume, and a terminal execution
-//! can never resume.
+//! Terminal states are rejected, not silently sampled. The gate protects runs
+//! that still need to resume, and a terminal execution can never resume.
 
 use serde::{Deserialize, Serialize};
 
 /// The persisted non-terminal states — the executions the drift gate protects.
 ///
-/// `PAUSED` (issue #383) is a non-terminal *active* state and must be
-/// enumerated everywhere in-flight runs are, so it sits alongside `RUNNING`
-/// rather than being silently omitted.
+/// `PAUSED` (issue #383) is a non-terminal *active* state. Every list of
+/// in-flight runs must include it beside `RUNNING`.
 pub const IN_FLIGHT_STATES: &[&str] = &["RUNNING", "PAUSED"];
 
 /// Default number of executions sampled per registered workflow type.
@@ -53,30 +51,29 @@ pub const MAX_SAMPLE_TOTAL: usize = 2_000;
 /// Request-wide budget for the serialized bytes one sample export may hold in
 /// memory before responding.
 ///
-/// [`MAX_SAMPLE_TOTAL`] bounds the fixture *count*, but the per-execution
-/// `max_bytes` ceiling is caller-raisable and applies to each document
-/// independently, so the count cap alone leaves the *aggregate* unbounded: at
-/// the 10 MiB default that is ~20 GiB of documents accumulated before a single
-/// response is serialized. The management API is a shared service, so a routine
-/// authenticated CI export must not be able to exhaust it.
+/// [`MAX_SAMPLE_TOTAL`] bounds the fixture *count* only. The per-execution
+/// `max_bytes` ceiling is caller-raisable and applies to each document, so the
+/// *aggregate* stays unbounded. At the 10 MiB default that is ~20 GiB before a
+/// single response is serialized. The management API is a shared service, so a
+/// routine authenticated CI export must not exhaust it.
 ///
-/// The budget is checked *before* fetching each history — the size of a document
-/// is not knowable until it is loaded — so peak retained bytes are bounded by
-/// this budget plus at most one document. That is a bound only if one document is
-/// itself bounded, so the sample route also **rejects** a `max_bytes` above this
-/// budget: without that ceiling the budget starts at zero, the first candidate is
-/// therefore always fetched and retained however large it is, and a single
-/// multi-gigabyte history exhausts the API despite this cap. With the ceiling,
-/// peak retained is at most twice this budget.
+/// The budget is checked *before* each history fetch, because the size of a
+/// document is unknown until it loads. Peak retained bytes are then this budget
+/// plus at most one document. That holds only if one document is bounded too.
+/// So the sample route also **rejects** a `max_bytes` above this budget.
+/// Without that ceiling, retained bytes start at zero, so the first candidate
+/// is always fetched however large it is. A single multi-gigabyte history
+/// then exhausts the API despite this cap. With the ceiling, peak retained is
+/// at most twice this budget.
 ///
-/// A per-document limit larger than the whole response budget is also incoherent
-/// — such a document could never be returned within the budget — so it is
-/// refused at the edge rather than loaded and then failed.
+/// A per-document limit above the whole response budget is also incoherent:
+/// such a document could never fit in the budget. So the edge refuses it
+/// instead of loading it and failing.
 ///
-/// Hitting the budget is **never silent**: the export stops and
-/// [`SampleManifest::truncated_by_size`] records it, so the gate reports a
-/// bundle that is smaller than the sample the operator asked for rather than
-/// certifying a build against a quietly-trimmed subset.
+/// Hitting the budget is **never silent**. The export stops and
+/// [`SampleManifest::truncated_by_size`] records it. The gate then reports a
+/// bundle smaller than the requested sample. It does not certify a build
+/// against a quietly trimmed subset.
 pub const MAX_SAMPLE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How the stratified sample orders candidates within each workflow type.
@@ -85,10 +82,10 @@ pub const MAX_SAMPLE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 pub enum SampleOrder {
     /// Oldest in-flight executions first (the default).
     ///
-    /// This is the risk-weighted choice: the longer a run has been in flight,
-    /// the more of its history was recorded by *older* code, so it is the most
-    /// likely to diverge against a candidate build — and the most expensive to
-    /// lose, since it has the most work already invested.
+    /// This is the risk-weighted choice. The longer a run is in flight, the
+    /// more of its history *older* code recorded. So it is the most likely to
+    /// diverge against a candidate build. It is also the most expensive to
+    /// lose, because it holds the most work.
     #[default]
     Oldest,
     /// Most recently started executions first.
@@ -124,8 +121,8 @@ impl SampleOrder {
 /// Cross-shard completeness of a sample.
 ///
 /// A sample drawn while a shard was unreachable covers less than the fleet.
-/// That is reported, never hidden — an operator gating a deploy needs to know
-/// the difference between "no drift" and "no drift *in the part we could see*".
+/// That is always reported. An operator gating a deploy must tell "no drift"
+/// from "no drift *in the visible part*".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleStatus {
@@ -174,24 +171,22 @@ pub struct SampleWorkflowCoverage {
     pub in_flight_total: u64,
     /// The execution ids the export actually wrote a fixture for, sorted.
     ///
-    /// The inventory the gate reconciles the delivered bundle against. Counts
-    /// alone — even per-type counts — accept any *substitution* that preserves
-    /// them: swap one execution of this type for a duplicate of another, and
-    /// `sampled` still matches while a real in-flight history was never
-    /// replayed. Only identities can tell "the bundle I was given" apart from
-    /// "a bundle with the right shape".
+    /// The gate reconciles the delivered bundle against this inventory. Counts
+    /// alone, even per type, accept any *substitution* that preserves them.
+    /// Swap one execution for a duplicate of another, and `sampled` still
+    /// matches while a real in-flight history is never replayed. Only
+    /// identities tell "the delivered bundle" from "a bundle of the right shape".
     ///
-    /// Exactly the survivors, so this agrees with
-    /// [`sampled`](Self::sampled) by construction: a candidate the export
-    /// selected but could not fetch contributes neither an id nor a count (it
-    /// is reported through
+    /// It holds exactly the survivors, so it agrees with
+    /// [`sampled`](Self::sampled) by construction. A selected candidate that
+    /// the export could not fetch adds neither an id nor a count. It goes to
     /// [`SampleManifest::export_failures`](SampleManifest::export_failures)
-    /// instead).
+    /// instead.
     ///
     /// `#[serde(default)]` so a manifest written before this field existed
     /// reads back as empty rather than failing the whole bundle. An empty list
-    /// is therefore *no claim*, not a claim of zero — the gate falls back to
-    /// the per-type count check for such a manifest rather than reporting every
+    /// is therefore *no claim*, not a claim of zero. For such a manifest the
+    /// gate falls back to the per-type count check. It does not report every
     /// fixture as unexpected.
     #[serde(default)]
     pub sampled_execution_ids: Vec<crate::types::ExecutionId>,
@@ -231,28 +226,27 @@ pub struct SampleManifest {
     /// Whether the export stopped early because it reached
     /// [`MAX_SAMPLE_RESPONSE_BYTES`].
     ///
-    /// Distinct from [`is_truncated`](Self::is_truncated), and the distinction
-    /// is what an operator acts on: that method reports the *intended*
-    /// truncation of sampling `per_workflow` out of a larger population, while
-    /// this reports an *unplanned* resource limit. The fix differs — narrow the
-    /// export (fewer states, one shard, a lower `max_bytes`) rather than raise
-    /// `--per-workflow`.
+    /// Distinct from [`is_truncated`](Self::is_truncated), and an operator acts
+    /// on the difference. That method reports the *intended* truncation of
+    /// sampling `per_workflow` out of a larger population. This field reports
+    /// an *unplanned* resource limit. The fix is to narrow the export (fewer
+    /// states, one shard, a lower `max_bytes`), not to raise `--per-workflow`.
     ///
     /// `#[serde(default)]` so a manifest written before this field existed
     /// reads back as `false` rather than failing the whole bundle.
     #[serde(default)]
     pub truncated_by_size: bool,
-    /// How many candidates the sample *selected* but the export could not
-    /// produce a fixture for — a history over `max_bytes`, or a shard that
-    /// became unreadable between selection and fetch.
+    /// How many *selected* candidates got no fixture.
     ///
-    /// Load-bearing, because no other field can express it. The export records
-    /// a failure instead of a document and continues, so
-    /// [`sampled_total`](Self::sampled_total) counts only the *survivors* and
-    /// therefore agrees exactly with the fixture count in the bundle. Without
-    /// this the gate replays a silently smaller, biased sample — biased against
-    /// the largest histories, which are the longest-running and so the most
-    /// likely to span the code change under test — and reports it as a pass.
+    /// Causes are a history over `max_bytes`, or a shard that became unreadable
+    /// between selection and fetch.
+    ///
+    /// No other field can express this. The export records a failure instead
+    /// of a document and continues. So [`sampled_total`](Self::sampled_total)
+    /// counts only the *survivors* and matches the fixture count in the bundle.
+    /// Without this field the gate replays a silently smaller sample and
+    /// reports a pass. That sample is biased against the largest histories.
+    /// Those run longest, so they are the most likely to span the code change.
     ///
     /// `#[serde(default)]` so a manifest written before this field existed
     /// reads back as `0` rather than failing the whole bundle.
@@ -285,15 +279,14 @@ impl SampleManifest {
     ///
     /// Deliberately distinct from [`is_truncated`](Self::is_truncated). That
     /// method reports the *intended* truncation of drawing `per_workflow` out of
-    /// a larger population — the normal, documented mode of the gate, and never
-    /// on its own a reason to fail. This one reports that the export could not
-    /// deliver even the slice it chose, which is an *unplanned* shortfall the
-    /// gate must not certify a build against.
+    /// a larger population. That is the normal mode of the gate, and never on
+    /// its own a reason to fail. This one reports that the export could not
+    /// deliver even the slice it chose. The gate must not certify a build
+    /// against that *unplanned* shortfall.
     ///
-    /// Both causes are the same defect from the gate's point of view — the
-    /// verified set is a silent, biased subset of the requested one — so they
-    /// share one predicate rather than two rungs a caller could handle
-    /// inconsistently:
+    /// To the gate both causes are the same defect: the verified set is a
+    /// silent, biased subset of the requested one. So they share one predicate,
+    /// and a caller cannot handle them inconsistently:
     ///
     /// * [`truncated_by_size`](Self::truncated_by_size) — the export hit
     ///   [`MAX_SAMPLE_RESPONSE_BYTES`] and stopped early.
@@ -382,10 +375,9 @@ pub const fn clamp_per_workflow(requested: usize) -> usize {
 
 /// Merge per-shard coverage rows into one fleet-wide, name-sorted view.
 ///
-/// A workflow type observed on several shards has its `sampled`,
-/// `in_flight_total` and `sampled_execution_ids` merged, so `in_flight_total`
-/// is the true cross-shard population rather than whichever shard answered
-/// last.
+/// Rows of one workflow type from several shards merge their `sampled`,
+/// `in_flight_total` and `sampled_execution_ids`. So `in_flight_total` is the
+/// true cross-shard population, not the last shard to answer.
 #[must_use]
 pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWorkflowCoverage> {
     let mut merged: std::collections::BTreeMap<String, SampleWorkflowCoverage> =
@@ -408,9 +400,9 @@ pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWo
                 .extend(row.sampled_execution_ids.iter().copied());
         }
     }
-    // Sorted so the manifest is byte-stable across shard iteration order: two
-    // exports of the same sample must produce the same manifest, or a diff of
-    // two CI artifacts reports noise.
+    // Sorted so the manifest is byte-stable across shard iteration order. Two
+    // exports of the same sample must match, or a diff of two CI artifacts
+    // reports noise.
     for entry in merged.values_mut() {
         entry
             .sampled_execution_ids
@@ -421,10 +413,10 @@ pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWo
 
 /// Build a filesystem-safe fixture file name for one sampled execution.
 ///
-/// The execution id is a UUID and therefore inherently safe; the workflow name
-/// is registry-supplied but is sanitized anyway so a hostile or merely awkward
-/// workflow name can never escape the bundle directory (`../`, absolute paths,
-/// path separators, NUL) when the CLI writes the file.
+/// The execution id is a UUID, so it is safe. The workflow name comes from the
+/// registry but is sanitized anyway. So a hostile or awkward name can never
+/// escape the bundle directory when the CLI writes the file (`../`, absolute
+/// paths, path separators, NUL).
 #[must_use]
 pub fn fixture_file_name(workflow_name: &str, execution_id: &str) -> String {
     let mut safe: String = workflow_name
@@ -537,9 +529,9 @@ mod tests {
 
     #[test]
     fn merge_sums_across_shards_and_sorts_by_name() {
-        // Identities from two different shards must both survive the merge --
-        // a manifest that dropped one shard's ids would declare a bundle the
-        // gate could never reconcile.
+        // Identities from two shards must both survive the merge. A manifest
+        // without the ids of one shard declares a bundle the gate cannot
+        // reconcile.
         let alpha_shard0 = crate::types::ExecutionId::new();
         let alpha_shard1 = crate::types::ExecutionId::new();
         let zeta_id = crate::types::ExecutionId::new();
@@ -672,9 +664,8 @@ mod tests {
 
     /// A manifest written before `truncated_by_size` existed must still parse.
     ///
-    /// The gate reads bundles produced by whatever version exported them, so a
-    /// missing field has to default rather than fail the whole bundle — which
-    /// would turn an older artifact into a blocked gate.
+    /// The gate reads bundles from any exporting version. A missing field must
+    /// default, or an older artifact blocks the gate.
     #[test]
     fn manifest_without_truncated_by_size_defaults_to_false() {
         let legacy = serde_json::json!({
@@ -697,9 +688,9 @@ mod tests {
         assert!(!manifest.is_incomplete_export());
     }
 
-    /// The two shortfall causes are different defects with different fixes, but
-    /// the gate must treat them identically: either one means the bundle is a
-    /// silent subset of the slice the sample chose.
+    /// The two shortfall causes have different fixes, but the gate treats them
+    /// the same. Either one makes the bundle a silent subset of the chosen
+    /// slice.
     #[test]
     fn incomplete_export_covers_both_a_size_cut_and_dropped_candidates() {
         let base = SampleManifest {
@@ -752,9 +743,8 @@ mod tests {
     ///
     /// `MAX_SAMPLE_TOTAL` alone leaves the retained bytes unbounded, because
     /// `max_bytes` is per-document and caller-raisable. This pins the budget as
-    /// the load-bearing bound rather than a decorative constant: it has to be
-    /// smaller than what the count cap permits at the default per-document
-    /// ceiling, or it never binds.
+    /// the real bound, not a decorative constant. It must be smaller than the
+    /// count cap permits at the default per-document ceiling, or it never binds.
     #[test]
     fn response_byte_budget_binds_below_the_count_cap() {
         let unbounded_worst_case =
@@ -764,9 +754,8 @@ mod tests {
             "the byte budget must bind before the count cap does: {MAX_SAMPLE_RESPONSE_BYTES} \
              vs {unbounded_worst_case}"
         );
-        // And it must still admit a realistic bundle rather than cutting normal
-        // exports short: the default sample is 50 per type, and a typical
-        // in-flight history is well under 1 MiB.
+        // It must still admit a realistic bundle. The default sample is 50 per
+        // type, and a typical in-flight history is well under 1 MiB.
         let realistic_bundle = DEFAULT_PER_WORKFLOW_SAMPLE * 1024 * 1024;
         assert!(
             MAX_SAMPLE_RESPONSE_BYTES >= realistic_bundle,

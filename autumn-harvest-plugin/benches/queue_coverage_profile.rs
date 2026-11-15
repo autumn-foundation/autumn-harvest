@@ -9,21 +9,17 @@
 //! deterministic instruction count (`valgrind --tool=callgrind`) or an
 //! allocation count/bytes figure (`valgrind --tool=dhat`).
 //!
-//! **Correction (Codex review, PR #1554):** this doc comment previously
-//! claimed callgrind counts were bit-for-bit reproducible here. The
-//! reasoning was that every queue/worker name is a fixed, non-random
-//! string. That reasoning was wrong. `std::collections::HashSet`'s default
-//! `RandomState` reseeds every process. So hash *values* differ run to run,
-//! regardless of whether the *keys* are random. Fixed keys only avoid the
-//! *additional* variance source `dlq_aggregate_profile.rs` /
-//! `run_chain_profile.rs` document: a `Uuid`-keyed map, where the key
-//! itself is fresh per run.
-//! Measured spread on this machine, five callgrind runs of the indexed
-//! path: 23,780,878-23,784,259 instructions (about 0.014%). dhat's
-//! allocation count/bytes are unaffected by hash values (allocation
-//! *count* does not depend on bucket layout) and were confirmed identical
-//! across repeated runs. See `docs/performance-queue-coverage.md`'s
-//! "Measurement" section for the full before/after range.
+//! Callgrind counts are not bit-for-bit reproducible here, although every
+//! queue and worker name is a fixed string (PR #1554). The default
+//! `RandomState` of `std::collections::HashSet` reseeds every process, so
+//! hash *values* differ run to run. Fixed keys only avoid the *additional*
+//! variance of a `Uuid`-keyed map, which `dlq_aggregate_profile.rs` and
+//! `run_chain_profile.rs` document.
+//! On this machine, five callgrind runs of the indexed path spread over
+//! 23,780,878-23,784,259 instructions (about 0.014%). Hash values do not
+//! change the dhat allocation count or bytes, and repeated runs gave
+//! identical figures. The "Measurement" section of
+//! `docs/performance-queue-coverage.md` has the full before/after range.
 //!
 //! # Workload
 //!
@@ -39,26 +35,22 @@
 //! workers x queues-per-worker) nested scan, run on every single request to
 //! this endpoint.
 //!
-//! A large multi-tenant deployment is exactly the shape that stresses this.
-//! It has many independently-named queues, one or a few per tenant. It also
-//! has a large worker fleet, where each worker polls only a handful of
-//! queues. This
-//! harness builds `QUEUE_COVERAGE_PROFILE_PENDING` (default 2 000) distinct
-//! pending queue names, and `QUEUE_COVERAGE_PROFILE_WORKERS` (default
-//! 1 000) workers. Each worker polls `QUEUE_COVERAGE_PROFILE_QUEUES_PER_WORKER`
-//! (default 10) queues drawn from a "covered" sub-range. It deliberately
-//! leaves `QUEUE_COVERAGE_PROFILE_UNCOVERED` (default 150) queue names
-//! assigned to no worker at all: the genuinely-uncovered (typo'd/undeployed
-//! queue) rows this endpoint exists to surface. A handful of queue names
-//! are also marked paused (some covered, some in the uncovered range), so
-//! the paused-exclusion branch is exercised too. This matches a real mixed
-//! fleet rather than an all-covered or all-uncovered strawman.
+//! A large multi-tenant deployment stresses this shape. It has many
+//! queues, one or a few per tenant, and a large fleet where each worker
+//! polls a handful of queues. This harness builds
+//! `QUEUE_COVERAGE_PROFILE_PENDING` (default 2 000) distinct pending queue
+//! names and `QUEUE_COVERAGE_PROFILE_WORKERS` (default 1 000) workers. Each
+//! worker polls `QUEUE_COVERAGE_PROFILE_QUEUES_PER_WORKER` (default 10)
+//! queues from a "covered" sub-range. `QUEUE_COVERAGE_PROFILE_UNCOVERED`
+//! (default 150) queue names have no worker. They are the typo'd or
+//! undeployed queues that this endpoint exists to surface. Some covered and
+//! some uncovered queue names are paused, so the paused-exclusion branch
+//! runs too. This matches a real mixed fleet.
 //!
-//! Every pending/uncovered queue forces the pre-fix `.any()` scan to run to
-//! completion over every worker: no covering worker exists to
-//! short-circuit on. That is the worst case for the O(n x m) shape. Per the
-//! module's own doc comment, it is also the scenario this endpoint is
-//! specifically built to detect, not an adversarial edge case.
+//! An uncovered queue forces the pre-fix `.any()` scan over every worker,
+//! because no covering worker short-circuits it. That is the worst case for
+//! the O(n x m) shape. The `queue_coverage` module doc names it as the case
+//! this endpoint detects, not an adversarial edge case.
 //!
 //! # Running
 //!
@@ -72,8 +64,8 @@
 //! ```
 //!
 //! `QUEUE_COVERAGE_PROFILE_REPS` (default 1) repeats the whole build+call
-//! cycle. It mirrors `dlq_aggregate_profile.rs`'s/`run_chain_profile.rs`'s
-//! default-1 pattern for a single already-sizeable input.
+//! cycle. One rep suffices for an input this size, as in
+//! `dlq_aggregate_profile.rs` and `run_chain_profile.rs`.
 
 use std::collections::BTreeSet;
 
@@ -84,9 +76,8 @@ use autumn_harvest_plugin::queue_coverage::partition_uncovered_and_paused;
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
-/// Reads `key` as a `usize`, using `default` only when the variable is
-/// genuinely *absent*. A *present but malformed* value is a configuration
-/// error, not silently substituted for the default.
+/// Reads `key` as a `usize`. Only an *absent* variable gives `default`. A
+/// malformed value panics.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw
@@ -118,12 +109,10 @@ fn build_pending(num_pending: usize) -> Vec<PendingQueueDemand> {
         .collect()
 }
 
-/// `num_workers` workers, each polling `queues_per_worker` queue names drawn
-/// from `0..covered_pool` (never from the `[covered_pool, num_pending)`
-/// reserved-uncovered range). An empty `shard_assignments` array is the
-/// legacy single-shard registration. It covers whichever shard is
-/// inspected, so this fixture is valid for the `shard_id = 0` call below,
-/// regardless of stride.
+/// `num_workers` workers, each polling `queues_per_worker` queue names from
+/// `0..covered_pool`, never from the uncovered range. An empty
+/// `shard_assignments` array is the legacy single-shard registration. It
+/// covers every shard, so the fixture suits the `shard_id = 0` call.
 fn build_workers(
     num_workers: usize,
     covered_pool: usize,
@@ -131,13 +120,9 @@ fn build_workers(
 ) -> Vec<WorkerRow> {
     (0..num_workers)
         .map(|i| {
-            // Contiguous, non-overlapping `queues_per_worker`-wide blocks
-            // that exactly tile `0..covered_pool` (the caller asserts the
-            // pool divides evenly). `num_workers` exceeds
-            // `covered_pool / queues_per_worker` blocks. So, as `i` ranges
-            // over `num_workers`, every block gets at least one worker.
-            // Every covered-range queue name is genuinely covered, not
-            // merely "probably, for these seeds".
+            // Blocks of `queues_per_worker` names tile `0..covered_pool`
+            // exactly; the caller asserts that. There are at least as many
+            // workers as blocks, so every covered name has a worker.
             let start = (i * queues_per_worker) % covered_pool;
             let queues: Vec<String> = (0..queues_per_worker)
                 .map(|j| queue_name((start + j) % covered_pool))
@@ -184,8 +169,7 @@ fn main() {
         queues_per_worker > 0,
         "QUEUE_COVERAGE_PROFILE_QUEUES_PER_WORKER must be at least 1"
     );
-    // reps=0 would exit having measured nothing but arg-parsing cost, and
-    // could be mistaken for a valid (implausibly fast) measurement.
+    // reps=0 measures only argument parsing, which can pass for a fast run.
     assert!(
         reps > 0,
         "QUEUE_COVERAGE_PROFILE_REPS must be at least 1, got 0"
@@ -206,24 +190,18 @@ fn main() {
         covered_pool / queues_per_worker
     );
 
-    // A handful of paused queue names: three from the covered range, two
-    // from the reserved-uncovered range. So both the "paused and covered"
-    // branch (silently excluded, no special bookkeeping) and the "paused
-    // and uncovered" branch (`paused_uncovered`) run on every rep.
+    // Three paused names are covered and two are uncovered. So each rep
+    // runs both the "paused and covered" branch, which excludes silently,
+    // and the `paused_uncovered` branch.
     let paused_indices = [50usize, 500, 1_000, covered_pool + 10, covered_pool + 40];
     let paused: BTreeSet<String> = paused_indices
         .into_iter()
         .filter(|i| *i < num_pending)
         .map(queue_name)
         .collect();
-    // Derived from the deduplicated `paused` set intersected with the
-    // uncovered-range names, not a raw count of `paused_indices`. A custom
-    // `QUEUE_COVERAGE_PROFILE_*` combination can make `covered_pool + 10`
-    // or `covered_pool + 40` collide with one of the fixed indices above,
-    // or with each other. `paused` already dedups that collision by
-    // construction, but a raw index count would not. That would then
-    // disagree with the function's own (correct) output on such a
-    // combination.
+    // Count from the deduplicated `paused` set, not from `paused_indices`.
+    // A custom size can make two paused indices collide. A raw count would
+    // then disagree with the correct output of the function.
     let uncovered_range_names: BTreeSet<String> =
         (covered_pool..num_pending).map(queue_name).collect();
     let paused_in_uncovered_range = paused.intersection(&uncovered_range_names).count();
@@ -236,10 +214,8 @@ fn main() {
         let workers = build_workers(num_workers, covered_pool, queues_per_worker);
         let (rows, paused_uncovered) =
             partition_uncovered_and_paused(pending, &workers, &paused, 0);
-        // Self-check: the reserved-uncovered range, minus the ones also
-        // paused, must show up as genuinely uncovered on every rep. Without
-        // this, a future change to either this harness or the function
-        // under test could keep "measuring" a silently wrong result.
+        // Self-check, so a later change cannot measure a wrong result: the
+        // uncovered range, less its paused names, is uncovered on every rep.
         assert_eq!(
             rows.len(),
             expected_uncovered_rows,

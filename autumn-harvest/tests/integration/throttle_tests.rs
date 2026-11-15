@@ -15,9 +15,11 @@
 )]
 //! Workflow-start throttle integration tests — issue #607.
 //!
-//! Verifies the core throttle ACs against a real Postgres container:
-//! - **Success metric** — a burst of K distinct starts against rate N + burst B:
-//!   admitted-start rate ≤ N+B, zero dropped, zero rejected, all K eventually run.
+//! These tests check the core throttle ACs against a real Postgres container.
+//!
+//! - **Success metric** — a burst of K distinct starts against rate N + burst B.
+//!   The admitted-start rate stays ≤ N+B. None is dropped or rejected, and all
+//!   K eventually run.
 //! - **Durable across restart** — deferred rows survive a connection drop; the
 //!   scanner drains them.
 //! - **AC-a** — an id-reuse short-circuit at fire time refunds the token.
@@ -278,17 +280,18 @@ async fn start(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str, input: serde
     .expect("start");
 }
 
-// issue #1053 (review C): the throttle scanner now consults the process-global
-// `GLOBAL_ADMISSION_GATE_CACHE` at fire time (debounce/event_batch do not). This
-// `integration` binary shares that static with the admission-gate suites, so hold
-// their serial guard (`admission_gate_authoritative_tests::TEST_SERIAL`) and clear
-// any leftover/concurrent gate before firing — otherwise a gate armed by a sibling
-// test (or left behind by a panicked one) would spuriously BLOCK these fires. The
-// guard also makes the reset non-stomping: it is mutually exclusive with the gate
-// suites, which hold the same guard for their whole body. Holding a std guard
-// across the fire `.await` mirrors the gate suites (hence the scoped allows); the
-// guard is `!Send`, but these `#[tokio::test]` helpers run on a current-thread
-// runtime, so the future is never sent across threads.
+// Issue #1053: the throttle scanner now consults the process-global
+// `GLOBAL_ADMISSION_GATE_CACHE` at fire time (debounce/event_batch do not).
+// This `integration` binary shares that static with the admission-gate suites.
+// So hold their serial guard (`admission_gate_authoritative_tests::TEST_SERIAL`)
+// and clear any leftover or concurrent gate before firing. Otherwise a gate
+// armed by a sibling test, or left behind by a panicked one, would spuriously
+// BLOCK these fires. The guard also makes the reset non-stomping: it is
+// mutually exclusive with the gate suites, which hold the same guard for their
+// whole body. Holding a std guard across the fire `.await` mirrors the gate
+// suites, hence the scoped allows. The guard is `!Send`, but these
+// `#[tokio::test]` helpers run on a current-thread runtime. So the future is
+// never sent across threads.
 #[allow(clippy::await_holding_lock, clippy::future_not_send)]
 async fn drain(conn: &mut AsyncPgConnection, metrics: &RecordingMetrics) -> usize {
     let _serial = crate::admission_gate_authoritative_tests::TEST_SERIAL
@@ -373,10 +376,11 @@ async fn burst_paces_and_all_eventually_run() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 7);
     assert_eq!(metrics.throttled.lock().unwrap().len(), 7);
 
-    // Drain in paced refill steps. Each refill tops the bucket to `burst`; the
-    // token bucket caps available tokens at `burst` (`LEAST(burst, tokens…)`), so
-    // a single scanner pass can never admit more than `burst` starts — the rate
-    // bound. Loop refills until the backlog drains: all 7 eventually run.
+    // Drain in paced refill steps. Each refill tops the bucket to `burst`. The
+    // token bucket caps available tokens at `burst` (`LEAST(burst, tokens…)`).
+    // So a single scanner pass can never admit more than `burst` starts, which
+    // is the rate bound. Loop refills until the backlog drains: all 7
+    // eventually run.
     let mut total_fired = 0;
     while throttle_row_count(&mut conn, key).await > 0 {
         set_bucket_tokens(&mut conn, &bkey, burst).await;
@@ -469,10 +473,12 @@ async fn deferred_starts_survive_restart() {
 
 /// AC-a / bypass: a `reject_duplicate` admission for a `workflow_id` that
 /// already has an active execution is bypassed immediately at
-/// `reserve_or_defer` time — no token consumed, no pending row ever written.
-/// (Prior to the bypass fix this deferred and only short-circuited at fire
-/// time; the bypass check now closes the window where the caller was told
-/// `202 throttled` for a start that could never be admitted.)
+/// `reserve_or_defer` time.
+///
+/// No token is consumed, and no pending row is ever written. Before the bypass
+/// fix, this deferred and short-circuited only at fire time. The bypass check
+/// closes the window where the caller was told `202 throttled` for a start
+/// that could never be admitted.
 #[tokio::test]
 async fn reject_duplicate_bypasses_throttle_when_execution_already_active() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -533,9 +539,9 @@ async fn reject_duplicate_bypasses_throttle_when_execution_already_active() {
         execs_before,
         "no new execution created by the bypass check itself"
     );
-    // No token was ever touched by the bypassed admission (still at 0 from
-    // the seed consuming the sole burst token — a bypass neither reserves
-    // nor needs to refund).
+    // The bypassed admission never touched a token. The bucket is still at 0
+    // from the seed consuming the sole burst token. A bypass neither reserves
+    // nor needs to refund.
     assert!(
         bucket_tokens(&mut conn, &bkey).await < 0.01,
         "bypass must not touch the token bucket"
@@ -580,8 +586,10 @@ async fn allow_duplicate_failed_only_does_not_bypass_a_failed_prior() {
 }
 
 /// `terminate_if_running` never bypasses, even when an active execution
-/// exists -- it always starts fresh (cancel + replace), so it must still
-/// consume throttle pacing like any other genuine admission.
+/// exists.
+///
+/// It always starts fresh (cancel + replace), so it must still consume
+/// throttle pacing like any other genuine admission.
 #[tokio::test]
 async fn terminate_if_running_never_bypasses() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -613,12 +621,13 @@ async fn terminate_if_running_never_bypasses() {
     );
 }
 
-/// AC-a residual case: a row genuinely deferred (no active execution existed
-/// at admission time, so the bypass check did not fire) can still race
-/// against a *concurrent, unrelated* start for the same `workflow_id` landing
-/// before the scanner fires it. The fire-time `AlreadyExists` short-circuit
-/// must still refund the token and drop the row without creating a second
-/// execution.
+/// AC-a residual case: a genuinely deferred row can still race a
+/// *concurrent, unrelated* start for the same `workflow_id`.
+///
+/// No active execution existed at admission time, so the bypass check did not
+/// fire. The unrelated start lands before the scanner fires the row. The
+/// fire-time `AlreadyExists` short-circuit must still refund the token and
+/// drop the row without creating a second execution.
 #[tokio::test]
 async fn fire_time_already_exists_still_refunds_token() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -886,10 +895,12 @@ async fn backlog_read_returns_per_key_counts() {
     );
 }
 
-/// A retry of a request whose start is already durably deferred (e.g. a client
-/// timing out before it saw the first `202` and retrying) must not create a
-/// second independent pending row for the same `workflow_id` — it should land on
-/// the *same* queued admission (code-review fix, issue #607).
+/// A retry of a request whose start is already durably deferred lands on the
+/// *same* queued admission (issue #607).
+///
+/// An example is a client that times out before it sees the first `202` and
+/// retries. The retry must not create a second independent pending row for
+/// the same `workflow_id`.
 #[tokio::test]
 async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -959,7 +970,6 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
         ThrottleAdmission::Bypassed => panic!("no prior execution exists for this workflow_id"),
     };
 
-    // No second row was inserted.
     assert_eq!(
         throttle_row_count(&mut conn, key).await,
         1,
@@ -967,13 +977,12 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     );
     assert_eq!(retry_outcome.workflow_id, first_outcome.workflow_id);
 
-    // The retry observed the ORIGINAL row's deferred_at (not a fresh insert): a
+    // The retry observed the ORIGINAL row's deferred_at, not a fresh insert. A
     // third identical call must return the exact same DB-round-tripped
-    // timestamp as the retry did (both go through the idempotency lookup, so
-    // comparing them avoids an in-memory-vs-Postgres timestamp precision
-    // mismatch against `first_outcome`, whose `deferred_at` was captured
-    // client-side with nanosecond precision before Postgres's microsecond
-    // truncation on insert).
+    // timestamp as the retry did. Both go through the idempotency lookup. So
+    // comparing them avoids a precision mismatch against `first_outcome`.
+    // Its `deferred_at` was captured client-side with nanosecond precision,
+    // before Postgres truncated it to microseconds on insert.
     let third = reserve_or_defer(
         &mut conn,
         params(
@@ -998,11 +1007,12 @@ async fn retry_with_same_workflow_id_does_not_create_a_second_pending_row() {
     assert_eq!(third_outcome.deferred_at, retry_outcome.deferred_at);
 }
 
-/// Code-review fix (issue #607): a retry carrying the same `workflow_id` but
-/// resolving to a *different* throttle key must still land on the original
-/// pending row -- even when the new key's bucket has an available token --
-/// rather than winning `Reserved` under the new key and leaving the old
-/// pending row orphaned (silently dropped later as a duplicate).
+/// A retry with the same `workflow_id` but a *different* throttle key still
+/// lands on the original pending row (issue #607).
+///
+/// That holds even when the new key's bucket has an available token. The
+/// retry must not win `Reserved` under the new key. That would orphan the old
+/// pending row, which is later silently dropped as a duplicate.
 #[tokio::test]
 async fn retry_resolving_to_a_different_key_still_defers_to_the_original_row() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -1089,15 +1099,16 @@ async fn retry_resolving_to_a_different_key_still_defers_to_the_original_row() {
     );
 }
 
-/// P1 code-review fix: a single throttle key whose backlog exceeds
-/// `THROTTLE_FIRE_BATCH_SIZE` must not starve a *different* key's newer,
-/// ready-to-fire row. Before the fix the scanner's claim query was a flat
-/// `ORDER BY deferred_at ASC LIMIT THROTTLE_FIRE_BATCH_SIZE` — with more than
-/// `THROTTLE_FIRE_BATCH_SIZE` older rows all under one exhausted key, the
-/// claim would select *only* that key's rows every tick, never reaching a
+/// A single throttle key whose backlog exceeds `THROTTLE_FIRE_BATCH_SIZE` must
+/// not starve a *different* key's newer, ready-to-fire row.
+///
+/// Before the fix, the scanner's claim query was a flat
+/// `ORDER BY deferred_at ASC LIMIT THROTTLE_FIRE_BATCH_SIZE`. Take more than
+/// `THROTTLE_FIRE_BATCH_SIZE` older rows, all under one exhausted key. The
+/// claim then selected *only* that key's rows every tick, never reaching a
 /// newer row under any other key. The per-key-fair CTE caps how many rows one
-/// `bucket_key` can contribute per tick (`THROTTLE_FIRE_PER_KEY_CAP`),
-/// guaranteeing headroom for other keys within the same batch limit.
+/// `bucket_key` can contribute per tick (`THROTTLE_FIRE_PER_KEY_CAP`). That
+/// guarantees headroom for other keys within the same batch limit.
 #[tokio::test]
 async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -1107,7 +1118,7 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     let cold_key = "cold-tenant";
 
     // hot_key: seed its bucket empty, then defer strictly more rows than
-    // THROTTLE_FIRE_BATCH_SIZE -- all older than cold_key's row below, and its
+    // THROTTLE_FIRE_BATCH_SIZE. All are older than cold_key's row below. Its
     // bucket is never refilled (rate ~0), so none of them can ever fire.
     reserve_or_defer(
         &mut conn,
@@ -1186,8 +1197,8 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     .await
     .expect("cold_key row defers");
     assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
-    // Give cold_key's bucket a token so the scanner can admit it this tick --
-    // this is the "ready to fire" newer row that must not be starved.
+    // Give cold_key's bucket a token so the scanner can admit it this tick.
+    // This is the "ready to fire" newer row that must not be starved.
     set_bucket_tokens(&mut conn, &cold_bucket_key, 1.0).await;
 
     // One scanner tick.
@@ -1201,9 +1212,9 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
         0,
         "cold_key's ready row must have fired this tick, proving it wasn't starved"
     );
-    // hot_key's bucket never had a token, so its per-key-capped candidates
-    // (at most THROTTLE_FIRE_PER_KEY_CAP of them) are examined and left in
-    // place, not deleted -- the whole backlog survives untouched.
+    // hot_key's bucket never had a token. So the scanner examines its
+    // per-key-capped candidates (at most THROTTLE_FIRE_PER_KEY_CAP of them) and
+    // leaves them in place. The whole backlog survives untouched.
     assert_eq!(
         throttle_row_count(&mut conn, hot_key).await,
         hot_backlog_size,
@@ -1211,18 +1222,21 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
     );
 }
 
-/// Code-review fix (issue #607, P1): the per-key cap (`THROTTLE_FIRE_PER_KEY_CAP`)
-/// bounds how many rows a *single* key can contribute to a scanner tick's
-/// candidate set, but with the original flat `ORDER BY deferred_at ASC LIMIT
-/// $2` outer selection, enough concurrently-exhausted keys can still fill
-/// the *entire* batch budget with rows that can never fire: 10 exhausted
-/// keys, each with exactly `THROTTLE_FIRE_PER_KEY_CAP` (10) permanently-stuck
-/// rows, already exhausts a 100-row (`THROTTLE_FIRE_BATCH_SIZE`) batch --
-/// permanently starving an 11th key's single, genuinely ready row every
-/// tick, even though it's newer than all of them. Fixed by ordering the
-/// candidate selection by per-key rank first (`rn ASC, deferred_at ASC`):
-/// every distinct key's oldest row is considered in the first "tier" before
-/// any key's second-oldest row is considered.
+/// The per-key cap alone cannot stop exhausted keys from filling the batch
+/// (issue #607).
+///
+/// `THROTTLE_FIRE_PER_KEY_CAP` bounds how many rows a *single* key can
+/// contribute to a scanner tick's candidate set. But with the original flat
+/// `ORDER BY deferred_at ASC LIMIT $2` outer selection, enough concurrently
+/// exhausted keys can still fill the *entire* batch budget with rows that can
+/// never fire. Take 10 exhausted keys, each with exactly
+/// `THROTTLE_FIRE_PER_KEY_CAP` (10) permanently stuck rows. They already
+/// exhaust a 100-row (`THROTTLE_FIRE_BATCH_SIZE`) batch. That permanently
+/// starves an 11th key's single, genuinely ready row every tick, even though
+/// it is newer than all of them. The fix orders the candidate selection by
+/// per-key rank first (`rn ASC, deferred_at ASC`). So every distinct key's
+/// oldest row is considered in the first "tier", before any key's
+/// second-oldest row.
 #[tokio::test]
 async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
     use diesel_async::RunQueryDsl;
@@ -1231,9 +1245,9 @@ async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
     let wf = "sync_tenant";
 
     // 10 distinct "exhausted" keys, each with exactly THROTTLE_FIRE_PER_KEY_CAP
-    // rows and no corresponding bucket row ever created -- try_consume_rate_limit_token
-    // can never debit a nonexistent bucket, so these rows are permanently
-    // stuck. 10 keys x 10 rows = 100 rows total, exactly filling
+    // rows and no bucket row ever created. try_consume_rate_limit_token can
+    // never debit a nonexistent bucket, so these rows are permanently stuck.
+    // 10 keys x 10 rows = 100 rows total, exactly filling
     // THROTTLE_FIRE_BATCH_SIZE.
     for key_idx in 0..10 {
         let key = format!("exhausted-{key_idx}");
@@ -1265,9 +1279,9 @@ async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
         "100 permanently-stuck rows across 10 exhausted keys"
     );
 
-    // A fresh, 11th key's single row, deferred strictly after all 100
-    // exhausted rows (so it is the *newest* by deferred_at) and given a
-    // real, debitable token.
+    // A fresh, 11th key's single row, with a real, debitable token. It is
+    // deferred strictly after all 100 exhausted rows, so it is the *newest* by
+    // deferred_at.
     let fresh_key = "fresh";
     reserve_or_defer(
         &mut conn,
@@ -1317,19 +1331,20 @@ async fn scanner_does_not_starve_a_fresh_key_behind_many_exhausted_keys() {
     );
 }
 
-/// Code-review fix (issue #607, P2): the rank-then-date ordering fix above
-/// only bounds the damage to the first `THROTTLE_FIRE_BATCH_SIZE` distinct
-/// exhausted keys -- beyond that many, their rank-1 rows alone still fill
-/// the whole batch on every tick, since nothing excludes a genuinely
-/// exhausted bucket from the candidate set in the first place. This test
-/// creates *real*, genuinely-empty buckets (not merely missing ones) for
-/// 100 distinct keys -- exactly `THROTTLE_FIRE_BATCH_SIZE` -- plus one more
-/// (101st) key with a real, ready bucket, so all 101 keys tie at rank 1 and
-/// the fresh key's newer `deferred_at` would lose the date tie-break under
-/// rank-only ordering. Fixed by pre-filtering candidates to rows whose
-/// bucket snapshot currently shows an available token (or are already
-/// expired, or have no bucket at all) -- a genuinely exhausted bucket is
-/// never a candidate, at any scale.
+/// Rank-then-date ordering alone fails beyond `THROTTLE_FIRE_BATCH_SIZE`
+/// exhausted keys (issue #607).
+///
+/// The fix above bounds the damage only to the first
+/// `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys. Beyond that many, their
+/// rank-1 rows alone still fill the whole batch on every tick. Nothing
+/// excluded a genuinely exhausted bucket from the candidate set. This test
+/// creates *real*, genuinely empty buckets (not merely missing ones) for 100
+/// distinct keys, exactly `THROTTLE_FIRE_BATCH_SIZE`. One more (101st) key has
+/// a real, ready bucket. So all 101 keys tie at rank 1, and the fresh key's
+/// newer `deferred_at` would lose the date tie-break under rank-only ordering.
+/// The fix pre-filters candidates to rows whose bucket snapshot shows an
+/// available token, or that are already expired, or that have no bucket. A
+/// genuinely exhausted bucket is never a candidate, at any scale.
 #[tokio::test]
 async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhausted_keys() {
     use diesel_async::RunQueryDsl;
@@ -1337,9 +1352,9 @@ async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhaust
     let metrics = RecordingMetrics::default();
     let wf = "sync_tenant";
 
-    // 100 distinct keys, each with a *real* bucket showing 0 available
-    // tokens (refill_rate = 0, so it can never refill) and exactly one
-    // pending row (rank 1).
+    // 100 distinct keys, each with a *real* bucket showing 0 available tokens
+    // and exactly one pending row (rank 1). The refill_rate is 0, so a bucket
+    // can never refill.
     for key_idx in 0..THROTTLE_FIRE_BATCH_SIZE {
         let key = format!("real-exhausted-{key_idx}");
         let bkey = bucket_key(wf, &key);
@@ -1377,10 +1392,10 @@ async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhaust
         "100 rows across 100 keys with real, permanently-empty buckets"
     );
 
-    // A 101st key's single row, deferred strictly after all 100 exhausted
-    // rows (so it is the newest by deferred_at -- and would lose the
-    // rank-then-date tie-break if the exhausted rows were still candidates)
-    // with a real, debitable token.
+    // A 101st key's single row, with a real, debitable token. It is deferred
+    // strictly after all 100 exhausted rows, so it is the newest by
+    // deferred_at. It would lose the rank-then-date tie-break if the exhausted
+    // rows were still candidates.
     let fresh_key = "real-fresh";
     reserve_or_defer(
         &mut conn,
@@ -1428,19 +1443,19 @@ async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhaust
     );
 }
 
-// ── `skip_size_check` ordering fix (issue #607 round 4) ─────────────────────
+// ── `skip_size_check` ordering fix (issue #607) ─────────────────────────────
 //
-// Round 3 added an early oversized-input rejection at 4 call sites, running
-// *before* `reserve_or_defer` is ever called. That meant it could not see
-// either of `reserve_or_defer`'s own two idempotent-retry shortcuts --
-// `Bypassed` (an active execution already satisfies the reuse policy) or an
-// idempotent attach to an already-pending row -- so a retry carrying a
+// An earlier fix added an early oversized-input rejection at 4 call sites. It
+// ran *before* `reserve_or_defer` was ever called. So it could not see the two
+// idempotent-retry shortcuts of `reserve_or_defer`. One is `Bypassed`: an
+// active execution already satisfies the reuse policy. The other is an
+// idempotent attach to an already-pending row. A retry carrying a
 // stale/oversized body for an already-active or already-pending workflow_id
-// was wrongly rejected with a size error instead of correctly resolving to
-// the existing execution/pending row. `skip_size_check` is the shared
-// primitive extracted so every call site can ask "would `reserve_or_defer`
-// resolve this via one of its two no-fresh-row shortcuts?" before ever
-// looking at the payload size.
+// was then wrongly rejected with a size error. It should resolve to the
+// existing execution or pending row. `skip_size_check` is the shared
+// primitive that every call site asks before it looks at the payload size.
+// It answers: "would `reserve_or_defer` resolve this via one of its two
+// no-fresh-row shortcuts?"
 
 #[tokio::test]
 async fn skip_size_check_true_when_execution_already_active() {
@@ -1513,9 +1528,9 @@ async fn skip_size_check_true_when_pending_row_already_exists() {
     assert!(matches!(admit, ThrottleAdmission::Deferred(_)));
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 
-    // A retry for the same workflow_id with a stale/oversized body must not
-    // be rejected -- `reserve_or_defer` would resolve it to the same pending
-    // row (issue #607's own idempotent-retry guarantee), not insert a
+    // A retry for the same workflow_id with a stale/oversized body must not be
+    // rejected. `reserve_or_defer` would resolve it to the same pending row
+    // (issue #607's own idempotent-retry guarantee). It would not insert a
     // second, size-checked row.
     assert!(
         autumn_harvest::throttle::skip_size_check(&mut conn, wf, wf_id, None)
@@ -1544,13 +1559,13 @@ async fn skip_size_check_false_for_a_genuinely_fresh_workflow_id() {
 //
 // `reserve_or_defer` rejects a throttle key over `THROTTLE_KEY_MAX_BYTES`
 // bytes before it would ever be persisted into a bucket/pending row. That
-// check must not run ahead of the two idempotent-retry shortcuts (an active
-// execution already satisfying the reuse policy, or an existing pending row
-// for the same workflow_id) -- both resolve entirely from `workflow_id` and
-// never persist anything keyed by the (possibly over-long) `throttle_key`, so
-// a retry carrying a stale/new input that happens to resolve to an over-long
-// key must still attach to the existing execution/pending row rather than
-// fail with a key-length error.
+// check must not run ahead of the two idempotent-retry shortcuts. One is an
+// active execution that already satisfies the reuse policy. The other is an
+// existing pending row for the same workflow_id. Both resolve entirely from
+// `workflow_id` and never persist anything keyed by the (possibly over-long)
+// `throttle_key`. So a retry whose stale/new input resolves to an over-long
+// key must still attach to the existing execution or pending row. It must
+// not fail with a key-length error.
 
 fn oversized_key() -> String {
     "k".repeat(autumn_harvest::throttle::THROTTLE_KEY_MAX_BYTES + 1)
@@ -1615,8 +1630,8 @@ async fn oversized_key_resolves_to_existing_pending_row() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 
     // A retry for the same workflow_id, whose stale/new input now resolves to
-    // an over-long key, must still resolve to the *existing* pending row --
-    // not fail on key length, and not insert a second row.
+    // an over-long key, must still resolve to the *existing* pending row. It
+    // must not fail on key length, and must not insert a second row.
     let oversized = oversized_key();
     let retry = reserve_or_defer(
         &mut conn,
@@ -1639,12 +1654,12 @@ async fn oversized_key_resolves_to_existing_pending_row() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
     assert_eq!(throttle_row_count(&mut conn, &oversized).await, 0);
 
-    // A third call (also via an oversized key) must land on the exact same
-    // row as the retry -- comparing two DB-round-tripped outcomes avoids the
-    // in-memory-vs-Postgres timestamp precision mismatch a comparison against
-    // `first_outcome` would hit (its `deferred_at` was captured client-side
-    // with nanosecond precision before Postgres's microsecond truncation on
-    // insert; see `retry_with_same_workflow_id_does_not_create_a_second_pending_row`).
+    // A third call, also via an oversized key, must land on the exact same row
+    // as the retry. Comparing two DB-round-tripped outcomes avoids a timestamp
+    // precision mismatch against `first_outcome`. Its `deferred_at` was
+    // captured client-side with nanosecond precision, before Postgres
+    // truncated it to microseconds on insert. See
+    // `retry_with_same_workflow_id_does_not_create_a_second_pending_row`.
     let third = reserve_or_defer(
         &mut conn,
         params(
@@ -1667,13 +1682,14 @@ async fn oversized_key_resolves_to_existing_pending_row() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 }
 
-/// Code-review fix (issue #607 round 7): `ThrottleDeferOutcome::fresh` must
-/// distinguish a brand-new pending row (this call durably inserted it) from
-/// an idempotent attach to an already-existing pending row (a retry for the
-/// same `workflow_id` resolved via `reserve_or_defer`'s own step-1
-/// shortcut) -- callers that count admissions (e.g. `schedule_backfill`'s
-/// `dispatched`/`max_runs` budget) must not treat the latter as a new
-/// admission.
+/// `ThrottleDeferOutcome::fresh` tells a new pending row from an idempotent
+/// attach (issue #607).
+///
+/// A fresh row is one this call durably inserted. An attach is a retry for the
+/// same `workflow_id` that the step-1 shortcut of `reserve_or_defer` resolved
+/// to an existing pending row. Callers that count admissions must not treat an
+/// attach as a new admission. An example is the `dispatched`/`max_runs` budget
+/// of `schedule_backfill`.
 #[tokio::test]
 async fn fresh_deferral_is_true_only_on_the_first_insert_not_on_a_retry() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -1759,14 +1775,14 @@ async fn oversized_key_still_rejected_for_a_genuinely_fresh_admission() {
     assert!(err.to_string().contains("exceeds maximum"), "{err}");
 }
 
-/// Code-review fix (issue #607): a pending row already past its
-/// `schedule_to_start` deadline must not be treated as an idempotent
-/// already-pending admission, even if the scanner hasn't dropped it yet
-/// (e.g. a delayed tick, or the retry racing the timeout sweep). Without the
-/// fix, a retry for the same `workflow_id` would silently return the stale
-/// row's `Deferred` outcome; the scanner then times out and deletes that row
-/// without ever starting a workflow, so the caller's accepted retry never
-/// actually runs.
+/// A pending row already past its `schedule_to_start` deadline is not an
+/// idempotent already-pending admission (issue #607).
+///
+/// That holds even if the scanner has not dropped it yet, for example after a
+/// delayed tick, or when the retry races the timeout sweep. Without the fix, a
+/// retry for the same `workflow_id` would silently return the stale row's
+/// `Deferred` outcome. The scanner then times out and deletes that row without
+/// ever starting a workflow. So the caller's accepted retry never runs.
 #[tokio::test]
 async fn expired_pending_row_is_not_returned_by_idempotent_retry_lookup() {
     use diesel_async::RunQueryDsl;
@@ -1831,7 +1847,7 @@ async fn expired_pending_row_is_not_returned_by_idempotent_retry_lookup() {
         "an expired pending row must not count as an already-pending admission"
     );
 
-    // A retry must not silently bind to the doomed row -- it must create a
+    // A retry must not silently bind to the doomed row. It must create a
     // genuinely fresh admission (a second row), not report the stale row's
     // outcome.
     let retry = reserve_or_defer(
@@ -1990,39 +2006,38 @@ async fn schedule_row(
         .expect("schedule row")
 }
 
-/// Code-review fix (issue #607): a scheduled fire whose input exceeds the
-/// effective byte cap must not be durably deferred by the throttle -- it
-/// must fail fast (before `reserve_or_defer` ever runs), leaving zero
-/// `harvest_start_throttle` rows and zero new executions, and must NOT
-/// advance `last_run_at`/`next_run_at` so the next tick retries the exact
-/// same slot rather than silently skipping it. Note: `tick_once` itself
-/// still returns `Ok(())` -- one schedule's dispatch failure is isolated
-/// from the rest of the tick by `tick_workflow_schedules`'s own per-schedule
-/// error handling (log + continue), so the fixed behavior is proven by the
-/// per-schedule assertions below, not by the tick's overall return value.
+/// A scheduled fire whose input exceeds the effective byte cap fails fast
+/// instead of being durably deferred (issue #607).
+///
+/// It fails before `reserve_or_defer` ever runs. It leaves zero
+/// `harvest_start_throttle` rows and zero new executions. It must NOT advance
+/// `last_run_at`/`next_run_at`, so the next tick retries the exact same slot
+/// instead of silently skipping it. Note: `tick_once` itself still returns
+/// `Ok(())`. The per-schedule error handling (log + continue) of
+/// `tick_workflow_schedules` isolates one schedule's dispatch failure from the
+/// rest of the tick. So the per-schedule assertions below prove the fixed
+/// behavior, not the tick's overall return value.
 #[tokio::test]
 async fn scheduler_tick_rejects_oversized_input_before_deferring() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "oversized_sched_wf";
 
-    // Per-workflow `max_input_bytes` only *raises* the registry-wide floor
-    // (`DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB, via
-    // `effective_cap = max(per_workflow_cap, registry.max_workflow_input_bytes)`),
-    // so the input must exceed the 2 MiB registry default, not the small
-    // per-workflow cap configured above.
+    // Per-workflow `max_input_bytes` only *raises* the registry-wide floor:
+    // `effective_cap = max(per_workflow_cap, registry.max_workflow_input_bytes)`,
+    // and `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` is 2 MiB. So the input must exceed
+    // the 2 MiB registry default, not the small per-workflow cap set above.
     let oversized_input = serde_json::json!({ "payload": "x".repeat(3 * 1024 * 1024) });
     let sched_id = insert_schedule_with_input(&mut conn, wf_name, oversized_input).await;
     let (last_run_before, next_run_before) = schedule_row(&mut conn, sched_id).await;
 
-    // Drain the throttle bucket to zero tokens first (a throwaway seed call
-    // with burst=1, `ON CONFLICT DO NOTHING` on the bucket row means this
-    // first insert's burst wins), so that WITHOUT this fix the oversized
-    // fire would hit the `Deferred` branch and durably persist a pending
-    // row -- exactly the bug being tested. With a fresh, unconsumed bucket
-    // (the registered policy's burst=100), the oversized fire would instead
-    // reach `Reserved` and fall through to the pre-existing, already-correct
-    // immediate-path cap enforcement, which cannot distinguish this fix from
-    // its absence.
+    // Drain the throttle bucket to zero tokens first, with a throwaway seed
+    // call with burst=1. `ON CONFLICT DO NOTHING` on the bucket row means this
+    // first insert's burst wins. WITHOUT this fix, the oversized fire would
+    // then hit the `Deferred` branch and durably persist a pending row, which
+    // is exactly the bug under test. A fresh, unconsumed bucket (the registered
+    // policy's burst=100) would let the oversized fire reach `Reserved`. It
+    // would fall through to the pre-existing, already-correct immediate-path
+    // cap enforcement, which cannot distinguish this fix from its absence.
     reserve_or_defer(
         &mut conn,
         AdmitThrottleParams {
@@ -2046,15 +2061,11 @@ async fn scheduler_tick_rejects_oversized_input_before_deferring() {
     let registry = make_throttled_registry(wf_name);
     let dags = Arc::new(DagCatalog::default());
 
-    // `tick_once` isolates one schedule's dispatch failure from the rest of
-    // the tick: `tick_workflow_schedules`'s per-schedule loop catches
-    // `tick_one_workflow_schedule`'s error, logs it, clears the schedule's
-    // fire claim, and continues to the next schedule -- it never propagates
-    // to `tick_once`'s own `Result` (so one misconfigured/oversized schedule
-    // can't halt every other schedule sharing the tick). The real proof that
-    // THIS schedule's dispatch failed-without-advancing lives in the
-    // execution/throttle-row/last_run_at assertions below, not in the tick's
-    // overall return value.
+    // The per-schedule loop of `tick_workflow_schedules` catches the error of
+    // `tick_one_workflow_schedule`, logs it, clears the schedule's fire claim,
+    // and continues. The error never reaches the `Result` of `tick_once`, so
+    // one oversized schedule cannot halt every other schedule in the tick. The
+    // assertions below prove that THIS dispatch failed without advancing.
     let result = tick_once(
         pool.clone(),
         registry.clone(),
@@ -2092,15 +2103,17 @@ async fn scheduler_tick_rejects_oversized_input_before_deferring() {
     );
 }
 
-/// Code-review fix (issue #607, P1): a throttled scheduled fire durably
-/// defers before any `harvest_workflow_executions` row exists. The
-/// scheduler's `max_active_runs`/overlap gate is computed solely from that
-/// table, so -- without counting pending throttle rows -- a schedule with
-/// `max_active_runs = 1` could dispatch (and defer) a *second* slot on a
-/// later tick while the first deferred fire is still sitting in the
-/// throttle queue, never having started an execution. This violates the
-/// schedule's own concurrency guarantee and lets throttled schedules
-/// overlap in a way the unthrottled scheduler would have skipped/buffered.
+/// A throttled scheduled fire counts against `max_active_runs` before it has
+/// an execution row (issue #607).
+///
+/// The fire durably defers before any `harvest_workflow_executions` row
+/// exists. The scheduler's `max_active_runs`/overlap gate is computed solely
+/// from that table. Without counting pending throttle rows, a schedule with
+/// `max_active_runs = 1` could dispatch (and defer) a *second* slot on a later
+/// tick. The first deferred fire would still sit in the throttle queue, never
+/// having started an execution. That violates the schedule's own concurrency
+/// guarantee. Throttled schedules would overlap where the unthrottled
+/// scheduler would have skipped or buffered.
 #[tokio::test]
 async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
     use diesel_async::RunQueryDsl;
@@ -2108,9 +2121,9 @@ async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
     let wf_name = "throttled_overlap_wf";
 
     // Seed the bucket with capacity exactly 1 (not the registered policy's
-    // real burst=100) so the very first admission attempt drains it --
-    // `ensure_throttle_bucket`'s `ON CONFLICT (key) DO NOTHING` means
-    // whichever call creates the bucket row wins its burst/refill_rate.
+    // real burst=100), so the very first admission attempt drains it.
+    // `ensure_throttle_bucket` uses `ON CONFLICT (key) DO NOTHING`, so the call
+    // that creates the bucket row wins its burst/refill_rate.
     reserve_or_defer(
         &mut conn,
         AdmitThrottleParams {
@@ -2174,9 +2187,9 @@ async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
     drop(conn);
 
     // Second tick: without the fix, `running` (computed only from
-    // harvest_workflow_executions) is still 0, so max_active_runs=1 would
-    // not block a second dispatch -- the schedule would defer a *second*
-    // pending row even though the first deferred fire hasn't started yet.
+    // harvest_workflow_executions) is still 0. So max_active_runs=1 would not
+    // block a second dispatch. The schedule would defer a *second* pending row
+    // even though the first deferred fire has not started yet.
     tick_once(
         pool.clone(),
         registry.clone(),
@@ -2198,11 +2211,13 @@ async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
     assert_eq!(execution_count(&mut conn, wf_name).await, 0);
 }
 
-/// Insert a schedule row with a pre-populated `buffered_runs` slot (a single
-/// past fire time), the buffered/backfill drain path's trigger condition
-/// (`jsonb_array_length(buffered_runs) > 0`), whose `workflow_input` is the
-/// caller-supplied JSON value. `next_run_at` is left far in the future so
-/// only the buffered-drain path (not the normal tick path) can dispatch it.
+/// Insert a schedule row with one pre-populated `buffered_runs` slot and a
+/// caller-supplied `workflow_input`.
+///
+/// The slot holds a single past fire time. It is the buffered/backfill drain
+/// path's trigger condition (`jsonb_array_length(buffered_runs) > 0`).
+/// `next_run_at` is far in the future, so only the buffered-drain path (not
+/// the normal tick path) can dispatch it.
 async fn insert_schedule_with_buffered_slot(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
@@ -2254,12 +2269,13 @@ async fn schedule_buffered_runs(conn: &mut AsyncPgConnection, id: Uuid) -> Vec<S
         .unwrap_or_default()
 }
 
-/// Same fix, buffered/backfill-fire loop (issue #607, P1): a throttled
-/// buffered-slot fire durably defers before any execution row exists, so
-/// this loop's `available = max_active_runs - running` must also count
-/// pending throttle rows -- otherwise a schedule with `max_active_runs = 1`
-/// could drain (and defer) a second buffered slot on a later tick while an
-/// earlier deferred fire from this same loop is still queued.
+/// The same fix for the buffered/backfill-fire loop (issue #607).
+///
+/// A throttled buffered-slot fire durably defers before any execution row
+/// exists. So this loop's `available = max_active_runs - running` must also
+/// count pending throttle rows. Otherwise a schedule with
+/// `max_active_runs = 1` could drain (and defer) a second buffered slot on a
+/// later tick. An earlier deferred fire from this loop would still be queued.
 #[tokio::test]
 async fn throttled_buffered_deferral_counts_against_max_active_runs() {
     use diesel_async::RunQueryDsl;
@@ -2336,9 +2352,9 @@ async fn throttled_buffered_deferral_counts_against_max_active_runs() {
         .expect("re-populate buffered_runs");
     drop(conn);
 
-    // Second tick: without the fix, `running` is still 0 (the first
-    // deferred fire never started an execution), so max_active_runs=1 would
-    // not block draining the second buffered slot too.
+    // Second tick: without the fix, `running` is still 0, because the first
+    // deferred fire never started an execution. So max_active_runs=1 would not
+    // block draining the second buffered slot too.
     tick_once(
         pool.clone(),
         registry.clone(),
@@ -2365,13 +2381,15 @@ async fn throttled_buffered_deferral_counts_against_max_active_runs() {
     );
 }
 
-/// Code-review fix (issue #607, proactive): the buffered/backfill-fire loop
-/// previously enforced **no cap at all** on either its throttle or immediate
-/// path (`None`/`0` are both "no cap" sentinels). A buffered slot whose input
-/// exceeds the effective cap and whose throttle bucket is empty must be
-/// dropped (not durably deferred, not retried forever) -- mirroring the
-/// scheduler-tick fix above, but via this loop's own `break`-and-drop
-/// convention rather than `return Err`.
+/// The buffered/backfill-fire loop drops an oversized slot whose throttle
+/// bucket is empty (issue #607).
+///
+/// The loop previously enforced **no cap at all** on either its throttle or
+/// immediate path (`None`/`0` are both "no cap" sentinels). A buffered slot
+/// whose input exceeds the effective cap and whose bucket is empty must be
+/// dropped, not durably deferred and not retried forever. This mirrors the
+/// scheduler-tick fix above, through this loop's own `break`-and-drop
+/// convention instead of `return Err`.
 #[tokio::test]
 async fn buffered_drain_drops_oversized_slot_before_deferring() {
     let (mut conn, url, _c) = setup_db().await;
@@ -2380,11 +2398,10 @@ async fn buffered_drain_drops_oversized_slot_before_deferring() {
     let oversized_input = serde_json::json!({ "payload": "x".repeat(3 * 1024 * 1024) });
     let sched_id = insert_schedule_with_buffered_slot(&mut conn, wf_name, oversized_input).await;
 
-    // Drain the throttle bucket first, exactly as in the scheduler-tick test:
-    // without this, a fresh bucket would let the oversized slot reach
-    // `Reserved` and fall through to the pre-existing immediate-path cap
-    // enforcement, making this test unable to distinguish the fix from its
-    // absence.
+    // Drain the throttle bucket first, exactly as in the scheduler-tick test.
+    // Otherwise a fresh bucket would let the oversized slot reach `Reserved`
+    // and fall through to the pre-existing immediate-path cap enforcement. The
+    // test could then not distinguish the fix from its absence.
     reserve_or_defer(
         &mut conn,
         AdmitThrottleParams {
@@ -2445,11 +2462,11 @@ async fn buffered_drain_drops_oversized_slot_before_deferring() {
 //
 // The scheduler-tick and buffered/backfill-fire throttle branches persist
 // `schedule_id`/`scheduled_for`/`origin` into the deferred row's
-// `start_options` so the eventual scanner-driven fire is attributed exactly
+// `start_options`. So the eventual scanner-driven fire is attributed exactly
 // as an immediate fire would be (carryover, run-history). That attribution
-// must extend to `harvest.schedule.runs` too -- otherwise every scheduled
-// slot that happened to defer silently undercounts the metric even though
-// it is later dispatched.
+// must extend to `harvest.schedule.runs` too. Otherwise every scheduled slot
+// that happened to defer silently undercounts the metric, even though it is
+// later dispatched.
 
 #[tokio::test]
 async fn scanner_fire_of_a_scheduled_deferral_records_schedule_run_metric() {
@@ -2460,10 +2477,10 @@ async fn scanner_fire_of_a_scheduled_deferral_records_schedule_run_metric() {
     let bkey = bucket_key(wf, key);
     let wf_id = "scheduled-deferred-job";
 
-    // Drain the sole burst token first (burst must be >= 1.0 -- a bucket
-    // capacity of 0.0 could never debit a token no matter what
-    // `set_bucket_tokens` sets afterward, since the debit query caps refill
-    // at `burst`) so the real admission below genuinely defers.
+    // Drain the sole burst token first, so the real admission below genuinely
+    // defers. Burst must be >= 1.0. The debit query caps refill at `burst`, so
+    // a bucket capacity of 0.0 could never debit a token, whatever
+    // `set_bucket_tokens` sets afterward.
     reserve_or_defer(
         &mut conn,
         AdmitThrottleParams {
@@ -2573,13 +2590,15 @@ async fn scanner_fire_of_a_non_scheduled_deferral_does_not_record_schedule_run_m
     );
 }
 
-/// Code-review fix (issue #607): the HTTP manual-backfill endpoint's
-/// throttle wiring persists `schedule_id` (for carryover lineage, #488) just
-/// like the scheduler-tick/buffered-run branches do, but its own immediate
-/// (unthrottled) dispatch path never calls `record_schedule_run` -- so
-/// gating solely on `schedule_id.is_some()` would let a *throttled* backfill
-/// fire inflate `harvest.schedule.runs` while an *unthrottled* backfill
-/// (through the exact same handler) never does. Must be gated on
+/// A scanner fire of a backfill deferral does not record the schedule-run
+/// metric (issue #607).
+///
+/// The HTTP manual-backfill endpoint's throttle wiring persists `schedule_id`
+/// (for carryover lineage, #488), like the scheduler-tick and buffered-run
+/// branches. But its own immediate (unthrottled) dispatch path never calls
+/// `record_schedule_run`. Gating solely on `schedule_id.is_some()` would let a
+/// *throttled* backfill fire inflate `harvest.schedule.runs`, while an
+/// *unthrottled* backfill through the same handler never does. So the gate is
 /// `origin == "scheduled"`, not merely the presence of a schedule_id.
 #[tokio::test]
 async fn scanner_fire_of_a_backfill_deferral_does_not_record_schedule_run_metric() {

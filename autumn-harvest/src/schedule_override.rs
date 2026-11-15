@@ -1043,7 +1043,6 @@ async fn delete_override(
     Ok(deleted > 0)
 }
 
-/// Insert or replace one override row.
 async fn upsert_override(
     conn: &mut AsyncPgConnection,
     row: &StoredOverride<'_>,

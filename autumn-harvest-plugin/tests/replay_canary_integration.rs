@@ -70,7 +70,7 @@ async fn test_replay_canary_api_endpoint() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // Authenticated request (admin) should hit the route and return a Pass verdict report
+    // An admin request reaches the route and gets a pass verdict report.
     let auth_req = Request::builder()
         .method("POST")
         .uri("/admin/workflows/replay-canary")
@@ -184,7 +184,6 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
         .await
         .unwrap();
 
-    // Event 1: WorkflowStarted
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
         timestamp: Utc::now(),
@@ -206,7 +205,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
         .await
         .unwrap();
 
-    // Event 2: ActivityScheduled with a mismatching activity name "different_activity"
+    // The recorded activity name differs from the one the workflow schedules.
     let act_event = WorkflowEvent::ActivityScheduled {
         activity_id: ActivityExecId::new(),
         name: "different_activity".to_string(),
@@ -227,7 +226,6 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
         .await
         .unwrap();
 
-    // Hit the endpoint.
     let auth_req = Request::builder()
         .method("POST")
         .uri("/admin/workflows/replay-canary")

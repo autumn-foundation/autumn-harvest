@@ -2,41 +2,41 @@
 //! returns the `.mir` files (located from cargo's JSON artifact messages).
 //!
 //! The whole substrate decision of D1 lives here. `rustc --emit=mir` is stable,
-//! but *finding* the file it wrote is not: the name carries cargo's metadata
-//! hash, so the only reliable route is cargo's own `--message-format=json`
-//! `compiler-artifact` messages, whose `filenames` name the rlib/binary the
+//! but *finding* the file it wrote is not. The name carries cargo's metadata
+//! hash. So the only reliable route is cargo's own `--message-format=json`
+//! `compiler-artifact` messages. Their `filenames` name the rlib/binary the
 //! `.mir` sits beside.
 //!
 //! Three invariants the driver enforces rather than assumes:
 //!
-//! * **opt-level 0.** At `-C opt-level=1` and above, rustc inlines the very
-//!   helper calls the interprocedural analysis exists to follow, so a laundered
-//!   source disappears into its caller and the tool would report
+//! * **opt-level 0.** At `-C opt-level=1` and above, rustc inlines the helper
+//!   calls that the interprocedural analysis exists to follow. A laundered
+//!   source then disappears into its caller. The tool would report
 //!   `proven-deterministic` for a workflow that is not. An optimized profile is
 //!   refused ([`crate::Error::Cargo`]), never silently accepted. The guard reads
 //!   `CARGO_ENCODED_RUSTFLAGS` with its `\x1f` separator and the plain-text
 //!   flag variables on whitespace, so a multi-flag `-O` cannot slip past it.
 //! * **this run's artifacts only.** A `compiler-artifact` message is accepted
-//!   only when its `package_id` is one of the ids `cargo metadata` resolved for
-//!   the packages this invocation asked for *and* its `target.kind` is the kind
-//!   requested. Cargo reports every unit in the dependency graph, so without the
-//!   package filter a `lib` request would accept any dependency's artifact —
-//!   and, through it, a `.mir` this invocation never emitted.
+//!   only when two things hold. Its `package_id` is one of the ids that
+//!   `cargo metadata` resolved for the requested packages. Its `target.kind`
+//!   is the kind requested. Cargo reports every unit in the dependency graph.
+//!   Without the package filter, a `lib` request would accept any dependency's
+//!   artifact, and through it a `.mir` this invocation never emitted.
 //! * **no stale MIR, and no guessed MIR.** The `.mir` path is derived from the
 //!   artifact filename that carries cargo's metadata hash
-//!   (`deps/libNAME-HASH.rmeta` → `deps/NAME-HASH.mir`), never by scanning a
-//!   directory for a `<crate>-*.mir` and taking the newest: two toolchains, a
-//!   restored cache or a `cp -a` all defeat mtime, and the file picked would be
-//!   analyzed as if it described the current source. When the derived file is
-//!   absent — a `fresh` unit whose target dir predates `--emit=mir` — the unit's
-//!   fingerprint is deleted and the build re-run exactly once; a second miss is
-//!   an error naming the target, not a silent gap in coverage.
+//!   (`deps/libNAME-HASH.rmeta` → `deps/NAME-HASH.mir`). It never comes from a
+//!   scan for the newest `<crate>-*.mir`. Two toolchains, a restored cache or a
+//!   `cp -a` all defeat mtime. The file picked would be analyzed as if it
+//!   described the current source. The derived file can be absent: a `fresh`
+//!   unit whose target dir predates `--emit=mir`. Then the unit's fingerprint
+//!   is deleted and the build re-runs exactly once. A second miss is an error
+//!   naming the target, not a silent gap in coverage.
 //!
 //! A relative `--target-dir` resolves against the **workspace root**, not the
-//! process's working directory, so the same command run from a subdirectory
-//! analyzes the same tree. (Cargo itself resolves it against the cwd; the
-//! asymmetry with the *default* — `<workspace root>/target/harvest-verify` —
-//! is worse than the asymmetry with cargo, because it silently splits one
+//! process's working directory. So the same command run from a subdirectory
+//! analyzes the same tree. (Cargo itself resolves it against the cwd. The
+//! *default* is `<workspace root>/target/harvest-verify`. An asymmetry with
+//! that default is worse than one with cargo, because it silently splits one
 //! logical emit directory into several.)
 
 use std::path::{Path, PathBuf};
@@ -145,9 +145,9 @@ pub fn emit_mir_with_warnings(req: &BuildRequest) -> crate::Result<(Vec<EmittedM
     let mut warnings: Vec<String> = Vec::new();
     let root = workspace_root(req.manifest_path.as_deref())?;
     // A relative `--target-dir` is resolved against the workspace root, not the
-    // cwd: the default lives there, and a run from a subdirectory that quietly
-    // emitted into a *second* directory would re-pay the whole build and could
-    // mix two feature sets in one tree. Documented on `Cli::target_dir`.
+    // cwd, because the default lives there. A run from a subdirectory could
+    // quietly emit into a *second* directory. It would re-pay the whole build
+    // and could mix two feature sets in one tree. See `Cli::target_dir`.
     let target_dir = match &req.target_dir {
         Some(dir) if dir.is_absolute() => dir.clone(),
         Some(dir) => root.join(dir),
@@ -171,9 +171,9 @@ pub fn emit_mir_with_warnings(req: &BuildRequest) -> crate::Result<(Vec<EmittedM
     for package in &packages {
         let spec = package.as_ref();
         let accept = package_ids(&metadata, req.manifest_path.as_deref(), spec)?;
-        // Everything that matches metadata by name — target enumeration,
-        // fingerprint purging — uses the *resolved name*; cargo itself gets the
-        // spec verbatim, so a form this tool cannot read still reaches it.
+        // Target enumeration and fingerprint purging match metadata by the
+        // *resolved name*. Cargo itself gets the spec verbatim, so a form this
+        // tool cannot read still reaches it.
         let name = spec.and_then(PackageSpec::name);
         let selections = targets_for(req, name, &metadata, &mut warnings);
         for selection in selections {
@@ -245,8 +245,8 @@ fn resolve_pkgid(manifest_path: Option<&Path>, spec: &str) -> crate::Result<Stri
 ///
 /// `None` means the request named no package, so cargo picks the workspace
 /// default; every workspace member is then a legitimate producer. Dependencies
-/// never are — and cargo reports one `compiler-artifact` per unit in the graph,
-/// so this is the filter that keeps a dependency's `.mir` out of the analysis.
+/// never are. Cargo reports one `compiler-artifact` per unit in the graph. So
+/// this filter keeps a dependency's `.mir` out of the analysis.
 fn package_ids(
     metadata: &serde_json::Value,
     manifest_path: Option<&Path>,
@@ -315,15 +315,15 @@ fn package_ids(
 
 /// A Cargo package SPEC as `-p` accepts it.
 ///
-/// Cargo's SPEC grammar is wider than a package name — `name`, `name@version`,
+/// Cargo's SPEC grammar is wider than a package name: `name`, `name@version`,
 /// the deprecated `name:version`, and URL forms whose fragment carries the
-/// package (`https://…#name@version`). Comparing the whole spec against
-/// `cargo metadata`'s bare `name` rejected every one of those *before cargo ran*,
-/// so `-p autumn-harvest@0.6.0` — a spec cargo itself accepts — failed with
-/// "knows no workspace package". So the spec is parsed here, and what cannot be
-/// parsed is still handed to cargo verbatim rather than refused: cargo is the
-/// authority on its own grammar, and this tool only needs the name to know
-/// whose artifacts to accept.
+/// package (`https://…#name@version`). A comparison of the whole spec against
+/// the bare `name` from `cargo metadata` rejected all of those *before cargo
+/// ran*. So `-p autumn-harvest@0.6.0`, a spec cargo itself accepts, failed
+/// with "knows no workspace package". So the spec is parsed here. What cannot
+/// be parsed still goes to cargo verbatim, not refused. Cargo is the authority
+/// on its own grammar. This tool only needs the name to know whose artifacts
+/// to accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageSpec {
     /// Verbatim, exactly as cargo will receive it.
@@ -365,8 +365,8 @@ impl PackageSpec {
 fn parse_package_spec(spec: &str) -> PackageSpec {
     let trimmed = spec.trim();
     // A URL form names the package in its fragment: `…#name@version`, or
-    // `…#version` for the package the URL itself names (whose name we then
-    // cannot read, which is exactly the pass-through case).
+    // `…#version` for the package the URL itself names. That name is then
+    // unreadable, which is the pass-through case.
     let tail = trimmed.rsplit('#').next().unwrap_or(trimmed);
     let (name, version) = split_name_version(tail);
     PackageSpec {
@@ -420,18 +420,20 @@ struct MemberPackage {
 /// Cargo's own default selection, for a request that names no target at all.
 ///
 /// `cargo build` with no `-p` and no target flag builds **the package the
-/// manifest resolves to** — the one owning the current directory, or the one
-/// `--manifest-path` names. This tool used to read that same shape as "nothing
-/// selected", skip emission entirely and report `analyzed 0` with exit 0: a
-/// gate that goes green over a run that built, parsed and verified nothing.
+/// manifest resolves to**. That is the one owning the current directory, or
+/// the one `--manifest-path` names. This tool used to read that shape as
+/// "nothing selected". It skipped emission and reported `analyzed 0` with exit
+/// 0. So the gate went green over a run that built, parsed and verified
+/// nothing.
 ///
 /// A **virtual** workspace root names no package, so there is nothing to
 /// default to (unless it has exactly one member). That is an error the operator
 /// can act on — pass `-p <member>` or `--mir` — never a silent empty run.
 ///
 /// # Errors
-/// When cargo cannot be run, when the manifest is a virtual root with more than
-/// one member, or when the resolved package has no lib and no bin target.
+/// - Cargo cannot be run.
+/// - The manifest is a virtual root with more than one member.
+/// - The resolved package has no lib and no bin target.
 pub fn default_request(req: &BuildRequest) -> crate::Result<BuildRequest> {
     let metadata = workspace_metadata(req)?;
     let manifest = located_manifest(req.manifest_path.as_deref())?;
@@ -480,9 +482,9 @@ pub fn default_request(req: &BuildRequest) -> crate::Result<BuildRequest> {
 
 /// The manifest a bare invocation resolves to.
 ///
-/// `cargo locate-project` **without** `--workspace`: the nearest `Cargo.toml`,
-/// which is the package cargo itself would build — not the workspace root's,
-/// which is where [`workspace_root`] deliberately points instead.
+/// `cargo locate-project` **without** `--workspace`: the nearest `Cargo.toml`.
+/// That is the package cargo itself would build. [`workspace_root`]
+/// deliberately points at the workspace root's manifest instead.
 fn located_manifest(manifest_path: Option<&Path>) -> crate::Result<PathBuf> {
     if let Some(path) = manifest_path {
         return Ok(path.to_path_buf());
@@ -598,8 +600,8 @@ pub fn workspace_root(manifest_path: Option<&Path>) -> crate::Result<PathBuf> {
 
 /// `rustc -V`, or `"unknown"` when rustc cannot be run.
 ///
-/// The report prints it because the MIR text format is not a stable API: the
-/// parser is validated on one toolchain and a different one is a warning, not a
+/// The report prints it because the MIR text format is not a stable API. The
+/// parser is validated on one toolchain. A different one is a warning, not a
 /// refusal (D1).
 #[must_use]
 pub fn rustc_version() -> String {
@@ -616,9 +618,9 @@ pub fn rustc_version() -> String {
 
 /// Collect pre-emitted `.mir` inputs (`--mir`), each a file or a directory.
 ///
-/// The crate name is recovered from the file stem by dropping a trailing
-/// `-<hash>` — rustc names its output `<crate>-<metadata hash>.mir`, and the
-/// parser and the analysis key workflow paths on that crate name. A stem with
+/// The crate name is the file stem without a trailing `-<hash>`. rustc names
+/// its output `<crate>-<metadata hash>.mir`. The parser and the analysis key
+/// workflow paths on that crate name. A stem with
 /// no such suffix (a hand-trimmed fixture like `format_and_outparams.mir`) is
 /// used whole. Dashes become underscores either way, because that is how the
 /// crate name appears inside the MIR itself.
@@ -644,10 +646,10 @@ pub fn collect_mir_paths(paths: &[PathBuf]) -> crate::Result<Vec<EmittedMir>> {
 
 /// Walk `dir` for `.mir` files, **without following symlinks**.
 ///
-/// `symlink_metadata` rather than `is_dir`/`is_file`: a linked directory
-/// turns the walk into someone else's tree, and a linked file makes the
-/// report name a path whose content lives somewhere the caller never
-/// pointed at. Only regular files are accepted, so a fifo or device node
+/// `symlink_metadata` rather than `is_dir`/`is_file`. A linked directory
+/// turns the walk into someone else's tree. A linked file makes the report
+/// name a path whose content lives somewhere the caller never pointed at.
+/// Only regular files are accepted, so a fifo or device node
 /// named `x.mir` cannot block the run either. That skip stays silent and
 /// deliberate, unlike a directory this invocation asked to read and could
 /// not.
@@ -716,11 +718,11 @@ fn is_metadata_hash(suffix: &str) -> bool {
 
 /// Split a flag variable into tokens the way cargo itself reads it.
 ///
-/// `CARGO_ENCODED_RUSTFLAGS` is **`\x1f`-separated**, precisely so a flag may
-/// contain spaces; splitting it on whitespace (as this used to) reads
-/// `--cfg\x1fx\x1f-O` as one token that equals none of the patterns, and an
-/// optimized build then produces MIR with the helper calls inlined away — i.e.
-/// a false `proven-deterministic`, the one outcome the tool must never print.
+/// `CARGO_ENCODED_RUSTFLAGS` is **`\x1f`-separated**, so a flag may contain
+/// spaces. A whitespace split reads `--cfg\x1fx\x1f-O` as one token that
+/// equals none of the patterns. An optimized build then produces MIR with the
+/// helper calls inlined away. The result is a false `proven-deterministic`, the
+/// one outcome the tool must never print.
 fn flag_tokens(var: &str, raw: &str) -> Vec<String> {
     if var == "CARGO_ENCODED_RUSTFLAGS" {
         raw.split('\x1f')
@@ -734,9 +736,10 @@ fn flag_tokens(var: &str, raw: &str) -> Vec<String> {
 
 /// The first token in `tokens` that asks for optimization, if any.
 ///
-/// Recognises `-O`, `-Copt-level=N` / `-C opt-level=N` (both spellings, and the
-/// two-token form cargo passes through verbatim) for any `N` other than `0`,
-/// and a release profile requested inline (`--release`, `--profile release`).
+/// Recognises `-O`, and `-Copt-level=N` / `-C opt-level=N` for any `N` other
+/// than `0`. Both spellings count, and so does the two-token form cargo passes
+/// through verbatim. A release profile requested inline (`--release`,
+/// `--profile release`) also counts.
 fn optimization_request(tokens: &[String]) -> Option<String> {
     let mut index = 0;
     while index < tokens.len() {
@@ -845,16 +848,15 @@ fn targets_for(
 
 /// The targets cargo itself would build for `-p <package>` with no target flag.
 ///
-/// Forcing `--lib` here is what made `-p billing-autumn-web` (and every other
-/// bin-only member) fail with "no library targets found in package", so the
-/// operator's only way to verify one was to know its bin names. Cargo's own
-/// rule is the package's **default targets**, which is what
-/// [`default_request`] already applies to a bare invocation: the lib if there
-/// is one, otherwise all of the bins.
+/// A forced `--lib` here made `-p billing-autumn-web` fail with "no library
+/// targets found in package". Every other bin-only member failed too. The
+/// operator then had to know the bin names to verify one. Cargo's own rule is
+/// the package's **default targets**: the lib if there is one, otherwise all
+/// of the bins. [`default_request`] already applies it to a bare invocation.
 ///
-/// A package the metadata does not describe — a spec this tool could not read,
-/// or no `-p` at all — keeps the historical `--lib`: cargo resolves it, and its
-/// error is the honest one.
+/// Some packages are not in the metadata: a spec this tool could not read, or
+/// no `-p` at all. These keep the historical `--lib`. Cargo resolves it, and
+/// its error is the honest one.
 fn default_targets(
     package: Option<&str>,
     metadata: &serde_json::Value,
@@ -872,8 +874,8 @@ fn default_targets(
     }
     if member.bins.is_empty() {
         // Neither a lib nor a bin: nothing to default to. Selecting nothing
-        // would report `analyzed 0` with exit 0 — a green gate over a run that
-        // built nothing — so cargo is asked for the lib and its error stands.
+        // would report `analyzed 0` with exit 0, a green gate over a run that
+        // built nothing. So ask cargo for the lib and let its error stand.
         warnings.push(format!(
             "package {name} has neither a lib nor a bin target to default to: pass a \
              target flag (`--example`, `--test`) or `--mir <path>`"
@@ -954,10 +956,9 @@ fn enumerate_examples(
 /// * `pkg/feat` and the weak `pkg?/feat` activate `feat` of ***`pkg`***, which
 ///   is a feature of this package only when `pkg` *is* this package.
 ///
-/// Recording the entry verbatim (as this used to) meant `--features a/x`
-/// enabled a "feature" literally named `a/x`, so every example of `a` whose
-/// `required-features` named `x` was reported as skipped for a feature the user
-/// had in fact asked for.
+/// A verbatim entry made `--features a/x` enable a "feature" literally named
+/// `a/x`. So every example of `a` whose `required-features` named `x` was
+/// reported as skipped, for a feature the user had in fact asked for.
 fn own_feature(entry: &str, pkg_name: Option<&str>) -> Option<String> {
     let entry = entry.trim();
     if entry.is_empty() || entry.starts_with("dep:") {
@@ -973,10 +974,10 @@ fn own_feature(entry: &str, pkg_name: Option<&str>) -> Option<String> {
 
 /// The feature set the request enables for `pkg`, closed over feature-to-feature edges.
 ///
-/// `default` is enabled unless `--no-default-features` was given, and the
-/// closure walks the package's own `features` table, so a `required-features`
-/// entry that is only *reachable* — `default = ["db"]`, or `a = ["b"]` with
-/// `--features a` — counts as enabled, exactly as it does for cargo.
+/// `default` is enabled unless `--no-default-features` was given. The closure
+/// walks the package's own `features` table. So a `required-features` entry
+/// that is only *reachable* counts as enabled, as it does for cargo. Examples
+/// are `default = ["db"]`, or `a = ["b"]` with `--features a`.
 fn enabled_features(
     req: &BuildRequest,
     pkg: &serde_json::Value,
@@ -1016,8 +1017,9 @@ fn enabled_features(
 ///
 /// Runs the build, accepts only this run's artifacts, and derives the `.mir`
 /// from each accepted artifact's hashed filename. A target that produced no
-/// `.mir` gets exactly one retry with its fingerprint deleted (the `fresh` unit
-/// whose target dir predates `--emit=mir`); a second miss is an error.
+/// `.mir` gets exactly one retry with its fingerprint deleted. That covers the
+/// `fresh` unit whose target dir predates `--emit=mir`. A second miss is an
+/// error.
 fn run_cargo_rustc(
     req: &BuildRequest,
     package: Option<&PackageSpec>,
@@ -1033,8 +1035,8 @@ fn run_cargo_rustc(
         return Ok(mirs);
     }
 
-    // Nothing on disk. Either cargo built nothing for this target (no accepted
-    // artifact at all), or it reported the unit `fresh` from a target dir that
+    // Nothing on disk. Cargo built nothing for this target (no accepted
+    // artifact at all). Or it reported the unit `fresh` from a target dir that
     // was populated without `--emit=mir`. Both are fixed the same way: drop the
     // fingerprints so cargo must recompile, and run once more.
     purge_fingerprints(
@@ -1115,9 +1117,9 @@ fn invoke_cargo_rustc(
 
 /// The `compiler-artifact` messages that belong to this invocation.
 ///
-/// Both filters are load-bearing. `target.kind` alone is not enough: cargo
-/// reports a `compiler-artifact` for **every** unit in the dependency graph, so
-/// a `--lib` request would accept every dependency's lib — and `TargetSel::Lib`
+/// Both filters are load-bearing. `target.kind` alone is not enough. Cargo
+/// reports a `compiler-artifact` for **every** unit in the dependency graph.
+/// So a `--lib` request would accept every dependency's lib. `TargetSel::Lib`
 /// has no target name to fall back on, so nothing else would exclude them.
 fn accepted_artifacts(
     stdout: &str,
@@ -1218,20 +1220,20 @@ fn mirs_of(
 ///    hashed `deps/libX-HASH.rmeta`.
 /// 2. **The uplifted copy, resolved by file identity.** For an example or a bin
 ///    cargo reports *only* `examples/NAME` — no hash anywhere in the message —
-///    and uplifts it by hard-linking `examples/NAME-HASH`. So the hashed sibling
-///    is found by asking the filesystem which file in that directory *is* the
-///    same file (same device and inode), which is exactly the relation "cargo
-///    uplifted this from that unit's output". A bin is uplifted from `deps/`
+///    and uplifts it by hard-linking `examples/NAME-HASH`. So the filesystem
+///    finds the hashed sibling: the file in that directory that *is* the same
+///    file (same device and inode). That is the relation "cargo uplifted this
+///    from that unit's output". A bin is uplifted from `deps/`
 ///    to the profile directory, so `deps/` beside it is searched too.
 /// 3. **A single unambiguous candidate.** Only reachable where the uplift was a
 ///    copy rather than a hard link. Exactly one `<name>-<hash>.mir` in the
 ///    directory is accepted; **two or more is an error**, not a choice.
 ///
 /// What is deliberately absent is the previous mtime-ordered scan for
-/// `<crate>-*.mir`. After a toolchain switch, a restored build cache, a `cp -a`
-/// or a second feature-set build, `deps/` holds several and the newest is not
-/// necessarily this run's — and the verdict computed from the wrong one looks
-/// exactly like a real verdict.
+/// `<crate>-*.mir`. A toolchain switch, a restored build cache, a `cp -a` or a
+/// second feature-set build leaves several in `deps/`. The newest is not
+/// necessarily this run's. A verdict computed from the wrong one looks exactly
+/// like a real verdict.
 fn mir_for_artifact(filenames: &[PathBuf]) -> crate::Result<Option<PathBuf>> {
     // 1. A filename that carries the hash.
     for path in filenames {
@@ -1417,9 +1419,9 @@ fn has_metadata_hash(stem: &str) -> bool {
 /// Delete the fingerprints of the unit that failed to produce a `.mir`, so the
 /// retry recompiles it instead of reporting it `fresh` again.
 ///
-/// Best effort by design: a fingerprint that cannot be removed simply means the
-/// retry finds nothing and the caller raises a named error, which is strictly
-/// better than a removal failure masking the real diagnosis.
+/// Best effort by design. If a fingerprint cannot be removed, the retry finds
+/// nothing and the caller raises a named error. That is strictly better than a
+/// removal failure masking the real diagnosis.
 fn purge_fingerprints(
     artifacts: &[Artifact],
     target_dir: &Path,
@@ -1483,10 +1485,10 @@ fn purge_fingerprints(
 /// The stale-MIR guard: a rebuilt target must have rewritten its `.mir`.
 fn check_freshness(path: &Path, started: SystemTime, fresh: bool) -> crate::Result<()> {
     if fresh {
-        // Cargo's fingerprint says this unit is up to date, and `path` was
-        // derived from *that unit's* hashed artifact filename — so the file on
-        // disk was written by a previous run of this same compilation, with
-        // this crate, these features and this toolchain. (Before the derivation
+        // Cargo's fingerprint says this unit is up to date. `path` was derived
+        // from *that unit's* hashed artifact filename. So a previous run of this
+        // same compilation wrote the file on disk, with this crate, these
+        // features and this toolchain. (Before the derivation
         // was exact this reasoning did not hold: a directory scan could hand
         // back another unit's file and `fresh` would wave it through.)
         return Ok(());
@@ -1638,9 +1640,9 @@ mod tests {
     #[test]
     fn a_package_with_no_target_flag_gets_its_default_targets() {
         // `-p <bin-only member>` used to force `--lib` and fail with "no library
-        // targets found in package", so a bin-only member could only be verified
-        // by naming its bins. Cargo's own default is the package's default
-        // targets, and so is this.
+        // targets found in package". A bin-only member could then only be
+        // verified by naming its bins. Cargo's own default is the package's
+        // default targets, and so is this.
         let req = BuildRequest {
             packages: vec!["bins-only".to_string()],
             ..BuildRequest::default()
@@ -1798,9 +1800,10 @@ mod tests {
         );
     }
 
-    /// One package, `a`, whose feature table exercises every shape the
-    /// normalizer has to read: a `default` set, a feature-to-feature edge and a
-    /// `dep:` edge that is not a feature at all.
+    /// One package, `a`, with every feature-table shape the normalizer reads.
+    ///
+    /// The shapes are a `default` set, a feature-to-feature edge and a `dep:`
+    /// edge that is not a feature at all.
     fn qualified_metadata() -> serde_json::Value {
         serde_json::json!({
             "packages": [{
@@ -2557,8 +2560,9 @@ mod tests {
         );
     }
 
-    /// Smoke test for the real cargo driver: opt in with `HARVEST_VERIFY_SMOKE=1`
-    /// (it compiles a corpus crate, so it is far too slow for the default run).
+    /// Smoke test for the real cargo driver: opt in with `HARVEST_VERIFY_SMOKE=1`.
+    ///
+    /// It compiles a corpus crate, so it is far too slow for the default run.
     #[test]
     #[ignore = "slow: compiles a corpus crate; set HARVEST_VERIFY_SMOKE=1 and run with --ignored"]
     fn smoke_emits_mir_for_a_corpus_crate() {

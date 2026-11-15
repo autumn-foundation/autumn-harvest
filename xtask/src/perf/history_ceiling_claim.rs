@@ -1,4 +1,5 @@
-//! `cargo xtask perf history-ceiling-claim`: the port of `autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh`.
+//! `cargo xtask perf history-ceiling-claim`: the port of
+//! `autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the workflow-history-ceiling scanner query fix
 //! in `timeout::workflow_history_ceiling_query()` (issue #493, Ledger perf

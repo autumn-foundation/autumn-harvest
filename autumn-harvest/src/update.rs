@@ -1,9 +1,9 @@
 //! Update handler registry for the workflow Update primitive (issue #140).
 //!
 //! An `UpdateRegistry` stores type-erased validators and async handlers keyed
-//! by name. Registration is idempotent — calling `register` twice for the same
-//! name is a no-op, making it safe to call at the top of every `#[workflow]`
-//! function on each replay cycle.
+//! by name. Registration is idempotent: a second `register` for the same name
+//! is a no-op. So a `#[workflow]` function can register at its top on each
+//! replay cycle.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

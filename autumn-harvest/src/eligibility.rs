@@ -9,7 +9,7 @@ pub enum Requirement {
     In { key: String, values: Vec<String> },
 }
 
-/// Helper to strip leading and trailing quotes from a string token.
+/// Strip whitespace and one pair of matching quotes from a token.
 fn strip_quotes(s: &str) -> &str {
     let mut s = s.trim();
     if s.len() >= 2
@@ -23,7 +23,8 @@ fn strip_quotes(s: &str) -> &str {
 /// Parse a comma-separated list of requirements (implicit AND).
 ///
 /// Supports exact matches like `key = "value"` and set membership like
-/// `key in ["a", "b"]`. Handles spaces and quotes robustly.
+/// `key in ["a", "b"]`. A quoted value may hold commas and the word `in`.
+///
 /// # Errors
 ///
 /// Returns an error string if the requirement syntax is invalid or if it contains an empty key.
@@ -106,7 +107,6 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
             }
             _ => {
                 if in_quotes.is_none() && in_idx.is_none() {
-                    // Check if the current byte_idx is the start of " in "
                     let rem = &token[byte_idx..];
                     if rem.get(..4).is_some_and(|s| s.eq_ignore_ascii_case(" in ")) {
                         in_idx = Some(byte_idx);
@@ -355,22 +355,18 @@ mod tests {
         labels.insert("region".to_string(), "eu-west-1".to_string());
         assert!(matches_requirements(&reqs, &labels));
 
-        // Mismatched value
         let mut labels_wrong_val = labels.clone();
         labels_wrong_val.insert("gpu".to_string(), "false".to_string());
         assert!(!matches_requirements(&reqs, &labels_wrong_val));
 
-        // Missing key
         let mut labels_missing_key = labels.clone();
         labels_missing_key.remove("region");
         assert!(!matches_requirements(&reqs, &labels_missing_key));
 
-        // In match wrong value
         let mut labels_wrong_in = labels.clone();
         labels_wrong_in.insert("region".to_string(), "us-east-1".to_string());
         assert!(!matches_requirements(&reqs, &labels_wrong_in));
 
-        // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
     }
 }

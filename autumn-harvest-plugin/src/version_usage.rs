@@ -172,7 +172,7 @@ pub async fn build_version_usage_report(
 /// Beyond the filter this is the shared cross-shard fan-out rule, and it now
 /// delegates to [`crate::shard_fanout::expected_shards`] (itself the core
 /// `external_target_location::fanout_shards`) rather than re-deriving it. This
-/// was the third independent copy of "pool keys ∪ readable ∪ default", and the
+/// was the third independent copy of "pool keys ∪ readable ∪ default". The
 /// engine's own by-business-key resolution now depends on that set meaning the
 /// same thing everywhere (issue #1146).
 fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BTreeSet<i32> {

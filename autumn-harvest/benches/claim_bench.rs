@@ -1,16 +1,16 @@
 //! Task-claim and enqueue throughput benchmark (issue #786).
 //!
 //! Harvest publishes a CPU-path budget (replay of a 10k-event history < 200ms,
-//! issue #135) but had no number at all for `queue::claim_task` — the single
-//! most scalability-critical query in the engine, and the one that has accreted
-//! roughly a `WHERE` predicate per phase since 3.7. This benchmark produces the
-//! reference numbers published in `docs/performance.md`, attributes cost to five
-//! representative accreted gates, and prints the claim plan so the next
+//! issue #135). It had no number at all for `queue::claim_task`. That is the
+//! most scalability-critical query in the engine. It has accreted roughly a
+//! `WHERE` predicate per phase since 3.7. This benchmark produces the reference
+//! numbers published in `docs/performance.md`. It attributes cost to five
+//! representative accreted gates. It prints the claim plan, so the next
 //! contributor to touch that query can see what they are changing.
 //!
 //! The gate breakdown measures five predicates. The other five are evaluated on
-//! every claim but are left on their cheapest null/empty path by every scenario
-//! here, so they are exercised rather than measured — `docs/performance.md`
+//! every claim. Every scenario here leaves them on their cheapest null/empty
+//! path, so they are exercised rather than measured. `docs/performance.md`
 //! names them and says so.
 //!
 //! # Running
@@ -42,11 +42,10 @@
 //! is deliberately left byte-for-byte unchanged by this slice.
 
 // The harness is shared verbatim with the CI gate in
-// `tests/integration/claim_budget_tests.rs` so the published numbers and the
-// gated number can never be produced by different code. It lives under `tests/`
-// because that is where the manifest-driven CI runner
-// (`.github/ci/integration-suites.txt`) can see and execute the gate; the bench
-// reaches across to it rather than the harness being duplicated.
+// `tests/integration/claim_budget_tests.rs`. So different code can never produce
+// the published numbers and the gated number. It lives under `tests/`, where the
+// manifest-driven CI runner (`.github/ci/integration-suites.txt`) can execute the
+// gate. The bench reaches across to it, so the harness is not duplicated.
 #[path = "../tests/integration/claim_bench_support.rs"]
 mod support;
 
@@ -190,9 +189,9 @@ async fn fairness_section(db: &BenchDb) {
 /// Read the server version for the report header.
 ///
 /// Report-only, and still bounded. A remote server that accepted provisioning
-/// and then stopped answering would otherwise hang here — *before* any scenario
-/// exists to carry a deadline — so `HARVEST_BENCH_SCENARIO_SECS` would be
-/// bypassed by a path that takes no measurement at all. Every await the
+/// and then stopped answering would otherwise hang here. That is *before* any
+/// scenario exists to carry a deadline. A path that takes no measurement at all
+/// would then bypass `HARVEST_BENCH_SCENARIO_SECS`. Every await the
 /// benchmark performs is under some ceiling, including the ones that only
 /// produce prose.
 async fn server_version(db: &BenchDb) -> String {
@@ -209,8 +208,8 @@ async fn server_version(db: &BenchDb) -> String {
 
 /// Render the p50/p99/max cells of a table row.
 ///
-/// A scenario that collected no post-warmup samples MUST NOT print `0.00` —
-/// that would publish a fabricated "instantaneous" measurement for a run that
+/// A scenario that collected no post-warmup samples MUST NOT print `0.00`.
+/// That would publish a fabricated "instantaneous" measurement for a run that
 /// measured nothing at all. `n/a` is the honest cell.
 fn stats_cells(stats: LatencyStats) -> String {
     if stats.count == 0 {
@@ -224,8 +223,8 @@ fn stats_cells(stats: LatencyStats) -> String {
 
 /// Marks a row whose measurement was cut short by the wall-clock budget.
 ///
-/// Such a row is still real (its percentiles describe the claims it *did*
-/// observe) but it is not a full sample, so it must never be quoted as a
+/// Such a row is still real: its percentiles describe the claims it *did*
+/// observe. But it is not a full sample, so it must never be quoted as a
 /// steady-state number without the caveat.
 const fn truncation_note(truncated: bool) -> &'static str {
     if truncated { " ⚠" } else { "" }
@@ -233,9 +232,9 @@ const fn truncation_note(truncated: bool) -> &'static str {
 
 /// Marks a row whose sample count is below [`MIN_MEANINGFUL_SAMPLES`].
 ///
-/// The gate refuses to defend a budget on fewer samples than this; the report
-/// must not silently publish one either, or a thin row gets transcribed into
-/// `docs/performance.md` and quoted as though it were a steady-state number.
+/// The gate refuses to defend a budget on fewer samples than this. The report
+/// must not silently publish one either. Otherwise a thin row gets transcribed
+/// into `docs/performance.md` and quoted as though it were a steady-state number.
 const fn thin_sample_note(stats: LatencyStats) -> &'static str {
     if stats.count > 0 && stats.count < MIN_MEANINGFUL_SAMPLES {
         " ‡"
@@ -313,11 +312,11 @@ fn print_claim_row(report: &ClaimReport, label: &str) {
 /// Claimers used for per-gate attribution.
 ///
 /// Deliberately **below** the headline scenario's 8 and below the core count of
-/// a typical CI/dev box. Attribution asks "what does this predicate cost?", and
-/// at 8 claimers on 4 cores the answer is swamped by run-queue scheduling: the
-/// tail columns stopped reproducing between runs (a baseline max of 285ms in
-/// one run and 3093ms in the next, for an identical scenario) even though the
-/// p50 deltas held steady. Measuring the predicate below saturation isolates the
+/// a typical CI/dev box. Attribution asks "what does this predicate cost?". At
+/// 8 claimers on 4 cores, run-queue scheduling swamps the answer. The tail
+/// columns stopped reproducing between runs, even though the p50 deltas held
+/// steady. A baseline max was 285ms in one run and 3093ms in the next, for an
+/// identical scenario. Measuring the predicate below saturation isolates the
 /// query cost from the contention cost. The headline scenario keeps 8 claimers —
 /// contention is the point *there*.
 const ATTRIBUTION_CLAIMERS: usize = 2;
@@ -343,7 +342,7 @@ async fn gate_breakdown(db: &BenchDb) {
 
     // Every gate's p50, so a row can be compared against its own comparand
     // rather than always against baseline. `paused_rows` seeds 2x the table
-    // depth, and claim latency is superlinear in depth, so comparing it to
+    // depth, and claim latency is superlinear in depth. So a comparison with
     // baseline would charge the anti-join for the extra rows too.
     // Streamed, not buffered: a full sweep takes tens of minutes and an operator
     // watching it should see each row land. Sound because every comparand is
@@ -438,8 +437,8 @@ async fn enqueue_section(db: &BenchDb) {
             // would silently mislabel which backlog a row describes.
             report.backlog,
             thin_sample_note(report.stats),
-            // Same mark the claim rows carry: a row that stopped on the
-            // wall-clock ceiling covers a partial window, and must not be
+            // Same mark the claim rows carry. A row that stopped on the
+            // wall-clock ceiling covers a partial window. It must not be
             // transcribed into docs/performance.md as a steady-state number.
             truncation_note(report.truncated),
             report.writers,
@@ -468,8 +467,8 @@ async fn explain_section(db: &BenchDb) {
     let headline = headline_scenario();
     println!("## `EXPLAIN (ANALYZE, BUFFERS)` — headline claim");
     println!();
-    // Bounded for the same reason as the report header: this section runs after
-    // every measurement, so a stall here would hang the process with all the
+    // Bounded for the same reason as the report header. This section runs after
+    // every measurement. A stall here would hang the process with all the
     // numbers already printed and nothing left to wait for. Failing loudly is
     // better than a silently missing plan — the report gets pasted into
     // `docs/performance.md`, where an absent plan is easy not to notice.

@@ -495,7 +495,6 @@ async fn ramp_aborts_automatically_when_target_build_fails_every_run() {
     );
 
     // The worker metrics carry the build of the worker that ran the task.
-    // The worker metrics carry the build of the worker that ran the task.
     // The label cap is process-wide. A full local run of every suite in one
     // process can fill it first, so `__other__` is also accepted.
     let terminal = metrics.terminal.lock().unwrap().clone();
@@ -1249,13 +1248,13 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
     );
 }
 
-/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
-/// does on every shard.
 /// The `ramp_id` that [`set_ramp_with_id`] stores for a caller id.
 fn stored(ramp_id: uuid::Uuid) -> uuid::Uuid {
     ramp_generation_id(ramp_id, QUEUE, BUILD_A, BUILD_B)
 }
 
+/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
+/// does on every shard.
 async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
     set_build_policy(conn, QUEUE, BUILD_A, None)
         .await

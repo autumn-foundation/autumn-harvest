@@ -1,40 +1,40 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `autumn_harvest::stall_diagnosis::classify_execution` — the
-//! pure root-cause classifier behind `GET /api/harvest/workflows/{id}/diagnose`
-//! (issue #809). Wall-clock timing is not admissible evidence on this
-//! (shared-vCPU) machine — every number this harness produces evidence for is
-//! a deterministic instruction count (`valgrind --tool=callgrind`) or
-//! allocation count/bytes (`valgrind --tool=dhat`), both reproducible
-//! bit-for-bit on any machine.
+//! Deterministic instruction/allocation-count profiling harness for
+//! `autumn_harvest::stall_diagnosis::classify_execution`.
+//!
+//! It is the pure root-cause classifier behind
+//! `GET /api/harvest/workflows/{id}/diagnose` (issue #809). Wall-clock timing is
+//! not admissible evidence on this shared-vCPU machine. Each number is a
+//! deterministic instruction count (`valgrind --tool=callgrind`) or allocation
+//! count/bytes (`valgrind --tool=dhat`). Both reproduce bit-for-bit on any
+//! machine.
 //!
 //! # Workload
 //!
 //! The plugin handler for `GET /workflows/{id}/diagnose`
 //! (`autumn-harvest-plugin/src/api.rs`) calls `classify_execution` **twice**
-//! per HTTP request: once to compute `db_verdict` (deciding whether an
-//! additional replay pass could change the answer) and once more, after
-//! populating `inputs.awaited_signals`/`inputs.replay_waits`, to compute the
-//! actual `blocked_on` response field. For the workload this harness
-//! exercises (a wide *pending-activity* fan-out with a genuine worst-cause
-//! row somewhere in it), `db_verdict` already resolves to an activity
-//! verdict, so `replay_could_win` is `false` and the second call runs
-//! unconditionally regardless. This harness reproduces that exact
-//! double-call shape.
+//! per HTTP request. The first call computes `db_verdict`, which decides whether
+//! a replay pass could change the answer. The handler then fills
+//! `inputs.awaited_signals`/`inputs.replay_waits`, and the second call computes
+//! the `blocked_on` response field. This harness uses a wide *pending-activity*
+//! fan-out with one worst-cause row. There `db_verdict` already resolves to an
+//! activity verdict, so `replay_could_win` is `false`. The second call runs
+//! anyway. This harness reproduces that double-call shape.
 //!
-//! The module's own docs name the wide fan-out as its **headline** use case:
-//! "one wedged slot among nineteen healthy ones" — the whole reason
-//! `classify_execution` folds over every pending activity row and reports the
-//! *worst* verdict, rather than the first. This harness builds exactly that
-//! shape: a realistic mix of task-queue rows dominated by ones an operator
-//! would actually be paging over (retry backoff with a recorded downstream
-//! error, an open circuit breaker), plus a handful of healthy rows, plus
-//! exactly one genuine `activity_no_worker` row (the true, permanent root
-//! cause) placed away from either end of the collection so a correctness
-//! fix cannot get away with only checking the first or last row.
+//! The module docs name the wide fan-out as the **headline** use case: "one
+//! wedged slot among nineteen healthy ones". That is why `classify_execution`
+//! folds over every pending activity row and reports the *worst* verdict, not
+//! the first. This harness builds that shape:
 //!
-//! This is deliberately **not** the all-healthy case: the endpoint exists to
-//! answer "why is this stalled?", so the realistic worst-case invocation this
-//! harness measures is exactly the one operators trigger it for.
+//! - Most rows are ones an operator pages over: retry backoff with a recorded
+//!   downstream error, or an open circuit breaker.
+//! - A handful of rows are healthy.
+//! - Exactly one `activity_no_worker` row is the true, permanent root cause. It
+//!   sits away from either end, so a fix cannot pass by checking only the first
+//!   or last row.
+//!
+//! This is deliberately **not** the all-healthy case. The endpoint answers
+//! "why is this stalled?", so this harness measures the case operators trigger
+//! it for.
 //!
 //! # Running
 //!
@@ -49,8 +49,8 @@
 //!
 //! `STALL_DIAGNOSIS_PROFILE_N` (default `500`) sets the number of pending
 //! activity rows per simulated execution. `STALL_DIAGNOSIS_PROFILE_REPS`
-//! (default `2_000`) sets how many times the (fixed) fan-out is diagnosed —
-//! i.e. how many simulated `/diagnose` HTTP requests are served.
+//! (default `2_000`) sets how many times the fixed fan-out is diagnosed, that
+//! is, how many simulated `/diagnose` HTTP requests run.
 
 use autumn_harvest::stall_diagnosis::{
     BlockingCircuitPhase, DiagnosisInputs, PendingActivityFacts, classify_execution,
@@ -74,10 +74,10 @@ const DOWNSTREAM_ERRORS: [&str; 3] = [
     "503 Service Unavailable from inventory sync service",
 ];
 
-/// A row in retry backoff with a recorded failure — the single most common
-/// shape in a real stalled fan-out (a flaking downstream), and the one that
-/// forces `classify_pending_activity` down its most allocation-heavy branch
-/// (`ActivityRetrying`, which clones both `activity_name` and `last_error`).
+/// A row in retry backoff with a recorded failure, from a flaking downstream.
+/// It is the most common shape in a real stalled fan-out. It forces
+/// `classify_pending_activity` down its most allocation-heavy branch:
+/// `ActivityRetrying` clones both `activity_name` and `last_error`.
 fn retrying_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
     PendingActivityFacts {
         activity_name: Some(ACTIVITIES[idx % ACTIVITIES.len()].to_string()),
@@ -135,10 +135,9 @@ fn circuit_open_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts
     }
 }
 
-/// The genuine, permanent root cause: nothing polls this queue at all. Placed
-/// at a non-trivial index by the caller (never index 0 or N-1) so a fold
-/// implementation that only checks the ends of the collection cannot pass by
-/// accident.
+/// The genuine, permanent root cause: nothing polls this queue at all. The
+/// caller never places it at index 0 or N-1. So a fold that checks only the
+/// ends of the collection cannot pass by accident.
 fn no_worker_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
     PendingActivityFacts {
         has_live_worker: false,
@@ -154,9 +153,10 @@ fn no_worker_index(n: usize) -> usize {
     (n * 2 / 3).min(n.saturating_sub(1))
 }
 
-/// Build the fixed, realistic fan-out this harness diagnoses repeatedly:
-/// ~70% retry backoff, ~20% healthy, ~9% open-breaker, and exactly one
-/// genuine `activity_no_worker` row placed at two-thirds of the way through.
+/// Build the fixed fan-out this harness diagnoses repeatedly.
+///
+/// It is ~70% retry backoff, ~20% healthy and ~9% open-breaker. Exactly one
+/// `activity_no_worker` row sits two-thirds of the way through.
 fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
     let no_worker_index = no_worker_index(n);
     let activities: Vec<PendingActivityFacts> = (0..n)
@@ -191,12 +191,12 @@ fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
 /// Reads `key` as a `usize`, using `default` only when the variable is
 /// genuinely *absent*. A *present but malformed* value (a typo, e.g.
 /// `STALL_DIAGNOSIS_PROFILE_N=50O`, or non-Unicode content) is a
-/// configuration error, not silently substituted for the default -- a
-/// harness whose whole point is producing a specific, documented,
-/// reproducible number must not silently profile a *different*
-/// configuration than the one actually requested and report success as if
-/// nothing were wrong (the fixture's own sanity check would still pass,
-/// since it's computed from the same substituted value).
+/// configuration error. It is not silently substituted for the default. This
+/// harness exists to produce a specific, documented, reproducible number. It
+/// must not silently profile a *different* configuration than the one
+/// requested and report success as if nothing were wrong. The fixture's own
+/// sanity check would still pass, since it is computed from the same
+/// substituted value.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw
@@ -211,30 +211,27 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 /// Rejects a workload size that would silently stop exercising the
 /// documented "wide fan-out with a genuine root cause away from either end"
-/// shape this harness exists to measure -- so shortening a Valgrind run
-/// can't quietly produce measurements for a degenerate workload instead.
+/// shape. This harness exists to measure that shape. So shortening a Valgrind
+/// run cannot quietly produce measurements for a degenerate workload instead.
 fn validate_workload_params(n: usize, reps: usize) {
-    // reps=0 skips the measured loop entirely -- the harness would exit 0
-    // and print a plausible-looking summary line without ever profiling the
-    // fold beyond the one unmeasured sanity call, which a profiler pointed
-    // at the resulting process could easily mistake for a valid
-    // (implausibly fast) measurement.
+    // reps=0 skips the measured loop. The harness then exits 0 with a
+    // plausible summary line, after only the unmeasured sanity call. A
+    // profiler can mistake that for a valid, implausibly fast measurement.
     assert!(
         reps >= 1,
         "STALL_DIAGNOSIS_PROFILE_REPS must be at least 1, got 0"
     );
-    // n=0 builds no activities at all, so the fold never finds the planted
-    // `activity_no_worker` row and the sanity check below fails with an
-    // opaque mismatch instead of a message naming the actual problem.
+    // n=0 builds no activities, so the fold never finds the planted
+    // `activity_no_worker` row. The sanity check then fails with an opaque
+    // mismatch. This check names the real problem.
     assert!(
         n >= 1,
         "STALL_DIAGNOSIS_PROFILE_N must be at least 1, got 0"
     );
     let idx = no_worker_index(n);
-    // For n in 1..=3 the planted row lands at index 0 or n-1 -- the first
-    // or last position -- no longer exercising the documented "away from
-    // either end" wide-fan-out workload the fold's worst-of tie-break logic
-    // is meant to be tested against.
+    // For n in 1..=3 the planted row lands at index 0 or n-1. Then the
+    // workload no longer puts it "away from either end", which the worst-of
+    // tie-break logic of the fold is meant to be tested against.
     assert!(
         idx > 0 && idx < n - 1,
         "STALL_DIAGNOSIS_PROFILE_N={n} is too small: the planted activity_no_worker row would \
@@ -251,9 +248,9 @@ fn main() {
 
     let inputs = build_inputs(n, now);
 
-    // Sanity check the fixture once, unmeasured, exactly like the real
-    // handler would read the answer: the fold must find the one genuine
-    // root cause among the crowd of retrying/healthy/circuit-open rows.
+    // Sanity check the fixture once, unmeasured, as the real handler reads
+    // the answer. The fold must find the one genuine root cause among the
+    // retrying, healthy and circuit-open rows.
     let sanity = classify_execution(&inputs, now).expect("non-terminal execution");
     assert_eq!(
         sanity.kind(),
@@ -261,12 +258,11 @@ fn main() {
         "fixture bug: fold did not find the planted worst-case row"
     );
 
-    // BTreeMap, not HashMap: this tally is read inside the measured loop
-    // below, and HashMap's default RandomState hasher is seeded per-process
-    // -- its SipHash instructions would leak into the profiled instruction
-    // count and make two "identical" runs diverge. BTreeMap is Ord-keyed
-    // (no hashing at all), so it costs nothing extra and keeps the profile
-    // reproducible bit-for-bit.
+    // BTreeMap, not HashMap: the measured loop below reads this tally.
+    // HashMap's default RandomState hasher is seeded per process. Its SipHash
+    // instructions would leak into the profiled count and make two
+    // "identical" runs diverge. BTreeMap is Ord-keyed with no hashing, so it
+    // keeps the profile reproducible bit-for-bit.
     let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     for _ in 0..reps {
@@ -283,9 +279,9 @@ fn main() {
         *kind_tally.entry(blocked_on.kind()).or_insert(0) += 1;
     }
 
-    // Printed so the binary can't be trivially dead-code-eliminated and so a
-    // regression that changes which verdict wins is loudly visible rather
-    // than silently under- or over-measuring the fold.
+    // Printed so the binary cannot be trivially dead-code-eliminated. The
+    // print also makes a regression that changes which verdict wins loudly
+    // visible, rather than silently under- or over-measuring the fold.
     let mut kinds: Vec<(&str, u64)> = kind_tally.into_iter().collect();
     kinds.sort_unstable();
     println!(

@@ -530,7 +530,7 @@ async fn rate_limit_bucket_exists(url: &str, key: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Review follow-ups: finalization retries, claim-fenced heartbeats.
+// Finalization retries and claim-fenced heartbeats.
 // ---------------------------------------------------------------------------
 
 /// A finalization write waits through several bounded attempts. A slot that
@@ -943,7 +943,6 @@ async fn an_idle_transaction_timeout_is_a_lost_connection() {
     assert!(!autumn_harvest::pool::is_session_timeout(&err), "{err:?}");
 }
 
-/// Insert a running workflow execution with a `WorkflowStarted` event.
 /// The session row that a failed acquire on worker `w-1` tried to insert.
 fn attempted_session_row(
     session_id: autumn_harvest::types::SessionId,
@@ -969,6 +968,7 @@ fn unseeded_session_row(
     )
 }
 
+/// Insert a running workflow execution with a `WorkflowStarted` event.
 async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
     use autumn_harvest::models::NewWorkflowExecution;
     use autumn_harvest::schema::harvest_workflow_executions;
@@ -3088,7 +3088,6 @@ async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
         .state
 }
 
-/// The backend pid of `conn`.
 async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
     #[derive(diesel::QueryableByName)]
     struct Pid {
@@ -3167,9 +3166,9 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
     // and the engine retries such a failure. That is the cost of the skip.
     //
     // The backend still shows the pid query as its last statement. A ping
-    // would show `SELECT 1`. The test does not kill the backend to prove this. The client can see
-    // the closed socket before the checkout, and then the pool replaces the
-    // connection with or without a ping.
+    // would show `SELECT 1`. The test does not kill the backend to prove this.
+    // The client can see the closed socket before the checkout, and then the
+    // pool replaces the connection with or without a ping.
     let last = diesel::sql_query("SELECT query FROM pg_stat_activity WHERE pid = $1")
         .bind::<diesel::sql_types::Integer, _>(old_pid)
         .get_result::<LastQuery>(&mut admin)

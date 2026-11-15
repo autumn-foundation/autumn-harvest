@@ -313,7 +313,6 @@ async fn start_run_for(
         .exec_id
 }
 
-/// The stored tenant of one run.
 async fn stored_tenant(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<String> {
     #[derive(diesel::QueryableByName)]
     struct T {
@@ -886,7 +885,6 @@ async fn mint_stores_lists_and_validates_the_tenant() {
     }
 }
 
-/// Mark one run as finished.
 async fn complete_run(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::sql_query(
         "UPDATE harvest_workflow_executions \
@@ -898,7 +896,6 @@ async fn complete_run(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     .expect("complete run");
 }
 
-/// The state of one run.
 async fn run_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct S {

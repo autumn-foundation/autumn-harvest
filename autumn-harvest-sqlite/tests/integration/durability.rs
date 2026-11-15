@@ -1,12 +1,12 @@
 //! Durability scenarios (AC4) + crash recovery (AC7).
 //!
-//! No Docker: `SQLite` is embedded via `rusqlite`'s `bundled` feature, and durable
-//! timers are driven by an injected "as-of" time (`*_as_of`) so restart tests are
+//! No Docker: `SQLite` is embedded through the `bundled` feature of `rusqlite`. An
+//! injected "as-of" time (`*_as_of`) drives durable timers, so restart tests are
 //! deterministic without sleeping.
 
 // The `#[workflow]` macro's generated body references the workflow's input
-// parameter, so a deliberately-unused `_n` param reads as a "used underscore
-// binding" through the expansion — a macro-interaction false positive.
+// parameter. So a deliberately-unused `_n` param reads as a "used underscore
+// binding" through the expansion: a macro-interaction false positive.
 #![allow(clippy::used_underscore_binding)]
 
 use std::sync::Arc;
@@ -33,9 +33,9 @@ async fn single_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 ///
 /// AC-D2 words the first durability scenario as "one workflow with **two
 /// activities** and a retry". `single_activity` above covers the retry with one
-/// activity; this covers the literal shape, which is also the more interesting
-/// one: the second activity's input is the first's *recorded* output, so a
-/// retry of either must not perturb the value the other sees.
+/// activity. This covers the literal shape, which is also more interesting. The
+/// second activity's input is the first's *recorded* output. So a retry of either
+/// must not perturb the value the other sees.
 #[workflow]
 async fn two_activities(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let doubled = ctx
@@ -126,13 +126,12 @@ async fn activity_retry_then_success() {
 /// The AC-D2 scenario as worded: two activities in one workflow, one of which
 /// retries.
 ///
-/// The retry is placed on the *first* activity deliberately. Its recovered
-/// output is what the second activity consumes, so a retry that leaked the
-/// failed attempt's state — or re-ran the first activity when replaying to
-/// reach the second — would corrupt the second's input rather than merely
-/// costing an extra call. The assertions therefore pin the *value* the second
-/// activity received, not just the final result: `(21 * 2) + 1 == 43`, with
-/// `double` called twice (fail, ok) and `increment` called exactly once.
+/// The retry is on the *first* activity deliberately. The second activity
+/// consumes its recovered output. A retry could leak the failed attempt's state,
+/// or a replay could re-run the first activity to reach the second. Either would
+/// corrupt the second's input, not merely cost an extra call. So the assertions pin
+/// the *value* the second activity received, not just the final result:
+/// `(21 * 2) + 1 == 43`. `double` runs twice (fail, ok) and `increment` once.
 #[tokio::test]
 async fn two_activities_with_retry() {
     let double_calls = Arc::new(AtomicUsize::new(0));
@@ -230,9 +229,8 @@ async fn timer_fires_across_restart() {
         );
     } // rt dropped == process exit; the timer row persists in the file.
 
-    // Second process: reopen the SAME file, advance the as-of time past the
-    // absolute deadline (t0 + 5s), and the timer fires — no virtual clock reset,
-    // no sleep.
+    // Second process: reopen the SAME file and advance the as-of time past the
+    // absolute deadline (t0 + 5s). The timer fires with no clock reset and no sleep.
     let mut rt2 = SqliteRuntime::open(&path).unwrap();
     rt2.register_workflow(&timer_then_done_info());
     let state = rt2
@@ -253,14 +251,12 @@ async fn signal_delivery_unblocks_workflow() {
     rt.register_workflow(&wait_then_echo_info());
     let exec = rt.start_workflow("wait_then_echo", json!(0)).unwrap();
 
-    // Blocks on the signal.
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
         matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
         "expected WaitingSignal(go), got {state:?}"
     );
 
-    // Deliver it out of band, then resume.
     rt.send_signal(exec, "go", json!({"ok": true})).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -290,9 +286,9 @@ async fn deterministic_replay_after_crash_does_not_reexecute_activity() {
         );
         exec = rt.start_workflow("single_activity", json!(5)).unwrap();
 
-        // Exactly one decision cycle: the activity runs + `ActivityCompleted` is
-        // persisted (finalize committed), but the workflow is not yet resumed
-        // past it — this is the crash-AFTER-commit state.
+        // Exactly one decision cycle: the activity runs and the finalize commits
+        // `ActivityCompleted`. The workflow has not resumed past it yet. This is the
+        // crash-AFTER-commit state.
         let progressed = rt.poll_once().await.unwrap();
         assert!(progressed);
         assert!(matches!(
@@ -340,13 +336,11 @@ async fn orphaned_running_task_is_reclaimed_and_body_reruns() {
     let exec;
     {
         // First process: register the workflow but NOT the activity. The cycle
-        // persists `ActivityScheduled` + the task row (committed) and the drain
-        // CLAIMS the task, then misses the (unregistered) body — which now RELEASES
-        // the claim back to PENDING (Codex #1069 P2), leaving the task re-claimable
-        // rather than stranded. That release is a *different* recovery path from the
-        // one under test here, so we fabricate the genuine crash-BEFORE-finalize
-        // state (a task left RUNNING by a process that claimed it and died mid-body)
-        // directly below.
+        // commits `ActivityScheduled` and the task row. The drain CLAIMS the task and
+        // finds no body. It RELEASES the claim back to PENDING (issue #1069), so the
+        // task stays claimable. That release is a *different* recovery path. The
+        // code below fabricates the real crash-BEFORE-finalize state: a task left
+        // RUNNING by a process that claimed it and died mid-body.
         let mut rt = SqliteRuntime::open(&path).unwrap();
         rt.register_workflow(&single_activity_info());
         exec = rt.start_workflow("single_activity", json!(7)).unwrap();
@@ -357,10 +351,9 @@ async fn orphaned_running_task_is_reclaimed_and_body_reruns() {
         );
     } // crash.
 
-    // Fabricate the crash-BEFORE-finalize orphan: a process claimed the (now
-    // PENDING) task, began running its body, and died before the finalize commit —
-    // i.e. the row is left RUNNING with no terminal event. Flip it via a raw
-    // connection to simulate exactly that stranded state.
+    // Fabricate the crash-BEFORE-finalize orphan. A process claimed the task, began
+    // its body, and died before the finalize commit. The row stays RUNNING with no
+    // terminal event. A raw connection flips it to that state.
     {
         let raw = rusqlite::Connection::open(&path).unwrap();
         let pending: i64 = raw

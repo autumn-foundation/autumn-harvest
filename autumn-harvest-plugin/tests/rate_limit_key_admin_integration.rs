@@ -2,11 +2,10 @@
 #![allow(clippy::items_after_statements)]
 //! HTTP integration test for per-key activity rate limits (issue #699), AC7.
 //!
-//! A dynamic per-key rate-limit bucket (`dyn-rate:{expr}:{tenant}`) is stored in
-//! the same `harvest_rate_limit_buckets` table as static and throttle buckets,
-//! so it is enumerated by the existing read-only `GET /admin/rate-limits`
-//! management endpoint with no new surface. This test proves a composite key is
-//! visible to operators there.
+//! A dynamic per-key rate-limit bucket (`dyn-rate:{expr}:{tenant}`) lives in
+//! the `harvest_rate_limit_buckets` table with static and throttle buckets. So
+//! the read-only `GET /admin/rate-limits` endpoint lists it, with no new
+//! surface. This test proves operators can see a composite key there.
 
 use std::sync::Arc;
 
@@ -120,9 +119,9 @@ async fn dynamic_composite_key_is_listed_by_admin_rate_limits() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // A dynamic per-key bucket, exactly as the enqueue path would lazily register:
-    // each component is a self-delimiting length-tagged literal (`L9:tenant_id`,
-    // `L4:acme`) and the `input.` prefix is normalized away.
+    // A dynamic per-key bucket, as the enqueue path registers it lazily. Each
+    // component is a self-delimiting length-tagged literal (`L9:tenant_id`,
+    // `L4:acme`). The `input.` prefix is normalized away.
     let composite = "dyn-rate:L9:tenant_id:L4:acme";
     seed_bucket(&url, composite).await;
     // A static bucket for good measure.

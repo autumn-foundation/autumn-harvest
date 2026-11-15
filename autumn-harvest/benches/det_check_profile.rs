@@ -2,7 +2,7 @@
 //! -- the source-scanning engine behind `harvest det-check` (issue #778), the
 //! CI governance gate for the determinism guardrails.
 //!
-//! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
+//! Wall-clock timing is unreliable on this (shared-vCPU) machine. So this
 //! binary is driven directly under `valgrind --tool=callgrind` (instruction
 //! counts) and `valgrind --tool=dhat` (allocation counts/bytes), which are
 //! deterministic across runs.

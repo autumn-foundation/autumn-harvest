@@ -5,8 +5,8 @@
 //! A DAG node can bind its activity input directly to one or more upstream node
 //! outputs via `.input_from(&up)` / `.input_from_all(&[..])` /
 //! `.input_from_aliased(&[..])`. A bound node receives the RAW upstream
-//! output(s) (single verbatim, or merged into a keyed JSON object) instead of
-//! the trigger-input + `dag_task` wrapper the unbound path uses.
+//! output(s), single verbatim or merged into a keyed JSON object. The unbound
+//! path sends the trigger input and a `dag_task` wrapper instead.
 #![cfg(all(feature = "unified-dag-execution", feature = "testing"))]
 #![allow(clippy::unused_async)]
 
@@ -359,11 +359,10 @@ async fn bound_etl_replay_sweep_1000() {
     }
 }
 
-/// Stronger sweep: a 3-source merged fan-in with a genuine rotating permutation
-/// of the within-level completion order (3! = 6 orderings). Asserts
-/// `ReplaySucceeded` on every iteration — which is only possible if the handler
-/// reconstructs the merged keyed input identically regardless of the order the
-/// three sources completed in.
+/// Stronger sweep: a 3-source merged fan-in that rotates the within-level
+/// completion order through all 3! = 6 orderings. Asserts `ReplaySucceeded` on
+/// every iteration. That holds only if the handler rebuilds the same merged
+/// keyed input whatever order the three sources completed in.
 #[tokio::test]
 async fn merged_three_source_replay_sweep_1000() {
     // All 6 permutations of the level-0 completion order for [a, b, c].
@@ -554,8 +553,8 @@ async fn bound_to_failed_upstream_yields_null() {
         .run(__autumn_workflow_info_fail_bind_dag().handler, Value::Null)
         .await;
 
-    // A failed upstream fails the DAG as a whole (any Failed status → Err), so
-    // — unlike the condition-skip sibling — the terminal result is an error.
+    // A failed upstream fails the whole DAG (any Failed status gives Err).
+    // Unlike the condition-skip sibling, the terminal result is an error.
     assert!(
         outcome.result.is_err(),
         "a DAG with a failed task must fail overall, got: {:?}",

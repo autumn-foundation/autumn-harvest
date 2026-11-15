@@ -181,7 +181,6 @@ impl Retention {
         self.requested.store(true, Ordering::Release);
     }
 
-    /// Take a queued pass.
     fn take_request(&self) -> bool {
         self.requested.swap(false, Ordering::AcqRel)
     }
@@ -881,7 +880,6 @@ fn signal(
         .map(|delivered| RoutedSignal { exec, delivered })
 }
 
-/// The stored state of `exec`.
 fn state_of(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<String> {
     Ok(runtime
         .describe(exec)?

@@ -13,21 +13,21 @@
 //!   residency map to the same shard, deterministically.
 //! - **AC1 (no placement)** — omitting both is byte-for-byte today's rendezvous
 //!   routing, and the response omits `shard_id` entirely.
-//! - **AC2/AC6** — an out-of-range shard, a drained (readable-but-not-writable)
-//!   shard, an unmapped residency key, and supplying *both* fields each return
-//!   a `400` JSON error — never a `500`, never a silent fall back to the
-//!   default shard, never a silent re-hash.
-//! - **AC5** — the chosen shard is observable after start: the response's
+//! - **AC2/AC6** — four inputs each return a `400` JSON error. They are an
+//!   out-of-range shard, a drained (readable-but-not-writable) shard, an
+//!   unmapped residency key, and *both* fields at once. Never a `500`, never a
+//!   silent fall back to the default shard, never a silent re-hash.
+//! - **AC5** — the chosen shard is observable after start. The response's
 //!   `shard_id`, the encoded `ExecutionId`, and the row's `shard_id` column all
-//!   agree, and the row exists on the intended shard's database **only**.
+//!   agree. The row exists on the intended shard's database **only**.
 //! - **Success metric** — N workflows across K residency keys land 100% on the
 //!   intended shard.
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which two fresh shard databases are created) when set — no
-//! Docker required — else boots a fresh testcontainers Postgres. Docker is not
-//! available in every sandbox, so these tests are compile-checked there and run
-//! Docker-backed in CI (matching the #543/#544/#601 precedent).
+//! Dual-mode: when `HARVEST_TEST_DATABASE_URL` is set, it is an admin URL for
+//! two fresh shard databases, and no Docker is needed. Otherwise the suite boots
+//! a fresh testcontainers Postgres. Some sandboxes have no Docker, so these
+//! tests only compile there. CI runs them Docker-backed (the #543/#544/#601
+//! precedent).
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -175,8 +175,8 @@ fn plain_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
-/// A workflow carrying a debounce policy, so a start against it is DEFERRED
-/// and its shard is derived from the debounce key rather than any pin.
+/// A workflow with a debounce policy, so a start against it is DEFERRED. Its
+/// shard comes from the debounce key, not from any pin.
 fn debounced_info(name: &'static str) -> WorkflowInfo {
     let mut info = plain_info(name);
     info.debounce = Some(DebouncePolicy {
@@ -187,8 +187,9 @@ fn debounced_info(name: &'static str) -> WorkflowInfo {
     info
 }
 
-/// A workflow carrying a start throttle (issue #607) with a **single** token,
-/// so the first start reserves it and proceeds while the second is DEFERRED
+/// A workflow with a start throttle (issue #607) of a **single** token.
+///
+/// The first start reserves the token and proceeds. The second is DEFERRED
 /// (`202`). Unlike debounce/batch, a throttled start threads the resolved
 /// shard through to `reserve_or_defer`, so a pin IS honoured there.
 fn throttled_info(name: &'static str) -> WorkflowInfo {
@@ -617,10 +618,10 @@ async fn drained_shard_pin_is_rejected_400() {
     );
 }
 
-/// A drained pin is a *fresh-start-only* rejection: it must sit after the #808
-/// committed-replay probe, so an at-least-once retry of a keyed start that
-/// already committed still returns its `200` no-op rather than flipping to a
-/// `400` the moment the operator begins draining the pinned shard.
+/// A drained pin is a *fresh-start-only* rejection. It must sit after the #808
+/// committed-replay probe. An at-least-once retry of a committed keyed start
+/// then still returns its `200` no-op. It does not flip to a `400` once the
+/// operator drains the pinned shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_keyed_replay_survives_the_pinned_shard_being_drained() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;
@@ -727,10 +728,10 @@ async fn blank_residency_key_is_rejected_400() {
 
 /// A debounced (or batched) start is DEFERRED and derives its shard from the
 /// debounce/batch key so all admissions for that key collapse on one shard.
-/// A per-request pin cannot be honoured there, so it must be REJECTED rather
-/// than silently ignored — silently accepting it would return `202` with no
-/// `shard_id` for the caller to check while placing residency-bound data on a
-/// hash-chosen shard, the exact silent-fallback this feature exists to remove.
+/// A per-request pin cannot be honoured there, so it must be REJECTED, not
+/// silently ignored. A silent accept returns `202` with no `shard_id` to check.
+/// It also places residency-bound data on a hash-chosen shard. This feature
+/// exists to remove exactly that silent fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placement_on_a_debounced_workflow_is_rejected_not_silently_ignored() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;
@@ -773,15 +774,16 @@ async fn placement_on_a_debounced_workflow_is_rejected_not_silently_ignored() {
     );
 }
 
-/// A shard the **router** knows (readable + writable) but for which the pool
-/// map has **no entry** — a real state mid a shard-add rollout, since the
-/// router's shard set and the pool map are configured independently.
+/// A shard the **router** knows (readable + writable) with **no entry** in the
+/// pool map.
 ///
-/// This is the exact silent-residency-breach path: `pool_for` falls back to the
-/// default shard's pool, so without an explicit-pool lookup the row would be
-/// written to the **default** database while the response, the encoded
-/// `ExecutionId`, and the row's `shard_id` column all claimed the pinned shard.
-/// The pinned branch must therefore fail closed with a `503` and write nothing.
+/// This state is real during a shard-add rollout. The router's shard set and the
+/// pool map are configured independently. This is the exact
+/// silent-residency-breach path. `pool_for` falls back to the default shard's
+/// pool. Without an explicit-pool lookup, the row goes to the **default**
+/// database. The response, the encoded `ExecutionId`, and the `shard_id` column
+/// still claim the pinned shard. So the pinned branch must fail closed with a
+/// `503` and write nothing.
 fn build_app_with_unpooled_shard(url_eu: &str, url_us: &str, url_drained: &str) -> HarvestApiApp {
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(EU_SHARD), build_pool(url_eu));
@@ -834,9 +836,9 @@ fn build_app_with_unpooled_shard(url_eu: &str, url_us: &str, url_drained: &str) 
     harvest_api_router(api_state)
 }
 
-/// AC2/AC5 (fail closed): a pin to a shard the router accepts but that has no
-/// pool of its own must **not** silently write to the default shard's database
-/// while reporting the pinned shard back to the caller. It is a `503` (a
+/// AC2/AC5 (fail closed): a pin to a routable shard with no pool of its own
+/// must **not** silently write to the default shard's database. The caller
+/// would see the pinned shard reported back. It is a `503` (a
 /// deployment-configuration gap, not a caller error) and nothing is started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routable_but_unpooled_shard_fails_closed_503_and_writes_nothing() {
@@ -872,16 +874,16 @@ async fn routable_but_unpooled_shard_fails_closed_503_and_writes_nothing() {
     assert_eq!(workflow_id_count(&drained, workflow_id).await, 0);
 }
 
-/// Codex P1 (issue #697 review): the #808 committed-replay probe must resolve
-/// a **pinned** request's connection with `exact_pool_for`, never `pool_for`.
+/// Issue #697: the #808 committed-replay probe must resolve a **pinned**
+/// request's connection with `exact_pool_for`, never `pool_for`.
 ///
 /// `pool_for` falls back to the DEFAULT shard's pool for a shard with no pool
-/// entry, so a pinned-but-unpooled request would probe the **wrong database**
-/// for its idempotency claim. When a same-key claim already exists there (from
-/// an earlier unpinned start) that is a false HIT: the caller gets `200` plus
-/// an `execution_id` on the *default* shard while having explicitly asked for a
-/// different jurisdiction -- a silent cross-shard residency breach, and exactly
-/// the failure this feature exists to remove. Failing closed (`503`) is right.
+/// entry. A pinned-but-unpooled request would then probe the **wrong database**
+/// for its idempotency claim. An earlier unpinned start can leave a same-key
+/// claim there. That is a false HIT. The caller gets `200` and an
+/// `execution_id` on the *default* shard, after it asked for a different
+/// jurisdiction. That silent cross-shard residency breach is exactly what this
+/// feature exists to remove. Failing closed (`503`) is right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_committed_replay_probe_never_falls_back_to_the_default_shard() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;
@@ -936,12 +938,12 @@ async fn pinned_committed_replay_probe_never_falls_back_to_the_default_shard() {
     assert_eq!(workflow_id_count(&drained, "order-probe").await, 0);
 }
 
-/// Codex P2 (issue #697 review): a THROTTLED start honours an explicit pin --
-/// the resolved shard is threaded into `reserve_or_defer` -- so its deferred
-/// `202` must echo `shard_id` too. There is no `execution_id` to decode yet, so
-/// without the echo a caller has no way at all to audit where a deferred pinned
-/// start will run. An unpinned throttled `202` must stay byte-identical to a
-/// pre-#697 build (no `shard_id` key at all).
+/// Issue #697: a THROTTLED start honours an explicit pin, because the resolved
+/// shard goes into `reserve_or_defer`. So its deferred `202` must echo
+/// `shard_id` too. There is no `execution_id` to decode yet. Without the echo, a
+/// caller cannot audit where a deferred pinned start will run. An unpinned
+/// throttled `202` must stay byte-identical to a pre-#697 build (no `shard_id`
+/// key at all).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn throttled_deferred_start_echoes_the_pinned_shard() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;
@@ -989,11 +991,10 @@ async fn throttled_deferred_start_echoes_the_pinned_shard() {
 /// The AC1 half of the throttle echo: an UNPINNED throttled `202` must omit
 /// `shard_id` entirely, so a pre-#697 client sees a byte-identical body.
 ///
-/// Uses an EU-only writable set so both starts deterministically land on the
-/// same shard -- throttle buckets are **shard-local** (`start-throttle:{wf}:{key}`
-/// lives in that shard's `harvest_rate_limit_buckets`), so an unpinned start
-/// rendezvous-hashed onto a different shard would find a full bucket and run
-/// immediately instead of deferring.
+/// An EU-only writable set makes both starts land on the same shard. Throttle
+/// buckets are **shard-local**: `start-throttle:{wf}:{key}` lives in that
+/// shard's `harvest_rate_limit_buckets`. An unpinned start hashed onto a
+/// different shard would find a full bucket and run at once, not defer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unpinned_throttled_deferred_start_omits_shard_id() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;
@@ -1035,8 +1036,8 @@ async fn unpinned_throttled_deferred_start_omits_shard_id() {
 
 /// AC6 over HTTP: a negative `shard_id` and the reserved `UNENCODED` sentinel
 /// are both `400` at the API boundary. The pure-parse tests assert only that
-/// the error names `shard_id`; these assert the end-to-end wire behaviour
-/// (never a `500`, never a silent re-hash onto the default shard).
+/// the error names `shard_id`. These assert the end-to-end wire behaviour:
+/// never a `500`, never a silent re-hash onto the default shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negative_and_sentinel_shard_ids_are_rejected_400_over_http() {
     let ((eu, us, drained), _guard) = setup_three_shards().await;

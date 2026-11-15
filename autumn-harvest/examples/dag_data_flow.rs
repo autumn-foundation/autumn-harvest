@@ -3,12 +3,12 @@
 //!
 //! ## The problem
 //!
-//! In a `#[dag]` pipeline every node's activity gets fed the DAG's *trigger
-//! input* (wrapped in a `{ "conf": …, "dag_task": "<name>" }` envelope), not the
-//! output of the node it depends on. So a classic `extract → transform → load`
-//! pipeline — where each stage consumes the prior stage's output — forced
-//! authors to either flatten the pipeline into one mega-activity or hand-thread
-//! outputs through shared state. Neither is the graph you wanted to draw.
+//! In a `#[dag]` pipeline, every node's activity gets the DAG's *trigger
+//! input*, not the output of the node it depends on. The input is wrapped in a
+//! `{ "conf": …, "dag_task": "<name>" }` envelope. In a classic
+//! `extract → transform → load` pipeline, each stage consumes the prior output.
+//! Authors had to flatten it into one mega-activity or thread outputs through
+//! shared state. Neither is the graph you wanted to draw.
 //!
 //! ## The solution: `.input_from(…)`
 //!
@@ -29,18 +29,18 @@
 //! | `.input_from_aliased(&[("k", &a)])` | a JSON object keyed by the **given alias**                     |
 //!
 //! Binding **implies the dependency edge** — no separate `.upstream(&up)` is
-//! required (though an extra one is harmless). A binding to a node that was
-//! skipped or failed yields a deterministic `Value::Null` for that source, so a
-//! bound node can still run (give it an `AllDone` trigger rule) and branch on
+//! required (though an extra one is harmless). A binding to a skipped or
+//! failed node yields a deterministic `Value::Null` for that source. So a bound
+//! node can still run (give it an `AllDone` trigger rule) and branch on
 //! null-vs-payload.
 //!
 //! ## Determinism
 //!
-//! A bound node's input derives **only** from already-recorded upstream outputs
-//! (frozen in `harvest_events` before the bound node is dispatched), so replay
-//! reproduces byte-identical inputs on every worker and every pass. Never derive
-//! a node's input from process state, the system clock, or random values — bind
-//! to an upstream output instead.
+//! A bound node's input derives **only** from already-recorded upstream
+//! outputs. They are frozen in `harvest_events` before the bound node is
+//! dispatched. So replay reproduces byte-identical inputs on every worker and
+//! every pass. Never derive a node's input from process state, the system
+//! clock, or random values. Bind to an upstream output instead.
 //!
 //! ## Invariants
 //!
@@ -184,8 +184,8 @@ mod tests {
     }
 
     /// AC2/AC3 (headline): each ETL stage receives EXACTLY the prior stage's
-    /// output — `transform` gets the raw `extract` array, `load` gets the raw
-    /// `transform` object — with no `conf`/`dag_task` wrapper anywhere.
+    /// output. `transform` gets the raw `extract` array, and `load` gets the raw
+    /// `transform` object. No `conf`/`dag_task` wrapper appears anywhere.
     #[tokio::test]
     async fn each_stage_receives_the_prior_stage_output() {
         let extract_out = json!([

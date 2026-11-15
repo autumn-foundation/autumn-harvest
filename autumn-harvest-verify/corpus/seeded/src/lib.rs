@@ -3,16 +3,16 @@
 //!
 //! **The contract of this crate.** Every module here contains exactly one
 //! `#[workflow]` function, named identically to its module, that carries exactly
-//! one distinct, deliberately *laundered* determinism bug. Every one of them
-//! must come back `nondeterminism-found` from `harvest-verify`, with a trace
-//! that names the helper it flowed through — and every one of them passes the
-//! entire syntactic layer cleanly:
+//! one distinct, deliberately *laundered* determinism bug. Each must come back
+//! `nondeterminism-found` from `harvest-verify`, with a trace that names the
+//! helper it flowed through. Each also passes the entire syntactic layer
+//! cleanly:
 //!
 //! * **Zero HVG findings of any severity.** The `#[workflow]` proc macro turns
 //!   hard blockers into `compile_error!` and warnings into a `#[deprecated]`
-//!   const, so a build of this crate under `RUSTFLAGS="-D warnings"` *is* the
-//!   proof — there is no other way to get it, since `autumn-harvest-macros` is
-//!   a `proc-macro` crate and cannot export its visitor to a test.
+//!   const. So a build of this crate under `RUSTFLAGS="-D warnings"` *is* the
+//!   proof. No other proof exists: `autumn-harvest-macros` is a `proc-macro`
+//!   crate and cannot export its visitor to a test.
 //! * **Zero `det_check` findings and zero suppressions.**
 //!   `autumn_harvest::det_check::check_paths` over `corpus/*/src` must return an
 //!   empty report. There is no `allow_nondeterministic_apis` and no
@@ -23,9 +23,9 @@
 //! 1. HVG001–HVG011 are a `syn` visitor over the **annotated body only**.
 //! 2. DET001–DET011 are a line-oriented substring scan over `#[workflow]` bodies
 //!    plus **one** helper hop resolved **same-file, same-module**.
-//! 3. HVG011/DET010 (hash iteration) track only **locally bound** hash idents
-//!    iterated by a bare ident or a *single* argument-free method — never
-//!    parameters, never struct fields, never adaptor chains.
+//! 3. HVG011/DET010 (hash iteration) track only **locally bound** hash idents.
+//!    The iteration must be a bare ident or a *single* argument-free method.
+//!    Parameters, struct fields and adaptor chains are never tracked.
 //!
 //! **Naming convention (used verbatim by `corpus/expectations.toml`).** The
 //! workflow function has the same name as its module, so the fully-qualified

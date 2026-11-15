@@ -602,7 +602,6 @@ async fn the_default_probe_runs_only_read_only_tools() {
     assert_eq!(effects, BTreeSet::from(["external", "write"]));
     assert_eq!(report.text, "probe done");
 
-    // The source is unchanged.
     assert_eq!(fx.event_digest(source).await, before);
     // The fork names its source and marks itself as a probe.
     let history = fx.history(probe).await;
@@ -625,7 +624,6 @@ async fn the_default_probe_runs_only_read_only_tools() {
         source_ledger,
         "no probe row carries the source run id"
     );
-    // The probe delivers nothing.
     assert_eq!(fx.delivery.count(), delivered, "agent_deliver never ran");
 }
 

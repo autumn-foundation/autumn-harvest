@@ -1,20 +1,19 @@
 //! Shared workload builder for the `replay_profile` instruction-count harness.
 //!
-//! Deliberately mirrors `replay_bench.rs`'s `sequential_workflow` /
-//! `build_history` shape (same number of activities per event, same
-//! `execute_activity_raw` call site) so this harness measures the *same*
-//! documented issue #135 workload, not a bespoke shape invented to flatter a
-//! particular change. The one addition is a realistic per-activity JSON
-//! payload (`activity_payload`) in place of `Value::Null` — a real workflow's
-//! activities carry real input/output records, and a payload-free history
-//! would under-count any cost that scales with payload size (`Value` clone,
-//! `serde_json` (de)serialization at the event-history boundary).
+//! Mirrors the `sequential_workflow` / `build_history` shape of
+//! `replay_bench.rs`: the same activities per event and the same
+//! `execute_activity_raw` call site. So this harness measures the documented
+//! issue #135 workload, not a shape that flatters one change.
 //!
-//! `activity_payload(i)` is called on *both* sides (history construction and
-//! the workflow's own `execute_activity_raw` call) so the recorded
-//! `ActivityScheduled.input` always matches what the replaying workflow code
-//! supplies — required for `WorkflowReplayer`'s strict-mode input comparison
-//! to pass.
+//! The one addition is a realistic per-activity JSON payload
+//! (`activity_payload`) in place of `Value::Null`. A payload-free history
+//! under-counts costs that scale with payload size: `Value` clone and
+//! `serde_json` (de)serialization at the event-history boundary.
+//!
+//! Both history construction and the workflow's `execute_activity_raw` call
+//! use `activity_payload(i)`. So the recorded `ActivityScheduled.input` matches
+//! what the replaying code supplies, as the strict-mode input comparison of
+//! `WorkflowReplayer` requires.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,9 +26,9 @@ use serde_json::{Value, json};
 
 /// A representative per-activity input record: an order line item.
 ///
-/// ~230 bytes serialized -- small enough to be typical of a real activity
-/// call, large enough to exercise `Value` clone / serde (de)serialization
-/// cost instead of measuring only the `Value::Null` fast path.
+/// About 230 bytes serialized. That is typical of a real activity call, and
+/// large enough to exercise `Value` clone and serde cost, not only the
+/// `Value::Null` fast path.
 #[must_use]
 pub fn activity_payload(i: usize) -> Value {
     json!({

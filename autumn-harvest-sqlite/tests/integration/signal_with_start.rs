@@ -77,7 +77,6 @@ fn staged(path: &Path, exec: ExecutionId, name: &str) -> i64 {
         .unwrap()
 }
 
-/// Every `harvest_signals` row.
 fn all_signals(path: &Path) -> i64 {
     raw(path)
         .query_row("SELECT COUNT(*) FROM harvest_signals", [], |r| r.get(0))

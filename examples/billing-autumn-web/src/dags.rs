@@ -46,22 +46,18 @@ pub fn billing_reconciliation(dag: &mut DagBuilder) {
     default_queue = "ops"
 )]
 pub fn anomaly_routing(dag: &mut DagBuilder) {
-    // Step 1: scan for discrepancies.
     let scan = dag.activity(scan_discrepancies);
 
-    // Step 2a: flag for audit when at least one discrepancy was found.
     let flag = dag
         .activity(flag_for_audit)
         .upstream(&scan)
         .condition(|outputs| outputs[0]["discrepancy_count"].as_u64().unwrap_or(0) > 0);
 
-    // Step 2b: auto-close when the run is clean.
     let close = dag
         .activity(auto_close_run)
         .upstream(&scan)
         .condition(|outputs| outputs[0]["discrepancy_count"].as_u64().unwrap_or(0) == 0);
 
-    // Step 3: join — fires once whichever branch ran (or was skipped).
     let _summary = dag
         .activity(send_reconciliation_summary)
         .upstream(&flag)

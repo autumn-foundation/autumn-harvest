@@ -1,15 +1,15 @@
 //! **C11** — interior mutability that is **locally constructed and never
 //! escapes**.
 //!
-//! A `RefCell` created inside the body, mutated in a loop over deterministic
-//! input, and read back is just a mutable local with extra steps: its final
-//! value is a pure function of the workflow input. The mirror image of
+//! The body creates a `RefCell`, mutates it in a loop over deterministic
+//! input, and reads it back. That is a mutable local with extra steps. Its
+//! final value is a pure function of the workflow input. The mirror image is
 //! `harvest_verify_corpus_seeded::wf_refcell_captured_state`, where the same
-//! `RefCell` machinery is applied to *ambient* state and must be found.
+//! `RefCell` machinery holds *ambient* state and must be found.
 //!
-//! What separates them is the **root** of the receiver place, not the type: a
-//! locally-allocated cell is a clean root; a `static`/thread-local one is an
-//! ambient source. An analyzer that keys on `RefCell` as a syntactic token
+//! The **root** of the receiver place separates them, not the type. A
+//! locally-allocated cell is a clean root. A `static` or thread-local one is
+//! an ambient source. An analyzer that keys on `RefCell` as a syntactic token
 //! flags this. Verdict: `proven-deterministic`.
 
 use std::cell::RefCell;

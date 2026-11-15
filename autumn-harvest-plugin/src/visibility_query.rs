@@ -156,7 +156,6 @@ pub fn workflow_names(expr: &Expr) -> Vec<String> {
     }
 }
 
-/// Whether `expr` holds an `OR`.
 fn has_or(expr: &Expr) -> bool {
     match expr {
         Expr::Leaf(_) => false,

@@ -101,10 +101,9 @@ async fn opposite_order_lock_acquisition_deadlocks() {
     let conn1_wants_b =
         tokio::spawn(async move { (lock_quota_key(&mut conn1, wf, "B").await, conn1) });
 
-    // Give conn1's request time to actually reach the server and start
-    // waiting. This is a one-directional wait for our own setup step to
-    // land. It is not a race against the mechanism under test. That
-    // mechanism is closed by explicit ordering below, not by timing.
+    // Give conn1's request time to reach the server and start waiting. This
+    // wait only lets the setup step land. It is not a race against the
+    // mechanism under test, which explicit ordering closes below.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // conn2 now wants A, held by (blocked) conn1 -- the cycle is closed.
@@ -162,8 +161,8 @@ async fn same_order_lock_acquisition_never_deadlocks() {
         (a, b, conn2)
     });
 
-    // Give conn2's A-request time to actually reach the server and start
-    // waiting, mirroring the sibling test's setup wait.
+    // Give conn2's A-request time to reach the server and start waiting, as
+    // in the sibling test.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // conn1 takes B too -- uncontended, since conn2 is still blocked on A

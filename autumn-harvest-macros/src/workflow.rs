@@ -68,10 +68,9 @@ struct QuotaArgs {
     /// The LLM caps and the tenant window (issue #1997), in the order of
     /// [`LLM_QUOTA_KEYS`].
     llm: [Option<u64>; 5],
-    /// Already parsed at attribute-parse time via [`parse_byte_size_macro`]
-    /// (e.g. `"10MiB"` -> `10_485_760`), mirroring `#[workflow(max_input_bytes
-    /// = "8MiB")]`'s own compile-time byte-size validation -- a typo is a
-    /// build error, not a registration-time panic.
+    /// Parsed at attribute-parse time via [`parse_byte_size_macro`] (e.g.
+    /// `"10MiB"` -> `10_485_760`), as for `#[workflow(max_input_bytes)]`. A
+    /// typo is a build error, not a registration-time panic.
     max_history_bytes: Option<u64>,
     max_dead_letters: Option<u32>,
 }
@@ -90,11 +89,11 @@ fn is_valid_rate(s: &str) -> bool {
 }
 
 /// The per-period count of an already-validated rate string (e.g. `"100/m"`
-/// -> `100.0`, `"0.5/s"` -> `0.5`). Only call after [`is_valid_rate`] has
-/// confirmed the string is well-formed -- mirrors
-/// `autumn_harvest::throttle::RateSpec::per_period_count`'s runtime parsing
-/// so the macro's compile-time check agrees with `ThrottlePolicy::from_rate_str`'s
-/// defaulted-burst rejection (issue #607 code review).
+/// -> `100.0`, `"0.5/s"` -> `0.5`). Call it only after [`is_valid_rate`]
+/// accepts the string. It mirrors the runtime parsing of
+/// `autumn_harvest::throttle::RateSpec::per_period_count`. So the compile-time
+/// check agrees with the defaulted-burst rejection of
+/// `ThrottlePolicy::from_rate_str` (issue #607).
 fn rate_per_period_count(s: &str) -> f64 {
     s.split_once('/')
         .and_then(|(count, _unit)| count.trim().parse::<f64>().ok())
@@ -161,14 +160,16 @@ struct WorkflowAttrs {
 
 /// Parse a bracketed dependency list — `[send_email, billing::charge_card, "raw_name"]`.
 ///
-/// Each element is either a path (its **last segment** is the registered name —
-/// neither `#[workflow]` nor `#[activity]` has a `name = "..."` rename
-/// attribute, so the fn ident always *is* the name) or a string literal (for a
-/// name dispatched by `ctx.execute_activity_raw("...", …)` that is not an
-/// identifier in scope). The two forms are equivalent; a path is not
-/// name-resolved by the compiler, so a typo stays a *preflight* failure — the
-/// exact deploy-time failure mode issue #802 specifies — rather than becoming a
-/// compile error that would also force the author to import every dependency.
+/// Each element is a path or a string literal. A path's **last segment** is
+/// the registered name. Neither `#[workflow]` nor `#[activity]` has a
+/// `name = "..."` rename attribute, so the fn ident always *is* the name. A
+/// string literal names a handler dispatched by
+/// `ctx.execute_activity_raw("...", …)` that is not an identifier in scope.
+///
+/// The two forms are equivalent. The compiler does not name-resolve a path, so
+/// a typo stays a *preflight* failure, the deploy-time failure mode of issue
+/// #802. A compile error would also force the author to import every
+/// dependency.
 fn parse_dependency_list(
     meta: &syn::meta::ParseNestedMeta<'_>,
     attr_name: &str,
@@ -229,21 +230,16 @@ fn declaration_expr(declared: Option<&[String]>) -> proc_macro2::TokenStream {
     )
 }
 
-/// The bracketed body of an `activities = [...]` / `children = [...]` list.
-///
-/// Parsed through a dedicated [`syn::parse::Parse`] impl so the `bracketed!`
-/// macro receives a real `ParseStream` binding, matching the repo's
-/// `meta.value()?.parse()?` idiom.
 /// Reject a repeated `activities` / `children` key.
 ///
 /// Every other `#[workflow]` attribute is last-wins, which is merely surprising
-/// for a scalar. Here it would silently **weaken a safety check**:
+/// for a scalar. Here it would silently **weaken a safety check**.
 /// `activities = [missing_handler], activities = []` records only the empty
-/// list, so preflight passes even though the first declaration named an
-/// unregistered handler — the exact deploy-time miss this attribute exists to
-/// catch. Fail loud instead. Rejecting rather than merging is deliberate: a
-/// repeated key is a mistake (a copy-paste, or a badly resolved merge), and
-/// silently concatenating would accept two lists the author believed were one.
+/// list. Preflight then passes, though the first declaration named an
+/// unregistered handler. That is the deploy-time miss this attribute exists
+/// to catch, so fail loud. Rejecting rather than merging is deliberate. A
+/// repeated key is a mistake (a copy-paste, or a badly resolved merge).
+/// Silently concatenating would accept two lists the author believed were one.
 fn reject_duplicate_dependency_attr<T>(
     meta: &syn::meta::ParseNestedMeta<'_>,
     existing: Option<&T>,
@@ -264,11 +260,10 @@ fn reject_duplicate_dependency_attr<T>(
 /// `#[workflow]`'s existing vocabulary has exactly two container idioms:
 /// `key = "string"` (`owner`, `runbook`, `severity`, `description`) and
 /// `key(a = .., b = ..)` (`concurrency`, `debounce`, `batch`, `throttle`).
-/// `activities`/`children` introduce a third, `key = [..]`, so an author who
-/// pattern-matched off either existing form lands on a raw `syn` error
-/// ("expected square brackets" / "expected `=`") that names neither the
-/// attribute nor the correct shape. Both wrong-container forms are caught
-/// explicitly and answered with this message instead.
+/// `activities`/`children` introduce a third, `key = [..]`. An author who
+/// copies either existing form gets a raw `syn` error ("expected square
+/// brackets" / "expected `=`"). It names neither the attribute nor the correct
+/// shape. So both wrong-container forms get this message instead.
 fn dependency_list_shape_hint(attr_name: &str) -> String {
     let example = if attr_name == "children" {
         "generate_report"
@@ -282,6 +277,11 @@ fn dependency_list_shape_hint(attr_name: &str) -> String {
     )
 }
 
+/// The bracketed body of an `activities = [...]` / `children = [...]` list.
+///
+/// Parsed through a dedicated [`syn::parse::Parse`] impl so the `bracketed!`
+/// macro receives a real `ParseStream` binding, matching the repo's
+/// `meta.value()?.parse()?` idiom.
 struct DependencyList {
     items: syn::punctuated::Punctuated<DependencyItem, syn::Token![,]>,
 }
@@ -307,12 +307,12 @@ impl syn::parse::Parse for DependencyItem {
         if input.peek(syn::LitStr) {
             return input.parse().map(Self::Literal);
         }
-        // Anything else must be a path. Probe with a fork rather than peeking
-        // for `Ident`: a qualifier like `crate::` / `self::` / `super::` is a
-        // KEYWORD, not an `Ident`, so a peek-based guard would reject
-        // `crate::billing::charge_card` before `syn::Path` ever saw it. Forking
-        // keeps the real stream unadvanced so the fallback error points at the
-        // offending token rather than wherever a partial parse stopped.
+        // Anything else must be a path. Probe with a fork, not a peek for
+        // `Ident`. A qualifier like `crate::` / `self::` / `super::` is a
+        // KEYWORD, not an `Ident`. A peek-based guard would reject
+        // `crate::billing::charge_card` before `syn::Path` saw it. The fork
+        // keeps the real stream unadvanced. So the fallback error points at
+        // the offending token, not where a partial parse stopped.
         if input.fork().parse::<syn::Path>().is_ok() {
             return input.parse().map(Self::Path);
         }
@@ -573,13 +573,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     "throttle requires `rate = \"...\"` (e.g. `rate = \"100/m\"`)",
                 )
             })?;
-            // A sub-unit rate (e.g. "0.5/s") with no explicit `burst` would
-            // default the bucket capacity to that same sub-one value, which
-            // can never successfully debit a token -- `ThrottlePolicy::
-            // from_rate_str` rejects this at runtime, but by then the
-            // generated companion function's `.expect(...)` panics at
-            // workflow-registration time instead of failing to compile.
-            // Reject it here instead (issue #607 code review).
+            // A sub-unit rate (e.g. "0.5/s") with no explicit `burst` sets the
+            // bucket capacity to that sub-one value. It can never debit a
+            // token. `ThrottlePolicy::from_rate_str` rejects this at runtime.
+            // By then the companion function's `.expect(...)` panics at
+            // workflow registration. So reject it at compile time (issue #607).
             if burst.is_none() && rate_per_period_count(&rate) < 1.0 {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
@@ -608,19 +606,17 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     key_expr = Some(value.value());
                     Ok(())
                 } else if inner.path.is_ident("max_active_executions") {
-                    // Unlike `concurrency`'s `limit`, zero is a deliberately
-                    // supported value (`QuotaPolicy::has_any_cap`'s own test
-                    // suite covers it) -- it means "block every start for this
-                    // key", not an author mistake, so it is not rejected here.
+                    // Unlike `concurrency`'s `limit`, zero is a supported value.
+                    // It means "block every start for this key", not an author
+                    // mistake. `QuotaPolicy::has_any_cap`'s own tests cover it.
                     let value: syn::LitInt = inner.value()?.parse()?;
                     let n: u32 = value.base10_parse()?;
                     max_active_executions = Some(n);
                     Ok(())
                 } else if inner.path.is_ident("max_history_bytes") {
                     // Byte-size string (e.g. "10MiB"), validated at compile
-                    // time via the same helper `#[workflow(max_input_bytes =
-                    // "8MiB")]` uses, so a typo is a build error rather than a
-                    // registration-time panic.
+                    // time like `#[workflow(max_input_bytes)]`. A typo is a
+                    // build error, not a registration-time panic.
                     let value: LitStr = inner.value()?.parse()?;
                     let s = value.value();
                     let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
@@ -755,9 +751,9 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
 ///
 /// Detection is by the error type's **last path segment ident** (`== "WorkflowFailure"`,
 /// with or without a `failure::` / `autumn_harvest::failure::` prefix), mirroring
-/// `activity_returns_activity_failure`. A `use` alias or a rename of the type is
-/// therefore not detected and falls back to the `.to_string()` path — a documented
-/// limitation, consistent with the activity precedent.
+/// `activity_returns_activity_failure`. So a `use` alias or a rename of the type
+/// is not detected, and falls back to the `.to_string()` path. This documented
+/// limitation matches the activity precedent.
 fn workflow_returns_workflow_failure(output: &syn::ReturnType) -> bool {
     let syn::ReturnType::Type(_, ty) = output else {
         return false;
@@ -890,11 +886,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // If the workflow returns `Result<_, WorkflowFailure>`, route the error
-    // through `WorkflowFailure`'s `IntoWorkflowErrorString` impl so the engine
-    // can recover the typed `error_type` / `details` / `non_retryable` from the
-    // wire envelope. Otherwise the legacy `.to_string()` path is used, keeping
-    // every `Result<_, String>` (or other `ToString` error) workflow unchanged.
+    // A `Result<_, WorkflowFailure>` error goes through `WorkflowFailure`'s
+    // `IntoWorkflowErrorString` impl. The engine then recovers the typed
+    // `error_type` / `details` / `non_retryable` from the wire envelope. Other
+    // error types keep the legacy `.to_string()` path unchanged.
     let returns_workflow_failure = workflow_returns_workflow_failure(&input_fn.sig.output);
     let encode_err = if returns_workflow_failure {
         quote! {
@@ -913,7 +908,6 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         &encode_err,
     );
 
-    // Emit execution_timeout as Option<Duration> using the task_duration helper.
     let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
         || quote! { None },
         |s| quote! { ::autumn_harvest::task_duration(#s) },
@@ -931,7 +925,6 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |s| quote! { ::autumn_harvest::task_duration(#s) },
     );
 
-    // Emit concurrency as Option<ConcurrencyPolicy>.
     let concurrency_expr = match attrs.concurrency {
         None => quote! { ::std::option::Option::None },
         Some(ConcurrencyArgs {
@@ -1051,10 +1044,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Emit quota as Option<QuotaPolicy> (issue #946). `max_history_bytes` is
-    // already a compile-time-validated `u64` (parsed above via
-    // `parse_byte_size_macro`), so no runtime `.expect(...)` is needed here --
-    // unlike `throttle`/`debounce`, which defer duration-string parsing to
-    // `::autumn_harvest::task_duration` at registration time.
+    // a `u64` already validated at compile time by `parse_byte_size_macro`. So
+    // it needs no runtime `.expect(...)`, unlike `throttle`/`debounce`. Those
+    // defer duration parsing to `::autumn_harvest::task_duration`.
     let quota_expr = match attrs.quota {
         None => quote! { ::std::option::Option::None },
         Some(QuotaArgs {
@@ -1256,22 +1248,23 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
-                    // Issue #499: debounce admission is owned exclusively by the
-                    // HTTP start route (`POST /workflows/{name}/start`). That route
-                    // has the registry + shard-router context the gate requires:
-                    // it routes the pending record onto the *debounce-key's* shard,
-                    // resolves the effective start options (SLA/timeout defaults +
-                    // server ceilings, operator metadata), enforces the input cap,
-                    // rejects `start_at`/`delay`, and preserves idempotent retries.
+                    // Issue #499: only the HTTP start route
+                    // (`POST /workflows/{name}/start`) admits a debounced start.
+                    // That route has the registry + shard-router context the gate
+                    // needs. It routes the pending record onto the *debounce-key's*
+                    // shard. It resolves the effective start options (SLA/timeout
+                    // defaults + server ceilings, operator metadata). It enforces
+                    // the input cap, rejects `start_at`/`delay`, and preserves
+                    // idempotent retries.
                     //
-                    // The typed stub cannot reproduce that correctly: it only
-                    // receives the workflow_id-derived `conn` (not the debounce-key
-                    // shard's connection) and has no registry handle, and a deferred
-                    // debounced start has no exec_id-keyed handle to return anyway.
-                    // So rather than silently bypassing the policy or admitting onto
-                    // the wrong shard, reject early with a clear pointer to the HTTP
-                    // route. Same rationale covers the sibling throttle and batch
-                    // checks `reject_if_admission_may_defer` also runs.
+                    // The typed stub cannot do that correctly. It receives only
+                    // the workflow_id-derived `conn`, not the debounce-key shard's
+                    // connection, and has no registry handle. A deferred debounced
+                    // start also has no exec_id-keyed handle to return. So reject
+                    // early with a pointer to the HTTP route. Do not bypass the
+                    // policy or admit onto the wrong shard. The same rationale
+                    // covers the throttle and batch checks of
+                    // `reject_if_admission_may_defer`.
                     info.reject_if_admission_may_defer(&input)?;
                     if opts.batch.is_some() {
                         return ::std::result::Result::Err(
@@ -1376,13 +1369,13 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
-                    // Issue #499: debounce admission is owned exclusively by the HTTP
-                    // start route (see `start_with_options` for the rationale). A
-                    // debounced workflow must not be started — or signal-with-started —
-                    // through the typed client, which cannot route to the debounce-key
-                    // shard or admit through the gate. Reject with a pointer to HTTP.
-                    // Same rationale covers the sibling throttle and batch checks
-                    // `reject_if_admission_may_defer` also runs.
+                    // Issue #499: only the HTTP start route admits a debounced
+                    // start (see `start_with_options` for the rationale). The typed
+                    // client must not start or signal-with-start a debounced
+                    // workflow. It cannot route to the debounce-key shard or admit
+                    // through the gate. Reject with a pointer to HTTP. The same
+                    // rationale covers the throttle and batch checks of
+                    // `reject_if_admission_may_defer`.
                     info.reject_if_admission_may_defer(&input)?;
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
@@ -1448,11 +1441,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         workflow_retry_policy: info.retry_policy
                             .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        // Schema validation (issue #373) is an HTTP-JSON-boundary
-                        // concern only: a typed stub caller's `input: I` is already
-                        // checked by Rust's type system, so it never needs runtime
-                        // schema validation -- consistent with every other
-                        // `validate_input` call site being in the HTTP handlers.
+                        // Schema validation (issue #373) belongs to the HTTP-JSON
+                        // boundary only. Rust's type system already checks a typed
+                        // stub caller's `input: I`. Every other `validate_input`
+                        // call site is in the HTTP handlers.
                         workflow_info: None,
                         start_source_override: None,
                         start_source_ref_override: None,

@@ -401,7 +401,6 @@ where
     }
 }
 
-/// Read one answer of the guest to `job`.
 async fn read_reply<S>(stream: &mut S, job: &SandboxJob) -> Result<GuestMessage, SandboxError>
 where
     S: AsyncRead + Unpin + Send,

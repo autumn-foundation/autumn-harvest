@@ -3,10 +3,10 @@
 //!
 //! Workflow-level retry (#523/#842) starts each attempt as a **fresh execution**
 //! with a new `exec_id`, linked to its predecessor via `retry_of_exec_id`. A
-//! caller holding the original id names the *logical* run, so every mutating
-//! and interactive management route must be routed to the **live attempt** —
-//! the deepest execution reachable by following `retry_of_exec_id` successors
-//! from `FAILED` rows.
+//! caller with the original id names the *logical* run. So each mutating and
+//! interactive management route must reach the **live attempt**. That is the
+//! deepest execution reachable through `retry_of_exec_id` successors from
+//! `FAILED` rows.
 //!
 //! Scenarios covered (all addressed by the ORIGINAL, sealed-`FAILED` id):
 //!   - `POST /workflows/{id}/signal/{name}`   → lands on the live attempt, and
@@ -18,10 +18,10 @@
 //!   - `GET  /workflows/{id}`                 → **unchanged**: describe is a
 //!     specific-`exec_id` read and still reports the addressed (sealed) row.
 //!
-//! The chain is seeded directly (a `FAILED` predecessor + a `RUNNING` successor
-//! carrying `retry_of_exec_id`), which is exactly the durable shape the worker's
-//! atomic retry transaction commits — so these tests exercise the HTTP routing
-//! without needing a live worker.
+//! The chain is seeded directly: a `FAILED` predecessor and a `RUNNING` successor
+//! with `retry_of_exec_id`. The atomic retry transaction of the worker commits
+//! exactly that durable shape. So these tests exercise the HTTP routing without
+//! a live worker.
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
@@ -121,9 +121,9 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
-/// (creating a fresh per-test database off it so tests in this binary never
-/// share state), else fall back to testcontainers.
+/// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`,
+/// else fall back to testcontainers. Each test gets a fresh database off that
+/// URL, so tests in this binary never share state.
 async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest_843_http_{}", uuid::Uuid::new_v4().simple());
@@ -282,8 +282,8 @@ async fn seed_execution(
 }
 
 /// Seed a two-attempt retry chain: attempt 1 sealed `FAILED`, attempt 2
-/// `RUNNING` and linked back via `retry_of_exec_id` — the exact durable shape
-/// the worker's atomic retry transaction commits.
+/// `RUNNING` and linked back via `retry_of_exec_id`. The atomic retry
+/// transaction of the worker commits exactly this durable shape.
 async fn seed_chain(pool: &DbPool) -> (ExecutionId, ExecutionId) {
     let first = seed_execution(pool, "FAILED", "attempt-1", None).await;
     let second = seed_execution(pool, "RUNNING", "attempt-2", Some(first)).await;
@@ -527,9 +527,9 @@ async fn pause_and_resume_routes_act_on_the_live_retry_attempt() {
     let (first, second) = seed_chain(&pool).await;
     seed_workflow_task(&pool, second).await;
 
-    // Pause is the REVERSIBLE containment lever, and it accepts only a
-    // RUNNING/PAUSED row — so unrouted it 409s against the sealed FAILED
-    // predecessor, leaving an operator only the destructive levers.
+    // Pause is the REVERSIBLE containment lever. It accepts only a
+    // RUNNING/PAUSED row, so unrouted it 409s against the sealed FAILED
+    // predecessor. The operator then has only the destructive levers.
     let (status, body) = post_json(
         &app,
         &format!("/workflows/{first}/pause"),
@@ -622,13 +622,13 @@ async fn update_result_route_reads_the_live_retry_attempt() {
     );
 }
 
-/// Codex review (PR #1200): resolving the update-result read *straight to the
-/// live attempt* is not enough. An `update_id` is minted per admission, so it
-/// lives on exactly ONE attempt. When an update is admitted (and completed) on
-/// attempt N and N then fails and schedules N+1, the durable
-/// `UpdateAdmitted`/`UpdateCompleted` pair stays on N while N+1 replays an
-/// empty history — so a live-attempt-only resolve would 404 forever and make a
-/// durable, already-computed result permanently inaccessible.
+/// PR #1200: the update-result read must not resolve *only to the live attempt*.
+///
+/// An `update_id` is minted per admission, so it lives on exactly ONE attempt.
+/// Suppose attempt N admits and completes an update, then fails and schedules
+/// N+1. The durable `UpdateAdmitted`/`UpdateCompleted` pair stays on N. N+1
+/// replays an empty history. A live-attempt-only resolve then 404s forever, and
+/// the durable result is lost to the caller.
 #[tokio::test]
 async fn update_result_route_finds_a_result_left_on_an_earlier_attempt() {
     let (url, _c) = setup().await;

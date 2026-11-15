@@ -215,7 +215,6 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         .await
         .expect("check conn");
 
-    // No execution must have been created.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
@@ -227,7 +226,6 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         "no run must be started when end_at is reached"
     );
 
-    // Schedule must be exhausted.
     let (exhausted_at, exhausted_reason): (Option<chrono::DateTime<Utc>>, Option<String>) =
         harvest_schedules::table
             .find(sched_id)
@@ -312,7 +310,6 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
     // Budget of 3, already used up.
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, None, Some(3)).await;
 
-    // Simulate budget already exhausted by setting runs_started = 3.
     diesel::update(harvest_schedules::table.find(sched_id))
         .set(harvest_schedules::dsl::runs_started.eq(3))
         .execute(&mut conn)
@@ -436,7 +433,6 @@ async fn runs_started_incremented_per_dispatch() {
     let (mut conn, url, _c) = setup_db().await;
 
     let wf_name = "br_runs_started_wf";
-    // Budget of 5, nothing consumed yet.
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, None, Some(5)).await;
     drop(conn);
 

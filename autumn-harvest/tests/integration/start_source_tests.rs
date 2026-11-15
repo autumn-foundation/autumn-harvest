@@ -1,7 +1,6 @@
 #![cfg(feature = "db")]
-// Each test holds `TEST_SERIAL` across `.await` points to serialize the shared
-// DB scrub + the process-global `ShardedDbPool` static — same as the
-// admission-gate / start-idempotency suites.
+// Each test holds `TEST_SERIAL` across `.await` points. This serializes the
+// shared DB scrub and the process-global `ShardedDbPool` static.
 #![allow(
     clippy::too_many_lines,
     clippy::doc_markdown,
@@ -15,21 +14,22 @@
 //! neutral placeholder `api`; this suite is the falsifiable RED→GREEN proof.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! directly (each test scrubs first, so run single-threaded); otherwise a fresh
-//! testcontainers Postgres is booted with the full migration bundle.
+//! directly. Each test scrubs first, so run single-threaded. Otherwise a fresh
+//! testcontainers Postgres boots with the full migration bundle.
 //!
-//! Paths driven here (pure core): `api` (start_or_load), `signal_with_start`,
-//! `update_with_start`, the three deferred carriers — `debounce`, `throttle`,
-//! `batch` — whose captured provenance must be RESTORED at fire time (never a
-//! hardcoded carrier-specific default), `reset` (own-source, driven via
-//! `reset_workflow_execution`), `schedule` (driven via `tick_once`), and
-//! `completion_trigger` (driven via `evaluate_triggers_for_execution`).
+//! Paths driven here (pure core):
+//! - `api` (`start_or_load`), `signal_with_start` and `update_with_start`.
+//! - The deferred carriers `debounce`, `throttle` and `batch`. Each must RESTORE
+//!   its captured provenance at fire time, never a hardcoded carrier default.
+//! - `reset` (own source, via `reset_workflow_execution`).
+//! - `schedule` (via `tick_once`).
+//! - `completion_trigger` (via `evaluate_triggers_for_execution`).
 //!
-//! Two worker-loop-only paths (`continue_as_new`, `child`) are directly
-//! asserted in the sibling `integration_e2e` module — they require its
-//! module-local worker-loop harness (`build_runtime_worker`, `spawn_test_worker`,
-//! the `continue_as_new_workflow` / child-round-trip handlers) that cannot be
-//! reproduced here without disproportionate scaffolding. `backfill` is only
+//! The sibling `integration_e2e` module asserts the worker-loop-only paths
+//! (`continue_as_new`, `child`). They need its module-local worker-loop harness
+//! (`build_runtime_worker`, `spawn_test_worker`, the `continue_as_new_workflow`
+//! and child-round-trip handlers).
+//! That harness is too large to reproduce here. `backfill` is only
 //! reachable through the plugin's `POST /admin/schedules/{id}/backfill` HTTP
 //! handler and is directly asserted in the plugin's `api_scheduler_integration`
 //! suite. The batch-API *immediate* start (`batch`) and manual trigger-now
@@ -39,15 +39,14 @@
 //! (`workflow_retry_inherits_predecessor_start_source`). See AC3 mapping in the
 //! PR / worker report for the full path→test table.
 //!
-//! NOTE (outbox): the generic cross-shard outbox producer
-//! (`autumn-harvest-plugin::outbox::dispatch_workflow_start_request`) is
-//! production-wired to stamp `start_source = StartSource::Outbox`
-//! (`outbox.rs`), but is exercised only by the outbox drain loop under a
-//! multi-shard deployment. A dedicated integration assertion needs the
-//! cross-shard outbox scaffolding (a second shard, a queued outbox row, the
-//! drain sweep) which is disproportionate for this slice; the value is
-//! confirmed by code reading and the shared `start_or_load` insert test above
-//! (which proves the insert path writes `request.start_source` verbatim).
+//! NOTE (outbox): the cross-shard outbox producer
+//! (`autumn-harvest-plugin::outbox::dispatch_workflow_start_request`) stamps
+//! `start_source = StartSource::Outbox` in `outbox.rs`. Only the outbox drain
+//! loop of a multi-shard deployment exercises it. A dedicated assertion needs a
+//! second shard, a queued outbox row and the drain sweep. That scaffolding is
+//! too large for this slice. Code reading confirms the value. The shared
+//! `start_or_load` insert test proves that the insert path writes
+//! `request.start_source` verbatim.
 
 use std::sync::Mutex;
 
@@ -586,12 +585,11 @@ async fn batch_fire_defaults_to_batch_source() {
 // reset — own source, referencing the source execution (AC3)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// A reset fork is an operator intervention: `insert_fork_execution` must record
-// its OWN `reset` source and reference the source execution id — it must never
-// inherit the source run's provenance. Driven end-to-end through the public
-// `reset_workflow_execution` entrypoint: start a RUNNING run (which appends a
-// `WorkflowStarted` event at id 0), then fork at that boundary and inspect the
-// successor row.
+// A reset fork is an operator intervention. `insert_fork_execution` must record
+// its OWN `reset` source and reference the source execution id. It must never
+// inherit the provenance of the source run. The test drives the public
+// `reset_workflow_execution` entrypoint. It starts a RUNNING run, which appends
+// `WorkflowStarted` at id 0, forks at that boundary and inspects the successor.
 
 #[tokio::test]
 async fn reset_records_reset_source_referencing_source_execution() {
@@ -652,13 +650,13 @@ async fn reset_records_reset_source_referencing_source_execution() {
 // schedule — scheduler tick, referencing the schedule id (AC3)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// A scheduler tick that fires a due slot inserts the run row synchronously (via
-// `start_or_load_workflow_execution`), so no worker needs to drain it: the row
-// exists with `start_source = schedule` and `start_source_ref = <schedule id>`
-// the instant `tick_once` returns.
+// A scheduler tick that fires a due slot inserts the run row synchronously, via
+// `start_or_load_workflow_execution`. No worker needs to drain it. The row has
+// `start_source = schedule` and `start_source_ref = <schedule id>` when
+// `tick_once` returns.
 
-/// A trivial workflow handler — the scheduler tick only *inserts* the run row;
-/// the body is never executed here (no worker is run).
+/// A trivial workflow handler. The tick only *inserts* the run row, so the body
+/// never runs here.
 fn noop_schedule_handler<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,

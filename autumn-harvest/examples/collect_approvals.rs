@@ -33,18 +33,20 @@ pub struct ApprovalStatus {
     pub timed_out: bool,
 }
 
-// HVG010 opt-out with justification (issue #799): this workflow deliberately
-// uses `futures::future::select` below to race a `wait_for_signal` against
-// an `await_condition_timeout`. The guardrail flags the combinator as a
-// HardBlocker because it cannot statically prove such a race is replay-safe, but
-// this specific use IS deterministic: `futures::future::select` polls its
-// branches in a FIXED order (signal first, then timer — unlike the randomized
-// `tokio::select!`), the timer is borrowed by `&mut` so the losing branch is
-// never dropped/leaked (it persists across loop iterations), and the signal
-// future is freshly re-issued each iteration. The winner is therefore a pure
-// function of recorded history order, so replay resolves it identically. This
-// is exactly the AC4 "author has verified this select is safe" opt-out; a
-// production workflow should prefer `ctx.race()` / `ctx.receive_signal_timeout()`.
+// HVG010 opt-out with justification (issue #799): this workflow uses
+// `futures::future::select` below to race a `wait_for_signal` against an
+// `await_condition_timeout`. The guardrail flags the combinator as a
+// HardBlocker, because it cannot statically prove such a race replay-safe.
+// This use IS deterministic, for three reasons:
+// - `futures::future::select` polls its branches in a FIXED order, signal
+//   first, then timer. `tokio::select!` randomizes the order.
+// - The timer is borrowed by `&mut`, so the losing branch is never dropped or
+//   leaked. It persists across loop iterations.
+// - Each iteration issues a fresh signal future.
+// So the winner is a pure function of recorded history order, and replay
+// resolves it identically. This is the AC4 "author has verified this select is
+// safe" opt-out. A production workflow should prefer `ctx.race()` /
+// `ctx.receive_signal_timeout()`.
 #[workflow(allow_nondeterministic_apis)]
 pub async fn collect_approvals(
     ctx: &WorkflowContext,

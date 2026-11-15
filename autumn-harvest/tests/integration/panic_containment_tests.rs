@@ -2,30 +2,30 @@
 //! Handler-panic containment behavioural tests — issue #782 (AC7).
 //!
 //! Injects panicking workflow and activity handlers and drives them end-to-end
-//! against a real Postgres instance + worker poll loop, proving that an
-//! **uncaught handler panic is contained as a clean failure** rather than
-//! crashing the worker process or wedging the task row:
+//! against a real Postgres and worker poll loop. The tests prove that an
+//! **uncaught handler panic is contained as a clean failure**. The panic does
+//! not crash the worker process or wedge the task row:
 //!
-//! - AC1/AC3 (activity): a panicking activity handler is caught at the worker
-//!   dispatch boundary, retried per the activity's retry policy, then fails
-//!   terminally with a typed `HandlerPanic` `ActivityFailed` event carrying the
+//! - AC1/AC3 (activity): the worker dispatch boundary catches a panicking
+//!   activity handler. The activity retries per its retry policy. It then
+//!   fails with a typed `HandlerPanic` `ActivityFailed` event that carries the
 //!   panic message. No poison-pill DLQ row; `crash_strikes` never incremented.
 //! - Local activity: a panicking `is_local = true` handler runs inline in the
-//!   workflow task; the panic is caught and flattened into the same retryable
-//!   `HandlerPanic` path (terminal `LocalActivityExhausted`), never unwinding
+//!   workflow task. The panic is caught and goes into the same retryable
+//!   `HandlerPanic` path (terminal `LocalActivityExhausted`). It never unwinds
 //!   the workflow-task dispatch.
-//! - AC2/AC6 (workflow body): a panicking workflow handler is caught in the
-//!   executor and re-dispatched (non-terminal, `RUNNING`, no event appended)
-//!   with capped backoff up to `workflow_panic_max_attempts`, then failed
+//! - AC2/AC6 (workflow body): the executor catches a panicking workflow
+//!   handler. It re-dispatches (non-terminal, `RUNNING`, no event appended)
+//!   with capped backoff up to `workflow_panic_max_attempts`. It then fails
 //!   terminally via a typed `HandlerPanic` `WorkflowFailed`. No poison-pill
 //!   DLQ row; `crash_strikes` stays 0; no #523 fresh-execution retry chain.
 //! - `workflow_panic_max_attempts = 0`: terminal on the first panic, no
 //!   re-dispatch.
 //!
-//! In every case the worker process stays up (the execution reaching a terminal
-//! state at all is the proof — a poisoned worker task would never process it),
-//! and the panic counters (`record_activity_panic` / `record_workflow_panic`)
-//! fire per panicking attempt/entry.
+//! In every case the worker process stays up. A terminal state is the proof,
+//! because a poisoned worker task would never process the execution. The
+//! panic counters (`record_activity_panic` / `record_workflow_panic`) fire
+//! per panicking attempt or entry.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted
@@ -137,9 +137,9 @@ impl MetricsRecorder for PanicMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// Worker + registry construction (self-contained: the integration_e2e harness
-// helpers are private to that module, and the workflow tests need a custom
-// `workflow_panic_max_attempts`, which no shared helper exposes).
+// Worker + registry construction, self-contained. The integration_e2e
+// helpers are private to that module. The workflow tests need a custom
+// `workflow_panic_max_attempts`, which no shared helper exposes.
 // ---------------------------------------------------------------------------
 
 fn build_registry(
@@ -400,11 +400,12 @@ fn panic_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
     Box::pin(async move { panic!("workflow boom") })
 }
 
-/// Workflow whose handler panics **during future construction** — the panic
-/// unwinds synchronously *before* `Box::pin(...)` is produced (issue #782 / PR
-/// #1012 review). A registered hand-written handler doing synchronous work
-/// before returning its boxed future must be contained identically to a body
-/// panic; the poll-time `catch_unwind` cannot reach it.
+/// Workflow whose handler panics **during future construction**.
+///
+/// The panic unwinds synchronously *before* `Box::pin(...)` is produced (issue
+/// #782, PR #1012). A hand-written handler can do synchronous work before it
+/// returns its boxed future. A panic there must be contained like a body
+/// panic. The poll-time `catch_unwind` cannot reach it.
 fn construction_panic_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
     panic!("workflow construction boom");
 }
@@ -425,9 +426,10 @@ fn workflow_calls_slow_panic_activity(
 }
 
 /// Regular activity that holds RUNNING for ~120ms (so the poller can sample it)
-/// then panics. The RUNNING window is legitimate handler execution; the point of
-/// the test is that the row leaves RUNNING promptly AFTER the panic, not that
-/// the handler itself is fast.
+/// then panics.
+///
+/// The RUNNING window is legitimate handler execution. The test checks that
+/// the row leaves RUNNING promptly AFTER the panic.
 fn slow_panic_activity(
     _ctx: &autumn_harvest::ActivityContext,
     _input: serde_json::Value,
@@ -545,8 +547,8 @@ async fn activity_handler_panic_is_contained_and_retried_then_terminal() {
     let pool_for_run = pool.clone();
     let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
 
-    // (a) The worker process survives the panic and drives the run to a terminal
-    // state — a poisoned worker task could never reach FAILED at all.
+    // (a) The worker process survives the panic and drives the run to a
+    // terminal state. A poisoned worker task could never reach FAILED.
     let execution = wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(20)).await;
 
     worker.shutdown();
@@ -723,9 +725,9 @@ async fn local_activity_handler_panic_is_contained_and_retried_then_terminal() {
 // Test 3 — workflow body panic: bounded re-dispatch then terminal
 // (AC2 + AC6 + AC7 c/d).
 //
-// Wall clock: with workflow_panic_max_attempts = 2 the first panic re-dispatches
-// with a ~1s capped-exponential backoff, the second is terminal — so the whole
-// test takes roughly 1–2s.
+// Wall clock: with workflow_panic_max_attempts = 2, the first panic
+// re-dispatches with a ~1s capped-exponential backoff. The second is terminal.
+// So the test takes roughly 1–2s.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -749,10 +751,10 @@ async fn workflow_handler_panic_is_re_dispatched_then_terminal_within_budget() {
     let pool_for_run = pool.clone();
     let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
 
-    // (b/c) Observe the non-terminal re-dispatch: between the first and second
-    // panic the workflow task is re-pended PENDING (state stays RUNNING, no
-    // event appended, crash_strikes stays 0) with a future scheduled_at rather
-    // than wedged in RUNNING. The 0.5s to 1s backoff window makes this
+    // (b/c) Observe the non-terminal re-dispatch. Between the two panics, the
+    // workflow task goes back to PENDING with a future scheduled_at. It is not
+    // wedged in RUNNING. The execution stays RUNNING, no event is appended, and
+    // crash_strikes stays 0. The 0.5s to 1s backoff window makes this
     // reliable (Equal jitter, issue #1792).
     let observer_url = url.clone();
     let observer = tokio::spawn(async move {
@@ -954,9 +956,9 @@ async fn workflow_panic_max_attempts_zero_is_terminal_on_first_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5 (PR #1012 review) — a workflow handler that panics during future
-// *construction* (before returning its boxed future) is contained end-to-end
-// exactly like a body panic: HandlerPanic terminal, no poison-pill, strikes 0.
+// Test 5 (PR #1012) — a workflow handler that panics during future
+// *construction* is contained end-to-end like a body panic. HandlerPanic
+// terminal, no poison-pill, strikes 0.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1044,11 +1046,11 @@ async fn workflow_construction_phase_panic_is_contained_as_handler_panic_termina
 //
 // #782's failure mode is a poisoned worker task that leaves the row wedged in
 // RUNNING forever (and then cascades via SKIP LOCKED re-claim). This test makes
-// the "off RUNNING within ~1 poll interval" success metric FALSIFIABLE rather
-// than inferred: it tight-polls `harvest_task_queue.state` for the activity
-// task, records the last instant it was seen RUNNING and the first instant it
-// was seen off RUNNING afterward, and asserts the containment transition is
-// bounded. A wedged task never leaves RUNNING, so any finite bound falsifies it.
+// the "off RUNNING within ~1 poll interval" success metric FALSIFIABLE. It
+// tight-polls `harvest_task_queue.state` for the activity task. It records the
+// last instant seen RUNNING and the first instant seen off RUNNING after it.
+// It asserts that this transition is bounded. A wedged task never leaves
+// RUNNING, so any finite bound falsifies it.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1085,11 +1087,11 @@ async fn panicking_activity_task_leaves_running_within_one_poll_interval() {
     let pool_for_run = pool.clone();
     let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
 
-    // Tight-poll the activity task row. The handler holds RUNNING for ~120ms so
-    // the ~5ms poll reliably samples it many times; `last_running` is therefore
-    // within ~one poll of the actual panic, and `first_off` is the first sample
-    // after the engine finalized the contained failure — so the measured delta
-    // is the containment latency plus poll granularity, i.e. "~1 poll interval".
+    // Tight-poll the activity task row. The handler holds RUNNING for ~120ms,
+    // so the ~5ms poll samples it many times. `last_running` is within about
+    // one poll of the panic. `first_off` is the first sample after the engine
+    // finalized the failure. The delta is the containment latency plus poll
+    // granularity, "~1 poll interval".
     let mut last_running: Option<tokio::time::Instant> = None;
     let mut first_off_after_running: Option<tokio::time::Instant> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1123,10 +1125,9 @@ async fn panicking_activity_task_leaves_running_within_one_poll_interval() {
         .expect("the activity task must transition OFF RUNNING (a wedged task never does)");
 
     // BOUND: the 25ms poll_interval times a generous multiple (40×). A contained
-    // panic finalizes the row within a few DB-ms plus one poll of granularity, so
-    // 1s is enormous headroom; a #782 wedge (RUNNING forever) makes this delta
-    // unbounded, so the assertion falsifies exactly that failure mode while
-    // tolerating CI scheduling jitter.
+    // panic finalizes the row within a few DB-ms plus one poll, so 1s is large
+    // headroom for CI jitter. A #782 wedge (RUNNING forever) makes this delta
+    // unbounded, so the assertion falsifies exactly that failure mode.
     let bound = Duration::from_secs(1);
     let transition = first_off.duration_since(last_running);
     assert!(
@@ -1140,15 +1141,15 @@ async fn panicking_activity_task_leaves_running_within_one_poll_interval() {
 // Test C (AC3 read-surface) — the panic message is on the task-row `error`
 // column during retry backoff.
 //
-// This is the executable, data-layer proof for AC3's "surfaced via the stack
-// API" clause without the Docker-only plugin HTTP harness. A backing-off
-// (PENDING) regular activity does NOT append an `ActivityFailed` event; its last
-// error lives in `harvest_task_queue.error` (written by `requeue_for_retry`) —
-// the exact column `GET /workflows/{id}/stack`'s `PendingActivity.last_failure`
-// (#773) reads. `requeue_for_retry` stores the unwrapped panic message (the
-// typed `HandlerPanic` error_type rides the terminal `ActivityFailed` event once
-// the run goes terminal — covered by the terminal test above), so during backoff
-// the column carries the panic message.
+// This is the data-layer proof for the "surfaced via the stack API" clause of
+// AC3, without the Docker-only plugin HTTP harness. A backing-off (PENDING)
+// regular activity does NOT append an `ActivityFailed` event. Its last error
+// lives in `harvest_task_queue.error`, written by `requeue_for_retry`.
+// `PendingActivity.last_failure` of `GET /workflows/{id}/stack` (#773) reads
+// that column. `requeue_for_retry` stores the unwrapped panic message. The
+// typed `HandlerPanic` error_type is on the terminal `ActivityFailed` event,
+// covered by the terminal test above. So during backoff the column carries
+// the panic message.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1164,9 +1165,9 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
             "panic_backoff_wf",
             workflow_calls_panic_activity,
         )],
-        // 3 attempts with a long 3s fixed backoff: attempt 1 panics → requeue
-        // PENDING with a future scheduled_at, giving a wide window to observe the
-        // backing-off task row before attempt 2 is claimed.
+        // 3 attempts with a long 3s fixed backoff. Attempt 1 panics and goes
+        // back to PENDING with a future scheduled_at. That gives a wide window
+        // to observe the task row before attempt 2 is claimed.
         vec![activity_info(
             "panic_activity",
             panic_activity,
@@ -1202,12 +1203,12 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
     worker.shutdown();
     handle.await.expect("worker task joins cleanly");
 
-    // This test deliberately shuts the worker down mid-backoff, leaving a
-    // claimable PENDING panic_activity task. Against a *shared* (persistent)
-    // HARVEST_TEST_DATABASE_URL cluster that leftover would be re-claimed by a
-    // later test's worker on the same default queue/shard and inflate its global
-    // panic counter, so delete this execution's task rows for isolation. (Under
-    // fresh testcontainers the whole DB is thrown away, so this is a no-op there.)
+    // This test shuts the worker down mid-backoff and leaves a claimable
+    // PENDING panic_activity task. On a *shared* HARVEST_TEST_DATABASE_URL
+    // cluster, the worker of a later test on the same queue and shard would
+    // claim it. That inflates the global panic counter of that test. So delete
+    // these task rows. Under
+    // fresh testcontainers, this is a no-op.
     let mut cleanup = connect(&url).await;
     diesel::delete(
         harvest_task_queue::table
@@ -1229,10 +1230,10 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
 }
 
 // ---------------------------------------------------------------------------
-// Test D (P2) — a child-workflow panic surfaces to the parent as a typed
-// `ChildWorkflowFailed` carrying error_type = "HandlerPanic" (routed via the
+// Test D — a child-workflow panic surfaces to the parent as a typed
+// `ChildWorkflowFailed` with error_type = "HandlerPanic". It routes via the
 // #767 typed-failure surface: child terminal `WorkflowFailed` → decode →
-// parent `ChildWorkflowFailed`).
+// parent `ChildWorkflowFailed`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

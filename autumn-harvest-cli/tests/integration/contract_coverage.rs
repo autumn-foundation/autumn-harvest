@@ -1,13 +1,12 @@
 /// CLI contract coverage tests.
 ///
-/// Every CLI subcommand that calls the management API must map to a route that
-/// is documented in `docs/api-contract.json`.  If a CLI command maps to a path
-/// that is not in the contract, either the contract is incomplete or the CLI
-/// has drifted from the documented API surface.
+/// Every CLI subcommand that calls the management API must map to a route in
+/// `docs/api-contract.json`. A path outside the contract means the contract
+/// is incomplete or the CLI has drifted from the documented API.
 ///
-/// The body-field tests additionally verify that every JSON key the CLI sends
-/// in a request body is listed in the contract's `request_body.fields` array,
-/// enforcing AC 4: "uses the documented request shape."
+/// The body-field tests check that the contract's `request_body.fields`
+/// lists every JSON key the CLI sends. That enforces AC 4: "uses the
+/// documented request shape."
 use autumn_harvest_cli::{ApiMethod, Cli};
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
@@ -31,7 +30,6 @@ fn contract_route_set() -> HashSet<(String, String)> {
         .collect()
 }
 
-/// Returns the HTTP method string for an `ApiMethod`.
 const fn method_str(m: ApiMethod) -> &'static str {
     match m {
         ApiMethod::Get => "GET",
@@ -162,7 +160,6 @@ fn assert_body_fields_documented(args: &[&str]) {
     let path = bare_path(&req.path);
     let fields_map = contract_route_request_fields();
 
-    // Find the matching contract entry by template matching.
     let entry = fields_map
         .iter()
         .find(|((m, t), _)| m == method && path_matches_template(path, t));

@@ -1,8 +1,8 @@
 //! The ephemeral `PostgreSQL` cluster the dev runtime provisions (issue #525).
 //!
-//! `initdb` into a throwaway directory, start a postmaster bound to loopback on
-//! a kernel-assigned port, create the database, hand back a DSN — then stop the
-//! server and delete every byte of it on the way out.
+//! `initdb` into a throwaway directory and start a postmaster on loopback, on a
+//! kernel-assigned port. Create the database and hand back a DSN. On the way
+//! out, stop the server and delete every byte of it.
 //!
 //! **The storage engine is unchanged.** This is a real `PostgreSQL` server running
 //! the engine's real migrations; what is automated is its *lifecycle*. A
@@ -75,15 +75,15 @@ pub fn ephemeral_dsn(user: &str, password: &str, port: u16, database: &str) -> S
 /// **Confinement**: `unix_socket_directories` is pinned *inside the session
 /// directory*. This is not cosmetic. Debian and Ubuntu build Postgres with
 /// `--with-system-tsearch`-style packaging defaults that put the socket in
-/// `/var/run/postgresql`, which an ordinary developer cannot write to — so on
-/// the single most common Linux dev platform the postmaster starts, fails with
-/// `could not create lock file … Permission denied`, and shuts itself down.
-/// Putting the socket under the session directory also means it is reclaimed
-/// with everything else rather than left behind.
+/// `/var/run/postgresql`. An ordinary developer cannot write there. So on the
+/// most common Linux dev platform, the postmaster starts and fails with
+/// `could not create lock file … Permission denied`, then shuts itself down.
+/// A socket under the session directory is also reclaimed with everything
+/// else, not left behind.
 ///
-/// **Throughput**: this cluster is deleted when the process exits, so durability
-/// settings that exist to survive a crash are pure cost — turning them off is
-/// what keeps first-run start-up inside the time budget.
+/// **Throughput**: this cluster is deleted when the process exits. So
+/// durability settings that exist to survive a crash are pure cost. Turning
+/// them off keeps first-run start-up inside the time budget.
 #[must_use]
 pub fn postgres_conf_lines(port: u16, socket_dir: &Path) -> Vec<String> {
     vec![
@@ -132,9 +132,9 @@ impl EphemeralPostgres {
     ///
     /// # Errors
     ///
-    /// [`DevError`] if the session directory cannot be created, `initdb` or
-    /// `pg_ctl` fails (the server's own stderr is included), or the cluster does
-    /// not accept connections within [`STARTUP_TIMEOUT`].
+    /// [`DevError`] if the session directory cannot be created, or if `initdb`
+    /// or `pg_ctl` fails (the error includes the server's own stderr). Also if
+    /// the cluster does not accept connections within [`STARTUP_TIMEOUT`].
     ///
     /// # Panics
     ///
@@ -145,15 +145,14 @@ impl EphemeralPostgres {
         config: &DevRuntimeConfig,
     ) -> Result<Self, DevError> {
         // FIRST, ahead of even touching the session root. Postgres refuses to
-        // run as `root` anyway, so this run is doomed — but `session_root`
-        // creates and hardens a directory and the caller reaps the records
-        // inside it, and at uid 0 both of those act on whatever another local
-        // user may have pre-created at `harvest-dev-0`. Refuse before any of
-        // that, not after.
+        // run as `root` anyway, so this run is doomed. But `session_root`
+        // creates and hardens a directory, and the caller reaps the records
+        // inside it. At uid 0, both act on whatever another local user may
+        // have pre-created at `harvest-dev-0`. Refuse before any of that.
         refuse_to_run_as_root()?;
-        // Never directly in the system temp directory: `session_root` creates
-        // and verifies an owner-only per-user root, because a session record is
-        // an instruction to stop a process and delete a tree.
+        // Never directly in the system temp directory. A session record is an
+        // instruction to stop a process and delete a tree. So `session_root`
+        // creates and verifies an owner-only per-user root.
         let root = session_root(
             &config
                 .session_root
@@ -162,9 +161,9 @@ impl EphemeralPostgres {
         )?;
         // Short by necessity, not by taste: a Unix socket path is capped at 107
         // bytes by `sockaddr_un`, and the socket lives inside this directory.
-        // A full 32-hex UUID here pushed a default `/tmp` layout over the limit,
-        // and Postgres's failure for that is `could not create any Unix-domain
-        // sockets` — which reads like anything but "your path is too long".
+        // A full 32-hex UUID here pushed a default `/tmp` layout over the limit.
+        // The Postgres failure for that is `could not create any Unix-domain
+        // sockets`, which reads like anything but "your path is too long".
         // The process id plus 32 bits of randomness is ample for a directory
         // that lives for minutes.
         let bytes = Uuid::new_v4().into_bytes();
@@ -187,9 +186,9 @@ impl EphemeralPostgres {
         match Self::provision(binaries, &session_dir, &data_dir).await {
             Ok(started) => Ok(started),
             Err(error) => {
-                // Never delete a directory whose cluster might still be up: a
-                // `pg_ctl start` that timed out, or a `postmaster.pid` we could
-                // not read, both leave a live postmaster behind. Removing the
+                // Never delete a directory whose cluster might still be up. A
+                // `pg_ctl start` that timed out, or an unreadable
+                // `postmaster.pid`, leaves a live postmaster behind. Removing the
                 // data directory then orphans it permanently, because the
                 // reaper only ever acts on records. Leave it for the next run.
                 if cluster_is_confirmed_down(binaries, &data_dir) {
@@ -372,8 +371,8 @@ impl EphemeralPostgres {
     /// # Errors
     ///
     /// [`DevError`] if the server could not be stopped or the directory could
-    /// not be removed — the two conditions that would leave state behind, so
-    /// they are reported rather than swallowed.
+    /// not be removed. Both would leave state behind, so they are reported,
+    /// not swallowed.
     pub async fn shutdown(mut self) -> Result<(), DevError> {
         self.teardown_pending = false;
         teardown(
@@ -401,10 +400,10 @@ impl Drop for EphemeralPostgres {
     /// Best-effort teardown for the panic / early-return path.
     ///
     /// `Drop` cannot await, so this runs the same stop-then-remove sequence
-    /// synchronously. A failure here is logged rather than propagated — the
-    /// reaper is the backstop, and the sequence leaves the session directory in
-    /// place when the cluster could not be confirmed stopped, which is exactly
-    /// what the reaper needs to find it.
+    /// synchronously. A failure here is logged, not propagated, because the
+    /// reaper is the backstop. When the cluster is not confirmed stopped, the
+    /// sequence leaves the session directory in place. That is exactly what
+    /// the reaper needs to find it.
     fn drop(&mut self) {
         if !self.teardown_pending {
             return;
@@ -459,9 +458,9 @@ async fn teardown(
 
 /// Stop the cluster, then — and only then — remove its directory.
 ///
-/// The ordering is the whole point: deleting the data directory of a postmaster
-/// that is still running corrupts a live cluster *and* orphans it, because the
-/// record the reaper needs goes with it.
+/// The ordering is the whole point. Deleting the data directory of a running
+/// postmaster corrupts a live cluster *and* orphans it. The record that the
+/// reaper needs goes with it.
 fn teardown_blocking(
     binaries: &PostgresBinaries,
     data_dir: &Path,
@@ -491,16 +490,18 @@ fn cluster_is_confirmed_down(binaries: &PostgresBinaries, data_dir: &Path) -> bo
 
 /// `pg_ctl stop -m fast --wait`, synchronously.
 ///
-/// `fast` (not `immediate`): it rolls back open transactions and shuts down
-/// cleanly, and there is no crash-recovery cost to avoid on a cluster we are
-/// about to delete.
+/// `fast` (not `immediate`) rolls back open transactions and shuts down
+/// cleanly. A cluster that is about to be deleted has no crash-recovery cost
+/// to avoid.
 ///
 /// **Returning `Ok` means the postmaster is gone, not that `pg_ctl` exited 0.**
-/// Three states used to be reported as success without being it: a missing
-/// `postmaster.pid` (so we did nothing at all), `pg_ctl` exiting 0 for a
-/// cluster it did not own, and a "not running" message that was merely English
-/// text. Every one of them ends in the caller deleting the data directory of a
-/// *live* postmaster, so the pid — when we know it — is checked directly.
+/// Three states used to be reported as success without being it:
+/// - a missing `postmaster.pid`, so nothing was done at all;
+/// - `pg_ctl` exiting 0 for a cluster it did not own;
+/// - a "not running" message that was merely English text.
+///
+/// Each one ends with the caller deleting the data directory of a *live*
+/// postmaster. So the pid, when known, is checked directly.
 ///
 /// The check gives the pid [`EXIT_GRACE`] to end, because the postmaster
 /// removes `postmaster.pid` before it exits.
@@ -526,9 +527,9 @@ pub(super) fn stop_cluster_blocking(
         .arg(STARTUP_TIMEOUT.as_secs().to_string())
         .arg("stop")
         .stdin(Stdio::null())
-        // `pg_ctl`'s "server is not running" is the one thing we read out of its
-        // stderr, so pin the locale rather than letting a translated message
-        // turn a clean stop into a reported failure.
+        // "server is not running" is the one thing read out of the `pg_ctl`
+        // stderr. Pin the locale, so a translated message cannot turn a clean
+        // stop into a reported failure.
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .stdout(Stdio::piped())
@@ -644,8 +645,8 @@ fn attach_log(error: DevError, log_file: &Path) -> DevError {
 ///
 /// Postgres has no "port 0" mode, so the port has to be concrete before the
 /// server starts. Binding and immediately releasing leaves a small race with
-/// anything else on the machine doing the same; a collision surfaces as a
-/// `pg_ctl start` failure naming the port rather than as silent misbehaviour.
+/// anything else on the machine doing the same. A collision surfaces as a
+/// `pg_ctl start` failure that names the port, not as silent misbehaviour.
 fn reserve_local_port() -> Result<u16, DevError> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|source| DevError::ReservePort { source })?;
@@ -687,9 +688,9 @@ pub const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
 
 /// The socket file Postgres will create in `socket_dir` for `port`.
 ///
-/// Split out so the length check is a pure function over a path — the failure it
-/// prevents is otherwise reported by Postgres as `could not create any
-/// Unix-domain sockets`, which names neither the path nor the limit.
+/// Split out so the length check is a pure function over a path. Otherwise
+/// Postgres reports the failure as `could not create any Unix-domain
+/// sockets`, which names neither the path nor the limit.
 #[must_use]
 pub fn unix_socket_path_len(socket_dir: &Path, port: u16) -> usize {
     socket_dir.as_os_str().len() + format!("/.s.PGSQL.{port}").len()
@@ -749,9 +750,9 @@ fn write_session_record(
             // So the reaper can stop this cluster with the very binaries that
             // started it, including a downloaded install discovery never sees.
             bin_dir: Some(binaries.bin_dir().to_path_buf()),
-            // Recorded together with the pid, so the reaper can later prove the
-            // process at that pid is still the one we started rather than a
-            // reuse of the number.
+            // Recorded with the pid, so the reaper can later prove that the
+            // process at that pid is still this postmaster. A reused pid fails
+            // that proof.
             postmaster_start_token: postmaster_pid.and_then(process_start_token),
             data_dir: data_dir.to_path_buf(),
             created_at: chrono::Utc::now(),
@@ -763,11 +764,11 @@ fn write_session_record(
 
 /// Refuse early, and legibly, when the process is `root`.
 ///
-/// `PostgreSQL` itself refuses to run as `root` — `initdb` exits with a security
-/// message before doing anything. Left to surface as a raw tool failure that
-/// reads like a bug in the dev runtime, so it is checked up front and answered
-/// with what to actually do about it. This is a real situation, not a
-/// hypothetical: plenty of container-based dev environments run as `root`.
+/// `PostgreSQL` itself refuses to run as `root`: `initdb` exits with a security
+/// message before doing anything. As a raw tool failure, that reads like a bug
+/// in the dev runtime. So it is checked up front, and the error says what to
+/// do. This is a real situation: plenty of container-based dev environments
+/// run as `root`.
 pub(super) fn refuse_to_run_as_root() -> Result<(), DevError> {
     if running_as_root() {
         return Err(DevError::RunningAsRoot);
@@ -778,10 +779,10 @@ pub(super) fn refuse_to_run_as_root() -> Result<(), DevError> {
 /// Whether this process is running as `root`, and so cannot provision a
 /// cluster.
 ///
-/// Dependency-free: the effective uid is reachable from `std` only through
-/// `libc`, and adding `libc` to this crate for one predicate would be a poor
-/// trade — so this asks `id`, which every Unix ships. Always `false` on
-/// Windows, which has no equivalent restriction.
+/// Dependency-free. The effective uid is reachable from `std` only through
+/// `libc`, and `libc` in this crate for one predicate is a poor trade. So this
+/// asks `id`, which every Unix ships. Always `false` on Windows, which has no
+/// equivalent restriction.
 #[must_use]
 pub fn running_as_root() -> bool {
     #[cfg(unix)]
@@ -830,16 +831,16 @@ fn write_private(path: &Path, contents: &str) -> Result<(), DevError> {
 ///
 /// `write_private` opens with `truncate(true)`, which is fine for a file
 /// written once and never again. The session record is not that: it is
-/// rewritten in place the moment the postmaster is up. A `SIGKILL` landing
-/// inside that rewrite leaves empty or half-written JSON, and
-/// `reap_stale_sessions` deliberately skips a record it cannot parse — so the
-/// postmaster and its data directory would be leaked *permanently*, by the one
-/// mechanism meant to reclaim them.
+/// rewritten in place the moment the postmaster is up. A `SIGKILL` inside that
+/// rewrite leaves empty or half-written JSON. `reap_stale_sessions`
+/// deliberately skips a record it cannot parse. So the postmaster and its data
+/// directory would leak *permanently*, through the one mechanism meant to
+/// reclaim them.
 ///
 /// So: write a private sibling and rename it over the target. `rename(2)` within
-/// a directory is atomic, and `std::fs::rename` replaces an existing
-/// destination on Windows too, so either the previous valid record or the new
-/// valid record is what any reader finds.
+/// a directory is atomic. `std::fs::rename` replaces an existing destination on
+/// Windows too. So any reader finds either the previous or the new valid
+/// record.
 ///
 /// Public so the atomicity itself is testable: a truncating writer and a
 /// renaming one are indistinguishable from the finished file alone.
@@ -866,8 +867,8 @@ pub fn write_private_atomic(path: &Path, contents: &str) -> Result<(), DevError>
 
 /// A 32-character alphanumeric password for the ephemeral superuser.
 ///
-/// Alphanumeric only so it survives a `postgresql.conf`/URI round trip without
-/// depending on escaping being right; 32 characters of it is ample for a
+/// Alphanumeric only, so it survives a `postgresql.conf`/URI round trip with
+/// no dependency on correct escaping. 32 characters is ample for a
 /// loopback-only cluster that exists for minutes.
 fn generate_password() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";

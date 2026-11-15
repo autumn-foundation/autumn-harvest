@@ -136,7 +136,7 @@ impl std::fmt::Debug for AppDbPool {
 ///
 /// In single-shard deployments this wraps exactly one Postgres pool; all
 /// lookups resolve to the same database. In sharded deployments it carries a
-/// [`ShardedDbPool`] with one entry per shard and routes lookups either by an
+/// [`ShardedDbPool`] with one entry per shard. It routes a lookup by an
 /// explicit [`ShardId`] or by the shard encoded in an [`ExecutionId`].
 #[derive(Clone)]
 pub struct HarvestDbPool {
@@ -204,13 +204,13 @@ impl HarvestDbPool {
 
     /// Return the pool for an explicit shard, with **no** default fallback.
     ///
-    /// Required wherever silently using the default shard's database would be
-    /// wrong rather than merely suboptimal — notably an explicitly pinned
-    /// workflow start (issue #697), where falling back would write
-    /// residency-bound data to the wrong database while still reporting the
-    /// pinned shard to the caller. The router's shard set and the pool map are
-    /// configured independently, so a shard known to the router but not yet
-    /// pooled (mid a shard-add rollout) is a real state.
+    /// Required wherever a silent use of the default shard's database would be
+    /// wrong, not merely suboptimal. The main case is an explicitly pinned
+    /// workflow start (issue #697). A fallback there would write
+    /// residency-bound data to the wrong database, yet report the pinned shard
+    /// to the caller. The router's shard set and the pool map are configured
+    /// independently. So a shard known to the router but not yet pooled (in a
+    /// shard-add rollout) is a real state.
     #[must_use]
     pub fn exact_pool_for(&self, shard: ShardId) -> Option<&DbPool> {
         self.sharded.exact_pool_for(shard)

@@ -2,9 +2,9 @@
 //! Signal-or-deadline approval gate (issue #476).
 //!
 //! Demonstrates `ctx.receive_signal_timeout`: await a human approval signal,
-//! else auto-reject after a deadline — in two lines, with zero shared mutable
-//! state and no hand-rolled `Arc<Mutex<...>>` + `await_condition_timeout`
-//! workaround.
+//! else auto-reject after a deadline. It takes two lines and no shared mutable
+//! state, and replaces a hand-rolled `Arc<Mutex<...>>` +
+//! `await_condition_timeout` workaround.
 //!
 //! Determinism contract: the race composes the existing `TimerStarted` /
 //! `TimerFired` and `SignalReceived` events. Whichever event was recorded

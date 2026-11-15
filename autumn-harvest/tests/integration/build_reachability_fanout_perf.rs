@@ -10,25 +10,21 @@
 //! `harvest_workers` carries no index on `build_id` at all, so its two
 //! per-build subqueries were a full sequential scan on every iteration.
 //!
-//! `build_reachability` (the per-build helper) is unchanged by this fix.
-//! It stays a correct, simple building block for its own single-build
-//! callers (the CLI, single-build API routes). It also gives this file a
-//! stable "before" reproduction. Looping it once per distinct build id, here
-//! in the test, is exactly what the pre-fix `all_build_reachability` did.
-//! So this file reproduces the pre-fix cost regardless of which commit is
-//! checked out.
+//! The fix leaves the per-build helper `build_reachability` unchanged. Its
+//! single-build callers (the CLI, single-build API routes) still use it. A
+//! test loop over it does what the pre-fix `all_build_reachability` did. So
+//! this file reproduces the pre-fix cost on any commit.
 //!
 //! Two tests:
-//! - [`all_build_reachability_agrees_with_the_per_build_helper`] -- fast,
-//!   always-run correctness check. It ties the batched function's output to
-//!   the trusted per-build helper's output, row by row. The fixture covers a
-//!   build present in only one of the three source tables.
+//! - [`all_build_reachability_agrees_with_the_per_build_helper`] -- a fast
+//!   correctness check that always runs. It compares the batched output with
+//!   the per-build helper, row by row. The fixture covers a build present in
+//!   only one of the three source tables.
 //! - [`zz_capture_build_reachability_fanout_evidence`] -- `#[ignore]`d. It
-//!   seeds a production-shaped fixture into a throwaway database. It then
-//!   captures a `pg_stat_statements` snapshot for two strategies: the "loop
-//!   over `build_reachability`" reproduction ("before"), and the real,
-//!   shipped `all_build_reachability` ("after"). It also compares the two
-//!   result sets for equivalence.
+//!   seeds a production-shaped fixture into a throwaway database. It captures
+//!   `pg_stat_statements` for the loop over `build_reachability` ("before")
+//!   and for the shipped `all_build_reachability` ("after"). It also checks
+//!   that the two result sets match.
 
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Text};
@@ -86,11 +82,10 @@ async fn seed_worker(
     .expect("seed worker");
 }
 
-/// The batched function must report exactly what the trusted per-build
-/// helper reports, for every build the fixture touches. That includes a
-/// build present in only one of the three source tables. The batched
-/// function's three independent lookups must each default to zero for it,
-/// rather than dropping the build entirely.
+/// The batched function reports what the per-build helper reports, for each
+/// build of the fixture. That includes a build present in one source table
+/// only. Each of the three batched lookups must default to zero for it, and
+/// must not drop the build.
 #[tokio::test]
 async fn all_build_reachability_agrees_with_the_per_build_helper() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -197,9 +192,8 @@ async fn all_build_reachability_agrees_with_the_per_build_helper() {
 
 /// Distinct build ids the fixture below produces.
 ///
-/// Mirrors `build_routing::all_build_ids_query`'s catalog query, duplicated
-/// here. This file then measures the same catalog scan regardless of which
-/// commit -- pre- or post-fix -- is checked out.
+/// A copy of the catalog query of `build_routing::all_build_ids_query`, so
+/// the file measures the same catalog scan on a pre-fix or post-fix commit.
 const DISTINCT_BUILD_IDS_QUERY: &str = "SELECT DISTINCT build_id FROM ( \
          SELECT assigned_build_id AS build_id FROM harvest_workflow_executions \
          WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
@@ -225,11 +219,11 @@ async fn distinct_build_ids(conn: &mut AsyncPgConnection) -> Vec<String> {
 }
 
 /// 50 distinct build ids, 60,000 executions, 30,000 queued tasks, and 3,000
-/// workers -- a long-lived fleet's worth of deploy history, not a toy input.
-/// Every count is a deterministic function of the row index, not
-/// `random()`. The fixture is therefore byte-identical on every run, in
-/// every commit. The "before" and "after" result sets below are a genuine
-/// equivalence check, not two different random draws.
+/// workers: the deploy history of a long-lived fleet.
+///
+/// Each count is a function of the row index, not `random()`. So the fixture
+/// is byte-identical on every run and commit, and the "before" and "after"
+/// result sets are a real equivalence check.
 const N_BUILDS: i64 = 50;
 const N_EXECUTIONS: i64 = 60_000;
 const N_TASKS: i64 = 30_000;
@@ -392,12 +386,12 @@ fn write_capture_artifacts(
     .unwrap_or_else(|e| panic!("write {label} result-rows artifact: {e}"));
 }
 
-/// "Before": look up the catalog, then loop `build_reachability` once per
-/// distinct build id -- exactly what the pre-fix `all_build_reachability`
-/// did internally. The catalog lookup runs inside this reset/capture window.
-/// It therefore carries the same one-time catalog cost `capture_after`
-/// incurs internally, so the comparison between the two isolates the
-/// per-build loop.
+/// "Before": look up the catalog, then call `build_reachability` once per
+/// distinct build id, as the pre-fix `all_build_reachability` did.
+///
+/// The catalog lookup runs inside the capture window. So both captures pay
+/// the same one-time catalog cost, and the comparison isolates the per-build
+/// loop.
 async fn capture_before(conn: &mut AsyncPgConnection, out_dir: &std::path::Path) -> Vec<ReachRow> {
     reset_pg_stat_statements(conn).await;
     let build_ids = distinct_build_ids(conn).await;

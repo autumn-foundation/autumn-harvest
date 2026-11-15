@@ -84,14 +84,13 @@ impl AnalyzerRule for ExcessiveRetriesRule {
         let mut activity_names: HashMap<&crate::types::ActivityExecId, &str> = HashMap::new();
         // Falls back to the most recently scheduled activity's name when an
         // `ActivityFailed` event's id has no exact match. Some history
-        // producers intentionally emit `ActivityFailed` events for retry
-        // attempts under a synthetic id with no corresponding
-        // `ActivityScheduled` (e.g. `WorkflowSimulator`'s observational
-        // per-attempt retry events, `simulator.rs`), so an exact-id-only
-        // lookup would misreport those as "Unknown" even though the
-        // surrounding history unambiguously identifies the activity.
-        // Both maps borrow from `history` rather than cloning — the names
-        // are only ever used to format a warning message.
+        // producers emit `ActivityFailed` for retry attempts under a synthetic
+        // id with no `ActivityScheduled`. An example is the observational
+        // per-attempt retry events of `WorkflowSimulator` (`simulator.rs`).
+        // An exact-id-only lookup would report those as "Unknown", although
+        // the surrounding history identifies the activity.
+        // Both maps borrow from `history` and do not clone. The names only
+        // format a warning message.
         let mut last_scheduled_name: Option<&str> = None;
 
         for event in history {
@@ -314,10 +313,10 @@ mod tests {
         assert!(warnings[0].message.contains("failed 3 times"));
     }
 
-    /// Regression test (code review, issue #541): a history producer may
-    /// emit `ActivityFailed` events under a synthetic id with no matching
-    /// `ActivityScheduled` (e.g. `WorkflowSimulator`'s observational
-    /// per-attempt retry events). The rule must still resolve the activity's
+    /// Regression test (issue #541). A history producer may emit
+    /// `ActivityFailed` under a synthetic id with no `ActivityScheduled`, such
+    /// as the per-attempt retry events of `WorkflowSimulator`. The rule must
+    /// still resolve the activity's
     /// name from the most recently scheduled activity instead of reporting
     /// "Unknown".
     #[test]

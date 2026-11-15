@@ -4,8 +4,8 @@
 //! and `GET /workflows?owner=&severity=` (list filter) end-to-end.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (run this file `--test-threads=1`, since the tests scrub
-//! shared tables); otherwise a fresh testcontainers Postgres is booted with
+//! against it directly. Run this file with `--test-threads=1`, since the tests
+//! scrub shared tables. Otherwise a fresh testcontainers Postgres boots with
 //! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
@@ -92,11 +92,11 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with_router(HarvestDbPool::from(pool.clone()), ShardRouter::default())
 }
 
-/// Create a fresh, fully-migrated database and return its URL -- for the
-/// exact-shard-resolver tests, which need a genuinely separate database per
-/// shard (one database pretending to be two shards would not exercise the
-/// "this shard's pool is unconfigured" case). Mirrors
-/// `lineage_tree_integration.rs::create_shard_db`.
+/// Create a fresh, fully-migrated database and return its URL.
+///
+/// The exact-shard-resolver tests need a separate database per shard. One
+/// database posing as two shards misses the "this shard's pool is unconfigured"
+/// case. Mirrors `lineage_tree_integration.rs::create_shard_db`.
 async fn create_shard_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
@@ -201,14 +201,12 @@ async fn send(
 /// Seed an execution (shard 0) in `state` with one `WorkflowStarted` event, plus
 /// optional seed owner/severity, so an annotate call has a row to act on.
 ///
-/// The id is minted via `ExecutionId::new_for_shard(0)` (matching how a real
-/// deployment mints ids -- see `run_chain_integration.rs`'s `seed_run`)
-/// rather than left to Postgres's own default UUID generation: the triage
-/// handler resolves its connection via the **exact** shard resolver (issue
-/// #759 review), which decodes the target shard from the id's own bytes and
-/// has no default-shard fallback -- a randomly-generated id's bytes are
-/// essentially never shard 0, which would make every seeded row invisible to
-/// the handler regardless of the `shard_id` column value set below.
+/// The id comes from `ExecutionId::new_for_shard(0)`, as in a real deployment
+/// (see `seed_run` in `run_chain_integration.rs`). A Postgres default UUID does
+/// not work. The triage handler uses the **exact** shard resolver (issue #759).
+/// It decodes the target shard from the bytes of the id, with no default-shard
+/// fallback. A random id almost never encodes shard 0. Every seeded row would
+/// then be invisible to the handler, whatever the `shard_id` column says.
 async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -375,11 +373,10 @@ async fn patch_round_trip_sets_fields_and_reflects_on_describe() {
 
 // AC1: an explicit JSON `null` clears a field to NULL. On the `TriageWorkflowResponse`
 // (the PATCH response), every cleared field is OMITTED (`skip_serializing_if`).
-// On the describe response, the cleared value is reflected per that struct's
-// own established per-field convention: `owner`/`severity` (pre-#759 fields,
-// no `skip_serializing_if`) serialize as explicit JSON `null`, while
-// `triage_note` (added by #759, `skip_serializing_if` -- matching the recently
-// -added `started_by`/`history_bloat_warned_at` sibling fields) is OMITTED.
+// The describe response follows the per-field convention of its struct.
+// `owner`/`severity` (pre-#759 fields, no `skip_serializing_if`) serialize as
+// explicit JSON `null`. `triage_note` (added by #759, with `skip_serializing_if`)
+// is OMITTED, like the `started_by`/`history_bloat_warned_at` sibling fields.
 #[tokio::test]
 async fn explicit_null_clears_a_field_and_reflects_on_describe() {
     let (url, _c) = setup_database().await;
@@ -499,9 +496,9 @@ async fn malformed_body_returns_400_with_audit_row() {
     assert_eq!(failed, 1, "a malformed body must still be audited");
 }
 
-// AC6: a MALFORMED execution id (not a valid UUID at all) is rejected 400 --
-// distinct from a well-formed-but-unknown UUID, which is 404 (see
-// `unknown_execution_id_returns_404` below). Never a panic, never a 500.
+// AC6: a MALFORMED execution id (not a valid UUID at all) is rejected 400. A
+// well-formed but unknown UUID is 404 (see `unknown_execution_id_returns_404`
+// below). Never a panic, never a 500.
 #[tokio::test]
 async fn malformed_execution_id_returns_400_not_500() {
     let (url, _c) = setup_database().await;
@@ -558,12 +555,12 @@ async fn patch_requires_admin() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "PATCH is admin-guarded");
 }
 
-// A set value longer than the operator-reason cap (500 chars, shared with
-// pause/legal-hold/queue-pause `reason` fields via `truncate_operator_reason`)
-// is truncated at the API boundary rather than persisted unbounded -- these
-// fields are now runtime, HTTP-caller-controlled strings (unlike the
-// compile-time `&'static str` owner/severity defaults from issue #372), and
-// they are echoed into the audit log and the durable row alike.
+// A set value over the operator-reason cap is truncated at the API boundary,
+// not persisted unbounded. The cap is 500 chars, shared with the
+// pause/legal-hold/queue-pause `reason` fields via `truncate_operator_reason`.
+// These fields are runtime strings that an HTTP caller controls. Issue #372
+// owner/severity defaults are compile-time `&'static str` values instead. The
+// value goes into both the audit log and the durable row.
 #[tokio::test]
 async fn oversized_field_values_are_truncated_at_the_boundary() {
     const CAP: usize = 500;
@@ -613,11 +610,10 @@ async fn oversized_field_values_are_truncated_at_the_boundary() {
 }
 
 // AC1/AC4: a truly EMPTY body (`{}`, every field omitted) is a genuine
-// HTTP-level no-op -- 200, empty `changed_fields`, no row mutation, and
-// (mirroring the pause/resume "no `error_summary` on a no-op" convention
-// `triage_diff_summary` documents) the written audit row reports no diff.
-// This exercises the full stack the CLI's `--no-flags` mapping relies on
-// (the CLI sends exactly `json!({})` when no annotate flags are given).
+// HTTP-level no-op: 200, empty `changed_fields`, and no row mutation. The audit
+// row reports no diff. That mirrors the pause/resume "no `error_summary` on a
+// no-op" convention that `triage_diff_summary` documents. The CLI sends exactly
+// `json!({})` when no annotate flags are given. This test covers that full stack.
 #[tokio::test]
 async fn empty_body_patch_is_a_true_http_level_no_op() {
     let (url, _c) = setup_database().await;
@@ -650,10 +646,10 @@ async fn empty_body_patch_is_a_true_http_level_no_op() {
     assert_eq!(describe["execution"]["owner"], json!("frank"));
     assert_eq!(describe["execution"]["severity"], json!("sev3"));
 
-    // The call is still audited (existing "no-op still writes its own row"
-    // convention, per `patch_round_trip_sets_fields_and_reflects_on_describe`),
-    // but its `error_summary` is `None` -- `triage_diff_summary` returns
-    // `None` for an empty changed-fields list.
+    // The call is still audited: a no-op still writes its own row (see
+    // `patch_round_trip_sets_fields_and_reflects_on_describe`). Its
+    // `error_summary` is `None`, because `triage_diff_summary` returns `None`
+    // for an empty changed-fields list.
     assert_eq!(
         audit_count(&mut conn, "workflow.annotate", &exec_id).await,
         1
@@ -665,8 +661,8 @@ async fn empty_body_patch_is_a_true_http_level_no_op() {
     );
 }
 
-// AC5: the audit row for a mutating PATCH captures the ACTOR and the
-// old->new VALUES for every changed field -- not merely that a row exists.
+// AC5: the audit row for a mutating PATCH captures the ACTOR and the old->new
+// VALUES for every changed field, not merely that a row exists.
 // A bug that dropped a field from the diff, swapped old/new, or wrote the
 // wrong actor would be invisible to a bare row-count assertion.
 #[tokio::test]
@@ -714,10 +710,10 @@ async fn audit_row_records_actor_and_old_to_new_values() {
     );
 }
 
-// AC3: owner/severity set via PATCH are IMMEDIATELY reflected in the existing
-// list filters (`GET /workflows?owner=...&severity=...`) with the same
-// semantics as the start-time values from #372 -- an execution whose owner
-// was reassigned via triage is found under the NEW owner and NOT the old one.
+// AC3: owner/severity set via PATCH show IMMEDIATELY in the list filters
+// (`GET /workflows?owner=...&severity=...`). The semantics match the start-time
+// values from #372. An execution reassigned via triage is found under the NEW
+// owner and NOT the old one.
 #[tokio::test]
 async fn owner_and_severity_set_via_patch_are_reflected_in_list_filter() {
     let (url, _c) = setup_database().await;
@@ -789,10 +785,9 @@ async fn owner_and_severity_set_via_patch_are_reflected_in_list_filter() {
 }
 
 // A whitespace-padded owner/severity value is trimmed before it is persisted
-// (issue #759 review): `GET /workflows?owner=...` trims its query value, so
-// an untrimmed stored label would be permanently unaddressable through the
-// advertised filter. Both describe and the list filter must see the
-// TRIMMED value.
+// (issue #759). `GET /workflows?owner=...` trims its query value. So the
+// advertised filter can never reach an untrimmed stored label. Both describe
+// and the list filter must see the TRIMMED value.
 #[tokio::test]
 async fn whitespace_padded_owner_and_severity_are_trimmed_and_filterable() {
     let (url, _c) = setup_database().await;
@@ -850,10 +845,10 @@ async fn whitespace_padded_owner_and_severity_are_trimmed_and_filterable() {
     );
 }
 
-// An all-whitespace owner/severity SET is folded into an explicit clear
-// (issue #759 review), matching how `parse_workflow_filters` already treats
-// an all-whitespace QUERY value as "no filter" -- a whitespace-only value can
-// never be persisted as a phantom, unfilterable label.
+// An all-whitespace owner/severity SET becomes an explicit clear (issue #759).
+// `parse_workflow_filters` treats an all-whitespace QUERY value as "no filter"
+// in the same way. So a whitespace-only value never persists as a phantom,
+// unfilterable label.
 #[tokio::test]
 async fn all_whitespace_owner_set_is_folded_into_a_clear() {
     let (url, _c) = setup_database().await;
@@ -899,11 +894,10 @@ async fn all_whitespace_owner_set_is_folded_into_a_clear() {
     );
 }
 
-// The audit diff summary quotes every old/new value (issue #759 review), so
-// a free-text `note` containing summary-lookalike syntax can never be
-// mistaken for a second, bogus field-change entry, and a literal value of
-// the string "(none)" is visibly distinct (quoted) from the unset sentinel
-// (unquoted).
+// The audit diff summary quotes every old/new value (issue #759). So a
+// free-text `note` with summary-lookalike syntax never reads as a second,
+// bogus field-change entry. A literal "(none)" value (quoted) also stays
+// distinct from the unset sentinel (unquoted).
 #[tokio::test]
 async fn audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread() {
     let (url, _c) = setup_database().await;
@@ -933,12 +927,11 @@ async fn audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread() {
 
     let (_, summary) = latest_audit_row(&mut conn, "workflow.annotate", &exec_id).await;
     let summary = summary.expect("a changed patch must record a diff summary");
-    // Only `note` changed, so the WHOLE summary must be exactly this one
-    // quoted field-change entry -- not merely `.contains()` it -- proving
-    // the note's embedded "; severity: P3 -> P0" text (a deliberate
-    // collision with the "; " field-change separator `triage_diff_summary`
-    // itself uses to join entries) was never split out into a second,
-    // bogus `severity:` entry appended after the note's value.
+    // Only `note` changed, so the WHOLE summary must equal this one quoted
+    // field-change entry, not merely `.contains()` it. The note embeds
+    // "; severity: P3 -> P0". That text collides on purpose with the "; "
+    // separator that `triage_diff_summary` uses to join entries. The exact match
+    // proves it never split into a second, bogus `severity:` entry.
     assert_eq!(
         summary, r#"note: (none) -> "ready; severity: P3 -> P0""#,
         "the lookalike note content must be wrapped in one quoted value, not read as a \
@@ -963,33 +956,32 @@ async fn audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread() {
     );
 }
 
-// ── Exact shard resolution (issue #759 review) ─────────────────────────────
+// ── Exact shard resolution (issue #759) ────────────────────────────────────
 //
 // The PATCH handler resolves its connection via the **exact** shard resolver
 // (`db_conn_for_execution_exact`), not the lenient `db_conn_for_execution`
 // every other single-execution route on this router still uses. The lenient
-// resolver falls back to the **default** shard when the target execution's
-// owning shard has no configured pool on this node -- the documented
-// mid-shard-add-rollout state. For a WRITE that fallback is a genuine
-// correctness hazard, strictly worse than the false-404 a read would
-// produce: it can report a false 404 for an execution that exists on the
-// unreachable shard, or -- if the default shard happens to hold an unrelated
-// row sharing the same UUID -- silently mutate the wrong database. These two
-// tests mirror `lineage_tree_integration.rs`'s
+// resolver falls back to the **default** shard when the owning shard has no
+// pool on this node. That is the documented mid-shard-add-rollout state. For
+// a WRITE, that fallback is a real correctness hazard, worse than a false 404
+// on a read. It can report a false 404 for an execution on the unreachable
+// shard. If the default shard holds an unrelated row with the same UUID, it
+// silently mutates the wrong database. These two tests mirror
+// `lineage_tree_integration.rs`'s
 // `a_root_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404` /
 // `a_root_on_a_shard_this_deployment_does_not_know_is_still_404`.
 
-/// The owning shard is known to the router but has no pool configured on
-/// this process -- must fail closed with `503`, never a false `404` or a
-/// silent write to the wrong database.
+/// The router knows the owning shard, but this process has no pool for it. The
+/// call must fail closed with `503`, never a false `404` or a silent write to
+/// the wrong database.
 #[tokio::test]
 async fn a_target_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() {
     let (admin_url, _guard) = setup_database().await;
     let shard0 = create_shard_db(&admin_url, &unique("triage_s0")).await;
 
-    // The router knows shards 0 and 1, but this process only has a pool for
-    // 0 -- the documented mid-shard-add-rollout state (`readable_shards`
-    // widened before the pool is configured).
+    // The router knows shards 0 and 1, but this process only has a pool for 0.
+    // That is the documented mid-shard-add-rollout state: `readable_shards`
+    // widens before the pool is configured.
     let pools = BTreeMap::from([(ShardId::new(0), build_pool(&shard0))]);
     let app = build_app_with_router(
         HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0))),
@@ -1019,9 +1011,9 @@ async fn a_target_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() 
     );
 }
 
-/// ...but an id whose embedded shard is not known to this deployment at all
-/// (a stale id, or an operator pasting a foreign UUID) must still be a clean
-/// `404`, not a confusing `503` -- the exact resolver must not over-reach.
+/// ...but an id with a shard unknown to this deployment must still be a clean
+/// `404`, not a confusing `503`. Such an id is stale, or a foreign UUID that an
+/// operator pasted. The exact resolver must not over-reach.
 #[tokio::test]
 async fn a_target_on_a_shard_this_deployment_does_not_know_is_still_404() {
     let (url, _c) = setup_database().await;

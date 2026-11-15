@@ -4,19 +4,19 @@
 //! **Mechanism.** `Order`. The workflow input is a `HashMap<String, u32>`.
 //! `helpers::pairs` flattens it with `<T as IntoIterator>::into_iter` into a
 //! `Vec`, freezing whatever order `RandomState` chose for this process. The
-//! workflow then dispatches one `ScheduleActivity` command per element, so the
-//! recorded command sequence is hash-seeded and a replay in another process
+//! workflow then dispatches one `ScheduleActivity` command per element. So the
+//! recorded command sequence is hash-seeded. A replay in another process
 //! records a different order.
 //!
 //! **Launder (three independent reasons the syntactic layer misses it).**
-//! 1. HVG011 fires only on a `for … in` over a *locally bound* ident whose
-//!    `let` initializer or type annotation is a `HashMap`/`HashSet`
-//!    (`iterated_hash_local` + `local_binding_target`); here the map arrives as
-//!    a **function parameter**, which is documented as never tracked, and the
+//! 1. HVG011 fires only on a `for … in` over a *locally bound* ident. Its
+//!    `let` initializer or type annotation must be a `HashMap`/`HashSet`
+//!    (`iterated_hash_local` + `local_binding_target`). Here the map arrives as
+//!    a **function parameter**, which is documented as never tracked. The
 //!    `for` loop iterates a `Vec`.
-//! 2. DET010 is the same rule re-implemented as a line scan over locally-bound
-//!    hash idents and misses it for the same reason; the remaining DET001–DET011
-//!    are substring tables that contain no `HashMap` spelling at all.
+//! 2. DET010 is the same rule as a line scan over locally-bound hash idents. It
+//!    misses for the same reason. The remaining DET001–DET011 are substring
+//!    tables that contain no `HashMap` spelling at all.
 //! 3. The iteration itself happens in another **crate**, inside a *generic*
 //!    function whose body contains no `HashMap` token — only the call site's
 //!    substitution reveals `T`. det_check resolves one hop, same file and same

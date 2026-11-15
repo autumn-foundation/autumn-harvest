@@ -1,19 +1,19 @@
 //! No-database HTTP tests for the inbound webhook receiver (issue #344).
 //!
 //! Builds a real autumn-web app with the generated webhook receiver routes
-//! and a `WebhookRegistry` extension (mirroring `install_registry_from_config`
-//! but built directly from a `WebhookConfig`, since no `autumn.toml` is
-//! loaded in this harness), then drives genuinely HMAC-signed requests
-//! through the real `SignedWebhook` extractor -- verification runs exactly
-//! as it would in production before any of this crate's handler code executes.
+//! and a `WebhookRegistry` extension. The registry mirrors
+//! `install_registry_from_config`, but comes straight from a `WebhookConfig`,
+//! since this harness loads no `autumn.toml`. The tests drive real
+//! HMAC-signed requests through the real `SignedWebhook` extractor.
+//! Verification runs as in production, before any handler code of this crate.
 //!
 //! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here -- `TestApp`
 //! replays plugin startup hooks and `start_harvest_runtime` requires a live
-//! Postgres. The fail-closed (runtime-not-started) path is exactly what this
-//! harness *can* prove without a database; the full dispatch flow (idempotent
-//! redelivery, exactly-one-execution) is covered by the testcontainers
-//! integration test (`webhook_receiver_integration.rs`, compile-checked in
-//! this sandbox per the #543/#544 precedent).
+//! Postgres. Without a database, this harness proves the fail-closed
+//! (runtime-not-started) path. The testcontainers suite
+//! `webhook_receiver_integration.rs` covers the full dispatch flow (idempotent
+//! redelivery, exactly-one-execution). It is compile-checked in this sandbox
+//! (the #543/#544 precedent).
 
 #![cfg(feature = "webhooks")]
 #![allow(
@@ -121,9 +121,9 @@ async fn fails_closed_when_runtime_is_not_started() {
     // The signature verified successfully (proving the request reached this
     // crate's handler code), which then fails closed because no
     // HarvestApiState::install(...) ever ran in this no-DB harness. 503, not
-    // 400: a transient boot-window condition must be a 5xx so autumn-web's
-    // replay-protection cleanup middleware releases the reserved delivery id
-    // for the provider's automatic retry (Codex review, PR #918).
+    // 400: a transient boot-window condition must be a 5xx. Then the
+    // replay-protection cleanup middleware of autumn-web releases the reserved
+    // delivery id for the provider's automatic retry (PR #918).
     resp.assert_status(503);
     resp.assert_body_contains("harvest runtime is not started");
 }
@@ -155,17 +155,14 @@ async fn missing_signature_header_returns_400() {
 
 #[tokio::test]
 async fn boot_window_failure_never_permanently_consumes_a_replay_protected_delivery_id() {
-    // Regression test for a Codex review finding (PR #918): the runtime-not-
-    // started path used to return 400, and autumn-web's
-    // webhook_replay_cleanup_middleware only releases a SignedWebhook
-    // extractor's reserved replay key on a 5xx response. A 400 there would
-    // have permanently consumed `dlv-replay-1`'s replay key on the very
-    // first attempt (even though nothing was ever actually dispatched), so a
-    // provider's automatic retry after the app finishes booting would 409 as
-    // a false duplicate forever. With the fix (503, not 400), both attempts
-    // below correctly release the key and neither is ever misdiagnosed as a
-    // duplicate -- proving the fix rather than the pre-fix (and, in this
-    // no-DB harness, permanently-broken) expectation of a 409 on redelivery.
+    // Regression test for PR #918: the runtime-not-started path used to return
+    // 400. The webhook_replay_cleanup_middleware of autumn-web releases a
+    // SignedWebhook extractor's reserved replay key only on a 5xx response. So
+    // a 400 consumed the replay key of `dlv-replay-1` on the first attempt for
+    // good, though nothing was dispatched. A provider retry after boot then
+    // got a false-duplicate 409 forever. With the fix (503, not 400), both
+    // attempts below release the key, and neither reads as a duplicate. The
+    // test proves the fix, not the pre-fix expectation of a 409 on redelivery.
     let client = build_client(vec![generic_endpoint("orders", "/hooks/orders", true)]);
     let body = serde_json::to_vec(&serde_json::json!({"order_id": "o-1"})).unwrap();
     let sig = sign(&body);
@@ -229,13 +226,12 @@ fn trigger_targeting_unregistered_workflow_panics_at_build_time() {
 
 #[test]
 fn trigger_targeting_a_registered_dag_panics_at_build_time() {
-    // A unified DAG auto-registers a shadow WorkflowInfo (issue #256), so
-    // without the DAG-aware check this would pass the plain
-    // registered-workflow assertion and only fail at the first live request
-    // (start_workflow/signal_with_start_workflow both reject registered
-    // DAGs) -- Codex review, PR #918. The DAG check runs before the plain
-    // registered-workflow check, so this fails fast even with an empty
-    // registered_workflows slice.
+    // A unified DAG auto-registers a shadow WorkflowInfo (issue #256). Without
+    // the DAG-aware check, this passes the plain registered-workflow assertion.
+    // It then fails only at the first live request, because
+    // start_workflow/signal_with_start_workflow reject registered DAGs (PR
+    // #918). The DAG check runs before the plain registered-workflow check. So
+    // this fails fast even with an empty registered_workflows slice.
     fn noop_dag_builder(_dag: &mut autumn_harvest::dag::DagBuilder) {}
 
     let triggers = vec![map_order_info()];

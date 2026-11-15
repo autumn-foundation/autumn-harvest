@@ -108,9 +108,9 @@ pub fn export_mermaid_with_critical_path(
     let cp_nodes: std::collections::HashSet<usize> =
         critical_path.path_indices.iter().copied().collect();
     // Only edges that are *consecutive* steps along the critical path are
-    // critical transitions. Membership in `cp_nodes` alone is not enough: a
-    // DAG can have a non-critical "shortcut" edge between two nodes that both
-    // happen to lie on the critical path (e.g. `A->B->C` plus a direct `A->C`).
+    // critical transitions. Membership in `cp_nodes` alone is not enough. Two
+    // nodes on the critical path can share a non-critical "shortcut" edge, as
+    // in `A->B->C` plus a direct `A->C`.
     let cp_edges: std::collections::HashSet<(usize, usize)> = critical_path
         .path_indices
         .windows(2)

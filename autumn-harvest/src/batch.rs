@@ -1,19 +1,17 @@
 //! Batch operations for fleet-wide workflow management (issue #102).
 //!
-//! Operators routinely need to act on hundreds or thousands of workflows at
-//! once: cancel everything triggered by a bad release, signal every in-flight
-//! onboarding to switch to a fallback path, terminate runaway DAG runs from a
-//! misconfigured schedule. The single-target `cancel_workflow_execution` and
-//! `send_signal` paths are too low-level for that — operators end up writing
-//! throwaway scripts that loop over `GET /workflows` and fire one request per
-//! row, with no rate limiting and no durability if the script's host dies.
+//! Operators must act on many workflows at once. Examples: cancel all runs
+//! from a bad release, signal every in-flight onboarding, terminate runaway
+//! DAG runs. The single-target `cancel_workflow_execution` and `send_signal`
+//! paths are too low-level for that. Without batches, operators write scripts
+//! that send one request per row, with no rate limit and no durability.
 //!
-//! This module models a batch as a durable row in `harvest_batch_jobs`. The
-//! API layer inserts the row and returns an id immediately; a background
-//! executor polls open jobs, walks the filter result set, and applies the
-//! per-target action via the existing single-target write paths so the event
-//! log stays unchanged. Per-target failures are captured in the `errors`
-//! field and counted in `failed`; they do not abort the batch.
+//! A batch is a durable row in `harvest_batch_jobs`. The API layer inserts
+//! the row and returns an id immediately. A background executor polls open
+//! jobs, walks the filter result set, and applies the action to each target.
+//! It uses the existing single-target write paths, so the event log does not
+//! change. A per-target failure goes into `errors` and `failed`. It does not
+//! abort the batch.
 
 use std::str::FromStr;
 
@@ -22,13 +20,12 @@ use serde_json::Value;
 
 /// What the batch operation does to each matched workflow execution.
 ///
-/// `Cancel` issues a graceful cancel via the existing
-/// `cancel_workflow_execution` path. `Terminate` is a hard finalize that does
-/// not run cancellation handlers — today it shares the same DB write as
-/// `Cancel` (the durable terminal state is `CANCELLED` either way), but the
-/// reason string is distinct so operators can tell the two apart in
-/// post-mortems and so the Phase 4 cancellation pipeline can branch on it.
-/// `Signal` enqueues a signal via the existing `signal::send_signal` path.
+/// `Cancel` issues a graceful cancel through `cancel_workflow_execution`.
+/// `Terminate` is a hard finalize that does not run cancellation handlers.
+/// Today it shares the DB write of `Cancel`, and the durable terminal state is
+/// `CANCELLED` either way. Its reason string is distinct, so operators can
+/// tell the two apart in post-mortems. The Phase 4 cancellation pipeline can
+/// also branch on it. `Signal` enqueues a signal through `signal::send_signal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BatchAction {
@@ -66,12 +63,10 @@ impl FromStr for BatchAction {
 
 /// Lifecycle status of a batch job row.
 ///
-/// New rows land in `Pending`, transition to `Running` when the executor
-/// claims them, and end in `Completed` (regardless of per-target failures —
-/// per-target failures are captured in the `errors` field, not the status).
-/// `Failed` is reserved for executor-level failures that prevent the batch
-/// from making progress (e.g. a malformed filter that the executor cannot
-/// translate into a SQL query).
+/// A new row starts in `Pending`, moves to `Running` when the executor claims
+/// it, and ends in `Completed`. Per-target failures go into `errors`, not the
+/// status. `Failed` is only for an executor-level failure that stops all
+/// progress, such as a filter that the executor cannot translate into SQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BatchJobStatus {
@@ -154,9 +149,9 @@ pub const DEFAULT_BATCH_CONCURRENCY: u32 = 32;
 
 /// Guard message returned when a batch filter has no narrowing criterion.
 ///
-/// Shared verbatim by the real-submit path ([`db::submit_batch_job`]) and the
-/// dry-run preview branch in the plugin so both reject an "act on everything"
-/// filter with an identical `400` (issue #769).
+/// The real-submit path ([`db::submit_batch_job`]) and the plugin's dry-run
+/// preview share it verbatim. So both reject an "act on everything" filter
+/// with an identical `400` (issue #769).
 pub const BATCH_EMPTY_FILTER_ERR: &str =
     "batch filter must specify at least one criterion: state, workflow_name, or search_attrs";
 
@@ -193,12 +188,11 @@ mod db {
     use crate::models::{BatchJob, NewBatchJob};
     use crate::schema::harvest_batch_jobs;
 
-    /// Submission request resolved into the row we want in the database.
+    /// Submission request resolved into the row to insert.
     ///
-    /// Idempotency: if a row with the same `idempotency_key` already exists we
-    /// return that row's id rather than starting a duplicate batch. The key
-    /// is supplied by the caller so the same client retry deterministically
-    /// resolves to the same job, preventing the "double-cancel" foot-gun.
+    /// Idempotency: if a row with the same `idempotency_key` exists, its id is
+    /// returned and no duplicate batch starts. The caller supplies the key, so
+    /// a client retry resolves to the same job and cannot double-cancel.
     #[derive(Debug, Clone)]
     pub struct BatchSubmission {
         pub action: BatchAction,
@@ -382,15 +376,15 @@ mod db {
 
     /// Atomically claim a batch job for exclusive processing by this worker.
     ///
-    /// Returns `true` when this caller acquired the claim and may proceed,
-    /// `false` when another worker already owns it (skip silently). Uses a
-    /// single conditional UPDATE with `PostgreSQL`'s row-level write lock so
-    /// two concurrent runtimes cannot both claim the same row: a `Pending`
-    /// row matches once and transitions to `Running`; a `Running` row only
-    /// matches when its `updated_at` is older than the lease window (the
-    /// previous owner is presumed dead). When transitioning from `Pending`
-    /// the `total` is persisted atomically with the status change, so the
-    /// claim is the single durable write that begins a job.
+    /// Returns `true` when this caller acquired the claim, and `false` when
+    /// another worker owns it. The caller then skips the job silently.
+    ///
+    /// One conditional UPDATE takes the `PostgreSQL` row write lock, so two
+    /// runtimes cannot both claim a row. A `Pending` row matches once and
+    /// moves to `Running`. A `Running` row matches only when its `updated_at`
+    /// is older than the lease window, because its owner is then presumed dead.
+    /// A claim from `Pending` also persists `total`, so the claim is the one
+    /// durable write that begins a job.
     pub async fn try_claim_job(
         conn: &mut AsyncPgConnection,
         job_id: Uuid,
@@ -430,9 +424,9 @@ mod db {
     ///
     /// The dispatched ids are the durable exclusion set used on resume to
     /// skip already-processed targets regardless of their current workflow
-    /// state. All four column updates land in a single SQL UPDATE so a crash
-    /// cannot persist counters without the matching `processed_ids` append —
-    /// otherwise a resumed tick would re-dispatch already-counted targets.
+    /// state. All four columns change in one SQL UPDATE. So a crash cannot
+    /// persist counters without the matching `processed_ids` append, and a
+    /// resumed tick does not re-dispatch targets that it already counted.
     pub async fn record_progress(
         conn: &mut AsyncPgConnection,
         id: Uuid,
@@ -456,8 +450,8 @@ mod db {
         };
 
         // Single UPDATE = single transaction = atomic. Appending an empty
-        // JSON array via `||` is a no-op, so it's safe to always include the
-        // errors and processed_ids set clauses regardless of input length.
+        // JSON array via `||` is a no-op. So the errors and processed_ids set
+        // clauses are always safe to include, whatever the input length.
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
                 harvest_batch_jobs::completed.eq(harvest_batch_jobs::completed + delta_completed),
@@ -590,28 +584,23 @@ mod db {
         }
     }
 
-    /// Resolve a batch filter against `harvest_workflow_executions` on a
-    /// single shard. Mirrors `load_workflows` in the plugin's API module but
-    /// returns just the IDs the executor needs to act on, and intentionally
-    /// drops the per-call limit so a 10k batch can drain over multiple ticks.
-    ///
-    /// `action` is consulted only to pick the default state filter when the
-    /// caller didn't supply one: Cancel/Signal default to the active states
-    /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
-    /// still active — cancel accepts it and a signal queues for delivery on
-    /// resume); Terminate defaults to "every non-terminal-sealed state"
-    /// (excludes `CANCELLED` and `TERMINATED`) because its whole purpose is to
-    /// seal stuck live rows as `TERMINATED` (already-terminal rows are
-    /// idempotent no-ops).
     /// Apply the per-action state defaults, `workflow_name`, and each
     /// `search_attrs @> $jsonb` containment predicate onto a boxed
     /// `harvest_workflow_executions` query.
     ///
+    /// `action` only picks the default state filter when the caller supplies
+    /// none. Cancel/Signal default to the active states `RUNNING`/`PAUSED`.
+    /// Terminal rows are no-ops, and a paused execution is still active:
+    /// cancel accepts it and a signal queues for delivery on resume. Terminate
+    /// defaults to every state except the sealed ones, `CANCELLED` and
+    /// `TERMINATED`. It seals stuck live rows as `TERMINATED`, and
+    /// already-terminal rows are idempotent no-ops.
+    ///
     /// This is the SINGLE predicate builder shared by [`resolve_targets_on_shard`]
     /// (the real submit), [`count_targets_on_shard`], and
-    /// [`sample_targets_on_shard`] (both the dry-run preview, issue #769). Any
-    /// change to the matching logic lands in exactly one place, so a dry-run
-    /// preview can never drift from what a real submit would act on.
+    /// [`sample_targets_on_shard`] (both the dry-run preview, issue #769). The
+    /// matching logic lives in one place, so a dry-run preview can never drift
+    /// from what a real submit would act on.
     fn apply_batch_filters<'a>(
         mut query: crate::schema::harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
         action: BatchAction,
@@ -627,13 +616,13 @@ mod db {
                     // already-sealed terminal states so a re-run never
                     // re-selects rows this batch already finalized (#504).
                     //
-                    // `MIGRATED` and `MIGRATING` (issue #964) are excluded for a
-                    // sharper reason than tidiness. Terminating a `MIGRATED`
-                    // source would overwrite the seal an id resolves through;
-                    // terminating a `MIGRATING` staged copy would poison the
-                    // migration permanently, because `discard_staged_copy` then
-                    // refuses the row on every retry and the run is stranded
-                    // holding the target's uniqueness slot. Neither is a run an
+                    // `MIGRATED` and `MIGRATING` (issue #964) are excluded too.
+                    // Terminating a `MIGRATED` source would overwrite the seal
+                    // that an id resolves through. Terminating a `MIGRATING`
+                    // staged copy would poison the migration permanently.
+                    // `discard_staged_copy` then refuses the row on every
+                    // retry, and the run is stranded holding the target's
+                    // uniqueness slot. Neither is a run an
                     // unfiltered "terminate everything" batch means to touch.
                     query = query.filter(harvest_workflow_executions::state.ne_all([
                         "CANCELLED",
@@ -660,6 +649,10 @@ mod db {
         query
     }
 
+    /// Resolve a batch filter to execution ids on a single shard.
+    ///
+    /// It mirrors `load_workflows` in the plugin's API module, but returns ids
+    /// only. It has no per-call limit, so a 10k batch can drain over ticks.
     async fn resolve_targets_on_shard(
         conn: &mut AsyncPgConnection,
         action: BatchAction,
@@ -781,14 +774,13 @@ mod db {
 
     /// The pool for the shard `target` **currently** lives on.
     ///
-    /// The all-shard scan finds a rebalanced run on its live target copy, but
-    /// the id it hands back still encodes the shard the run was minted on. A
-    /// plain `pool_for_execution` would therefore dispatch the cancel, the
-    /// terminate or the signal back to the sealed source, where the row reads
-    /// as `MIGRATED`: signals come back shard-unavailable and a terminate
-    /// would seal the wrong copy while the live one keeps running. Following
-    /// the forwarding pointer is what makes "the scan found it, so the write
-    /// reaches it" true.
+    /// The all-shard scan finds a rebalanced run on its live target copy. The
+    /// id it returns still encodes the shard that minted the run. A plain
+    /// `pool_for_execution` would send the write to the sealed source, where
+    /// the row reads as `MIGRATED`. Signals would fail as shard-unavailable,
+    /// and a terminate would seal the wrong copy while the live one runs.
+    /// The forwarding pointer makes "the scan found it, so the write reaches
+    /// it" true.
     ///
     /// Single-shard deployments take the original path verbatim — there is
     /// nowhere to migrate to, so there is no pointer to read.
@@ -826,10 +818,9 @@ mod db {
 
     /// Drive every open batch job to terminal status across all shards.
     ///
-    /// One tick is sufficient for a 1k-target batch on a laptop-class
-    /// Postgres; the spawned executor task in the plugin re-enters this loop
-    /// on each scheduler interval so longer batches drain over multiple
-    /// ticks without holding open transactions.
+    /// One tick drains a 1k-target batch on a laptop-class Postgres. The
+    /// plugin's executor task re-enters this loop on each scheduler interval.
+    /// So longer batches drain over many ticks without open transactions.
     pub async fn run_executor_once(
         pool: &ShardedDbPool,
         config: &BatchExecutorConfig,
@@ -849,10 +840,9 @@ mod db {
         pool: &ShardedDbPool,
         config: &BatchExecutorConfig,
     ) -> HarvestResult<()> {
-        // Discover open jobs from every shard. The same job_id may live on
-        // every shard's workflow table; the row itself is per-shard so we
-        // process each shard's view independently and merge counters via
-        // `record_progress` against the *default* shard's row.
+        // The same job_id may live on every shard. The row is per-shard, so
+        // each shard's view is processed independently. `record_progress`
+        // merges counters into the *default* shard's row.
         for (_shard, shard_pool) in pool.iter_shards() {
             // This block drops the listing connection before `process_job`
             // runs, because `process_job` does not need it past `open_jobs`.
@@ -866,8 +856,6 @@ mod db {
             for job in jobs {
                 process_job(pool, shard_pool, job, config).await?;
             }
-            // After processing this shard's view we move on; the same job
-            // surface on other shards will be picked up in their iteration.
         }
         Ok(())
     }
@@ -922,11 +910,9 @@ mod db {
             None
         };
 
-        // Walk every shard, collect targets, dispatch with bounded fan-out.
-        // Bolt: Pre-calculate total shards to hint the initial capacity of `all_targets`.
-        // While we don't know exactly how many executions exist on each shard,
-        // pre-allocating an estimated batch size prevents continuous reallocations
-        // when concatenating results from 256 default shards.
+        // The per-shard execution count is not known. An estimate from the
+        // shard count still prevents repeated reallocation when the loop
+        // concatenates results from 256 default shards.
         let mut all_targets: Vec<ExecutionId> = Vec::with_capacity(pool.iter_shards().count() * 10);
         for (_, shard_pool) in pool.iter_shards() {
             let mut conn = executor_conn(shard_pool).await?;
@@ -934,11 +920,10 @@ mod db {
             all_targets.append(&mut targets);
         }
 
-        // Atomic lease claim with total: a Pending row transitions to Running
-        // and persists `total` in one write; a Running row with an expired
-        // lease is reclaimed without touching `total`. If another worker
-        // owns the lease, skip silently. record_progress runs on the owning
-        // shard (where the job row lives).
+        // A Pending row moves to Running and persists `total` in one write.
+        // A Running row with an expired lease is reclaimed without touching
+        // `total`. If another worker owns the lease, skip silently.
+        // record_progress runs on the shard that holds the job row.
         //
         // This block checks out and releases the claim connection; the rest
         // of the function does not hold it. The dispatch loop below
@@ -959,13 +944,11 @@ mod db {
             return Ok(());
         }
 
-        // Build the durable exclusion set from prior ticks. Resume-by-identity:
-        // a target whose UUID is already in `processed_ids` was dispatched on
-        // a previous tick (success or failure was already counted), so skip it
-        // regardless of its current workflow state. This is the correct fix
-        // for Signal — signaled workflows stay RUNNING and would otherwise be
-        // re-dispatched, and an offset-based cursor is unsafe when the RUNNING
-        // set drains naturally during a recovery window.
+        // Resume by identity. A target in `processed_ids` was dispatched and
+        // counted on a previous tick, so skip it whatever its current state.
+        // Signaled workflows stay RUNNING and would otherwise be re-dispatched.
+        // An offset-based cursor is unsafe, because the RUNNING set drains
+        // during a recovery window.
         let processed: std::collections::HashSet<Uuid> =
             serde_json::from_value::<Vec<String>>(job.processed_ids.clone())
                 .unwrap_or_default()
@@ -982,7 +965,6 @@ mod db {
         let metrics = Arc::clone(&config.metrics);
         let codecs = &config.payload_codecs;
 
-        // Dispatch in chunks of `concurrency` to bound in-flight ops.
         for chunk in targets_to_dispatch.chunks(concurrency) {
             let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
             for target in chunk.iter().copied() {

@@ -436,7 +436,6 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
         "sample IDs should include the running v1 execution; got {sample_ids:?}"
     );
 
-    // Now mark the v1 execution as COMPLETED
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .unwrap();
@@ -607,10 +606,9 @@ async fn retirement_check_degraded_when_one_shard_unavailable() {
 }
 
 /// Executions that started before a version gate was inserted carry no
-/// `MarkerRecorded` event for that change id.  When the gate is later added to
-/// the code and `workflow_name` is supplied to the retirement check, these
-/// pre-gate executions must appear as blockers (`recorded_version` = 0) so that
-/// operators are not misled into retiring the old branch prematurely.
+/// `MarkerRecorded` event for that change id. The retirement check with a
+/// `workflow_name` must list them as blockers (`recorded_version` = 0). Otherwise
+/// operators can retire the old branch too early.
 #[tokio::test]
 async fn retirement_check_includes_pre_gate_executions_as_blockers() {
     let (database_url, _container) = setup_database_url_with_migrations().await;

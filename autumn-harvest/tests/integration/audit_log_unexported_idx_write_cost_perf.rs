@@ -4,13 +4,13 @@
 //! audit export.
 //!
 //! Issue #1272 (closed via PR #1518, documentation only) established a gap.
-//! `harvest_audit_log_unexported_idx` — `(occurred_at, id) WHERE export_seq
-//! IS NULL` — matches every row in `harvest_audit_log` when no audit-export
+//! `harvest_audit_log_unexported_idx`, `(occurred_at, id) WHERE export_seq
+//! IS NULL`, matches every row of `harvest_audit_log` when no audit-export
 //! sink is configured. `export_seq` then stays `NULL` forever. The issue
-//! text is explicit about the real fixes: (1) lazy index creation on opt-in,
-//! and (4) a separate operator-applied migration. The issue calls both
-//! real fixes, but only "if the cost proves material on a large audit
-//! table". That, the issue says, "wants a measurement, not a guess."
+//! names the real fixes: (1) lazy index creation on opt-in, and (4) a
+//! separate operator-applied migration. It wants them only "if the cost
+//! proves material on a large audit table". That, the issue says, "wants a
+//! measurement, not a guess."
 //!
 //! `audit_export_tests.rs`'s own module doc repeats the same deferral:
 //! "The insert-path index cost is separate (issue #1272)."
@@ -19,35 +19,32 @@
 //! builds it lazily. This harness now builds it for the with-index arm.
 //!
 //! This harness is that measurement. It seeds a production-shaped
-//! `harvest_audit_log` once. The fixture has 500,000 pre-existing rows,
-//! realistic operation-name and actor cardinality, and `occurred_at`
-//! spread across the 90-day default retention window. `export_seq` stays
-//! `NULL` throughout -- the exact steady state of an unconfigured
-//! deployment.
+//! `harvest_audit_log` once: 500,000 rows, realistic operation-name and
+//! actor cardinality, and `occurred_at` spread across the 90-day default
+//! retention window. `export_seq` stays `NULL` throughout, as on an
+//! unconfigured deployment.
 //!
-//! It then physically clones that one seeded database, with `CREATE
-//! DATABASE ... TEMPLATE`, into two byte-identical scenario databases.
-//! One keeps the shipped schema, index present. The other drops the
-//! index -- the "lazily created, only on opt-in" counterfactual. The
-//! clone, not independent re-seeding, is what makes the two scenarios
-//! comparable. Independent seeding would build two physically different
-//! B-trees, for reasons unrelated to the index under test.
+//! `CREATE DATABASE ... TEMPLATE` then clones that database into two
+//! byte-identical scenario databases. The shipped schema has no such index.
+//! The harness builds it in one database, as the exporter does on opt-in. The
+//! other stays without it, as an unconfigured deployment does. The clone makes
+//! the two scenarios comparable. Independent seeding would build two
+//! physically different B-trees, for reasons unrelated to the index under
+//! test.
 //!
-//! The harness then drives the REAL public entry point every mutating
-//! management-API handler calls, `audit::insert_audit`, for a batch of
-//! new rows in both databases. It
-//! reports the buffer/WAL delta `pg_stat_statements` attributes to the
-//! `INSERT INTO harvest_audit_log` statement itself, plus the index's own
-//! size and its `idx_scan` count. `idx_scan` is observed across a
-//! representative read workload: `audit::list_audit`, the real `GET /audit`
-//! handler's own entry point.
+//! The harness then calls `audit::insert_audit`, the entry point of every
+//! mutating management-API handler, for a batch of new rows in both
+//! databases. It reports the buffer and WAL delta that `pg_stat_statements`
+//! attributes to the `INSERT INTO harvest_audit_log` statement. It also
+//! reports the index size, and its `idx_scan` count across a read workload
+//! of `audit::list_audit`, the entry point of `GET /audit`.
 //!
 //! Evidence is `pg_stat_statements` buffers, WAL bytes and `pg_relation_size`.
-//! Wall-clock alone is never evidence, per this persona's charter.
+//! Wall-clock time alone is never evidence.
 
-// `cast_precision_loss`: every `as f64` cast below is a small, bounded
-// evidence count (buffers, WAL bytes, insert calls), for ratio/percentage
-// reporting. None comes near `f64`'s 2^52 mantissa limit.
+// `cast_precision_loss`: each `as f64` cast is a small evidence count
+// (buffers, WAL bytes, insert calls) for a ratio. None nears the 2^52
+// mantissa limit of `f64`.
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
 use super::claim_bench_support::with_db_name;
@@ -67,17 +64,11 @@ async fn setup_server() -> (String, DbGuard) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
     }
-    // Preload `pg_stat_statements` so the fallback path works too, not
-    // just an external `HARVEST_TEST_DATABASE_URL` that happens to
-    // already have it configured. Review finding on PR #1666, mirroring
-    // `claim_bench_support.rs`'s own identical fix: the extension's C
-    // hooks only exist once preloaded at postmaster start. A later
-    // `CREATE EXTENSION` (which `ensure_pg_stat_statements` still runs,
-    // to register the SQL-level objects) cannot retroactively enable
-    // them. `.with_cmd(...)` replaces `Image::cmd()` rather than merging
-    // with it. So the image's own `fsync=off` default is repeated here
-    // explicitly. Otherwise fsync would silently re-enable, slowing
-    // down every Docker-fallback run.
+    // Preload `pg_stat_statements`, as `claim_bench_support.rs` does. Its C
+    // hooks exist only when preloaded at postmaster start. A later `CREATE
+    // EXTENSION` registers the SQL objects but cannot enable the hooks.
+    // `.with_cmd(...)` replaces `Image::cmd()`, so it repeats the image's
+    // `fsync=off` default. Otherwise fsync would slow every Docker run.
     let container = Postgres::default()
         .with_tag("16")
         .with_cmd([
@@ -102,18 +93,14 @@ async fn create_fresh_db(admin_url: &str, name: &str, cleanup: &DbCleanupGuard) 
     let _ = diesel::sql_query(format!("CREATE DATABASE \"{name}\""))
         .execute(&mut admin)
         .await;
-    // Registered right after the statement above, succeeded or not --
-    // review finding on PR #1666. A panic in migration below must not
-    // skip cleanup for a database that `CREATE DATABASE` already made.
-    // Registering an unmade name is harmless: `drop_databases_impl` runs
-    // `DROP DATABASE IF EXISTS`.
+    // Register the name whether or not the statement succeeded. A panic in
+    // the migration must not skip cleanup of a database that exists. An
+    // unmade name is harmless: `drop_databases_impl` uses `IF EXISTS`.
     cleanup.register(name);
 
-    // `with_db_name`, not a naive `rsplit_once('/')` -- review finding on
-    // PR #1666. A raw split panics on a legal libpq keyword/value DSN,
-    // which has no `/` at all. It also silently drops query-string
-    // options (`sslmode`, `application_name`, certs) from a URL-form
-    // DSN that carries them.
+    // Not `rsplit_once('/')`: a raw split panics on a legal libpq
+    // keyword/value DSN, which has no `/`. It also drops query-string
+    // options (`sslmode`, `application_name`, certs) from a URL DSN.
     let url = with_db_name(admin_url, name).expect("admin url selects a database");
     let mut conn = AsyncPgConnection::establish(&url)
         .await
@@ -125,19 +112,13 @@ async fn create_fresh_db(admin_url: &str, name: &str, cleanup: &DbCleanupGuard) 
     url
 }
 
-/// Postgres truncates every identifier -- quoted or not -- to
-/// `NAMEDATALEN - 1` (63) bytes at the lexer level. `CREATE DATABASE
-/// "<name>"` with a longer `name` then creates a shorter database than
-/// this function returns. Every later `with_db_name(admin, name)` call
-/// builds a connection URL for the untruncated name, so it fails to
-/// connect to the database `CREATE DATABASE` actually made. Review
-/// finding on PR #1666: the full 32-hex-character `Uuid::simple()` form
-/// pushed both scenario labels' names to 69-70 bytes. 16 hex characters
-/// (64 bits) keeps every current prefix well under the limit. That is
-/// still, for the two or three names one test run creates, effectively
-/// collision-free. The assertion below still catches it explicitly, not
-/// silently via a Postgres-side truncation, if a future longer prefix
-/// pushes the total over the limit again.
+/// A unique database name of 63 bytes or fewer.
+///
+/// Postgres truncates every identifier, quoted or not, to `NAMEDATALEN - 1`
+/// (63) bytes. A longer name makes a database that `with_db_name` cannot
+/// reach. A full 32-hex `Uuid::simple()` pushed the scenario names to 69-70
+/// bytes. 16 hex characters (64 bits) keep each prefix under the limit and
+/// are collision-free for a few names. The assertion catches a longer prefix.
 fn unique(prefix: &str) -> String {
     let suffix = &uuid::Uuid::new_v4().simple().to_string()[..16];
     let name = format!("{prefix}_{suffix}");
@@ -150,24 +131,20 @@ fn unique(prefix: &str) -> String {
     name
 }
 
-/// Best-effort `DROP DATABASE IF EXISTS` for every name given. One
-/// connection error, or one drop failure, does not stop the rest. Each
-/// name gets its own attempt. A failure is logged, not panicked. This
-/// runs during cleanup. By then the evidence it would report on is
-/// already captured, or the run has already failed.
+/// Best-effort `DROP DATABASE IF EXISTS` for every name given.
+///
+/// One failure does not stop the rest. A failure is logged, not panicked.
+/// By cleanup time the evidence is captured, or the run has already failed.
 async fn drop_databases_impl(admin_url: &str, names: &[String]) {
     let Ok(mut admin) = AsyncPgConnection::establish(admin_url).await else {
         eprintln!("cleanup: could not connect to admin database, leaving {names:?} in place");
         return;
     };
     for name in names {
-        // Self-found running this fix. `DROP DATABASE` can race a
-        // just-dropped `AsyncPgConnection` whose own backend has not
-        // finished closing on the server yet. It then fails with "is
-        // being accessed by other users", even though nothing in this
-        // process still holds it open. A few short retries absorb that
-        // race without turning a best-effort cleanup step into one that
-        // blocks indefinitely.
+        // `DROP DATABASE` can race a dropped `AsyncPgConnection` whose
+        // backend has not closed yet. It then fails with "is being accessed
+        // by other users". A few short retries absorb that race, and the
+        // cleanup still cannot block forever.
         let mut attempts_left = 30;
         loop {
             let result = diesel::sql_query(format!("DROP DATABASE IF EXISTS \"{name}\""))
@@ -188,18 +165,15 @@ async fn drop_databases_impl(admin_url: &str, names: &[String]) {
     }
 }
 
-/// Registers every scenario database this harness creates. `register`
-/// is called immediately after each `CREATE DATABASE` succeeds. That
-/// is before anything else in that function can fail. So a panic
-/// partway through `seed_base_db`/`measure` still leaves this guard
-/// knowing what to clean up, not just the success path. Review finding
-/// on PR #1666: an earlier revision cleaned up only after both `measure`
-/// calls returned normally. A mid-measurement panic on the
-/// `HARVEST_TEST_DATABASE_URL` path still leaked whatever had already
-/// been created.
+/// Registers every scenario database this harness creates.
 ///
-/// Two ways to actually run that cleanup, for two different cases --
-/// see `cleanup` and `Drop::drop` below for why they differ.
+/// `register` runs right after each `CREATE DATABASE`, before anything else
+/// can fail. So a panic in `seed_base_db` or `measure` still leaves the guard
+/// a full list. Otherwise a panic on the `HARVEST_TEST_DATABASE_URL` path
+/// leaks the databases made so far.
+///
+/// `cleanup` and `Drop::drop` run the cleanup for two different cases. Their
+/// doc comments say why they differ.
 struct DbCleanupGuard {
     admin_url: String,
     names: std::sync::Mutex<Vec<String>>,
@@ -224,18 +198,14 @@ impl DbCleanupGuard {
         std::mem::take(&mut *self.names.lock().expect("cleanup registry mutex"))
     }
 
-    /// The success-path cleanup call. Self-found running the first
-    /// version of this guard: a blocking `Drop`, below, self-deadlocks
-    /// here. This test's default `#[tokio::test]` runtime is
-    /// single-threaded. A connection's own graceful async shutdown
-    /// needs that same thread to be polled again. Only then can its
-    /// background I/O driver task notice the handle was dropped, and
-    /// actually close the socket. Only then does Postgres see the
-    /// backend go away. A plain `.await` here does that naturally. That
-    /// is why the retries inside `drop_databases_impl` then succeed
-    /// quickly, instead of timing out. `Drop::drop` cannot `.await`.
-    /// That is exactly why it cannot do this the same way -- see its
-    /// own doc comment.
+    /// The success-path cleanup.
+    ///
+    /// A blocking `Drop` self-deadlocks here. The default `#[tokio::test]`
+    /// runtime is single-threaded. A connection closes its socket only when
+    /// that thread polls its I/O driver task again. Only then does Postgres
+    /// see the backend go away. A plain `.await` lets that happen, so the
+    /// retries in `drop_databases_impl` succeed quickly. `Drop::drop` cannot
+    /// `.await`, so it cannot work this way.
     async fn cleanup(&self) {
         let names = self.take_names();
         if !names.is_empty() {
@@ -245,33 +215,23 @@ impl DbCleanupGuard {
 }
 
 impl Drop for DbCleanupGuard {
-    /// A last-resort fallback only. The main test body no longer relies
-    /// on this path for its own panics -- review finding on PR #1666.
-    /// `tokio::spawn`ing the measurement work catches a panic there as
-    /// an `Err(JoinError)`, instead of unwinding past this guard. So the
-    /// test function itself can `.await` `cleanup()` in response. What
-    /// is left for `Drop::drop` to cover is narrower: a panic inside
-    /// `cleanup()` itself, or a path that reaches neither `cleanup()`
-    /// nor the `tokio::spawn`/`Err` arm. `Drop::drop` is synchronous, so
-    /// it cannot `.await` the connections above closing before it
-    /// attempts `DROP DATABASE` itself.
+    /// A last-resort fallback only.
     ///
-    /// An earlier revision spawned a thread and blocked on it with
-    /// `JoinHandle::join`. That was an attempt to get a synchronous
-    /// call out of an async cleanup -- review finding on PR #1666's
-    /// own testing, not Codex's. `join` blocks this OS thread. That
-    /// thread is the only one the `current_thread` runtime has, to run
-    /// anything on. That includes the very connection-shutdown tasks
-    /// the spawned thread's retries were waiting on. That is a real
-    /// deadlock, not a slow retry. It reproduced identically at every
+    /// The test spawns the measurement work, so a panic there arrives as an
+    /// `Err(JoinError)`, and the test awaits `cleanup()`. This path covers
+    /// the rest: a panic inside `cleanup()`, or a path that reaches neither.
+    /// `Drop::drop` is synchronous, so it cannot await the connections that
+    /// close before its `DROP DATABASE`.
+    ///
+    /// Do not block on a spawned thread with `JoinHandle::join`. `join`
+    /// blocks the one thread of the `current_thread` runtime. The
+    /// connection-shutdown tasks that the retries wait on need that thread.
+    /// That is a real deadlock, not a slow retry. It reproduced at every
     /// retry budget tried, up to 15 seconds.
     ///
-    /// The fix here does not block. It spawns a detached thread and
-    /// returns immediately, so it cannot deadlock. The cost: cleanup
-    /// is no longer guaranteed to finish before the process can exit.
-    /// This is now a narrow, last-resort path rather than the main
-    /// panic-path handler, so that cost applies to a correspondingly
-    /// narrower set of failures.
+    /// So this spawns a detached thread and returns at once. It cannot
+    /// deadlock. The cost is that cleanup may not finish before the process
+    /// exits. That cost applies only to the narrow set of failures above.
     fn drop(&mut self) {
         let names = self.take_names();
         if names.is_empty() {
@@ -370,13 +330,11 @@ struct IdxScanRow {
 /// Reads `pg_stat_user_indexes` for `harvest_audit_log`, first forcing this
 /// backend's own counters to flush.
 ///
-/// PG16's statistics collector batches updates. Querying
-/// `pg_stat_user_indexes` right after a scan, on the same backend, can
-/// still read the pre-scan counters. That would let a real index use hide
-/// behind a stale zero -- review finding on PR #1666. `SELECT
-/// pg_stat_force_next_flush()` makes the read authoritative. Issue #1511's
-/// own measurement used the identical mechanism for `pg_stat_database`
-/// counters, for the identical reason.
+/// PG16 batches its statistics updates. A read of `pg_stat_user_indexes`
+/// right after a scan, on the same backend, can still see the pre-scan
+/// counters. A real index use could then hide behind a stale zero. `SELECT
+/// pg_stat_force_next_flush()` makes the read authoritative. The measurement
+/// of issue #1511 used it on `pg_stat_database` for the same reason.
 async fn index_scan_counts(conn: &mut AsyncPgConnection) -> Vec<IdxScanRow> {
     diesel::sql_query("SELECT pg_stat_force_next_flush()")
         .execute(conn)
@@ -440,14 +398,11 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
     } else {
         "batch"
     };
-    // Deterministic, not `Uuid::new_v4()` -- review finding on PR #1666.
-    // `fixture_row(i)` must be a pure function of `i`. That way the
-    // measured window draws byte-identical `target_id` values in both
-    // scenarios. `harvest_audit_log.id`, the actual primary key, is a
-    // separate, irreducible source of randomness. This harness cannot
-    // control it without bypassing `audit::insert_audit`'s reliance on
-    // the schema's own `gen_random_uuid()` default. See that function's
-    // call site below for why that reliance is not optional here.
+    // Deterministic, not `Uuid::new_v4()`. `fixture_row(i)` must be a pure
+    // function of `i`, so both scenarios draw the same `target_id` values.
+    // The primary key `harvest_audit_log.id` stays random. Only a bypass of
+    // `audit::insert_audit` and its `gen_random_uuid()` default could control it.
+    // The call site in `measure` says why that bypass is wrong.
     let target_id = format!("{}-{i}", uuid::Uuid::from_u128(i as u128));
     let route = format!(
         "POST /{target_type}s/{{id}}/{}",
@@ -468,41 +423,30 @@ fn fixture_row(i: usize) -> (String, String, String, String, String, String) {
     )
 }
 
-/// Seeds `n` pre-existing audit rows through the REAL batched entry point,
-/// `audit::insert_audit_batch`. It then backdates `occurred_at` with a
-/// single bulk `UPDATE`, to spread the rows across the 90-day default
-/// retention window. `occurred_at` is DB-defaulted to `NOW()` at insert
-/// time and is not a `NewAuditRecord` field. Backdating afterward is the
-/// only way to give the fixture realistic time-density without
-/// hand-writing `INSERT` statements that bypass the code path under test.
-/// The backdating `UPDATE` runs once, outside the measured window.
+/// Seeds `n` audit rows through `audit::insert_audit_batch`, then
+/// backdates them across the 90-day default retention window.
 ///
-/// `occurred_at` is a key column of four of this table's five indexes,
-/// `harvest_audit_log_unexported_idx` among them. A non-`HOT` update on
-/// an indexed column touches both the heap and the index. So the
-/// backdating `UPDATE` leaves one dead entry per row in each of those
-/// four indexes. It also leaves one dead heap tuple per row in the
-/// table itself. Without cleanup, the measurements below would read a
-/// transient, bloated shape. That bloat's exact size would depend on
-/// autovacuum's own timing, not on the fixture -- review finding on PR
-/// #1666.
+/// `occurred_at` defaults to `NOW()` in the database and is not a
+/// `NewAuditRecord` field. A hand-written `INSERT` would bypass the code
+/// under test, so one bulk `UPDATE` backdates the rows afterward. It runs
+/// once, outside the measured window.
 ///
-/// A plain `VACUUM` marks the dead entries reusable, in the heap and
-/// in every index. It does not shrink either one. `pg_relation_size`
-/// would still report the growth from the update. A later insert
-/// could reuse a freed page instead of paying a real allocation cost.
-/// That is a second review finding on PR #1666, for the indexes. A
-/// third finding, for the heap, followed once the index-only fix did
-/// not close the gap on its own. `VACUUM FULL` rewrites the heap into
-/// a compact file. As part of that rewrite it always rebuilds every
-/// index too. That gives the fixture the shape a table built directly
-/// from this data would have. Heap and indexes both, not just the
-/// indexes.
+/// `occurred_at` is a key column of four of the five indexes of this table,
+/// `harvest_audit_log_unexported_idx` among them. A non-`HOT` update of an
+/// indexed column touches the heap and the index. So the `UPDATE` leaves a
+/// dead heap tuple per row, and a dead entry per row in each of those
+/// indexes. That bloat would make the measurements depend on autovacuum
+/// timing, not on the fixture.
 ///
-/// `VACUUM FULL` takes `ACCESS EXCLUSIVE` on this table. That is
-/// acceptable only because this connection is the sole client of this
-/// disposable per-scenario database at this point in setup, before
-/// `op_conn`/`stats_conn` exist.
+/// A plain `VACUUM` marks dead entries reusable but shrinks nothing.
+/// `pg_relation_size` would still report the growth. A later insert could
+/// reuse a freed page instead of paying a real allocation. `VACUUM FULL`
+/// rewrites the heap into a compact file and rebuilds every index. The
+/// fixture then has the shape of a table built directly from this data.
+///
+/// `VACUUM FULL` takes `ACCESS EXCLUSIVE` on this table. That is acceptable
+/// only because this connection is the sole client of the disposable
+/// database at this point, before `op_conn` and `stats_conn` exist.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     const CHUNK: usize = 4999;
     let mut done = 0;
@@ -539,11 +483,8 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: usize) {
     .execute(conn)
     .await
     .expect("backdate fixture rows across the retention window");
-    // `VACUUM FULL`, not plain `VACUUM` or a separate `REINDEX TABLE`.
-    // See this function's own doc comment above for why. It compacts
-    // both the heap and every index in one pass. The disposable,
-    // single-connection database this runs against is why the
-    // `ACCESS EXCLUSIVE` lock it takes is acceptable here.
+    // `VACUUM FULL`, not plain `VACUUM` or a separate `REINDEX TABLE`: the
+    // doc comment says why.
     diesel::sql_query("VACUUM FULL harvest_audit_log")
         .execute(conn)
         .await
@@ -564,22 +505,13 @@ struct Measurement {
     occurred_at_idx_scans_after_reads: i64,
 }
 
-/// Seeds one shared, fully-prepared fixture database: the real batched
-/// insert entry point, the backdating `UPDATE`, `VACUUM`, `REINDEX TABLE`
-/// -- everything `seed_fixture` does, run exactly once.
+/// Seeds one shared fixture database with `seed_fixture`, exactly once.
 ///
-/// Review finding on PR #1666: the earlier revision called `seed_fixture`
-/// independently inside each of the two `measure` calls. Each call draws
-/// its own `random()` timestamps. The database assigns its own
-/// `gen_random_uuid()` primary keys too. So the two runs built
-/// physically different B-trees, even before the target index was added
-/// or dropped. Page occupancy and split points could differ for reasons
-/// that have nothing to do with the index under test.
-///
-/// Seeding once here, then physically cloning this exact database with
-/// `CREATE DATABASE ... TEMPLATE` for each scenario below, fixes that.
-/// It makes the two scenario databases byte-identical up to the one
-/// index difference this harness measures.
+/// A seed per `measure` call would draw its own `random()` timestamps and
+/// `gen_random_uuid()` primary keys. The two runs would build physically
+/// different B-trees, so page occupancy and split points could differ. Each
+/// scenario clones this database with `CREATE DATABASE ... TEMPLATE`
+/// instead. The two databases then differ only in the measured index.
 async fn seed_base_db(admin: &str, cleanup: &DbCleanupGuard) -> String {
     let base_name = unique("audit_write_cost_base");
     let url = create_fresh_db(admin, &base_name, cleanup).await;
@@ -588,9 +520,8 @@ async fn seed_base_db(admin: &str, cleanup: &DbCleanupGuard) -> String {
         .expect("seed connection");
     ensure_pg_stat_statements(&mut seed_conn).await;
     seed_fixture(&mut seed_conn, FIXTURE_ROWS).await;
-    // `CREATE DATABASE ... TEMPLATE` requires zero other backends
-    // connected to the source. Drop this connection now so the clones
-    // below never race it.
+    // `CREATE DATABASE ... TEMPLATE` needs a source with no other backend,
+    // so the clones must not race this connection.
     drop(seed_conn);
     base_name
 }
@@ -612,21 +543,20 @@ async fn measure(
     ))
     .execute(&mut admin_conn)
     .await;
-    // Registered before `.expect()` below can panic -- same reasoning
-    // as `create_fresh_db`'s own registration.
+    // Register before `.expect()` can panic, as in `create_fresh_db`.
     cleanup.register(&db_name);
     create_result.expect("clone the shared, already-seeded fixture for this scenario");
     drop(admin_conn);
-    // `with_db_name`, not a naive `rsplit_once('/')` -- same review
-    // finding on PR #1666 as `create_fresh_db` above.
+    // Not `rsplit_once('/')`, for the reason in `create_fresh_db`.
     let url = with_db_name(admin, &db_name).expect("admin url selects a database");
 
     let mut seed_conn = AsyncPgConnection::establish(&url)
         .await
         .expect("seed connection");
 
-    // Issue #1667: no migration creates the index. The shipped-schema arm
-    // builds it, as the exporter does on its first tick.
+    // Issue #1667: a later migration drops the index, so the shipped schema
+    // has none. The with-index arm builds it, as the exporter does on its first
+    // tick.
     if !drop_unexported_idx {
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS harvest_audit_log_unexported_idx \
@@ -653,19 +583,14 @@ async fn measure(
 
     // A checkpoint right before the measured window, in both scenarios.
     // The first write to a page after a checkpoint carries a full-page
-    // image. Under this fixture's write load, that image can arrive from
-    // an autovacuum-triggered checkpoint firing unpredictably mid-window,
-    // rather than from the code under test. Forcing one here puts both
-    // scenarios' measured windows on the same footing.
+    // image. An autovacuum checkpoint could fire mid-window and add one.
+    // A forced checkpoint here puts both windows on the same footing.
     //
-    // Only when this harness owns the whole server -- the testcontainer
-    // path. Review finding on PR #1666: `CHECKPOINT` flushes every
-    // database on the server, not just this scenario's. The
-    // `HARVEST_TEST_DATABASE_URL` path may point at a shared server.
-    // Skip the checkpoint there instead. That trades away some
-    // checkpoint-timing noise control. The alternative -- an I/O spike,
-    // and a WAL-delta confound from unrelated activity -- would land on
-    // a server this harness does not own.
+    // Only on the testcontainer path, where this harness owns the server.
+    // `CHECKPOINT` flushes every database on the server. The
+    // `HARVEST_TEST_DATABASE_URL` server may be shared, so skip it there.
+    // That costs some noise control. The alternative puts an I/O spike and
+    // a WAL confound on a server this harness does not own.
     if owns_server {
         diesel::sql_query("CHECKPOINT")
             .execute(&mut stats_conn)
@@ -678,21 +603,17 @@ async fn measure(
         );
     }
 
-    // The REAL public entry point every mutating management-API handler
-    // calls once per request (`audit::insert_audit`'s own doc comment:
-    // "Called after every covered management mutation").
+    // Every mutating management-API handler calls `audit::insert_audit`
+    // once per request. Its doc comment says "Called after every covered
+    // management mutation".
     //
-    // `harvest_audit_log.id`, the primary key, is DB-defaulted
-    // (`gen_random_uuid()`), not a `NewAuditRecord` field. So each row
-    // inserted here still gets its own random `id`, unlike the now-
-    // deterministic `target_id` above. That randomness cannot be
-    // removed without inserting through something other than
-    // `audit::insert_audit` itself. It is also not a testing artifact.
-    // A real deployment's own inserts get the identical random `id`
-    // distribution. Measuring its effect is measuring the real
-    // workload, not adding noise to it. `fixture_row`'s own determinism
-    // fix still matters: it isolates this one irreducible source from
-    // every other, avoidable one.
+    // The primary key `harvest_audit_log.id` defaults to
+    // `gen_random_uuid()` and is not a `NewAuditRecord` field. So each row
+    // gets a random `id`, unlike the deterministic `target_id`. Only an
+    // insert that bypasses `audit::insert_audit` could remove it. A real
+    // deployment has the same random `id` distribution, so it is part of
+    // the workload, not noise. `fixture_row` still removes every other,
+    // avoidable source.
     for i in 0..MEASURED_INSERTS {
         let (actor, operation, target_type, target_id, route, status) =
             fixture_row(FIXTURE_ROWS + i);
@@ -713,14 +634,10 @@ async fn measure(
             .await
             .expect("insert_audit should succeed");
     }
-    // Review finding on PR #1666: `pg_current_wal_lsn()` (the earlier
-    // approach) advances for writes to every database on the server,
-    // not just this one. On the `HARVEST_TEST_DATABASE_URL` path that
-    // server may be shared. Unrelated concurrent traffic could then
-    // dwarf or reverse the delta this harness reports. `wal_bytes`,
-    // read below from the same `pg_stat_statements` snapshot the
-    // buffer counters already come from, is per-statement instead --
-    // attributable only to the matched `INSERT` calls.
+    // Not `pg_current_wal_lsn()`: it advances for every database on the
+    // server, and the `HARVEST_TEST_DATABASE_URL` server may be shared.
+    // Other traffic could dwarf or reverse the delta. The `wal_bytes` of
+    // `pg_stat_statements` counts only the matched `INSERT` calls.
     let stat_rows = snapshot_statements(&mut stats_conn, &db_name).await;
     let insert_rows: Vec<&StatRow> = stat_rows
         .iter()
@@ -735,11 +652,10 @@ async fn measure(
     let insert_buffers: i64 = insert_rows.iter().map(|r| r.total_buffers).sum();
     let insert_wal_bytes: i64 = insert_rows.iter().map(|r| r.wal_bytes).sum();
 
-    // Representative read workload: the real `GET /audit` entry point,
-    // `audit::list_audit`, with filters an operator actually uses --
-    // recency, actor, operation. None of these touch
-    // `harvest_audit_log_unexported_idx`. It is not eligible for any of
-    // them, exactly as it would not be for the real handler in production.
+    // A read workload through `audit::list_audit`, the `GET /audit` entry
+    // point, with the filters an operator uses: recency, actor, operation.
+    // `harvest_audit_log_unexported_idx` is not eligible for any of them,
+    // as in production.
     let _ = audit::list_audit(&mut op_conn, &AuditFilters::default())
         .await
         .expect("list_audit default");
@@ -790,24 +706,18 @@ async fn measure(
 async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
     let (admin, guard) = setup_server().await;
     let owns_server = guard.is_some();
-    // `Arc`, not a plain local -- review finding on PR #1666. `cleanup`
-    // must survive a panic anywhere in the `tokio::spawn`ed block below,
-    // so the `Err` arm can still call its real `async fn cleanup(&self)`.
-    // A plain local would itself be dropped while unwinding that block,
-    // reaching only `Drop::drop`'s detached, un-joined thread -- exactly
-    // the gap this restructuring closes. See `Drop for DbCleanupGuard`'s
-    // own doc comment for why that thread cannot be a reliable substitute.
+    // An `Arc`, so `cleanup` survives a panic in the spawned block and the
+    // `Err` arm can await `cleanup()`. A plain local would drop while that
+    // block unwinds, and reach only the detached thread of `Drop::drop`.
+    // The doc comment of `Drop for DbCleanupGuard` says why that thread is
+    // not reliable.
     let cleanup = std::sync::Arc::new(DbCleanupGuard::new(admin.clone()));
 
-    // The measurement work runs as its own task -- review finding on PR
-    // #1666. `tokio::spawn` catches a panic internally and reports it as
-    // `Err(JoinError)` instead of unwinding this function's own stack.
-    // That leaves this `async fn` itself un-panicked. It can still
-    // `.await` real cleanup in the `Err` arm below, no matter where
-    // inside the spawned block the panic came from. A plain
-    // `std::thread` would not help here. This is `tokio::spawn`,
-    // another task on the same single-threaded runtime, not another OS
-    // thread. So it carries none of `Drop`'s own self-deadlock risk.
+    // The measurement runs as its own task. `tokio::spawn` reports a panic
+    // as `Err(JoinError)` and does not unwind this function. So the `Err`
+    // arm can await cleanup, wherever the panic came from. The task runs
+    // on the same runtime, not on another OS thread, so it cannot deadlock
+    // as a blocking `Drop` does.
     let spawned_admin = admin.clone();
     let spawned_cleanup = std::sync::Arc::clone(&cleanup);
     let measured = tokio::spawn(async move {
@@ -883,24 +793,15 @@ async fn zz_capture_audit_log_unexported_idx_write_cost_evidence() {
         before.unexported_idx_scans_after_reads
     );
 
-    // Explicit, awaited cleanup here, ahead of the assertions below,
-    // rather than waiting for `cleanup`'s own end-of-scope `Drop`. A
-    // positive-control or zero-scan assertion failure below should still
-    // leave the server clean immediately, not just eventually.
-    // `DbCleanupGuard::drop` remains a last-resort fallback only.
-    // Panics from the measurement work itself are already handled by
-    // the `tokio::spawn`/`Err` arm above, which awaits this same method.
+    // Await cleanup before the assertions, not at the end-of-scope `Drop`.
+    // A failed assertion then still leaves the server clean at once.
     cleanup.cleanup().await;
 
-    // Positive control (review finding on PR #1666). If the read path
-    // never registers on ANY index here, a zero on the target index is
-    // worthless. It would mean the flush/read mechanism itself is not
-    // seeing scans, not that this index specifically went unused.
-    // `list_audit`'s default call orders by `occurred_at DESC` with no
-    // filter. `harvest_audit_occurred_at_idx` exists to serve exactly that
-    // call. So it must show at least one real scan across the same three
-    // `list_audit` calls whose `harvest_audit_log_unexported_idx` count is
-    // asserted zero below.
+    // Positive control. If the reads register on no index, a zero on the
+    // target index proves nothing: the flush and read may see no scans.
+    // The default `list_audit` call orders by `occurred_at DESC` with no
+    // filter, which `harvest_audit_occurred_at_idx` serves. So that index
+    // must show a scan across the same three reads.
     assert!(
         before.occurred_at_idx_scans_after_reads > 0,
         "harvest_audit_occurred_at_idx must show at least one real scan from the same \

@@ -64,12 +64,11 @@ fn classify_accepts_a_unix_socket_dsn() {
 #[cfg(not(unix))]
 #[test]
 fn classify_refuses_a_unix_socket_dsn_where_there_are_no_unix_sockets() {
-    // `tokio_postgres::config::Host::Unix` is `#[cfg(unix)]`, so off Unix the
-    // client parses `host=/tmp/...` as an ordinary TCP *hostname* — and the gate
-    // classifies whatever the client will actually dial, by design. A name that
-    // is not loopback is refused, which is the right answer on a platform with
-    // no Unix sockets to reach: the DSN could not have worked anyway, and
-    // failing closed beats inventing a meaning the client does not share.
+    // `tokio_postgres::config::Host::Unix` is `#[cfg(unix)]`. Off Unix, the
+    // client parses `host=/tmp/...` as an ordinary TCP *hostname*. The gate
+    // classifies what the client will dial, by design. It refuses a name that
+    // is not loopback. With no Unix sockets, the DSN could not work anyway,
+    // and failing closed beats inventing a meaning the client does not share.
     assert!(
         matches!(
             classify_database_url(UNIX_SOCKET_DSN),
@@ -160,9 +159,9 @@ fn classify_refuses_an_sslmode_the_client_itself_cannot_use() {
 #[test]
 fn classify_allows_a_keyword_value_dsn_whose_password_contains_sslmode_text() {
     // A bare `dsn.find("sslmode=")` cannot tell a key from the inside of a
-    // value, so a legal loopback database with this password was refused as
-    // TLS-requiring — a message describing a state the DSN is not in. The
-    // closing `'` is what made the extracted value read as exactly `require`.
+    // value. So it refused a legal loopback database with this password as
+    // TLS-requiring, a state the DSN is not in. The closing `'` made the
+    // extracted value read as exactly `require`.
     let dsn = "host=localhost password='sslmode=require' dbname=harvest_dev";
     let safety = classify_database_url(dsn);
     assert!(
@@ -186,9 +185,9 @@ fn classify_allows_a_uri_whose_parameter_value_contains_sslmode_text() {
 
 #[test]
 fn classify_allows_other_keyword_values_that_contain_sslmode_text() {
-    // Not just `password`: any value at all. `options` is the realistic one —
-    // it carries arbitrary server settings — and an unquoted value is scanned
-    // by the same code path as a quoted one.
+    // Not just `password`: any value at all. `options` is the realistic one,
+    // because it carries arbitrary server settings. The same code path scans
+    // an unquoted value and a quoted one.
     for dsn in [
         "host=127.0.0.1 dbname=harvest_dev options='-c sslmode=require'",
         "host=127.0.0.1 dbname=harvest_dev application_name=sslmode=require",
@@ -204,10 +203,10 @@ fn classify_allows_other_keyword_values_that_contain_sslmode_text() {
 
 #[test]
 fn classify_still_refuses_a_real_sslmode_key_in_keyword_value_syntax() {
-    // The reason the textual scan exists at all: `tokio_postgres` models only
-    // `disable`/`prefer`/`require`, so `verify-ca` and `verify-full` — the two
-    // strongest signals of a remote managed database — would otherwise arrive
-    // as an opaque parse error rather than as the specific thing they are.
+    // The reason the textual scan exists: `tokio_postgres` models only
+    // `disable`/`prefer`/`require`. `verify-ca` and `verify-full` are the two
+    // strongest signals of a remote managed database. Without the scan, they
+    // arrive as an opaque parse error.
     for (dsn, expected) in [
         (
             "host=localhost sslmode=verify-ca dbname=harvest_dev",
@@ -267,10 +266,9 @@ fn classify_still_refuses_a_real_sslmode_key_in_uri_syntax() {
 #[test]
 fn classify_reads_a_percent_encoded_sslmode_key_the_way_the_client_does() {
     // `tokio_postgres` percent-decodes URI query keys and values before it
-    // matches them, so `%73slmode=verify-full` IS the sslmode parameter as far
-    // as the code that dials is concerned. Comparing the raw bytes would miss
-    // it, and `get_ssl_mode()` cannot name it because the client refuses to
-    // parse `verify-full` at all.
+    // matches them. So `%73slmode=verify-full` IS the sslmode parameter to the
+    // code that dials. A raw byte comparison misses it. `get_ssl_mode()` cannot
+    // name it, because the client refuses to parse `verify-full`.
     for dsn in [
         "postgres://u:pw@db.example.com/app?%73slmode=verify-full",
         "postgres://u:pw@db.example.com/app?sslmode=verify%2Dfull",
@@ -303,10 +301,10 @@ fn classify_does_not_read_a_uri_path_or_userinfo_as_a_query_parameter() {
 
 #[test]
 fn classify_terminates_and_never_panics_on_adversarial_dsn_syntax() {
-    // The scan walks quotes and `\` escapes by hand. Unterminated quotes,
-    // trailing escapes, empty values and multi-byte characters after an escape
-    // are all inputs a developer can type, and none of them may hang the dev
-    // runtime or slice a `String` off a character boundary.
+    // The scan walks quotes and `\` escapes by hand. A developer can type
+    // unterminated quotes, trailing escapes, empty values and multi-byte
+    // characters after an escape. None may hang the dev runtime or slice a
+    // `String` off a character boundary.
     for dsn in [
         "host=localhost password='unterminated",
         r"host=localhost password=trailing\",
@@ -334,11 +332,11 @@ fn classify_terminates_and_never_panics_on_adversarial_dsn_syntax() {
 #[test]
 fn redaction_covers_a_password_separated_by_non_ascii_whitespace() {
     // The Postgres client separates keyword/value options on the Unicode
-    // `White_Space` property, so a no-break space genuinely starts a new
-    // option and this DSN really does carry a password the client will use.
-    // A scanner that only knows ASCII whitespace swallows the whole tail into
-    // `host`'s value, finds no `password` key, and prints the credential in
-    // the one string whose entire purpose is to be safe to paste into an issue.
+    // `White_Space` property. So a no-break space starts a new option, and
+    // this DSN carries a password that the client uses. An ASCII-only scanner
+    // swallows the tail into the `host` value and finds no `password` key. It
+    // then prints the credential in the one string meant to be safe to paste
+    // into an issue.
     let dsn = "host=localhost\u{a0}password=hunter2\u{a0}dbname=app";
     let redacted = redact_dsn(dsn);
     assert!(
@@ -350,13 +348,13 @@ fn redaction_covers_a_password_separated_by_non_ascii_whitespace() {
 
 #[test]
 fn redaction_still_covers_a_password_next_to_a_multibyte_escape() {
-    // The keyword scanner is shared with the safety gate after #1286, so the
-    // banner's whole reason for existing — never printing a credential — is
-    // asserted against the shared implementation too.
-    // Asserted as an EXACT string, not by absence of the password: `value_span`
-    // is new API, and a one-byte slip at either end of it either leaks the edge
-    // of a credential or eats the option next to it. Both survive a
-    // `!contains("hunter2")` check.
+    // After #1286, the safety gate shares the keyword scanner. So the banner's
+    // one purpose, never printing a credential, is checked against the shared
+    // implementation too.
+    // The check is an EXACT string, not the absence of the password.
+    // `value_span` is new API. A one-byte slip at either end leaks the edge of
+    // a credential or eats the next option. Both pass a `!contains("hunter2")`
+    // check.
     let dsn = r"host=localhost password='hunter2\é x' dbname=harvest_dev";
     assert_eq!(
         redact_dsn(dsn),
@@ -373,9 +371,9 @@ fn redaction_still_covers_a_password_next_to_a_multibyte_escape() {
 #[test]
 fn classify_considers_every_sslmode_occurrence_not_just_the_last() {
     // The client keeps the LAST value for a duplicated key. This scan refuses
-    // if ANY occurrence demands TLS, which is the failing-closed side of that
-    // disagreement — and costs nothing real, because a DSN naming `verify-*`
-    // anywhere is one `Config::from_str` refuses outright.
+    // if ANY occurrence demands TLS, which fails closed. That costs nothing
+    // real, because `Config::from_str` refuses a DSN that names `verify-*`
+    // anywhere.
     for dsn in [
         "host=localhost sslmode=disable sslmode=verify-full dbname=app",
         "host=localhost sslmode=verify-full sslmode=disable dbname=app",
@@ -416,9 +414,9 @@ fn classify_matches_the_sslmode_key_and_value_case_insensitively() {
 
 #[test]
 fn classify_reaches_the_verdicts_the_substring_scan_used_to_short_circuit() {
-    // Refusing on text found inside a value did not just cost a good message:
-    // it returned BEFORE the host and name checks, so the DSN's real problem
-    // was never reported. These are the verdicts that were unreachable.
+    // A refusal on text inside a value also returned BEFORE the host and name
+    // checks. So the DSN's real problem was never reported. These verdicts
+    // were unreachable.
     let remote_hostaddr = classify_database_url(
         "postgres://u@localhost/app?hostaddr=203.0.113.5&application_name=sslmode=require",
     );
@@ -470,14 +468,13 @@ fn classify_does_not_read_a_uri_userinfo_as_a_query_parameter() {
 
 #[test]
 fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
-    // Codex round 1 (P2). The first `?` is NOT the query delimiter.
+    // The first `?` is NOT the query delimiter.
     // `tokio_postgres` reads userinfo with `take_until(&['@'])` over the whole
-    // remaining string BEFORE it looks for a query, so everything here up to
-    // the `@` is the *username* and these DSNs have no query string at all.
-    // Splitting at the first `?` invents a parameter out of a credential — and
-    // when the invented key percent-decodes to `sslmode`, the gate refuses a
-    // loopback database it should have allowed. That is the very bug #1286 is
-    // about, reintroduced through the other syntax.
+    // remaining string BEFORE it looks for a query. So everything up to the
+    // `@` is the *username*, and these DSNs have no query string. A split at
+    // the first `?` makes a parameter out of a credential. When that key
+    // percent-decodes to `sslmode`, the gate refuses a loopback database it
+    // should allow. That is the bug of #1286 again, through the other syntax.
     for dsn in [
         "postgres://u?%73slmode=verify-full&x=y@localhost/app",
         "postgres://u?sslmode=verify-full@localhost/app",
@@ -511,12 +508,11 @@ fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
 
 #[test]
 fn redaction_survives_leading_whitespace_before_the_scheme() {
-    // Codex round 2 (P1). `is_uri_dsn` ignores leading whitespace for the
-    // *decision*, so `redact_dsn` takes the URI branch — and the query locator
-    // has to ignore it the same way or it finds no scheme, reports no query,
-    // and hands back a DSN whose password was never looked at. The gate allows
-    // this DSN (it trims before classifying, then sees loopback), so the banner
-    // really does render it.
+    // `is_uri_dsn` ignores leading whitespace for the *decision*, so
+    // `redact_dsn` takes the URI branch. The query locator must ignore it the
+    // same way. Otherwise it finds no scheme and no query, and never looks at
+    // the password. The gate trims before it classifies and sees loopback, so
+    // it allows this DSN and the banner renders it.
     for dsn in [
         "  postgres://u@localhost/db?password=hunter2",
         "\tpostgresql://u@localhost/db?password=hunter2",
@@ -542,9 +538,9 @@ fn redaction_survives_leading_whitespace_before_the_scheme() {
 
 #[test]
 fn redaction_finds_a_query_password_behind_a_question_mark_in_the_userinfo() {
-    // The same locator, in the direction that leaks rather than over-refuses:
-    // splitting at the first `?` made `a=1@localhost/db` the whole "query", so
-    // the real `password=` parameter after it was never seen.
+    // The same locator, in the direction that leaks: a split at the first `?`
+    // made `a=1@localhost/db` the whole "query". So the real `password=`
+    // parameter after it was never seen.
     let dsn = "postgres://x?a=1@localhost/db?password=hunter2";
     let redacted = redact_dsn(dsn);
     assert!(!redacted.contains("hunter2"), "{redacted:?}");
@@ -678,10 +674,9 @@ fn classify_fails_closed_on_an_unparseable_dsn() {
 
 #[test]
 fn classify_refuses_a_userinfo_that_hides_a_remote_host() {
-    // `url` splits userinfo at the LAST `@`, the Postgres client at the FIRST —
-    // so a hand-rolled gate and the connection disagree about where the host
-    // even begins. Classifying with the client's own parser removes the
-    // disagreement.
+    // `url` splits userinfo at the LAST `@`, the Postgres client at the FIRST.
+    // So a hand-rolled gate and the connection disagree about where the host
+    // begins. The client's own parser removes the disagreement.
     let safety = classify_database_url("postgres://user@evil.example.com@127.0.0.1/app");
     assert!(matches!(safety, DatabaseSafety::Refused(_)), "{safety:?}");
 }
@@ -1080,9 +1075,9 @@ fn a_record_whose_data_dir_is_not_its_own_is_never_acted_on() {
 
 #[test]
 fn the_start_token_distinguishes_a_reused_pid_from_the_recorded_process() {
-    // A pid is not an identity: the gap between a SIGKILLed run and the next
-    // `cargo dev` is exactly where pid reuse happens, and the reaper would
-    // otherwise `SIGKILL` whoever inherited the number.
+    // A pid is not an identity. Pid reuse happens between a SIGKILLed run and
+    // the next `cargo dev`. Without this check, the reaper would `SIGKILL`
+    // whoever inherited the number.
     let stat = "4243 (postgres) S 1 4243 4243 0 -1 4194560 100 0 0 0 1 2 3 4 20 0 1 0 87231                 148424 1234 18446744073709551615";
     assert_eq!(proc_stat_start_time(stat).as_deref(), Some("87231"));
 
@@ -1105,12 +1100,11 @@ fn a_malformed_stat_line_yields_no_start_token() {
 
 #[test]
 fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
-    // Codex round 1 (P2). A default `cargo dev` on a machine with no
-    // PostgreSQL downloads one into a per-user cache that discovery does not
-    // search. Without this field the reaper had no `pg_ctl` for such a
-    // cluster — and on Windows no fallback either, since `process_start_token`
-    // is `None` there, so a force-killed run would have leaked its postmaster
-    // and data directory permanently.
+    // A default `cargo dev` on a machine with no PostgreSQL downloads one into
+    // a per-user cache that discovery does not search. Without this field, the
+    // reaper had no `pg_ctl` for such a cluster. Windows has no fallback either,
+    // since `process_start_token` is `None` there. So a force-killed run leaked
+    // its postmaster and data directory permanently.
     let record = record(4242, Some(4243));
     let decoded =
         SessionRecord::from_json(&record.to_json().expect("serialize")).expect("deserialize");
@@ -1119,11 +1113,10 @@ fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
 
 #[test]
 fn an_ipv6_host_produces_a_parseable_url() {
-    // Codex round 2 (P2). `format!("http://{host}:{port}")` turns the valid
-    // loopback host `::1` into `http://::1:3000`, which no URL parser accepts —
-    // so the readiness poll could never succeed and the runtime would report
-    // `ServerNotReady` after its full budget, with the real cause absent from
-    // the message.
+    // `format!("http://{host}:{port}")` turns the valid loopback host `::1`
+    // into `http://::1:3000`, which no URL parser accepts. The readiness poll
+    // could never succeed. The runtime then reported `ServerNotReady` after its
+    // full budget, without the real cause.
     assert_eq!(http_authority("::1", 3000), "[::1]:3000");
     assert_eq!(http_authority("fe80::1", 3000), "[fe80::1]:3000");
     // Already bracketed, and the non-IPv6 cases, are left alone.
@@ -1160,7 +1153,7 @@ fn a_record_written_before_bin_dir_existed_still_parses() {
 
 #[test]
 fn a_session_record_remembers_the_owner_that_created_it() {
-    // Codex round 2 (P2). Liveness alone lets a REUSED owner pid make an
+    // Liveness alone lets a REUSED owner pid make an
     // abandoned session look permanently active, so its cluster and data
     // directory would survive every later start. The start time tells the
     // recorded run apart from whoever inherited its pid.
@@ -1222,11 +1215,11 @@ fn the_effective_postmaster_pid_is_none_when_neither_source_has_one() {
 
 #[test]
 fn a_zombie_process_does_not_count_as_running() {
-    // The distinction that makes teardown assertable. `pg_ctl` daemonises the
-    // postmaster, so once it exits it is an orphan whose reaping belongs to
-    // init — which, in a container, can take arbitrarily long. Both
-    // `/proc/<pid>` and `kill -0` stay true for that whole window, so counting
-    // a zombie as running reports correct teardown as a leak.
+    // This distinction makes teardown assertable. `pg_ctl` daemonises the
+    // postmaster, so once it exits it is an orphan that init must reap. In a
+    // container, that can take arbitrarily long. `/proc/<pid>` and `kill -0`
+    // stay true for that whole window. So a zombie counted as running reports
+    // correct teardown as a leak.
     assert!(!proc_stat_is_live(
         "4243 (postgres) Z 1 4243 4243 0 -1 4194560"
     ));
@@ -1243,10 +1236,10 @@ fn a_zombie_process_does_not_count_as_running() {
 
 #[test]
 fn the_liveness_parser_survives_a_process_name_containing_spaces_and_parens() {
-    // `/proc/<pid>/stat`'s second field is the raw executable name: it can
-    // contain both spaces and parentheses, which is why the state is the first
-    // token after the LAST `)` rather than the third whitespace field. Postgres
-    // backends rename themselves to things like `postgres: walwriter `.
+    // The second field of `/proc/<pid>/stat` is the raw executable name. It can
+    // contain spaces and parentheses. So the state is the first token after the
+    // LAST `)`, not the third whitespace field. Postgres backends rename
+    // themselves to names like `postgres: walwriter `.
     assert!(proc_stat_is_live(
         "4243 (postgres: (walwriter) ) S 1 4243 4243 0 -1 4194560"
     ));
@@ -1306,19 +1299,18 @@ fn the_server_never_listens_beyond_loopback() {
 #[test]
 fn the_unix_socket_lives_inside_the_session_directory() {
     // Not cosmetic: Debian/Ubuntu's packaged Postgres defaults the socket to
-    // `/var/run/postgresql`, which an ordinary developer cannot write to — the
+    // `/var/run/postgresql`, which an ordinary developer cannot write to. The
     // postmaster then starts, fails `could not create lock file`, and shuts
-    // down. Confining it here also means it is reclaimed with the session.
+    // down. Here the socket is also reclaimed with the session.
     let session = Path::new("/tmp/harvest-dev-1-aa");
     let socket_dir = session.join("socket");
     let conf = postgres_conf_lines(5432, &socket_dir).join("\n");
-    // Built from the same path rather than spelled out: `Path::join` uses the
-    // platform separator, so a hard-coded POSIX string asserts the separator
-    // instead of the containment this test is about. Windows's separator is
-    // itself a backslash. So the expected value below goes through the same
-    // escaping the generated config does (issue #1299), not the raw path.
-    // Otherwise this fails on Windows, for the same reason the config now
-    // renders that separator doubled.
+    // Built from the same path, not spelled out: `Path::join` uses the
+    // platform separator. A hard-coded POSIX string would check the separator,
+    // not the containment. The Windows separator is a backslash. So the
+    // expected value goes through the same escaping as the generated config
+    // (issue #1299), not the raw path. Otherwise this fails on Windows, where
+    // the config renders that separator doubled.
     assert!(
         conf.contains(&format!(
             "unix_socket_directories = '{}'",
@@ -1369,10 +1361,10 @@ fn a_backslash_and_a_quote_together_are_both_escaped_independently() {
 #[test]
 fn the_default_session_layout_leaves_room_for_the_unix_socket() {
     // A Unix socket address is capped at 107 bytes, and the socket lives inside
-    // the session directory — so the directory NAMES are load-bearing. A 32-hex
-    // UUID in the session name pushed a perfectly ordinary `/tmp` layout over
-    // the limit, and Postgres reports that as `could not create any Unix-domain
-    // sockets`, which names neither the path nor the cap.
+    // the session directory. So the directory NAMES are load-bearing. A 32-hex
+    // UUID in the session name pushed an ordinary `/tmp` layout over the limit.
+    // Postgres reports that as `could not create any Unix-domain sockets`,
+    // which names neither the path nor the cap.
     let socket_dir = Path::new("/tmp/harvest-dev-4294967295/session-4294967295-0123abcd/socket");
     let len = unix_socket_path_len(socket_dir, u16::MAX);
     assert!(
@@ -1468,8 +1460,8 @@ fn banner_names_a_byo_database_rather_than_claiming_to_own_it() {
 
 #[test]
 fn redaction_covers_every_spelling_of_a_password() {
-    // The banner is the one thing developers paste into issues and chat, so a
-    // password may not survive in ANY accepted form — not just `user:pw@`.
+    // Developers paste the banner into issues and chat. So a password must not
+    // survive in ANY accepted form, not just `user:pw@`.
     for dsn in [
         "postgres://u:hunter2@localhost:5432/app",
         "postgres://u@localhost:5432/app?password=hunter2",
@@ -1504,12 +1496,11 @@ fn redaction_is_not_confused_by_an_at_sign_after_the_authority() {
 
 #[test]
 fn banner_does_not_promise_a_restart_demonstration_provisioned_storage_cannot_give() {
-    // Codex round 1 (P1). The banner used to say "kill this process mid-timer
-    // and start it again to watch the run resume from history". With
-    // provisioned storage that is impossible — `shutdown` deletes the cluster
-    // and the reaper reclaims a killed run's directory — so a new user
-    // following it would see an empty run and conclude the engine had lost
-    // their workflow.
+    // The banner used to say "kill this process mid-timer and start it again
+    // to watch the run resume from history". With provisioned storage that is
+    // impossible. `shutdown` deletes the cluster, and the reaper reclaims a
+    // killed run's directory. A new user would see an empty run and conclude
+    // the engine had lost their workflow.
     let banner = render_banner(&banner_inputs());
     let lowered = banner.to_lowercase();
     assert!(
@@ -1542,7 +1533,7 @@ fn banner_offers_the_restart_demonstration_only_for_a_database_we_did_not_create
 
 #[test]
 fn redaction_survives_a_quoted_password_containing_whitespace() {
-    // Codex round 1 (P2). `split_whitespace()` redacted `password='foo` and
+    // `split_whitespace()` redacted `password='foo` and
     // left `hunter2'` in a string whose whole purpose is to be safe to paste.
     for dsn in [
         "host=localhost password='foo hunter2' dbname=app",
@@ -1619,11 +1610,10 @@ impl EnvVarGuard {
     /// environment set it to.
     ///
     /// A `DevRuntime::start` test that expects a refusal OTHER than
-    /// `UnsupportedHarvestMode` must not depend on this process's ambient
-    /// environment. It must not assume that leaves Harvest mode at its
-    /// embedded default. An inherited `AUTUMN_HARVEST__MODE=split` would
-    /// otherwise make it see the new gate's refusal. That is not the refusal
-    /// it actually asserts (Codex review on issue #1291's pull request).
+    /// `UnsupportedHarvestMode` must not depend on the ambient environment.
+    /// It must not assume that leaves Harvest mode at its embedded default.
+    /// An inherited `AUTUMN_HARVEST__MODE=split` would make it see the new
+    /// gate's refusal, not the one it asserts (issue #1291).
     fn unset(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         // SAFETY: see `set`.
@@ -1646,11 +1636,10 @@ impl Drop for EnvVarGuard {
 
 /// Every env var `resolve_harvest_mode_source` reads, forced to a known-safe
 /// state. A `DevRuntime::start` test asserting a non-Harvest-mode refusal
-/// then sees the embedded default. This holds regardless of what the
-/// process inherited.
+/// then sees the embedded default, whatever the process inherited.
 ///
-/// `AUTUMN_MANIFEST_DIR` is pointed at a fresh directory holding its own
-/// empty `autumn.toml`, not merely unset (Codex review, issue #1291).
+/// `AUTUMN_MANIFEST_DIR` points at a fresh directory that holds its own
+/// empty `autumn.toml`. It is not merely unset (issue #1291).
 ///
 /// `find_config_file_named` falls back to the process's current directory.
 /// It does this whenever the manifest directory has no matching file.
@@ -1662,7 +1651,7 @@ impl Drop for EnvVarGuard {
 ///
 /// `AUTUMN_PROFILE` is forced unset too, so no `autumn-<profile>.toml`
 /// lookup happens from that source. `resolve_profile` also falls back to
-/// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
+/// `AUTUMN_IS_DEBUG` (issue #1291), so this unsets that too.
 /// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
 /// profile and reopen the same checkout-root fallback for its file.
 /// `AUTUMN_ENV` selects a profile first (issue #1614), so this unsets it too.
@@ -1696,11 +1685,9 @@ async fn starting_against_a_remote_database_is_refused() {
     let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
-        // Kernel-chosen. These tests are about DSN classification, but the port
-        // is settled FIRST (deliberately — see `DevRuntime::start`), so a fixed
-        // one makes them fight each other for 127.0.0.1:3000 when the harness
-        // runs them in parallel, and the loser fails with a bind error instead
-        // of the refusal it was asserting.
+        // Kernel-chosen. `DevRuntime::start` settles the port FIRST, on
+        // purpose. A fixed port makes parallel tests fight for 127.0.0.1:3000.
+        // The loser fails with a bind error, not the refusal it asserts.
         http_port: 0,
         ..DevRuntimeConfig::default()
     })
@@ -1834,7 +1821,7 @@ async fn starting_with_split_mode_from_autumn_toml_is_refused() {
     .expect("autumn.toml should be written");
     let _mode = EnvVarGuard::unset("AUTUMN_HARVEST__MODE");
     let _url = EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL");
-    // Unset, not just the manifest dir (Codex review, issue #1291).
+    // Unset, not just the manifest dir (issue #1291).
     //
     // An inherited profile selector would resolve an ambient
     // `autumn-<profile>.toml`. This temp dir holds no such file, so
@@ -1868,13 +1855,12 @@ async fn starting_with_split_mode_from_autumn_toml_is_refused() {
 
 #[test]
 fn the_harvest_mode_gate_is_re_checked_after_provisioning() {
-    // Codex review (P1) on issue #1291's pull request. `provision_storage`
-    // can run for a long time, downloading Postgres on a clean machine.
-    // `autumn.toml` is a file this dev runtime does not own. A single check
-    // before provisioning proves nothing about ambient config once
-    // provisioning finishes. `DevRuntime::start` must re-check right before
-    // starting the server. It already re-proves its HTTP port the same way,
-    // rather than trusting the reservation from before provisioning.
+    // Issue #1291. `provision_storage` can run for a long time, downloading
+    // Postgres on a clean machine. `autumn.toml` is a file this dev runtime
+    // does not own. A single check before provisioning proves nothing about
+    // ambient config once provisioning finishes. `DevRuntime::start` must
+    // re-check right before starting the server. It already re-proves its
+    // HTTP port the same way, rather than trusting the earlier reservation.
     //
     // Asserted on the source, the same way the root-refusal ordering above
     // is. The property is an ordering, not a single behavior. A test could
@@ -1914,16 +1900,15 @@ fn the_harvest_mode_gate_is_re_checked_after_provisioning() {
 
 #[test]
 fn no_test_here_reserves_the_fixed_default_http_port() {
-    // A test that starts the runtime with `DevRuntimeConfig::default()` inherits
-    // the default port 3000 and really does bind it, because `DevRuntime::start`
-    // settles the port before anything else. Several such tests run in parallel
-    // under the harness, so they fight over one global port and the loser fails
-    // with `Address already in use` instead of whatever it was asserting.
+    // A test that starts the runtime with `DevRuntimeConfig::default()`
+    // inherits port 3000 and binds it, because `DevRuntime::start` settles the
+    // port first. Parallel tests then fight over one global port. The loser
+    // fails with `Address already in use`, not with what it asserts.
     //
-    // It cost a red macOS CI leg, and it is invisible on a developer machine
-    // where 3000 happens to be free, so it is pinned here rather than trusted to
-    // review. Every inline `DevRuntime::start(DevRuntimeConfig { .. })` must name
-    // an `http_port`; pass 0 unless the test is specifically about a port.
+    // It cost a red macOS CI leg. It is invisible on a developer machine where
+    // 3000 is free, so this pins it instead of trusting review. Every inline
+    // `DevRuntime::start(DevRuntimeConfig { .. })` must name an `http_port`.
+    // Pass 0 unless the test is about a port.
     let source = std::fs::read_to_string(
         workspace_root().join("autumn-harvest-plugin/tests/dev_runtime_tests.rs"),
     )
@@ -1975,22 +1960,22 @@ fn config_defaults_to_provisioning_its_own_storage() {
 
 #[test]
 fn dev_runtime_adds_no_migration_and_no_event_variant() {
-    // AC6. The dev runtime provisions storage and then uses the engine exactly
-    // as an embedder does: it must not grow the schema, the event contract, or
-    // the set of `harvest_events` writers.
+    // AC6. The dev runtime provisions storage and then uses the engine as an
+    // embedder does. It must not grow the schema, the event contract, or the
+    // set of `harvest_events` writers.
     //
-    // Asserted as a property of the module's own sources rather than as a
-    // migration count, deliberately: a hard-coded count would collide with every
-    // unrelated migration landing in parallel, which is precisely what the
-    // changelog-fragment convention exists to avoid.
+    // This is a property of the module's own sources, not a migration count,
+    // on purpose. A hard-coded count would collide with every unrelated
+    // migration in parallel. The changelog-fragment convention exists to
+    // avoid that.
     let dev_dir = workspace_root().join("autumn-harvest-plugin/src/dev");
     let sources = read_sources(&dev_dir);
     assert!(!sources.is_empty(), "the dev module should have sources");
 
     for (path, body) in &sources {
-        // Comment lines are stripped first: this guard is about what the code
-        // *does*, and a doc comment explaining that the dev runtime never
-        // writes `harvest_events` must not fail the test that says so.
+        // Comment lines are stripped first. This guard is about what the code
+        // *does*. A doc comment saying that the dev runtime never writes
+        // `harvest_events` must not fail the test that says so.
         let body = &strip_comment_lines(body);
         for forbidden in [
             "embed_migrations!",
@@ -2055,15 +2040,15 @@ fn workspace_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 3
+// Quoted DSN values, session record writes and the root refusal
 // ---------------------------------------------------------------------------
 
 #[test]
 fn redaction_survives_a_quoted_password_containing_a_question_mark() {
-    // Codex round 3 (P2). `?` starts a query string in a URI and is an ordinary
-    // character in a keyword/value string. Splitting on it before knowing which
-    // syntax the DSN was in cut `password='abc?hunter2'` in half: the scanner
-    // redacted the head and the tail was appended back verbatim.
+    // `?` starts a query string in a URI and is an ordinary character in a
+    // keyword/value string. A split on it before the syntax was known cut
+    // `password='abc?hunter2'` in half. The scanner redacted the head and
+    // appended the tail back verbatim.
     for dsn in [
         "host=localhost password='abc?hunter2 ghi' dbname=harvest_dev",
         "host=localhost password=abc?hunter2 dbname=harvest_dev",
@@ -2094,16 +2079,14 @@ fn redaction_still_treats_a_real_uri_query_as_a_query() {
 
 #[test]
 fn a_session_record_is_replaced_rather_than_truncated_in_place() {
-    // Codex round 3 (P2). The record is rewritten once the postmaster is up. A
-    // truncating writer killed mid-rewrite leaves empty or partial JSON, and
-    // `reap_stale_sessions` deliberately skips a record it cannot parse — so
-    // the very mechanism meant to reclaim a killed run's postmaster would leak
-    // it permanently instead.
+    // The record is rewritten once the postmaster is up. A truncating writer
+    // killed mid-rewrite leaves empty or partial JSON. `reap_stale_sessions`
+    // skips a record it cannot parse, on purpose. So the mechanism meant to
+    // reclaim a killed run's postmaster would leak it permanently.
     //
     // A finished file cannot tell the two writers apart, so this asks the
-    // filesystem: a hard link pinned to the original inode still holds the old
-    // bytes after a rename, and would have been truncated along with the
-    // target by an in-place rewrite.
+    // filesystem. A hard link to the original inode still holds the old bytes
+    // after a rename. An in-place rewrite would truncate it with the target.
     let dir = tempfile::tempdir().expect("temp dir");
     let record = dir.path().join("session.json");
     write_private_atomic(&record, "{\"first\":true}").expect("first write");
@@ -2153,15 +2136,15 @@ fn a_session_record_is_written_owner_only() {
 
 #[test]
 fn root_is_refused_before_any_session_state_is_touched() {
-    // Codex round 3 (P1). As `root`, `provision_storage` used to create and
-    // harden the session root and run the reaper — which executes a recorded
-    // `bin_dir`'s `pg_ctl` — before Postgres's own "cannot run as root" refusal
-    // was reached. Any unprivileged local user can pre-create `harvest-dev-0`,
-    // so that ordering handed them a root-executed binary.
+    // As `root`, `provision_storage` used to create and harden the session
+    // root and run the reaper before the "cannot run as root" refusal of
+    // Postgres. The reaper executes the `pg_ctl` of a recorded `bin_dir`. Any
+    // unprivileged local user can pre-create `harvest-dev-0`. So that order
+    // handed them a root-executed binary.
     //
-    // Asserted on the sources with comments stripped, the same way AC6 is: the
-    // bug was an *ordering*, and the ordering is what has to stay true. A
-    // behavioural test could only ever observe it on a machine running as root.
+    // Asserted on the sources with comments stripped, like AC6. The bug was an
+    // *ordering*, and the ordering must stay true. A behavioural test could
+    // only observe it on a machine running as root.
     let mod_rs = workspace_root().join("autumn-harvest-plugin/src/dev/mod.rs");
     let body = strip_comment_lines(&std::fs::read_to_string(&mod_rs).expect("mod.rs"));
     let refusal = body
@@ -2193,9 +2176,9 @@ fn root_is_refused_before_any_session_state_is_touched() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn provisioning_as_root_creates_no_session_root() {
-    // The behavioural half of the same finding, which only says anything on a
-    // machine actually running as root — which plenty of container-based dev
-    // environments, and this repo's own CI image, are.
+    // The behavioural half of the same bug. It only says anything on a machine
+    // that runs as root. Many container-based dev environments do, and so does
+    // this repo's own CI image.
     if !autumn_harvest_plugin::dev::running_as_root() {
         return;
     }
@@ -2230,15 +2213,15 @@ async fn provisioning_as_root_creates_no_session_root() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 4
+// Percent-encoded keys, reused owner pids and the loopback-only host
 // ---------------------------------------------------------------------------
 
 #[test]
 fn redaction_decodes_a_percent_encoded_password_key() {
-    // Codex round 4 (P2). `tokio_postgres`'s URI parser percent-decodes query
-    // keys before matching them (`config.rs`, `parse_params`), so
-    // `?%70assword=` IS the password parameter to the code that dials — while
-    // a comparison against the raw key printed the whole credential.
+    // The URI parser of `tokio_postgres` percent-decodes query keys before it
+    // matches them (`config.rs`, `parse_params`). So `?%70assword=` IS the
+    // password parameter to the code that dials. A comparison against the raw
+    // key printed the whole credential.
     for dsn in [
         "postgres://u@localhost/app?%70assword=hunter2",
         "postgres://u@localhost/app?%50ASSWORD=hunter2",
@@ -2262,11 +2245,11 @@ fn redaction_leaves_other_query_parameters_byte_for_byte() {
 
 #[test]
 fn a_reused_owner_pid_does_not_strand_a_session_forever() {
-    // Codex round 4 (P2). `owner_alive` is an identity answer — the caller
-    // computes it from the recorded owner start token. Matching our own pid
-    // used to short-circuit ahead of it, so a run that received a dead
-    // predecessor's pid (ordinary under supervisors and pid namespaces) would
-    // skip that session, and so would every run after it.
+    // `owner_alive` is an identity answer, computed by the caller from the
+    // recorded owner start token. A match on the current pid used to
+    // short-circuit ahead of it. Supervisors and pid namespaces often hand a
+    // run a dead predecessor's pid. That run would skip the session, and so
+    // would every run after it.
     let record = SessionRecord {
         owner_pid: 4242,
         owner_start_token: Some("111".to_owned()),
@@ -2320,10 +2303,9 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_non_loopback_http_host_is_refused() {
-    // Codex round 4 (P2). `http_host` is public and documented as
-    // loopback-only, but a doc comment is not an enforcement — and the
-    // management router is mounted with `.api(...)`, not `api_with_auth`,
-    // precisely because it is supposed to be unreachable.
+    // `http_host` is public and documented as loopback-only, but a doc comment
+    // is not an enforcement. The management router is mounted with
+    // `.api(...)`, not `api_with_auth`, because it is meant to be unreachable.
     let _guard = DEV_RUNTIME_START_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2347,18 +2329,18 @@ async fn a_non_loopback_http_host_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 5
+// Effective uid parsing and reaping during the start window
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 #[test]
 fn the_uid_parser_reads_the_effective_id_not_the_real_one() {
-    // Codex round 5 (P2). The `Uid:` line is `real effective saved filesystem`,
-    // and `id -u` reports the *effective* id (`id -ru` is the real one). Reading
-    // the first column made the two sources disagree for exactly the process the
-    // root refusal must not fail open on: a setuid-root launcher, real uid 1000,
-    // effective uid 0 — which would have read as "not root" and then reaped a
-    // real user's session root, executing its recorded `pg_ctl` as root.
+    // The `Uid:` line is `real effective saved filesystem`, and `id -u`
+    // reports the *effective* id (`id -ru` is the real one). Reading the first
+    // column made the two sources disagree for a setuid-root launcher: real
+    // uid 1000, effective uid 0. The root refusal must not fail open on that
+    // process. It would read as "not root", reap a real user's session root,
+    // and execute its recorded `pg_ctl` as root.
     use autumn_harvest_plugin::dev::parse_proc_status_uid;
 
     let setuid_root = "Name:\tharvest-dev\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
@@ -2373,12 +2355,11 @@ fn the_uid_parser_reads_the_effective_id_not_the_real_one() {
 
 #[test]
 fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
-    // Codex round 5 (P2). During the start window the record carries no
-    // postmaster pid, so `postmaster.pid` is the only evidence a cluster is
-    // running. A truncated file — exactly what a crash mid-write leaves —
-    // parsed to `None`, which reads as "no server": `decide_reap` answered
-    // `Remove`, deleting the data directory out from under a postmaster that
-    // may well still be running, along with the only record that could stop it.
+    // During the start window the record has no postmaster pid. So
+    // `postmaster.pid` is the only evidence that a cluster runs. A crash
+    // mid-write leaves a truncated file, which parsed to `None` ("no server").
+    // `decide_reap` then answered `Remove`. It deleted the data directory under
+    // a postmaster that may still run, and the only record that could stop it.
     //
     // Absence of a pid is evidence only when it is *confirmed* absence.
     let base = tempfile::tempdir().expect("temp dir");
@@ -2588,9 +2569,9 @@ fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
 /// The getting-started chapter must lead with `cargo dev` and still keep the
 /// Docker route, and the command it prints must be the one the alias defines.
 ///
-/// A doc guard rather than prose, following the repo's existing
-/// `*_docs.rs` convention: AC7 is the one criterion whose whole content is a
-/// document, so an untested claim about it is no claim at all.
+/// A doc guard, not prose, by the repo's `*_docs.rs` convention. AC7 is the
+/// one criterion whose whole content is a document. So an untested claim about
+/// it is no claim at all.
 #[test]
 fn the_getting_started_chapter_leads_with_the_zero_setup_path() {
     let root = workspace_root();

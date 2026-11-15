@@ -12,9 +12,9 @@
 //! download a build (see [`super::acquire`]).
 //!
 //! The ordering and the "does this directory hold a usable toolset" decision are
-//! pure functions over an injected environment and an injected probe, so the
-//! whole policy — including the macOS and Windows layouts — is unit-testable on
-//! any host.
+//! pure functions over an injected environment and an injected probe. So the
+//! whole policy, the macOS and Windows layouts included, is unit-testable on any
+//! host.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -191,9 +191,9 @@ fn well_known_bin_dirs(platform: Platform) -> Vec<PathBuf> {
 
 /// The first candidate directory holding the whole toolset.
 ///
-/// `probe` answers "does this directory contain this executable"; it takes the
-/// platform-correct file name (`initdb.exe` on Windows), so a caller only has
-/// to test for existence.
+/// `probe` answers "does this directory contain this executable". It gets the
+/// platform-correct file name (`initdb.exe` on Windows), so a caller only tests
+/// for existence.
 #[must_use]
 pub fn resolve_bin_dir(
     candidates: &[PathBuf],

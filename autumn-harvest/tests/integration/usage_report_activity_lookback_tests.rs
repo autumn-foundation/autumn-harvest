@@ -164,16 +164,12 @@ async fn seed_event(
 /// query exactly once, against whatever index state the ambient database
 /// already has, rather than toggling [`CANDIDATE_INDEX_SQL`] itself.
 ///
-/// An earlier version of this test dropped and rebuilt the index in place, to
-/// compare before and after. But the documented `HARVEST_TEST_DATABASE_URL`
-/// path points at a real, potentially large, shared database, not a
-/// throwaway one. Doing a full non-concurrent `CREATE INDEX` there, on every
-/// run of a test billed as fast and always-on, has real costs. It would
-/// transiently drop a real schema index from under any concurrently-running
-/// test. It would also hold a table-wide lock for however long that shared
-/// corpus takes to index. That specific before/after equivalence proof
-/// belongs to the evidence-capture test below. That test already covers it,
-/// running in its own isolated throwaway database.
+/// The test does not drop and rebuild the index to compare plans.
+/// `HARVEST_TEST_DATABASE_URL` can point at a large, shared database, not a
+/// throwaway one. A rebuild there would drop a real schema index from under
+/// concurrent tests. Its non-concurrent `CREATE INDEX` would also hold a
+/// table-wide lock while the shared corpus indexes. The evidence-capture test
+/// below proves the before/after equivalence in its own throwaway database.
 #[tokio::test]
 async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
@@ -184,12 +180,10 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     let base = chrono::Utc::now() - chrono::Duration::hours(1);
 
     // Unique per invocation. `usage_sql()` groups by workflow_name over a
-    // window wide enough to span this whole test. So a fixed name would
-    // double-count against leftover rows from an earlier run of this same
-    // test, against a shared, uncleaned `HARVEST_TEST_DATABASE_URL` database.
-    // This was caught by a real, reproducible failure in this environment.
-    // Repeated runs within the same hour accumulated
-    // retry_row.activity_executions beyond the expected 2.
+    // window that spans this whole test. A fixed name would also count the
+    // leftover rows of an earlier run on a shared `HARVEST_TEST_DATABASE_URL`
+    // database. Repeated runs within one hour then pushed
+    // `retry_row.activity_executions` above the expected 2.
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let retry_wf_name = format!("usage_lookback_retry_wf_{run_id}");
     let external_wf_name = format!("usage_lookback_external_wf_{run_id}");
@@ -248,14 +242,11 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
     };
 
     // A high row_limit, not the caller-facing default. `usage_sql()` applies
-    // `ORDER BY 1 LIMIT $5`. This test's group names sort lexicographically
-    // wherever `u` falls. That depends on however many OTHER distinct
-    // workflow_name values a shared `HARVEST_TEST_DATABASE_URL` database has
-    // accumulated in the last hour. Other suites and runs contribute rows
-    // here too. A small limit could silently truncate this test's own groups
-    // out of the result, on a busy shared database. That would fail the
-    // `.expect(...)` lookups below, for a reason that has nothing to do with
-    // the query's correctness.
+    // `ORDER BY 1 LIMIT $5`. A shared `HARVEST_TEST_DATABASE_URL` database
+    // can hold many OTHER workflow names from the last hour, sorted before
+    // this test's names. A small limit could then cut this test's groups
+    // from the result. The `.expect(...)` lookups below would fail for a
+    // reason unrelated to the query's correctness.
     let rows = load_usage_grouped(&mut conn, SHARD_ID, &query, 1_000_000)
         .await
         .expect("query usage report");
@@ -450,25 +441,21 @@ async fn capture(
     out_dir: &std::path::Path,
     label: &str,
 ) -> Vec<UsageRow> {
-    // This reset failure must not be swallowed, and neither may the stats
-    // query below it.
-    // CREATE EXTENSION above stays best-effort. A genuinely absent
-    // extension fails here first: pg_stat_statements_reset() does not
-    // exist without it.
-    // A reset failure past that point means something else is wrong. For
-    // example, the connecting role lacks EXECUTE on
-    // pg_stat_statements_reset(). Both forms' normalized query text is
-    // identical. Silently proceeding would let the "before" counts leak
-    // into the "after" capture. Postgres would then aggregate the two,
-    // publishing a contaminated comparison that still reports success.
+    // Neither this reset nor the stats query below may fail silently.
+    // CREATE EXTENSION above stays best-effort. An absent extension fails
+    // here first, because pg_stat_statements_reset() does not exist without
+    // it. A later reset failure means something else is wrong, such as a
+    // role without EXECUTE on pg_stat_statements_reset(). Both forms share
+    // one normalized query text. A silent failure would let the "before"
+    // counts leak into the "after" capture. The comparison would then be
+    // contaminated and still report success.
     //
     // Scoped to THIS database's dbid (`pg_stat_statements_reset(0, dbid, 0)`),
     // not the bare zero-argument form. `setup_bench_db` provisions its own
     // throwaway database. But `pg_stat_statements` is a per-CLUSTER view. The
     // zero-argument reset wipes statistics for every database, user and query
-    // on the whole server. If `HARVEST_TEST_DATABASE_URL` names a Postgres
-    // shared with other tenants' monitoring, this would destroy their data on
-    // every capture.
+    // on the whole server. On a `HARVEST_TEST_DATABASE_URL` Postgres shared
+    // with other tenants' monitoring, each capture would destroy their data.
     diesel::sql_query(
         "SELECT pg_stat_statements_reset(0, \
          (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
@@ -491,15 +478,12 @@ async fn capture(
     // `pg_stat_statements` is a per-CLUSTER view. On a
     // `HARVEST_TEST_DATABASE_URL` server shared with other databases, an
     // unscoped SELECT here ranks THIS database's freshly-reset entries
-    // alongside every OTHER database's un-reset entries. That sharing is the
-    // same scenario the scoped reset above guards against. Those foreign
+    // alongside every OTHER database's un-reset entries. Those foreign
     // entries can match the same LIKE pattern and have larger buffer counts.
-    // This was discovered directly while verifying the reset fix. Querying
-    // this bench db's own dbid showed only 3 rows, but the unscoped query
-    // returned 5. The extra two came from other databases on this same
-    // Postgres instance, one of them this very verification's own `postgres`
-    // database. Scoped to `current_database()`'s dbid so the "top 5" ranking
-    // can only ever reflect this run's own statements.
+    // A check of the reset fix saw 3 rows for this dbid and 5 unscoped. The
+    // extra two came from other databases on the same server. The scope to
+    // `current_database()`'s dbid keeps the "top 5" ranking to this run's own
+    // statements.
     let stats: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
          (shared_blks_hit + shared_blks_read) AS total_buffers, temp_blks_written \

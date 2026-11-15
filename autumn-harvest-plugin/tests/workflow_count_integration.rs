@@ -1,10 +1,10 @@
 //! Integration tests for `GET /workflows/count` (issue #544).
 //!
-//! Seeds workflow executions across states and workflow types and asserts the
-//! endpoint groups by `state`/`workflow_name` with a real per-shard SQL
-//! `GROUP BY`, applies filters before grouping, caps cardinality with an
-//! `other` rollup, merges across shards, and degrades gracefully (never a
-//! 500) when a shard is unreachable.
+//! The suite seeds executions across states and workflow types. The endpoint
+//! groups by `state`/`workflow_name` with a real per-shard SQL `GROUP BY`. It
+//! applies filters before grouping and caps cardinality with an `other` rollup.
+//! It merges across shards and degrades gracefully (never a 500) when a shard is
+//! unreachable.
 
 use std::collections::BTreeMap;
 

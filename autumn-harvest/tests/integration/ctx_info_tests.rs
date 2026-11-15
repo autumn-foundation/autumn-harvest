@@ -1,8 +1,8 @@
 //! DB/worker integration test for `ctx.info()` run metadata (issue #698).
 //!
-//! Exercises the real worker → executor → `WorkflowContext` threading of the
-//! spawning parent's execution id: a top-level run reports no parent, and a
-//! child spawned by it reports the parent's execution id via
+//! Exercises how the real worker, executor and `WorkflowContext` thread the
+//! parent's execution id. A top-level run reports no parent. A child it
+//! spawns reports the parent's execution id via
 //! `ctx.info().parent_execution_id`. The child captures its `info()` into its
 //! own output so the test can assert on it after the run.
 //!

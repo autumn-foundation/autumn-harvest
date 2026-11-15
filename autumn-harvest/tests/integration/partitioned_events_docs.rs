@@ -1,13 +1,12 @@
 //! Guards that keep `docs/partitioned-events.md` honest (issue #958).
 //!
-//! No DB, no feature gate. Each assertion pins a claim that is either
-//! **load-bearing for an operator following the runbook under pressure** or
-//! **dangerous to quietly lose in a later editing pass**.
+//! No DB, no feature gate. Each assertion pins a claim that is
+//! **load-bearing for an operator under pressure** or **dangerous to lose in a
+//! later edit**.
 //!
-//! The ones that matter most are the honest limits: that the whole retention
-//! pass is *not* made fast by this change, that reads do not prune, and that
-//! the foreign key is gone. Every one of those reads like a nit in review and
-//! costs an operator a bad decision if it disappears.
+//! The honest limits matter most. This change does *not* make the whole
+//! retention pass fast. Reads do not prune. The foreign key is gone. Each one
+//! reads like a nit in review, and its loss costs an operator a bad decision.
 
 use std::path::{Path, PathBuf};
 
@@ -187,9 +186,9 @@ fn the_doc_tells_an_operator_how_to_answer_why_space_has_not_come_back() {
         s.contains("harvest partition status"),
         "there must be one command to run"
     );
-    // Sourced from the code, not copied: a hand-written list here would go
-    // stale the moment a reason is reworded or a fourth is added, and the guard
-    // would stay green while the doc stopped matching what an operator sees.
+    // Sourced from the code, not copied. A hand-written list goes stale when a
+    // reason is reworded or added. The guard would then stay green while the
+    // doc no longer matches what an operator sees.
     for reason in autumn_harvest::partition::SWEEP_REASONS {
         assert!(
             s.contains(reason),

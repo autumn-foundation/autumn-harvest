@@ -19,8 +19,8 @@
 //!   unknown execution id is rejected (AC6).
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded; each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle.
+//! against it directly. Each test scrubs first, so run single-threaded.
+//! Otherwise a fresh testcontainers Postgres boots with the full migration bundle.
 
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
@@ -288,9 +288,9 @@ async fn empty_patch_is_a_true_no_op() {
     assert_eq!(row.triage_note.as_deref(), Some("note"));
 }
 
-// AC4: applying the same non-empty patch twice is idempotent -- the second
-// application reports no changed fields (final value equals current value)
-// and leaves the row byte-identical.
+// AC4: the same non-empty patch applied twice is idempotent. The second
+// application reports no changed fields, because each final value equals the
+// current value. It leaves the row byte-identical.
 #[tokio::test]
 async fn identical_patch_applied_twice_is_idempotent() {
     let (url, _container) = setup_db().await;

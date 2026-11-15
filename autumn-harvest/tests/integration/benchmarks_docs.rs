@@ -2,9 +2,8 @@
 //!
 //! `docs/benchmarks.md` exists to be *believed*: an evaluating architect sizes a
 //! deployment against it and then reproduces it from a fresh clone. That only
-//! works while the doc, the harness and the committed topology agree, so this
-//! suite pins them together — the `alert_pack_docs` / `chaos_docs` pattern
-//! applied to a performance page.
+//! works while the doc, the harness and the committed topology agree. This
+//! suite pins them together, as `alert_pack_docs` and `chaos_docs` do.
 //!
 //! It also pins the two scope boundaries issue #941 draws, because both are
 //! promises to the reader rather than incidental facts:
@@ -419,10 +418,9 @@ fn the_docs_drift_guard_itself_runs_in_ci() {
 fn every_published_baseline_appears_on_its_own_row_in_the_versioned_results_file() {
     let results = read(&results_doc_path());
     for baseline in PUBLISHED_BASELINES {
-        // The harness renders the results table itself, so match the whole row
-        // rather than the number alone: a bare-number check passes when the
-        // right value sits on the wrong scenario or the wrong shard count, which
-        // is exactly the drift worth catching.
+        // The harness renders the results table, so match the whole row. A
+        // bare-number check passes when the right value sits on the wrong
+        // scenario or shard count, which is exactly the drift worth catching.
         let row = format!(
             "| `{}` | {} | `{}` | {:.2} |",
             baseline.scenario.as_str(),

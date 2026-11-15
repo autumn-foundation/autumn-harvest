@@ -54,13 +54,10 @@ use crate::util::repo_path;
 const SEMCONV_COMMIT: &str = "331541c4057c53d133c32efadaa7b656636eda77";
 /// The latest upstream release on the day of [`SEMCONV_COMMIT`].
 const BASELINE_TAG: &str = "v1.44.0";
-/// The upstream repository of the conventions.
 const SEMCONV_REPO: &str = "https://github.com/open-telemetry/semantic-conventions.git";
 /// Community `main` on 2026-10-18. Move it with the pins above.
 const COMMUNITY_COMMIT: &str = "9c30b48354004ef818bcf3661ece2b32ca4dd787";
-/// The upstream community repository.
 const COMMUNITY_REPO: &str = "https://github.com/open-telemetry/community.git";
-/// The default image registry.
 const DEFAULT_REGISTRY: &str = "mirror.gcr.io";
 
 /// The model, as a path from the repository root.

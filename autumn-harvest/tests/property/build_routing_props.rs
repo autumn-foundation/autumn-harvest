@@ -36,10 +36,9 @@ proptest! {
 
     /// `validate_ramp_percent` is `Ok` iff the percent is in `0..=100`.
     ///
-    /// The strategy explicitly seeds the inclusive-bound cases (-1, 0, 100, 101)
-    /// alongside `any::<i32>()`, since proptest rarely samples those exact
-    /// boundaries on its own — this reliably catches an off-by-one on the
-    /// inclusive bound (`0..100` vs `0..=100`).
+    /// The strategy seeds the bound cases (-1, 0, 100, 101) beside `any::<i32>()`.
+    /// Proptest rarely samples those exact boundaries on its own. The seeds catch
+    /// an off-by-one on the inclusive bound (`0..100` vs `0..=100`).
     #[test]
     fn validate_ramp_percent_accepts_exactly_0_to_100(
         percent in prop_oneof![Just(-1i32), Just(0i32), Just(100i32), Just(101i32), any::<i32>()]

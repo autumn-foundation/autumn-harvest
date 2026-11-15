@@ -74,20 +74,19 @@ fn metrics_rs_recorder_wires_into_telemetry_config() {
 // Bridge-coverage tests (issue #754 adapter bug fix).
 //
 // The adapter's module doc promises "All `METRIC_*` names from `telemetry.rs`
-// are forwarded verbatim", but `record_workflow_timeout`,
-// `record_payload_observed`, and `record_payload_rejected` previously fell
-// through to the trait's no-op defaults, making the catalogued
-// `harvest.workflow.timeout`, `harvest.payload.bytes`, and
-// `harvest.payload.rejected` series unreachable from a Prometheus scrape.
-// These tests install a capturing local recorder so a missing bridge fails
-// (nothing registered), not just "does not panic".
+// are forwarded verbatim". `record_workflow_timeout`,
+// `record_payload_observed`, and `record_payload_rejected` once fell through
+// to the trait's no-op defaults. A Prometheus scrape then never saw
+// `harvest.workflow.timeout`, `harvest.payload.bytes`, or
+// `harvest.payload.rejected`. These tests install a capturing local recorder.
+// So a missing bridge fails (nothing registered), not just "does not panic".
 // ---------------------------------------------------------------------------
 
 /// Which `metrics::Recorder` registration method the adapter routed a key
 /// through. The dashboard pack's series allowlist (`_total` counters,
-/// `_bucket`/`_sum`/`_count` histograms, bare gauges) rests on the adapter
-/// registering each metric as the documented instrument, so the tests assert
-/// the kind, not just the key name and labels.
+/// `_bucket`/`_sum`/`_count` histograms, bare gauges) needs each metric as the
+/// documented instrument. So the tests assert the kind, not just the key name
+/// and labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstrumentKind {
     Counter,

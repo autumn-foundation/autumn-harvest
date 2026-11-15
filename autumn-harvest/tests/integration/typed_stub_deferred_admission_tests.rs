@@ -84,8 +84,6 @@ fn build_pool(database_url: &str) -> DbPool {
         .expect("test pool should build")
 }
 
-// ── Test Workflow Declaration ───────────────────────────────────────────────
-//
 // An unkeyed (global) throttle always applies (issue #607's `key_expr:
 // None` branch). These tests need no JSON input shape to trigger the
 // rejection. Debounce/batch rejection is already covered indirectly,

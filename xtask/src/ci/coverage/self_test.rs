@@ -87,12 +87,10 @@ macro_rules! check_that {
     };
 }
 
-/// A line map from pairs.
 fn lines(pairs: &[(i64, i128)]) -> BTreeMap<i64, i128> {
     pairs.iter().copied().collect()
 }
 
-/// A branch map from tuples.
 fn branches(items: &[(i64, &str, &str, i128)]) -> BTreeMap<BranchKey, i128> {
     items
         .iter()
@@ -100,7 +98,6 @@ fn branches(items: &[(i64, &str, &str, i128)]) -> BTreeMap<BranchKey, i128> {
         .collect()
 }
 
-/// Parses a JSON literal of the test.
 fn json(text: &str) -> Result<Value> {
     pyjson::loads(text)
 }
@@ -113,12 +110,10 @@ fn base(path: &str, floors: &str, tolerance: f64) -> Result<Value> {
     ))
 }
 
-/// The module floors of `baseline` at `path`.
 fn floors_of<'a>(baseline: &'a Value, path: &str) -> Result<&'a Value> {
     baseline.index("modules")?.index(path)
 }
 
-/// A row of the summary with its branch percent replaced.
 const fn with_branches_pct(row: FileRow, pct: f64) -> FileRow {
     FileRow {
         branches_pct: Some(pct),

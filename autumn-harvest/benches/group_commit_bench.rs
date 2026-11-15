@@ -439,7 +439,6 @@ impl Bench {
                 let mut per_second = [0.0; 2];
                 for mode in order {
                     let lanes = if mode == Mode::Solo { &solo } else { &group };
-                    // `run` returns the wall time of all `decisions`.
                     let wall = self.run(mode, lanes, &samples, writers, decisions).await;
                     let at = usize::from(mode == Mode::Group);
                     per_second[at] = decisions as f64 / wall.as_secs_f64();

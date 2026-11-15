@@ -527,7 +527,6 @@ impl AnonymisedPool {
     }
 }
 
-/// Append the section of `entry` to `out`.
 fn render_entry(out: &mut String, entry: &AnonymisedEvaluation) -> fmt::Result {
     let first = entry
         .first_divergence
@@ -581,7 +580,6 @@ const fn yes_no(flag: bool) -> &'static str {
     if flag { "yes" } else { "no" }
 }
 
-/// One verdict in words.
 fn verdict_text(verdict: Verdict) -> String {
     let divergence = match verdict {
         Verdict::Same => return "same".to_owned(),
@@ -910,13 +908,11 @@ mod tests {
         out
     }
 
-    /// The pool slot of each digest, by digest.
     fn slots_by_digest(seed: u64, digests: &[String]) -> BTreeMap<String, (usize, AnonId)> {
         let slots = pool_slots(seed, "exec-1", digests).unwrap();
         digests.iter().cloned().zip(slots).collect()
     }
 
-    /// The number of distinct ids in `slots`.
     fn distinct_ids(slots: &BTreeMap<String, (usize, AnonId)>) -> usize {
         slots
             .values()

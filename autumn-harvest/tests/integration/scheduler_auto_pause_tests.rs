@@ -1,9 +1,9 @@
 #![cfg(feature = "db")]
 //! Auto-pause schedule tests — issue #360.
 //!
-//! Verifies that a schedule with `consecutive_failure_limit` set is
-//! automatically paused after the configured number of consecutive
-//! execution failures, and can be resumed by clearing the auto-pause state.
+//! Verifies that a schedule with `consecutive_failure_limit` set pauses after
+//! that many consecutive execution failures. Clearing the auto-pause state
+//! resumes it.
 //!
 //! The tests use a real Postgres container (testcontainers) to exercise the
 //! scheduler tick path end-to-end.

@@ -1,69 +1,60 @@
-//! Deterministic (non-criterion) harness for profiling `ReplayVerifier`'s
-//! batch fixture-verification cost -- issue #251's realistic budget
-//! ("verifying 1,000 fixtures averaging 1k events each completes in under
-//! 30 seconds on a 4-core laptop, in-memory user code, no DB").
+//! Deterministic harness for profiling the batch fixture-verification cost of
+//! `ReplayVerifier`.
 //!
-//! Unlike `replay_profile.rs` (which constructs `Vec<WorkflowEvent>` directly
-//! in memory and calls `WorkflowReplayer::replay_from_events`),
-//! `ReplayVerifier::verify_dir` exercises a *different* boundary that no
-//! existing profiling harness in this repo touches: real filesystem I/O
-//! (`std::fs::read_to_string` over a directory walk) and JSON *deserialize*
-//! of `HistorySnapshot`/`WorkflowEvent` from a string -- the same
-//! `serde_json::from_str` boundary a production worker crosses every time it
-//! loads a recorded history from `harvest_events`. `replay_profile.rs`
-//! constructs events as Rust struct literals and never exercises this path
-//! at all.
+//! The workload is the issue #251 budget. 1,000 fixtures that average 1k events
+//! each must verify in under 30 seconds on a 4-core laptop, with in-memory user
+//! code and no DB.
 //!
-//! Mirrors `replay_verifier_bench.rs`'s exact fixture shape (`Value::Null`
-//! payloads, `activity_count` activities per fixture) so this harness
-//! measures the *same* documented issue #251 workload, not a bespoke shape
-//! invented to flatter a particular change. The one difference is the
-//! *fixture count*, which is reduced by default (see
-//! `VERIFY_PROFILE_FIXTURES` below) purely to keep a single valgrind run
-//! tractable -- callgrind emulation is roughly one to two orders of
-//! magnitude slower than native execution, and issue #251's full 1,000
-//! fixtures is calibrated against a 30-second *native* wall-clock budget.
-//! Fixture count and total instructions scale linearly (see
-//! `docs/performance-verify.md`), so a reduced run is representative; set
-//! `VERIFY_PROFILE_FIXTURES=1000` to reproduce the exact documented shape
-//! given enough wall-clock headroom.
+//! `replay_profile.rs` builds `Vec<WorkflowEvent>` in memory and calls
+//! `WorkflowReplayer::replay_from_events`. `ReplayVerifier::verify_dir` crosses a
+//! boundary that no other profiling harness here touches. It does real
+//! filesystem I/O (`std::fs::read_to_string` over a directory walk). It
+//! deserializes `HistorySnapshot`/`WorkflowEvent` from a string with
+//! `serde_json::from_str`. A production worker crosses the same boundary each
+//! time it loads a recorded history from `harvest_events`.
 //!
-//! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
-//! binary is not measured with `cargo bench` / criterion timing. It is driven
-//! directly under `valgrind --tool=callgrind` (instruction counts) and
-//! `valgrind --tool=dhat` (allocation counts/bytes), which are deterministic
-//! across runs. See `docs/performance-verify.md` for the numbers this
-//! produces and how to reproduce them.
+//! The fixture shape mirrors `replay_verifier_bench.rs`: `Value::Null` payloads
+//! and `activity_count` activities per fixture. So this harness measures the
+//! documented issue #251 workload, not a shape that flatters a change. Only the
+//! default *fixture count* is smaller (see `VERIFY_PROFILE_FIXTURES` below), to
+//! keep one valgrind run tractable. Callgrind emulation is one to two orders of
+//! magnitude slower than native. The 1,000 fixtures of issue #251 target a
+//! 30-second *native* budget. Fixture count and total instructions scale
+//! linearly (see `docs/performance-verify.md`), so a reduced run is
+//! representative. Set `VERIFY_PROFILE_FIXTURES=1000` for the exact documented
+//! shape, given enough wall-clock headroom.
 //!
-//! `harness = false`, own `main()` -- same shape as `replay_profile.rs` -- so
-//! the compiled artifact is a plain executable a profiler can be pointed at
-//! directly, with no criterion wall-clock loop diluting the measured work.
+//! Wall-clock timing is unreliable on this shared-vCPU machine, so this binary
+//! does not use `cargo bench` / criterion timing. It runs under
+//! `valgrind --tool=callgrind` (instruction counts) and `valgrind --tool=dhat`
+//! (allocation counts/bytes), which are deterministic across runs. See
+//! `docs/performance-verify.md` for the numbers and how to reproduce them.
+//!
+//! `harness = false`, own `main()`, the same shape as `replay_profile.rs`. A
+//! profiler can point at the plain executable, with no criterion wall-clock
+//! loop to dilute the measured work.
 //!
 //! # Two-phase mode (`prepare` / `run`) -- the profiling-correct entry point
 //!
-//! `verify_dir`'s runtime spawns one `tokio::task` per fixture (see
-//! `ReplayVerifier::verify_dir`'s implementation) and drives them on a
-//! multi-threaded runtime. Under callgrind, cost incurred while a *worker
-//! thread* executes a spawned task's poll is **not** attributed as a
-//! call-graph descendant of the `block_on` frame on the *spawning* thread --
-//! callgrind's flat/self-cost view (`callgrind_annotate`) still sums it
-//! correctly across all threads, but the `block_on` call site's own
-//! "inclusive cost" in the call-graph view undercounts. Do not use
-//! `block_on`'s call-graph inclusive cost as a proxy for `verify_dir`'s share
-//! of the profile; use `callgrind_annotate`'s flat totals as this crate's
+//! The `verify_dir` runtime spawns one `tokio::task` per fixture and drives them
+//! on a multi-threaded runtime. Under callgrind, a worker thread's poll of a
+//! spawned task is **not** a call-graph descendant of the `block_on` frame on
+//! the *spawning* thread. The flat/self-cost view
+//! (`callgrind_annotate`) still sums it across all threads. But the inclusive
+//! cost of the `block_on` call site undercounts, so it is no proxy for the
+//! share of `verify_dir`. Use the flat totals of `callgrind_annotate`, as
 //! `docs/performance-verify.md` does.
 //!
 //! Fixture generation (`build_fixture_json` + `serde_json::to_string` + N
-//! `std::fs::write` calls) is real, non-trivial cost that has nothing to do
-//! with `ReplayVerifier` and must not be included in a `verify_dir`
-//! measurement. `VERIFY_PROFILE_MODE=prepare` runs *only* that fixture-writing
-//! step (no tokio runtime, no `ReplayVerifier`) against a directory named by
-//! `VERIFY_PROFILE_DIR`, so it can be run **unprofiled** as a setup step.
-//! `VERIFY_PROFILE_MODE=run` then does the reverse -- no fixture generation at
-//! all, just: build a tokio runtime (~60K instructions; negligible against
-//! `verify_dir`'s cost -- see `docs/performance-verify.md`'s reconciliation
-//! section) and call `verify_dir` on the pre-populated `VERIFY_PROFILE_DIR`.
-//! Point a profiler at the `run`-mode invocation only:
+//! `std::fs::write` calls) is real cost unrelated to `ReplayVerifier`. A
+//! `verify_dir` measurement must exclude it. `VERIFY_PROFILE_MODE=prepare` runs
+//! *only* that step, with no tokio runtime and no `ReplayVerifier`. It writes to
+//! the directory that `VERIFY_PROFILE_DIR` names, so it can run **unprofiled**.
+//! `VERIFY_PROFILE_MODE=run` does the reverse, with no fixture generation. It
+//! builds a tokio runtime and calls `verify_dir` on the pre-populated
+//! `VERIFY_PROFILE_DIR`. The runtime build (~60K instructions) is negligible
+//! (see the reconciliation section of `docs/performance-verify.md`). Point a
+//! profiler at the `run`-mode invocation only:
 //!
 //! ```text
 //! export VERIFY_PROFILE_DIR=/tmp/verify-fixtures
@@ -81,16 +72,16 @@
 //! ```
 //!
 //! `VERIFY_PROFILE_MODE` (default `full`, when unset) selects the mode:
-//! `prepare` (write fixtures only, no runtime), `run` (verify a pre-populated
-//! directory only, no fixture generation -- both `prepare` and `run` require
-//! `VERIFY_PROFILE_DIR` to be set to the same path), or the default `full`
-//! (build + write fixtures to a fresh tempdir + verify, all in one process --
-//! a convenience mode for a quick smoke run; NOT the mode to point a profiler
-//! at when isolating `verify_dir`'s own cost, since it also measures fixture
-//! generation). Any other value panics rather than silently falling back to
-//! `full` -- a typo in `VERIFY_PROFILE_MODE` (e.g. `ru` instead of `run`)
-//! must not produce a plausible-looking but methodologically invalid
-//! measurement.
+//!
+//! - `prepare`: write fixtures only, with no runtime.
+//! - `run`: verify a pre-populated directory only, with no fixture generation.
+//!   `prepare` and `run` both need `VERIFY_PROFILE_DIR` set to the same path.
+//! - `full`: build, write fixtures to a fresh tempdir and verify, in one
+//!   process. It is a convenience mode for a quick smoke run. It also measures
+//!   fixture generation, so do NOT profile it to isolate `verify_dir`.
+//!
+//! Any other value panics and never falls back to `full`. A typo such as `ru`
+//! for `run` must not produce a plausible but invalid measurement.
 //!
 //! # Running (`full` convenience mode)
 //!
@@ -110,11 +101,10 @@
 //! ```
 //!
 //! `VERIFY_PROFILE_FIXTURES` (default `20`) sets the number of fixture files
-//! written to a directory and verified. `VERIFY_PROFILE_ACTIVITIES` (default
-//! `500`, matching `replay_verifier_bench.rs`'s `bench_1000_fixtures` -- `500`
-//! activities = `1_001` events per fixture, issue #251's exact per-fixture
-//! shape) sets activities per fixture. Both env vars must match between a
-//! `prepare` invocation and its paired `run` invocation.
+//! written and verified. `VERIFY_PROFILE_ACTIVITIES` (default `500`) sets the
+//! activities per fixture. `500` matches `bench_1000_fixtures` in
+//! `replay_verifier_bench.rs`: `1_001` events per fixture, the exact issue #251
+//! shape. Both env vars must match between a `prepare` run and its paired `run`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -185,18 +175,19 @@ fn build_fixture_json(activity_count: usize) -> String {
     serde_json::to_string(&snapshot).unwrap()
 }
 
-/// Read `key` as a `usize`. An *absent* variable uses `default`; a
-/// *present but unparseable* value panics rather than silently falling back
-/// to `default` -- a typo like `VERIFY_PROFILE_FIXTURES=2O` (letter O) or
+/// Read `key` as a `usize`. An *absent* variable uses `default`. A
+/// *present but unparseable* value panics and does not fall back to
+/// `default`. A typo like `VERIFY_PROFILE_FIXTURES=2O` (letter O) or
 /// `VERIFY_PROFILE_ACTIVITIES=1000x` must not silently select a different
-/// workload and produce a plausible-looking but methodologically invalid
-/// measurement (the same principle `VERIFY_PROFILE_MODE`'s dispatch below
-/// applies to a malformed mode string). Runs at the very top of `main()`,
-/// before the `prepare`/`run` mode split, so it executes in the profiled
-/// `run`-mode process too -- but the success-path work (one env lookup, one
-/// `parse()` call) is byte-for-byte what the previous
-/// `.ok().and_then(...).unwrap_or(default)` chain already did; only the
-/// error-handling branches differ, and those don't execute for a
+/// workload. That gives a plausible-looking but methodologically invalid
+/// measurement. `VERIFY_PROFILE_MODE`'s dispatch below applies the same
+/// principle to a malformed mode string.
+///
+/// This runs at the very top of `main()`, before the `prepare`/`run` mode
+/// split. So it executes in the profiled `run`-mode process too. The
+/// success-path work (one env lookup, one `parse()` call) is byte-for-byte
+/// what the previous `.ok().and_then(...).unwrap_or(default)` chain did.
+/// Only the error-handling branches differ. Those do not execute for a
 /// correctly-configured measurement run, so this needed no re-measurement.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
@@ -210,37 +201,32 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-/// Filename for the tiny sidecar `prepare_fixtures` writes alongside the
-/// fixture files, recording the exact `fixtures`/`activities` values used to
-/// generate them (`key=value` lines -- deliberately not JSON: `verify_dir`'s
-/// directory walk globs every `*.json` file in the directory as a fixture to
-/// replay, and a stray non-fixture `.json` file there would fail as a
-/// spurious harness error). `run` mode reads it via `read_prepared_meta` to
-/// derive the ground-truth workload shape *cheaply*, in preference to
-/// `activities_per_fixture_from_disk`'s full-fixture parse below -- see that
-/// function's doc comment for why a *some* ground-truth check is needed at
-/// all, and its measured cost (~3.9M instructions / ~3% of the isolated
-/// `verify_dir` total measured elsewhere in this file's history -- see
-/// `docs/performance-verify.md` -- non-negligible, and exactly the kind of
-/// unrelated cost the two-phase split exists to keep out of the profiled
-/// `run`-mode region). The sidecar read costs a few thousand instructions
-/// for a few dozen bytes, not millions for an entire ~1001-event fixture.
+/// Filename of the small sidecar that `prepare_fixtures` writes beside the
+/// fixtures.
+///
+/// It records the `fixtures`/`activities` values used, as `key=value` lines.
+/// It is deliberately not JSON. `verify_dir` replays each `*.json` file in the
+/// directory, so a stray non-fixture `.json` file fails as a spurious harness
+/// error. `run` mode reads it with `read_prepared_meta` to get the ground-truth
+/// workload shape *cheaply*. The alternative is the full-fixture parse of
+/// `activities_per_fixture_from_disk`, whose doc says why a ground-truth check
+/// is needed at all. That parse costs ~3.9M instructions, ~3% of the isolated
+/// `verify_dir` total (see `docs/performance-verify.md`). The two-phase split
+/// exists to keep such unrelated cost out of the profiled `run` region. The
+/// sidecar read costs a few thousand instructions, not millions.
 const PROFILE_META_FILENAME: &str = "verify_profile_meta.txt";
 
-/// Read the `fixtures`/`activities` values `prepare_fixtures` persisted to
-/// `PROFILE_META_FILENAME`. `None` only when the sidecar is genuinely
-/// *missing* (a directory populated without going through
-/// `VERIFY_PROFILE_MODE=prepare` at all), in which case the caller falls
-/// back to `activities_per_fixture_from_disk`. A sidecar that *exists* but
-/// is malformed or truncated (a bad number, or a missing `fixtures=`/
-/// `activities=` line -- e.g. from a `prepare` invocation that crashed or
-/// was killed mid-write) panics rather than being silently treated the same
-/// as "missing": collapsing both cases to the same `None` would route a
-/// *damaged* sidecar into the same expensive full-fixture-parse fallback
-/// this sidecar mechanism exists to avoid inside the profiled `run`-mode
-/// region (`activities_per_fixture_from_disk`'s doc comment measures that
-/// fallback at ~3.9M instructions / ~3% of the isolated total) -- silently,
-/// with no diagnostic that the sidecar was ever damaged in the first place.
+/// Read the `fixtures`/`activities` values that `prepare_fixtures` persisted to
+/// `PROFILE_META_FILENAME`.
+///
+/// Returns `None` only when the sidecar is *missing*, because the directory was
+/// not populated by `VERIFY_PROFILE_MODE=prepare`. The caller then falls back
+/// to `activities_per_fixture_from_disk`. A sidecar that exists but is
+/// malformed or truncated panics. Examples are a bad number, or a missing
+/// `fixtures=`/`activities=` line from a `prepare` that crashed mid-write. A
+/// `None` there would silently route a *damaged* sidecar into the expensive
+/// full-fixture-parse fallback (~3.9M instructions, ~3% of the isolated total).
+/// That cost lands in the profiled `run` region, with no diagnostic.
 fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
     let path = dir.join(PROFILE_META_FILENAME);
     let text = match std::fs::read_to_string(&path) {
@@ -268,22 +254,24 @@ fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
 }
 
 /// Delete any pre-existing `PROFILE_META_FILENAME` sidecar from `dir` before
-/// `prepare_fixtures` starts rewriting fixture files -- run first, ahead of
-/// `remove_stale_fixtures` and the fixture-write loop below, so the sidecar
-/// is gone for the *entire* window during which the fixtures on disk are
-/// changing. Without this, a `prepare` invocation interrupted (crash, kill,
-/// OOM) anywhere between finishing the fixture-write loop and finishing its
-/// own fresh sidecar write leaves the *previous* invocation's sidecar
-/// behind: well-formed, but describing a workload shape (e.g. a different
-/// `activities` value) that no longer matches the now-rewritten fixtures.
-/// `read_prepared_meta`'s malformed-sidecar panic cannot catch this -- a
-/// leftover-from-a-previous-run sidecar is not malformed, just stale --  so
-/// `run_verify` would trust it and silently report the wrong shape. Deleting
-/// it first turns that whole interruption window into the already-supported
-/// "sidecar genuinely absent" case (`read_prepared_meta` returns `None`,
-/// `run_verify` falls back to `activities_per_fixture_from_disk`, which now
-/// derives the true shape from what's actually on disk), instead of a
-/// stale-but-well-formed sidecar silently lying about it.
+/// `prepare_fixtures` starts rewriting fixture files. This runs first, ahead
+/// of `remove_stale_fixtures` and the fixture-write loop below. So the sidecar
+/// is gone for the *entire* window in which the fixtures on disk change.
+///
+/// Without this, an interrupted `prepare` invocation (crash, kill, OOM) can
+/// leave the *previous* invocation's sidecar behind. The window runs from the
+/// end of the fixture-write loop to the end of the fresh sidecar write. The
+/// old sidecar is well-formed, but it describes a workload shape (e.g. a
+/// different `activities` value) that no longer matches the rewritten
+/// fixtures. `read_prepared_meta`'s malformed-sidecar panic cannot catch this.
+/// A leftover sidecar is not malformed, just stale. So `run_verify` would
+/// trust it and silently report the wrong shape.
+///
+/// Deleting it first turns that whole interruption window into the supported
+/// "sidecar genuinely absent" case. `read_prepared_meta` returns `None`, and
+/// `run_verify` falls back to `activities_per_fixture_from_disk`. That
+/// function derives the true shape from what is actually on disk. A
+/// stale-but-well-formed sidecar cannot then lie about it.
 fn remove_stale_meta(dir: &std::path::Path) {
     for path in [
         dir.join(PROFILE_META_FILENAME),
@@ -297,31 +285,28 @@ fn remove_stale_meta(dir: &std::path::Path) {
     }
 }
 
-/// Filename for the temp sidecar `write_meta_atomically` writes and syncs
-/// before renaming it into place as `PROFILE_META_FILENAME`. Also removed by
-/// `remove_stale_meta`, so a leftover temp file from a `prepare` invocation
-/// that crashed *during* the temp-write step (before ever reaching the
-/// rename) does not linger in the directory across a later `prepare`.
+/// Filename of the temp sidecar that `write_meta_atomically` writes and syncs
+/// before it renames it to `PROFILE_META_FILENAME`. `remove_stale_meta` also
+/// removes it. So a temp file from a `prepare` that crashed before the rename
+/// does not linger into a later `prepare`.
 fn profile_meta_tmp_filename() -> String {
     format!("{PROFILE_META_FILENAME}.tmp")
 }
 
-/// Write `PROFILE_META_FILENAME` atomically: the contents are written to and
-/// `sync_all`'d on a temp file in the same directory first, then published
-/// via `std::fs::rename` -- an atomic filesystem operation (on the same
-/// filesystem, which `dir` and the temp file always share here) -- so a
-/// reader (`read_prepared_meta`) can only ever observe the fully-old sidecar
-/// or the fully-new one, never a partial write.
+/// Write `PROFILE_META_FILENAME` atomically.
 ///
-/// Without this, a `prepare` invocation interrupted (crash, kill, OOM, or
-/// simply a short write) *during* the sidecar write can leave a
-/// *syntactically valid but wrong* truncated prefix on disk -- e.g. an
-/// intended `activities=500` truncated to `activities=50` still parses as a
-/// legitimate `usize`. `read_prepared_meta`'s malformed-sidecar panic cannot
-/// catch this case (the truncated content is not malformed, just
-/// incomplete-and-coincidentally-valid), so `run` would silently report the
-/// wrong workload shape with no diagnostic that the sidecar was ever
-/// interrupted mid-write.
+/// The contents go to a temp file in the same directory, which is `sync_all`'d
+/// and then published with `std::fs::rename`. The rename is atomic on one
+/// filesystem, and `dir` and the temp file always share one. So
+/// `read_prepared_meta` sees the fully-old sidecar or the fully-new one, never
+/// a partial write.
+///
+/// Otherwise an interrupted `prepare` (crash, kill, OOM, or a short write) can
+/// leave a truncated prefix that is *syntactically valid but wrong*. For
+/// example, `activities=500` truncated to `activities=50` still parses as a
+/// `usize`. The malformed-sidecar panic of `read_prepared_meta` cannot catch
+/// that, because the content is not malformed. So `run` would silently report
+/// the wrong workload shape.
 fn write_meta_atomically(dir: &std::path::Path, fixtures: usize, activities: usize) {
     let tmp_path = dir.join(profile_meta_tmp_filename());
     let final_path = dir.join(PROFILE_META_FILENAME);
@@ -335,23 +320,21 @@ fn write_meta_atomically(dir: &std::path::Path, fixtures: usize, activities: usi
     std::fs::rename(&tmp_path, &final_path).expect("publish profile meta sidecar");
 }
 
-/// Remove any pre-existing `fixture_*.json` files from `dir` before
-/// `prepare_fixtures` writes a fresh set. Without this, re-running `prepare`
-/// with a *smaller* `VERIFY_PROFILE_FIXTURES` than a previous run against the
-/// same `VERIFY_PROFILE_DIR` leaves higher-numbered files behind (e.g. a
-/// prior `fixtures=50` run's `fixture_00020.json`..`fixture_00049.json`
-/// survive a later `fixtures=20` run, which only rewrites indices 0..19).
-/// `verify_dir` globs every `*.json` file in the directory, so those stale
-/// leftovers -- possibly written with a *different* `VERIFY_PROFILE_ACTIVITIES`
-/// value -- would silently be included in the next `run`-mode measurement,
-/// producing a non-uniform, partially-stale workload instead of the
-/// requested one; `report.fixtures_total`'s equality assert only catches
-/// this when the stale count happens to disagree with the *new* run's
-/// `VERIFY_PROFILE_FIXTURES`, not when it happens to coincide. Only removes
-/// files matching the exact naming pattern `prepare_fixtures` itself writes
-/// -- the sidecar (non-`.json` extension) and any unrelated file are left
-/// alone. Runs only from `prepare`/`full` mode, never from `run` mode, so
-/// this adds zero cost to the profiled measurement region.
+/// Remove any `fixture_*.json` files from `dir` before `prepare_fixtures`
+/// writes a fresh set.
+///
+/// Otherwise a re-run of `prepare` with a *smaller* `VERIFY_PROFILE_FIXTURES`
+/// against the same `VERIFY_PROFILE_DIR` leaves higher-numbered files behind.
+/// For example, a `fixtures=20` run rewrites only indices 0..19, so
+/// `fixture_00020.json`..`fixture_00049.json` from an earlier `fixtures=50` run
+/// survive. `verify_dir` globs every `*.json` file, so the stale files join the
+/// next `run` measurement. They can have a *different*
+/// `VERIFY_PROFILE_ACTIVITIES`, which gives a non-uniform workload. The
+/// equality assert on `report.fixtures_total` catches this only when the stale
+/// count differs from the new `VERIFY_PROFILE_FIXTURES`. This removes only
+/// files with the exact name pattern of `prepare_fixtures`. The sidecar and
+/// other files stay. It runs only in `prepare`/`full` mode, so it adds no cost
+/// to the profiled region.
 fn remove_stale_fixtures(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -370,17 +353,16 @@ fn remove_stale_fixtures(dir: &std::path::Path) {
 }
 
 /// Write `fixtures` copies of the same fixture JSON into `dir`, plus the
-/// `PROFILE_META_FILENAME` sidecar recording the exact values used. Pure
-/// filesystem I/O plus one one-time `serde_json::to_string` -- intentionally
-/// isolable so it can run **unprofiled** (`VERIFY_PROFILE_MODE=prepare`)
-/// ahead of a profiled `VERIFY_PROFILE_MODE=run` pass that measures only
-/// `ReplayVerifier::verify_dir`. Idempotent regardless of growing or
-/// shrinking `fixtures`/`activities` between runs: `remove_stale_meta` and
-/// `remove_stale_fixtures` clear any pre-existing sidecar/`fixture_*.json`
-/// files first, so re-running `prepare` against an existing directory always
-/// leaves it in exactly the state a single `prepare` call with the current
-/// arguments would produce -- and never in a state where a *stale* sidecar
-/// survives alongside freshly (or partially) rewritten fixtures.
+/// `PROFILE_META_FILENAME` sidecar with the exact values used.
+///
+/// It is pure filesystem I/O plus one `serde_json::to_string`. It runs
+/// **unprofiled** (`VERIFY_PROFILE_MODE=prepare`) ahead of a profiled
+/// `VERIFY_PROFILE_MODE=run` pass that measures only
+/// `ReplayVerifier::verify_dir`. It is idempotent when `fixtures`/`activities`
+/// grow or shrink between runs. `remove_stale_meta` and `remove_stale_fixtures`
+/// first clear any old sidecar and `fixture_*.json` files. So a re-run leaves
+/// the directory as one `prepare` call with the current arguments would. A
+/// *stale* sidecar never survives beside rewritten fixtures.
 fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
     std::fs::create_dir_all(dir).expect("create fixture dir");
     remove_stale_meta(dir);
@@ -393,17 +375,15 @@ fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
     write_meta_atomically(dir, fixtures, activities);
 }
 
-/// A *genuinely absent* `VERIFY_PROFILE_DIR` panics unconditionally (unchanged).
-/// A *present but empty-string* value (`VERIFY_PROFILE_DIR=`, a common shell
-/// misconfiguration where a variable is exported but never assigned) is
-/// rejected too, rather than silently succeeding: `PathBuf::from("")` is not
-/// an error to construct, `std::fs::create_dir_all("")` is a silent no-op
-/// rather than an error, and `PathBuf::from("").join("fixture_00000.json")`
-/// resolves to the bare relative filename `"fixture_00000.json"` --
-/// `prepare`/`run` would then silently read and write profiling artifacts
-/// in the process's current working directory instead of the intended
-/// fixture directory, with no diagnostic that `VERIFY_PROFILE_DIR` was ever
-/// misconfigured.
+/// A *genuinely absent* `VERIFY_PROFILE_DIR` panics unconditionally.
+///
+/// A *present but empty-string* value (`VERIFY_PROFILE_DIR=`) is rejected too.
+/// That is a common shell misconfiguration: the variable is exported but never
+/// assigned. `PathBuf::from("")` constructs without error, and
+/// `std::fs::create_dir_all("")` is a silent no-op.
+/// `PathBuf::from("").join("fixture_00000.json")` resolves to the bare relative
+/// filename `"fixture_00000.json"`. So `prepare`/`run` would silently use the
+/// current working directory, with no diagnostic of the misconfiguration.
 fn required_profile_dir(mode: &str) -> std::path::PathBuf {
     let value = std::env::var("VERIFY_PROFILE_DIR")
         .unwrap_or_else(|_| panic!("VERIFY_PROFILE_DIR must be set in `{mode}` mode"));
@@ -417,28 +397,26 @@ fn required_profile_dir(mode: &str) -> std::path::PathBuf {
     value.into()
 }
 
-/// Recursively collect every `*.json` fixture file under `dir`, mirroring
-/// `ReplayVerifier::verify_dir`'s own directory-walk semantics (its private
-/// `collect_json_files` helper -- not a `pub` item this external bench
-/// binary can call, so this mirrors rather than reuses it) so a nested
-/// layout (e.g. `suite/fixture.json`) that `verify_dir` itself accepts is
-/// not silently invisible to this fallback. Also excludes the same
-/// replay-drift-bundle manifest filename `verify_dir` excludes, so pointing
-/// this fallback at a `replay_bundle`-produced directory (issue #798) does
-/// not misparse the manifest file as a fixture.
+/// Recursively collect every `*.json` fixture file under `dir`. This mirrors
+/// the directory walk of `ReplayVerifier::verify_dir`. Its private
+/// `collect_json_files` helper is not a `pub` item this external bench binary
+/// can call, so this mirrors it and does not reuse it. A nested layout (e.g.
+/// `suite/fixture.json`) that `verify_dir` accepts is then visible to this
+/// fallback too. It also excludes the replay-drift-bundle manifest filename
+/// that `verify_dir` excludes. So a `replay_bundle`-produced directory (issue
+/// #798) does not make this fallback misparse the manifest as a fixture.
 ///
-/// Classifies each entry via `DirEntry::file_type()`, not `path.is_dir()` --
-/// the latter follows symlinks (`Path::is_dir()` is backed by
-/// `fs::metadata`), while `verify_dir`'s own `collect_json_files`
+/// Classifies each entry via `DirEntry::file_type()`, not `path.is_dir()`.
+/// The latter follows symlinks (`Path::is_dir()` is backed by
+/// `fs::metadata`). `verify_dir`'s own `collect_json_files`
 /// (`src/testing.rs`) classifies via `entry.file_type()`, which does *not*
-/// follow symlinks. Using `path.is_dir()` here would recurse into a
-/// directory reached only through a symlink that `verify_dir` itself never
-/// traverses (so this fallback could report metadata for fixtures `verify_dir`
-/// never actually measured, or spin on a symlink cycle `verify_dir` handles
-/// gracefully by simply not recursing into it) -- `entry.file_type()` makes
-/// this fallback's traversal match what was actually verified, entry for
-/// entry. An entry whose type can't be determined (a race, a broken
-/// symlink) is silently skipped rather than panicking, matching
+/// follow symlinks. `path.is_dir()` here would recurse into a directory that
+/// only a symlink reaches, which `verify_dir` itself never traverses. This
+/// fallback could then report metadata for fixtures that `verify_dir` never
+/// measured. It could also spin on a symlink cycle that `verify_dir` skips.
+/// `entry.file_type()` makes this traversal match what was verified, entry
+/// for entry. An entry whose type cannot be determined (a race, a broken
+/// symlink) is silently skipped and does not panic. That matches
 /// `collect_json_files`'s own tolerant `if let Ok(file_type) = ...` handling.
 fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
@@ -463,72 +441,58 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Fallback for `read_prepared_meta` returning `None`: parse every `*.json`
-/// fixture found under `dir` (recursively, via `collect_json_fixtures`
-/// above -- matching `verify_dir`'s own discovery, so a nested fixture
-/// layout is not missed here), derive each one's per-fixture activity count
-/// by counting its `WorkflowEvent::ActivityScheduled` events (validating
-/// that every fixture agrees), and sum every fixture's *actual* recorded
-/// event count along the way.
+/// Fallback when `read_prepared_meta` returns `None`.
 ///
-/// Returns `(activities_per_fixture, total_events_across_all_fixtures)`.
-/// The second field exists because `run_verify`'s reported
-/// `total_events_verified` cannot be reconstructed from
-/// `activities_per_fixture` alone here the way it can on the sidecar-present
-/// path: a `prepare`-populated fixture is *guaranteed* to be exactly
-/// `build_fixture_json`'s synthetic `WorkflowStarted` + two events per
-/// activity shape, so `fixtures * (activities * 2 + 1)` is exact there --
-/// but a hand-populated directory reaching this fallback carries no such
-/// guarantee (retried activities' extra `ActivityStarted` events, timers,
-/// signals, or any other event `verify_dir` itself accepts can all inflate
-/// a fixture's real event count well past that synthetic formula), so the
-/// only way to report a truthful total is to sum what was actually parsed.
-/// This reuses the parse this function already pays for the heterogeneity
-/// check -- no extra pass over the fixtures is needed for it.
+/// It parses every `*.json` fixture under `dir`. The walk is recursive, through
+/// `collect_json_fixtures`, to match the discovery of `verify_dir`. It counts
+/// the `WorkflowEvent::ActivityScheduled` events of each fixture, checks that
+/// every fixture agrees, and sums the *actual* recorded event counts.
 ///
-/// Counts `ActivityScheduled` directly rather than inferring a count from
-/// the total event length -- `(events.len() - 1) / 2` only holds for this
-/// file's own synthetic shape (`build_fixture_json`'s exact
-/// `WorkflowStarted` + one `ActivityScheduled`/`ActivityCompleted` pair per
-/// activity), which this fallback's own doc comment below says is *not*
-/// what reaches it. A real worker history instead emits one `ActivityStarted`
-/// per attempt: a *retryable* failure appends no event at all (`
-/// queue::requeue_for_retry` only updates the `harvest_task_queue` row --
-/// see its doc comment and `WorkflowTestEnv::mock_activity_retries`'s at
-/// `src/testing.rs:5278-5286`); the activity's only other history event is
-/// its single terminal `ActivityCompleted` or `ActivityFailed`. So a single
-/// activity retried a few times still inflates the raw event count -- via
-/// the repeated `ActivityStarted`s, which `HistoryMatcher::scan_activity_terminal`
-/// (`src/replay.rs`) skips as transparent noise while scanning for that one
-/// terminal event -- well past two per activity; halving it would badly
-/// overcount that fixture's activities, and two fixtures with the *same*
-/// logical activity count but *different* retry counts would (wrongly)
-/// disagree under the halved formula and trip the heterogeneity panic below
-/// on otherwise-valid, uniform input. `ActivityScheduled` is recorded
-/// exactly once per logical activity dispatch regardless of how many
-/// attempts it took, so counting it is robust to any event shape
-/// `verify_dir` itself accepts.
+/// Returns `(activities_per_fixture, total_events_across_all_fixtures)`. The
+/// second field exists because this path cannot rebuild the reported
+/// `total_events_verified` of `run_verify` from `activities_per_fixture`. A
+/// `prepare`-written fixture is *guaranteed* to have the synthetic shape of
+/// `build_fixture_json`: `WorkflowStarted` plus two events per activity. So
+/// `fixtures * (activities * 2 + 1)` is exact on the sidecar path. A
+/// hand-populated directory has no such guarantee. Retried activities' extra
+/// `ActivityStarted` events, timers, signals, or any other event that
+/// `verify_dir` accepts can inflate the real count. So the only truthful total
+/// is the sum of what was parsed. It reuses the parse of the heterogeneity
+/// check, with no extra pass.
 ///
-/// A directory populated by `prepare_fixtures` writes identical fixture
-/// copies -- but it also *always* writes the `PROFILE_META_FILENAME`
-/// sidecar this fallback exists to substitute for, so that path never
-/// actually reaches this function. The only directories that do are
-/// hand-populated (no sidecar at all), where nothing guarantees every
-/// fixture shares one activity count: such a directory can legitimately mix
-/// e.g. 500- and 1,000-activity snapshots that each verify successfully on
-/// their own. `run_verify` reports the returned activity count across the
-/// *entire* fixture set, so reporting only one sampled fixture's count would
-/// silently mislabel every fixture that disagrees with it. Every fixture
-/// found is therefore parsed and checked to agree with the first; a
-/// heterogeneous set panics naming the two disagreeing files rather than
-/// reporting one arbitrary shape as if it applied to all of them.
+/// It counts `ActivityScheduled` and does not infer a count from the event
+/// length. `(events.len() - 1) / 2` holds only for the synthetic shape of
+/// `build_fixture_json`. As the next paragraph says, that shape never reaches
+/// this fallback. A real worker history emits one `ActivityStarted` per attempt.
+/// A *retryable* failure appends no event at all: `queue::requeue_for_retry`
+/// updates only the `harvest_task_queue` row. See its doc comment, and
+/// `WorkflowTestEnv::mock_activity_retries` at `src/testing.rs:5278-5286`. The
+/// only other history event of the activity is its single terminal
+/// `ActivityCompleted` or `ActivityFailed`. So retries inflate the raw count
+/// with repeated `ActivityStarted` events, well past two per activity.
+/// `HistoryMatcher::scan_activity_terminal` (`src/replay.rs`) skips them as
+/// noise while it scans for the terminal event. Halving would overcount that
+/// fixture's activities. Two fixtures with the *same* activity count but
+/// *different* retry counts would then disagree. That trips the heterogeneity
+/// panic below on valid, uniform input. `ActivityScheduled` is recorded once
+/// per logical dispatch, however many attempts it took. So counting it is
+/// robust to any event shape that `verify_dir` accepts.
 ///
-/// Full JSON parse of every fixture is real, non-trivial cost (see
-/// `PROFILE_META_FILENAME`'s doc comment: ~3.9M instructions for *one*
-/// realistic-size fixture) -- acceptable here because, as above, this whole
-/// function is already documented as unreachable from a normal two-phase
-/// `prepare`/`run` invocation (which always carries the sidecar); it is not
-/// the golden profiled path this harness exists to keep clean.
+/// `prepare_fixtures` writes identical fixture copies. But it *always* writes
+/// the `PROFILE_META_FILENAME` sidecar too, so that path never reaches this
+/// function. Only hand-populated directories do, and there nothing guarantees
+/// one activity count. Such a directory can mix 500- and 1,000-activity
+/// snapshots that each verify on their own. `run_verify` reports the returned
+/// count for the *entire* fixture set. One sampled fixture's count would
+/// silently mislabel each fixture that disagrees with it. So each fixture is
+/// parsed and checked against the first. A heterogeneous set panics and names
+/// the two disagreeing files.
+///
+/// A full JSON parse of each fixture is real cost: ~3.9M instructions for *one*
+/// realistic fixture (see the `PROFILE_META_FILENAME` doc). That is acceptable,
+/// because a normal two-phase `prepare`/`run` invocation always has the sidecar
+/// and never reaches this function. It is not the profiled path this harness
+/// keeps clean.
 fn activities_per_fixture_from_disk(dir: &std::path::Path) -> (usize, usize) {
     let mut fixture_paths = collect_json_fixtures(dir);
     fixture_paths.sort();
@@ -544,16 +508,14 @@ fn activities_per_fixture_from_disk(dir: &std::path::Path) -> (usize, usize) {
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
         let snapshot: HistorySnapshot = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-        // The fixture's real, actually-recorded event count -- never a
-        // formula derived from `activities_per_fixture`, since a fixture
-        // reaching this fallback is not guaranteed to have the synthetic
-        // "WorkflowStarted + 2 events per activity" shape (see the doc
-        // comment above).
+        // The real recorded event count, never a formula from
+        // `activities_per_fixture`. A fixture on this fallback path need not
+        // have the synthetic "WorkflowStarted + 2 events per activity" shape
+        // (see the doc comment above).
         total_events += snapshot.events.len();
-        // One `ActivityScheduled` per logical activity dispatch, regardless
-        // of how many `ActivityStarted`/`ActivityFailed` retry-attempt
-        // events surround it -- see the doc comment above for why this must
-        // not be inferred from the raw event count instead.
+        // One `ActivityScheduled` per logical activity dispatch, however many
+        // `ActivityStarted`/`ActivityFailed` retry events surround it. The doc
+        // comment above says why the raw event count must not be used.
         let count = snapshot
             .events
             .iter()
@@ -579,10 +541,11 @@ fn activities_per_fixture_from_disk(dir: &std::path::Path) -> (usize, usize) {
     (first.expect("checked non-empty above").1, total_events)
 }
 
-/// Build the tokio runtime + call `verify_dir` on `dir`. This is the ONLY
-/// work `VERIFY_PROFILE_MODE=run` performs -- no fixture generation, no
-/// directory creation -- so it is the region a profiler should be pointed
-/// at when isolating `verify_dir`'s own cost. See the module doc comment.
+/// Build the tokio runtime and call `verify_dir` on `dir`.
+///
+/// This is the ONLY work of `VERIFY_PROFILE_MODE=run`, with no fixture
+/// generation and no directory creation. So point a profiler at it to isolate
+/// the cost of `verify_dir`. See the module doc comment.
 fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -604,28 +567,23 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
         "unexpected fixture failure(s): {report:?}"
     );
 
-    // Derive the reported workload shape from what `prepare` actually wrote
-    // -- see `PROFILE_META_FILENAME`'s doc comment for why this must not
-    // simply trust the `activities` env-var argument, and why the cheap
-    // sidecar read is preferred over the full-fixture-parse fallback inside
-    // this profiled region.
+    // Derive the reported workload shape from what `prepare` wrote. The
+    // `PROFILE_META_FILENAME` doc says why this must not trust the
+    // `activities` env-var argument. It also says why the cheap sidecar read
+    // beats the full-fixture-parse fallback inside this profiled region.
     //
-    // The two paths disagree on how `total_events_verified` below must be
-    // derived, so both `actual_activities` and (on the fallback path only)
-    // the fixtures' real summed event count travel together:
-    // sidecar-present -> `None` here; every `prepare`-written fixture is
-    // *guaranteed* to be `build_fixture_json`'s exact synthetic
-    // `WorkflowStarted` + 2-events-per-activity shape, so the cheap
-    // `fixtures * (actual_activities * 2 + 1)` formula below is exact, and
-    // computing it costs nothing beyond the sidecar read already required.
-    // sidecar-absent -> `Some(sum of every parsed fixture's real event
-    // count)`; a hand-populated fixture reaching this fallback carries no
-    // such shape guarantee (retried activities' extra `ActivityStarted`
-    // events, timers, signals, or any other event `verify_dir` itself
-    // accepts can all inflate a fixture's true event count past that
-    // synthetic formula), so the true total must be read from what was
-    // actually parsed rather than reconstructed from `actual_activities`
-    // alone -- see `activities_per_fixture_from_disk`'s doc comment.
+    // The two paths derive `total_events_verified` below differently. So
+    // `actual_activities` travels with the real summed event count, which
+    // only the fallback path has:
+    // - Sidecar present: `None`. Each `prepare`-written fixture is
+    //   *guaranteed* to have the synthetic shape of `build_fixture_json`. So
+    //   `fixtures * (actual_activities * 2 + 1)` below is exact and costs
+    //   nothing beyond the sidecar read.
+    // - Sidecar absent: `Some(sum of each parsed fixture's real event count)`.
+    //   A hand-populated fixture has no shape guarantee. Retries, timers,
+    //   signals or any other accepted event can inflate its count. So the
+    //   true total comes from the parse (see the doc comment of
+    //   `activities_per_fixture_from_disk`).
     let (actual_activities, actual_total_events) =
         if let Some((_prepared_fixtures, prepared_activities)) = read_prepared_meta(dir) {
             (prepared_activities, None)
@@ -633,26 +591,27 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
             let (activities, total_events) = activities_per_fixture_from_disk(dir);
             (activities, Some(total_events))
         };
-    // `actual_activities` -- not the `activities` env-var argument above -- is
-    // the authoritative value: it's derived from what's *actually on disk*
-    // (via the sidecar `prepare` wrote, or, on the no-sidecar fallback path,
-    // parsed directly out of the fixtures found there), i.e. the exact
-    // workload `verify_dir` is about to profile on the very next line. The
-    // `activities > 0` assert in `main()` only rejects a misconfigured
-    // *current invocation*'s env var; it cannot see that this `run`
-    // invocation's `VERIFY_PROFILE_DIR` was populated separately -- a
-    // directory `prepare`d by an older binary predating that assert, one
-    // reused across sessions without a matching `prepare` re-run, or a
-    // hand-populated one -- and so may hold zero-activity fixtures on disk
-    // regardless of what the current process's `VERIFY_PROFILE_ACTIVITIES`
-    // says. Without this check, such a directory falls into the mismatch
-    // warning just below (a mismatch between a *positive* actual count and
-    // the requested one is intentionally only a warning, not a hard failure
-    // -- see that branch), then silently profiles the exact same degenerate,
-    // single-`WorkflowStarted`-event-per-fixture workload the
-    // `VERIFY_PROFILE_ACTIVITIES=0` check in `main()` exists to reject,
-    // printing a plausible `activities_per_fixture=0 ... succeeded=N` line
-    // and exiting 0.
+    // `actual_activities` is the authoritative value, not the `activities`
+    // env-var argument above. It comes from what is *actually on disk*: the
+    // sidecar that `prepare` wrote, or, on the no-sidecar fallback path, the
+    // fixtures parsed there. That is the exact workload `verify_dir` profiles
+    // on the next line.
+    //
+    // The `activities > 0` assert in `main()` only rejects a misconfigured env
+    // var of the *current invocation*. It cannot see that this `run`
+    // invocation's `VERIFY_PROFILE_DIR` was populated separately. Examples
+    // are a directory that an older binary `prepare`d before that assert, one
+    // reused across sessions without a new `prepare`, or a hand-populated one.
+    // Such a directory may hold zero-activity fixtures, whatever the current
+    // `VERIFY_PROFILE_ACTIVITIES` says.
+    //
+    // Without this check, such a directory falls into the mismatch warning
+    // just below. A mismatch between a *positive* actual count and the
+    // requested one is intentionally only a warning (see that branch). The
+    // run then silently profiles the same degenerate workload, one
+    // `WorkflowStarted` event per fixture. The `VERIFY_PROFILE_ACTIVITIES=0`
+    // check in `main()` exists to reject that workload. The run prints a
+    // plausible `activities_per_fixture=0 ... succeeded=N` line and exits 0.
     assert!(
         actual_activities > 0,
         "the fixtures actually found in {} have 0 activities each -- \
@@ -683,17 +642,17 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
     );
 }
 
-/// Read `VERIFY_PROFILE_MODE`, defaulting an *absent* variable to `"full"`.
-/// A *non-UTF-8* value panics rather than being silently folded into the
-/// same default as "absent" -- `std::env::var`'s `Err` covers both
-/// `VarError::NotPresent` and `VarError::NotUnicode`, and collapsing both
-/// into `.unwrap_or_else(|_| "full")` would let a non-UTF-8 mode value (a
-/// launcher passing a raw, invalid-UTF-8 `OsString`, reachable on Unix)
-/// silently run the un-isolated `full` mode inside what the caller believes
-/// is a profiled, isolated `run`-mode invocation -- exactly the failure this
-/// file's other two workload-shape checks (`env_usize` and the `match
-/// mode.as_str()` catch-all just below) already guard against. Mirrors
-/// `env_usize`'s `NotPresent`/`NotUnicode` split.
+/// Read `VERIFY_PROFILE_MODE`, and default an *absent* variable to `"full"`.
+///
+/// A *non-UTF-8* value panics and does not fold into the "absent" default. The
+/// `Err` of `std::env::var` covers both `VarError::NotPresent` and
+/// `VarError::NotUnicode`. `.unwrap_or_else(|_| "full")` on both would let a
+/// non-UTF-8 value run the un-isolated `full` mode. That value can come from a
+/// launcher that passes a raw, invalid-UTF-8 `OsString` on Unix. The caller
+/// then believes it runs an isolated, profiled `run` mode. The other two
+/// workload-shape checks guard against the same failure: `env_usize` and the
+/// `match mode.as_str()` catch-all below. This mirrors the
+/// `NotPresent`/`NotUnicode` split of `env_usize`.
 fn resolve_mode() -> String {
     match std::env::var("VERIFY_PROFILE_MODE") {
         Ok(value) => value,
@@ -709,23 +668,17 @@ fn main() {
     let mode = resolve_mode();
     let fixtures = env_usize("VERIFY_PROFILE_FIXTURES", 20);
     let activities = env_usize("VERIFY_PROFILE_ACTIVITIES", 500);
-    // `fixtures == 0` would silently "succeed" rather than signal a
-    // misconfiguration: `prepare_fixtures` writes zero `fixture_*.json`
-    // files (and still writes a `PROFILE_META_FILENAME` sidecar claiming
-    // `fixtures=0`), and `ReplayVerifier::replay_dir` deliberately treats an
-    // empty fixture directory as a successful *empty* report --
-    // `fixtures_total: 0, succeeded: 0, failed: 0, harness_errors: 0` (see
-    // the `if files.is_empty()` branch in `replay_dir`, `src/testing.rs`) --
-    // rather than an error. So `run`/`full` mode would print a
-    // plausible-looking `verify_profile: fixtures=0 ... succeeded=0` line
-    // and exit 0 while Callgrind/DHAT recorded only tokio-runtime-build and
-    // harness overhead, not one byte of the documented `verify_dir`
-    // fixture-verification workload this file exists to measure. Rejecting
-    // it here -- before the `prepare`/`run`/`full` dispatch below, so it
-    // applies uniformly to all three modes -- turns a silently-vacuous
-    // "measurement" into a loud, immediate configuration error instead of a
-    // near-zero instruction count that could be mistaken for a genuine (and
-    // wildly optimistic) profiling result.
+    // `fixtures == 0` would silently "succeed" instead of signalling a
+    // misconfiguration. `prepare_fixtures` writes zero `fixture_*.json` files,
+    // and still writes a sidecar that claims `fixtures=0`.
+    // `ReplayVerifier::replay_dir` deliberately reports an empty fixture
+    // directory as a successful *empty* report, not an error. See the
+    // `if files.is_empty()` branch in `replay_dir`, `src/testing.rs`. So
+    // `run`/`full` mode would print a plausible `fixtures=0 ... succeeded=0`
+    // line and exit 0. Callgrind/DHAT would record only runtime-build and
+    // harness overhead, none of the `verify_dir` workload. The check runs
+    // before the `prepare`/`run`/`full` dispatch below, so it covers all three
+    // modes. It turns a vacuous "measurement" into a loud configuration error.
     assert!(
         fixtures > 0,
         "VERIFY_PROFILE_FIXTURES=0 verifies nothing: `verify_dir` reports a trivially \
@@ -734,26 +687,27 @@ fn main() {
          instead of exercising the documented verification workload -- set it to a positive \
          value (the default is 20)"
     );
-    // `activities == 0` is a distinct but analogous methodological trap: unlike
-    // `fixtures == 0`, `verify_dir` genuinely does real work here -- it still
+    // `activities == 0` is a distinct but analogous methodological trap.
+    // Unlike `fixtures == 0`, `verify_dir` does real work here. It still
     // spawns one task per fixture, reads and parses each `*.json` file, and
-    // replays each one -- so this isn't a literal empty-batch no-op. But
-    // `build_fixture_json(0)` produces a fixture containing only a single
-    // `WorkflowStarted` event (see the `for i in 0..activity_count` loop
-    // above, which runs zero times), so every fixture collapses to the
-    // cheapest possible replay: no `ActivityScheduled`/`ActivityCompleted`
-    // pair, no `HistoryMatcher` event-by-event matching, nothing beyond one
-    // trivial deserialize + an immediate `Ok` return. That's precisely the
-    // event-processing/replay-matching cost this harness exists to measure
-    // (the module doc comment's stated purpose: issue #251's "1k events
-    // each" workload, and `VERIFY_PROFILE_ACTIVITIES`'s own doc comment:
-    // "500 activities = 1,001 events per fixture, issue #251's exact
-    // per-fixture shape") -- an accidental zero here would still print a
-    // plausible, honestly-labeled `activities_per_fixture=0` line, but the
-    // resulting Ir count would be dominated by fixed per-fixture overhead
-    // (task spawn, file I/O, a near-empty JSON parse) rather than the
-    // per-event cost a change under review is meant to move, making it just
-    // as capable of producing a misleading "5% floor" verdict as the
+    // replays each one. So this is not a literal empty-batch no-op.
+    //
+    // But `build_fixture_json(0)` produces a fixture with only a single
+    // `WorkflowStarted` event (the `for i in 0..activity_count` loop above
+    // runs zero times). So every fixture collapses to the cheapest possible
+    // replay. There is no `ActivityScheduled`/`ActivityCompleted` pair and no
+    // `HistoryMatcher` event-by-event matching. There is only one trivial
+    // deserialize and an immediate `Ok` return. That skips the
+    // event-processing/replay-matching cost this harness exists to measure.
+    // The module doc names issue #251's "1k events each" workload. The doc
+    // of `VERIFY_PROFILE_ACTIVITIES` says "500 activities = 1,001 events per
+    // fixture, issue #251's exact per-fixture shape".
+    //
+    // An accidental zero still prints a plausible, honestly-labeled
+    // `activities_per_fixture=0` line. But fixed per-fixture overhead (task
+    // spawn, file I/O, a near-empty JSON parse) dominates the resulting Ir
+    // count. A change under review is meant to move the per-event cost. So
+    // this case can give a misleading "5% floor" verdict, like the
     // `fixtures == 0` case above.
     assert!(
         activities > 0,

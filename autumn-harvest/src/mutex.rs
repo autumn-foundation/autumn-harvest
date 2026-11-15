@@ -1,79 +1,80 @@
 //! Durable mutual-exclusion locks for workflow code (issue #691).
 //!
-//! This module is the DB-helper layer behind `ctx.mutex(key).acquire()` — a
-//! `WorkflowContext` author primitive that durably suspends the calling workflow
-//! until it holds exclusive access to `key`. It owns the raw-SQL access to the
-//! two backing tables (`harvest_mutex_locks`, `harvest_mutex_waiters`) and the
-//! `harvest_mutex_lock_seq` fencing sequence; the author-facing handle/guard API
+//! This module is the DB-helper layer behind `ctx.mutex(key).acquire()`. That
+//! `WorkflowContext` primitive durably suspends the calling workflow until it
+//! holds exclusive access to `key`. This module owns the raw SQL for the two
+//! backing tables (`harvest_mutex_locks`, `harvest_mutex_waiters`) and the
+//! `harvest_mutex_lock_seq` fencing sequence. The author-facing handle/guard API
 //! and the executor/worker suspension wiring land in later milestones.
 //!
 //! # Shard-local scope
 //!
-//! Mutex coordination is **shard-local**: the lock row and the FIFO waiter rows
-//! live on the contending workflows' own shard, exactly like per-key concurrency
-//! limits (issue #247). Two workflows that must exclude one another therefore
-//! have to resolve to the **same** shard. Cross-shard global locks are out of
-//! scope — there is no cross-shard coordination here.
+//! Mutex coordination is **shard-local**. The lock row and the FIFO waiter rows
+//! live on the contending workflows' own shard, like per-key concurrency limits
+//! (issue #247). Two workflows that must exclude one another therefore have to
+//! resolve to the **same** shard. Cross-shard global locks are out of scope —
+//! there is no cross-shard coordination here.
 //!
 //! # Lease contract (the honest caveat)
 //!
 //! Crash safety rests on two mechanisms: a `lease_expires_at` TTL backstop and a
 //! monotonic `lock_seq` **fencing token**. If a holder crashes (or its worker
 //! stops renewing), the lease scanner reclaims the expired lease and wakes the
-//! next waiter. `lock_seq` fences the lock **table**: release/reclaim match on
-//! `(holder_exec_id, lock_seq)`, so a reclaimed-then-resumed stale holder's
-//! release is a 0-row no-op and the table can never be corrupted.
+//! next waiter. `lock_seq` fences the lock **table**. Release and reclaim match
+//! on `(holder_exec_id, lock_seq)`. A reclaimed-then-resumed stale holder's
+//! release is then a 0-row no-op, so the table can never be corrupted.
 //!
 //! What the engine cannot fence is the **author's external side effects**. The
-//! lease TTL must exceed the worst-case wall-clock time a workflow spends inside
-//! a single held step — concretely, the **interval between the lease-renewing
-//! decision cycles** of the holder. Renewal happens per decision cycle (and on
-//! resume from pause); a lock held across a **single long region that spans no
-//! such cycle** — one long-running activity, a child workflow, or an nd-block
-//! backoff longer than the TTL — can have its lease expire and be reclaimed by
-//! a waiter while the original holder still believes it holds the lock,
-//! admitting a second holder that runs concurrently against whatever external
-//! resource the lock was protecting. Hold locks across **short** critical
-//! regions; if a region must span a long durable step, raise the TTL above that
-//! step's worst-case duration. This is the standard lease-lock trade-off. See
-//! [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
+//! lease TTL must exceed the worst-case wall-clock time of a single held step.
+//! That step is the **interval between the lease-renewing decision cycles** of
+//! the holder. Renewal happens per decision cycle and on resume from pause.
+//! Some regions span no such cycle: one long-running activity, a child
+//! workflow, or an nd-block backoff longer than the TTL. A lock held across
+//! such a **single long region** can lose its lease to a waiter. The original
+//! holder then still believes it holds the lock. So two holders can run
+//! concurrently against the external resource the lock protects. Hold locks
+//! across **short** critical regions. If a region must span a long durable
+//! step, raise the TTL above that step's worst-case duration. This is the
+//! standard lease-lock trade-off. See [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
 //!
 //! # Behavior notes
 //!
 //! - **Held-duration metric.** `harvest.mutex.held_duration` is measured on
-//!   **explicit guard drop / `.release()`** (a normal region exit). A lock held
-//!   all the way to a terminal state is freed by the **terminal sweep**, which
-//!   does not measure held-duration, so a lock never explicitly released does
-//!   not contribute to this histogram.
-//! - **No mixed suspension batch.** `acquire()` is its own suspension shape;
-//!   `tokio::join!(ctx.mutex(k).acquire(), <other await>)` (racing an acquire
-//!   against another durable await in one decision cycle) is **rejected** — the
-//!   worker fails the mixed suspension batch loud rather than silently
+//!   **explicit guard drop / `.release()`** (a normal region exit). The
+//!   **terminal sweep** frees a lock held all the way to a terminal state. The
+//!   sweep does not measure held-duration, so such a lock does not contribute
+//!   to this histogram.
+//! - **No mixed suspension batch.** `acquire()` is its own suspension shape.
+//!   The worker **rejects** `tokio::join!(ctx.mutex(k).acquire(), <other await>)`,
+//!   which races an acquire against another durable await in one decision
+//!   cycle. It fails the mixed suspension batch loud rather than silently
 //!   corrupting. Acquire the lock in its own suspension, then do the other work.
 //! - **`ctx.race()` interop (known limitation).** Calling
 //!   `ctx.mutex(k).acquire()` in the **same decision cycle** immediately after
 //!   `ctx.race()` can nd-block when a race loser is still in-flight at
 //!   resolution. This is a **pre-existing `ctx.race()` (issue #600)
-//!   replay-consumption limitation** affecting **any** follow-on durable command
-//!   (a plain activity as much as an acquire), not something specific to mutex.
-//!   Until #600 is fixed, interpose a state-consulting call between the race and
-//!   the acquire, or await the race in a **prior** cycle before acquiring.
+//!   replay-consumption limitation**, not something specific to mutex. It
+//!   affects **any** follow-on durable command, a plain activity as much as an
+//!   acquire. Until #600 is fixed, interpose a state-consulting call between
+//!   the race and the acquire, or await the race in a **prior** cycle before
+//!   acquiring.
 //!
 //! # Advisory-first lock ordering (deadlock avoidance)
 //!
 //! Every acquire / release / reclaim / sweep transaction takes a
 //! `pg_advisory_xact_lock(hashtext(key))` **first**, before touching any lock or
 //! waiter row. This uniform ordering prevents an ABBA deadlock with the terminal
-//! auto-release sweep, which runs *inside* the workflow's terminal-transition
-//! commit: if the sweep took a row lock before the advisory lock while acquire
-//! took them in the opposite order, a deadlock would roll the terminal commit
-//! back. Advisory-first everywhere removes the inversion by construction.
+//! auto-release sweep. That sweep runs *inside* the workflow's
+//! terminal-transition commit. Suppose the sweep took a row lock before the
+//! advisory lock while acquire took them in the opposite order. A deadlock
+//! would then roll the terminal commit back. Advisory-first everywhere removes
+//! the inversion by construction.
 //!
 //! `hashtext` produces a 32-bit hash, so two distinct keys can (rarely) collide
 //! onto the same advisory-lock slot and be briefly, harmlessly serialized
-//! against each other. This never affects correctness: every row operation still
-//! matches `lock_key` **exactly**, so a collision only costs a little needless
-//! serialization, never a wrong grant or release.
+//! against each other. This never affects correctness. Every row operation
+//! still matches `lock_key` **exactly**. A collision only costs a little
+//! needless serialization, never a wrong grant or release.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -93,10 +94,11 @@ pub const DEFAULT_MUTEX_LEASE_TTL: Duration = Duration::from_secs(60);
 /// [`MUTEX_LEASE_TTL_SECS_BITS`] (`Duration::as_secs_f64` is not `const`).
 const DEFAULT_LEASE_TTL_SECS_F64: f64 = 60.0;
 
-/// Process-global effective mutex lease TTL, in **seconds**, stored as the bit
-/// pattern of an `f64` ([`f64::to_bits`]) so it carries sub-second precision
-/// (mirrors `start_idempotency`'s purge-window static and the
-/// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` process-global idiom).
+/// Process-global effective mutex lease TTL, in **seconds**.
+///
+/// It holds the bit pattern of an `f64` ([`f64::to_bits`]), so it carries
+/// sub-second precision. It mirrors `start_idempotency`'s purge-window static
+/// and the `GLOBAL_DEFAULT_WORKFLOW_QUEUE` process-global idiom.
 ///
 /// Set once at worker startup from the configured `WorkerConfig::mutex_lease_ttl`
 /// via [`set_mutex_lease_ttl`] (the `From<WorkerConfig>` path), read by the
@@ -107,9 +109,9 @@ static MUTEX_LEASE_TTL_SECS_BITS: AtomicU64 = AtomicU64::new(DEFAULT_LEASE_TTL_S
 /// Set the process-global mutex lease TTL (issue #691).
 ///
 /// Called at worker startup from `WorkerConfig::mutex_lease_ttl`. A degenerate
-/// duration (non-positive or non-finite) is **ignored**: the previous (or
-/// default) value is kept and a warning is logged, rather than storing a `0`
-/// TTL that would let the scanner reclaim every lock instantly.
+/// duration (non-positive or non-finite) is **ignored**. The previous (or
+/// default) value stays and a warning is logged. A stored `0` TTL would let
+/// the scanner reclaim every lock instantly.
 pub fn set_mutex_lease_ttl(ttl: Duration) {
     let secs = ttl.as_secs_f64();
     if !(secs.is_finite() && secs > 0.0) {
@@ -215,8 +217,10 @@ pub const fn grant_lock_stmt() -> &'static str {
      RETURNING lock_seq"
 }
 
-/// Read-only "would a grant to `$2` succeed right now?" check: `$2` is the head
-/// of line AND the key is either free or its lease has expired.
+/// Read-only check that a grant to `$2` would succeed right now.
+///
+/// It is true when `$2` is the head of line AND the key is either free or its
+/// lease has expired.
 ///
 /// `$1` = `lock_key`, `$2` = `waiter_exec_id`. Returns one `grantable` bool row.
 #[must_use]
@@ -250,7 +254,7 @@ pub const fn release_lock_stmt() -> &'static str {
 }
 
 /// Release by `(key, holder)` with **no** `lock_seq` fence — for the terminal
-/// sweep / release-all path where the seq isn't threaded. `$1` = `lock_key`,
+/// sweep / release-all path where the seq is not threaded. `$1` = `lock_key`,
 /// `$2` = `holder_exec_id`. `RETURNING acquired_at`.
 #[must_use]
 pub const fn release_lock_by_holder_key_stmt() -> &'static str {
@@ -396,12 +400,11 @@ pub const fn holder_holds_any_stmt() -> &'static str {
 
 /// Best-effort grant metrics for `$2` (`waiter_exec_id`) on key `$1`.
 ///
-/// Reads the
-/// waiter's `requested_at` (for the wait-duration histogram) and the current
-/// total waiter-queue depth for the key (for the contention gauge). The waiter
-/// row still exists at grant time — [`grant_lock_stmt`] does not delete it, only
-/// the eventual fenced release does — so this reads it directly. Returns at most
-/// one row.
+/// Reads the waiter's `requested_at` (for the wait-duration histogram) and the
+/// current total waiter-queue depth for the key (for the contention gauge). The
+/// waiter row still exists at grant time, so this reads it directly.
+/// [`grant_lock_stmt`] does not delete it; only the eventual fenced release
+/// does. Returns at most one row.
 #[must_use]
 pub const fn waiter_wait_metrics_stmt() -> &'static str {
     "SELECT requested_at, \
@@ -622,7 +625,7 @@ mod db_ops {
     ///
     /// Feeds the `harvest.mutex.wait_duration`
     /// and `harvest.mutex.contention_depth` metrics. Returns `None` if the
-    /// waiter row is gone (shouldn't happen at grant time). **Not**
+    /// waiter row is gone (should not happen at grant time). **Not**
     /// `table_present`-guarded — called only on the acquire/grant path.
     ///
     /// # Errors
@@ -781,7 +784,7 @@ mod db_ops {
     /// Remove every waiter row for `exec_id` across all keys and wake each key's
     /// new head of line.
     ///
-    /// Guarded. A spurious wake (the exec wasn't actually the
+    /// Guarded. A spurious wake (the exec was not actually the
     /// head) is safe — the woken task simply re-parks.
     ///
     /// # Errors
@@ -981,7 +984,7 @@ mod pure_tests {
     use super::*;
 
     /// Serializes the mutex-lease-TTL global setter tests against each other so
-    /// they don't race in the shared lib-test binary (mirrors
+    /// they do not race in the shared lib-test binary (mirrors
     /// `start_idempotency::PURGE_WINDOW_TEST_LOCK`).
     static LEASE_TTL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -997,7 +1000,6 @@ mod pure_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Whole and sub-second values round-trip.
         set_mutex_lease_ttl(Duration::from_secs(120));
         assert_eq!(effective_mutex_lease_ttl(), Duration::from_secs(120));
 
@@ -1009,7 +1011,7 @@ mod pure_tests {
         set_mutex_lease_ttl(Duration::ZERO);
         assert!((effective_mutex_lease_ttl().as_secs_f64() - 1.5).abs() < 1e-9);
 
-        // Restore the default so ordering-independent test runs don't leak state.
+        // Restore the default so ordering-independent test runs do not leak state.
         set_mutex_lease_ttl(DEFAULT_MUTEX_LEASE_TTL);
         assert_eq!(effective_mutex_lease_ttl(), DEFAULT_MUTEX_LEASE_TTL);
     }
@@ -1021,11 +1023,9 @@ mod pure_tests {
             .with_timezone(&Utc);
         let before = base - chrono::Duration::seconds(1);
         let after = base + chrono::Duration::seconds(1);
-        // Not yet expired.
         assert!(!lease_expired(base, before));
         // Expired exactly at the deadline (>=).
         assert!(lease_expired(base, base));
-        // Expired past the deadline.
         assert!(lease_expired(base, after));
     }
 

@@ -405,7 +405,7 @@ async fn test_delayed_start_no_premature_dispatch() {
     assert!(scheduled_at > now + chrono::Duration::seconds(1));
     assert!(scheduled_at <= now + chrono::Duration::seconds(4));
 
-    // Verify worker hasn't claimed it immediately
+    // Verify that the worker has not claimed it immediately
     tokio::time::sleep(Duration::from_millis(500)).await;
     let tasks_mid = load_tasks(&mut conn, exec_id).await;
     assert_eq!(tasks_mid.len(), 1);

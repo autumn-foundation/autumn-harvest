@@ -1,4 +1,4 @@
-//! Fixture (review round 2, finding 3): two inherent impls whose SELF TYPE
+//! Fixture: two inherent impls whose SELF TYPE
 //! shares a last path segment, with different bodies.
 //!
 //! Compiled standalone (no workspace deps) with:
@@ -7,9 +7,9 @@
 //!
 //! rustc 1.98 prints the impl body path WITH its module prefix
 //! (`a::<impl at shadowed_impls.rs:..>::run`) and the call site fully qualified
-//! (`b::Worker::run(move _1)`), so the module path is recoverable on both sides.
-//! Keying the impl index on the bare self-type name (`Worker`) collapsed the two
-//! and `or_insert_with` kept whichever came first — a call to `b::Worker::run`
+//! (`b::Worker::run(move _1)`). So the module path is recoverable on both sides.
+//! An impl index keyed on the bare self-type name (`Worker`) collapsed the two,
+//! and `or_insert_with` kept whichever came first. A call to `b::Worker::run`
 //! was then analyzed as `a::Worker::run`'s clean body.
 //!
 //! `WorkflowContext` is a stand-in, as in `format_and_outparams.rs`; every

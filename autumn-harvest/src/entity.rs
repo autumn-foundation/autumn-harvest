@@ -563,7 +563,6 @@ where
             raw_input,
         } = self;
         let drops_input = !trust_start_input && ctx.start_source().carries_caller_input();
-        // Decode the raw input only when the run keeps it.
         if let Some(raw) = raw_input.filter(|_| !drops_input) {
             checkpoint = serde_json::from_value(raw)?;
         }

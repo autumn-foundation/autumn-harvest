@@ -2,23 +2,22 @@
 //!
 //! These are the **money tests** for the issue's headline determinism AC:
 //!
-//! > on replay the recorded fire instant is used verbatim and the calendar is
-//! > **not** re-read; an operator calendar edit can never change an
+//! > On replay the recorded fire instant is used verbatim. The calendar is
+//! > **not** re-read. An operator calendar edit can never change an
 //! > already-armed timer's deadline.
 //!
 //! ## How each test fails on regression
 //!
-//! Every test replays a history whose recorded `TimerStarted { duration_secs }`
-//! was produced by one calendar, against a replayer configured with a calendar
-//! that **would compute a different answer** (or none at all). If the freeze
-//! ever stopped being load-bearing — i.e. if the resolution closure re-ran on
-//! replay — the recomputed duration would differ and
+//! Each test replays a history whose `TimerStarted { duration_secs }` came from
+//! one calendar. The replayer has a calendar that **would compute a different
+//! answer**, or none at all. Suppose the resolution closure re-ran on replay.
+//! The recomputed duration would then differ.
 //! `HistoryMatcher::match_timer_strict`'s exact `!=` comparison surfaces it as
 //! `ReplayStatus::NonDeterminismDetected { kind: TimerMismatch, .. }`.
 //!
-//! That makes the recorded timer duration itself the probe: no separate
-//! branch-marker activity is needed, so these tests cannot pass vacuously the
-//! way a "workflow completes either way" fixture would.
+//! So the recorded timer duration itself is the probe. No branch-marker
+//! activity is needed. These tests cannot pass vacuously, as a "workflow
+//! completes either way" fixture would.
 //!
 //! Verified by mutation during development: forcing the closure to recompute on
 //! replay turns tests 1–3 RED with exactly that error.
@@ -136,11 +135,10 @@ fn replayer(calendars: Option<BusinessCalendars>) -> WorkflowReplayer {
 /// snapshot is registered on the live worker's builder, and replay paths default
 /// to empty shared state.
 ///
-/// If the resolution closure re-ran on replay it would find no calendar and
-/// freeze an `UnknownCalendar` outcome instead of the recorded deadline; because
-/// the value is frozen, the closure is never invoked and the replay succeeds.
-/// This is what makes replay and deploy-canary contexts safe *by construction*
-/// rather than by a special-case guard.
+/// A closure that re-ran on replay would find no calendar. It would freeze an
+/// `UnknownCalendar` outcome instead of the recorded deadline. The value is
+/// frozen, so the closure never runs and the replay succeeds. So replay and
+/// deploy-canary contexts are safe *by construction*, not by a special guard.
 #[tokio::test]
 async fn replay_business_day_history_with_no_calendars_registered_succeeds() {
     let report = replayer(None).replay_from_events(canonical_history()).await;
@@ -158,8 +156,8 @@ async fn replay_business_day_history_with_no_calendars_registered_succeeds() {
 /// already-armed timer's deadline.**
 ///
 /// The replay calendar marks the frozen deadline's own date (Mon 2026-07-06) as
-/// a holiday, so a recomputation would resolve to Tue 07-07 — a different
-/// `duration_secs` — and `match_timer_strict` would report `TimerMismatch`.
+/// a holiday. A recomputation would resolve to Tue 07-07, a different
+/// `duration_secs`, and `match_timer_strict` would report `TimerMismatch`.
 #[tokio::test]
 async fn replay_business_day_history_with_mutated_calendar_keeps_frozen_deadline() {
     let mutated = BusinessCalendars::new().with_calendar(
@@ -184,10 +182,10 @@ async fn replay_business_day_history_with_mutated_calendar_keeps_frozen_deadline
 /// The issue's success metric: replays to the **identical** fire instant in
 /// **100%** of runs, including after the calendar is edited post-arming.
 ///
-/// Each of the 1000 fixtures is genuinely distinct — the anchor's date,
-/// time-of-day, and the recorded skip set all vary — and each is replayed under
-/// a calendar that excludes the fixture's own deadline date, so a recompute is
-/// guaranteed to produce a different answer. A single leak fails the run.
+/// Each of the 1000 fixtures is genuinely distinct: the anchor's date,
+/// time-of-day and recorded skip set all vary. Each replays under a calendar
+/// that excludes the fixture's own deadline date. So a recompute must produce
+/// a different answer. A single leak fails the run.
 #[tokio::test]
 async fn replay_business_day_1000_distinct_fixtures_all_succeed() {
     let base = utc("2026-01-05T00:00:00Z"); // a Monday
@@ -200,13 +198,11 @@ async fn replay_business_day_1000_distinct_fixtures_all_succeed() {
             + chrono::Duration::days(i64::from(i % 200))
             + chrono::Duration::minutes(i64::from(i % 1440));
         // Vary the recorded deadline between 1 and 6 calendar days out. The
-        // fixture is self-consistent by construction: the recorded duration is
-        // derived from (deadline - anchor), which is exactly what a live run
-        // would have recorded for THAT frozen pair.
+        // recorded duration is (deadline - anchor), exactly what a live run
+        // would record for THAT frozen pair.
         let deadline = anchor + chrono::Duration::days(1 + i64::from(i % 6));
-        // Vary the recorded skip set too, so no two fixtures share a payload
-        // (the doc comment's "genuinely distinct" claim is load-bearing: an
-        // all-identical corpus would make 1000 iterations no stronger than 1).
+        // Vary the recorded skip set too, so no two fixtures share a payload.
+        // An all-identical corpus would make 1000 iterations no stronger than 1.
         let skipped: Vec<NaiveDate> = (0..(i % 3))
             .map(|k| (anchor + chrono::Duration::days(i64::from(k) + 1)).date_naive())
             .collect();
@@ -246,8 +242,8 @@ async fn replay_business_day_missing_freeze_event_diverges() {
     let report = replayer(Some(BusinessCalendars::new().with_calendar("biz", [])))
         .replay_from_events(events)
         .await;
-    // Assert the specific classification, not merely "not success" — a bare
-    // `!ReplaySucceeded` would also be satisfied by an unrelated failure and
+    // Assert the specific classification, not merely "not success". An
+    // unrelated failure also satisfies a bare `!ReplaySucceeded`. That check
     // could not detect a regression that stopped reporting the missing freeze.
     match &report.status {
         ReplayStatus::NonDeterminismDetected {
@@ -344,12 +340,11 @@ async fn replay_business_day_frozen_rejection_survives_a_calendar_extension() {
     // would SUCCEED and the workflow would complete instead of failing.
     let generous = BusinessCalendars::new().with_calendar_covering("biz", [], day(2030, 12, 31));
     let report = replayer(Some(generous)).replay_from_events(events).await;
-    // The SAME failure, not merely *a* failure: assert the recorded message is
-    // reproduced verbatim, so a recompute that failed for some other reason
-    // could not pass this test.
-    // Issue #952: this history ends in a terminal `WorkflowFailed`, so a replay
-    // that reproduces the failure is a clean replay (`ReplaySucceeded`) and the
-    // reproduced error is read through `failure_message()`.
+    // The SAME failure, not merely *a* failure. The recorded message must
+    // come back verbatim, so a recompute that failed otherwise cannot pass.
+    // Issue #952: this history ends in a terminal `WorkflowFailed`. A replay
+    // that reproduces the failure is a clean replay (`ReplaySucceeded`). Read
+    // the reproduced error through `failure_message()`.
     assert!(
         !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "a frozen rejection must not surface as non-determinism:\n{report}"

@@ -409,10 +409,9 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
             .any(|check| check["name"] == "worker_coverage")
     );
 
-    // Issue #797: the scanner-liveness check is part of the report, and an
-    // API-only process (this test runs no worker, so no control loops) passes
-    // with an empty registry rather than reporting seven phantom wedged
-    // scanners.
+    // Issue #797: the scanner-liveness check is part of the report. This test
+    // runs no worker, so it has no control loops. An API-only process passes
+    // with an empty registry and reports no phantom wedged scanners.
     let scanner_check = body["checks"]
         .as_array()
         .expect("checks should be an array")

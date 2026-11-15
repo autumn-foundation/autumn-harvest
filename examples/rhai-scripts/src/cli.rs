@@ -148,7 +148,6 @@ pub async fn main(cli: Cli) -> ExitCode {
     }
 }
 
-/// Run one command.
 async fn dispatch(cli: Cli) -> Result<u8, Stop> {
     match cli.command {
         Command::Run {

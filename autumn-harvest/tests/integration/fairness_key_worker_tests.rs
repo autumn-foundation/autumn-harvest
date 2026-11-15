@@ -78,7 +78,6 @@ struct Row {
     fairness_key: Option<String>,
 }
 
-/// A count.
 #[derive(diesel::QueryableByName)]
 struct Count {
     #[diesel(sql_type = diesel::sql_types::BigInt)]

@@ -40,10 +40,10 @@
 //! previous statement's writes.
 //!
 //! Evidence is `pg_stat_statements` call/buffer counts, not wall-clock.
-//! Wall-clock is not admissible on a shared-vCPU machine. This mirrors
-//! `scheduler_overdue_pass_perf.rs`'s harness for the sibling investigation
-//! into a periodic background pass, not a per-HTTP-request path: same
-//! tool, same fixture-then-snapshot structure.
+//! Wall-clock is not admissible on a shared-vCPU machine. The harness
+//! mirrors `scheduler_overdue_pass_perf.rs`, which measures another
+//! periodic background pass: same tool, same fixture-then-snapshot
+//! structure.
 
 #![allow(clippy::too_many_lines)]
 
@@ -414,8 +414,8 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64) -> SizePoint {
 /// Sweeps three fixture sizes so the artifact demonstrates the call-count
 /// shape directly, not just one point on the curve. Run once against the
 /// pre-fix code (`PERF_LABEL=before`), once against the post-fix code
-/// (`PERF_LABEL=after`) -- see
-/// `autumn-harvest/scripts/mutex_lease_reclaim_perf_repro.sh`.
+/// (`PERF_LABEL=after`) -- see the "Reproduce" section of
+/// `docs/performance-mutex-lease-reclaim.md`.
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
             docs/performance-mutex-lease-reclaim.md"]

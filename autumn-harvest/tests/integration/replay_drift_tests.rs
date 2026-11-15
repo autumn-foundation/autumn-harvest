@@ -259,8 +259,8 @@ async fn reordered_activities_are_reported_as_drift_with_full_detail() {
     assert_eq!(report.exit_code(), 1, "divergence must exit non-zero");
 }
 
-/// Every fixture in a drifted bundle is reported — the gate must not stop at
-/// the first divergence, or an operator only ever sees one of N regressions.
+/// Every fixture in a drifted bundle is reported. A gate that stops at the
+/// first divergence shows an operator only one of N regressions.
 #[tokio::test]
 async fn all_diverged_fixtures_are_reported_not_just_the_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -282,9 +282,9 @@ async fn all_diverged_fixtures_are_reported_not_just_the_first() {
 // AC5 — the false-green guard
 // ===========================================================================
 
-/// A gate that passes on an empty bundle is worse than no gate: a typo'd
+/// A gate that passes on an empty bundle is worse than no gate. A mistyped
 /// `--output-dir`, a failed export, or a filter that matched nothing would all
-/// report "green" while verifying nothing.
+/// report "green" while it verifies nothing.
 #[tokio::test]
 async fn empty_bundle_is_not_clean_and_exits_non_zero() {
     let dir = tempfile::tempdir().unwrap();
@@ -339,8 +339,8 @@ async fn missing_bundle_directory_is_a_harness_error() {
     assert_eq!(report.exit_code(), 2);
 }
 
-/// A fixture naming a workflow this binary does not register must be a harness
-/// error (exit 2), not a silent pass — otherwise a renamed `#[workflow]` fn
+/// A fixture that names a workflow this binary does not register is a harness
+/// error (exit 2), not a silent pass. Otherwise a renamed `#[workflow]` fn
 /// silently drops its whole in-flight population out of the gate.
 #[tokio::test]
 async fn unregistered_workflow_blocks_the_gate() {
@@ -551,16 +551,15 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
     );
 }
 
-/// The export stops accumulating once it hits the aggregate byte budget, so a
-/// bundle can be *smaller than the sample the operator asked for* even though
-/// every shard was reachable and every fixture present replays clean.
+/// The export stops at the aggregate byte budget. So a bundle can be *smaller
+/// than the sample the operator asked for*, although every shard was reachable
+/// and every present fixture replays clean.
 ///
-/// Recording that on the manifest is not enough on its own: a CI gate reads the
-/// exit code, not the rendered report, so a size-cut bundle that exits `0`
-/// certifies the build against a quietly-trimmed subset. The bytes are dropped
-/// in export order, so what goes missing is the *tail* of each type's
-/// risk-ordered slice — precisely the executions the `oldest` default exists to
-/// prioritise.
+/// A manifest record alone is not enough. A CI gate reads the exit code, not
+/// the rendered report. A size-cut bundle that exits `0` certifies the build
+/// against a quietly-trimmed subset. The export drops bytes in export order, so
+/// it loses the *tail* of each type's risk-ordered slice. Those are precisely
+/// the executions that the `oldest` default prioritises.
 #[tokio::test]
 async fn a_size_truncated_bundle_blocks_the_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -615,12 +614,12 @@ async fn a_size_truncated_bundle_blocks_the_gate() {
 /// The export records the failure and moves on, so the bundle silently holds
 /// fewer fixtures than the sample chose.
 ///
-/// This is the false-GREEN the manifest exists to prevent, and the count check
-/// alone cannot see it: the manifest's `sampled_total` counts *survivors*, so it
-/// agrees with the bundle exactly. Without a dedicated signal the gate replays a
-/// biased subset — biased against the largest histories, which are the longest
-/// running and therefore the most likely to span the code change under test —
-/// and exits `0`.
+/// The manifest exists to prevent this false GREEN, and the count check alone
+/// cannot see it. The manifest's `sampled_total` counts *survivors*, so it
+/// agrees with the bundle exactly. Without a dedicated signal the gate replays
+/// a biased subset and exits `0`. The bias is against the largest histories.
+/// Those run longest, so they are the most likely to span the code change
+/// under test.
 #[tokio::test]
 async fn an_export_that_dropped_candidates_blocks_the_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -732,10 +731,10 @@ async fn partial_shard_coverage_can_block_the_gate() {
 /// carries no manifest at all.
 ///
 /// The flag means "never certify a partial read of the fleet". A missing or
-/// unparseable manifest is not evidence of complete coverage — it is the absence
-/// of evidence, which is exactly what the flag exists to refuse. Treating it as
-/// satisfied turns a lost artifact, a `.gitignore`d file, or a CI glob that
-/// missed one filename into a silently green release gate.
+/// unparseable manifest is not evidence of complete coverage. It is the absence
+/// of evidence, which the flag exists to refuse. Treating it as satisfied turns
+/// a lost artifact, a `.gitignore`d file, or a CI glob that missed one filename
+/// into a silently green release gate.
 #[tokio::test]
 async fn require_complete_coverage_fails_closed_without_a_manifest() {
     let dir = tempfile::tempdir().unwrap();
@@ -767,12 +766,12 @@ async fn require_complete_coverage_fails_closed_without_a_manifest() {
 
 /// Same fail-closed rule when the manifest exists but cannot be parsed.
 ///
-/// The rung moved from `4` to `2` in Codex round 21, and the move is the point:
-/// a corrupt manifest disables the rung-`2` and rung-`3` guards for *every*
-/// caller, so blocking only under the opt-in `require_complete_coverage` left the
-/// default gate green on a damaged bundle. Rung `2` ("the gate could not fully
-/// run") both describes it correctly and dominates rung `4`, so this bundle is
-/// now refused whether or not the flag is set — see
+/// The rung moved from `4` to `2`, and the move is the point. A corrupt
+/// manifest disables the rung-`2` and rung-`3` guards for *every* caller. So
+/// blocking only under the opt-in `require_complete_coverage` left the default
+/// gate green on a damaged bundle. Rung `2` ("the gate could not fully run")
+/// describes it correctly and dominates rung `4`. So the gate now refuses this
+/// bundle whether or not the flag is set. See
 /// `corrupt_manifest_blocks_the_default_gate`.
 #[tokio::test]
 async fn require_complete_coverage_fails_closed_on_a_corrupt_manifest() {
@@ -854,11 +853,11 @@ async fn drift_report_display_names_the_diverged_workflow() {
 /// A workflow that **completes** against a history still holding unconsumed
 /// events is drift, not a clean replay.
 ///
-/// This is the shape of a real regression that deleting a step produces: the
-/// new code returns `Ok` two activities early, so nothing "mismatches" — the
-/// replay simply stops short. A gate that only compared command-by-command
-/// would call this clean and certify a build that abandons in-flight work
-/// mid-pipeline. It must land in `diverged`.
+/// A deleted step produces this regression. The new code returns `Ok` two
+/// activities early, so nothing "mismatches" — the replay simply stops short.
+/// A gate that only compared command-by-command would call this clean. It
+/// would certify a build that abandons in-flight work mid-pipeline. It must
+/// land in `diverged`.
 #[tokio::test]
 async fn early_completion_against_unconsumed_history_is_drift_not_a_pass() {
     fn stops_early<'a>(
@@ -894,12 +893,12 @@ async fn early_completion_against_unconsumed_history_is_drift_not_a_pass() {
 
 /// A workflow that returns `Err` during replay is reported as drift too.
 ///
-/// The distinction matters for the *verdict*, not the taxonomy: the candidate
+/// The distinction matters for the *verdict*, not the taxonomy. The candidate
 /// build cannot resume this execution, whether it failed a determinism check or
 /// panicked on data the old build handled. Either way the run does not survive
 /// the deploy, so the gate must not exit 0. The `kind` is `None` because there
-/// is no recorded-vs-emitted command pair to name — the failure is the workflow's
-/// own error, and it rides `first_divergence` instead.
+/// is no recorded-vs-emitted command pair to name. The failure is the
+/// workflow's own error, and it rides `first_divergence` instead.
 #[tokio::test]
 async fn a_workflow_that_errors_during_replay_is_reported_not_swallowed() {
     fn always_errs<'a>(
@@ -935,10 +934,10 @@ async fn a_workflow_that_errors_during_replay_is_reported_not_swallowed() {
 /// A blocked fixture outranks a divergence.
 ///
 /// The ordering is not cosmetic. Exit 1 says "your code regressed"; exit 2 says
-/// "this gate did not fully run". A bundle containing both must report 2,
-/// because the divergence count is a *lower bound* — the blocked fixture might
-/// have diverged too, and an operator who reads a `1` treats the listed
-/// divergences as the complete set.
+/// "this gate did not fully run". A bundle with both must report 2, because
+/// the divergence count is a *lower bound*. The blocked fixture might have
+/// diverged too. An operator who reads a `1` treats the listed divergences as
+/// the complete set.
 #[tokio::test]
 async fn a_blocked_fixture_outranks_a_divergence_in_the_exit_code() {
     let dir = tempfile::tempdir().unwrap();
@@ -963,9 +962,9 @@ async fn a_blocked_fixture_outranks_a_divergence_in_the_exit_code() {
 
 /// A divergence outranks the coverage rungs (3 and 4).
 ///
-/// An incomplete sample that nonetheless caught a real regression must report
-/// the regression: exit 4 reads as "inconclusive, re-run", which would invite an
-/// operator to widen the sample and promote — shipping the drift.
+/// An incomplete sample that caught a real regression must report the
+/// regression. Exit 4 reads as "inconclusive, re-run". That invites an operator
+/// to widen the sample and promote, which ships the drift.
 #[tokio::test]
 async fn a_divergence_outranks_the_coverage_rungs() {
     let dir = tempfile::tempdir().unwrap();
@@ -1063,8 +1062,8 @@ async fn is_clean_always_agrees_with_exit_code_on_every_rung() {
 /// A workflow whose control flow depends on `should_continue_as_new()`.
 ///
 /// `continue_as_new_threshold` is a *deployment* setting
-/// (`HarvestBuilder::history_policy`), not a property of the recorded history —
-/// so the bundle cannot carry it and the gate must be told.
+/// (`HarvestBuilder::history_policy`), not a property of the recorded history.
+/// So the bundle cannot carry it, and the gate must be told.
 fn checkpointing_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1103,13 +1102,13 @@ fn checkpointed_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, exec_id, events)
 }
 
-/// Replaying under the DEFAULT policy when production runs a customized one
-/// reports drift for a workflow that never drifted — a false red that blocks a
-/// healthy deploy. `with_history_policy` is what makes the gate faithful.
+/// Production can run a customized policy. A replay under the DEFAULT policy
+/// then reports drift for a workflow that never drifted. That false red blocks
+/// a healthy deploy. `with_history_policy` makes the gate faithful.
 ///
-/// Both halves are asserted against the same bundle, because the builder is
-/// only meaningful as a pair: if the default-policy replay were also clean, the
-/// test would pass without the fix doing anything.
+/// Both halves assert against the same bundle, because only the pair is
+/// meaningful. If the default-policy replay were also clean, the test would
+/// pass without the fix doing anything.
 #[tokio::test]
 async fn bundle_replays_under_the_configured_history_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -1165,9 +1164,9 @@ async fn workflow_replayer_bundle_delegation_carries_the_history_policy() {
 
 /// A workflow that embeds its own business `workflow_id` in an activity input.
 ///
-/// `workflow_id` lives in no `WorkflowEvent`, so a fixture that omits it leaves
-/// the replay context with `""` unless a fallback is threaded in — making this
-/// the cheapest way to prove the fallback actually arrives.
+/// `workflow_id` lives in no `WorkflowEvent`. A fixture that omits it leaves the
+/// replay context with `""` unless a fallback is threaded in. So this is the
+/// cheapest way to prove that the fallback arrives.
 fn workflow_id_bearing_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1181,9 +1180,9 @@ fn workflow_id_bearing_workflow<'a>(
     })
 }
 
-/// An in-flight history recorded by a run whose business `workflow_id` was
-/// `order-42`, in a snapshot that does **not** carry the id — a hand-built
-/// fixture, or one exported before issue #698 threaded the field.
+/// An in-flight history of a run whose business `workflow_id` was `order-42`.
+/// The snapshot does **not** carry the id, like a hand-built fixture or one
+/// exported before issue #698 threaded the field.
 fn workflow_id_snapshot_json(workflow_name: &str) -> String {
     let events = vec![
         started_event(),
@@ -1198,14 +1197,14 @@ fn workflow_id_snapshot_json(workflow_name: &str) -> String {
 }
 
 /// `WorkflowReplayer::replay_bundle` delegates to `ReplayVerifier`; every
-/// configured replay-context fallback must survive that hop (Codex round-10 P2).
+/// configured replay-context fallback must survive that hop.
 ///
-/// Issue #614 already proved this for `history_policy`. The four
-/// `HistorySnapshot`-metadata fallbacks — `context_headers`,
-/// `execution_timeout`, `parent_execution_id`, `workflow_id` — were still being
-/// discarded, so a caller who configured them on the replayer and then called
-/// `replay_bundle` silently replayed under a *different* context and got drift
-/// for a workflow that never drifted.
+/// Issue #614 already proved this for `history_policy`. The delegation still
+/// discarded the four `HistorySnapshot`-metadata fallbacks: `context_headers`,
+/// `execution_timeout`, `parent_execution_id` and `workflow_id`. A caller who
+/// configured them on the replayer and then called `replay_bundle` replayed
+/// under a *different* context. That caller got drift for a workflow that
+/// never drifted.
 #[tokio::test]
 async fn workflow_replayer_bundle_delegation_carries_the_workflow_id_fallback() {
     let dir = tempfile::tempdir().unwrap();
@@ -1223,9 +1222,9 @@ async fn workflow_replayer_bundle_delegation_carries_the_workflow_id_fallback() 
     );
 }
 
-/// The control that keeps the fallback test honest: without the builder call the
-/// replay context resolves `workflow_id` to `""`, the activity input differs, and
-/// the fixture genuinely diverges.
+/// Control for the fallback test. Without the builder call the replay context
+/// resolves `workflow_id` to `""`, the activity input differs, and the fixture
+/// genuinely diverges.
 ///
 /// Without this, the test above would pass even if the fallback did nothing.
 #[tokio::test]
@@ -1247,14 +1246,14 @@ async fn the_workflow_id_fallback_genuinely_changes_the_outcome() {
 }
 
 // ===========================================================================
-// The execution's queue must survive the fixture round trip (Codex round-12 P1)
+// The execution's queue must survive the fixture round trip
 // ===========================================================================
 
 /// A workflow that embeds its own execution queue in an activity input.
 ///
-/// `ctx.queue_name()` is sourced from the live worker's task row and lives in no
-/// `WorkflowEvent`, so a fixture that omits it leaves the replay context at the
-/// empty-string default — the same family as `context_headers` / `workflow_id`.
+/// `ctx.queue_name()` comes from the live worker's task row and lives in no
+/// `WorkflowEvent`. A fixture that omits it leaves the replay context at the
+/// empty-string default, like `context_headers` and `workflow_id`.
 fn queue_bearing_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1299,8 +1298,8 @@ fn queue_snapshot_json(workflow_name: &str, queue: Option<&str>) -> String {
 /// workflow that branches on `ctx.queue_name()` replays clean.
 ///
 /// Without the field, `run_workflow_canary` leaves the replay context's queue at
-/// `""`, the recorded activity input no longer matches, and an **unchanged**
-/// candidate false-reports drift — the worst outcome a release gate can produce.
+/// `""`. The recorded activity input then no longer matches. An **unchanged**
+/// candidate false-reports drift, the worst outcome a release gate can produce.
 #[tokio::test]
 async fn a_snapshot_carrying_the_queue_replays_clean() {
     let dir = tempfile::tempdir().unwrap();
@@ -1321,9 +1320,8 @@ async fn a_snapshot_carrying_the_queue_replays_clean() {
     );
 }
 
-/// The control that keeps the money test honest: a snapshot that omits the queue
-/// (a legacy export) genuinely diverges, so the test above cannot pass on a
-/// no-op.
+/// Control for the money test. A snapshot that omits the queue (a legacy
+/// export) genuinely diverges, so the test above cannot pass on a no-op.
 #[tokio::test]
 async fn a_snapshot_without_the_queue_genuinely_diverges() {
     let dir = tempfile::tempdir().unwrap();
@@ -1343,7 +1341,7 @@ async fn a_snapshot_without_the_queue_genuinely_diverges() {
 }
 
 /// `replay_bundle` delegates to `ReplayVerifier`; the replayer's own configured
-/// queue fallback must survive that hop, exactly like `workflow_id` (round-10 P2).
+/// queue fallback must survive that hop, exactly like `workflow_id`.
 #[tokio::test]
 async fn workflow_replayer_bundle_delegation_carries_the_queue_fallback() {
     let dir = tempfile::tempdir().unwrap();
@@ -1368,11 +1366,11 @@ async fn workflow_replayer_bundle_delegation_carries_the_queue_fallback() {
 /// A manifest declaring more fixtures than the bundle holds means files went
 /// missing after the export — a truncated artifact upload, a partial copy.
 ///
-/// Every surviving fixture can replay cleanly, so neither the divergence rung
-/// nor `require_complete_coverage` catches it: the manifest's shard status still
-/// reads `complete`, because the *export* was complete; it was the *bundle* that
-/// lost files. Left unguarded, the gate certifies a strict subset of the sample
-/// and reports success.
+/// Every surviving fixture can replay cleanly, so the divergence rung cannot
+/// catch it. Nor can `require_complete_coverage`: the shard status still reads
+/// `complete`, because the *export* was complete. The *bundle* lost files.
+/// Left unguarded, the gate certifies a strict subset of the sample and
+/// reports success.
 #[tokio::test]
 async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -1471,8 +1469,8 @@ async fn a_bundle_whose_fixtures_were_all_skipped_verifies_nothing() {
 }
 
 /// A workflow type with in-flight work but **zero** sampled fixtures was never
-/// replayed at all — materially worse than ordinary truncation, where at least
-/// some executions of the type are checked.
+/// replayed at all. That is materially worse than ordinary truncation, which
+/// still checks some executions of the type.
 #[tokio::test]
 async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
     let dir = tempfile::tempdir().unwrap();
@@ -1549,8 +1547,8 @@ async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
 
 /// A workflow that passes a real, non-trivial input to its activity.
 ///
-/// The input matters: the guard exists because a claim-check envelope is
-/// compared *against a real value*, so a workflow passing `Value::Null` could
+/// The input matters. The guard exists because replay compares a claim-check
+/// envelope *against a real value*. A workflow that passes `Value::Null` could
 /// not surface the bug at all.
 fn payload_bearing_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1571,10 +1569,9 @@ fn payload_bearing_workflow<'a>(
 /// An in-flight history whose activity input is either the real payload or a
 /// large-payload **offload reference envelope** (issue #524) standing in for it.
 ///
-/// The envelope is built by hand rather than through `PayloadOffloader` so the
-/// fixture needs no `PayloadStore`: the wire shape is the contract the guard
-/// keys on, and building it here proves the guard reads the same discriminator
-/// the offloader writes.
+/// The envelope is built by hand, not through `PayloadOffloader`, so the
+/// fixture needs no `PayloadStore`. The guard keys on the wire shape. Building
+/// it here proves the guard reads the same discriminator the offloader writes.
 fn payload_snapshot_json(workflow_name: &str, offloaded: bool) -> String {
     let real = serde_json::json!({"blob": "x".repeat(64)});
     let input = if offloaded {
@@ -1602,12 +1599,12 @@ fn payload_snapshot_json(workflow_name: &str, offloaded: bool) -> String {
 
 /// The money test for the offload guard.
 ///
-/// The export path loads history with `load_history_undecoded`, so on a
-/// deployment with a `PayloadStore` registered any payload over the offload
-/// threshold reaches the bundle as a claim-check envelope. The bundle walk
-/// builds its `WorkflowReplayer` with `payload_offloader: None` and cannot
-/// inflate it, so a **healthy** workflow computing the real input would be
-/// compared against the envelope and reported as drift.
+/// The export path loads history with `load_history_undecoded`. With a
+/// `PayloadStore` registered, any payload over the offload threshold reaches
+/// the bundle as a claim-check envelope. The bundle walk builds its
+/// `WorkflowReplayer` with `payload_offloader: None` and cannot inflate it.
+/// A **healthy** workflow that computes the real input would then mismatch
+/// the envelope and be reported as drift.
 ///
 /// That is a false red on a clean deploy — the single worst outcome a release
 /// gate can produce. It must be a harness error (exit 2) naming the fix.
@@ -1682,9 +1679,9 @@ async fn a_payload_bearing_fixture_without_envelopes_is_untouched() {
 
 /// The discriminator appearing inside ordinary payload *data* must not block.
 ///
-/// The guard fast-rejects on a raw substring scan, so a workflow whose own JSON
-/// happens to mention the key reaches the structured check — which must find no
-/// real envelope and let the fixture through.
+/// The guard fast-rejects on a raw substring scan. A workflow whose own JSON
+/// mentions the key reaches the structured check. That check must find no real
+/// envelope and let the fixture through.
 #[tokio::test]
 async fn the_envelope_key_appearing_as_plain_data_does_not_block() {
     let dir = tempfile::tempdir().unwrap();
@@ -1720,10 +1717,9 @@ async fn the_envelope_key_appearing_as_plain_data_does_not_block() {
 /// An in-flight history whose activity input is a **codec envelope**
 /// (issue #608) standing in for the real payload.
 ///
-/// Built by hand rather than through a `PayloadCodecs` registry so the fixture
-/// needs no codec: the wire shape is the contract the guard keys on, and
-/// building it here proves the guard reads the same discriminator the codec
-/// encode path writes.
+/// Built by hand, not through a `PayloadCodecs` registry, so the fixture needs
+/// no codec. The guard keys on the wire shape. Building it here proves the
+/// guard reads the same discriminator the codec encode path writes.
 fn codec_snapshot_json(workflow_name: &str) -> String {
     let events = vec![
         started_event(),
@@ -1741,17 +1737,17 @@ fn codec_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, ExecutionId::new(), events)
 }
 
-/// The money test for the codec guard (Codex round-10 P1).
+/// The money test for the codec guard.
 ///
-/// The export loads history with `load_history_undecoded`, and
-/// `read_path_decoder` returns `None` whenever `decode_payloads_on_read` is
-/// left at its default `false` — so on a codec-**encrypting** deployment every
-/// payload-bearing field reaches the bundle as ciphertext in a codec envelope.
+/// The export loads history with `load_history_undecoded`. `read_path_decoder`
+/// returns `None` while `decode_payloads_on_read` keeps its default `false`.
+/// So on a codec-**encrypting** deployment every payload-bearing field reaches
+/// the bundle as ciphertext in a codec envelope.
 ///
 /// The bundle walk builds its `WorkflowReplayer` with no codec registry and
-/// cannot decode it, so a **healthy** workflow computing the real plaintext
-/// input would be compared against the envelope and reported as drift: a false
-/// red blocking a clean deploy, the single worst outcome a release gate can
+/// cannot decode it. A **healthy** workflow that computes the real plaintext
+/// input would then mismatch the envelope and be reported as drift. That false
+/// red blocks a clean deploy, the single worst outcome a release gate can
 /// produce. It must be a harness error (exit 2) naming the fix.
 #[tokio::test]
 async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() {
@@ -1794,7 +1790,7 @@ async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() 
     );
 }
 
-/// The money test for the contradicted-emptiness rule (Codex round-18 P1).
+/// The money test for the contradicted-emptiness rule.
 ///
 /// `allow_empty_bundle(true)` is the right setting for a fleet that may
 /// legitimately be idle. But an **export outage** produces an empty bundle too:
@@ -1806,9 +1802,9 @@ async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() 
 /// candidates — so nothing failed to fetch and no size ceiling was hit. Rung 4
 /// reads the status but only under `require_complete_coverage`, off by default.
 ///
-/// Honoring the opt-out therefore exits 0 on a bundle that inspected nothing —
-/// a release certified against zero workflows, the worst verdict this gate can
-/// produce.
+/// Honoring the opt-out therefore exits 0 on a bundle that inspected nothing.
+/// That certifies a release against zero workflows, the worst verdict this
+/// gate can produce.
 #[tokio::test]
 async fn an_empty_bundle_from_a_failed_export_is_not_licensed_by_allow_empty_bundle() {
     let dir = tempfile::tempdir().unwrap();
@@ -1852,8 +1848,8 @@ async fn an_empty_bundle_from_a_failed_export_is_not_licensed_by_allow_empty_bun
 }
 
 /// A **partial** read is the same defect as a total one when nothing was
-/// verified: the shards that were reachable held no in-flight work, but the
-/// unreachable ones are exactly where the drift would have been.
+/// verified. The reachable shards held no in-flight work. The drift would be
+/// exactly in the unreachable ones.
 #[tokio::test]
 async fn an_empty_bundle_from_a_partial_export_is_not_licensed_either() {
     let dir = tempfile::tempdir().unwrap();
@@ -1887,9 +1883,9 @@ async fn an_empty_bundle_from_a_partial_export_is_not_licensed_either() {
     );
 }
 
-/// The complement, so the fix does not simply break the flag it is tightening:
-/// a genuinely idle fleet — every shard read, nothing in flight — still exits 0
-/// under the opt-out.
+/// The complement, so the fix does not break the flag it tightens. A genuinely
+/// idle fleet (every shard read, nothing in flight) still exits 0 under the
+/// opt-out.
 #[tokio::test]
 async fn an_empty_bundle_with_complete_coverage_is_still_licensed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1931,9 +1927,9 @@ async fn an_empty_bundle_with_complete_coverage_is_still_licensed() {
 ///
 /// The exporter writes the manifest unconditionally — alongside the fixtures,
 /// and even when it produced none (see `build_bundle_files`). So a
-/// Harvest-produced bundle always carries one, and "no manifest" means the
-/// bundle did not come from the exporter: a hand-assembled directory, or a gate
-/// binary pointed at the wrong path. That is not the export-outage case, and
+/// Harvest-produced bundle always carries one. "No manifest" means the bundle
+/// did not come from the exporter: a hand-assembled directory, or a gate binary
+/// pointed at the wrong path. That is not the export-outage case.
 /// `require_complete_coverage(true)` is the lever for an operator who wants
 /// absent evidence to fail closed.
 ///
@@ -1985,13 +1981,13 @@ fn erased_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, ExecutionId::new(), events)
 }
 
-/// The money test for the erasure guard (Codex round-16 P2).
+/// The money test for the erasure guard.
 ///
-/// A bundle acquires an erased fixture two ways, and the second needs no race:
-/// the sample export selects an execution in flight and it completes and is
-/// erased before the sequential per-candidate fetch reaches it; or the **batch**
-/// export, which has no in-flight restriction, exports a terminal execution —
-/// exactly the population erasure is allowed to touch.
+/// A bundle acquires an erased fixture two ways, and the second needs no race.
+/// First, the sample export selects an in-flight execution. It completes and is
+/// erased before the sequential per-candidate fetch reaches it. Second, the
+/// **batch** export has no in-flight restriction and exports a terminal
+/// execution. That is exactly the population erasure may touch.
 ///
 /// Either way the payload is gone irreversibly, so replaying it compares the
 /// candidate's real inputs against scrubbed placeholders. That is a false red
@@ -2039,9 +2035,9 @@ async fn an_erased_fixture_blocks_the_gate_instead_of_reporting_drift() {
 }
 
 /// The guard keys on a tombstone in a **payload field**, not on the string
-/// appearing anywhere in the document. A workflow whose own data happens to
-/// mention the marker is perfectly replayable, and blocking it would be a new
-/// false red invented by the fix for the old one.
+/// anywhere in the document. A workflow whose own data mentions the marker is
+/// perfectly replayable. Blocking it would be a new false red, invented by the
+/// fix for the old one.
 #[tokio::test]
 async fn a_payload_that_merely_mentions_the_tombstone_key_still_replays() {
     let dir = tempfile::tempdir().unwrap();
@@ -2074,8 +2070,8 @@ async fn a_payload_that_merely_mentions_the_tombstone_key_still_replays() {
     );
 }
 
-/// A fixture whose payload carries the issue #608 **undecodable marker** — the
-/// per-field graceful degrade a lossy decode writes when it *tried* and failed
+/// A fixture whose payload carries the issue #608 **undecodable marker**.
+/// A lossy decode writes this per-field marker when it *tried* and failed
 /// (unknown codec, bad base64, codec error, invalid JSON).
 ///
 /// Decoding was attempted and the plaintext is gone, so replaying it is just as
@@ -2187,7 +2183,7 @@ fn mentions_workflow<'a>(
 }
 
 // ===========================================================================
-// The candidate build id must reach every fixture context (Codex round-13 P1)
+// The candidate build id must reach every fixture context
 // ===========================================================================
 //
 // `ctx.build_id()` differs in kind from every other value this gate threads.
@@ -2197,11 +2193,11 @@ fn mentions_workflow<'a>(
 // configured** `WorkerConfig::build_id` through `WorkflowExecuteSpanMeta`, not
 // the execution's recorded `assigned_build_id`.
 //
-// That inverts the correct source. Recording the *exporting* worker's build into
-// the fixture and replaying under it would replay the **old** build's id — the
-// precise value that hides the divergence this gate exists to find. The
-// candidate build id is therefore a uniform, operator-supplied *replay-config*
-// value, deliberately with no snapshot field.
+// That inverts the correct source. A fixture could record the *exporting*
+// worker's build and replay under it. That replays the **old** build's id, the
+// precise value that hides the divergence this gate exists to find. So the
+// candidate build id is a uniform, operator-supplied *replay-config* value,
+// deliberately with no snapshot field.
 
 /// A workflow that embeds its worker's build id in an activity input.
 fn build_id_bearing_workflow<'a>(
@@ -2217,14 +2213,13 @@ fn build_id_bearing_workflow<'a>(
     })
 }
 
-/// The shape the finding actually describes: a **candidate-only branch**.
+/// The shape at risk: a **candidate-only branch**.
 ///
-/// Build `v2` takes a new path; every other build takes the historical one. The
-/// recorded history below was produced by `v1`, so replaying it under the
-/// candidate `v2` *must* surface the divergence — that is the gate working.
-/// With `build_id` stuck at `None` the candidate branch is unreachable, the old
-/// path replays cleanly, and the gate reports **false GREEN** on code that will
-/// diverge the moment it is promoted.
+/// Build `v2` takes a new path; every other build takes the historical one.
+/// `v1` produced the recorded history below, so a replay under the candidate
+/// `v2` *must* surface the divergence. With `build_id` stuck at `None` the
+/// candidate branch is unreachable and the old path replays cleanly. The gate
+/// then reports **false GREEN** on code that diverges the moment it is promoted.
 fn candidate_branching_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2268,11 +2263,11 @@ fn build_id_snapshot_json(workflow_name: &str, recorded_input: Value, activity: 
     serde_json::to_string(&snapshot).unwrap()
 }
 
-/// The money test: with the candidate build id threaded, a `v2`-only branch is
-/// actually taken during the gate, so the drift it will cause after promotion is
-/// caught **before** the deploy.
+/// The money test. With the candidate build id threaded, the gate takes a
+/// `v2`-only branch. So it catches the drift that branch causes after
+/// promotion **before** the deploy.
 ///
-/// Without the fix this reports clean — the exact false GREEN the finding names.
+/// Without the fix this reports clean, which is the false GREEN at issue.
 #[tokio::test]
 async fn a_candidate_only_branch_is_caught_when_the_build_id_is_threaded() {
     let dir = tempfile::tempdir().unwrap();
@@ -2297,10 +2292,9 @@ async fn a_candidate_only_branch_is_caught_when_the_build_id_is_threaded() {
     );
 }
 
-/// The control that keeps the money test honest: replayed as the *recorded*
-/// build, the same fixture and the same candidate code replay cleanly — so the
-/// divergence above is genuinely attributable to the candidate branch and not to
-/// some unrelated mismatch in the fixture.
+/// Control for the money test. Replayed as the *recorded* build, the same
+/// fixture and candidate code replay cleanly. So the candidate branch causes
+/// the divergence above, not some unrelated mismatch in the fixture.
 #[tokio::test]
 async fn the_same_fixture_replays_clean_under_the_recorded_build() {
     let dir = tempfile::tempdir().unwrap();
@@ -2324,9 +2318,9 @@ async fn the_same_fixture_replays_clean_under_the_recorded_build() {
     );
 }
 
-/// The value must reach the replay context verbatim, not merely flip a branch:
-/// a workflow that embeds `ctx.build_id()` in an activity input replays clean
-/// only when the configured build id matches what the recording worker reported.
+/// The value must reach the replay context verbatim, not merely flip a branch.
+/// A workflow that embeds `ctx.build_id()` in an activity input replays clean
+/// only when the configured build id matches the recording worker's.
 #[tokio::test]
 async fn the_configured_build_id_reaches_the_replayed_activity_input() {
     let dir = tempfile::tempdir().unwrap();
@@ -2349,8 +2343,8 @@ async fn the_configured_build_id_reaches_the_replayed_activity_input() {
     );
 }
 
-/// Control for the test above: with no build id configured the context reports
-/// `None`, the recorded input no longer matches, and the fixture diverges — so
+/// Control for the test above. With no build id configured the context reports
+/// `None`, the recorded input no longer matches, and the fixture diverges. So
 /// the delegation genuinely carries the value.
 #[tokio::test]
 async fn an_unset_build_id_genuinely_diverges() {
@@ -2374,9 +2368,9 @@ async fn an_unset_build_id_genuinely_diverges() {
     );
 }
 
-/// `ReplayVerifier` is the gate's own public surface — the CLI binary builds one
-/// directly rather than going through `WorkflowReplayer::replay_bundle` — so the
-/// candidate build id must be settable there too.
+/// `ReplayVerifier` is the gate's own public surface. The CLI binary builds one
+/// directly, not through `WorkflowReplayer::replay_bundle`. So the candidate
+/// build id must be settable there too.
 #[tokio::test]
 async fn replay_verifier_carries_the_candidate_build_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -2399,20 +2393,21 @@ async fn replay_verifier_carries_the_candidate_build_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Candidate payload caps (Codex round 20)
+// Candidate payload caps
 // ---------------------------------------------------------------------------
 
-/// Comfortably under the library default activity-input cap (2 MiB) and
-/// comfortably over the candidate cap the tests below configure, so the two
-/// configurations genuinely disagree about this one workflow.
+/// The activity-input cap that the candidate worker in the tests below sets.
 const CANDIDATE_CAP_BYTES: u64 = 512 * 1024;
+/// Comfortably under the library default activity-input cap (2 MiB) and over
+/// the candidate cap the tests below configure. So the two configurations
+/// genuinely disagree about this one workflow.
 const PAYLOAD_BYTES: usize = 700 * 1024;
 
-/// Schedules a single activity whose input sits between the candidate worker's
-/// configured cap and the library default — i.e. accepted by one and rejected by
-/// the other. The history stops at `WorkflowStarted`, so this dispatch happens
-/// at the frontier, which is where an in-flight fixture actually exercises the
-/// cap: an already-recorded activity matches history and never re-checks it.
+/// Schedules one activity whose input sits between the candidate worker's cap
+/// and the library default, so one accepts it and the other rejects it. The
+/// history stops at `WorkflowStarted`, so this dispatch happens at the frontier.
+/// Only there does an in-flight fixture exercise the cap. An already-recorded
+/// activity matches history and never re-checks it.
 fn large_input_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2426,10 +2421,10 @@ fn large_input_workflow<'a>(
     })
 }
 
-/// A candidate build that *lowers* a payload cap is the false-GREEN direction:
-/// replay accepts the input under the library default, the promoted worker
-/// rejects it with `PayloadTooLarge`, and the gate has certified a build that
-/// will break the very executions it sampled.
+/// A candidate build that *lowers* a payload cap is the false-GREEN direction.
+/// Replay accepts the input under the library default, and the promoted worker
+/// rejects it with `PayloadTooLarge`. The gate has then certified a build that
+/// breaks the very executions it sampled.
 #[tokio::test]
 async fn candidate_activity_input_cap_reaches_the_replay_context() {
     let dir = tempfile::tempdir().unwrap();
@@ -2453,8 +2448,8 @@ async fn candidate_activity_input_cap_reaches_the_replay_context() {
     );
 }
 
-/// Control: without the setting the same bundle replays clean, so the assertion
-/// above is carried by the cap rather than by the fixture happening to fail.
+/// Control: without the setting the same bundle replays clean. So the cap
+/// carries the assertion above, not a fixture that happens to fail.
 #[tokio::test]
 async fn omitting_the_candidate_cap_certifies_the_oversized_input() {
     let dir = tempfile::tempdir().unwrap();
@@ -2476,10 +2471,10 @@ async fn omitting_the_candidate_cap_certifies_the_oversized_input() {
     );
 }
 
-/// The offload threshold (#524) modulates the same decision: a worker that
-/// offloads large payloads *skips* the cap, so a gate that knows the cap but not
-/// the threshold reports drift the promoted worker would never hit — the
-/// false-RED direction of the same gap.
+/// The offload threshold (#524) modulates the same decision. A worker that
+/// offloads large payloads *skips* the cap. A gate that knows the cap but not
+/// the threshold reports drift that the promoted worker never hits. That is
+/// the false-RED direction of the same gap.
 #[tokio::test]
 async fn candidate_offload_threshold_reaches_the_replay_context() {
     let dir = tempfile::tempdir().unwrap();
@@ -2503,9 +2498,9 @@ async fn candidate_offload_threshold_reaches_the_replay_context() {
     );
 }
 
-/// `ReplayVerifier` is the gate's own public surface — the embedder's gate binary
-/// builds one directly — so the candidate payload limits must be settable there
-/// too, exactly as the build id and history policy already are.
+/// `ReplayVerifier` is the gate's own public surface, and the embedder's gate
+/// binary builds one directly. So the candidate payload limits must be settable
+/// there too, like the build id and history policy.
 #[tokio::test]
 async fn replay_verifier_carries_the_candidate_payload_caps() {
     let dir = tempfile::tempdir().unwrap();
@@ -2529,15 +2524,15 @@ async fn replay_verifier_carries_the_candidate_payload_caps() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 21 — a present-but-unreadable manifest must block the gate
+// A present-but-unreadable manifest must block the gate
 // ---------------------------------------------------------------------------
 
 /// A manifest that is **present but unreadable** must block the *default* gate.
 ///
 /// This is a different case from an absent manifest, and the distinction is the
 /// whole fix. An **absent** manifest means the bundle did not come from the
-/// exporter at all (a hand-assembled directory), which stays deliberately
-/// supported — it simply carries no coverage claim. A manifest that **exists**
+/// exporter at all (a hand-assembled directory). That stays deliberately
+/// supported, and it carries no coverage claim. A manifest that **exists**
 /// asserts the opposite: this bundle *is* an exporter product. If it cannot be
 /// read, the claim it carried was damaged in transit, and every manifest-derived
 /// guard silently evaporates:
@@ -2550,9 +2545,9 @@ async fn replay_verifier_carries_the_candidate_payload_caps() {
 /// into `false` and the surviving fixtures replay to a green exit `0`. That is a
 /// release certified against an export whose own record of what it did was lost.
 ///
-/// Rung `2` ("the gate could not fully run") is the right verdict rather than
-/// rung `4`: rung `4` is gated on the opt-in `require_complete_coverage`, so a
-/// default gate would still exit `0` — which is precisely the hole.
+/// Rung `2` ("the gate could not fully run") is the right verdict, not rung
+/// `4`. Rung `4` needs the opt-in `require_complete_coverage`, so a default
+/// gate would still exit `0`. That is precisely the hole.
 #[tokio::test]
 async fn corrupt_manifest_blocks_the_default_gate() {
     let dir = tempfile::tempdir().unwrap();
@@ -2593,9 +2588,9 @@ async fn corrupt_manifest_blocks_the_default_gate() {
 /// The absent-manifest path must stay fail-open — the fix must not turn every
 /// hand-assembled bundle into a blocked gate.
 ///
-/// This is the regression guard for the deliberate support decision the
-/// unreadable-manifest fix sits next to: "no manifest" is a bundle that makes no
-/// coverage claim, not a bundle whose claim was lost.
+/// This guards the deliberate support decision beside the unreadable-manifest
+/// fix. "No manifest" is a bundle that makes no coverage claim, not a bundle
+/// whose claim was lost.
 #[tokio::test]
 async fn absent_manifest_still_replays_normally() {
     let dir = tempfile::tempdir().unwrap();
@@ -2640,7 +2635,7 @@ async fn readable_manifest_is_not_reported_as_unreadable() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 21 — replay must register the candidate's declarative handlers
+// Replay must register the candidate's declarative handlers
 // ---------------------------------------------------------------------------
 
 /// A workflow that branches on whether a declarative query handler is
@@ -2648,12 +2643,12 @@ async fn readable_manifest_is_not_reported_as_unreadable() {
 ///
 /// The live worker registers a workflow's declarative `#[query]` / `#[update]`
 /// handlers *before any workflow code runs* (`executor.rs`, "Auto-register
-/// declarative handlers before any workflow code runs"), and
+/// declarative handlers before any workflow code runs").
 /// `ctx.list_query_names()` merges the declarative map into its result. So this
-/// branch is genuinely observable from workflow code — the same class as the
-/// payload caps fixed in round 20: **candidate configuration that lives in no
-/// `WorkflowEvent`**, which replay must mirror or it is not replaying the
-/// candidate at all.
+/// branch is genuinely observable from workflow code. It is the same class as
+/// the candidate payload caps tested above: **candidate configuration that
+/// lives in no `WorkflowEvent`**. Replay must mirror it, or it is not replaying
+/// the candidate at all.
 fn query_branching_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2697,11 +2692,11 @@ fn progress_query_info() -> autumn_harvest::info::QueryHandlerInfo {
 /// The gate must replay with the candidate's declarative query handlers
 /// registered, or it false-reports drift on unchanged code.
 ///
-/// The recorded history was produced by a live worker that had `progress`
-/// registered, so it scheduled `step_one`. Replaying the *same* workflow with an
-/// empty declarative registry takes the `else` branch and schedules `step_two` —
-/// reported as drift on a workflow nobody changed (a false RED that blocks a
-/// good release).
+/// A live worker with `progress` registered recorded the history, so it
+/// scheduled `step_one`. Replaying the *same* workflow with an empty declarative
+/// registry takes the `else` branch and schedules `step_two`. The gate reports
+/// that as drift on a workflow nobody changed, a false RED that blocks a good
+/// release.
 #[tokio::test]
 async fn candidate_declarative_query_handlers_are_registered_during_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -2769,7 +2764,7 @@ async fn removing_a_declarative_handler_is_still_reported_as_drift() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 22 — per-workflow candidate config must not be applied bundle-wide
+// Per-workflow candidate config must not be applied bundle-wide
 //
 // One family, two members: configuration the live worker resolves *by workflow
 // type* but which replay previously applied to every fixture uniformly.
@@ -2787,9 +2782,9 @@ async fn removing_a_declarative_handler_is_still_reported_as_drift() {
 fn foreign_progress_query_info() -> autumn_harvest::info::QueryHandlerInfo {
     autumn_harvest::info::QueryHandlerInfo {
         name: "progress",
-        // Note: NOT "wf" — this handler belongs to another workflow in the same
-        // `queries![…]` collection, exactly as a real multi-workflow candidate
-        // build would hand the gate.
+        // NOT "wf": this handler belongs to another workflow in the same
+        // `queries![…]` collection. A real multi-workflow candidate build hands
+        // the gate exactly that.
         workflow: "other_wf",
         module: "replay_drift_tests",
         input_type_hint: "()",
@@ -2805,10 +2800,10 @@ fn foreign_progress_query_info() -> autumn_harvest::info::QueryHandlerInfo {
 /// (false-RED direction).
 ///
 /// The recording worker filtered by workflow type, so `wf` never saw
-/// `other_wf`'s `progress` query and scheduled `step_two`. Replaying with the
+/// `other_wf`'s `progress` query and scheduled `step_two`. A replay with the
 /// candidate's whole registry unfiltered puts that foreign handler on `wf`'s
-/// context, flips the branch to `step_one`, and reports drift on a workflow
-/// nobody changed — blocking a good release.
+/// context and flips the branch to `step_one`. It then reports drift on a
+/// workflow nobody changed, which blocks a good release.
 #[tokio::test]
 async fn foreign_workflow_declarative_handler_is_not_registered_during_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -2846,9 +2841,9 @@ async fn foreign_workflow_declarative_handler_is_not_registered_during_replay() 
 /// The candidate genuinely **dropped** `wf`'s own `progress` handler, but kept a
 /// same-named one on `other_wf`. The promoted worker will filter, show `wf`
 /// nothing, and take the `step_two` branch — a real drift from the recorded
-/// `step_one`. Registering unfiltered lets the foreign handler stand in for the
-/// deleted one, the replay still matches history, and the gate certifies a build
-/// that changed behavior.
+/// `step_one`. Unfiltered registration lets the foreign handler stand in for
+/// the deleted one. The replay still matches history, and the gate certifies a
+/// build that changed behavior.
 #[tokio::test]
 async fn dropping_a_handler_is_still_drift_when_another_workflow_keeps_the_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -2883,9 +2878,8 @@ async fn dropping_a_handler_is_still_drift_when_another_workflow_keeps_the_name(
 /// A workflow that records a large side-effect value, then parks on an activity.
 ///
 /// `max_workflow_input` caps side-effect values as well as child-workflow inputs
-/// (`WorkflowContext::with_payload_caps`), and the cap is only consulted at the
-/// frontier — which is exactly where an in-flight fixture lands, so this is the
-/// shape the gate actually samples.
+/// (`WorkflowContext::with_payload_caps`). Only the frontier consults the cap.
+/// An in-flight fixture lands exactly there, so the gate samples this shape.
 fn big_side_effect_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -2903,9 +2897,9 @@ fn big_side_effect_workflow<'a>(
 
 /// Build a `WorkflowInfo` carrying a per-workflow input-cap override.
 ///
-/// Written as a literal rather than via `#[workflow]` so the test can set
-/// `max_input_bytes` directly — the macro attribute and this field are the same
-/// value, and the literal keeps the cap under test visible at the call site.
+/// A literal, not `#[workflow]`, so the test can set `max_input_bytes`
+/// directly. The macro attribute and this field are the same value. The literal
+/// keeps the cap under test visible at the call site.
 fn capped_wf_info(max_input_bytes: Option<u64>) -> autumn_harvest::info::WorkflowInfo {
     autumn_harvest::info::WorkflowInfo {
         quota: None,
@@ -2938,9 +2932,8 @@ fn capped_wf_info(max_input_bytes: Option<u64>) -> autumn_harvest::info::Workflo
 /// workflow during replay, exactly as the live worker raises it.
 ///
 /// The worker resolves `per.max(global)` per workflow type. A gate that applies
-/// only the global cap rejects a frontier dispatch the promoted worker will
-/// happily accept — `PayloadTooLarge` reported as drift on a workflow nobody
-/// changed.
+/// only the global cap rejects a frontier dispatch that the promoted worker
+/// accepts. It reports `PayloadTooLarge` as drift on a workflow nobody changed.
 #[tokio::test]
 async fn per_workflow_input_cap_override_is_applied_during_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -2972,8 +2965,8 @@ async fn per_workflow_input_cap_override_is_applied_during_replay() {
 /// The falsifying control: with no declared override the global cap binds, and
 /// the same fixture legitimately fails.
 ///
-/// This proves the test above passes *because* the override is applied and not
-/// for some unrelated reason — and pins the direction that must keep working: a
+/// This proves the test above passes *because* the override is applied, not for
+/// some unrelated reason. It also pins the direction that must keep working: a
 /// candidate whose global cap is genuinely too low is still caught.
 #[tokio::test]
 async fn without_an_override_the_global_input_cap_still_binds() {
@@ -2999,14 +2992,14 @@ async fn without_an_override_the_global_input_cap_still_binds() {
 }
 
 // ---------------------------------------------------------------------------
-// Bundle ↔ manifest inventory reconciliation (round-23 P1)
+// Bundle ↔ manifest inventory reconciliation
 // ---------------------------------------------------------------------------
 
 /// An in-flight history for `workflow_name` under a caller-chosen execution id.
 ///
-/// The identity tests below need to control which executions the bundle holds so
-/// they can disagree with the manifest in a *count-preserving* way — the exact
-/// corruption an aggregate comparison accepts.
+/// The identity tests below control which executions the bundle holds. So they
+/// can disagree with the manifest in a *count-preserving* way, the exact
+/// corruption that an aggregate comparison accepts.
 fn in_flight_snapshot_with_id(workflow_name: &str, exec_id: ExecutionId) -> String {
     let events = vec![
         started_event(),
@@ -3295,7 +3288,7 @@ async fn per_type_counts_bind_even_without_declared_identities() {
 }
 
 // ===========================================================================
-// Round 24 — an incomplete in-progress branch is in-flight, not drift
+// An incomplete in-progress branch is in-flight, not drift
 // ===========================================================================
 //
 // `check_strict_replay_no_match` already grants canary replay a frontier
@@ -3309,10 +3302,10 @@ async fn per_type_counts_bind_even_without_declared_identities() {
 //   * `LocalActivityInProgress` — a local activity mid-retry (>= 1 recorded
 //     `LocalActivityFailed` and no terminal).
 //
-// Issue #1048 already settled the pattern for this class on the race twins:
-// an `InProgress` arm makes no inline decision, falls through to re-park, and
-// lets the executor's end-of-cycle `history_has_unconsumed_events` authority
-// decide. These two arms are simply the ones #1048 did not reach.
+// Issue #1048 already settled the pattern for this class on the race twins.
+// An `InProgress` arm makes no inline decision and falls through to re-park.
+// The executor's end-of-cycle `history_has_unconsumed_events` authority then
+// decides. These two arms are the ones #1048 did not reach.
 
 /// Spawns a child workflow, then continues. In-flight histories park at the
 /// `ChildWorkflowStarted` frontier with no terminal.
@@ -3361,9 +3354,9 @@ fn in_flight_child_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, ExecutionId::new(), events)
 }
 
-/// A local activity genuinely mid-retry: scheduled with a 3-attempt budget,
-/// one recorded failure, **no terminal** — so one attempt is still owed and the
-/// workflow re-parks on it rather than resolving.
+/// A local activity genuinely mid-retry: a 3-attempt budget, one recorded
+/// failure, **no terminal**. So one attempt is still owed, and the workflow
+/// re-parks on it rather than resolving.
 ///
 /// Two neighbouring shapes deliberately do NOT reach the
 /// `LocalActivityInProgress` arm's suspension path, and neither is what this
@@ -3372,10 +3365,9 @@ fn in_flight_child_snapshot_json(workflow_name: &str) -> String {
 /// * `failed_attempts == 0` resolves to `NoMatch` inside
 ///   `match_local_activity_strict`, which `check_strict_replay_no_match`
 ///   already grants the canary frontier exception.
-/// * `failed_attempts >= max_attempts` is *exhaustion*: the arm returns the
-///   recorded `last_error` without re-running the handler, so the workflow
-///   fails for a genuine business reason — faithfully reproducing what the
-///   live worker will do next.
+/// * `failed_attempts >= max_attempts` is *exhaustion*. The arm returns the
+///   recorded `last_error` without re-running the handler. So the workflow
+///   fails for a genuine business reason, as the live worker does next.
 fn in_flight_local_activity_retry_snapshot_json(workflow_name: &str) -> String {
     let activity_id = ActivityExecId::new();
     let events = vec![
@@ -3483,9 +3475,9 @@ async fn a_changed_child_workflow_name_is_still_drift() {
     assert_eq!(report.exit_code(), 1, "must block promotion: {report}");
 }
 
-/// The other half of Codex's ask: the error is **retained** for completed-history
-/// strict replay. `verify_dir` (issue #251) must still reject both shapes — an
-/// incomplete history is a fixture-quality defect there, not a normal state.
+/// The other half of the fix: strict replay of a completed history **retains**
+/// the error. `verify_dir` (issue #251) must still reject both shapes. There an
+/// incomplete history is a fixture-quality defect, not a normal state.
 #[tokio::test]
 async fn strict_replay_still_rejects_both_incomplete_shapes() {
     let dir = tempfile::tempdir().unwrap();
@@ -3514,16 +3506,16 @@ async fn strict_replay_still_rejects_both_incomplete_shapes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Built-in side effects at the in-flight frontier (issue #798, Codex round 25).
+// Built-in side effects at the in-flight frontier (issue #798).
 //
 // `ctx.system_now()` / `system_time_now()` / `new_uuid()` / `random_u64()` /
 // `random_f64()` all funnel through `capture_builtin_validated`; `random_range`
 // carries its own copy of the same match. Both resolve a frontier read to
-// `HistoryMatch::NoMatch` — `match_side_effect_event` returns `NoMatch` *only*
-// when `prepare_match()` is false (the cursor is past the end); any other event
-// at the cursor is `Diverged`, handled by a separate arm that fires in all
-// modes. So `NoMatch` here is precisely "this is a fresh live capture", which
-// for an in-flight fixture is the normal case, not drift.
+// `HistoryMatch::NoMatch`. `match_side_effect_event` returns `NoMatch` *only*
+// when `prepare_match()` is false (the cursor is past the end). Any other event
+// at the cursor is `Diverged`, which a separate arm handles in all modes. So
+// `NoMatch` here means "this is a fresh live capture". For an in-flight fixture
+// that is the normal case, not drift.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// An in-flight history whose recorded work is fully consumed: `step_one` ran to
@@ -3678,16 +3670,15 @@ async fn a_random_range_at_the_in_flight_frontier_is_not_drift() {
 // `run_workflow_canary` has two terminal arms that both reach the frontier
 // with recorded history fully consumed: the `Err(_elapsed)` (suspended) arm
 // and the `Ok(Ok(output))` (completing) arm. The suspended arm tolerates a
-// command emitted at the frontier (that's `workflow_system_now_then_park`
-// above: the tests pass because the workflow *parks* on `step_two` after
-// reading the clock). The completing arm did not: a workflow that reads the
-// clock at the frontier and then returns `Ok` — rather than parking on
-// another activity — used to reject with "new commands emitted beyond
-// recorded history", even though nothing about finishing instead of parking
-// makes the wall-clock read any less legitimate. For an in-flight execution,
-// which is all `replay_bundle` ever replays, reaching the end of the
-// function is exactly as valid an outcome as parking on the next await
-// point.
+// command emitted at the frontier. `workflow_system_now_then_park` above shows
+// this: the tests pass because the workflow *parks* on `step_two` after
+// reading the clock. The completing arm did not. A workflow could read the
+// clock at the frontier and then return `Ok` instead of parking on another
+// activity. That run used to reject with "new commands emitted beyond
+// recorded history". Yet finishing instead of parking makes the wall-clock
+// read no less legitimate. `replay_bundle` replays only in-flight executions.
+// For those, reaching the end of the function is as valid an outcome as
+// parking on the next await point.
 
 /// Consumes the recorded activity, reads the wall clock at the frontier, then
 /// **completes** instead of parking — the shape from issue #1175.
@@ -3733,11 +3724,11 @@ async fn a_run_that_completes_after_a_builtin_side_effect_at_the_frontier_is_not
 }
 
 /// The control: the completing-path relaxation must not swallow genuine
-/// drift. A handler that replays a *different* activity name than the one
-/// recorded still resolves to a mismatch in the matcher — a check that fires
-/// long before the (now-relaxed) "new commands beyond history" guard — and
-/// must still be reported as drift even though this workflow also completes
-/// rather than parking.
+/// drift. A handler that replays a *different* activity name than the recorded
+/// one still resolves to a mismatch in the matcher. That check fires long
+/// before the (now-relaxed) "new commands beyond history" guard. So the gate
+/// still reports drift, although this workflow also completes rather than
+/// parking.
 fn workflow_wrong_activity_then_complete<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3785,10 +3776,10 @@ async fn a_completing_run_with_a_mismatched_activity_is_still_drift() {
 ///
 /// Asserting on the *reason* — not merely on `failed == 1` — is what makes this a
 /// real guard. The workflow also parks on `step_two`, which strict replay rejects
-/// on its own, so a bare count assertion would stay green even if the built-in
-/// guard were deleted outright. The deferred nd error is drained before that
-/// check (`executor.rs`), so the side-effect message is the one that surfaces —
-/// and only while the guard exists.
+/// on its own. So a bare count assertion would stay green even with the built-in
+/// guard deleted outright. The executor drains the deferred nd error before
+/// that check (`executor.rs`). So the side-effect message surfaces, and only
+/// while the guard exists.
 #[tokio::test]
 async fn strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -3819,23 +3810,22 @@ async fn strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history()
     );
 }
 
-/// The completing-shape counterpart of the test above: strict replay must
-/// still reject a run that emits a built-in side effect past the end of
-/// recorded history even when the workflow *completes* afterward rather than
-/// parking on a further activity.
+/// The completing-shape counterpart of the test above. Strict replay must
+/// still reject a built-in side effect past the end of recorded history. That
+/// holds even when the workflow *completes* afterward instead of parking.
 ///
 /// `workflow_system_now_then_complete` consumes only the recorded history and
-/// returns `Ok` — nothing to park on. Note the rejection here is still
-/// classified as `SideEffectDrift` (the built-in's own deferred
-/// non-determinism error, `ctx.take_deferred_nd_error()`, fires ahead of the
-/// `Ok(Ok(output))` arm's own "new commands emitted beyond recorded history"
-/// completing-path check — the same as the parking test above): a built-in
-/// read is caught before it ever reaches that later check, whether the
-/// workflow goes on to park or to complete. That later check — verified by
-/// code-review to be byte-identical to its pre-#1175 form in
-/// `run_strict_with_ctx` — remains reachable for a non-built-in significant
-/// command; this test's job is only to confirm the built-in guard survives
-/// completing, not to force that specific later branch.
+/// returns `Ok`, with nothing to park on. The rejection is still classified as
+/// `SideEffectDrift`, as in the parking test above. The built-in's own deferred
+/// non-determinism error (`ctx.take_deferred_nd_error()`) fires first. The
+/// `Ok(Ok(output))` arm's "new commands emitted beyond recorded history"
+/// completing-path check comes later. So a built-in read is caught before that
+/// later check, whether the workflow parks or completes.
+///
+/// That later check is byte-identical to its pre-#1175 form in
+/// `run_strict_with_ctx`, verified by code review. It stays reachable for a
+/// non-built-in significant command. This test only confirms that the built-in
+/// guard survives completing. It does not force that later branch.
 #[tokio::test]
 async fn strict_replay_still_rejects_a_completing_run_with_a_builtin_side_effect_past_end_of_history()
  {

@@ -3,8 +3,8 @@
 //! `shutdown` and the `Drop` guard cover the exits a process gets to observe.
 //! `SIGKILL` is not one of them, and a developer who kills a wedged `cargo dev`
 //! is doing the most ordinary thing in the world. Without this, every such kill
-//! would leak a postmaster holding a port and a data directory that nothing will
-//! ever remove.
+//! would leak a postmaster that holds a port and a data directory. Nothing
+//! would ever remove them.
 //!
 //! So the *next* start reaps: it reads the session records under the per-user
 //! session root and reclaims each one whose owning process is gone.
@@ -15,23 +15,23 @@
 //! directory. Four things stand between that and a planted record:
 //!
 //! 1. **The root is per-user, owned by us, and `0700` — checked on every use.**
-//!    Sessions never live directly in the world-writable system temp directory,
-//!    where any other local account could create `harvest-dev-*/session.json`
-//!    naming a pid of ours, or a `bin_dir` whose `pg_ctl` we would then run.
+//!    Sessions never live directly in the world-writable system temp directory.
+//!    There, any other local account could create `harvest-dev-*/session.json`.
+//!    It could name a pid of ours, or a `bin_dir` whose `pg_ctl` the reaper runs.
 //!    Ownership is a real, uid-based check on Unix. Windows has no such check
-//!    yet (issue #1287); `directory_is_ours` falls back to a weaker location
-//!    heuristic there, and says so in its own doc comment.
+//!    yet (issue #1287). There, `directory_is_ours` falls back to a weaker
+//!    location heuristic, and its own doc comment says so.
 //! 2. **The record must be self-consistent.** Its `data_dir` has to be the one
-//!    this layout puts inside the session directory; a record pointing elsewhere
-//!    is corrupt or planted and is left alone.
+//!    this layout puts inside the session directory. A record that points
+//!    elsewhere is corrupt or planted, and is left alone.
 //! 3. **A pid is not an identity.** The recorded postmaster start time must
 //!    still match, so a reused pid is never mistaken for the process we
-//!    started. A record with no start time is *unknown*, not a match — a
-//!    live pid there is left alone rather than reaped (issue #1295). With no
+//!    started. A record with no start time is *unknown*, not a match. A live
+//!    pid there is left alone, not reaped (issue #1295). With no
 //!    pid at all, a live process on the data directory also blocks reaping
 //!    (issue #1585).
-//! 4. **No blind kill.** A cluster we could not stop through `pg_ctl` is left
-//!    running *and* its directory is left in place, because deleting the data
+//! 4. **No blind kill.** A cluster that `pg_ctl` could not stop is left
+//!    running, *and* its directory is left in place. Deleting the data
 //!    directory out from under a live postmaster is worse than leaking it.
 
 use std::path::{Path, PathBuf};
@@ -63,10 +63,10 @@ pub fn session_root(base: &Path) -> Result<PathBuf, DevError> {
 
 /// Make the session root owner-only, and refuse a root that is not ours.
 ///
-/// A symlink is rejected outright — another user could repoint it. Ownership is
-/// then checked directly: an unprivileged process cannot `chmod` a foreign
-/// directory, but `root` can, so a successful `chmod` is evidence only when we
-/// are not `root` and the uid comparison is what actually decides.
+/// A symlink is rejected outright, because another user could repoint it.
+/// Ownership is then checked directly. An unprivileged process cannot `chmod`
+/// a foreign directory, but `root` can. So a successful `chmod` is evidence
+/// only for a non-root process, and the uid comparison is what decides.
 fn harden_root(root: &Path) -> Result<(), DevError> {
     let metadata = std::fs::symlink_metadata(root).map_err(|source| DevError::SessionDir {
         path: root.to_path_buf(),
@@ -88,9 +88,9 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
     {
         use std::os::unix::fs::PermissionsExt as _;
         // Ownership, not permission to chmod. For an unprivileged user those
-        // are the same question, but `root` can `chmod` a directory any local
-        // user pre-created — so a successful chmod proves nothing at uid 0,
-        // and the records inside name a `bin_dir` whose `pg_ctl` the reaper
+        // are the same question. But `root` can `chmod` a directory that any
+        // local user pre-created. So a successful chmod proves nothing at uid
+        // 0, and the records inside name a `bin_dir` whose `pg_ctl` the reaper
         // then runs. `directory_is_ours` above is what actually decides.
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
             DevError::UntrustedSessionRoot {
@@ -220,12 +220,12 @@ fn current_user_token() -> String {
 
 /// The **effective** uid, via `/proc/self/status` or `id -u`.
 ///
-/// Effective, not real, and the distinction is the whole point: this answer
-/// gates the root refusal *and* the session-root ownership check, and a process
-/// with a non-zero real uid but euid 0 — a setuid-root launcher — has every
+/// Effective, not real, and the distinction is the whole point. This answer
+/// gates the root refusal *and* the session-root ownership check. A
+/// setuid-root launcher has a non-zero real uid but euid 0. It has every
 /// privilege the refusal exists to keep away from a planted session record.
-/// `id -u` reports the effective id (`id -ru` is the real one), so both sources
-/// must agree on that or the answer depends on which one happened to work.
+/// `id -u` reports the effective id (`id -ru` is the real one). Both sources
+/// must agree on that, or the answer depends on which one happened to work.
 ///
 /// `/usr/bin/id` by absolute path: resolving it through `PATH` would let a
 /// planted `id` on a developer's `PATH` silently answer whatever it liked.
@@ -256,15 +256,14 @@ pub(super) fn unix_uid() -> Option<u32> {
 
 /// The **effective** uid from a `/proc/self/status` body.
 ///
-/// The `Uid:` line is `real  effective  saved  filesystem`, and the second
-/// column is what `id -u` reports — reading the first made the two sources
-/// disagree for any process whose real and effective ids differ, which is
-/// exactly the setuid-root case the root refusal must not fail open on.
+/// The `Uid:` line is `real  effective  saved  filesystem`, and `id -u`
+/// reports the second column. A read of the first made the two sources
+/// disagree when the real and effective ids differ. That is exactly the
+/// setuid-root case on which the root refusal must not fail open.
 ///
-/// The filesystem uid (fourth column) is what the kernel actually attributes
-/// new files to, and it equals the effective uid unless something calls
-/// `setfsuid`, which nothing here does; the ownership check is written against
-/// the effective uid on that basis.
+/// The kernel attributes new files to the filesystem uid (fourth column).
+/// It equals the effective uid unless something calls `setfsuid`, and nothing
+/// here does. So the ownership check uses the effective uid.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn parse_proc_status_uid(status: &str) -> Option<u32> {
@@ -277,8 +276,8 @@ pub fn parse_proc_status_uid(status: &str) -> Option<u32> {
 
 /// What Postgres's own `postmaster.pid` file says about a session.
 ///
-/// Three states, not two: "there is no pid file" and "I could not read the pid
-/// file" mean opposite things to a reaper that deletes data directories.
+/// Three states, not two. "There is no pid file" and "the pid file is
+/// unreadable" mean opposite things to a reaper that deletes data directories.
 enum PidFile {
     /// Confirmed absent. `pg_ctl` removes it on a clean stop, so this is real
     /// evidence that no server is running.
@@ -391,10 +390,10 @@ fn reap_one_session(
     if record.postmaster_pid.is_none() && matches!(pid_file, PidFile::Unreadable) {
         // Absence of a pid is only evidence when it is *confirmed* absence. A
         // transient read error, or the truncated file a crash mid-write
-        // leaves, would otherwise read as "no server" — and `decide_reap`
-        // would answer `Remove`, deleting the data directory out from under a
-        // postmaster that may well still be running, along with the only
-        // record that could ever stop it. Leave it for a run that can tell.
+        // leaves, would otherwise read as "no server". `decide_reap` would
+        // then answer `Remove`. That deletes the data directory of a
+        // postmaster that may still be running, with the only record that
+        // could ever stop it. Leave it for a run that can tell.
         tracing::warn!(
             path = %dir.display(),
             "dev runtime: leaving a session whose postmaster.pid could not be read"
@@ -491,16 +490,16 @@ fn session_postmaster_identity(record: &SessionRecord) -> PostmasterIdentity {
 /// Whether the process at the recorded owner pid is still the run that created
 /// this session.
 ///
-/// Liveness alone is not enough, for the same reason it is not enough for the
-/// postmaster: a force-killed run frees its pid, and an unrelated long-lived
-/// process that inherits the number makes the session look permanently active —
-/// so its cluster and data directory would survive every later start, forever.
-/// The recorded start time is what tells the two apart.
+/// Liveness alone is not enough, for the same reason as for the postmaster.
+/// A force-killed run frees its pid. An unrelated long-lived process can
+/// inherit the number and make the session look permanently active. Its
+/// cluster and data directory would then survive every later start, forever.
+/// The recorded start time tells the two apart.
 ///
 /// Falls back to plain liveness when either side has no token (a record written
 /// before the field existed; a platform that cannot supply one). That is the
-/// pre-existing behaviour, and the conservative direction: it can only make us
-/// skip a session, never reap a live one.
+/// pre-existing behaviour, and the conservative direction. It can only skip a
+/// session, never reap a live one.
 fn owner_is_the_recorded_one(record: &SessionRecord) -> bool {
     if !process_is_alive(record.owner_pid) {
         return false;
@@ -658,11 +657,11 @@ fn stop_orphan(
     postmaster_pid: u32,
 ) -> bool {
     if let Some(binaries) = binaries {
-        // Ignore the result and check the process instead: `pg_ctl` can exit 0
+        // Ignore the result and check the process instead. `pg_ctl` can exit 0
         // for a cluster it did not actually stop (a missing `postmaster.pid`,
-        // say), and an early return on "it said OK" used to skip the
-        // identity-proven signal below entirely — leaving the session
-        // unreclaimable and re-warning on every future run.
+        // say). An early return on "it said OK" used to skip the
+        // identity-proven signal below entirely. The session then stayed
+        // unreclaimable and re-warned on every future run.
         let _ = postgres::stop_cluster_blocking(binaries, &record.data_dir, Some(postmaster_pid));
         if !process_is_alive(postmaster_pid) {
             return true;
@@ -725,13 +724,12 @@ pub fn proc_stat_start_time(stat: &str) -> Option<String> {
 
 /// Whether a process with this id is still *running*.
 ///
-/// **A zombie is not running.** This distinction is the whole point: `pg_ctl`
-/// daemonises the postmaster, so once it exits it is an orphan whose reaping
-/// belongs to init — and in a container, or under any supervisor that is not a
-/// subreaper, that can take arbitrarily long. Both `/proc/<pid>` existing and
-/// `kill -0` succeeding stay true for the entire zombie window, so a naive
-/// check reports a cleanly stopped cluster as still running and makes correct
-/// teardown look broken.
+/// **A zombie is not running.** This distinction is the whole point. `pg_ctl`
+/// daemonises the postmaster, so once it exits it is an orphan that init
+/// reaps. In a container, or under any supervisor that is not a subreaper,
+/// that can take arbitrarily long. `/proc/<pid>` exists and `kill -0` succeeds
+/// for the entire zombie window. So a naive check reports a cleanly stopped
+/// cluster as still running, and correct teardown looks broken.
 ///
 /// Deliberately dependency-free: `/proc` where it exists, and the platform's own
 /// tool (by absolute path) elsewhere.
@@ -773,9 +771,9 @@ pub fn process_is_alive(pid: u32) -> bool {
 /// Whether a `/proc/<pid>/stat` line describes a live (non-zombie) process.
 ///
 /// The second field is the executable name in parentheses and can itself contain
-/// spaces and parentheses, so the state is the first token after the **last**
-/// `)` — the documented way to parse this file, and the reason this is not a
-/// plain `split_whitespace().nth(2)`.
+/// spaces and parentheses. So the state is the first token after the **last**
+/// `)`. That is the documented way to parse this file, and the reason this is
+/// not a plain `split_whitespace().nth(2)`.
 #[must_use]
 pub fn proc_stat_is_live(stat: &str) -> bool {
     let Some((_, after_comm)) = stat.rsplit_once(')') else {

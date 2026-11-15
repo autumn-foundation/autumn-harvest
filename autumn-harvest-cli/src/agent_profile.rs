@@ -188,7 +188,6 @@ pub const REFINE_WORKFLOW: &str = "agent_refine";
 /// `autumn_harvest_agent::refine::SIGNAL_REFINE_APPROVAL`.
 pub const SIGNAL_REFINE_APPROVAL: &str = "refine_approval";
 
-/// The page size of `pending`.
 const PENDING_PAGE_SIZE: i64 = 50;
 
 /// The `GET /workflows` path of the refine runs of `kind` that wait.

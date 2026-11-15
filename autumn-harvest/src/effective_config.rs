@@ -2,11 +2,11 @@
 //!
 //! Answers the operator question "what configuration is this fleet actually
 //! running with, right now?" without reading source, env files, or the
-//! builder chain. The [`EffectiveConfigView`] is the serialisable, **secret-free**
-//! snapshot of the resolved [`WorkerConfig`](crate::builder::WorkerConfig),
-//! payload caps, shard topology, compiled feature flags, and pool sizing that
-//! the plugin captures once at startup and serves from
-//! `GET /api/harvest/admin/config`.
+//! builder chain. The [`EffectiveConfigView`] is a serialisable,
+//! **secret-free** snapshot. It holds the resolved
+//! [`WorkerConfig`](crate::builder::WorkerConfig), payload caps, shard
+//! topology, compiled feature flags, and pool sizing. The plugin captures it
+//! once at startup and serves it from `GET /api/harvest/admin/config`.
 //!
 //! ## Redaction by construction
 //!
@@ -26,15 +26,15 @@
 //! ## Coverage guard (the falsifiable #695 acceptance criterion)
 //!
 //! [`WorkerConfigView::from_worker_config`] destructures [`WorkerConfig`] with
-//! an **exhaustive pattern and NO `..`**. Adding a new operator-tunable field to
-//! `WorkerConfig` is a **compile error** here until the author decides how to
-//! surface it (a value, a derived boolean, or an explicit
-//! presence-only-for-secrets mapping). This is stronger than any runtime test.
+//! an **exhaustive pattern and NO `..`**. A new operator-tunable field in
+//! `WorkerConfig` is a **compile error** here. The error stays until the author
+//! decides how to surface it: a value, a derived boolean, or an explicit
+//! presence-only-for-secrets mapping. This is stronger than any runtime test.
 //!
 //! ## Duration representation
 //!
 //! Every duration is serialized as **whole milliseconds** (`u64`) with a
-//! `_ms`-suffixed field name — one tunable (the worker poll interval) is 500 ms,
+//! `_ms`-suffixed field name. One tunable (the worker poll interval) is 500 ms,
 //! so a seconds representation would lose precision. Unset `Option<Duration>`
 //! ceilings serialize as an explicit JSON `null` with the key still present, so
 //! "unbounded" is unambiguous and distinguishable from "field omitted".
@@ -57,9 +57,9 @@ fn opt_dur_ms(d: Option<Duration>) -> Option<u64> {
 
 /// Compiled-in Cargo feature flags of the **core** `autumn-harvest` crate.
 ///
-/// Evaluated with `cfg!` *inside* this crate so the result reflects how the
-/// engine binary was actually compiled — not the plugin crate's own feature
-/// set, which can legitimately differ.
+/// Evaluated with `cfg!` *inside* this crate. So the result reflects how the
+/// engine binary was actually compiled, not the plugin crate's own feature
+/// set. The two sets can legitimately differ.
 #[must_use]
 pub const fn compiled_feature_flags() -> FeatureFlagsView {
     FeatureFlagsView {
@@ -106,7 +106,7 @@ pub struct DispatchConfigView {
     /// [`key_prefixes`](Self::key_prefixes) instead.
     pub key_prefix: Option<String>,
     /// One key-family prefix per shard, for a multi-shard install (issue
-    /// #1429 review). `None` on a single-shard install, which reports its
+    /// #1429). `None` on a single-shard install, which reports its
     /// one prefix through [`key_prefix`](Self::key_prefix) instead. A
     /// multi-shard install has no single key family for
     /// `/admin/config` to report under `key_prefix` alone.
@@ -125,8 +125,8 @@ pub struct DispatchConfigView {
 
 /// Secret-free projection of [`WorkerConfig`].
 ///
-/// This is a flat serialization DTO: each boolean is an independent, orthogonal
-/// configuration flag (or a secret-redaction presence marker), not a state
+/// This is a flat serialization DTO. Each boolean is an independent, orthogonal
+/// configuration flag or a secret-redaction presence marker. It is not a state
 /// machine, so the excessive-bools lint does not apply.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize)]
@@ -217,8 +217,8 @@ pub struct WorkerConfigView {
     pub replication_watermark_retain_ms: u64,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
-    /// Worth reading back from a live fleet: a prefix that matches nothing
-    /// reports the shard as having no standby, and a prefix that is too broad
+    /// Worth reading back from a live fleet. A prefix that matches nothing
+    /// reports the shard as having no standby. A prefix that is too broad
     /// counts an unrelated walsender as one.
     pub replication_slot_prefix: String,
     /// Maximum workflow start delay, milliseconds.
@@ -229,18 +229,18 @@ pub struct WorkerConfigView {
     pub poison_pill_threshold: i32,
     /// Whether poison-pill quarantine is enabled (`poison_pill_threshold > 0`).
     pub poison_pill_quarantine_enabled: bool,
-    /// Consecutive capability misses (claims by a worker with no handler
-    /// registered for the task's type) before a task escalates to the ordinary
+    /// Consecutive capability misses before a task escalates to the ordinary
     /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    /// A miss is a claim by a worker with no handler for the task's type.
     /// `0` escalates on the first miss.
     ///
     /// **No dead-letter row is written.** The escalation routes through
-    /// `fail_task_and_execution_with_history`, which fails the task and the
-    /// execution without inserting into `harvest_dead_letters` — the reason
-    /// lives on the failed execution row, so an operator diagnosing an
-    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
-    /// this path would also be indistinguishable from a poison-pill
-    /// quarantine, #367, which a capability miss deliberately is not.)
+    /// `fail_task_and_execution_with_history`. It fails the task and the
+    /// execution and inserts nothing into `harvest_dead_letters`. The reason
+    /// lives on the failed execution row. So an operator who diagnoses an
+    /// exhausted budget queries failed workflows, not the DLQ. A DLQ entry on
+    /// this path would also look like a poison-pill quarantine (#367), which a
+    /// capability miss deliberately is not.
     pub capability_miss_max_redeliveries: u32,
     /// Wall-clock budget for a single workflow-task dispatch, milliseconds (0 = disabled).
     pub workflow_task_timeout_ms: u64,
@@ -251,9 +251,9 @@ pub struct WorkerConfigView {
     /// `WorkerConfig`-level hard history-event ceiling (`null` = unbounded).
     ///
     /// This is the **raw `WorkerConfig` knob**. The *resolved* effective ceiling
-    /// (builder value falling back to this one) is surfaced separately as
-    /// [`PayloadCapsView::max_workflow_history_events`]; both are reported so an
-    /// operator can distinguish the worker-level default from the value actually
+    /// is the builder value, or this one as a fallback. It is surfaced as
+    /// [`PayloadCapsView::max_workflow_history_events`]. Both are reported, so
+    /// an operator can tell the worker-level default from the value actually
     /// enforced.
     pub max_workflow_history_events: Option<u64>,
     /// Default debounce max-wait cap, milliseconds.
@@ -320,13 +320,13 @@ pub struct WorkerConfigView {
     /// REDACTED: whether the **resolved runtime** database pool is sharded
     /// (never the handle).
     ///
-    /// This reflects the pool the runtime *actually* uses — the runner-provided
+    /// This reflects the pool the runtime *actually* uses, not only the
+    /// `WorkerConfig` knob. The order is the runner-provided
     /// [`HarvestRunnerResources::with_sharded_pool`] override, then
-    /// [`WorkerConfig::with_sharded_pool`], then the fallback single pool — not
-    /// solely the `WorkerConfig` knob. The capture site passes the resolved
-    /// value through [`ShardedInfo`]; when no override is supplied (the pure
-    /// no-DB mapping path) it falls back to the `WorkerConfig::sharded_pool`
-    /// field.
+    /// [`WorkerConfig::with_sharded_pool`], then the fallback single pool. The
+    /// capture site passes the resolved value through [`ShardedInfo`]. With no
+    /// override (the pure no-DB mapping path), it falls back to the
+    /// `WorkerConfig::sharded_pool` field.
     pub sharded_pool_configured: bool,
     /// REDACTED: number of shards in the resolved runtime sharded pool (0 if not
     /// sharded). See [`sharded_pool_configured`](Self::sharded_pool_configured).
@@ -383,11 +383,11 @@ impl WorkerConfigView {
     /// optional resolved-runtime-pool override for the two sharded-pool fields.
     ///
     /// When `resolved` is `Some`, [`sharded_pool_configured`] and
-    /// [`sharded_pool_shard_count`] take the resolved runtime pool's values —
-    /// covering the runner-provided `HarvestRunnerResources::with_sharded_pool`
+    /// [`sharded_pool_shard_count`] take the resolved runtime pool's values.
+    /// That covers the runner-provided `HarvestRunnerResources::with_sharded_pool`
     /// override, `WorkerConfig::with_sharded_pool`, and the fallback single pool
     /// alike. When `None`, they fall back to the `WorkerConfig::sharded_pool`
-    /// field (keeping the pure no-DB mapping path valid).
+    /// field, which keeps the pure no-DB mapping path valid.
     ///
     /// The exhaustive destructure below is the **#695 coverage guard** — do NOT
     /// add `..`. A new [`WorkerConfig`] field must break compilation here until
@@ -411,7 +411,7 @@ impl WorkerConfigView {
         // Bind the sharded-pool presence/count before the (feature-gated)
         // destructure so both `db` and non-`db` builds produce the same view.
         // A resolved-runtime override, when supplied, wins over the raw
-        // `WorkerConfig::sharded_pool` knob (issue #695 review).
+        // `WorkerConfig::sharded_pool` knob (issue #695).
         #[cfg(feature = "db")]
         let wc_sharding = worker
             .sharded_pool
@@ -545,10 +545,10 @@ impl WorkerConfigView {
             labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             max_workflow_history_events: *max_workflow_history_events,
             default_debounce_max_wait_ms: dur_ms(*default_debounce_max_wait),
-            // Mirror the sibling `_ms` fields: surface the resolved TTL straight
-            // from the bound `WorkerConfig` field (the authoritative per-config
-            // value), rather than reading the process-global — the global is set
-            // from this same field at `From<WorkerConfig>` time (issue #691).
+            // Mirror the sibling `_ms` fields: surface the resolved TTL from the
+            // bound `WorkerConfig` field, the authoritative per-config value. Do
+            // not read the process-global. `From<WorkerConfig>` sets the global
+            // from this same field (issue #691).
             mutex_lease_ttl_ms: dur_ms(*mutex_lease_ttl),
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
@@ -673,22 +673,22 @@ pub struct ShardTopologyView {
     /// jurisdiction labels (`"eu"`, `"us"`), never caller input or credentials,
     /// and this endpoint is admin-gated.
     ///
-    /// Surfacing it is what lets an operator detect the failure mode a
-    /// topology-only snapshot hides: two replicas deployed with **different**
-    /// key → shard maps report identical `readable`/`writable`/`default` sets
-    /// while placing the same `residency_key` in **different jurisdictions**
-    /// depending on which replica serves the request. Diff this field across
+    /// It lets an operator detect a failure mode that a topology-only snapshot
+    /// hides. Two replicas with **different** key → shard maps report identical
+    /// `readable`/`writable`/`default` sets. Yet they place the same
+    /// `residency_key` in **different jurisdictions**, depending on which
+    /// replica serves the request. Diff this field across
     /// replicas before accepting pinned starts. `BTreeMap` ordering makes the
     /// projection stable, so a byte comparison of two snapshots is meaningful.
     pub residency_map: BTreeMap<String, i32>,
     /// The declared retired-shard → successor mapping (issue #964).
     ///
-    /// Empty unless the deployment has decommissioned a shard. Surfacing it is
-    /// the same argument as `residency_map`, applied to a strictly worse
-    /// failure mode: two replicas that disagree about where a **retired**
-    /// shard's ids resolve will answer the *same* `ExecutionId` from *different*
-    /// databases — one finding the run, the other a confident `404` — while
-    /// reporting identical `readable`/`writable`/`default` sets. Diff this field
+    /// Empty unless the deployment has decommissioned a shard. The argument is
+    /// the same as for `residency_map`, with a strictly worse failure mode.
+    /// Two replicas can disagree about where a **retired** shard's ids resolve.
+    /// They then answer the *same* `ExecutionId` from *different* databases.
+    /// One finds the run, the other returns a confident `404`. Both report
+    /// identical `readable`/`writable`/`default` sets. Diff this field
     /// across replicas as the last step of a shard decommission.
     pub shard_forwards: BTreeMap<i32, i32>,
     /// The shards reserved for pinned work, one per tenant cell (issue #1837).
@@ -703,12 +703,11 @@ impl ShardTopologyView {
     /// Project a [`ShardRouter`](crate::shard::ShardRouter) into its view.
     #[must_use]
     pub fn from_router(router: &crate::shard::ShardRouter) -> Self {
-        // Coverage guard (issue #695 pattern, extended to the router by the
-        // issue #697 review): destructure EXHAUSTIVELY so adding a
-        // placement-affecting accessor to `ShardRouter` without surfacing it
-        // here is a compile error rather than a silent snapshot gap -- which is
-        // exactly how `residency_map` slipped through when it was introduced.
-        // Do NOT add `..`.
+        // Coverage guard (issue #695 pattern, extended to the router by issue
+        // #697): destructure EXHAUSTIVELY. A new placement-affecting accessor on
+        // `ShardRouter` that is not surfaced here is then a compile error, not a
+        // silent snapshot gap. That gap is how `residency_map` slipped through
+        // when it was introduced. Do NOT add `..`.
         let crate::shard::ShardRouterParts {
             readable_shards,
             writable_shards,
@@ -757,9 +756,9 @@ pub struct FeatureFlagsView {
 ///
 /// The plugin resolves a **single** database pool, so
 /// [`worker_pool_max_connections`](PoolConfigView::worker_pool_max_connections)
-/// is the effective *total* connection budget for the deployment — there is no
-/// separate `max_total_connections` field because there is no second pool to
-/// aggregate. [`shard_pool_count`](PoolConfigView::shard_pool_count) is derived
+/// is the effective *total* connection budget for the deployment. There is no
+/// second pool to aggregate, so there is no `max_total_connections` field.
+/// [`shard_pool_count`](PoolConfigView::shard_pool_count) is derived
 /// from the resolved shard topology (always `1` on the plugin path, which
 /// rejects multi-shard deployments).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -773,10 +772,10 @@ pub struct PoolConfigView {
 
 /// Connection-budget sizing read off one resolved database pool.
 ///
-/// This is the **DB-free** input to [`resolve_pool_view`]: the capture site
-/// reads the two numbers off a live pool (which needs a DB), then hands them to
-/// the pure precedence decision, which is testable without ever constructing a
-/// real pool.
+/// This is the **DB-free** input to [`resolve_pool_view`]. The capture site
+/// reads the two numbers off a live pool, which needs a DB. It then hands them
+/// to the pure precedence decision. That decision is testable without a real
+/// pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolSizing {
     /// Maximum connections in the (default-shard) pool.
@@ -786,15 +785,16 @@ pub struct PoolSizing {
 }
 
 /// Resolved sharded-pool presence + shard count read off the runtime's
-/// *actual* storage pool (issue #695 review).
+/// *actual* storage pool (issue #695).
 ///
 /// This is the **DB-free override input** to the [`WorkerConfigView`]
-/// sharded-pool fields: the capture site resolves which pool the runtime
-/// actually uses (runner-provided `HarvestRunnerResources::with_sharded_pool`,
-/// then `WorkerConfig::with_sharded_pool`, then the fallback single pool) and
-/// hands the result here, so the reported values describe the resolved runtime
-/// pool rather than solely the `WorkerConfig` knob — and the pure decision stays
-/// testable without ever constructing a real pool.
+/// sharded-pool fields. The capture site resolves which pool the runtime
+/// actually uses. The order is the runner-provided
+/// `HarvestRunnerResources::with_sharded_pool`, then
+/// `WorkerConfig::with_sharded_pool`, then the fallback single pool. It hands
+/// the result to this type. So the reported values describe the resolved
+/// runtime pool, not only the `WorkerConfig` knob. The pure decision stays
+/// testable without a real pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardedInfo {
     /// Whether the resolved runtime storage pool is a sharded pool.
@@ -804,25 +804,23 @@ pub struct ShardedInfo {
     /// Shard ids present in the **resolved runtime pool**, ascending.
     ///
     /// Carried so the snapshot can report the worker's *effective* shard
-    /// assignments (issue #961, AC1/AC8): an empty
+    /// assignments (issue #961, AC1/AC8). An empty
     /// [`WorkerConfig::shard_assignments`] means "auto: cover every pool
-    /// shard", and only the resolved runtime pool knows which shards those
-    /// are. This is always populated from the resolved pool — including the
-    /// single-shard fallback wrapper — so `GET /admin/config` reports the same
-    /// list the worker actually polls, which is what the add-a-shard runbook's
-    /// coverage check reads.
+    /// shard". Only the resolved runtime pool knows which shards those are.
+    /// The resolved pool always populates it, the single-shard fallback
+    /// wrapper included. So `GET /admin/config` reports the list the worker
+    /// actually polls. The coverage check of the add-a-shard runbook reads it.
     pub shard_ids: Vec<i32>,
 }
 
 /// Resolve the reported [`PoolConfigView`], mirroring the pool-selection
-/// precedence in `HarvestRunner::start` (issue #695 review).
+/// precedence in `HarvestRunner::start` (issue #695).
 ///
 /// The runner gives a configured sharded pool
 /// (`WorkerConfig::with_sharded_pool`) precedence over the fallback
-/// single-shard pool derived from `harvest_pool`. The effective-config snapshot
-/// must therefore report the sizing of the pool the runtime *actually* uses:
-/// when a sharded pool is present its sizing wins, otherwise the fallback
-/// sizing is reported.
+/// single-shard pool derived from `harvest_pool`. So the effective-config
+/// snapshot reports the sizing of the pool the runtime *actually* uses. A
+/// sharded pool's sizing wins. Otherwise the fallback sizing is reported.
 #[must_use]
 pub fn resolve_pool_view(sharded_pool: Option<PoolSizing>, fallback: PoolSizing) -> PoolConfigView {
     let chosen = sharded_pool.unwrap_or(fallback);
@@ -1237,10 +1235,10 @@ mod tests {
     }
 
     /// Issue #964: the same replica-drift argument as the residency map, applied
-    /// to a strictly worse failure mode. Two replicas that disagree about where a
-    /// RETIRED shard's ids resolve answer the *same* `ExecutionId` from
-    /// *different* databases -- one finding the run, the other a confident 404 --
-    /// while reporting identical readable/writable/default sets.
+    /// to a strictly worse failure mode. Two replicas can disagree about where a
+    /// RETIRED shard's ids resolve. They answer the *same* `ExecutionId` from
+    /// *different* databases. One finds the run, the other a confident 404. Both
+    /// report identical readable/writable/default sets.
     #[test]
     fn shard_topology_surfaces_the_retired_shard_forwards() {
         let replica_a = crate::shard::ShardRouter::new(
@@ -1270,7 +1268,7 @@ mod tests {
         );
     }
 
-    /// Issue #697 review (Codex P2): two replicas deployed with DIFFERENT
+    /// Issue #697: two replicas deployed with DIFFERENT
     /// residency maps place the same key in different jurisdictions while
     /// reporting identical readable/writable/default sets. The snapshot must
     /// surface the map so an operator can diff it across the fleet.
@@ -1466,8 +1464,8 @@ mod tests {
     #[test]
     fn resolve_pool_view_prefers_sharded_pool_sizing_when_present() {
         // Mirrors the runner precedence: a configured sharded pool
-        // (WorkerConfig::with_sharded_pool) wins over the fallback pool, so the
-        // snapshot must report the sharded pool's sizing — not the fallback's.
+        // (WorkerConfig::with_sharded_pool) wins over the fallback pool. So the
+        // snapshot must report the sharded pool's sizing, not the fallback's.
         let fallback = PoolSizing {
             max_connections: 10,
             shard_count: 1,
@@ -1525,10 +1523,10 @@ mod tests {
     #[test]
     fn worker_view_reports_effective_shard_assignments_not_the_auto_sentinel() {
         // AC8: `docs/sharding.md` step 4 tells an operator to verify coverage
-        // with `GET /admin/config` -> `worker.shard_assignments`. That check is
-        // only meaningful if the view reports the *resolved* list, so a worker
-        // left on auto (empty `shard_assignments`) shows the concrete shards it
-        // will poll rather than an empty array the operator cannot act on.
+        // with `GET /admin/config` -> `worker.shard_assignments`. That check
+        // needs the view to report the *resolved* list. A worker left on auto
+        // (empty `shard_assignments`) then shows the concrete shards it will
+        // poll, not an empty array that the operator cannot act on.
         let auto = WorkerConfig::default();
         assert!(
             auto.shard_assignments.is_empty(),
@@ -1553,9 +1551,9 @@ mod tests {
 
     #[test]
     fn worker_view_never_widens_an_explicit_shard_assignment() {
-        // The mirror of the test above: a deliberately narrowed worker (the
-        // one-worker-process-per-shard shape) must be reported as narrowed, so
-        // an operator flipping a shard writable can *see* the missing id.
+        // The mirror of the test above. A deliberately narrowed worker (the
+        // one-worker-process-per-shard shape) must be reported as narrowed. Then
+        // an operator who flips a shard writable can *see* the missing id.
         let explicit =
             WorkerConfig::default().with_shard_assignments([crate::types::ShardId::new(1)]);
 

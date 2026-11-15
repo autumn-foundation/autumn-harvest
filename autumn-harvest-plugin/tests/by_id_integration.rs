@@ -1,21 +1,20 @@
 //! Integration tests for the business-id ("latest run") management API
 //! variants (issue #805): `/workflows/by-id/{workflow_name}/{workflow_id}/...`.
 //!
-//! These delegate to the existing `exec_id` handlers after resolving
-//! `(workflow_name, workflow_id) → ExecutionId`, so they exercise the shared
-//! resolver, the resolution rule (AC2 — active-first, else most-recent
-//! terminal, else 404), the required-name rule, the always-present
-//! `execution_id` (header + body, AC4), and the continue-as-new correctness
-//! (the success metric — resolve to the live successor, not the sealed
-//! predecessor).
+//! The routes resolve `(workflow_name, workflow_id) → ExecutionId`, then
+//! delegate to the `exec_id` handlers. These tests cover the shared resolver
+//! and the resolution rule (AC2: active first, else most recent terminal, else
+//! 404). They also cover the required-name rule and the always-present
+//! `execution_id` in header and body (AC4). The success metric: a
+//! continue-as-new chain resolves to the live successor, not the sealed
+//! predecessor.
 //!
 //! The pure ranking math is unit-tested in `autumn-harvest/src/execution.rs`
 //! (`select_resolved_run`); these tests verify the HTTP wiring + the DB
 //! resolution + the delegation.
 //!
-//! Docker/testcontainers is not available in every sandbox, so these tests are
-//! compile-checked (`cargo test --no-run`) there and run against a real
-//! Postgres in CI (and against a local Postgres 16 when available).
+//! A sandbox without Docker only compile-checks these tests
+//! (`cargo test --no-run`). CI runs them against a real Postgres.
 
 #![allow(clippy::too_many_lines)]
 
@@ -64,10 +63,10 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-/// Dual-mode: use a pre-migrated Postgres from `HARVEST_TEST_DATABASE_URL` when
-/// set (no Docker required — each test uses a distinct `(name, workflow_id)` so
-/// rows never collide across a shared DB), else boot a fresh testcontainers
-/// Postgres. Mirrors `legal_hold_integration.rs`.
+/// Uses a pre-migrated Postgres from `HARVEST_TEST_DATABASE_URL` when set,
+/// else boots a testcontainers Postgres. Each test uses a distinct
+/// `(name, workflow_id)`, so rows never collide in a shared database.
+/// Mirrors `legal_hold_integration.rs`.
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
@@ -256,11 +255,10 @@ fn progress_info() -> WorkflowInfo {
     }
 }
 
-/// Seed a queryable `progress_wf` run for `(name, workflow_id)`: a raw execution
-/// row plus a `WorkflowStarted` + one scheduled/completed activity pair per
-/// item, so the `progress` query reconstructs a count of `items.len()`. Uses a
-/// raw insert (not `start_or_load_workflow_execution`) so the seeded history is
-/// exactly what the query drive replays against.
+/// Seed a queryable `progress_wf` run for `(name, workflow_id)`.
+/// It writes a `WorkflowStarted` event and one activity pair per item, so the
+/// `progress` query returns `items.len()`. A raw insert keeps the seeded
+/// history exactly what the query replays.
 async fn seed_query_run(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -309,12 +307,11 @@ async fn seed_query_run(
 }
 
 /// Raw-insert a *terminal* run for `(name, workflow_id)` at an explicit
-/// `started_at` offset. Unlike [`seed`], this does not go through
-/// `start_or_load_workflow_execution` — whose standalone semantics *load* an
-/// existing terminal run rather than mint a fresh one — so it can create
-/// multiple distinct terminal rows sharing one `(workflow_name, workflow_id)`
-/// (the partial unique index only covers *active* runs), which is exactly the
-/// "most-recent terminal wins" scenario the resolver's no-active branch handles.
+/// `started_at` offset. [`seed`] goes through
+/// `start_or_load_workflow_execution`, which loads an existing terminal run.
+/// A raw insert can create many terminal rows for one
+/// `(workflow_name, workflow_id)`, because the partial unique index covers
+/// only active runs. That is the "most recent terminal wins" case.
 async fn seed_terminal_raw(
     conn: &mut AsyncPgConnection,
     name: &str,
@@ -684,7 +681,7 @@ async fn resolves_to_most_recent_terminal_when_no_active() {
     assert_eq!(resp.body["execution"]["state"], json!("COMPLETED"));
 }
 
-// ── FIX 5: query by business id end-to-end (GET + POST) ──────────────────────
+// ── query by business id end-to-end (GET + POST) ─────────────────────────────
 //
 // The one genuinely-bespoke AC4 body path: the by-id query handlers re-wrap the
 // (opaque) exec-id query response as `{ "execution_id": …, "result": <value> }`.
@@ -744,11 +741,11 @@ async fn query_by_id_get_and_post_rewrap_execution_id_and_result() {
     assert_eq!(resp.body["result"], json!(2));
 }
 
-// ── FIX 6: pause/resume admin parity + no existence oracle ───────────────────
+// ── pause/resume admin parity + no existence oracle ─────────────────────────
 //
-// pause/resume mirror cancel's admin gate. An unauthenticated mutating by-id
-// call against a NONEXISTENT (name, id) must 401 (admin runs at the route layer,
-// BEFORE resolution) — never a 404 that would leak whether the run exists.
+// pause/resume mirror cancel's admin gate. An unauthenticated by-id mutation
+// on a NONEXISTENT (name, id) must 401, because admin runs before resolution.
+// A 404 would leak whether the run exists.
 
 #[tokio::test]
 async fn pause_resume_require_admin_and_do_not_leak_existence() {
@@ -823,7 +820,7 @@ async fn pause_resume_require_admin_and_do_not_leak_existence() {
     );
 }
 
-// ── FIX 7: /result by-id carries the header even on the still-running (204) path
+// ── /result by-id carries the header even on the still-running (204) path
 //
 // A RUNNING run has no terminal output yet, so /result returns 204 (empty body).
 // The X-Harvest-Execution-Id header is the raison d'être of the header design —
@@ -855,15 +852,13 @@ async fn result_by_id_running_returns_header_on_empty_body() {
     );
 }
 
-// ── FIX 8: multi-terminal ordering end-to-end (newest terminal wins) ─────────
+// ── multi-terminal ordering end-to-end (newest terminal wins) ───────────────
 //
-// Several coexisting TERMINAL runs for the same (name, id) with distinct
-// started_at and no active run → resolve to the NEWEST terminal (the DB
-// order(started_at.desc()) no-active branch, end-to-end). The realistic shape
-// is a continue-as-new chain that finally completed: only CONTINUED_AS_NEW /
-// TERMINATED rows are released from the active-run partial unique index, so a
-// (name, id) with >1 terminal row is a CAN chain plus its final terminal. Here
-// the newest by started_at is the COMPLETED final run.
+// Several TERMINAL runs for one (name, id), with no active run, resolve to the
+// NEWEST by started_at. The realistic shape is a completed continue-as-new
+// chain. Only CONTINUED_AS_NEW / TERMINATED rows leave the active-run partial
+// unique index. So a (name, id) with >1 terminal row is a CAN chain plus its
+// final run. Here the newest is the COMPLETED final run.
 
 #[tokio::test]
 async fn resolves_to_newest_terminal_across_multiple_terminals() {
@@ -871,11 +866,9 @@ async fn resolves_to_newest_terminal_across_multiple_terminals() {
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("conn");
 
-    // Raw inserts (not seed/start_or_load, which loads an existing terminal
-    // rather than minting a new one) so distinct rows coexist. Two sealed
-    // CONTINUED_AS_NEW predecessors (released from the active index) + one
-    // COMPLETED final run, inserted out of started_at order to prove the DB
-    // orders by started_at (not insertion order).
+    // Raw inserts let distinct terminal rows coexist. Two sealed
+    // CONTINUED_AS_NEW predecessors and one COMPLETED final run go in out of
+    // started_at order. That proves the DB orders by started_at.
     let _p1 = seed_terminal_raw(
         &mut conn,
         "order_flow",
@@ -906,13 +899,12 @@ async fn resolves_to_newest_terminal_across_multiple_terminals() {
     assert_eq!(resp.body["execution"]["state"], json!("COMPLETED"));
 }
 
-// ── FIX 9(a): a bare workflow_id (name-only, 3-segment path) is rejected 400
+// ── a bare workflow_id (name-only, 3-segment path) is rejected 400 ──────────
 //
-// The by-id routes require BOTH segments; a name-only `/workflows/by-id/{name}`
-// path (no workflow_id) is an input-validation error and is rejected with a
-// literal 400 (not a structural 404), matching AC3 verbatim ("a bare
-// workflow_id without a name is rejected 400"). Guard routes are registered for
-// both GET and POST so the rejection is uniform.
+// The by-id routes require BOTH segments. A name-only `/workflows/by-id/{name}`
+// path is an input-validation error, so it gets a literal 400, not a 404.
+// That matches AC3 verbatim. Guard routes exist for GET and POST, so the
+// rejection is uniform.
 
 #[tokio::test]
 async fn name_only_by_id_path_is_rejected_400() {
@@ -1097,7 +1089,7 @@ async fn start_with_omitted_workflow_id_still_auto_generates() {
     );
 }
 
-// ── issue #1353 review (correctness pass): the empty-`workflow_id` guard
+// ── issue #1353: the empty-`workflow_id` guard
 // must cover every route that can create a fresh execution, not only
 // `POST /workflows/{name}/start`. `signal-with-start`, `update-with-start`
 // and `batch_start` each parse their own request struct. Each can reach the

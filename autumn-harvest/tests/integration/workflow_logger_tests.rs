@@ -721,12 +721,12 @@ async fn replayer_produces_zero_log_events() {
 /// are byte-identical across repeated drives of the same position.
 ///
 /// **This is NOT the AC2 randomized-interleaving replay test.** It simulates the
-/// store with an in-memory map and never replays, so it cannot observe the
-/// durable dedup at all — deleting the unique index would not fail it. The real
+/// store with an in-memory map and never replays. So it cannot observe the
+/// durable dedup, and deleting the unique index would not fail it. The real
 /// AC2 artifact is
-/// `workflow_logs_tests::randomized_replay_interleavings_never_duplicate_or_reorder_lines`,
-/// which drives the real executor over a growing history (including
-/// replay-transparent growth) and persists through the real
+/// `workflow_logs_tests::randomized_replay_interleavings_never_duplicate_or_reorder_lines`.
+/// That test drives the real executor over a growing history, including
+/// replay-transparent growth. It persists through the real
 /// `store::append_workflow_logs` into the real table.
 ///
 /// Kept because it is the fast local guard: it fails in milliseconds without a

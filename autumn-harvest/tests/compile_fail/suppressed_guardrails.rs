@@ -90,10 +90,10 @@ async fn ordered_iteration_workflow(ctx: &WorkflowContext) -> Result<(), String>
 }
 
 // HVG010 activity-body negative control (issue #799, AC6/AC7): the select!
-// macro AND the futures combinator functions inside an #[activity] body are
-// never flagged — activities may race freely (only the recorded result
-// matters, not the internal control flow). This fully-linted activity (no
-// allow_nondeterministic_apis) must compile clean.
+// macro and the futures combinator functions are never flagged inside an
+// #[activity] body. Activities may race freely, because only the recorded
+// result matters, not the internal control flow. This fully-linted activity
+// (no allow_nondeterministic_apis) must compile clean.
 #[activity(start_to_close = "30s")]
 async fn activity_may_race_freely(_ctx: &ActivityContext) -> Result<(), String> {
     let fa = Box::pin(async {});

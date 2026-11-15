@@ -4,9 +4,9 @@
 //! rows-remaining-per-key-id shape after a real rotation, and the contract
 //! registration that keeps `docs/api-contract.json` honest.
 //!
-//! Runs against a real Postgres 16 container (or `HARVEST_TEST_DATABASE_URL`,
-//! in which case each test gets its own throwaway database — the rotation
-//! census is shard-wide by design and cannot share a database).
+//! Runs against a real Postgres 16 container or `HARVEST_TEST_DATABASE_URL`.
+//! With the variable, each test gets its own throwaway database, because the
+//! rotation census is shard-wide.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

@@ -2,9 +2,9 @@
 //!
 //! Builds a real autumn-web app with the generated workflow tool routes and
 //! `mount_mcp("/mcp")`, then drives the JSON-RPC endpoint. `tools/list` and
-//! schema derivation need no database; `tools/call` paths assert the error
-//! contract that proves dispatch flows through the real handler pipeline
-//! (the runtime is not installed, so handle-taking calls fail closed).
+//! schema derivation need no database. The `tools/call` paths assert the error
+//! contract, which proves dispatch reaches the real handler pipeline. No
+//! runtime is installed, so handle-taking calls fail closed.
 //!
 //! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here — `TestApp`
 //! replays plugin startup hooks and `start_harvest_runtime` requires a live
@@ -358,17 +358,13 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
 
     // Start tool: dispatch reaches the real (delegated) start_workflow
     // handler and fails closed pre-startup, same as the other calls above.
-    // NOTE: start_tool no longer duplicates issue #373 schema validation
-    // itself (removed as a redundant, closure-captured-schema copy of the
-    // check start_workflow already performs against the live registry --
-    // see the code-review hardening notes in docs/shipped-work.md); that
-    // validation is
-    // gated behind a successful `api_state.runtime()` lookup inside
-    // start_workflow, which this no-DB harness can never reach, so a
-    // schema-violation rejection cannot be exercised here. That guarantee is
-    // instead covered end-to-end (with a real runtime) by
+    // NOTE: start_tool does not repeat the issue #373 schema validation. The
+    // check lives in start_workflow, against the live registry (see the
+    // hardening notes in docs/shipped-work.md). It runs only after a
+    // successful `api_state.runtime()` lookup, which this no-DB harness never
+    // reaches. So
     // `mcp_start_tool_rejects_input_that_violates_the_published_schema` in
-    // `tests/mcp_tools_integration.rs`.
+    // `tests/mcp_tools_integration.rs` covers it with a real runtime.
     let out = rpc(
         &client,
         json!({
@@ -429,9 +425,9 @@ async fn dag_start_tool_call_dispatches_through_the_dag_trigger_pipeline() {
     let client = build_dag_client();
 
     // No storage/runtime installed -> the delegated trigger_dag_run handler
-    // fails closed on harvest's own runtime check, proving the call reaches
-    // the real DAG trigger pipeline (not the generic start_workflow path,
-    // which would fail closed with a different, workflow-shaped error).
+    // fails closed on harvest's own runtime check. That proves the call reaches
+    // the real DAG trigger pipeline. The generic start_workflow path would
+    // fail with a different, workflow-shaped error.
     let out = rpc(
         &client,
         json!({
@@ -450,16 +446,16 @@ async fn dag_start_tool_call_dispatches_through_the_dag_trigger_pipeline() {
 
 // ── Read-only operator role × MCP tool routes (issue #776, F1) ────────────────
 //
-// The generated MCP tool routes are registered app-level (outside the nested
-// management router that carries the `enforce_read_only_class` layer), so
-// without a per-route gate a read-only principal could START / SIGNAL / UPDATE
-// / DAG-start a workflow through a tool. `build_mcp_tool_routes(role_auth=true)`
+// The generated MCP tool routes are registered app-level, outside the nested
+// management router that carries the `enforce_read_only_class` layer. Without
+// a per-route gate, a read-only principal could START / SIGNAL / UPDATE /
+// DAG-start a workflow through a tool. `build_mcp_tool_routes(role_auth=true)`
 // installs `enforce_read_only_mcp_mutation` on every mutating tool. These
-// tests drive each generated tool route directly (a read-only `Session`
-// injected into request extensions, exactly as the embedder auth middleware
-// would populate it) and assert the class boundary. A `403` is produced ONLY
-// by the gate (the handlers themselves return 400/404/503 when the runtime is
-// absent, never 403), so `status == 403` ⟺ the gate fired.
+// tests drive each generated tool route directly and assert the class
+// boundary. A read-only `Session` goes into the request extensions, as the
+// embedder auth middleware would put it. Only the gate produces a `403`. With
+// no runtime, the handlers return 400/404/503. So `status == 403` ⟺ the gate
+// fired.
 
 use autumn_harvest_plugin::mcp_tools::tool_route_specs;
 use autumn_web::AppState;
@@ -533,10 +529,10 @@ fn mutation_paths(
 /// `(Method, concrete_path)` for one generated tool route.
 type RouteMeta = Vec<(Method, String)>;
 
-/// Build a raw axum router from the generated tool routes (exactly what
-/// `AppBuilder::routes(routes)` does inside `Plugin::build`, minus the app
-/// scaffolding), so a `Session` can be injected per request. Returns the app
-/// plus the mutating and read `(Method, concrete_path)` sets.
+/// Build a raw axum router from the generated tool routes, as
+/// `AppBuilder::routes(routes)` does inside `Plugin::build`. A test can then
+/// inject a `Session` per request. Returns the app plus the mutating and read
+/// `(Method, concrete_path)` sets.
 fn build_router(role_auth_enabled: bool) -> (Router, RouteMeta, RouteMeta) {
     build_router_with(&open_mutations_state(), role_auth_enabled)
 }
@@ -610,9 +606,9 @@ async fn readonly_principal_is_denied_mutating_mcp_tools_but_reaches_reads() {
         );
     }
 
-    // A read-only principal → NOT 403 on read tools (status/watch): the gate is
-    // only installed on mutations, so the handler runs (and fails fast on the
-    // bogus handle without a DB).
+    // A read-only principal → NOT 403 on read tools (status/watch). The gate
+    // is only on mutations, so the handler runs and fails fast on the bogus
+    // handle.
     for (method, path) in &reading {
         let (status, _) = drive(&app, method, path, Some(readonly_session())).await;
         assert_ne!(

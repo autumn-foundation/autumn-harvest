@@ -406,12 +406,12 @@ pub enum DeadLetterReason {
         timeout_secs: u64,
     },
     /// A completion-callback delivery (issue #605) exhausted its configured
-    /// retry budget without ever receiving a 2xx response. Distinct from
-    /// clean task-retry exhaustion: there is no `harvest_task_queue` row or
-    /// workflow execution to reactivate on redrive — an operator-triggered
-    /// redrive resets the *same* `harvest_completion_deliveries` row
-    /// (`completion_callback::redrive_delivery`) to `PENDING` so the
-    /// scanner re-attempts it with the same `delivery_id`.
+    /// retry budget without ever receiving a 2xx response. This differs from
+    /// clean task-retry exhaustion. A redrive has no `harvest_task_queue` row or
+    /// workflow execution to reactivate. An operator-triggered redrive resets
+    /// the *same* `harvest_completion_deliveries` row
+    /// (`completion_callback::redrive_delivery`) to `PENDING`. The scanner then
+    /// re-attempts it with the same `delivery_id`.
     CallbackDeliveryExhausted {
         delivery_id: Uuid,
         attempts: i32,
@@ -459,18 +459,18 @@ impl DeadLetterReason {
 }
 
 /// Delegate a `task_type = "CALLBACK"` dead-letter's replay to the
-/// completion-delivery redrive primitive (issue #605), so the generic DLQ
-/// replay surface (single-row API, bulk replay, UI) actually redrives the
-/// delivery instead of failing on `dead_letter_task_type`'s "invalid
-/// `task_type`" error (issue #921 review, Codex P2). Called from inside the
-/// caller's already-open transaction; `completion_callback::redrive_delivery`
-/// opens its own nested transaction (a savepoint) on the same connection,
-/// which is safe.
+/// completion-delivery redrive primitive (issue #605).
+///
+/// This makes the generic DLQ replay surface (single-row API, bulk replay, UI)
+/// redrive the delivery. It does not fail on the "invalid `task_type`" error of
+/// `dead_letter_task_type` (issue #921). The caller's transaction is already
+/// open. `completion_callback::redrive_delivery` opens its own nested
+/// transaction (a savepoint) on the same connection, which is safe.
 ///
 /// Returns the delivery's own id (`original_task_id`, stable across
-/// redrives) in place of a newly-created task-queue row id — there is no
-/// task-queue row for a completion delivery, so this is the closest
-/// equivalent "id of the unit of work that now represents this retry."
+/// redrives), not a new task-queue row id. A completion delivery has no
+/// task-queue row. So this id is the closest equivalent: "id of the unit of
+/// work that now represents this retry."
 async fn redrive_callback_dead_letter(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
@@ -725,13 +725,12 @@ pub struct NewDeadLetterEntry {
 /// Denormalizes `workflow_name` and the resolved per-tenant `quota_key` (issue
 /// #946) onto the DLQ row itself, via a single indexed point lookup keyed on
 /// `entry.workflow_exec_id`. This mirrors the `owner`/`severity` denormalization
-/// precedent (issue #372): `max_dead_letters` quota accounting must never
-/// depend on the originating execution row still existing once retention
-/// (issue #737) collects it, and resolving it centrally here (rather than
-/// requiring every one of `dead_letter()`'s many call sites to pass it in)
-/// guarantees every DLQ insertion path gets correct quota bookkeeping for
-/// free. When `workflow_exec_id` is `None` (a non-workflow-scoped task), both
-/// columns are left `NULL`.
+/// precedent (issue #372). `max_dead_letters` quota accounting must never
+/// depend on the originating execution row, which retention (issue #737) can
+/// collect. The central lookup here means no call site of `dead_letter()` has
+/// to pass the values in. So every DLQ insertion path gets correct quota
+/// bookkeeping for free. When `workflow_exec_id` is `None` (a
+/// non-workflow-scoped task), both columns are left `NULL`.
 ///
 /// This form does not encode the input. It stores the input as it arrives,
 /// so a stored envelope stays an envelope. Use [`dead_letter_with_codecs`] to
@@ -916,12 +915,12 @@ pub async fn replay_dead_letter_at(
                 .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
 
             // A completion-callback dead letter (issue #605) is not a
-            // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+            // WORKFLOW/ACTIVITY task-queue row. It is an exhausted
             // completion-delivery attempt, and "replay by re-enqueue" below
             // has no meaning for it. Delegate to the delivery's own redrive
-            // primitive instead of erroring with "invalid task_type" (issue
-            // #921 review, Codex P2): the generic DLQ "replay" surface (API,
-            // bulk replay, UI) must actually redrive the delivery, not fail.
+            // primitive, not an "invalid task_type" error (issue #921). The
+            // generic DLQ "replay" surface (API, bulk replay, UI) must redrive
+            // the delivery, not fail.
             if entry.task_type.eq_ignore_ascii_case("callback") {
                 return redrive_callback_dead_letter(
                     conn,
@@ -973,10 +972,10 @@ pub async fn replay_dead_letter_at(
                     }
                     params.required_build_id = build_id;
                     // Concurrency policy lives on WorkflowInfo and governs
-                    // workflow-task slots only.  Activity tasks are not subject
-                    // to the workflow-level cap (the claim query enforces caps
-                    // per task_type, so mixing them would throttle activities
-                    // against the wrong budget).
+                    // workflow-task slots only. The workflow-level cap does not
+                    // apply to activity tasks. The claim query enforces caps
+                    // per task_type, so a mix would throttle activities
+                    // against the wrong budget.
                     if task_type == TaskType::Workflow
                         && decoded
                         && let Some(reg) = registry
@@ -1016,13 +1015,13 @@ pub async fn replay_dead_letter_at(
 
 /// Count dead-letter rows matching `filter` without applying a row limit.
 ///
-/// Used both internally (to populate `BulkDlqResult::matched`) and by the
-/// API fan-out layer to count matches on shards where the global limit is
-/// already exhausted, so that `matched` in the aggregated response always
-/// reflects the true pre-limit total across all shards.
+/// It populates `BulkDlqResult::matched`. The API fan-out layer also uses it
+/// to count matches on shards where the global limit is already exhausted. So
+/// `matched` in the aggregated response is the true pre-limit total across all
+/// shards.
 ///
-/// This is part of the external-embedder surface (issue #613): the live HTTP
-/// path uses the `_api_bulk` variants in the plugin's `api.rs`, which apply the
+/// This is part of the external-embedder surface (issue #613). The live HTTP
+/// path uses the `_api_bulk` variants in the plugin's `api.rs`. They apply the
 /// same predicate set. Keep the two in sync when adding a filter dimension.
 ///
 /// A cause filter is compute-on-read — it loads all SQL-prefiltered rows and
@@ -1476,9 +1475,9 @@ async fn query_dead_letters_for_redrive(
 ///
 /// Re-enqueues the dead-lettered task onto its original queue with a fresh
 /// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
-/// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
-/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
-/// resumes from existing history append-only). The whole operation is one
+/// owning execution sealed `FAILED` at quarantine time (`FAILED → RUNNING`).
+/// It appends a [`WorkflowEvent::WorkflowRedriven`] event, so replay resumes
+/// from existing history append-only. The whole operation is one
 /// transaction.
 ///
 /// Outcomes:
@@ -1541,9 +1540,8 @@ pub async fn redrive_dead_letter_at(
             };
 
             // Delegate a completion-callback dead letter (issue #605) to its
-            // own redrive primitive instead of erroring with "invalid
-            // task_type" (issue #921 review, Codex P2) -- see
-            // `redrive_callback_dead_letter`'s doc comment.
+            // own redrive primitive, not an "invalid task_type" error (issue
+            // #921). See the doc comment of `redrive_callback_dead_letter`.
             if entry.task_type.eq_ignore_ascii_case("callback") {
                 return match redrive_callback_dead_letter(
                     conn,
@@ -1723,21 +1721,20 @@ pub async fn redrive_dead_letters(
 // Root-cause aggregation (issue #385)
 // ---------------------------------------------------------------------------
 //
-// The DLQ aggregation endpoint answers the operator's first incident question —
-// "what is the shape of this fire?" — by grouping dead-letter rows along a small,
-// named set of dimensions and returning per-group counts plus a handful of
+// The DLQ aggregation endpoint answers the first incident question of an
+// operator: what is the shape of this fire? It groups dead-letter rows along
+// a small, named set of dimensions. It returns per-group counts plus a few
 // representative `dead_letter_id`s. It is a read-path-only feature: no new
 // `WorkflowEvent` variants and no schema change.
 //
 // **Signature derivation choice.** `harvest_dead_letters.error` is freeform
 // `TEXT`, so grouping on the raw column yields a long tail of singletons. This
-// slice implements the *compute-on-read normalized substring* option (the
-// zero-migration choice called out in the issue): [`failure_signature`] takes
-// the first line of the error, normalizes dynamic runs (UUIDs, long hex strings,
-// and decimal integers) to fixed placeholders, and truncates to
-// [`SIGNATURE_MAX_LEN`] characters. Because it is a pure function of the error
-// text, the same root cause aggregates identically across queries and across
-// shards.
+// slice implements the *compute-on-read normalized substring* option, the
+// zero-migration choice in the issue. [`failure_signature`] takes the first
+// line of the error. It normalizes dynamic runs (UUIDs, long hex strings, and
+// decimal integers) to fixed placeholders. It truncates to
+// [`SIGNATURE_MAX_LEN`] characters. It is a pure function of the error text.
+// So the same root cause aggregates identically across queries and shards.
 
 /// Maximum length of a derived failure signature, in characters.
 pub const SIGNATURE_MAX_LEN: usize = 200;
@@ -1757,9 +1754,9 @@ const PLACEHOLDER_NUM: &str = "<NUM>";
 
 /// Derive a stable, deterministic failure signature from a freeform DLQ error.
 ///
-/// The signature is the first line of `error`, with dynamic runs (UUIDs, long
-/// hex strings, and decimal integers) normalized to fixed placeholders and the
-/// result truncated to [`SIGNATURE_MAX_LEN`] characters. It is a pure function
+/// The signature is the first line of `error`. Dynamic runs (UUIDs, long hex
+/// strings, and decimal integers) become fixed placeholders. The result is
+/// truncated to [`SIGNATURE_MAX_LEN`] characters. It is a pure function
 /// of its input, so it is identical across queries and across shards for the
 /// same root-cause error text (issue #385).
 #[must_use]
@@ -1777,11 +1774,11 @@ pub const ERROR_CLASS_MAX_LEN: usize = 80;
 ///
 /// Engine-authored quarantine entries serialize a tagged [`DeadLetterReason`]
 /// as their `error` (see `dead_letter`'s callers); those map to the reason's
-/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error —
-/// a plain `Err(String)` or a typed activity-failure envelope — is retry
-/// exhaustion (there is no production path that dead-letters a plain
-/// retry-exhausted activity, but tests and embedders can), so it maps to
-/// `"retry_exhaustion"`. Pure and deterministic: identical across queries and
+/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error is
+/// retry exhaustion and maps to `"retry_exhaustion"`. Such an error is a plain
+/// `Err(String)` or a typed activity-failure envelope. No production path
+/// dead-letters a plain retry-exhausted activity, but tests and embedders can.
+/// Pure and deterministic: identical across queries and
 /// shards for the same input.
 #[must_use]
 pub fn dlq_reason(error: &str) -> String {
@@ -1805,14 +1802,14 @@ pub fn dlq_reason(error: &str) -> String {
 /// deterministic: identical across queries and shards for the same input.
 ///
 /// An empty `error` yields an empty-string class, which the bulk-filter
-/// validator rejects with `400` (a degenerate input: production `error` is NOT
-/// NULL and carries a tagged reason or a non-empty message).
+/// validator rejects with `400`. That input is degenerate: production `error`
+/// is NOT NULL and carries a tagged reason or a non-empty message.
 #[must_use]
 pub fn error_class(error: &str) -> String {
-    // Every branch returns a trimmed value so a padded `error_type` facet key
-    // round-trips through the (trimming) bulk-filter validator (issue #613): a
-    // facet key read from this classifier and fed back as a `BulkDlqFilter`
-    // cause dimension must re-select the same rows.
+    // Every branch returns a trimmed value. So a padded `error_type` facet key
+    // round-trips through the trimming bulk-filter validator (issue #613). A
+    // facet key from this classifier, fed back as a `BulkDlqFilter` cause
+    // dimension, must re-select the same rows.
     if let Some(failure) = crate::failure::parse_typed_payload(error) {
         return truncate_chars(failure.error_type.trim(), ERROR_CLASS_MAX_LEN);
     }
@@ -1887,9 +1884,9 @@ fn is_hex_run(token: &str) -> bool {
     {
         return !body.is_empty() && body.bytes().all(|b| b.is_ascii_hexdigit());
     }
-    // Plain hex: require length >= 8 to avoid normalizing short words, and
-    // require at least one hex letter (a-f/A-F) so pure decimal strings ≥8
-    // digits fall through to replace_digit_runs instead of becoming <HEX>.
+    // Plain hex: require length >= 8, so short words stay as they are. Also
+    // require at least one hex letter (a-f/A-F). Then a pure decimal string of
+    // 8 or more digits falls through to replace_digit_runs, not <HEX>.
     token.len() >= 8
         && token.bytes().all(|b| b.is_ascii_hexdigit())
         && token
@@ -2039,10 +2036,11 @@ impl DlqAggregateParams {
     /// Parse and validate query-string pairs into aggregation parameters.
     ///
     /// `now` anchors relative durations (e.g. `since=24h`). Unknown query keys
-    /// are ignored (forward-compatible), but invalid values for known keys —
-    /// an unknown `group_by` dimension, a malformed duration, or an out-of-range
-    /// `limit_groups`/`samples_per_group` — return `Err(message)` so the caller
-    /// can answer `400 Bad Request` rather than silently matching nothing.
+    /// are ignored (forward-compatible). An invalid value for a known key
+    /// returns `Err(message)`, so the caller can answer `400 Bad Request` and
+    /// not silently match nothing. Examples are an unknown `group_by`
+    /// dimension, a malformed duration, or an out-of-range
+    /// `limit_groups`/`samples_per_group`.
     ///
     /// # Errors
     ///
@@ -2261,13 +2259,13 @@ fn render_group_key(params: &DlqAggregateParams, key: &[Option<String>]) -> serd
 /// workflow-count fleet snapshot in `autumn-harvest-plugin`).
 ///
 /// `groups` is sorted descending by `count_of` (ties broken by `key`,
-/// ascending) and truncated to `limit`. When the dropped tail's summed count
-/// is positive, it is folded into one rollup entry appended via `make_other`
-/// and the returned `bool` is `true`; a truncation that only drops zero-count
-/// entries reports `false` and appends no rollup row (this never happens for
-/// real `COUNT(*)` rows, which are always `>= 1`, but keeps the helper exact
-/// for any future caller with synthetic zero-count groups). Per-group counts
-/// always reconcile to the pre-rollup total either way.
+/// ascending) and truncated to `limit`. A dropped tail with a positive summed
+/// count folds into one rollup entry from `make_other`, and the returned
+/// `bool` is `true`. A truncation that only drops zero-count entries reports
+/// `false` and appends no rollup row. Real `COUNT(*)` rows are always `>= 1`,
+/// so that never happens for them. The rule keeps the helper exact for a
+/// future caller with synthetic zero-count groups. Per-group counts always reconcile to the
+/// pre-rollup total either way.
 #[must_use]
 pub fn rollup_top_n<K: Ord, A, T>(
     mut groups: Vec<(K, A)>,
@@ -2302,10 +2300,10 @@ pub fn rollup_top_n<K: Ord, A, T>(
 ///
 /// Counts sum across shards; `first_seen`/`last_seen` take the global min/max;
 /// sample IDs are taken from any shard up to `samples_per_group`. Groups are
-/// ordered by descending count (ties broken by key for determinism). When more
-/// than `limit_groups` distinct groups exist, the long tail is rolled into a
-/// single `{"_other": true}` group so the per-group counts reconcile to
-/// `filtered_total`, and `truncated` is set to `true`.
+/// ordered by descending count (ties broken by key for determinism). Past
+/// `limit_groups` distinct groups, the long tail rolls into a single
+/// `{"_other": true}` group, and `truncated` is set to `true`. So the per-group
+/// counts reconcile to `filtered_total`.
 #[must_use]
 pub fn merge_dlq_aggregates(
     params: &DlqAggregateParams,
@@ -2379,10 +2377,9 @@ pub fn merge_dlq_aggregates(
 /// [`aggregate_dead_letters`] selects it: `(id, workflow_exec_id,
 /// activity_name, queue_name, task_type, failed_at, error)`.
 ///
-/// `pub` (rather than the module-private alias this used to be) so
-/// [`group_dead_letter_rows`] -- and the `dlq_aggregate_profile` benchmark
-/// harness that drives it directly, without a database -- can be called from
-/// outside this module.
+/// It is `pub` so code outside this module can call
+/// [`group_dead_letter_rows`]. The `dlq_aggregate_profile` benchmark harness
+/// drives it directly, without a database.
 pub type AggregateRow = (
     Uuid,
     Option<Uuid>,
@@ -2398,25 +2395,21 @@ pub type AggregateRow = (
 /// Pure and DB-free: the derived [`failure_signature`]/[`dlq_reason`]/
 /// [`error_class`] classification, the per-row grouping key, and the count/
 /// first-seen/last-seen/sample-id bookkeeping are all in-memory work with no
-/// I/O. Shared verbatim by [`aggregate_dead_letters`] (fed real DB rows) and
-/// the `dlq_aggregate_profile` benchmark harness (fed a synthetic but
-/// realistic incident-shaped batch), so both exercise byte-identical code —
-/// see `benches/dlq_aggregate_profile.rs` and
-/// `docs/performance-dlq-aggregate.md`.
+/// I/O. [`aggregate_dead_letters`] (real DB rows) and the
+/// `dlq_aggregate_profile` benchmark harness (a synthetic incident-shaped
+/// batch) share it verbatim. So both exercise byte-identical code. See
+/// `benches/dlq_aggregate_profile.rs` and `docs/performance-dlq-aggregate.md`.
 ///
-/// Deliberately uses `entry(key.clone())` rather than a `get_mut`-first
-/// lookup: a `get_mut`-first rewrite was measured to save ~6% instructions
-/// on a hit-heavy (few groups, many rows -- the intended "DLQ flood"
-/// triage) workload, but `group_by` is fully caller-controlled, and the
-/// same rewrite was independently measured to *cost* ~4.5% instructions on
-/// an adversarial miss-heavy workload (a caller-chosen `group_by` that
-/// yields mostly-distinct keys, e.g. `[ActivityName]` on a fleet with many
-/// distinct activity names): `get_mut` plus a fallback `insert` pays two
-/// hash+probe passes on every miss, versus `entry()`'s one. `entry()`'s
-/// per-row cost is invariant to hit/miss ratio, which matters more for a
-/// caller-facing endpoint than optimizing one particular input shape at
-/// another's expense. See `docs/performance-dlq-aggregate.md`'s "Negative
-/// result" section for the full measurement.
+/// It deliberately uses `entry(key.clone())`, not a `get_mut`-first lookup.
+/// A `get_mut`-first rewrite saved ~6% instructions on a hit-heavy workload
+/// (few groups, many rows: the intended "DLQ flood" triage). But `group_by` is
+/// fully caller-controlled. The same rewrite *cost* ~4.5% instructions on an
+/// adversarial miss-heavy workload. An example is `[ActivityName]` on a fleet
+/// with many distinct activity names. `get_mut` plus a fallback `insert` pays
+/// two hash+probe passes on every miss; `entry()` pays one. The per-row cost
+/// of `entry()` does not depend on the hit/miss ratio. For a caller-facing
+/// endpoint, that matters more than a gain on one input shape. See the
+/// "Negative result" section of `docs/performance-dlq-aggregate.md`.
 #[must_use]
 #[allow(
     clippy::implicit_hasher,
@@ -2571,10 +2564,6 @@ async fn load_workflow_names(
         .map_err(crate::error::database_error)?;
     Ok(rows.into_iter().collect())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -3416,8 +3405,8 @@ mod tests {
     fn error_class_trims_padded_error_type_for_round_trip() {
         use crate::failure::{ActivityFailure, IntoActivityErrorString};
         // A typed envelope whose error_type carries surrounding whitespace must
-        // classify to the trimmed class so the facet key round-trips through the
-        // (trimming) bulk-filter validator (issue #613, P3-1).
+        // classify to the trimmed class. Then the facet key round-trips through
+        // the trimming bulk-filter validator (issue #613).
         let padded = ActivityFailure::non_retryable("  CircuitOpen  ", "open").into_error_payload();
         assert_eq!(error_class(&padded), "CircuitOpen");
     }

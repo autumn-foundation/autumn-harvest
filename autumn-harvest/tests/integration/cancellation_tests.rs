@@ -855,9 +855,9 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     .await
     .expect("workflow cancellation should succeed");
 
-    // Give the worker time to: observe cancellation (up to ~500ms poll),
-    // cancel the token, elapse the 500ms grace period, then abort the
-    // handler and record the activity failure.
+    // The worker observes cancellation (up to ~500ms poll) and cancels the
+    // token. After the 500ms grace period it aborts the handler and records
+    // the activity failure.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let tasks = load_tasks(&mut conn, exec_id).await;
@@ -899,8 +899,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
 // AC #9 — three named integration tests
 // ---------------------------------------------------------------------------
 
-// AC test 1: activity_exits_early_on_workflow_cancellation
-//
 // An activity that calls ctx.heartbeat() in a loop exits early (and sets the
 // probe flag) within one heartbeat interval after the workflow is cancelled.
 #[allow(clippy::too_many_lines)]
@@ -1076,8 +1074,6 @@ async fn activity_exits_early_on_workflow_cancellation() {
     worker_task.await.expect("worker should stop cleanly");
 }
 
-// AC test 2: activity_without_cancellation_check_completes_normally
-//
 // An activity that never calls heartbeat() is not stopped by the cooperative
 // cancellation path.  It is only stopped by the worker's hard-abort after the
 // grace period — confirming cancellation is purely cooperative via heartbeat.
@@ -1241,13 +1237,11 @@ async fn activity_without_cancellation_check_completes_normally() {
     worker_task.await.expect("worker should stop cleanly");
 }
 
-// AC test 3: heartbeat_checkpoint_preserved_across_cancel_signal
-//
 // When cancellation arrives, the checkpoint payload flushed to the database
 // before the cancel must still be the value the activity context received at
 // dispatch time.  The cancel path clears heartbeat_details on the task row
-// (for fresh retries), but an activity context built before the cancel already
-// holds the pre-cancel snapshot in memory — so its view is stable.
+// for fresh retries. An activity context built before the cancel already
+// holds the pre-cancel snapshot in memory, so its view is stable.
 #[tokio::test]
 async fn heartbeat_checkpoint_preserved_across_cancel_signal() {
     use autumn_harvest::schema::harvest_task_queue::dsl;

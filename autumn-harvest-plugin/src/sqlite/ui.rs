@@ -83,7 +83,6 @@ fn layout(title: &str, up: &str, body: &Markup) -> Markup {
     }
 }
 
-/// An HTML page with a status.
 fn page(status: StatusCode, markup: Markup) -> Response {
     (status, markup).into_response()
 }

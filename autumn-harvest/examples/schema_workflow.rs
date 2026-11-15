@@ -180,9 +180,9 @@ fn variant_schema() -> serde_json::Value {
 
 /// Every workflow this "app" registers, with its published schemas attached.
 ///
-/// This is the single source of truth for both the demo output below and the
-/// `--emit-contract` generator: the schema gate can only ever be as accurate as
-/// the registry it is handed, so they must not drift.
+/// The single source of truth for the demo output below and the
+/// `--emit-contract` generator. The schema gate is only as accurate as its
+/// registry, so the two must not drift.
 fn registered_workflows() -> Vec<WorkflowInfo> {
     vec![
         onboarding_info()
@@ -221,8 +221,6 @@ fn declared_side_effects() -> Vec<SideEffectInfo> {
     let info = info.with_value_schema_fn(variant_schema);
     vec![info]
 }
-
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
     // `--emit-contract` turns this example into the schema-contract generator

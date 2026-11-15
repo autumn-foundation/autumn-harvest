@@ -440,7 +440,6 @@ pub(crate) struct Edit<'a> {
 
 /// The end of one stage.
 pub(crate) struct Edited {
-    /// The result.
     pub outcome: StageOutcome,
     /// The editor calls.
     pub attempts: u32,

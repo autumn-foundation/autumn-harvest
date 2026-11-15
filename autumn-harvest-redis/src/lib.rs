@@ -85,8 +85,8 @@
 //!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) therefore stay in
 //!   one Redis Cluster slot. The dispatch read (`next`) does too: it reads
 //!   one queue's stream per call, never combining several queues into one
-//!   multi-key `XREADGROUP` (Codex review, issue #1429). This crate still
-//!   connects with a single-node
+//!   multi-key `XREADGROUP` (issue #1429). This crate still connects with a
+//!   single-node
 //!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
 //!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
 //!   redirects across a multi-node Cluster deployment. A cluster-aware

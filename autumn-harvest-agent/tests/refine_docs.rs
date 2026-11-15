@@ -8,16 +8,13 @@ use std::path::{Path, PathBuf};
 /// The guide that holds the section.
 const GUIDE: &str = "docs/agent-adapter.md";
 
-/// The heading of the section.
 const SECTION: &str = "## 25. Refine an agent";
 
 /// The heading of the section that holds the settings table.
 const POLICY_SECTION: &str = "## 18. The refine policy (issue #2394)";
 
-/// The ADR of the refine loop.
 const ADR: &str = "docs/adr/0016-agent-refinement.md";
 
-/// The ADR index.
 const ADR_INDEX: &str = "docs/adr/README.md";
 
 /// The command of the guide that runs the example.

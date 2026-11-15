@@ -3,12 +3,12 @@
 //! `score::select` in the agent crate maps each verdict to an entry. An
 //! entry is a draw id and an order key. A reject has no key. The copy
 //! `key_of_bits` makes the key, and a theorem shows that the key keeps the
-//! order of the bits. The copies
-//! below are `pick` and `best_draw`. The spec `chosen` folds `pick` over a
-//! sequence. The theorems state three properties. The winner has the top
-//! key. A reject never wins while a key exists. The result depends only on
-//! the set of entries, so no order of the input changes it. The proptest
-//! `select_does_not_depend_on_the_order` checks the engine with floats.
+//! order of the bits. The copies below are `pick` and `best_draw`. The spec
+//! `chosen` folds `pick` over a sequence. The theorems state three
+//! properties. The winner has the top key. A reject never wins while a key
+//! exists. The result depends only on the set of entries, so no order of the
+//! input changes it. The proptest `select_does_not_depend_on_the_order`
+//! checks the engine with floats.
 
 use vstd::prelude::*;
 

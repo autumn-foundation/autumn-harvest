@@ -4,31 +4,23 @@
 //!
 //! `fire_due_on_conn` (`autumn-harvest/src/completion_callback.rs`) claims
 //! up to `COMPLETION_DELIVERY_FIRE_BATCH_SIZE` (100) due rows in one
-//! statement, and dispatches every claimed delivery's HTTP POST
-//! concurrently. It then walks the batch a second time and calls
-//! `apply_outcome` on each row's own turn through the loop. Every
-//! `Delivered` or `Backoff` outcome opens its own
-//! `UPDATE harvest_completion_deliveries ... WHERE id = $id AND attempt =
-//! $attempt` round trip. A tick that resolves N rows issues 1 batched
-//! claim, plus N independent outcome-recording statements. That is
-//! exactly the shape this persona's charter names: "Workflow/activity
-//! bookkeeping queries (Harvest) that are individually trivial and
-//! collectively dominant... find them by `calls`."
+//! statement, and sends their HTTP POSTs concurrently. It then walks the
+//! batch again and calls `apply_outcome` once per row. Each `Delivered` or
+//! `Backoff` outcome makes its own `UPDATE harvest_completion_deliveries ...
+//! WHERE id = $id AND attempt = $attempt` round trip. So a tick that resolves
+//! N rows sends 1 batched claim and N outcome statements. Each is trivial,
+//! but together they dominate, and `calls` finds them.
 //!
-//! The fix batches the `Delivered` and `Backoff` paths into two
-//! `UPDATE ... FROM unnest(...)` statements. That is one round trip per
-//! outcome kind per tick, regardless of how many rows land in that kind.
-//! It leaves the rarer `DeadLetter` path's per-row transaction untouched
-//! (fence-check + `FOR UPDATE` re-read + DLQ insert). That transaction is
-//! load-bearing for the anti-PII-resurrection CAS documented on
-//! `dead_letter_entry_with_current_payload`.
+//! The fix batches the `Delivered` and `Backoff` paths into two `UPDATE ...
+//! FROM unnest(...)` statements: one round trip per outcome kind per tick.
+//! The rarer `DeadLetter` path keeps its per-row transaction (fence check,
+//! `FOR UPDATE` re-read, DLQ insert). The anti-PII-resurrection CAS on
+//! `dead_letter_entry_with_current_payload` needs that transaction.
 //!
-//! Evidence here is `pg_stat_statements` call and buffer counts, never
-//! wall-clock. This harness follows the same shape as
-//! `completion_trigger_outbox_queue_perf.rs`: a fresh, uniquely-named,
-//! fully-migrated database per measurement point. `pg_stat_statements` is
-//! reset immediately before the measured call and snapshotted immediately
-//! after it.
+//! The evidence is `pg_stat_statements` call and buffer counts, never
+//! wall-clock time. As in `completion_trigger_outbox_queue_perf.rs`, each
+//! measurement gets a fresh, migrated database. `pg_stat_statements` resets
+//! just before the measured call and is read just after it.
 
 #![allow(clippy::too_many_lines)]
 
@@ -111,12 +103,10 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 // ── Deterministic deliverer: even index -> 2xx, odd index -> 500 ───────────
 //
-// A realistic tick mixes successful and failing deliveries; a harness that
-// only ever exercises the `Delivered` path would leave the `Backoff` batch
-// unmeasured. The outcome is derived from the numeric suffix baked into
-// `target_url` at seed time, not from call order. So it stays stable
-// regardless of how `join_all` interleaves the concurrent dispatch
-// futures.
+// A real tick mixes successful and failing deliveries. With only the
+// `Delivered` path, the `Backoff` batch would go unmeasured. The outcome
+// comes from the numeric suffix of `target_url`, not from call order, so
+// it does not depend on how `join_all` interleaves the dispatches.
 struct ParityDeliverer;
 
 impl CompletionCallbackDeliverer for ParityDeliverer {
@@ -147,18 +137,17 @@ fn install_config() {
         secret: CallbackSecret::new(b"perf-harness-secret".to_vec()),
         ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
         default_targets: Vec::new(),
-        // 5 attempts. This harness's single scanner tick only ever makes
-        // attempt 1, so every failing row is still under budget and takes
-        // the `Backoff` branch, never `DeadLetter`. That keeps the
-        // measured tick's writes concentrated in the two batched paths
-        // this investigation targets.
+        // 5 attempts. The one scanner tick makes attempt 1 only, so each
+        // failing row takes the `Backoff` branch, never `DeadLetter`. So
+        // the measured writes all go to the two batched paths.
         retry_policy: RetryPolicy::exponential(5, std::time::Duration::from_secs(30)),
     }));
 }
 
-/// Seeds `n` production-shaped, already-due delivery rows for one execution.
-/// Half resolve `Delivered` (even index), half `Backoff` (odd index) --
-/// see `ParityDeliverer`.
+/// Seeds `n` production-shaped, due delivery rows for one execution.
+///
+/// Even indexes resolve `Delivered` and odd ones `Backoff` (see
+/// `ParityDeliverer`).
 fn build_rows(
     exec_id: Uuid,
     n: usize,
@@ -266,13 +255,12 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Is `row` one of the outcome-recording writes this investigation
-/// targets -- an `UPDATE` against `harvest_completion_deliveries` that is
-/// *not* the claim statement? The claim query is the only one that joins
-/// a `candidate` CTE. Excluding that leaves exactly the outcome writes.
-/// There are three distinct per-row statement shapes before this fix
-/// (`Delivered`/`Backoff`/`DeadLetter`), and two batched-plus-one-per-row
-/// shapes after it.
+/// Whether `row` is an outcome write: an `UPDATE` of
+/// `harvest_completion_deliveries` that is not the claim.
+///
+/// Only the claim joins a `candidate` CTE. Before the fix there are three
+/// per-row shapes (`Delivered`, `Backoff`, `DeadLetter`). After it there are
+/// two batched shapes and one per-row shape.
 fn is_outcome_write_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.starts_with("update")
@@ -356,8 +344,8 @@ async fn measure_one_batch(admin: &str, n: usize) -> SizePoint {
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
-    // The real public entry point under test: the completion-callback
-    // scanner, exactly as `timeout.rs`'s periodic sweep calls it.
+    // The completion-callback scanner, as the periodic sweep of
+    // `timeout.rs` calls it.
     let wal_before = wal_bytes(&mut stats_conn).await;
     let processed = fire_due_completion_deliveries(&mut op_conn, &None, &[])
         .await
@@ -497,9 +485,8 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
     let rows = build_rows(exec_id, 100, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
-    // Claim the batch exactly as the scanner would, so the EXPLAIN below
-    // targets rows in the same `INFLIGHT` state the real outcome-write
-    // statement runs against.
+    // Claim the batch as the scanner does, so the EXPLAIN reads rows in
+    // the `INFLIGHT` state that the real outcome write sees.
     let claim_sql = "
         WITH candidate AS (
             SELECT id FROM harvest_completion_deliveries
@@ -520,8 +507,7 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
 
-    // Before: what the per-row path runs, once, for one row of the batch --
-    // the statement shape that previously ran N times per tick.
+    // Before: the per-row statement, for one row. It ran N times per tick.
     let before_sql = format!(
         "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) \
          UPDATE harvest_completion_deliveries \
@@ -535,7 +521,7 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
         .await
         .expect("explain per-row update");
 
-    // After: the batched shape, applied to the whole claimed batch at once.
+    // After: the batched shape, over the whole claimed batch.
     let id_list = ids
         .iter()
         .map(|id| format!("'{id}'"))
@@ -632,12 +618,12 @@ async fn read_outcomes(conn: &mut AsyncPgConnection) -> Vec<DeliveryOutcomeRow> 
     .expect("read outcome rows")
 }
 
-/// Proves the batched outcome-recording path leaves every row in exactly
-/// the state the per-row `apply_outcome` path would have: same `state`,
-/// same `attempt`, same `last_status`/`last_error`. `delivered_at` is set
-/// on exactly the same rows too. This test is not `#[ignore]`d, so it
-/// runs against the fixed code path on every normal test run. That makes
-/// it a permanent regression guard, not a one-off comparison.
+/// The batched outcome path leaves each row as the per-row `apply_outcome`
+/// path does.
+///
+/// `state`, `attempt`, `last_status` and `last_error` match, and
+/// `delivered_at` is set on the same rows. The test is not `#[ignore]`d, so
+/// it guards the fixed path on every normal run.
 #[tokio::test]
 async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_batch() {
     let _guard = TEST_SERIAL.lock().await;
@@ -654,9 +640,8 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    // 21 rows: an odd count exercises an unbalanced Delivered/Backoff
-    // split (11 even-index Delivered, 10 odd-index Backoff). It is well
-    // under one claim batch, so every row resolves in a single tick.
+    // 21 rows: an odd count gives an unbalanced split (11 Delivered, 10
+    // Backoff). It is under one claim batch, so one tick resolves all.
     let rows = build_rows(exec_id, 21, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
@@ -702,9 +687,9 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
     }
 }
 
-/// A single-row batch (the degenerate case every batched-`UPDATE` rewrite
-/// must handle: `unnest` over a one-element array) still resolves exactly
-/// like the per-row path.
+/// A single-row batch resolves as the per-row path does.
+///
+/// Each batched `UPDATE` must handle `unnest` over a one-element array.
 #[tokio::test]
 async fn scanner_handles_a_single_row_batch() {
     let _guard = TEST_SERIAL.lock().await;
@@ -737,15 +722,13 @@ async fn scanner_handles_a_single_row_batch() {
     assert_eq!(outcomes[0].state, "DELIVERED");
 }
 
-/// Retry exhaustion (`DeadLetter`) is untouched by this fix. It still
-/// takes one transaction per row, and still resolves correctly alongside
-/// a batch that also contains `Delivered`/`Backoff` rows.
+/// Retry exhaustion (`DeadLetter`) keeps one transaction per row. It still
+/// resolves correctly next to `Delivered` and `Backoff` rows in one batch.
 #[tokio::test]
 async fn scanner_dead_letters_alongside_a_batched_delivered_and_backoff_mix() {
     let _guard = TEST_SERIAL.lock().await;
-    // max_attempts = 1: any non-2xx immediately exhausts the retry budget,
-    // so the odd-index rows take the `DeadLetter` branch instead of
-    // `Backoff` in this test specifically.
+    // max_attempts = 1: a non-2xx exhausts the retry budget at once, so
+    // the odd-index rows take `DeadLetter` instead of `Backoff`.
     *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
         deliverer: Arc::new(ParityDeliverer),
         secret: CallbackSecret::new(b"perf-harness-secret".to_vec()),

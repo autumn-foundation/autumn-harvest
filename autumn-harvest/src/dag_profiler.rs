@@ -83,8 +83,8 @@ impl DagProfiler {
         let mut task_start_times = vec![None; tasks.len()];
         let mut task_end_times = vec![None; tasks.len()];
 
-        // Priority queue-like behavior using a sorted vector of (time, kind)
-        let mut event_queue: Vec<(Duration, usize, bool)> = Vec::new(); // bool: true = start, false = end
+        // A sorted vector of `(time, task, is_start)` acts as a priority queue.
+        let mut event_queue: Vec<(Duration, usize, bool)> = Vec::new();
 
         for level in levels {
             for &task_index in level {
@@ -96,7 +96,6 @@ impl DagProfiler {
                     .or(task.start_to_close)
                     .unwrap_or(self.default_duration);
 
-                // Find when this task can start
                 let mut start_time = Duration::ZERO;
                 for &up_idx in &task.upstreams {
                     if let Some(up_end) = task_end_times[up_idx] {
@@ -113,10 +112,9 @@ impl DagProfiler {
             }
         }
 
-        // Sort events chronologically. If times are equal, ends come before starts.
         event_queue.sort_by(|a, b| {
             a.0.cmp(&b.0).then_with(|| {
-                // If the time is the same, and the task is the same, start before end (handles 0 duration tasks).
+                // A zero-duration task starts before it ends.
                 if a.1 == b.1 && a.2 != b.2 {
                     return if a.2 {
                         std::cmp::Ordering::Less
@@ -125,7 +123,8 @@ impl DagProfiler {
                     };
                 }
 
-                // Otherwise, end events (false) go before start events (true) to prevent artificial concurrency peaks
+                // Otherwise an end sorts before a start at the same time.
+                // Back-to-back tasks then do not inflate the peak.
                 match (a.2, b.2) {
                     (false, true) => std::cmp::Ordering::Less,
                     (true, false) => std::cmp::Ordering::Greater,

@@ -1,10 +1,9 @@
 #![cfg(feature = "db")]
 //! Workflow-level retry policy tests — issue #523.
 //!
-//! Verifies that a workflow with a `retry_policy` set is automatically
-//! re-run on failure, exhausted chains count as one failure toward schedule
-//! auto-pause, and non-retryable/cancelled/timed-out outcomes are never
-//! retried.
+//! A workflow with a `retry_policy` re-runs automatically on failure. An
+//! exhausted chain counts as one failure toward schedule auto-pause.
+//! Non-retryable, cancelled and timed-out outcomes never retry.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
@@ -119,10 +118,10 @@ fn always_fail_handler(
 /// Always fails with a typed `WorkflowFailure` whose `error_type` is the
 /// exception CLASS `"NullPointerException"` and whose message carries the detail
 /// (`"NullPointerException: bad input"`). The #523 retry gate matches
-/// `non_retryable_errors` against the decoded typed `error_type` class on exact
-/// equality (`RetryPolicy::is_non_retryable`) — NOT a substring of the raw
-/// message — so the fixture must publish the class as `error_type`, mirroring
-/// the passing sibling `workflow_typed_non_retryable_error_type_no_retry`.
+/// `non_retryable_errors` against the decoded typed `error_type` class. It uses
+/// exact equality (`RetryPolicy::is_non_retryable`), NOT a substring of the raw
+/// message. So the fixture publishes the class as `error_type`, like the
+/// sibling `workflow_typed_non_retryable_error_type_no_retry`.
 fn non_retryable_fail_handler(
     _ctx: &WorkflowContext,
     _input: Value,
@@ -152,8 +151,8 @@ fn typed_non_retryable_fail_handler(
 }
 
 /// Fails with a typed `WorkflowFailure` whose `error_type`
-/// (`"TransientGlitch"`) is NOT in the policy's `non_retryable_errors` list —
-/// the control that must still retry after FIX B.
+/// (`"TransientGlitch"`) is NOT in the policy's `non_retryable_errors` list.
+/// This control must still retry after the issue #767 gate fix.
 fn typed_retryable_fail_handler(
     _ctx: &WorkflowContext,
     _input: Value,
@@ -167,13 +166,13 @@ fn typed_retryable_fail_handler(
 }
 
 /// Fails with a typed `WorkflowFailure` whose `error_type` (`"TransientTimeout"`)
-/// is NOT in the policy's `non_retryable_errors` list, but whose HUMAN MESSAGE
-/// (`"fatal"`) coincidentally equals a `non_retryable_errors` pattern (Codex P2,
-/// issue #767). A typed failure must be classified by its `error_type` class
-/// ONLY — this class is retryable, so the run must still retry even though the
-/// message text matches. (`is_non_retryable` matches on exact equality, so the
-/// message must exactly equal the pattern for the pre-fix gate — which combined
-/// the class match with a raw-message match — to have wrongly suppressed it.)
+/// is NOT in the policy's `non_retryable_errors` list (issue #767). Its HUMAN
+/// MESSAGE (`"fatal"`) equals a `non_retryable_errors` pattern. A typed failure
+/// is classified by its `error_type` class ONLY. This class is retryable, so
+/// the run must still retry although the message matches. The pre-fix gate
+/// combined the class match with a raw-message match. `is_non_retryable` uses
+/// exact equality, so the message must equal the pattern exactly to trip the
+/// pre-fix gate.
 fn typed_message_collision_fail_handler(
     _ctx: &WorkflowContext,
     _input: Value,
@@ -183,15 +182,14 @@ fn typed_message_collision_fail_handler(
     })
 }
 
-/// Fails via the `Result<_, WorkflowFailure>` sentinel path (issue #767,
-/// Codex P2): a workflow returning `Err("fatal".into())` — where the `Err` is a
-/// `WorkflowFailure` built from a plain string — collapses `error_type` to
-/// `None` (the reserved `"Error"` sentinel) with `message == "fatal"`. The
-/// engine's `encode_err` shim wraps it in the `harvest_workflow_failure_v1`
-/// envelope, so the raw boundary string is the envelope JSON, NOT `"fatal"`.
-/// The retry gate must match `non_retryable_errors` against the *decoded human
-/// message* (`"fatal"`), never the envelope, or this workflow would retry to
-/// exhaustion.
+/// Fails via the `Result<_, WorkflowFailure>` sentinel path (issue #767). The
+/// workflow returns `Err("fatal".into())`, a `WorkflowFailure` built from a
+/// plain string. That collapses `error_type` to `None` (the reserved `"Error"`
+/// sentinel) with `message == "fatal"`. The engine's `encode_err` shim wraps it
+/// in the `harvest_workflow_failure_v1` envelope, so the raw boundary string is
+/// the envelope JSON, NOT `"fatal"`. The retry gate must match
+/// `non_retryable_errors` against the *decoded human message* (`"fatal"`), never
+/// the envelope, or this workflow would retry to exhaustion.
 fn sentinel_string_non_retryable_fail_handler(
     _ctx: &WorkflowContext,
     _input: Value,
@@ -357,9 +355,9 @@ async fn start_workflow(
     .await
 }
 
-/// Like [`start_workflow`] but seeds the run on a caller-chosen shard, so the
-/// issue #697 AC4 retry-inheritance test can use a NON-default shard (a
-/// `default_shard` regression would otherwise pass on shard 0).
+/// Like [`start_workflow`] but seeds the run on a caller-chosen shard. The
+/// issue #697 AC4 retry-inheritance test needs a NON-default shard, because a
+/// `default_shard` regression would pass on shard 0.
 async fn start_workflow_on_shard(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -562,9 +560,9 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
 }
 
-/// Wait until an execution is durably parked on a timer: a `harvest_timers` row
-/// exists for it (the workflow suspended on its `ctx.timer(...)`) — the
-/// unambiguous "parked" signal.
+/// Wait until an execution is durably parked on a timer. The unambiguous
+/// "parked" signal is a `harvest_timers` row for it, written when the workflow
+/// suspends on its `ctx.timer(...)`.
 ///
 /// `"SUSPENDED"` is NOT a persisted state: a timer-parked run's row is
 /// `"RUNNING"` with `worker_id IS NULL`, and the state CHECK constraint forbids
@@ -590,8 +588,8 @@ async fn wait_for_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
 /// Wait until a retry execution (`retry_of_exec_id = original_exec_id`) reaches
 /// one of the given states and return its `ExecutionId`.
 ///
-/// The retry run has its own unique `workflow_id` (its UUID stringified) so it
-/// cannot be found by polling the original `workflow_id`; poll via the
+/// The retry run has its own unique `workflow_id` (its UUID stringified). So
+/// polling the original `workflow_id` cannot find it. Poll via the
 /// `retry_of_exec_id` FK instead.
 async fn wait_for_retry_state(
     conn: &mut AsyncPgConnection,
@@ -765,12 +763,12 @@ async fn workflow_retries_on_transient_failure_and_succeeds() {
 }
 
 /// Issue #740: a workflow-level retry (#523) is the same logical run trying
-/// again, so the retry execution must INHERIT the predecessor's start-source
-/// provenance triple (`schedule` here, with a ref + operator) rather than being
-/// re-attributed as a fresh `api` start. Driven end-to-end through the real
-/// worker loop — the inheritance happens inside `persist_workflow_failure`,
-/// which is engine-internal. Uses the env-aware DB helper so it runs against a
-/// local `HARVEST_TEST_DATABASE_URL` or a fresh testcontainer.
+/// again. So the retry execution must INHERIT the start-source provenance
+/// triple of its predecessor (`schedule` here, with a ref and operator). It must
+/// not become a fresh `api` start. The real worker loop drives it, because the
+/// inheritance happens inside the engine-internal `persist_workflow_failure`.
+/// The env-aware DB helper runs it against a local `HARVEST_TEST_DATABASE_URL`
+/// or a fresh testcontainer.
 #[tokio::test]
 async fn workflow_retry_inherits_predecessor_start_source() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -943,11 +941,11 @@ async fn workflow_retry_exhaustion_counts_as_one_failure() {
     );
 
     // The retry execution (attempt 2) does NOT have WorkflowRetryScheduled in its
-    // history. The #523 retry run gets its OWN distinct UUID `workflow_id` (the
-    // tested contract, per the passing `retry_run_has_fresh_history_and_correct_linkage`),
-    // so it can never be found by the original `workflow_id`; select it via the
-    // `retry_of_exec_id` FK — matching the `failed_count` loop above and the
-    // `wait_for_retry_state` helper.
+    // history. The #523 retry run gets its OWN distinct UUID `workflow_id`. That
+    // contract is tested by `retry_run_has_fresh_history_and_correct_linkage`.
+    // So the original `workflow_id` never finds it. Select it via the
+    // `retry_of_exec_id` FK, like the `failed_count` loop and
+    // `wait_for_retry_state`.
     let attempt2_id = wait_for_retry_state(&mut check2, exec_id, &["FAILED"]).await;
     let retry_history = get_history(&mut check2, attempt2_id).await;
     assert!(
@@ -1030,14 +1028,14 @@ async fn workflow_non_retryable_error_no_retry() {
     );
 }
 
-/// FIX B (issue #767): the #523 workflow-level retry gate matches the policy's
-/// `non_retryable_errors` class list against the *decoded typed workflow
-/// `error_type`*, not just a raw-string match on the envelope. A workflow
-/// returning `WorkflowFailure::new("ValidationRejected", ...)` whose class is in
-/// `non_retryable_errors` must NOT be retried — even though the wire envelope
-/// string never equals the class name. (Before the fix this workflow would
-/// wrongly retry to exhaustion, since `failure_is_non_retryable` only matched
-/// the ACTIVITY envelope / the raw string.)
+/// Issue #767: the #523 workflow-level retry gate matches the
+/// `non_retryable_errors` class list of the policy. It matches the *decoded
+/// typed workflow `error_type`*, not just the raw envelope string. A workflow
+/// returns `WorkflowFailure::new("ValidationRejected", ...)` with a class in
+/// `non_retryable_errors`. It must NOT retry, although the wire envelope string
+/// never equals the class name. Before the fix it retried to exhaustion,
+/// because `failure_is_non_retryable` matched only the ACTIVITY envelope or the
+/// raw string.
 #[tokio::test]
 async fn workflow_typed_non_retryable_error_type_no_retry() {
     let (url, _c) = setup().await;
@@ -1115,9 +1113,9 @@ async fn workflow_typed_non_retryable_error_type_no_retry() {
     );
 }
 
-/// FIX B control (issue #767): a typed `WorkflowFailure` whose `error_type`
+/// Control for issue #767: a typed `WorkflowFailure` whose `error_type`
 /// (`"TransientGlitch"`) is NOT in the policy's `non_retryable_errors` list must
-/// STILL be retried — proving the gate change did not break normal retries.
+/// STILL retry. This proves that the gate change keeps normal retries.
 #[tokio::test]
 async fn workflow_typed_retryable_error_type_still_retries() {
     let (url, _c) = setup().await;
@@ -1181,11 +1179,11 @@ async fn workflow_typed_retryable_error_type_still_retries() {
     );
 }
 
-/// Codex P2 regression guard (issue #767): a typed `WorkflowFailure` whose
-/// `error_type` (`"TransientTimeout"`) is NOT in `non_retryable_errors`, but
-/// whose HUMAN MESSAGE (`"fatal"`) equals a `non_retryable_errors` pattern, must
-/// STILL retry. The pre-fix gate passed `decoded.message` as the raw arg to
-/// `is_non_retryable`, so the class OR'd with a message match and wrongly
+/// Regression guard for issue #767. A typed `WorkflowFailure` has an
+/// `error_type` (`"TransientTimeout"`) that is NOT in `non_retryable_errors`.
+/// Its HUMAN MESSAGE (`"fatal"`) equals a `non_retryable_errors` pattern. It
+/// must STILL retry. The pre-fix gate passed `decoded.message` as the raw arg
+/// to `is_non_retryable`. So it OR-ed the class with a message match, and it
 /// suppressed the retry of a retryable typed class. The fix classifies typed
 /// failures by `error_type` class ONLY.
 #[tokio::test]
@@ -1254,14 +1252,14 @@ async fn workflow_typed_message_collision_still_retries() {
     );
 }
 
-/// FIX B — sentinel path (issue #767, Codex P2): a `Result<_, WorkflowFailure>`
-/// workflow returning `Err("fatal".into())` collapses its `error_type` to `None`
-/// (reserved `"Error"` sentinel) with `message == "fatal"`, and the engine wraps
-/// it in the `harvest_workflow_failure_v1` envelope on the boundary. With
-/// `non_retryable_errors = ["fatal"]`, the retry gate must halt retries by
-/// matching the **decoded human message** — NOT the raw envelope JSON. Before
-/// the fix (which matched against the raw envelope) this workflow would wrongly
-/// retry to exhaustion because the envelope string never equals `"fatal"`.
+/// Sentinel path (issue #767): a `Result<_, WorkflowFailure>` workflow returns
+/// `Err("fatal".into())`. That collapses its `error_type` to `None` (reserved
+/// `"Error"` sentinel) with `message == "fatal"`. The engine wraps it in the
+/// `harvest_workflow_failure_v1` envelope on the boundary. With
+/// `non_retryable_errors = ["fatal"]`, the retry gate must halt retries. It
+/// matches the **decoded human message**, NOT the raw envelope JSON. The
+/// pre-fix gate matched the raw envelope. That string never equals `"fatal"`,
+/// so the workflow retried to exhaustion.
 #[tokio::test]
 async fn workflow_sentinel_string_non_retryable_message_no_retry() {
     let (url, _c) = setup().await;
@@ -1379,7 +1377,6 @@ async fn cancelled_workflow_is_not_retried() {
     let mut check = connect(&url).await;
     wait_for_parked(&mut check, exec_id).await;
 
-    // Cancel the execution.
     cancel_workflow_execution(
         &mut connect(&url).await,
         exec_id,
@@ -1394,12 +1391,12 @@ async fn cancelled_workflow_is_not_retried() {
     worker.shutdown();
     let _ = worker_handle.await;
 
-    // Scope: this verifies that cancelling a timer-PARKED run seals it CANCELLED
-    // and starts no second execution. Because cancel deletes the parked workflow
-    // task and seals CANCELLED directly (the handler is never re-run), the
-    // failure->retry gate is not exercised here; genuinely covering "a FAILED run
-    // that is then cancelled is not retried" would require a failing-then-cancelled
-    // race and is left as a follow-up.
+    // Scope: cancelling a timer-PARKED run seals it CANCELLED and starts no
+    // second execution. Cancel deletes the parked workflow task and seals
+    // CANCELLED directly, so the handler never re-runs. So this test does not
+    // exercise the failure->retry gate. Covering "a FAILED run that is then
+    // cancelled is not retried" needs a failing-then-cancelled race. That is
+    // left as a follow-up.
     // No retry was performed.
     assert_eq!(
         metrics.retry_count(),
@@ -1545,10 +1542,10 @@ async fn retry_run_has_fresh_history_and_correct_linkage() {
 }
 
 /// Issue #617 (T3): a workflow-level retry (#523) is the same logical run trying
-/// again, so the retry execution must INHERIT the predecessor's chain-scoped
-/// lifetime cap VERBATIM — the origin's absolute `chain_deadline_at` is carried
-/// forward, NOT re-anchored to `now + chain_execution_timeout`. Driven
-/// end-to-end through the real worker loop; the inheritance happens inside
+/// again. So the retry execution must INHERIT the chain-scoped lifetime cap of
+/// its predecessor VERBATIM. The absolute `chain_deadline_at` of the origin
+/// carries forward, NOT re-anchored to `now + chain_execution_timeout`. The
+/// real worker loop drives it. The inheritance happens inside
 /// `persist_workflow_failure`, which sets
 /// `inherited_chain_deadline_at = exec_ref.chain_deadline_at`. A
 /// re-anchor mutant (`inherited_chain_deadline_at: None`) fails this test.
@@ -1579,8 +1576,8 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     .await;
 
     // Stamp the ORIGIN's chain cap BEFORE the worker fails it: a 7d duration and
-    // a FUTURE absolute deadline (so the retry successor is not immediately timed
-    // out). The retry must copy this absolute value verbatim.
+    // a FUTURE absolute deadline. The retry successor then does not time out at
+    // once. The retry must copy this absolute value verbatim.
     let origin_chain_deadline = chrono::Utc::now() + chrono::Duration::hours(6);
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
@@ -1654,17 +1651,17 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
 }
 
 /// Issue #697 AC4: a workflow-level retry (#523) is the same logical run trying
-/// again, so the retry execution must stay on the predecessor's shard — both in
-/// the encoded `ExecutionId` (what every later id-based lookup routes on) and in
-/// the row's `shard_id` column. Otherwise a residency-pinned run would silently
-/// migrate to another country's database the first time it hit a transient
-/// failure.
+/// again. So the retry execution must stay on the shard of its predecessor. That
+/// holds in the encoded `ExecutionId`, which every later id-based lookup routes
+/// on. It also holds in the `shard_id` column of the row. Otherwise a
+/// residency-pinned run would silently move to the database of another country
+/// on its first transient failure.
 ///
-/// Seeded on a **non-default** shard (6) so this falsifies BOTH an
-/// `ExecutionId::new()` regression (UNENCODED sentinel) and a "always use
-/// `default_shard`" one. Driven end to end through the real worker loop: the
-/// retry execution id is minted inside `persist_workflow_failure`, which is
-/// engine-internal and not reachable from a pure unit test.
+/// Seeded on a **non-default** shard (6). So this falsifies BOTH an
+/// `ExecutionId::new()` regression (UNENCODED sentinel) and an "always use
+/// `default_shard`" one. The real worker loop drives it. The retry execution
+/// id is minted inside the engine-internal `persist_workflow_failure`, which a
+/// pure unit test cannot reach.
 #[tokio::test]
 async fn workflow_retry_stays_on_the_predecessor_shard() {
     let pinned = ShardId::new(6);

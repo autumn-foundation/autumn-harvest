@@ -3,8 +3,8 @@
 //! `docs/rnd/determinism-static-analysis.md` is AC1's primary deliverable: a
 //! leadership decision document about whether a semantic, MIR-level determinism
 //! analysis is worth building and keeping. Its load-bearing claims are not
-//! prose — they are a boundary set, a rule-subsumption matrix, and three success
-//! metrics, each of which is only meaningful if it still matches the code.
+//! prose. They are a boundary set, a rule-subsumption matrix, and three success
+//! metrics. Each one means something only while it still matches the code.
 //!
 //! An R&D report is unusually prone to rotting into a lie precisely because
 //! nothing compiles against it. The two precedents in `docs/rnd/` both answered
@@ -13,13 +13,13 @@
 //!   * the boundary table must list every `unknown` reason the tool can emit —
 //!     `proven-deterministic` is only honest with its boundary set attached;
 //!   * the subsumption matrix must cover all 22 syntactic rules (HVG001–HVG011,
-//!     DET001–DET011), because AC8 asks specifically which of them could retire
-//!     and a matrix with holes cannot answer that;
+//!     DET001–DET011). AC8 asks which of them could retire, and a matrix with
+//!     holes cannot answer that;
 //!   * every metric must name a test a reviewer can run, and that test must
 //!     exist;
-//!   * the report must state the AC5-versus-AC7 resolution, since AC5 suggests a
-//!     macro attribute that AC7 forbids and a reader comparing deliverable to
-//!     AC list would otherwise read the allowlist file as an unexplained miss.
+//!   * the report must state the AC5-versus-AC7 resolution. AC5 suggests a
+//!     macro attribute that AC7 forbids. Without it, a reader who compares the
+//!     deliverable to the AC list sees the allowlist file as an unexplained miss.
 //!
 //! ## Why the boundary list is hard-coded here
 //!
@@ -35,8 +35,8 @@
 //!     `BoundaryKind::ALL` appears in that table, so no boundary is
 //!     undocumented.
 //!
-//! Neither half alone is enough: this one can be satisfied by a table that
-//! matches a stale constant, and that one by a table with extra rows.
+//! Neither half alone is enough. A table that matches a stale constant passes
+//! this one. A table with extra rows passes that one.
 //!
 //! Deliberately NOT guarded: the report's judgements — the go/no-go reasoning,
 //! the cost estimates, the recommendation on scope. Those are argument, not
@@ -56,9 +56,9 @@ fn repo_root() -> PathBuf {
 ///
 /// Every guard here slices the document by byte offset or matches exact table
 /// cells. Under the CRLF checkout of the Windows CI leg, `str::lines()` strips
-/// the `\r` while the raw text keeps it, so offsets reconstructed from line
-/// lengths under-count one byte per line — and this report contains em dashes,
-/// so the resulting shift can land mid-character and panic. Mirrors
+/// the `\r` while the raw text keeps it. Offsets rebuilt from line lengths then
+/// under-count one byte per line. This report contains em dashes, so the shift
+/// can land mid-character and panic. Mirrors
 /// `sqlite_feasibility_docs::read_normalized`.
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
@@ -316,9 +316,9 @@ fn report_relates_every_syntactic_rule_to_the_semantic_pass() {
 }
 
 /// Every metric the issue names must cite a test a reviewer can run, and that
-/// test must exist. The repo's own precedent (`docs/performance.md`) is explicit
-/// that ratios are asserted by tests while timings are published, not asserted —
-/// a timing assertion in CI is flaky, and a flaky gate is worse than a table.
+/// test must exist. The repo precedent (`docs/performance.md`) is explicit:
+/// tests assert ratios, and timings are published, not asserted. A timing
+/// assertion in CI is flaky, and a flaky gate is worse than a table.
 #[test]
 fn success_metrics_cite_tests_that_exist() {
     const CITED_TESTS: &[&str] = &["corpus::detection_rate_meets_the_success_metric"];
@@ -523,16 +523,16 @@ fn release_record_carries_the_entry() {
 //
 // Mirrors `sqlite_feasibility_docs::guards_run_on_docs_only_changes`. Docs-only
 // PRs skip the entire `test` matrix (every step there is gated on
-// `changes.outputs.code`), so a guard suite about a document is exactly the suite
-// that would never fire on a change to that document.
+// `changes.outputs.code`). So a guard suite about a document would never fire on
+// a change to that document.
 
 /// The **whole** workflow step stanza containing `needle`, from its `- name:`
 /// through to the line before the next step's `- name:` (or the end of the block).
 ///
-/// Bounding at the *next* step rather than at `needle` is the load-bearing part:
+/// Bounding at the *next* step rather than at `needle` is the load-bearing part.
 /// `needle` sits inside the step's `run:` line, so a slice that stops there
-/// cannot see an `if:` written below `run:` — and GitHub Actions does not care
-/// about key order within a step. See the same helper in
+/// cannot see an `if:` written below `run:`. GitHub Actions ignores key order
+/// within a step. See the same helper in
 /// `sqlite_feasibility_docs`, where a two-line reordering once evaded this exact
 /// guard.
 fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
@@ -600,9 +600,9 @@ fn guards_run_on_docs_only_changes() {
 
 #[test]
 fn step_stanza_covers_keys_written_after_run() {
-    // Self-test of the helper above, mirroring `sqlite_feasibility_docs`: an
-    // `if:` placed *below* `run:` is valid YAML with identical semantics and is
-    // invisible to a slice that stops at the `run:` line.
+    // Self-test of the helper above, mirroring `sqlite_feasibility_docs`. An
+    // `if:` placed *below* `run:` is valid YAML with identical semantics. A
+    // slice that stops at the `run:` line cannot see it.
     let block = "\n      - name: Some earlier step\n        run: echo earlier\n\
                  \n      - name: Guard step\n        run: cargo test GUARD_FILTER\n\
                  \n        if: needs.changes.outputs.code == 'true'\n\

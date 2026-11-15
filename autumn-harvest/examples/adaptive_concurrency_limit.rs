@@ -41,10 +41,6 @@ const CHARGE_CARD: &str = "charge_card";
 /// A fast internal activity. It opts out of the default policy.
 const LOAD_CART: &str = "load_cart";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 /// The policy for `charge_card`. Each field is shown with its default value.
 fn charge_card_policy() -> AdaptiveLimitPolicy {
     let mut policy = AdaptiveLimitPolicy::new(1, 200);
@@ -76,10 +72,6 @@ fn worker_config() -> WorkerConfig {
     }
     .with_adaptive_limit(adaptive_limit_config())
 }
-
-// ---------------------------------------------------------------------------
-// Simulated dependency
-// ---------------------------------------------------------------------------
 
 /// A dependency that serves `knee` calls at once at full speed. Above the
 /// knee, latency grows in proportion to the concurrency, as for a pool of

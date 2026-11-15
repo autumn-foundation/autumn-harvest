@@ -447,7 +447,6 @@ impl Member {
         }
     }
 
-    /// The mandate of the member.
     pub(crate) const fn mandate(&self) -> &Mandate {
         &self.mandate
     }
@@ -3057,7 +3056,6 @@ async fn durable_peer(
 
 /// What a `delegate` call asks a durable peer.
 struct Ask {
-    /// The task text.
     text: String,
     /// The strategy, if the call asks for one.
     sample: Option<crate::sampling::OpSample>,
@@ -3094,7 +3092,6 @@ enum NoReply {
 }
 
 impl NoReply {
-    /// The verdict of the cause.
     const fn verdict(&self) -> Refusal {
         match self {
             Self::Timeout(_) => Refusal::ReplyTimeout,
@@ -3103,7 +3100,6 @@ impl NoReply {
         }
     }
 
-    /// The cause in words.
     fn cause(&self) -> String {
         match self {
             Self::Timeout(timeout) => {
@@ -3169,10 +3165,9 @@ fn peer_outcome(
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
-                // The keys keep their old order, also under the
-                // `preserve_order` feature of `serde_json`.
-                // The answer key comes first, then `error`, so the cut
-                // measures the error too.
+                // The keys keep their old order, also under the `preserve_order`
+                // feature of `serde_json`. The answer key comes first, then
+                // `error`, so the cut measures the error too.
                 let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
@@ -3229,7 +3224,6 @@ struct ReplyWait {
     /// `true` for a durable agent. It also races the wait against an
     /// interrupt.
     live: bool,
-    /// The reply deadline.
     timeout: Duration,
     /// The value of [`REPLY_VERDICT_PATCH`] for this message.
     verdict_text: bool,

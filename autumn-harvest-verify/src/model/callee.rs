@@ -1,7 +1,7 @@
 //! Decomposition of the callee path text that MIR prints at a call site.
 //!
-//! Stable `rustc --emit=mir` prints a call target as one line of text, and that
-//! text is the only handle the analyzer has on *what* is being called:
+//! Stable `rustc --emit=mir` prints a call target as one line of text. That text
+//! is the only handle the analyzer has on *what* is being called:
 //!
 //! ```text
 //! _5 = SystemTime::now() -> [return: bb3, unwind continue];
@@ -10,15 +10,15 @@
 //! _2 = <impl at src/lib.rs:5:1: 5:15>::next(move _3) -> ...;
 //! ```
 //!
-//! [`CalleePath::parse`] turns that text into the fields the model matches on:
-//! the generic-stripped path segments, the receiver (self) type, the trait of a
-//! qualified `<T as Tr>::m` call, and the generic arguments — all recovered with
-//! a balanced-delimiter scan, never with a regex or a naive `split("::")`, both
-//! of which fall apart on `<<T as IntoIterator>::IntoIter as Iterator>::collect`.
+//! [`CalleePath::parse`] turns that text into the fields the model matches on.
+//! These are the generic-stripped path segments, the receiver (self) type, the
+//! trait of a qualified `<T as Tr>::m` call, and the generic arguments. A
+//! balanced-delimiter scan recovers them. A regex or a naive `split("::")` falls
+//! apart on `<<T as IntoIterator>::IntoIter as Iterator>::collect`.
 //!
-//! Parsing is total: any text at all yields a `CalleePath` (in the worst case
-//! one whose `segments` is the whole text), because a callee the analyzer
-//! cannot decompose must become a boundary, never a panic.
+//! Parsing is total: any text at all yields a `CalleePath`. In the worst case its
+//! `segments` is the whole text. A callee the analyzer cannot decompose must
+//! become a boundary, never a panic.
 
 use crate::util::{
     generic_args_of, is_segment_suffix, is_type_shaped, matching_angle, peel_refs, split_top,
@@ -35,8 +35,8 @@ pub struct CalleePath {
     /// Path segments with generic arguments stripped.
     ///
     /// For a qualified call these are only the segments *after* the `<..>`
-    /// header: `<HashMap<K, V> as IntoIterator>::into_iter` yields
-    /// `["into_iter"]`, with the self type in [`Self::receiver`] and the trait
+    /// header. `<HashMap<K, V> as IntoIterator>::into_iter` yields
+    /// `["into_iter"]`. The self type goes in [`Self::receiver`] and the trait
     /// in [`Self::trait_`].
     pub segments: Vec<String>,
     /// The self / receiver type name: its last `::` segment, generics stripped.
@@ -50,9 +50,9 @@ pub struct CalleePath {
     /// references peeled: `b::Worker` for `b::Worker::run`, `HashMap` for
     /// `<HashMap<K, V> as IntoIterator>::into_iter`.
     ///
-    /// [`Self::receiver`] is only its last segment, which is what the model
-    /// matches on; the module qualifier is what tells two same-named impls in
-    /// the analyzed set apart, so it is kept here rather than thrown away.
+    /// [`Self::receiver`] is only its last segment, which the model matches on.
+    /// The module qualifier tells two same-named impls in the analyzed set
+    /// apart, so it is kept here.
     pub receiver_path: Option<String>,
     /// Trait of a qualified `<T as Trait>::m` call (last segment, generics stripped).
     pub trait_: Option<String>,
@@ -62,9 +62,10 @@ pub struct CalleePath {
     pub receiver_generic_args: Vec<String>,
     /// The receiver is a trait object (`dyn Tr`).
     pub is_dyn: bool,
-    /// The span-carrying brace form of the receiver, verbatim and complete —
-    /// `{closure@f.rs:16:21: 16:24}`, `{async block@..}`, `{coroutine@..}` —
-    /// which is the key the resolver matches closure bodies on (D7).
+    /// The span-carrying brace form of the receiver, verbatim and complete.
+    ///
+    /// Examples are `{closure@f.rs:16:21: 16:24}`, `{async block@..}` and
+    /// `{coroutine@..}`. The resolver matches closure bodies on this key (D7).
     pub closure_span: Option<String>,
 }
 
@@ -74,17 +75,17 @@ impl CalleePath {
     /// Two shapes exist. A **qualified** path starts with `<`: the header is
     /// `<SelfTy as Trait>`, `<SelfTy>`, `<impl Trait for Ty>` or
     /// `<impl at file:l:c: l:c>`, and everything after the matching `>` is the
-    /// segment list. An **unqualified** path is a `::`-separated segment list in
-    /// which a token that starts with `<` is either the preceding segment's
-    /// generic arguments (`LocalKey::<RefCell<u64>>::with`) or an inherent-impl
+    /// segment list. An **unqualified** path is a `::`-separated segment list.
+    /// In it, a token that starts with `<` is the preceding segment's generic
+    /// arguments (`LocalKey::<RefCell<u64>>::with`). Or it is an inherent-impl
     /// self type (`slice::<impl [String]>::sort_by`).
     ///
-    /// For an unqualified path the receiver is the penultimate *name* segment,
-    /// but only when it is type-shaped — it starts with an uppercase ASCII
+    /// For an unqualified path the receiver is the penultimate *name* segment.
+    /// It counts only when it is type-shaped: it starts with an uppercase ASCII
     /// letter or with `{`. Without that guard `std::env::var` would report a
-    /// receiver of `env` and a rule keyed on `receiver = "HashMap"` could be
-    /// satisfied by a module named `HashMap`-alike; module segments are
-    /// lowercase by convention and are skipped.
+    /// receiver of `env`. A rule keyed on `receiver = "HashMap"` could then
+    /// match a module named `HashMap`-alike. Module segments are lowercase by
+    /// convention and are skipped.
     #[must_use]
     pub fn parse(text: &str) -> Self {
         let text = text.trim();
@@ -108,9 +109,9 @@ impl CalleePath {
 
     /// True when [`Self::segments`] ends with `rule`'s `::`-separated segments.
     ///
-    /// This is the `path` matching rule of the model: a rule path is a **suffix**
-    /// of the callee path, because MIR prints rustc's *trimmed* def-paths and a
-    /// rule keyed on a full path would match nothing (see the model TOML header).
+    /// This is the `path` matching rule of the model. A rule path is a **suffix**
+    /// of the callee path, because MIR prints rustc's *trimmed* def-paths. A rule
+    /// keyed on a full path would match nothing (see the model TOML header).
     #[must_use]
     pub fn ends_with_path(&self, rule: &str) -> bool {
         is_segment_suffix(rule, &self.segments)
@@ -249,8 +250,8 @@ impl TypeName {
     /// Decompose a type as MIR prints it. Never fails and never panics.
     ///
     /// References, raw pointers and lifetimes are peeled (`&'a mut HashMap<K, V>`
-    /// → `HashMap`), `dyn Tr + Send` yields `Tr`, a qualified `<T as Tr>::Assoc`
-    /// yields `Assoc`, and a brace form is normalised to its kind
+    /// → `HashMap`). `dyn Tr + Send` yields `Tr`. A qualified `<T as Tr>::Assoc`
+    /// yields `Assoc`. A brace form is normalised to its kind
     /// (`{closure@f.rs:1:1: 1:2}` → `{closure}`, `{async fn body of sub()}` →
     /// `{async fn body}`).
     #[must_use]
