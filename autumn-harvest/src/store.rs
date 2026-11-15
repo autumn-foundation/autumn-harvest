@@ -1545,7 +1545,7 @@ pub async fn load_history_inflated_undecoded(
 ///
 /// One `eq_any` query loads every requested execution's history. This
 /// replaces one `load_history_undecoded` call per execution. It shares the
-/// same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+/// same `(workflow_exec_id, event_id)` unique key
 /// `load_history_undecoded` relies on. Ordering by that same leading pair
 /// lets Postgres serve the whole batch as one ordered index scan. No extra
 /// sort node is needed, across every requested execution.

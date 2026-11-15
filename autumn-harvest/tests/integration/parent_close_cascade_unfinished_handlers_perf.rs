@@ -17,8 +17,8 @@
 //!
 //! `check_and_report_unfinished_handlers_batch` replaces the loop with one
 //! `eq_any` query, [`autumn_harvest::store::load_histories_undecoded_batch`].
-//! It is backed by the same `idx_harvest_events_exec (workflow_exec_id,
-//! event_id)` index the single-execution loader already used, so the fix
+//! It is backed by the same `(workflow_exec_id, event_id)` unique key the
+//! single-execution loader already used, so the fix
 //! needs no schema change.
 //!
 //! Two tests:

@@ -3674,7 +3674,7 @@ async fn load_dead_letter_details_batch(
 
     // One `LATERAL`-per-id "last 10" query instead of N separate
     // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
-    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+    // same `(workflow_exec_id, event_id)` unique key
     // the old per-row query relied on. The outer `ORDER BY` groups each
     // id's rows in ascending `event_id` order already, so no per-group
     // reverse step is needed here. The old function fetched descending

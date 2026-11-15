@@ -4557,8 +4557,8 @@ impl EventScope {
 ///    old executions, bounded by [`SweepOptions::owner_probe_cap`]. If they fit
 ///    under the cap, ask the *narrow* question: do any of THESE executions
 ///    have a row in this partition? That is one index probe per execution on
-///    `idx_harvest_events_exec`. The cohort predicate prunes it to this
-///    partition.
+///    the `(workflow_exec_id, event_id, cohort)` unique key. The cohort
+///    predicate prunes it to this partition.
 ///
 ///    This tier makes the sweeper survive the common case. Tier 1's predicate
 ///    is a property of the whole executions table, not of this partition.
