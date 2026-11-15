@@ -5252,10 +5252,10 @@ impl WorkerConfig {
     /// Let one claim statement take up to `rows` rows.
     ///
     /// A claim loop then takes up to its share of the free slots in one
-    /// statement: 2, 4 or 8 rows. A claim with queue weights, fairness keys,
-    /// priority ageing, an owned workflow claim, an adaptive limit at its
-    /// edge or a cost hold still takes one row. `0` and `1` set `None`, one
-    /// row per claim.
+    /// statement: 2, 4 or 8 rows. Queue weights, fairness keys, priority
+    /// ageing and an owned workflow claim keep one row per claim. So do an
+    /// adaptive limit, a cost hold and a dispatch channel. `0` and `1` set
+    /// `None`, one row per claim.
     ///
     /// # Example
     ///
