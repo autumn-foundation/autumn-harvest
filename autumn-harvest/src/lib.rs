@@ -524,6 +524,8 @@ pub mod retention;
 pub mod retry_budget;
 /// Retry envelope analysis: which configured attempts fit the deadline.
 pub mod retry_envelope;
+/// Retry storm forecast: how much load an outage adds, and where it lands.
+pub mod retry_storm;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
