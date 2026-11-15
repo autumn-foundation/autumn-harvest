@@ -128,8 +128,8 @@ pub fn claim_batch_share(workflow: usize, activity: usize, loops: usize, max: us
 }
 
 /// A batch is never empty and never over its cap. Each allowed kind has a
-/// permit for every row: every loop that takes the same batch takes at most
-/// the free permits, plus less than one batch.
+/// permit for every row. The loops that take the same batch together take
+/// less than one batch past the free permits.
 pub proof fn theorem_a_batch_fits_each_allowed_kind(
     workflow: int,
     activity: int,

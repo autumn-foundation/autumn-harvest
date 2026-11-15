@@ -24,8 +24,9 @@ lets one statement take up to `n` rows, in batches of 2, 4 or 8.
 
 ## How a batch claims
 
-The batch text derives from the window form of the default claim, after the
-DR fence and the kind predicate are in it. Only two CTEs change:
+`queue::claim_task_batch_with_slots` sends the batch claim. Its text derives
+from the window form of the default claim, after the DR fence and the kind
+predicate are in it. Only two CTEs change:
 
 * `seek_candidate` locks up to 2, 4 or 8 rows with `FOR UPDATE SKIP LOCKED`.
   It also returns the claim key of each row: sticky rank, priority and due
