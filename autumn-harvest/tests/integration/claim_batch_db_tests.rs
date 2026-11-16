@@ -326,6 +326,18 @@ async fn concurrent_batches_take_each_row_exactly_once() {
 /// belong to other runs, and the claim still takes them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique_queue("batch-expiry");
@@ -382,21 +394,14 @@ async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
     assert!(!claimer.is_finished(), "the claim waits on the bucket lock");
     holder.batch_execute("COMMIT").await.expect("release");
 
-    let claimed = claimer.await.expect("claimer");
+    let taken = claimer.await.expect("claimer");
     assert_eq!(
-        priorities(&claimed),
+        priorities(&taken),
         [3, 2, 1],
         "the other runs keep their rows"
     );
-    assert!(claimed.iter().all(|row| row.0 != expiring));
+    assert!(taken.iter().all(|row| row.0 != expiring));
 
-    #[derive(diesel::QueryableByName)]
-    struct State {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        state: String,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        attempt: i32,
-    }
     let row: State =
         diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
             .bind::<diesel::sql_types::Uuid, _>(expiring)
@@ -404,11 +409,6 @@ async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
             .await
             .expect("expiring row");
     assert_eq!((row.state.as_str(), row.attempt), ("PENDING", 0));
-    #[derive(diesel::QueryableByName)]
-    struct Tokens {
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        tokens: f64,
-    }
     let tokens: Tokens =
         diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
             .bind::<diesel::sql_types::Text, _>(&bucket)
