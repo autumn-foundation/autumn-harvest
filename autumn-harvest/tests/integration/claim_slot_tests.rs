@@ -908,8 +908,21 @@ const RECOVERY_LIMIT: Duration = Duration::from_secs(10);
 const STALL: Duration = Duration::from_secs(3);
 /// The width of one rate window.
 const WINDOW: Duration = Duration::from_secs(1);
-/// The backlog of each run.
+/// The backlog at the start of each run. The run adds more if the rate needs it.
 const STALL_BACKLOG: usize = 6000;
+/// The share of extra tasks over the need, because the rate may rise.
+const BACKLOG_HEADROOM: f64 = 1.5;
+
+/// The tasks to add so that the backlog lasts for `horizon` at `rate`.
+///
+/// A fast run eats more of the backlog before the stall. The same speed
+/// raises the need, so a fixed backlog cannot cover every runner (issue #2706).
+fn backlog_shortfall(left: usize, rate: f64, horizon: Duration) -> usize {
+    let needed = rate.max(0.0) * horizon.as_secs_f64() * BACKLOG_HEADROOM;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let needed = needed.ceil() as usize;
+    needed.saturating_sub(left)
+}
 
 /// Claims per second between two samples.
 fn rate(from: (Instant, usize), to: (Instant, usize)) -> f64 {
@@ -952,16 +965,13 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     windows.sort_by(f64::total_cmp);
     let before = windows[1];
 
-    // The backlog must outlast the stall and the longest recovery.
+    // Top up the backlog so that it outlasts the stall and the longest recovery.
     let left = STALL_BACKLOG.saturating_sub(last.1);
-    #[allow(clippy::cast_precision_loss)]
-    let needed = before * (RECOVERY_LIMIT + Duration::from_secs(2)).as_secs_f64();
-    #[allow(clippy::cast_precision_loss)]
-    let enough = left as f64 >= needed;
-    assert!(
-        enough,
-        "{left} tasks left at {before:.0}/s cannot outlast the recovery; raise STALL_BACKLOG"
-    );
+    let horizon = RECOVERY_LIMIT + Duration::from_secs(2);
+    let add = backlog_shortfall(left, before, horizon);
+    if add > 0 {
+        seed(&db.url, &queue, add, false, ShardId::new(0)).await;
+    }
 
     // The stall: one transaction holds the table for `STALL`.
     let mut staller = connect(&db.url).await;
@@ -1015,6 +1025,43 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     };
     eprintln!("claim slot stall recovery, cap {cap:?}: {recovery:?}");
     recovery
+}
+
+/// A backlog that covers the need asks for no top-up.
+#[test]
+fn shortfall_is_zero_when_the_backlog_covers_the_need() {
+    assert_eq!(backlog_shortfall(8000, 400.0, Duration::from_secs(12)), 0);
+}
+
+/// The failing run of issue #2706: 4688 left, 400/s, 12 s.
+#[test]
+fn shortfall_covers_a_fast_runner() {
+    let add = backlog_shortfall(4688, 400.0, Duration::from_secs(12));
+    assert!(
+        4688 + add >= 4800,
+        "the top-up covers the need; added {add}"
+    );
+}
+
+/// The need holds headroom, because the rate may rise after the stall.
+#[test]
+fn shortfall_keeps_headroom_over_the_need() {
+    let add = backlog_shortfall(0, 100.0, Duration::from_secs(10));
+    assert!(add > 1000, "headroom over 100/s for 10 s; added {add}");
+}
+
+/// A rate of zero needs nothing.
+#[test]
+fn shortfall_is_zero_at_a_zero_rate() {
+    assert_eq!(backlog_shortfall(0, 0.0, Duration::from_secs(12)), 0);
+}
+
+/// The top-up grows with the rate, so no rate ceiling exists.
+#[test]
+fn shortfall_scales_with_the_rate() {
+    let slow = backlog_shortfall(0, 200.0, Duration::from_secs(12));
+    let fast = backlog_shortfall(0, 800.0, Duration::from_secs(12));
+    assert!(fast + 4 >= 4 * slow, "slow {slow}, fast {fast}");
 }
 
 /// The cap off, then the cap on, one after the other. Each run must recover
