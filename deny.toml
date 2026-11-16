@@ -147,14 +147,19 @@ ignore = [
     # `core::pin::pin!` or pin-project-lite.
     { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; reached only through aws-smithy, loom and wasmtimer, never used directly here. Revisit: those crates move to core::pin::pin! or pin-project-lite." },
 
-    # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
-    # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
-    # no direct use in this repo. "No safe upgrade is available" per the
-    # advisory. Nothing to bump; the maintenance signal belongs to
-    # autumn-web's dependency on `validator`.
-    # Revisit: if autumn-web drops or replaces `validator`, or
-    # proc-macro-error2 gains a maintained release.
-    { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
+    # RUSTSEC-2026-0173 — GONE, not deferred. `cargo deny --all-features
+    # check` (Ballast, 2026-11-16) flagged this ignore entry with
+    # `advisory-not-detected`: "no crate matched advisory criteria".
+    # `cargo tree --workspace --all-features -i proc-macro-error2` confirms
+    # it: the package no longer resolves at all. validator_derive moved from
+    # validator 0.20.1 (proc-macro-error2) to validator 0.21.0, which pulls
+    # the maintained successor instead (`cargo tree -i proc-macro-error3`
+    # shows it hanging off the same validator_derive -> validator ->
+    # autumn-web chain). No manifest here changed; `autumn-web`'s own
+    # `validator` requirement resolved to the newer release on a lockfile
+    # refresh, the same way the `croner` duplicate above picked up a newer
+    # release with no version bump on our side. No ignore entry needed.
+
     # RUSTSEC-2026-0459 — libsqlite3-sys, bundled SQLite before 3.54.0 can
     # return uninitialised page-cache memory when it opens a database with a
     # sibling `-wal` file of another page size. The fix is libsqlite3-sys
@@ -211,15 +216,19 @@ ignore = [
     #   private key, with jsonwebtoken.
     { id = "RUSTSEC-2026-0387", reason = "undetermined from this repo. Code here runs no P-256 or P-384 secret-key operation. OIDC only verifies, and the one test signer uses EdDSA. Since autumn-web 0.10.0, only jsonwebtoken 11.1.0 holds crypto-bigint 0.5.5, through its pinned p256 and p384 0.13. autumn-web itself, Web Push included, uses p256 0.14 and the fixed crypto-bigint 0.7.10. Any leak depends on the compiler and the CPU. Revisit: jsonwebtoken moves to elliptic-curve 0.14, a third crypto-bigint version appears, or code here signs with an EC key." },
 
-    # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
-    # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
-    # reqwest-retry -> postgresql_archive, which is itself gated behind
-    # autumn-harvest-plugin's `dev-runtime-managed` feature: local-only
-    # ephemeral-Postgres tooling for `cargo dev`, off by default and never in
-    # a release build (see the feature's own doc comment in
-    # autumn-harvest-plugin/Cargo.toml). Revisit: postgresql_archive drops
-    # its parking_lot 0.11 dependency, or instant gains a maintained fork.
-    { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
+    # RUSTSEC-2024-0384 — GONE, not deferred. `cargo deny --all-features
+    # check` (Ballast, 2026-11-16) flagged this ignore entry with
+    # `advisory-not-detected`: "no crate matched advisory criteria".
+    # `cargo tree --workspace --all-features -i instant` confirms it: the
+    # package no longer resolves at all, including under
+    # `cargo tree -p autumn-harvest-plugin --features dev-runtime-managed`,
+    # the one feature that used to reach it. `postgresql_archive` 0.22.0 is
+    # still there and still pulls `reqwest-retry` 0.9.1, but that chain now
+    # resolves to `parking_lot` 0.12.5 everywhere in the graph — no 0.11
+    # instance remains, so the `wasm-timer` / `instant` leg it used to carry
+    # is gone with it. No manifest here changed; this is a lockfile-refresh
+    # side effect of an upstream release, the same as the `proc-macro-error2`
+    # entry above. No ignore entry needed.
 
     # RUSTSEC-2026-0440: astral-tokio-tar 0.6.4 is unmaintained. It reports
     # no vulnerability, and no safe upgrade exists. testcontainers 0.27 pulls
