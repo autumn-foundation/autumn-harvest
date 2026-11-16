@@ -212,6 +212,10 @@ impl FsPlan {
             {
                 return Err(failed());
             }
+            // A strict umask of the worker would close each new directory to
+            // the code uid, so the steps run with none. The code gets the
+            // umask of the worker back below.
+            let old_umask = libc::umask(0);
             for step in &self.steps {
                 if !run_step(step) {
                     return Err(failed());
@@ -222,6 +226,7 @@ impl FsPlan {
             {
                 return Err(failed());
             }
+            libc::umask(old_umask);
         }
         Ok(())
     }
@@ -1225,6 +1230,41 @@ mod tests {
             Some(leaked) => assert!(!leaked, "the mask leaked into the shared root"),
             None => eprintln!("skipped: this host refuses a private mount namespace"),
         }
+    }
+
+    /// A strict umask of the worker must not close the directories of the
+    /// new root to the code uid.
+    #[test]
+    fn a_pivot_ignores_a_strict_worker_umask() {
+        if !is_root() {
+            eprintln!("skipped: the code uid differs from the worker only for root");
+            return;
+        }
+        let out = std::thread::spawn(|| {
+            // SAFETY: CLONE_FS gives this thread its own umask, so no other
+            // test sees the change.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+            // SAFETY: umask has no preconditions.
+            unsafe { libc::umask(0o077) };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                if !fs_isolation_available().await {
+                    return None;
+                }
+                let code = "cat /etc/passwd > /dev/null && echo ok; umask";
+                Some(run(FsIsolation::pivot(), code).await)
+            })
+        })
+        .join()
+        .unwrap();
+        let Some(out) = out else {
+            eprintln!("skipped: this host has no mount namespace for the executor");
+            return;
+        };
+        assert_eq!(out.stdout, "ok\n0077\n", "{}", out.stderr);
     }
 
     #[tokio::test]
