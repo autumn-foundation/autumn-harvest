@@ -2120,6 +2120,10 @@ fn support(
   budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
   `<subject> <relation> <object> [episodes: <id>, ...]`.
+- **Output cap.** The engine sets no cap on the reply of a pass. An app
+  sets one with `EpisodeSettings::max_pass_output_tokens(n)` (issue #2695).
+  A cap that cuts a reply makes it unparsable, so size a cap to
+  `max_pass_episodes`. 0 sets no cap.
 - **Labels.** A fact takes the labels of every episode of its pass. A
   memory store that cannot keep labels refuses a labelled fact, and the
   report counts it under `facts_refused`. The sources of a refused fact
