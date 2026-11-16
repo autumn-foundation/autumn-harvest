@@ -1624,6 +1624,11 @@ impl AgentHarness {
         let execution = tool.execute(call.arguments, &ctx);
         Ok(
             match tokio::time::timeout(self.tool_timeout, execution).await {
+                Ok(Ok(_)) if request.read_only && changed_workspace(handle.as_ref()) => {
+                    // A read-only run never moves the head. A success result
+                    // would hide the dropped change from the model (issue #2692).
+                    self.error_outcome(READ_ONLY_WORKSPACE_REFUSAL)
+                }
                 Ok(Ok(output)) => {
                     let mut outcome = ToolOutcome::ok(fit_result(
                         truncate(&output.to_string(), self.tool_output_limit),
@@ -2168,6 +2173,15 @@ fn workspace_failure(err: &AgentError) -> String {
     } else {
         model_failure(err)
     }
+}
+
+/// The text of a refused workspace change on a read-only run (issue #2692).
+const READ_ONLY_WORKSPACE_REFUSAL: &str =
+    "this run cannot change the workspace; the change was not saved";
+
+/// Whether the tool call changed the workspace that it loaded.
+fn changed_workspace(handle: Option<&WorkspaceHandle>) -> bool {
+    handle.is_some_and(|handle| handle.snapshot().is_dirty())
 }
 
 fn workspace_timeout() -> String {
