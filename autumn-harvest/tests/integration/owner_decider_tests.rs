@@ -930,9 +930,16 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     wait_for_wakes(&mut wakes, &normal).await;
     let high = start_instant(&mut conn, &client, &queue, Some(Priority::High), &mut wakes).await;
     wait_for_wakes(&mut wakes, &[high]).await;
-    // The owner has the wake of each run now. Free the permit at once, while
-    // the key lookup of the high-priority hint may still run. A ready row of
-    // lower rank must not take the permit first.
+    // A wake is not a rank. A finished key lookup grants one take pass, and
+    // that pass does not wait for a hint without a key. So a permit freed in
+    // that pass can go to a ranked normal run. Free the permit only after
+    // the owner ranks the high-priority run. The owner must then take it
+    // before the older backlog.
+    #[cfg(feature = "testing")]
+    eventually("the owner ranks the high-priority run", async || {
+        node.worker.owner_ranked(high)
+    })
+    .await;
     SLOW_GATE.notify_one();
     wait_for_execution_state_with_timeout(&db.url, slow, "COMPLETED", WAIT).await;
     for exec in normal.iter().copied().chain([high]) {

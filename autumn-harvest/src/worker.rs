@@ -34205,6 +34205,10 @@ pub struct Worker {
     /// The partitions that the owner wake tasks listen on (issue #2253).
     owner_listening:
         Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
+    /// The executions that an owner decider has ranked by a key (issue
+    /// #2308). Tests wait for a rank before they free a permit.
+    #[cfg(feature = "testing")]
+    owner_ranked: std::sync::Mutex<HashSet<uuid::Uuid>>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -37297,6 +37301,8 @@ impl Worker {
             claim_targets: std::sync::RwLock::default(),
             owner_wake_shards: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
+            #[cfg(feature = "testing")]
+            owner_ranked: std::sync::Mutex::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             pool_refused: AtomicBool::new(false),
@@ -37365,6 +37371,35 @@ impl Worker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&key)
+    }
+
+    /// Whether an owner decider has ranked `exec_id` by its claim key (issue
+    /// #2308). A wake alone does not rank a run. Tests wait for the rank
+    /// before they free a permit, so the take order is the rank order.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn owner_ranked(&self, exec_id: ExecutionId) -> bool {
+        self.owner_ranked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&exec_id.as_uuid())
+    }
+
+    /// Record the rows that a decider ranked. The set stops at
+    /// [`OWNER_HINTS_MAX`], so it stays bounded.
+    #[cfg(feature = "testing")]
+    fn note_owner_ranked(&self, rows: &[queue::OwnerRow]) {
+        let mut ranked = self
+            .owner_ranked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for row in rows {
+            if ranked.len() >= OWNER_HINTS_MAX {
+                break;
+            }
+            ranked.insert(row.exec_id);
+        }
     }
 
     /// Whether the workflow cache holds an entry for `exec_id` (issue
@@ -42497,6 +42532,8 @@ impl Worker {
         match event {
             DeciderEvent::Scanned(Ok(scan)) => {
                 let full = scan.due.len() >= limit;
+                #[cfg(feature = "testing")]
+                self.note_owner_ranked(&scan.due);
                 for row in scan.due {
                     state.queue(row);
                 }
@@ -42512,7 +42549,11 @@ impl Worker {
                     );
                 }
             }
-            DeciderEvent::Keyed(execs, Ok(rows)) => state.keyed(&execs, Some(rows)),
+            DeciderEvent::Keyed(execs, Ok(rows)) => {
+                #[cfg(feature = "testing")]
+                self.note_owner_ranked(&rows);
+                state.keyed(&execs, Some(rows));
+            }
             DeciderEvent::Keyed(execs, Err(error)) => {
                 state.keyed(&execs, None);
                 if state.may_warn(now) {
