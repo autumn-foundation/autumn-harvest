@@ -244,7 +244,11 @@ mod claim_window {
 
     const RUN_EXPIRED_TAIL: &str = " ) AS expired )";
 
-    const RUN_EXPIRED_VETO: &str = "AND NOT (SELECT expired FROM run_expired_now)";
+    const RUN_EXPIRED_VETO: &str = "AND NOT (SELECT expired FROM run_expired_now) ";
+
+    const CLAIM_SOURCE: &str = "FROM candidate WHERE ";
+
+    const CLAIM_LIVE_SOURCE: &str = "FROM claim_live candidate WHERE ";
 
     /// The batch form of a window text: `seek_candidate` locks up to `rows`
     /// rows, and `candidate` keeps them in claim order.
@@ -256,8 +260,10 @@ mod claim_window {
     /// claims join it.
     ///
     /// `run_expired_now` lists each row whose run passed its deadline by the
-    /// clock read after the bucket lock. The debit and the claim skip those
-    /// rows only, so one expired run does not stop the rest of a batch.
+    /// clock read after the bucket lock. The debit and the claim read
+    /// `claim_live`, the other rows, so one expired run does not stop the rest
+    /// of a batch. `claim_live` is materialized, so the claim never tests the
+    /// concurrency-key lock of an expired row.
     ///
     /// # Panics
     ///
@@ -318,15 +324,21 @@ mod claim_window {
                         "run_expired_now AS MATERIALIZED ( SELECT c.id AS expired_id \
                          FROM candidate c {predicate} )"
                     ));
+                    kept.push(
+                        "claim_live AS MATERIALIZED ( SELECT c.* FROM candidate c \
+                         WHERE NOT EXISTS (SELECT 1 FROM run_expired_now x \
+                         WHERE x.expired_id = c.id) )"
+                            .to_owned(),
+                    );
                 }
                 "rate_limit_debit" | "claimed" => {
                     let text = squash(cte.text);
                     assert_eq!(text.matches(RUN_EXPIRED_VETO).count(), 1, "{}", cte.name);
-                    kept.push(text.replace(
-                        RUN_EXPIRED_VETO,
-                        "AND NOT EXISTS (SELECT 1 FROM run_expired_now x \
-                         WHERE x.expired_id = candidate.id)",
-                    ));
+                    assert_eq!(text.matches(CLAIM_SOURCE).count(), 1, "{}", cte.name);
+                    kept.push(
+                        text.replace(RUN_EXPIRED_VETO, "")
+                            .replace(CLAIM_SOURCE, CLAIM_LIVE_SOURCE),
+                    );
                 }
                 _ => kept.push(cte.text.to_owned()),
             }
@@ -515,21 +527,21 @@ mod claim_window {
                                 "claim_ranked",
                                 "candidate",
                                 "run_expired_now",
+                                "claim_live",
                                 "rate_limit_debit",
                                 "claimed"
                             ],
                             "{case}"
                         );
                         assert_eq!(
-                            sql.matches(
-                                "AND NOT EXISTS (SELECT 1 FROM run_expired_now x \
-                                 WHERE x.expired_id = candidate.id)"
-                            )
-                            .count(),
+                            sql.matches(CLAIM_LIVE_SOURCE).count(),
                             2,
-                            "{case}: the debit and the claim skip expired rows only"
+                            "{case}: the debit and the claim read the live rows only"
                         );
-                        assert!(!sql.contains(RUN_EXPIRED_VETO), "{case}");
+                        assert!(
+                            !sql.contains("SELECT expired FROM run_expired_now"),
+                            "{case}"
+                        );
                         let rows = batch.rows();
                         assert!(sql.contains(&format!("LIMIT {rows} FOR UPDATE SKIP LOCKED")));
                         assert!(!sql.contains(SEEK_CANDIDATE_LOCK), "{case}");

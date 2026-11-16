@@ -25,7 +25,13 @@ new=(f"claim_ranked AS MATERIALIZED ( SELECT c.*, row_number() OVER ( ORDER BY c
 s=s.replace(old,new)
 s=re.sub(r'run_expired_now AS MATERIALIZED \( SELECT EXISTS \( SELECT 1 FROM candidate c (.*?) \) AS expired \)',
          r'run_expired_now AS MATERIALIZED ( SELECT c.id AS expired_id FROM candidate c \1 )', s, count=1)
-veto="AND NOT (SELECT expired FROM run_expired_now)"
+live=("claim_live AS MATERIALIZED ( SELECT c.* FROM candidate c WHERE NOT EXISTS "
+      "(SELECT 1 FROM run_expired_now x WHERE x.expired_id = c.id) ), rate_limit_debit AS")
+assert s.count(", rate_limit_debit AS")==1
+s=s.replace(", rate_limit_debit AS", ", "+live)
+veto="AND NOT (SELECT expired FROM run_expired_now) "
 assert s.count(veto)==2, s.count(veto)
-s=s.replace(veto,"AND NOT EXISTS (SELECT 1 FROM run_expired_now x WHERE x.expired_id = candidate.id)")
+s=s.replace(veto,"")
+assert s.count("FROM candidate WHERE ")==2, s.count("FROM candidate WHERE ")
+s=s.replace("FROM candidate WHERE ","FROM claim_live candidate WHERE ")
 open(out,'w').write(s)

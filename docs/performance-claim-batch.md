@@ -36,10 +36,13 @@ predicate are in it. These CTEs change:
   `claimed` reads the statement snapshot, so two rows of one key would both
   pass it. One bucket row takes one debit, however many claims join it.
 * `run_expired_now` lists each row whose run passed its deadline by the clock
-  that `fresh_now` reads after the bucket lock. `rate_limit_debit` and
-  `claimed` skip those rows only. The run can pass its deadline while the
-  claim waits on the bucket lock. Then that row stays `PENDING` and spends no
-  token, and the claim still takes the other rows of the batch.
+  that `fresh_now` reads after the bucket lock. `claim_live` holds the other
+  rows, and `rate_limit_debit` and `claimed` read it in place of
+  `candidate`. The run can pass its deadline while the claim waits on the
+  bucket lock. Then that row stays `PENDING`, spends no token and takes no
+  concurrency-key lock, and the claim still takes the other rows of the
+  batch. `claim_live` is materialized, so `claimed` never tests the key lock
+  of a row that it then drops.
 
 `fresh_now` is the same text as in the window form. When the batch finds no
 row and sets the fallback flag, the full statement runs and takes one row at
@@ -85,10 +88,10 @@ three rounds
 | 4 | 1.149 | 0.287 |
 | 8 | 1.233 | 0.154 |
 
-With the per-row expiry check, three more rounds give 1.115, 1.113, 1.196
-and 1.259 ms per statement for k = 1, 2, 4 and 8
+With the per-row expiry check, three more rounds give 1.014, 1.055, 1.104
+and 1.209 ms per statement for k = 1, 2, 4 and 8
 ([`pgbench-results-row-expiry.txt`](perf-artifacts/claim-batch/pgbench-results-row-expiry.txt)).
-The k = 8 statement still costs 1.13x the k = 1 statement.
+The k = 8 statement still costs 1.19x the k = 1 statement.
 
 ### Claim census
 
