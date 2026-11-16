@@ -42,6 +42,8 @@ pub mod error;
 pub mod exec;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+#[cfg(target_os = "linux")]
+pub mod fs_isolation;
 pub mod guest;
 pub mod outcome;
 pub mod policy;

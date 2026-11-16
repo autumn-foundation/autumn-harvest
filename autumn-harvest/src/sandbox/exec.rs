@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::capture::StreamCapture;
 use super::error::SandboxError;
+use super::fs_isolation::FsIsolation;
 use super::guest::PlanExecutor;
 use super::outcome::{
     MAX_SKIP_REASON_BYTES, MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus,
@@ -108,6 +109,8 @@ pub struct ExecOptions {
     /// together, and the end of the run kills each of them. `None` gives
     /// each process its own CPU limit. The guest agent always sets it.
     pub cgroup_root: Option<PathBuf>,
+    /// The file system that the code sees.
+    pub fs: FsIsolation,
 }
 
 impl Default for ExecOptions {
@@ -116,6 +119,7 @@ impl Default for ExecOptions {
             scratch_root: std::env::temp_dir(),
             run_as: None,
             cgroup_root: None,
+            fs: FsIsolation::Shared,
         }
     }
 }
