@@ -239,6 +239,7 @@ pub struct ProposedFact {
 
 /// The input of the model turn of a pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsolidateTurn {
     /// The harness model. `None` is the default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]

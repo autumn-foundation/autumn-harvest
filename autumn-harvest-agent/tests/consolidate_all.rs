@@ -376,6 +376,53 @@ async fn a_stuck_agent_does_not_starve_the_others() {
 // Edges.
 // ---------------------------------------------------------------------------
 
+/// The output cap of the pass request that lists `needle`.
+fn cap_of(model: &TryFnModel, needle: &str) -> Option<u32> {
+    let requests = model.requests();
+    let request = requests
+        .iter()
+        .find(|request| is_pass(request) && user_text(request).contains(needle))
+        .expect("a pass request lists the episode");
+    request.max_tokens
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_takes_its_output_cap_from_the_settings_of_its_kind() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    let model = echo_model();
+    let kind = |name: &str, settings: EpisodeSettings| {
+        AgentProfile::new(name)
+            .memory(AgentMemory::Store)
+            .episodes(settings)
+    };
+    let harness = harness(&db, model.clone(), &episodes, &memory)
+        .agent(kind(
+            "capped",
+            EpisodeSettings::default().max_pass_output_tokens(6_000),
+        ))
+        .agent(kind(
+            "zero",
+            EpisodeSettings::default().max_pass_output_tokens(0),
+        ));
+    let mut rt = runtime(&db, harness);
+    say(&mut rt, &desk("d1"), "plain-text").await;
+    say(
+        &mut rt,
+        &AgentId::new("capped", "c1").unwrap(),
+        "capped-text",
+    )
+    .await;
+    say(&mut rt, &AgentId::new("zero", "z1").unwrap(), "zero-text").await;
+
+    let report = fire(&mut rt, &ConsolidateAll::default()).await;
+    assert_eq!(report.started, 3, "{report:?}");
+    assert_eq!(cap_of(&model, "plain-text"), None, "no default cap");
+    assert_eq!(cap_of(&model, "capped-text"), Some(6_000));
+    assert_eq!(cap_of(&model, "zero-text"), None, "0 sets no cap");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_with_an_every_trigger_gets_no_dispatched_pass() {
     let (_dir, db) = fresh_db();

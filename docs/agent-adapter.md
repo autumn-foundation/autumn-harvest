@@ -2122,8 +2122,11 @@ fn support(
   `<subject> <relation> <object> [episodes: <id>, ...]`.
 - **Output cap.** The engine sets no cap on the reply of a pass. An app
   sets one with `EpisodeSettings::max_pass_output_tokens(n)` (issue #2695).
-  A cap that cuts a reply makes it unparsable, so size a cap to
-  `max_pass_episodes`. 0 sets no cap.
+  0 sets no cap. With no cap, the provider default applies: Anthropic
+  needs a wire value and gets its adapter default of 16000, and an
+  OpenAI-compatible server may use a small one. A cap that cuts a reply
+  makes it unparsable, so size a cap to `max_pass_episodes`. A reply with
+  no cap can also pass the run token budget by one reply.
 - **Labels.** A fact takes the labels of every episode of its pass. A
   memory store that cannot keep labels refuses a labelled fact, and the
   report counts it under `facts_refused`. The sources of a refused fact

@@ -133,8 +133,8 @@ pub struct EpisodeSettings {
     /// The most episodes that one pass reads, oldest first. 0 counts as 1.
     pub max_pass_episodes: u32,
     /// The most tokens that the model may write in one pass. `None` sets
-    /// no cap, so the engine adds none. 0 counts as `None`. A reply that
-    /// the cap cuts off does not parse.
+    /// no cap, so the engine adds none and the provider default applies.
+    /// 0 counts as `None`. A reply that a cap cuts off does not parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_pass_output_tokens: Option<u32>,
 }
