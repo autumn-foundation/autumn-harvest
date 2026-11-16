@@ -3,6 +3,10 @@
 //! The code shares the host kernel, so this backend is not a boundary for
 //! hostile code. The default [`super::SandboxPolicy`] refuses it. Use
 //! [`super::SandboxPolicy::for_development`] to accept it.
+//!
+//! The code sees the file system of the worker, unless
+//! [`super::exec::ExecOptions::fs`] says otherwise. See
+//! [`super::fs_isolation::FsIsolation`].
 
 use tokio_util::sync::CancellationToken;
 
