@@ -111,7 +111,8 @@ pub struct ExecOptions {
     /// together, and the end of the run kills each of them. `None` gives
     /// each process its own CPU limit. The guest agent always sets it.
     pub cgroup_root: Option<PathBuf>,
-    /// The file system that the code sees.
+    /// The file system that the code sees. `Shared` by default. See
+    /// [`FsIsolation`].
     pub fs: FsIsolation,
 }
 
@@ -776,8 +777,8 @@ impl ChildSetup {
             open_files: libc::rlim_t::from(limits.max_open_files),
             processes: libc::rlim_t::from(limits.max_processes),
             stack: stack_hard_limit().map(|hard| (child_stack_limit(hard), hard)),
-            // SAFETY: getuid and getgid have no preconditions.
-            ids: unsafe { (libc::getuid(), libc::getgid()) },
+            // SAFETY: geteuid and getegid have no preconditions.
+            ids: unsafe { (libc::geteuid(), libc::getegid()) },
             fs,
         }
     }
@@ -825,12 +826,14 @@ impl ChildSetup {
                 };
                 return Err(io::Error::from_raw_os_error(failed));
             }
+            // The walk of `/proc/self/fd` needs `/proc`, which a pivot removes,
+            // so mark the descriptors before the mounts.
+            mark_descriptors_cloexec()?;
             // The mounts need the rights of the executor, so they run before
             // the code uid below.
             if let Some(fs) = &self.fs {
                 fs.apply((!self.root).then_some(self.ids))?;
             }
-            mark_descriptors_cloexec()?;
             set_limit(libc::RLIMIT_CORE, 0, 0)?;
             set_limit(
                 libc::RLIMIT_CPU,

@@ -6,7 +6,7 @@
 //!
 //! The code sees the file system of the worker, unless
 //! [`super::exec::ExecOptions::fs`] says otherwise. See
-//! [`super::fs_isolation::FsIsolation`].
+//! [`super::fs_isolation::FsIsolation`]. `for_development` does not set it.
 
 use tokio_util::sync::CancellationToken;
 

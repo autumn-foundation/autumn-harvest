@@ -50,6 +50,8 @@ existing worker changes. Landlock is a later layer, not a replacement.
 | A mask path does not exist | Refuse the run. A path that appears later would stay open |
 | `unshare` or a mount fails | Fail closed with `SandboxUnavailable` |
 | The remount to read-only fails in a user namespace | Copy the `nosuid`, `nodev`, `noexec` flags of the source mount |
+| The mask path lies under a symlinked scratch root | Compare real paths, and refuse a mask over the work directory |
+| `/etc/ssl` holds private keys | List `/etc/ssl/certs` only |
 | The job unmounts a mask | The mounts are locked, and `NO_NEW_PRIVS` holds. The job holds no capability after exec |
 | The old root stays reachable after the pivot | `pivot_root(".", ".")`, then a lazy unmount of the old root |
 | `/proc` shows the worker | `Pivot` mounts no `/proc` |
@@ -69,10 +71,7 @@ existing worker changes. Landlock is a later layer, not a replacement.
 - **Yellow (gain).** One option closes the whole class. `Pivot` also hides
   sibling runs and the scratch root. A rootless host needs no new privilege.
 - **Green (new ideas).** A probe, `fs_isolation_available`, as for the
-  network. A later change can set `Pivot` as the policy default, and add
-  Landlock.
-- **Blue (process).** Red tests first, then the code, then a review from
-  four views: safety, async-signal safety, API and docs, tests.
+  network. A later change can set `Pivot` as the default, and add Landlock.
 
 ## 5. Design
 

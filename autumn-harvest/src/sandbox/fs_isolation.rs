@@ -39,7 +39,7 @@ pub const PIVOT_READ_ONLY: &[&str] = &[
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
-    "/etc/ssl",
+    "/etc/ssl/certs",
     "/etc/ca-certificates",
     "/etc/passwd",
     "/etc/group",
@@ -66,26 +66,33 @@ const ROOT_TMPFS_OPTIONS: &str = "mode=755,size=1m";
 /// nothing, and the code cannot open it.
 const MASK_TMPFS_OPTIONS: &str = "mode=000,size=4k,nr_inodes=2";
 
-/// The `statvfs` flags that map to the same mount flag. `ST_RELATIME` has
-/// its own value, so [`inherited_flags`] converts it.
+/// The `statvfs` flags that map to the same mount flag.
 const ST_COPIED: libc::c_ulong = 1 | 2 | 4 | 8 | 1024 | 2048;
+/// The `statvfs` flag for `relatime`. It has its own value, so
+/// [`inherited_flags`] converts it.
 const ST_RELATIME: libc::c_ulong = 4096;
 
 /// What file system the code of a run sees.
+///
+/// A later release can add a setting, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FsIsolation {
     /// The file system of the worker. No mount namespace.
     #[default]
     Shared,
     /// The file system of the worker, minus these paths.
     ///
-    /// Each path must be absolute and must exist. A path that resolves to a
+    /// Each path must be absolute, must exist, and must not hold `..` or cover
+    /// the work directory. A path that resolves to a
     /// directory shows empty. A path that resolves to another kind of file
     /// reads as `/dev/null`, so a socket refuses the connection.
     ///
     /// A mask hides a path, not an inode. A hard link, a bind mount or a
     /// path that the list omits still reaches the data. Sibling runs in the
-    /// scratch root stay visible. Use [`FsIsolation::Pivot`] to close both.
+    /// scratch root stay visible. A mask does not hide `/proc`, and a
+    /// non-root worker shares its uid with the code. Use
+    /// [`FsIsolation::Pivot`] to close these gaps.
     Mask(Vec<PathBuf>),
     /// A new root. It holds the `read_only` paths, the work directory, a
     /// private `/tmp` and a few device nodes, and nothing else.
@@ -103,12 +110,6 @@ impl FsIsolation {
         Self::Pivot {
             read_only: PIVOT_READ_ONLY.iter().map(PathBuf::from).collect(),
         }
-    }
-
-    /// Does this setting make a mount namespace?
-    #[must_use]
-    pub const fn is_isolated(&self) -> bool {
-        !matches!(self, Self::Shared)
     }
 
     /// Does this setting need a mount point for the new root?
@@ -305,7 +306,7 @@ unsafe fn run_step(step: &Step) -> bool {
             Step::Touch(dst) => {
                 let fd = libc::open(
                     dst.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                    libc::O_CREAT | libc::O_RDONLY | libc::O_CLOEXEC,
                     0o644,
                 );
                 fd >= 0 && libc::close(fd) == 0
@@ -392,6 +393,14 @@ fn check_absolute(path: &Path) -> Result<(), SandboxError> {
 
 /// The steps of a mask. Nested paths fold into the outer one.
 fn mask_plan(paths: &[PathBuf], work: &Path) -> Result<FsPlan, SandboxError> {
+    // The scratch root can hold a symbolic link. Compare real paths, or a
+    // mask over the real work directory would pass the check below.
+    let work = std::fs::canonicalize(work).map_err(|e| {
+        config(format!(
+            "the work directory {} cannot be resolved: {e}",
+            work.display()
+        ))
+    })?;
     let mut targets = BTreeSet::new();
     for path in paths {
         check_absolute(path)?;
@@ -401,7 +410,7 @@ fn mask_plan(paths: &[PathBuf], work: &Path) -> Result<FsPlan, SandboxError> {
                 path.display()
             ))
         })?;
-        if work.starts_with(&real) || real == Path::new("/") {
+        if work.starts_with(&real) {
             return Err(config(format!(
                 "the mask path {} covers the work directory",
                 path.display()
@@ -482,8 +491,21 @@ fn pivot_plan(
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut leaves: Vec<Step> = Vec::new();
 
+    // A directory entry already shows each path under it, so a nested or
+    // repeated entry adds nothing, and its mount point would collide.
+    let mut bound_dirs: Vec<&Path> = Vec::new();
+    let mut seen: BTreeSet<&Path> = BTreeSet::new();
     for path in read_only {
         check_absolute(path)?;
+        if path == Path::new("/tmp") || work.starts_with(path) {
+            return Err(config(format!(
+                "the read-only path {} covers /tmp or the work directory",
+                path.display()
+            )));
+        }
+        if bound_dirs.iter().any(|dir| path.starts_with(dir)) || !seen.insert(path.as_path()) {
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(path) else {
             continue;
         };
@@ -500,6 +522,7 @@ fn pivot_plan(
         }
         let remount = inherited_flags(path)? | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
         if meta.is_dir() {
+            bound_dirs.push(path);
             dirs.insert(dst.clone());
         } else {
             leaves.push(Step::Touch(cstring(&dst)?));
@@ -565,13 +588,14 @@ fn pivot_plan(
 
 /// Whether this host lets the executor build a private mount namespace.
 ///
-/// The probe starts `/bin/sh -c true` with the same namespace and mount
-/// steps that a run uses.
+/// The probe starts `/bin/sh -c true` in a new user namespace (non-root
+/// only) and a new mount namespace, with a private root tree. It does not
+/// try `tmpfs` or `pivot_root`, so a `Pivot` run can still fail closed.
 pub async fn fs_isolation_available() -> bool {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
-    // SAFETY: getuid and getgid have no preconditions.
-    let ids = (!root).then(|| unsafe { (libc::getuid(), libc::getgid()) });
+    // SAFETY: geteuid and getegid have no preconditions.
+    let ids = (!root).then(|| unsafe { (libc::geteuid(), libc::getegid()) });
     let probe = FsPlan {
         steps: Vec::new(),
         pivot: None,
@@ -886,8 +910,9 @@ mod tests {
     #[test]
     fn a_nested_mask_folds_into_the_outer_one() {
         let (dir, file) = secret_dir();
+        let work = tempfile::tempdir().unwrap();
         let plan = FsIsolation::Mask(vec![file, dir.path().to_path_buf()])
-            .prepare(None, Path::new("/nowhere/work"), 0)
+            .prepare(None, work.path(), 0)
             .unwrap()
             .unwrap();
         assert_eq!(plan.steps.len(), 1, "{plan:?}");
@@ -902,6 +927,64 @@ mod tests {
             .prepare(None, &work, 0)
             .expect_err("the mask would hide the work directory");
         assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_mask_over_a_symlinked_work_directory_is_refused() {
+        let (dir, _file) = secret_dir();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("work")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = FsIsolation::Mask(vec![real])
+            .prepare(None, &link.join("work"), 0)
+            .expect_err("the work directory lies under the mask");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_mask_over_the_root_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let err = FsIsolation::Mask(vec!["/".into()])
+            .prepare(None, work.path(), 0)
+            .expect_err("the root covers the work directory");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_pivot_path_over_tmp_or_the_work_directory_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        for bad in [
+            PathBuf::from("/tmp"),
+            PathBuf::from("/"),
+            work.path().into(),
+        ] {
+            let fs = FsIsolation::Pivot {
+                read_only: vec![bad.clone()],
+            };
+            let err = fs
+                .prepare(Some(Path::new("/r")), work.path(), 1 << 20)
+                .expect_err("the path must be refused");
+            assert!(matches!(err, SandboxError::Config(_)), "{bad:?}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pivot_accepts_nested_and_repeated_read_only_paths() {
+        if !needs_isolation().await {
+            return;
+        }
+        for extra in ["/usr/bin", "/etc/passwd", "/usr", "/dev/null"] {
+            let mut read_only: Vec<PathBuf> = PIVOT_READ_ONLY.iter().map(PathBuf::from).collect();
+            read_only.push(extra.into());
+            let out = try_run(
+                FsIsolation::Pivot { read_only },
+                &SandboxRequest::new("sh", "echo ok"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{extra}: {e:?}"));
+            assert_eq!(out.stdout, "ok\n", "{extra}: {}", out.stderr);
+        }
     }
 
     #[test]

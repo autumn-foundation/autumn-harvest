@@ -1,4 +1,4 @@
-## Phase 2697 — A private file system for the process sandbox (issue #2697)
+## A private file system for the process sandbox (issue #2697)
 
 `ProcessBackend` ran each job with the whole file system of the worker. The
 job could read the databases of the app, write its config, and connect to its
@@ -18,8 +18,6 @@ The design is in `docs/design/DESIGN-2697.md`.
   themselves, so a new `tmpfs` accepts files. The code keeps its ids.
 - A host that refuses the mount namespace fails the run closed with
   `SandboxUnavailable`. `fs_isolation_available()` probes the host.
-- `ChildSetup` is no longer `Copy`. It holds the precomputed mount steps, so
-  the child allocates nothing.
 
 No migration. No `WorkflowEvent` variant. No replay impact.
 
@@ -31,6 +29,7 @@ the probe. The suite also ran as a non-root user.
 ### Upgrade notes for the next release guide
 
 - **Breaking.** `ExecOptions` has a new public field, `fs`. A struct literal
-  needs `..ExecOptions::default()`.
+  needs `..ExecOptions::default()`. `FsIsolation` is `#[non_exhaustive]`, so
+  a `match` needs a wildcard arm.
 - **Behavior.** No change until an operator sets `fs`. Set
   `FsIsolation::pivot()` for code that the app does not review.

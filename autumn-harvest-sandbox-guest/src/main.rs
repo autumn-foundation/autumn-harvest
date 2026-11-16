@@ -63,6 +63,7 @@ fn agent_main() -> std::process::ExitCode {
             scratch_root: config.work_dir.clone(),
             run_as: Some(config.run_as),
             cgroup_root: Some(linux::CGROUP_ROOT.into()),
+            // The microVM is the boundary, so the file system stays shared.
             ..ExecOptions::default()
         });
         let listener = Arc::new(linux::vsock_listener(config.port)?);

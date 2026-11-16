@@ -183,8 +183,9 @@ The process executor gives each run:
 The process backend has these limits. Inside a microVM, none of them
 matters, because the microVM ends after one run.
 
-- It has no seccomp filter. It has no mount namespace and no cgroup unless
-  you set `ExecOptions::fs` and `ExecOptions::cgroup_root`.
+- It has no seccomp filter. It has no mount namespace unless you set
+  `ExecOptions::fs`. It has no cgroup unless you set
+  `ExecOptions::cgroup_root`.
 - Without `ExecOptions::cgroup_root`, a process that calls `setsid` leaves
   the group, and the executor cannot kill it.
 - With `FsIsolation::Shared`, the default, the code sees the whole file
@@ -227,14 +228,21 @@ let backend = ProcessBackend::new(ExecOptions {
 - **`Mask`** fails open. A directory shows empty. A file, or a socket,
   reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
   a second path still reaches the data. It does not hide the other runs in
-  the scratch root. Each path must be absolute and must exist, or the run is
-  refused with a config error.
+  the scratch root, and it does not hide `/proc`. Each path must be
+  absolute and must exist. It must not hold `..` or cover the work
+  directory. Otherwise the run is refused with a config error.
 - Both settings need a mount namespace. A non-root worker enters it through
   its user namespace. When the host refuses, the run fails closed with
-  `SandboxUnavailable`. `fs_isolation_available()` probes the host, as
-  `network_isolation_available()` does for the network.
-- Neither setting hides abstract Unix sockets when the policy allows the
-  network. Deny the network to close them.
+  `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
+  probes the host, as `network_isolation_available()` does for the network.
+  The probe tries the mount namespace only, so a `Pivot` run can still fail
+  closed.
+- Under `Pivot`, the code writes only the work directory and `/tmp`.
+- Neither setting hides abstract Unix sockets of the worker network
+  namespace when the policy allows the network. Deny the network to close
+  them.
+- `SandboxPolicy::for_development` does not set `ExecOptions::fs`. Set it
+  on the options of the backend.
 
 The process backend is the only backend that can give code a network. A
 runtime refuses a policy that allows the network on a backend without one.
