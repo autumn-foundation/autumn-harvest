@@ -374,8 +374,14 @@ fn cstring(path: &Path) -> Result<CString, SandboxError> {
         .map_err(|_| config(format!("the path {} holds a NUL byte", path.display())))
 }
 
-/// Check that `path` is absolute and holds no `..`.
+/// Check that `path` is absolute and holds no `..` and no NUL byte.
 fn check_absolute(path: &Path) -> Result<(), SandboxError> {
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(config(format!(
+            "the file system path {} holds a NUL byte",
+            path.display()
+        )));
+    }
     if !path.is_absolute() {
         return Err(config(format!(
             "the file system path {} is not absolute",
@@ -649,15 +655,40 @@ mod tests {
         }
     }
 
+    async fn run_with(
+        options: ExecOptions,
+        network: NetworkPolicy,
+        request: &SandboxRequest,
+    ) -> Result<SandboxOutcome, SandboxError> {
+        let plan = SandboxPolicy::for_development()
+            .with_network(network)
+            .plan(request)
+            .expect("valid request");
+        execute_plan(&plan, &options, &CancellationToken::new()).await
+    }
+
     async fn try_run(
         fs: FsIsolation,
         request: &SandboxRequest,
     ) -> Result<SandboxOutcome, SandboxError> {
-        let plan = SandboxPolicy::for_development()
-            .with_network(NetworkPolicy::Allow)
-            .plan(request)
-            .expect("valid request");
-        execute_plan(&plan, &options(fs), &CancellationToken::new()).await
+        run_with(options(fs), NetworkPolicy::Allow, request).await
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        euid == 0
+    }
+
+    fn has_python() -> bool {
+        let found = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !found {
+            eprintln!("skipped: python3 is not installed");
+        }
+        found
     }
 
     async fn run(fs: FsIsolation, code: &str) -> SandboxOutcome {
@@ -765,6 +796,11 @@ mod tests {
             .unwrap();
         assert_ne!(masked.stdout, "connected\n");
         assert_ne!(masked.status, RunStatus::Exited { code: 0 });
+        assert!(
+            masked.stderr.contains("refused") || masked.stderr.contains("ConnectionRefused"),
+            "the connect must fail with a refusal: {}",
+            masked.stderr
+        );
     }
 
     #[tokio::test]
@@ -848,13 +884,14 @@ mod tests {
         let out = run(
             FsIsolation::pivot(),
             &format!(
-                "ls {} 2>&1; echo x > /tmp/mine; echo done",
+                "ls {} 2>&1; echo x > /tmp/mine && echo tmpok; echo done",
                 marker.display()
             ),
         )
         .await;
         std::fs::remove_file(&marker).unwrap();
         assert!(out.stdout.contains("No such file"), "{}", out.stdout);
+        assert!(out.stdout.contains("tmpok\n"), "{}", out.stdout);
         assert!(out.stdout.ends_with("done\n"), "{}", out.stdout);
     }
 
@@ -1026,6 +1063,167 @@ mod tests {
         ] {
             let len = format_map(&mut buf, id);
             assert_eq!(std::str::from_utf8(&buf[..len]).unwrap(), want);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pivot_mounts_carry_the_expected_flags() {
+        if !needs_isolation().await || !has_python() {
+            return;
+        }
+        // 1 is read-only, 2 is nosuid, 4 is nodev.
+        let code =
+            "import os\nfor p in ('/usr', '/tmp', '.'):\n    print(p, os.statvfs(p).f_flag & 7)";
+        let out = try_run(FsIsolation::pivot(), &SandboxRequest::new("python3", code))
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "/usr 7\n/tmp 6\n. 6\n", "{}", out.stderr);
+    }
+
+    #[tokio::test]
+    async fn a_masked_directory_is_not_writable_and_has_no_mode() {
+        if !needs_isolation().await {
+            return;
+        }
+        let (dir, _file) = secret_dir();
+        let path = dir.path().display();
+        let out = run(
+            FsIsolation::Mask(vec![dir.path().to_path_buf()]),
+            &format!("touch {path}/x 2>/dev/null; echo rc=$?; stat -c %a {path}"),
+        )
+        .await;
+        assert_eq!(out.stdout, "rc=1\n0\n", "{}", out.stderr);
+    }
+
+    #[tokio::test]
+    async fn a_pivot_run_leaves_no_trace_after_a_timeout() {
+        if !needs_isolation().await {
+            return;
+        }
+        let scratch =
+            tempfile::tempdir_in("/var/tmp").unwrap_or_else(|_| tempfile::tempdir().unwrap());
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let options = ExecOptions {
+            scratch_root: scratch.path().to_path_buf(),
+            fs: FsIsolation::pivot(),
+            ..ExecOptions::default()
+        };
+        let slow = SandboxRequest::new("sh", "sleep 30").with_timeout_ms(500);
+        let out = run_with(options.clone(), NetworkPolicy::Allow, &slow)
+            .await
+            .unwrap();
+        assert_eq!(out.status, RunStatus::TimedOut);
+        let quick = SandboxRequest::new("sh", "echo ok");
+        run_with(options, NetworkPolicy::Allow, &quick)
+            .await
+            .unwrap();
+        let left: Vec<_> = std::fs::read_dir(scratch.path()).unwrap().collect();
+        assert!(left.is_empty(), "the scratch root must be empty: {left:?}");
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(!mounts.contains(&scratch.path().display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_pivot_runs_a_dedicated_uid_with_no_network() {
+        if !needs_isolation().await {
+            return;
+        }
+        if !is_root() {
+            eprintln!("skipped: run_as needs a root worker");
+            return;
+        }
+        let options = ExecOptions {
+            run_as: Some((4242, 4242)),
+            fs: FsIsolation::pivot(),
+            ..ExecOptions::default()
+        };
+        let code = "id -u; echo x > out && echo work; echo x > /tmp/t && echo tmp; cat /etc/passwd > /dev/null && echo passwd; ls /bin > /dev/null && echo bin";
+        let out = run_with(
+            options,
+            NetworkPolicy::Deny,
+            &SandboxRequest::new("sh", code),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.stdout, "4242\nwork\ntmp\npasswd\nbin\n",
+            "{}",
+            out.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pivot_without_a_root_directory_is_unavailable() {
+        let err = FsIsolation::pivot()
+            .prepare(None, Path::new("/w"), 0)
+            .expect_err("a pivot needs a root directory");
+        assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_path_with_a_nul_byte_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let fs = FsIsolation::Pivot {
+            read_only: vec![PathBuf::from("/usr\0x")],
+        };
+        let err = fs
+            .prepare(Some(Path::new("/r")), work.path(), 0)
+            .expect_err("a NUL byte must be refused");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_failed_mount_step_maps_to_an_unavailable_run() {
+        let err = crate::sandbox::exec::spawn_error("sh", &io::Error::from_raw_os_error(FS_FAILED));
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("mount")),
+            "{err:?}"
+        );
+    }
+
+    /// The child must make the tree private before it mounts. A thread in
+    /// its own mount namespace with a shared root shows a leak.
+    #[test]
+    fn a_mask_does_not_leak_into_a_shared_root() {
+        if !is_root() {
+            eprintln!("skipped: a shared root needs a root worker");
+            return;
+        }
+        let (_dir, file) = secret_dir();
+        let masked = file.display().to_string();
+        let leaked = std::thread::spawn(move || {
+            // SAFETY: CLONE_NEWNS gives this thread its own mount namespace.
+            // CLONE_FS lets a thread change its own namespace, so no other
+            // test sees the change.
+            if unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) } != 0 {
+                return None;
+            }
+            // SAFETY: mount reads valid C strings.
+            let shared = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_SHARED,
+                    std::ptr::null(),
+                )
+            };
+            if shared != 0 {
+                return None;
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(run(FsIsolation::Mask(vec![file]), "true"));
+            let table = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
+            Some(table.contains(&masked))
+        })
+        .join()
+        .unwrap();
+        match leaked {
+            Some(leaked) => assert!(!leaked, "the mask leaked into the shared root"),
+            None => eprintln!("skipped: this host refuses a private mount namespace"),
         }
     }
 

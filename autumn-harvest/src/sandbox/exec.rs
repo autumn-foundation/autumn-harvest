@@ -692,7 +692,7 @@ impl Drop for GroupGuard {
 }
 
 /// Map a spawn error to a sandbox error.
-fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
+pub(super) fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
     match err.raw_os_error() {
         Some(NETNS_FAILED) => SandboxError::Unavailable(
             "the policy denies the network, and this host does not allow an empty network \
