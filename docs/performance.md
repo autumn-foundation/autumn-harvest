@@ -3130,3 +3130,11 @@ standalone note rather than part of the claim-path attribution table above:
   `harvest_worker_task_stats_updated_at_idx` serves (prune buffers -97.5%,
   -98.3% and -98.2% for live fleets of 500, 2,000 and 8,000 workers,
   `pg_stat_statements`).
+* [`docs/performance-redundant-index-drop.md`](performance-redundant-index-drop.md)
+  — an audit of the 73 indexes of the three hot tables (issue #2684). Five
+  indexes of `harvest_events` and `harvest_workflow_executions` duplicated
+  or never served a query. Dropping them cuts WAL per run by 4.1% and an
+  event insert by 7.1%. Throughput does not move.
+* [`docs/performance-retention-pass-statement-cache.md`](performance-retention-pass-statement-cache.md)
+  — the retention candidate loop planned five statements per candidate.
+  `cached_stmt` keeps them prepared (`pg_stat_statements`, `retention_reclaim_bench`).
