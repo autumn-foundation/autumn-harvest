@@ -309,6 +309,7 @@ pub mod dag_leverage;
 pub mod dag_linter;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_profiler;
+pub mod dag_retry_envelope;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
 pub mod dag_slack;
