@@ -504,7 +504,7 @@ fn pivot_plan(
 
     // A directory entry already shows each path under it, so a nested or
     // repeated entry adds nothing, and its mount point would collide.
-    let mut bound_dirs: Vec<&Path> = Vec::new();
+    let mut bound_dirs: Vec<PathBuf> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     // A link of the list shows the paths under it, and a directory made at
     // the same place would collide with it. So an entry under a link adds
@@ -549,16 +549,30 @@ fn pivot_plan(
                 target: cstring(&target)?,
                 dst: cstring(&dst)?,
             });
-            // A link to a file, such as `/etc/resolv.conf` into `/run`, needs
-            // its target. Bind that file only, never its directory.
+            // A link needs its target. A resolver file in `/run` is one case,
+            // a runtime directory with a version is another. Bind the target
+            // only, never the directory above it.
             if let Ok(real) = std::fs::canonicalize(path)
-                && std::fs::metadata(&real).is_ok_and(|m| m.is_file())
+                && let Ok(target_meta) = std::fs::metadata(&real)
+                && (target_meta.is_file() || target_meta.is_dir())
                 && !bound_dirs.iter().any(|dir| real.starts_with(dir))
                 && seen.insert(real.clone())
             {
+                if real == Path::new("/tmp") || work.starts_with(&real) {
+                    return Err(config(format!(
+                        "the target {} of the link {} covers /tmp or the work directory",
+                        real.display(),
+                        path.display()
+                    )));
+                }
                 let real_dst = inside(root, &real);
                 add_parents(&mut dirs, root, &real_dst);
-                leaves.push(Step::Touch(cstring(&real_dst)?));
+                if target_meta.is_dir() {
+                    bound_dirs.push(real.clone());
+                    dirs.insert(real_dst.clone());
+                } else {
+                    leaves.push(Step::Touch(cstring(&real_dst)?));
+                }
                 leaves.push(Step::Bind {
                     src: cstring(&real)?,
                     dst: cstring(&real_dst)?,
@@ -572,7 +586,7 @@ fn pivot_plan(
         }
         let remount = inherited_flags(path)? | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
         if meta.is_dir() {
-            bound_dirs.push(path);
+            bound_dirs.push(path.clone());
             dirs.insert(dst.clone());
         } else {
             leaves.push(Step::Touch(cstring(&dst)?));
@@ -1327,6 +1341,39 @@ mod tests {
             "{}",
             out.stdout
         );
+    }
+
+    #[tokio::test]
+    async fn a_pivot_follows_a_link_to_a_directory() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A runtime directory is often a link to a versioned directory.
+        let (dir, _file) = secret_dir();
+        let holder = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(holder.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = holder.path().join("current");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let mut read_only: Vec<PathBuf> = PIVOT_READ_ONLY.iter().map(PathBuf::from).collect();
+        read_only.push(link.clone());
+        let code = format!("cat {}/secret.db", link.display());
+        let out = run(FsIsolation::Pivot { read_only }, &code).await;
+        assert_eq!(out.stdout, "s3cret", "{}", out.stderr);
+    }
+
+    #[test]
+    fn a_link_to_the_work_directory_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("up");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let fs = FsIsolation::Pivot {
+            read_only: vec![link],
+        };
+        let err = fs
+            .prepare(Some(Path::new("/r")), work.path(), 1 << 20)
+            .expect_err("the target covers the work directory");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
     }
 
     #[tokio::test]
