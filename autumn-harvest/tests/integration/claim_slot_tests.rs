@@ -930,6 +930,13 @@ fn backlog_shortfall(left: usize, rate: f64, horizon: Duration) -> usize {
     needed.saturating_sub(left)
 }
 
+/// Whether `left` tasks last for `horizon` at `rate`, with no headroom.
+fn backlog_covers(left: usize, rate: f64, horizon: Duration) -> bool {
+    #[allow(clippy::cast_precision_loss)]
+    let left = left as f64;
+    rate.is_finite() && left >= rate.max(0.0) * horizon.as_secs_f64()
+}
+
 /// Claims per second between two samples.
 fn rate(from: (Instant, usize), to: (Instant, usize)) -> f64 {
     let secs = to.0.duration_since(from.0).as_secs_f64();
@@ -973,6 +980,7 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
 
     // The run tops up the backlog, so that it outlasts the stall and the longest recovery.
     // The fleet keeps claiming while the seed runs, so each round re-reads the claims.
+    // A round refills to the headroom target but needs only the bare need to pass.
     assert!(
         before.is_finite() && before > 0.0,
         "the rate before the stall is {before}; the fleet claimed nothing"
@@ -982,11 +990,12 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     let mut covered = false;
     for _ in 0..TOP_UP_ROUNDS {
         let claimed = AtomicUsize::load(&counter.tasks, Ordering::Relaxed);
-        let add = backlog_shortfall(seeded.saturating_sub(claimed), before, horizon);
-        if add == 0 {
+        let left = seeded.saturating_sub(claimed);
+        if backlog_covers(left, before, horizon) {
             covered = true;
             break;
         }
+        let add = backlog_shortfall(left, before, horizon);
         seed(&db.url, &queue, add, false, ShardId::new(0)).await;
         seeded += add;
     }
@@ -1101,6 +1110,31 @@ fn shortfall_is_zero_at_a_negative_rate() {
 #[test]
 fn shortfall_is_zero_at_a_zero_horizon() {
     assert_eq!(backlog_shortfall(0, 400.0, Duration::ZERO), 0);
+}
+
+/// Claims during a seed leave the backlog above the need, so the run stops.
+#[test]
+fn coverage_holds_after_claims_during_a_seed() {
+    let horizon = Duration::from_secs(12);
+    let refilled = 4688 + backlog_shortfall(4688, 400.0, horizon);
+    assert!(backlog_covers(refilled - 1, 400.0, horizon));
+}
+
+/// A backlog under the need does not cover it.
+#[test]
+fn coverage_fails_under_the_need() {
+    assert!(!backlog_covers(4799, 400.0, Duration::from_secs(12)));
+    assert!(backlog_covers(4800, 400.0, Duration::from_secs(12)));
+}
+
+/// A rate that is not finite never counts as covered.
+#[test]
+fn coverage_fails_at_a_rate_that_is_not_finite() {
+    assert!(!backlog_covers(
+        usize::MAX,
+        f64::NAN,
+        Duration::from_secs(1)
+    ));
 }
 
 /// The cap off, then the cap on, one after the other. Each run must recover
