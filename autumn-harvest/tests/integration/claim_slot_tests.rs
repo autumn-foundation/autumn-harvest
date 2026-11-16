@@ -910,15 +910,21 @@ const STALL: Duration = Duration::from_secs(3);
 const WINDOW: Duration = Duration::from_secs(1);
 /// The backlog at the start of each run. The run adds more if the rate needs it.
 const STALL_BACKLOG: usize = 6000;
-/// The share of extra tasks over the need, because the rate may rise.
+/// The factor over the need. It covers a rate rise and the claims during a seed.
 const BACKLOG_HEADROOM: f64 = 1.5;
+/// The most top-up rounds before the run fails.
+const TOP_UP_ROUNDS: usize = 5;
 
 /// The tasks to add so that the backlog lasts for `horizon` at `rate`.
 ///
 /// A fast run eats more of the backlog before the stall. The same speed
 /// raises the need, so a fixed backlog cannot cover every runner (issue #2706).
 fn backlog_shortfall(left: usize, rate: f64, horizon: Duration) -> usize {
+    if !rate.is_finite() {
+        return 0;
+    }
     let needed = rate.max(0.0) * horizon.as_secs_f64() * BACKLOG_HEADROOM;
+    // The rate is clamped to zero or more, so the cast cannot lose a sign.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let needed = needed.ceil() as usize;
     needed.saturating_sub(left)
@@ -965,13 +971,29 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     windows.sort_by(f64::total_cmp);
     let before = windows[1];
 
-    // Top up the backlog so that it outlasts the stall and the longest recovery.
-    let left = STALL_BACKLOG.saturating_sub(last.1);
+    // The run tops up the backlog, so that it outlasts the stall and the longest recovery.
+    // The fleet keeps claiming while the seed runs, so each round re-reads the claims.
+    assert!(
+        before.is_finite() && before > 0.0,
+        "the rate before the stall is {before}; the fleet claimed nothing"
+    );
     let horizon = RECOVERY_LIMIT + Duration::from_secs(2);
-    let add = backlog_shortfall(left, before, horizon);
-    if add > 0 {
+    let mut seeded = STALL_BACKLOG;
+    let mut covered = false;
+    for _ in 0..TOP_UP_ROUNDS {
+        let claimed = AtomicUsize::load(&counter.tasks, Ordering::Relaxed);
+        let add = backlog_shortfall(seeded.saturating_sub(claimed), before, horizon);
+        if add == 0 {
+            covered = true;
+            break;
+        }
         seed(&db.url, &queue, add, false, ShardId::new(0)).await;
+        seeded += add;
     }
+    assert!(
+        covered,
+        "{TOP_UP_ROUNDS} top-ups did not outlast the recovery at {before:.0}/s"
+    );
 
     // The stall: one transaction holds the table for `STALL`.
     let mut staller = connect(&db.url).await;
@@ -1033,21 +1055,18 @@ fn shortfall_is_zero_when_the_backlog_covers_the_need() {
     assert_eq!(backlog_shortfall(8000, 400.0, Duration::from_secs(12)), 0);
 }
 
-/// The failing run of issue #2706: 4688 left, 400/s, 12 s.
+/// The failing run of issue #2706: 4688 left, 400/s, 12 s. The top-up holds headroom.
 #[test]
 fn shortfall_covers_a_fast_runner() {
     let add = backlog_shortfall(4688, 400.0, Duration::from_secs(12));
-    assert!(
-        4688 + add >= 4800,
-        "the top-up covers the need; added {add}"
-    );
+    assert_eq!(add, 7200 - 4688);
 }
 
 /// The need holds headroom, because the rate may rise after the stall.
 #[test]
 fn shortfall_keeps_headroom_over_the_need() {
     let add = backlog_shortfall(0, 100.0, Duration::from_secs(10));
-    assert!(add > 1000, "headroom over 100/s for 10 s; added {add}");
+    assert_eq!(add, 1500);
 }
 
 /// A rate of zero needs nothing.
@@ -1061,7 +1080,27 @@ fn shortfall_is_zero_at_a_zero_rate() {
 fn shortfall_scales_with_the_rate() {
     let slow = backlog_shortfall(0, 200.0, Duration::from_secs(12));
     let fast = backlog_shortfall(0, 800.0, Duration::from_secs(12));
-    assert!(fast + 4 >= 4 * slow, "slow {slow}, fast {fast}");
+    assert_eq!(fast, 4 * slow);
+}
+
+/// A rate that is not a finite number needs nothing.
+#[test]
+fn shortfall_is_zero_at_a_rate_that_is_not_finite() {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(backlog_shortfall(0, bad, Duration::from_secs(12)), 0);
+    }
+}
+
+/// A negative rate needs nothing.
+#[test]
+fn shortfall_is_zero_at_a_negative_rate() {
+    assert_eq!(backlog_shortfall(0, -5.0, Duration::from_secs(12)), 0);
+}
+
+/// A zero horizon needs nothing.
+#[test]
+fn shortfall_is_zero_at_a_zero_horizon() {
+    assert_eq!(backlog_shortfall(0, 400.0, Duration::ZERO), 0);
 }
 
 /// The cap off, then the cap on, one after the other. Each run must recover
