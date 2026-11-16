@@ -507,7 +507,7 @@ struct PivotBuild<'a> {
 }
 
 impl<'a> PivotBuild<'a> {
-    fn new(root: &'a Path, work: &'a Path) -> Self {
+    const fn new(root: &'a Path, work: &'a Path) -> Self {
         Self {
             root,
             work,
