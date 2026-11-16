@@ -505,7 +505,17 @@ fn pivot_plan(
     // A directory entry already shows each path under it, so a nested or
     // repeated entry adds nothing, and its mount point would collide.
     let mut bound_dirs: Vec<&Path> = Vec::new();
-    let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    // A link of the list shows the paths under it, and a directory made at
+    // the same place would collide with it. So an entry under a link adds
+    // nothing, whatever the order of the list.
+    let links: Vec<&Path> = read_only
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .collect();
     for path in read_only {
         check_absolute(path)?;
         if path == Path::new("/tmp") || work.starts_with(path) {
@@ -519,7 +529,12 @@ fn pivot_plan(
         if DEVICES.iter().any(|device| path == Path::new(device)) {
             continue;
         }
-        if bound_dirs.iter().any(|dir| path.starts_with(dir)) || !seen.insert(path.as_path()) {
+        if bound_dirs.iter().any(|dir| path.starts_with(dir))
+            || links
+                .iter()
+                .any(|link| path != link && path.starts_with(link))
+            || !seen.insert(path.clone())
+        {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -534,6 +549,25 @@ fn pivot_plan(
                 target: cstring(&target)?,
                 dst: cstring(&dst)?,
             });
+            // A link to a file, such as `/etc/resolv.conf` into `/run`, needs
+            // its target. Bind that file only, never its directory.
+            if let Ok(real) = std::fs::canonicalize(path)
+                && std::fs::metadata(&real).is_ok_and(|m| m.is_file())
+                && !bound_dirs.iter().any(|dir| real.starts_with(dir))
+                && seen.insert(real.clone())
+            {
+                let real_dst = inside(root, &real);
+                add_parents(&mut dirs, root, &real_dst);
+                leaves.push(Step::Touch(cstring(&real_dst)?));
+                leaves.push(Step::Bind {
+                    src: cstring(&real)?,
+                    dst: cstring(&real_dst)?,
+                    remount: inherited_flags(&real)?
+                        | libc::MS_RDONLY
+                        | libc::MS_NOSUID
+                        | libc::MS_NODEV,
+                });
+            }
             continue;
         }
         let remount = inherited_flags(path)? | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
@@ -1265,6 +1299,46 @@ mod tests {
             return;
         };
         assert_eq!(out.stdout, "ok\n0077\n", "{}", out.stderr);
+    }
+
+    #[tokio::test]
+    async fn a_pivot_follows_a_link_to_its_file_only() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A resolver file is often a link into /run.
+        let (dir, file) = secret_dir();
+        let other = dir.path().join("unrelated.txt");
+        std::fs::write(&other, "no").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("resolv.conf");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let mut read_only: Vec<PathBuf> = PIVOT_READ_ONLY.iter().map(PathBuf::from).collect();
+        read_only.push(link.clone());
+        let code = format!(
+            "cat {}; echo; cat {} 2>&1 | head -c 40",
+            link.display(),
+            other.display()
+        );
+        let out = run(FsIsolation::Pivot { read_only }, &code).await;
+        assert!(out.stdout.starts_with("s3cret\n"), "{}", out.stdout);
+        assert!(
+            !out.stdout.contains("no\n") || out.stdout.contains("No such"),
+            "{}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pivot_accepts_an_entry_under_a_listed_link() {
+        if !needs_isolation().await {
+            return;
+        }
+        // On a merged-usr host, /bin is a link. The entry adds nothing.
+        let mut read_only: Vec<PathBuf> = PIVOT_READ_ONLY.iter().map(PathBuf::from).collect();
+        read_only.push("/bin/sh".into());
+        let out = run(FsIsolation::Pivot { read_only }, "echo ok").await;
+        assert_eq!(out.stdout, "ok\n", "{}", out.stderr);
     }
 
     #[tokio::test]
