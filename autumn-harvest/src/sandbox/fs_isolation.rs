@@ -503,6 +503,11 @@ fn pivot_plan(
                 path.display()
             )));
         }
+        // The device list below binds these nodes. A `nodev` bind here
+        // would stop that bind from opening the node.
+        if DEVICES.iter().any(|device| path == Path::new(device)) {
+            continue;
+        }
         if bound_dirs.iter().any(|dir| path.starts_with(dir)) || !seen.insert(path.as_path()) {
             continue;
         }
