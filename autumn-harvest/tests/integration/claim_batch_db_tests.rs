@@ -318,3 +318,105 @@ async fn concurrent_batches_take_each_row_exactly_once() {
         "every plain row and three keyed rows, the cap"
     );
 }
+
+/// A run whose deadline passes during the claim stops its own row only.
+///
+/// The first row spends a token from a bucket that a peer holds locked, so
+/// the claim reads its clock after the run deadline. The rows behind it
+/// belong to other runs, and the claim still takes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_queue("batch-expiry");
+    let bucket = unique_queue("batch-expiry-bucket");
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket, 0.0, 1.0)
+        .await
+        .expect("bucket");
+
+    let run = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, input, state, deadline_at) \
+         VALUES ($1, 'batch-expiry', $2, 0, '{}'::jsonb, 'RUNNING', \
+                 NOW() + INTERVAL '2 seconds')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(run)
+    .bind::<diesel::sql_types::Text, _>(run.to_string())
+    .execute(&mut conn)
+    .await
+    .expect("insert run");
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(run);
+    params.activity_name = Some("noop".to_owned());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket.clone());
+    params.priority = 9;
+    let expiring = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    for priority in [3, 2, 1] {
+        enqueue(&mut conn, &queue, &plain(priority)).await;
+    }
+
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("begin holder");
+    diesel::sql_query("SELECT 1 FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Text, _>(&bucket)
+        .execute(&mut holder)
+        .await
+        .expect("hold the bucket lock");
+
+    let claim_url = url.clone();
+    let claim_queue = queue.clone();
+    let claimer = tokio::spawn(async move {
+        let mut claim_conn = connect(&claim_url).await;
+        claim(
+            &mut claim_conn,
+            &claim_queue,
+            "w-expiry",
+            None,
+            ClaimBatch::Four,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(!claimer.is_finished(), "the claim waits on the bucket lock");
+    holder.batch_execute("COMMIT").await.expect("release");
+
+    let claimed = claimer.await.expect("claimer");
+    assert_eq!(
+        priorities(&claimed),
+        [3, 2, 1],
+        "the other runs keep their rows"
+    );
+    assert!(claimed.iter().all(|row| row.0 != expiring));
+
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let row: State =
+        diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(expiring)
+            .get_result(&mut conn)
+            .await
+            .expect("expiring row");
+    assert_eq!((row.state.as_str(), row.attempt), ("PENDING", 0));
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let tokens: Tokens =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket)
+            .get_result(&mut conn)
+            .await
+            .expect("bucket row");
+    assert!(
+        (tokens.tokens - 1.0).abs() < f64::EPSILON,
+        "the expired row spends no token"
+    );
+}

@@ -1,0 +1,12 @@
+round 1 k=1 stmt_ms=1.233 per_row_ms=1.233
+round 1 k=2 stmt_ms=1.108 per_row_ms=0.554
+round 1 k=4 stmt_ms=1.129 per_row_ms=0.282
+round 1 k=8 stmt_ms=1.208 per_row_ms=0.151
+round 2 k=1 stmt_ms=1.031 per_row_ms=1.031
+round 2 k=2 stmt_ms=1.097 per_row_ms=0.548
+round 2 k=4 stmt_ms=1.221 per_row_ms=0.305
+round 2 k=8 stmt_ms=1.355 per_row_ms=0.169
+round 3 k=1 stmt_ms=1.081 per_row_ms=1.081
+round 3 k=2 stmt_ms=1.133 per_row_ms=0.567
+round 3 k=4 stmt_ms=1.239 per_row_ms=0.310
+round 3 k=8 stmt_ms=1.215 per_row_ms=0.152

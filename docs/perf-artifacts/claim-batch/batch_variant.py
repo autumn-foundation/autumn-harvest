@@ -23,4 +23,9 @@ assert s.count(old)==1
 new=(f"claim_ranked AS MATERIALIZED ( SELECT c.*, row_number() OVER ( ORDER BY c.claim_rank DESC, c.claim_priority DESC, c.claim_due ASC, c.id ASC ) AS claim_rn FROM seek_candidate c ), "
      f"candidate AS MATERIALIZED ( SELECT r.* FROM claim_ranked r WHERE r.claim_rn < COALESCE(( SELECT min(x.claim_rn) FROM claim_ranked x WHERE x.claim_rn > 1 AND (x.concurrency_key IS NOT NULL OR x.rate_limit_key IS NOT NULL) ), {k+1}) )")
 s=s.replace(old,new)
+s=re.sub(r'run_expired_now AS MATERIALIZED \( SELECT EXISTS \( SELECT 1 FROM candidate c (.*?) \) AS expired \)',
+         r'run_expired_now AS MATERIALIZED ( SELECT c.id AS expired_id FROM candidate c \1 )', s, count=1)
+veto="AND NOT (SELECT expired FROM run_expired_now)"
+assert s.count(veto)==2, s.count(veto)
+s=s.replace(veto,"AND NOT EXISTS (SELECT 1 FROM run_expired_now x WHERE x.expired_id = candidate.id)")
 open(out,'w').write(s)
