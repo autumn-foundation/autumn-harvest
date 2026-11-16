@@ -25,12 +25,14 @@ result, not from the commit message.
 
 | Window | Merges into PR branches | Conflicted | PRs that merged | PRs with a conflict |
 |---|---:|---:|---:|---:|
-| 2026-08 (from 27th) | 26 | 21 | — | — |
-| 2026-09 | 153 | 73 | — | — |
-| 2026-10 | 446 | 327 | — | — |
+| 2026-08 (from 27th) | 11 | 9 | 10 | 8 |
+| 2026-09 | 153 | 73 | 80 | 53 |
+| 2026-10 | 446 | 327 | 157 | 122 |
 | 2026-11 (to 16th) | 93 | 76 | 44 | 39 |
 | Whole window | 703 | 485 (69%) | 285 | 217 |
 
+The merge columns sum to the window totals. The PR columns do not, because
+one PR can merge `trunk-dev` in more than one month.
 `trunk-dev` has 851 non-merge commits in the window. A branch that rebased,
 or never merged `trunk-dev`, is not visible. So the counts are a floor.
 
