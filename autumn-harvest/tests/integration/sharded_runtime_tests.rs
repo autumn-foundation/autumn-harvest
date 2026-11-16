@@ -2108,7 +2108,7 @@ async fn batch_claim_dispatch_counts(assigned: Vec<ShardId>, per_shard: usize) -
             .build();
         let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
         let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
-        runtime_config.worker_id = "w-batch".to_owned();
+        "w-batch".clone_into(&mut runtime_config.worker_id);
         runtime_config.poll_interval = Duration::from_millis(50);
         runtime_config.shutdown_timeout = Duration::from_secs(2);
         runtime_config.sharded_pool = Some(sharded.clone());
