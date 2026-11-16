@@ -1604,8 +1604,8 @@ impl AgentHarness {
         if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
             return Ok(self.skill_outcome(lookup, &call.arguments));
         }
-        // A read-only run can read the files but never moves the head. A
-        // probe never moves it either, because the head belongs to the
+        // A read-only run can read the files but never moves the head. A call
+        // that changes them there is an error (issue #2692). A probe never moves it either, because the head belongs to the
         // source scope (issue #2378).
         let keep_files = !request.read_only && request.probe_effects.is_none();
         // Only a tool that opts in loads the workspace (issue #2274).

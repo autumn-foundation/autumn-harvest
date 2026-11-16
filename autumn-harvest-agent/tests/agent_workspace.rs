@@ -395,8 +395,8 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
     let model = ScriptedModel::new(vec![
         write("w1", "notes.txt", "the first draft"),
         answer("saved", 1),
-        // A tick is read-only. Its write runs, the model reads an error, and the
-        // head stays (issue #2692).
+        // A tick is read-only. Its write runs, the tool call returns an error,
+        // and the head stays (issue #2692).
         write("w2", "notes.txt", "a draft from a tick"),
         answer("HEARTBEAT_OK", 1),
         read("r3", "notes.txt"),
