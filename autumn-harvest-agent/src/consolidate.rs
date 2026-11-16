@@ -1283,6 +1283,30 @@ mod tests {
         assert!(!facts.capped);
     }
 
+    #[tokio::test]
+    async fn a_reply_that_stops_for_a_tool_call_is_not_capped() {
+        let facts = turn_of("no facts here", StopReason::ToolUse).await;
+        assert!(!facts.capped);
+    }
+
+    #[test]
+    fn the_capped_forms_round_trip() {
+        let stop = serde_json::to_string(&ConsolidationStop::OutputCapped).unwrap();
+        assert_eq!(stop, "\"output_capped\"");
+        let back: ConsolidationStop = serde_json::from_str(&stop).unwrap();
+        assert_eq!(back, ConsolidationStop::OutputCapped);
+        let facts = ConsolidateFacts {
+            capped: true,
+            ..ConsolidateFacts::default()
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        assert!(json.contains("\"capped\":true"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ConsolidateFacts>(&json).unwrap(),
+            facts
+        );
+    }
+
     #[test]
     fn a_recorded_turn_without_the_flag_reads_as_not_capped() {
         let old: ConsolidateFacts = serde_json::from_str("{}").unwrap();

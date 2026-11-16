@@ -541,6 +541,60 @@ async fn a_reply_cut_off_at_the_output_cap_ends_as_output_capped() {
     assert_eq!(log.pending(10).len(), 1, "the next pass reads it again");
 }
 
+/// A model whose pass reply is `text`, cut off at the output cap.
+fn capped_model(text: &'static str) -> Arc<TryFnModel> {
+    TryFnModel::new(move |request| -> Reply {
+        let mut reply = text_reply(if is_pass(request) { text } else { "ok" }, 4, 2);
+        if is_pass(request) {
+            reply.stop_reason = StopReason::MaxTokens;
+        }
+        Ok(reply)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_child_pass_fails_the_op_with_a_named_error() {
+    let (_dir, db) = fresh_db();
+    let model = capped_model("{\"facts\":[{\"subject\":\"ada");
+    let settings = EpisodeSettings::default().every(2).max_episodes(2);
+    let harness = AgentHarness::new(model.clone())
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(Arc::new(InMemoryEpisodeStore::default()))
+        .agent(profile(Some(settings)));
+    let mut rt = runtime(&db, harness);
+    say(&mut rt, "one").await;
+    say(&mut rt, "two").await;
+    assert_eq!(pass_count(&model), 1);
+    let state = state_of(&rt, &agent()).await;
+    assert_eq!(state.failures, 1);
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("OutputCapped")),
+        "{:?}",
+        state.last_error
+    );
+    say(&mut rt, "three").await;
+    assert_eq!(pass_count(&model), 1, "no retry on the next op");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_reply_that_parses_completes_the_pass() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+    let harness = AgentHarness::new(capped_model("{\"facts\":[]}"))
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes.clone())
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.stop, ConsolidationStop::Completed);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pass_with_no_episodes_calls_no_model() {
     let (_dir, db) = fresh_db();
