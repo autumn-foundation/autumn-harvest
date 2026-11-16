@@ -427,7 +427,7 @@ async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
 /// `NOW()` stays at the transaction start, so the statement-start gate sees
 /// each run as live. The clock read after the bucket locks sees the runs that
 /// the sleep expired. Row 1 carries a capped concurrency key of an expiring
-/// run, and row 3 has no key and no bucket, so only the expiry check of
+/// run. Row 3 has no key and no bucket, so only the expiry check of
 /// `claimed` stops it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_row_takes_no_key_lock_and_its_peers_still_claim() {
