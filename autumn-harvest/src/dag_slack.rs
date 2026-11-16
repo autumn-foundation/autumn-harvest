@@ -174,7 +174,7 @@ impl DagSlackAnalyzer {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
-fn to_duration(nanos: u128) -> Duration {
+pub(crate) fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.
         Duration::new(secs, (nanos % 1_000_000_000) as u32)
