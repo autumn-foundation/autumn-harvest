@@ -1,5 +1,11 @@
 # 🏛️ Keystone [deferred]: raise the documented Postgres floor (trigger: 2026-11-12 PG14 end of life, or a first feature outside the partitioned layout that needs SQL newer than 12)
 
+> **Update (2026-11-16).** Assay #18 (`docs/assays/0018-postgres-12-pgcrypto-schema.md`)
+> measured a PG 12 failure. A harvest install outside `public` fails with
+> `gen_random_uuid() does not exist` in two of four setups. PG 14 and PG 16 pass. So
+> "12+" holds only when the `pgcrypto` schema is on every harvest search path.
+> Trigger 1 passed on 2026-11-12 with no owner.
+
 > **Update (2026-10-19).** Assay #15 (`docs/assays/0015-postgres-12-floor.md`) ran
 > part of the evidence this record asked for. All 139 core migrations in
 > `autumn-harvest/migrations` apply on PG 12.22 and PG 14.24, and the schema matches

@@ -38181,6 +38181,9 @@ folds fragments in here.
   worker-driven test for each acceptance criterion, a scheduler fire included.
   HTTP tests on the route, each refusal and the audit rows. A source guard over
   the schedule paths and the decodes.
+- **Phase** (implemented): Assay #18: the Postgres 12 floor outside `public`. Assay ledger #18 installs the core schema into a non-`public` schema on PG 12.22, PG 14.24 and PG 16.15, under five search-path setups, three runs each. The verdict is kill for an unqualified "12+": two PG 12 setups fail with `gen_random_uuid() does not exist`, and PG 14 and PG 16 pass all of them. See `docs/assays/0018-postgres-12-pgcrypto-schema.md`.
+
+  No engine change: no `WorkflowEvent` variant, no migration, no public API change.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
