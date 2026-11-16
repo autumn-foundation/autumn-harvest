@@ -232,6 +232,81 @@ mod claim_window {
         )
     }
 
+    const SEEK_CANDIDATE_COLUMNS: &str = "SELECT id, task_type, concurrency_key, \
+         concurrency_cap, rate_limit_key, activity_name, workflow_exec_id FROM harvest_task_queue";
+
+    const SEEK_CANDIDATE_LOCK: &str = "LIMIT 1 FOR UPDATE SKIP LOCKED";
+
+    const WINDOW_CANDIDATE_CTE: &str = "candidate AS ( SELECT * FROM seek_candidate )";
+
+    /// The batch form of a window text: `seek_candidate` locks up to `rows`
+    /// rows, and `candidate` keeps them in claim order.
+    ///
+    /// Only the first row may carry a concurrency key or a rate-limit key, so
+    /// `candidate` stops before the next row that carries one. The cap
+    /// re-check of `claimed` reads the statement snapshot, so two rows of one
+    /// key would both pass it. One bucket row takes one debit, however many
+    /// claims join it.
+    ///
+    /// # Panics
+    ///
+    /// When `window` is not a window text. Every input is a constant.
+    #[must_use]
+    pub(super) fn batch_claim_sql(window: &str, rows: usize) -> String {
+        assert!(rows >= 2, "a batch claims two rows or more");
+        let (ctes, tail) = split_ctes(window);
+        let mut kept = Vec::with_capacity(ctes.len() + 1);
+        for cte in &ctes {
+            match cte.name {
+                "seek_candidate" => {
+                    let text = squash(cte.text);
+                    assert_eq!(text.matches(SEEK_CANDIDATE_COLUMNS).count(), 1);
+                    assert_eq!(text.matches(SEEK_CANDIDATE_LOCK).count(), 1);
+                    kept.push(
+                        text.replace(
+                            SEEK_CANDIDATE_COLUMNS,
+                            &format!(
+                                "SELECT id, task_type, concurrency_key, concurrency_cap, \
+                                 rate_limit_key, activity_name, workflow_exec_id, \
+                                 CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() \
+                                 THEN 1 ELSE 0 END AS claim_rank, priority AS claim_priority, \
+                                 {} AS claim_due FROM harvest_task_queue",
+                                super::CLAIM_ORDER_DUE_SQL
+                            ),
+                        )
+                        .replace(
+                            SEEK_CANDIDATE_LOCK,
+                            &format!("LIMIT {rows} FOR UPDATE SKIP LOCKED"),
+                        ),
+                    );
+                }
+                "candidate" => {
+                    assert_eq!(squash(cte.text), WINDOW_CANDIDATE_CTE);
+                    kept.push(
+                        "claim_ranked AS MATERIALIZED ( SELECT c.*, row_number() OVER ( \
+                         ORDER BY c.claim_rank DESC, c.claim_priority DESC, c.claim_due ASC, \
+                         c.id ASC ) AS claim_rn FROM seek_candidate c )"
+                            .to_owned(),
+                    );
+                    kept.push(format!(
+                        "candidate AS MATERIALIZED ( SELECT r.* FROM claim_ranked r \
+                         WHERE r.claim_rn < COALESCE(( SELECT min(x.claim_rn) \
+                         FROM claim_ranked x WHERE x.claim_rn > 1 \
+                         AND (x.concurrency_key IS NOT NULL OR x.rate_limit_key IS NOT NULL) \
+                         ), {}) )",
+                        rows + 1
+                    ));
+                }
+                _ => kept.push(cte.text.to_owned()),
+            }
+        }
+        assert!(
+            kept.iter().any(|c| c.starts_with("claim_ranked")),
+            "a window text defines candidate"
+        );
+        format!("WITH {} {tail}", kept.join(", "))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -369,6 +444,81 @@ mod claim_window {
                  OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0))"
             ));
             assert_eq!(body("candidate"), FULL_CANDIDATE_BODY);
+        }
+
+        #[test]
+        fn batch_claim_sql_changes_only_the_lock_limit_and_the_candidate() {
+            use crate::queue::{
+                ClaimBatch, TaskType, batch_claim_query_for, window_claim_query_for,
+            };
+            for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+                for fenced in [false, true] {
+                    let window = window_claim_query_for(kind, fenced, false);
+                    let (window_ctes, window_tail) = split_ctes(window);
+                    for batch in [ClaimBatch::Two, ClaimBatch::Four, ClaimBatch::Eight] {
+                        let case = format!("kind {kind:?}, fenced {fenced}, {batch:?}");
+                        let sql = batch_claim_query_for(kind, fenced, batch);
+                        let (ctes, tail) = split_ctes(sql);
+                        assert_eq!(tail, window_tail, "{case}: the final query");
+                        assert_eq!(binds(sql), binds(window), "{case}: the binds");
+                        let changed: Vec<_> = ctes
+                            .iter()
+                            .filter(|c| {
+                                window_ctes
+                                    .iter()
+                                    .find(|w| w.name == c.name)
+                                    .is_none_or(|w| w.text != c.text)
+                            })
+                            .map(|c| c.name)
+                            .collect();
+                        assert_eq!(
+                            changed,
+                            ["seek_candidate", "claim_ranked", "candidate"],
+                            "{case}"
+                        );
+                        let rows = batch.rows();
+                        assert!(sql.contains(&format!("LIMIT {rows} FOR UPDATE SKIP LOCKED")));
+                        assert!(!sql.contains(SEEK_CANDIDATE_LOCK), "{case}");
+                        assert!(sql.contains(&format!("), {}) )", rows + 1)), "{case}");
+                    }
+                }
+            }
+        }
+
+        /// The batch ranks its rows by the sort key of `seek_candidate`.
+        #[test]
+        fn the_batch_rank_follows_the_claim_order_without_ageing() {
+            let window = crate::queue::window_claim_query_for(None, false, false);
+            let (ctes, _) = split_ctes(window);
+            let seek = squash(
+                ctes.iter()
+                    .find(|c| c.name == "seek_candidate")
+                    .map(|c| c.text)
+                    .unwrap_or_default(),
+            );
+            assert!(seek.contains(
+                "ORDER BY CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
+                 ELSE 0 END DESC"
+            ));
+            assert!(seek.contains(&format!(
+                "ELSE priority END DESC, {} ASC LIMIT 1",
+                squash(super::super::CLAIM_ORDER_DUE_SQL)
+            )));
+            let batch = batch_claim_sql(window, 2);
+            assert!(batch.contains(
+                "CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END \
+                 AS claim_rank, priority AS claim_priority"
+            ));
+            assert!(batch.contains(&format!(
+                "{} AS claim_due",
+                squash(super::super::CLAIM_ORDER_DUE_SQL)
+            )));
+        }
+
+        #[test]
+        #[should_panic(expected = "a batch claims two rows or more")]
+        fn a_batch_of_one_row_panics() {
+            let _ = batch_claim_sql(crate::queue::window_claim_query_for(None, false, false), 1);
         }
 
         #[test]
@@ -3822,6 +3972,187 @@ pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool)
     } + 2 * usize::from(fenced)
         + usize::from(owned);
     &WINDOW[slot]
+}
+
+/// The most rows that one batch claim may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimBatch {
+    /// Two rows.
+    Two,
+    /// Four rows.
+    Four,
+    /// Eight rows.
+    Eight,
+}
+
+impl ClaimBatch {
+    /// The row count.
+    #[must_use]
+    pub const fn rows(self) -> usize {
+        match self {
+            Self::Two => 2,
+            Self::Four => 4,
+            Self::Eight => 8,
+        }
+    }
+
+    /// The largest batch of at most `rows` rows, or `None` below two.
+    #[must_use]
+    pub const fn at_most(rows: usize) -> Option<Self> {
+        match rows {
+            0 | 1 => None,
+            2 | 3 => Some(Self::Two),
+            4..=7 => Some(Self::Four),
+            _ => Some(Self::Eight),
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Two => 0,
+            Self::Four => 1,
+            Self::Eight => 2,
+        }
+    }
+}
+
+/// The batch form of the window claim. See [`claim_task_batch_with_slots`].
+#[must_use]
+pub fn batch_claim_query_for(
+    kind: Option<TaskType>,
+    fenced: bool,
+    batch: ClaimBatch,
+) -> &'static str {
+    use std::sync::LazyLock;
+    const BATCHES: [ClaimBatch; 3] = [ClaimBatch::Two, ClaimBatch::Four, ClaimBatch::Eight];
+    static BATCH: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut variants = Vec::with_capacity(18);
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for batch in BATCHES {
+                    variants.push(claim_window::batch_claim_sql(
+                        window_claim_query_for(kind, fenced, false),
+                        batch.rows(),
+                    ));
+                }
+            }
+        }
+        variants
+    });
+    let slot = match kind {
+        None => 0,
+        Some(TaskType::Workflow) => 6,
+        Some(TaskType::Activity) => 12,
+    } + 3 * usize::from(fenced)
+        + batch.index();
+    &BATCH[slot]
+}
+
+/// What a batch claim returned.
+#[derive(Debug)]
+pub enum SlottedBatch {
+    /// The claim took one task or more.
+    Claimed(Vec<TaskQueueItem>),
+    /// The claim found no task.
+    Empty,
+    /// Every slot of the shard was held, so no claim statement ran.
+    NoSlot,
+}
+
+/// [`claim_task_with_slots`] for up to `batch` rows in one statement.
+///
+/// Only the default claim has a batch form: no priority ageing, no fair
+/// claim and no owned claim. A claim with any of them goes through
+/// [`claim_task_with_slots`].
+///
+/// Each row passes the post-claim rechecks of a single claim. A row that
+/// they give back is hinted after the commit. When the batch finds no row
+/// and sets the fallback flag, the full statement runs and takes one row
+/// at most.
+///
+/// # Errors
+///
+/// As [`claim_task_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_batch_with_slots(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    slots: Option<ClaimSlots>,
+    batch: ClaimBatch,
+) -> HarvestResult<SlottedBatch> {
+    begin_claim_transaction(conn, CLAIM_BEGIN_WITH_SETTINGS_SQL).await?;
+    let body: HarvestResult<Option<Vec<ClaimOutcome>>> = async {
+        if let Some(slots) = slots
+            && take_claim_slot(conn, slots).await?.is_none()
+        {
+            return Ok(None);
+        }
+        let fence = fence_binding(shard);
+        let query = |sql| CachedClaimQuery {
+            sql,
+            ageing: false,
+            worker_id,
+            queues,
+            worker_build_id,
+            aging_secs: None,
+            circuit_breaker_activities,
+            ineligible_activities,
+            fence: fence.clone(),
+            by_id: None,
+            owned: None,
+        };
+        let rows: Vec<WindowClaimRow> = query(batch_claim_query_for(kind, fence.is_some(), batch))
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let fallback = <[WindowClaimRow]>::first(&rows).is_some_and(|row| row.fallback);
+        let mut tasks: Vec<TaskQueueItem> = rows.into_iter().filter_map(|row| row.task).collect();
+        if claim_window::window_step(!tasks.is_empty(), fallback)
+            == claim_window::WindowStep::Fallback
+        {
+            tasks = query(claim_query_for(kind, fence.is_some(), ClaimFairness::Off))
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        let pipeline: &AsyncPgConnection = conn;
+        futures::future::join_all(
+            tasks
+                .into_iter()
+                .map(|task| apply_post_claim_rechecks(pipeline, task, worker_id)),
+        )
+        .await
+        .into_iter()
+        .collect::<HarvestResult<Vec<_>>>()
+        .map(Some)
+    }
+    .await;
+    let Some(outcomes) = finish_claim_transaction(conn, body).await? else {
+        return Ok(SlottedBatch::NoSlot);
+    };
+    let mut claimed = Vec::with_capacity(outcomes.len());
+    let mut released = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            ClaimOutcome::Claimed(task) => claimed.push(*task),
+            ClaimOutcome::Released(id) => released.push(id),
+            ClaimOutcome::Empty => {}
+        }
+    }
+    if !released.is_empty() {
+        record_pending_hints(conn, &released).await;
+    }
+    Ok(if claimed.is_empty() {
+        SlottedBatch::Empty
+    } else {
+        SlottedBatch::Claimed(claimed)
+    })
 }
 
 struct WindowClaimRow {

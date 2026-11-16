@@ -595,6 +595,12 @@ impl AdaptiveLimitRegistry {
         });
     }
 
+    /// Whether any activity type can have a limit.
+    #[must_use]
+    pub fn any_policy(&self) -> bool {
+        self.config.default_policy.is_some() || self.config.overrides.values().any(Option::is_some)
+    }
+
     /// Whether any activity type is at its cap. It reads no lock, so the
     /// claim path can call it on every poll.
     #[must_use]
@@ -682,6 +688,20 @@ mod tests {
 
     const A: &str = "charge_card";
     const B: &str = "send_email";
+
+    #[test]
+    fn any_policy_is_false_only_with_no_limit_for_any_type() {
+        let none = AdaptiveLimitRegistry::new(AdaptiveLimitConfig::disabled());
+        assert!(!none.any_policy());
+        let off =
+            AdaptiveLimitRegistry::new(AdaptiveLimitConfig::disabled().with_activity(A, None));
+        assert!(!off.any_policy());
+        assert!(registry(AdaptiveLimitPolicy::new(2, 8)).any_policy());
+        let one = AdaptiveLimitRegistry::new(
+            AdaptiveLimitConfig::disabled().with_activity(A, Some(AdaptiveLimitPolicy::new(2, 8))),
+        );
+        assert!(one.any_policy());
+    }
 
     fn registry(policy: AdaptiveLimitPolicy) -> Arc<AdaptiveLimitRegistry> {
         Arc::new(AdaptiveLimitRegistry::new(

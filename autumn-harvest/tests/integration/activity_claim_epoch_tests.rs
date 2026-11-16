@@ -964,6 +964,7 @@ fn e2e_worker(
                 max_concurrent_activities: 2,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),

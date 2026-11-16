@@ -95,6 +95,8 @@ mod ci_nextest_archive;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 #[cfg(feature = "db")]
+mod claim_batch_db_tests;
+#[cfg(feature = "db")]
 mod claim_batched_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]

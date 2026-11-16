@@ -287,6 +287,17 @@ pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
         .filter(|v| *v > 0)
 }
 
+/// The most rows of one claim statement. Unset keeps one row per claim.
+pub const CLAIM_BATCH_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_BATCH";
+
+/// The batch size that `raw` asks for, or `None` for one row per claim.
+#[must_use]
+pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
+    raw.and_then(|v| v.trim().parse::<u8>().ok())
+        .filter(|v| *v > 1)
+        .and_then(std::num::NonZeroU8::new)
+}
+
 /// Set to `1` to run the throughput scenario in owner mode (issue #2252).
 ///
 /// The bench turns owner mode on in each shard database before the fleet
@@ -2021,6 +2032,13 @@ mod tests {
         assert_eq!(claim_loops_override(Some("0")), None);
         assert_eq!(claim_loops_override(Some("two")), None);
         assert_eq!(claim_loops_override(None), None);
+        let rows = |raw| claim_batch_override(raw).map(std::num::NonZeroU8::get);
+        assert_eq!(rows(Some("8")), Some(8));
+        assert_eq!(rows(Some(" 4 ")), Some(4));
+        assert_eq!(rows(Some("1")), None);
+        assert_eq!(rows(Some("0")), None);
+        assert_eq!(rows(Some("many")), None);
+        assert_eq!(rows(None), None);
     }
 
     #[test]
@@ -4293,6 +4311,8 @@ pub mod db {
         {
             runtime.max_concurrent_claims = loops;
         }
+        runtime.claim_batch_max =
+            super::claim_batch_override(std::env::var(super::CLAIM_BATCH_ENV_VAR).ok().as_deref());
         runtime.sharded_pool = Some(sharded.clone());
         Arc::new(Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"))
     }
