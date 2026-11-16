@@ -2085,3 +2085,96 @@ fn dag_widening_only_moves_names_onto_the_new_shard() {
          rebalance path, so the stability assertion above is vacuous",
     );
 }
+
+/// Seed `per_shard` instant workflows on each shard of `assigned`, start a
+/// worker with batch claims, and return the dispatch count of each shard.
+async fn batch_claim_dispatch_counts(assigned: Vec<ShardId>, per_shard: usize) -> Vec<u64> {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    let metrics = Arc::new(ShardMetrics::default());
+    let worker = {
+        let built = HarvestBuilder::new()
+            .workflows(vec![instant_info()])
+            .telemetry(TelemetryConfig {
+                service_name: Arc::from("sharded_runtime_tests"),
+                propagator: Arc::new(autumn_harvest::telemetry::NoOpPropagator),
+                metrics: Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+            })
+            .worker(
+                WorkerConfig::default()
+                    .with_shard_assignments(assigned.clone())
+                    .with_claim_batch_max(8),
+            )
+            .build();
+        let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+        let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+        runtime_config.worker_id = "w-batch".to_owned();
+        runtime_config.poll_interval = Duration::from_millis(50);
+        runtime_config.shutdown_timeout = Duration::from_secs(2);
+        runtime_config.sharded_pool = Some(sharded.clone());
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"))
+    };
+
+    let mut execs = Vec::new();
+    for shard_id in &assigned {
+        let pool = sharded.exact_pool_for(*shard_id).expect("shard pool");
+        let mut conn = pool.get().await.expect("shard conn");
+        for n in 0..per_shard {
+            let exec_id = ExecutionId::new_for_shard(*shard_id);
+            let wf_id = format!("batch-{}-{n}", shard_id.as_i32());
+            start_or_load_workflow_execution(
+                &mut conn,
+                start_params(exec_id, "shard_probe", &wf_id),
+                None,
+            )
+            .await
+            .expect("start workflow on shard");
+            execs.push((*shard_id, exec_id));
+        }
+    }
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(0))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&default_pool).await;
+    });
+    for (shard_id, exec_id) in &execs {
+        assert!(
+            wait_for_state(
+                &urls[shard_id],
+                *exec_id,
+                "COMPLETED",
+                Duration::from_secs(30)
+            )
+            .await,
+            "a batch-claimed workflow on shard {shard_id:?} never completed",
+        );
+    }
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    assigned
+        .iter()
+        .map(|shard_id| metrics.dispatched_for(shard_id.as_i32()))
+        .collect()
+}
+
+/// A batch claim dispatches several tasks in one poll. The shard counter
+/// counts each task, on the multi-shard loop and on the single-shard loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_claim_counts_each_dispatched_task_on_its_shard() {
+    const PER_SHARD: usize = 12;
+    let all: Vec<ShardId> = SHARDS.iter().copied().map(ShardId::new).collect();
+    assert_eq!(
+        batch_claim_dispatch_counts(all, PER_SHARD).await,
+        vec![PER_SHARD as u64; SHARDS.len()],
+        "the multi-shard loop counts every dispatched task"
+    );
+    assert_eq!(
+        batch_claim_dispatch_counts(vec![ShardId::new(1)], PER_SHARD).await,
+        vec![PER_SHARD as u64],
+        "the single-shard loop counts every dispatched task"
+    );
+}
