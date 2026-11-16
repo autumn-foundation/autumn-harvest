@@ -491,6 +491,190 @@ fn add_parents(dirs: &mut BTreeSet<PathBuf>, root: &Path, dst: &Path) {
     }
 }
 
+/// The steps of a pivot, built one entry at a time.
+struct PivotBuild<'a> {
+    root: &'a Path,
+    work: &'a Path,
+    /// The directories to make in the new root. A set sorts a parent before
+    /// its children.
+    dirs: BTreeSet<PathBuf>,
+    /// The mounts and links, in order.
+    leaves: Vec<Step>,
+    /// A directory entry already shows each path under it, so a nested or
+    /// repeated entry adds nothing, and its mount point would collide.
+    bound_dirs: Vec<PathBuf>,
+    seen: BTreeSet<PathBuf>,
+}
+
+impl<'a> PivotBuild<'a> {
+    fn new(root: &'a Path, work: &'a Path) -> Self {
+        Self {
+            root,
+            work,
+            dirs: BTreeSet::new(),
+            leaves: Vec::new(),
+            bound_dirs: Vec::new(),
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// Does `path` cover `/tmp` or the work directory?
+    fn covers_scratch(&self, path: &Path) -> bool {
+        path == Path::new("/tmp") || self.work.starts_with(path)
+    }
+
+    /// Does an earlier entry already show `path`?
+    fn is_shown(&self, path: &Path) -> bool {
+        self.bound_dirs.iter().any(|dir| path.starts_with(dir))
+    }
+
+    /// Bind the host path `src` read-only at the same path in the new root.
+    fn bind_read_only(&mut self, src: &Path, is_dir: bool) -> Result<(), SandboxError> {
+        let dst = inside(self.root, src);
+        add_parents(&mut self.dirs, self.root, &dst);
+        if is_dir {
+            self.bound_dirs.push(src.to_path_buf());
+            self.dirs.insert(dst.clone());
+        } else {
+            self.leaves.push(Step::Touch(cstring(&dst)?));
+        }
+        self.leaves.push(Step::Bind {
+            src: cstring(src)?,
+            dst: cstring(&dst)?,
+            remount: inherited_flags(src)? | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+        });
+        Ok(())
+    }
+
+    /// Add one entry of the list. `links` holds each entry that is a link.
+    fn add_entry(&mut self, path: &Path, links: &[&Path]) -> Result<(), SandboxError> {
+        check_absolute(path)?;
+        if self.covers_scratch(path) {
+            return Err(config(format!(
+                "the read-only path {} covers /tmp or the work directory",
+                path.display()
+            )));
+        }
+        // The device list binds these nodes. A `nodev` bind here would stop
+        // that bind from opening the node.
+        if DEVICES.iter().any(|device| path == Path::new(device)) {
+            return Ok(());
+        }
+        // A link of the list shows the paths under it, and a directory made
+        // at the same place would collide with it. So an entry under a link
+        // adds nothing, whatever the order of the list.
+        if self.is_shown(path)
+            || links
+                .iter()
+                .any(|link| path != *link && path.starts_with(link))
+            || !self.seen.insert(path.to_path_buf())
+        {
+            return Ok(());
+        }
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return Ok(());
+        };
+        if meta.file_type().is_symlink() {
+            return self.add_link(path);
+        }
+        self.bind_read_only(path, meta.is_dir())
+    }
+
+    /// Recreate the link `path`, and bind its target.
+    ///
+    /// A link needs its target. A resolver file in `/run` is one case, a
+    /// runtime directory with a version is another. Only the target is bound,
+    /// never the directory above it.
+    fn add_link(&mut self, path: &Path) -> Result<(), SandboxError> {
+        let target = std::fs::read_link(path)
+            .map_err(|e| config(format!("cannot read the link {}: {e}", path.display())))?;
+        let dst = inside(self.root, path);
+        add_parents(&mut self.dirs, self.root, &dst);
+        self.leaves.push(Step::Symlink {
+            target: cstring(&target)?,
+            dst: cstring(&dst)?,
+        });
+        if let Ok(real) = std::fs::canonicalize(path)
+            && let Ok(target_meta) = std::fs::metadata(&real)
+            && (target_meta.is_file() || target_meta.is_dir())
+            && !self.is_shown(&real)
+            && self.seen.insert(real.clone())
+        {
+            if self.covers_scratch(&real) {
+                return Err(config(format!(
+                    "the target {} of the link {} covers /tmp or the work directory",
+                    real.display(),
+                    path.display()
+                )));
+            }
+            self.bind_read_only(&real, target_meta.is_dir())?;
+        }
+        Ok(())
+    }
+
+    /// Bind the device nodes that exist on the host.
+    fn add_devices(&mut self) -> Result<(), SandboxError> {
+        for device in DEVICES {
+            let path = Path::new(device);
+            if !std::fs::metadata(path).is_ok_and(|m| m.file_type().is_char_device()) {
+                continue;
+            }
+            let dst = inside(self.root, path);
+            add_parents(&mut self.dirs, self.root, &dst);
+            self.leaves.push(Step::Touch(cstring(&dst)?));
+            self.leaves.push(Step::Bind {
+                src: cstring(path)?,
+                dst: cstring(&dst)?,
+                remount: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Bind the work directory read-write.
+    fn add_work(&mut self) -> Result<(), SandboxError> {
+        let dst = inside(self.root, self.work);
+        add_parents(&mut self.dirs, self.root, &dst);
+        self.dirs.insert(dst.clone());
+        self.leaves.push(Step::Bind {
+            src: cstring(self.work)?,
+            dst: cstring(&dst)?,
+            remount: inherited_flags(self.work)? | libc::MS_NOSUID | libc::MS_NODEV,
+        });
+        Ok(())
+    }
+
+    /// Put the steps in order: the roots, the directories, then the leaves.
+    fn finish(self, tmp_bytes: u64) -> Result<FsPlan, SandboxError> {
+        let tmp = inside(self.root, Path::new("/tmp"));
+        let mut steps = vec![
+            Step::Tmpfs {
+                dst: cstring(self.root)?,
+                flags: libc::MS_NOSUID | libc::MS_NODEV,
+                options: CString::new(ROOT_TMPFS_OPTIONS).map_err(|e| config(e.to_string()))?,
+            },
+            Step::Mkdir(cstring(&tmp)?),
+            Step::Tmpfs {
+                dst: cstring(&tmp)?,
+                flags: libc::MS_NOSUID | libc::MS_NODEV,
+                options: CString::new(format!("mode=1777,size={tmp_bytes}"))
+                    .map_err(|e| config(e.to_string()))?,
+            },
+        ];
+        // Each parent is a directory made here, or an earlier mount.
+        for dir in self.dirs {
+            if dir != tmp {
+                steps.push(Step::Mkdir(cstring(&dir)?));
+            }
+        }
+        steps.extend(self.leaves);
+        Ok(FsPlan {
+            steps,
+            pivot: Some((cstring(self.root)?, cstring(self.work)?)),
+        })
+    }
+}
+
 /// The steps of a pivot.
 fn pivot_plan(
     read_only: &[PathBuf],
@@ -499,16 +683,6 @@ fn pivot_plan(
     tmp_bytes: u64,
 ) -> Result<FsPlan, SandboxError> {
     check_absolute(work)?;
-    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut leaves: Vec<Step> = Vec::new();
-
-    // A directory entry already shows each path under it, so a nested or
-    // repeated entry adds nothing, and its mount point would collide.
-    let mut bound_dirs: Vec<PathBuf> = Vec::new();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    // A link of the list shows the paths under it, and a directory made at
-    // the same place would collide with it. So an entry under a link adds
-    // nothing, whatever the order of the list.
     let links: Vec<&Path> = read_only
         .iter()
         .map(PathBuf::as_path)
@@ -516,138 +690,13 @@ fn pivot_plan(
             std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
         })
         .collect();
+    let mut build = PivotBuild::new(root, work);
     for path in read_only {
-        check_absolute(path)?;
-        if path == Path::new("/tmp") || work.starts_with(path) {
-            return Err(config(format!(
-                "the read-only path {} covers /tmp or the work directory",
-                path.display()
-            )));
-        }
-        // The device list below binds these nodes. A `nodev` bind here
-        // would stop that bind from opening the node.
-        if DEVICES.iter().any(|device| path == Path::new(device)) {
-            continue;
-        }
-        if bound_dirs.iter().any(|dir| path.starts_with(dir))
-            || links
-                .iter()
-                .any(|link| path != link && path.starts_with(link))
-            || !seen.insert(path.clone())
-        {
-            continue;
-        }
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        let dst = inside(root, path);
-        add_parents(&mut dirs, root, &dst);
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(path)
-                .map_err(|e| config(format!("cannot read the link {}: {e}", path.display())))?;
-            leaves.push(Step::Symlink {
-                target: cstring(&target)?,
-                dst: cstring(&dst)?,
-            });
-            // A link needs its target. A resolver file in `/run` is one case,
-            // a runtime directory with a version is another. Bind the target
-            // only, never the directory above it.
-            if let Ok(real) = std::fs::canonicalize(path)
-                && let Ok(target_meta) = std::fs::metadata(&real)
-                && (target_meta.is_file() || target_meta.is_dir())
-                && !bound_dirs.iter().any(|dir| real.starts_with(dir))
-                && seen.insert(real.clone())
-            {
-                if real == Path::new("/tmp") || work.starts_with(&real) {
-                    return Err(config(format!(
-                        "the target {} of the link {} covers /tmp or the work directory",
-                        real.display(),
-                        path.display()
-                    )));
-                }
-                let real_dst = inside(root, &real);
-                add_parents(&mut dirs, root, &real_dst);
-                if target_meta.is_dir() {
-                    bound_dirs.push(real.clone());
-                    dirs.insert(real_dst.clone());
-                } else {
-                    leaves.push(Step::Touch(cstring(&real_dst)?));
-                }
-                leaves.push(Step::Bind {
-                    src: cstring(&real)?,
-                    dst: cstring(&real_dst)?,
-                    remount: inherited_flags(&real)?
-                        | libc::MS_RDONLY
-                        | libc::MS_NOSUID
-                        | libc::MS_NODEV,
-                });
-            }
-            continue;
-        }
-        let remount = inherited_flags(path)? | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
-        if meta.is_dir() {
-            bound_dirs.push(path.clone());
-            dirs.insert(dst.clone());
-        } else {
-            leaves.push(Step::Touch(cstring(&dst)?));
-        }
-        leaves.push(Step::Bind {
-            src: cstring(path)?,
-            dst: cstring(&dst)?,
-            remount,
-        });
+        build.add_entry(path, &links)?;
     }
-    for device in DEVICES {
-        let path = Path::new(device);
-        if !std::fs::metadata(path).is_ok_and(|m| m.file_type().is_char_device()) {
-            continue;
-        }
-        let dst = inside(root, path);
-        add_parents(&mut dirs, root, &dst);
-        leaves.push(Step::Touch(cstring(&dst)?));
-        leaves.push(Step::Bind {
-            src: cstring(path)?,
-            dst: cstring(&dst)?,
-            remount: 0,
-        });
-    }
-    let work_dst = inside(root, work);
-    add_parents(&mut dirs, root, &work_dst);
-    dirs.insert(work_dst.clone());
-    let work_flags = inherited_flags(work)? | libc::MS_NOSUID | libc::MS_NODEV;
-    leaves.push(Step::Bind {
-        src: cstring(work)?,
-        dst: cstring(&work_dst)?,
-        remount: work_flags,
-    });
-
-    let tmp = inside(root, Path::new("/tmp"));
-    let tmp_options = format!("mode=1777,size={tmp_bytes}");
-    let mut steps = vec![
-        Step::Tmpfs {
-            dst: cstring(root)?,
-            flags: libc::MS_NOSUID | libc::MS_NODEV,
-            options: CString::new(ROOT_TMPFS_OPTIONS).map_err(|e| config(e.to_string()))?,
-        },
-        Step::Mkdir(cstring(&tmp)?),
-        Step::Tmpfs {
-            dst: cstring(&tmp)?,
-            flags: libc::MS_NOSUID | libc::MS_NODEV,
-            options: CString::new(tmp_options).map_err(|e| config(e.to_string()))?,
-        },
-    ];
-    // A set sorts a parent before its children. Each parent is a directory
-    // made here, or an earlier mount.
-    for dir in dirs {
-        if dir != tmp {
-            steps.push(Step::Mkdir(cstring(&dir)?));
-        }
-    }
-    steps.extend(leaves);
-    Ok(FsPlan {
-        steps,
-        pivot: Some((cstring(root)?, cstring(work)?)),
-    })
+    build.add_devices()?;
+    build.add_work()?;
+    build.finish(tmp_bytes)
 }
 
 /// Whether this host lets the executor build a private mount namespace.
