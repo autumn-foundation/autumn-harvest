@@ -515,6 +515,33 @@ async fn a_reply_that_does_not_parse_marks_no_episode() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reply_cut_off_at_the_output_cap_ends_as_output_capped() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+    let model = TryFnModel::new(|request| -> Reply {
+        if is_pass(request) {
+            let mut cut = text_reply("{\"facts\":[{\"subject\":\"ada", 4, 2);
+            cut.stop_reason = StopReason::MaxTokens;
+            return Ok(cut);
+        }
+        Ok(text_reply("ok", 1, 1))
+    });
+    let harness = AgentHarness::new(model)
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes.clone())
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.stop, ConsolidationStop::OutputCapped);
+    assert_eq!(report.usage, TokenUsage::new(4, 2));
+    let log = episodes.load(&episode_scope()).await.unwrap();
+    assert_eq!(log.pending(10).len(), 1, "the next pass reads it again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pass_with_no_episodes_calls_no_model() {
     let (_dir, db) = fresh_db();
     let model = model(two_facts);

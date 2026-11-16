@@ -2133,8 +2133,10 @@ fn support(
   `sqlite::consolidate` or `postgres::consolidate` starts one pass.
 - **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
   `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
-  `disabled` or `reset`. A refused budget and a reply that does not parse
-  write no fact and mark no episode. SQLite has no run budget, so a pass
+  `output_capped`, `disabled` or `reset`. A refused budget and a reply that
+  does not parse write no fact and mark no episode. `output_capped` means
+  the reply hit the output cap. A retry fails the same way, so read fewer
+  episodes or raise the cap. SQLite has no run budget, so a pass
   there always passes the budget check.
 - **Erase.** `Control::ResetMemory` clears the episode scope first, then the
   memory scope, then the transcript windows of the agent.
