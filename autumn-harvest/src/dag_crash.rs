@@ -131,7 +131,7 @@ impl<'a> DagCrashPlanner<'a> {
             // So the gain is exactly the useful part of the cut.
             durations[index] -= gain;
             makespan -= gain;
-            let cost = (gain * u128::from(rate)).div_ceil(1_000_000_000);
+            let cost = step_cost(gain, rate);
             total_cost = total_cost.saturating_add(cost);
             steps.push(CrashStep {
                 index,
@@ -200,6 +200,17 @@ impl<'a> DagCrashPlanner<'a> {
         }
         makespan
     }
+}
+
+/// Cost of removing `nanos` at `rate` per second, rounded up.
+///
+/// Whole seconds and the remainder are priced apart. So the product never
+/// scales a large duration by one billion before the division.
+fn step_cost(nanos: u128, rate: u64) -> u128 {
+    let rate = u128::from(rate);
+    let whole = (nanos / 1_000_000_000).saturating_mul(rate);
+    let part = (nanos % 1_000_000_000 * rate).div_ceil(1_000_000_000);
+    whole.saturating_add(part)
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
@@ -308,6 +319,14 @@ mod tests {
             .plan(Duration::from_millis(12_500));
         assert_eq!(plan.steps[0].shortened_by, Duration::from_millis(500));
         assert_eq!(plan.total_cost, 2);
+    }
+
+    #[test]
+    fn huge_cut_cost_does_not_overflow() {
+        let gain = u128::from(u64::MAX) * 1_000_000_000;
+        let expected = u128::from(u64::MAX) * u128::from(u64::MAX);
+        assert_eq!(step_cost(gain, u64::MAX), expected);
+        assert_eq!(step_cost(1, 1), 1);
     }
 
     #[test]
