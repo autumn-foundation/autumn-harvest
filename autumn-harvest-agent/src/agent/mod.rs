@@ -62,7 +62,7 @@ use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
 use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
-use crate::memory::{EditKey, MemoryScope};
+use crate::memory::{EditKey, MemoryScope, READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
 use crate::sampling::{OpSample, SampleFailure, sample_task};
@@ -2426,7 +2426,8 @@ impl AgentRun<'_> {
             .map_or_else(Vec::new, |peer| peer.waiting.to_vec());
         let mut tree = segment_tree(&mut state, id, profile, run_id.clone(), waiting);
         if task.memory_in_state {
-            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
+            let access = memory_access(self.ctx, task.memory_writable());
+            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree, access));
         }
         open_notes(&mut task, &state, &mut progress, &mut tree);
         let run = Run {
@@ -2526,7 +2527,15 @@ impl AgentRun<'_> {
             }
         };
         let stream = task.stream;
-        draw_op_task(&mut task, &state, profile, peer.as_ref());
+        // A draw has no `memory` tool, so it reads the snapshot only. The
+        // gate is asked only when the draw renders a snapshot. Otherwise the
+        // access is not read.
+        let access = if task.memory_in_state && !state.memory.is_empty() {
+            memory_access(self.ctx, false)
+        } else {
+            SnapshotAccess::Read
+        };
+        draw_op_task(&mut task, &state, profile, peer.as_ref(), access);
         // Each draw carries the task in its input. A task over the input cap
         // would fail the spawn after the policy read, so it fails here.
         if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
@@ -2666,6 +2675,7 @@ fn draw_op_task(
     state: &AgentState,
     profile: &AgentProfile,
     peer: Option<&PeerSegment<'_>>,
+    access: SnapshotAccess,
 ) {
     if let Some(peer) = peer {
         let mandate = peer.member.mandate();
@@ -2695,13 +2705,26 @@ fn draw_op_task(
     }
     if task.memory_in_state && !state.memory.is_empty() {
         // A draw reads the state memory but cannot edit it.
-        let snapshot = crate::memory::render_snapshot(&state.memory);
+        let snapshot = crate::memory::render_snapshot(&state.memory, access);
         task.system = Some(match task.system.take() {
             Some(system) => format!("{system}\n\n{snapshot}"),
             None => snapshot,
         });
         task.flow_labels
             .extend(crate::memory::snapshot_labels(&state.memory));
+    }
+}
+
+/// The snapshot access of a run that has the `memory` tool when
+/// `writable` is true.
+///
+/// A run without the tool asks the patch gate. A history from before the
+/// gate rendered the edit head, so its replay renders that head again.
+fn memory_access(ctx: &WorkflowContext, writable: bool) -> SnapshotAccess {
+    if writable || !ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        SnapshotAccess::Edit
+    } else {
+        SnapshotAccess::Read
     }
 }
 
@@ -2834,11 +2857,12 @@ fn open_memory(
     state: &mut AgentState,
     task: &mut AgentTask,
     tree: &mut Tree,
+    access: SnapshotAccess,
 ) -> Vec<crate::memory::MemoryBlock> {
     if state.memory.is_empty() {
         state.memory = crate::memory::MemoryBlock::defaults();
     }
-    let snapshot = crate::memory::render_snapshot(&state.memory);
+    let snapshot = crate::memory::render_snapshot(&state.memory, access);
     task.system = Some(match task.system.take() {
         Some(system) => format!("{system}\n\n{snapshot}"),
         None => snapshot,
