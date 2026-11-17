@@ -48,6 +48,8 @@ rule.
 | The model widens the ceiling or the kind. | The call arguments deny unknown keys. Only the instruction and the items come from the call. |
 | A sweep passes the token cap of its parent. | The call cap is the ceiling or what the parent has left, whichever is lower. With none left, no child starts. |
 | A draw sends what the parent read past a flow rule. | The sweep input carries the labels of the parent, and each draw starts with them. |
+| A read-only parent writes through a draw. | The sweep input carries `read_only` and `allowed_effects`, and each draw keeps only what the parent and the policy both allow. |
+| An answer hides the taint of what its item read. | Each row keeps the labels of its draws, and the parent takes them. |
 | A call asks for 1000 items. | `max_items` bounds a call. A wider call gets an error result, and no child starts. |
 | An item text passes the item cap. | The plan checks `MAX_SWEEP_ITEM_BYTES` and refuses the call. |
 | The whole input passes the child input cap. | The plan checks the activity input cap and refuses the call. |
@@ -125,4 +127,6 @@ noted.
 | A policy refusal leaves the run going | `a_policy_refusal_gives_an_error_result_and_the_run_goes_on` |
 | The parent cap bounds each sweep | `a_sweep_takes_at_most_what_the_parent_has_left`, `a_parent_with_no_token_left_starts_no_sweep` |
 | Each draw starts with the labels of the parent | `each_item_starts_with_the_labels_of_the_parent` |
+| A read-only parent gives read-only draws | `a_read_only_parent_gives_read_only_draws` |
+| The labels of an item join the parent | `the_labels_that_an_item_exercised_join_the_parent` |
 | The history replays | `the_parent_history_replays_clean` |

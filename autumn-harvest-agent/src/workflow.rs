@@ -2619,6 +2619,13 @@ async fn sweep(
     // Each draw starts with the labels of the parent, as a delegated child
     // does. So a flow rule in a draw sees what the parent read.
     planned.input.flow_labels.clone_from(&tree.exercised);
+    // A draw never runs a wider effect than the parent, as a delegated
+    // child never does.
+    planned.input.read_only = task.read_only;
+    planned
+        .input
+        .allowed_effects
+        .clone_from(&task.allowed_effects);
     if crate::bounds::exceeds_activity_input(&planned.input) {
         return Ok(ToolOutcome::error(
             "the sweep items are too large for one call; split the list",
@@ -2646,6 +2653,11 @@ async fn sweep(
             return Ok(ToolOutcome::error(&format!("the sweep failed: {error}")));
         }
     };
+    // The labels that the items exercised join the run, as the labels of a
+    // delegated child do.
+    for row in &report.rows {
+        tree.exercised.extend(row.flow_labels.iter().cloned());
+    }
     progress.usage = progress.usage.saturating_add(report.totals.usage);
     progress.add_cost(report.totals.cost_usd_micros);
     let result = sweep_tool::result_of(&planned.labels, &report, ceiling);

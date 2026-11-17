@@ -368,3 +368,70 @@ async fn each_item_starts_with_the_labels_of_the_parent() {
         assert_eq!(item["flow_labels"], json!(["private_data"]), "{item}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_parent_gives_read_only_draws() {
+    let model = model(three_items());
+    let mut parent = task(Some(setting(1_000)));
+    parent.read_only = true;
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, harness(Arc::clone(&model)));
+    let exec = sqlite::start(&mut rt, &parent).unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(ended.stop, AgentStop::Completed);
+
+    let sweeps = child_inputs(&rt, exec, "agent_sweep");
+    let (sweep_id, input) = &sweeps[0];
+    assert_eq!(input["read_only"], json!(true));
+    for (_, item) in child_inputs(&rt, *sweep_id, "agent_sample") {
+        assert_eq!(item["read_only"], json!(true), "{item}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_labels_that_an_item_exercised_join_the_parent() {
+    use autumn_harvest_agent::{FlowRules, FnTool, Rule, ToolEffect};
+
+    // Each item reads a labelled tool before it answers. The setting adds
+    // no label, so the label can come only from the items.
+    let arguments = three_items();
+    let model = TryFnModel::new(move |request: &ChatRequest| {
+        if offers_sweep(request) {
+            if has_tool_result(request) {
+                return answer("done", 3);
+            }
+            return calls(&[("c1", SWEEP_TOOL, arguments.clone())], 3);
+        }
+        if has_tool_result(request) {
+            return answer("read it", ITEM_TOKENS);
+        }
+        calls(&[("s1", "secret", json!({}))], ITEM_TOKENS)
+    });
+    let secret = FnTool::new(
+        "secret",
+        "Read a secret.",
+        json!({"type": "object"}),
+        |_| async { Ok(json!("s")) },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .label("private_data")
+    .shared();
+    // Labels are recorded only under flow rules.
+    let rules = FlowRules::new().forbid(
+        ["private_data", "effect:external"],
+        Rule::Deny("no send after a secret".into()),
+    );
+    let harness = harness(Arc::clone(&model)).tool(secret).flow_rules(rules);
+    let scorer = autumn_harvest_agent::sampling::ScorerRef::deterministic(Answered::ID).unwrap();
+    let plain = SweepTool::new(KIND, NonZeroU32::new(1_000).unwrap(), scorer);
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &task(Some(plain))).unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(ended.stop, AgentStop::Completed);
+    assert!(
+        ended.flow_labels.contains("private_data"),
+        "{:?}",
+        ended.flow_labels
+    );
+}

@@ -3947,8 +3947,14 @@ let profile = AgentProfile::new("assistant").sweep(sweep);
 - Each draw starts with the flow labels of the parent, as a delegated
   child does (`SweepInput::flow_labels`, then `SampleInput::flow_labels`).
   So a flow rule in a draw sees what the parent read.
-- The result adds `flow_labels` of the setting to the run, so a rule sees
-  that the run read outside text.
+- Each draw keeps the effects of the parent. A read-only parent gives
+  read-only draws, and each draw keeps only the effects that the parent
+  and the policy both allow (`read_only` and `allowed_effects` on the
+  sweep input and the sample input).
+- The labels that the draws of an item exercised come back in
+  `SweepRow::flow_labels`, and they join the run.
+- The result also adds `flow_labels` of the setting to the run, so a rule
+  sees that the run read outside text.
 - A draw and a delegated child never get the tool, so a sweep never
   nests. A call in a probe gets an error result.
 - `Answered` accepts each completed run with a non-empty answer. It fits
