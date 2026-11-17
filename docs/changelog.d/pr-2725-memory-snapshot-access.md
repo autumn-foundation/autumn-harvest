@@ -1,4 +1,4 @@
-## Memory snapshot head follows the `memory` tool
+## Memory snapshot head follows the `memory` tool (PR #2725)
 
 The memory snapshot told every run to "Edit them with the `memory` tool".
 A run without that tool read the same sentence: a heartbeat tick or a
