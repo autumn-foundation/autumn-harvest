@@ -2292,8 +2292,8 @@ fn coder(
   deletes leaves the workspace. So a file that the run moves joins only
   when the run names its new path. The tool-call activity
   saves a changed workspace after a call that succeeds, and returns the new
-  reference with the result. A read-only run reads the files, but its
-  changes are not saved.
+  reference with the result. A read-only run reads the files. A call
+  that changes them returns an error, and the head stays.
 - **Run again on a store failure.** The tool-call activity runs once. A
   workspace store that times out or fails with a retryable error is the one
   exception: the workflow runs the call again from the same head, up to
