@@ -325,3 +325,46 @@ async fn a_parent_with_no_token_left_starts_no_sweep() {
     let _ = rt.run_until_blocked(exec).await.unwrap();
     assert_eq!(item_requests(&model), 0, "no item ran");
 }
+
+/// The inputs of each child that `exec` started under `workflow`.
+fn child_inputs(
+    rt: &autumn_harvest_sqlite::SqliteRuntime,
+    exec: autumn_harvest_sqlite::ExecutionId,
+    workflow: &str,
+) -> Vec<(autumn_harvest_sqlite::ExecutionId, Value)> {
+    use autumn_harvest::event::WorkflowEvent;
+    rt.load_history(exec)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name,
+                input,
+            } if workflow_name == workflow => Some((child_id, input)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_item_starts_with_the_labels_of_the_parent() {
+    let model = model(three_items());
+    let mut parent = task(Some(setting(1_000)));
+    parent.flow_labels.insert("private_data".to_owned());
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, harness(Arc::clone(&model)));
+    let exec = sqlite::start(&mut rt, &parent).unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(ended.stop, AgentStop::Completed);
+
+    let sweeps = child_inputs(&rt, exec, "agent_sweep");
+    assert_eq!(sweeps.len(), 1);
+    let (sweep_id, input) = &sweeps[0];
+    assert_eq!(input["flow_labels"], json!(["private_data"]));
+    let items = child_inputs(&rt, *sweep_id, "agent_sample");
+    assert_eq!(items.len(), 3);
+    for (_, item) in &items {
+        assert_eq!(item["flow_labels"], json!(["private_data"]), "{item}");
+    }
+}

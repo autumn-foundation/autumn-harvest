@@ -2616,6 +2616,9 @@ async fn sweep(
         return Ok(ToolOutcome::error("the run has no token left for a sweep"));
     }
     planned.input.max_total_tokens = Some(ceiling);
+    // Each draw starts with the labels of the parent, as a delegated child
+    // does. So a flow rule in a draw sees what the parent read.
+    planned.input.flow_labels.clone_from(&tree.exercised);
     if crate::bounds::exceeds_activity_input(&planned.input) {
         return Ok(ToolOutcome::error(
             "the sweep items are too large for one call; split the list",

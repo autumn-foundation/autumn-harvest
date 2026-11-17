@@ -3944,6 +3944,9 @@ let profile = AgentProfile::new("assistant").sweep(sweep);
 - The parent counts the usage and the cost of the sweep tree in its own
   report. A sweep that fails in the engine gives an error result. Its spend
   is in the ledger only.
+- Each draw starts with the flow labels of the parent, as a delegated
+  child does (`SweepInput::flow_labels`, then `SampleInput::flow_labels`).
+  So a flow rule in a draw sees what the parent read.
 - The result adds `flow_labels` of the setting to the run, so a rule sees
   that the run read outside text.
 - A draw and a delegated child never get the tool, so a sweep never

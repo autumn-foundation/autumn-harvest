@@ -179,6 +179,10 @@ pub struct SweepInput {
     /// The token budget of the whole sweep tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
+    /// The flow labels that the caller has exercised (issue #2716). Each
+    /// item passes them to its draws.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub flow_labels: std::collections::BTreeSet<String>,
 }
 
 impl SweepInput {
@@ -197,6 +201,7 @@ impl SweepInput {
             scorer,
             concurrency: None,
             max_total_tokens: None,
+            flow_labels: std::collections::BTreeSet::new(),
         }
     }
 
@@ -511,6 +516,7 @@ fn item_input(input: &SweepInput, item: &SweepItem, draws: u32) -> SampleInput {
     .concurrency(draws);
     sample.expected.clone_from(&item.expected);
     sample.brief = true;
+    sample.flow_labels.clone_from(&input.flow_labels);
     sample
 }
 

@@ -327,6 +327,10 @@ pub struct SampleInput {
     /// sets it, so each child result in its history stays short.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub brief: bool,
+    /// The flow labels that the caller has exercised (issue #2716). Each
+    /// draw starts with them, so a flow rule sees the taint of the caller.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 impl SampleInput {
@@ -347,6 +351,7 @@ impl SampleInput {
             max_total_tokens: None,
             expected: None,
             brief: false,
+            flow_labels: BTreeSet::new(),
         }
     }
 
@@ -363,6 +368,7 @@ impl SampleInput {
             max_total_tokens: None,
             expected: None,
             brief: false,
+            flow_labels: BTreeSet::new(),
         }
     }
 
@@ -625,6 +631,7 @@ pub async fn agent_sample(
     };
     let mut task = profile_task(&profile, &input.input);
     task.max_total_tokens = tree_budget(task.max_total_tokens, input.max_total_tokens);
+    task.flow_labels.extend(input.flow_labels);
     let sample = OpSample {
         strategy: input.strategy,
         scorer: input.scorer,
