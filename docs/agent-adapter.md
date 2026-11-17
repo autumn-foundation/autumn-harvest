@@ -2119,7 +2119,8 @@ fn support(
   mandate forbids disables the pass. It checks the LLM budget and the
   budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
-  `<subject> <relation> <object> [episodes: <id>, ...]`.
+  `<subject> <relation> <object> [episodes: <id>, ...]`. The engine sets
+  no output cap. `EpisodeSettings::max_output_tokens` sets one (issue #2696).
 - **Labels.** A fact takes the labels of every episode of its pass. A
   memory store that cannot keep labels refuses a labelled fact, and the
   report counts it under `facts_refused`. The sources of a refused fact

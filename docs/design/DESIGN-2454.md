@@ -95,6 +95,7 @@ pub struct EpisodeSettings {
     pub model: Option<String>,      // a harness model name
     pub facts_block: String,        // default "memory"
     pub max_pass_episodes: u32,     // default 20
+    pub max_output_tokens: Option<u32>, // default None, no cap
 }
 
 pub enum ConsolidationTrigger {

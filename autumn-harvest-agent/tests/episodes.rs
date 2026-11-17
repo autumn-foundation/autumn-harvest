@@ -596,6 +596,29 @@ async fn a_capped_reply_that_parses_completes_the_pass() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pass_sets_the_configured_output_cap_and_no_default() {
+    for (settings, want) in [
+        (EpisodeSettings::default(), None),
+        (EpisodeSettings::default().max_output_tokens(512), Some(512)),
+    ] {
+        let (_dir, db) = fresh_db();
+        let episodes = Arc::new(InMemoryEpisodeStore::default());
+        seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+        let model = model(two_facts);
+        let harness = AgentHarness::new(model.clone())
+            .memory(Arc::new(InMemoryMemoryStore::new()))
+            .episodes(episodes)
+            .agent(profile(Some(settings)));
+        let mut rt = runtime(&db, harness);
+        let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        let pass: Vec<_> = model.requests().into_iter().filter(is_pass).collect();
+        assert_eq!(pass.len(), 1);
+        assert_eq!(pass[0].max_tokens, want);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pass_with_no_episodes_calls_no_model() {
     let (_dir, db) = fresh_db();
     let model = model(two_facts);

@@ -132,6 +132,9 @@ pub struct EpisodeSettings {
     pub facts_block: String,
     /// The most episodes that one pass reads, oldest first. 0 counts as 1.
     pub max_pass_episodes: u32,
+    /// The output cap of the model call of a pass. `None` sets no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl Default for EpisodeSettings {
@@ -143,6 +146,7 @@ impl Default for EpisodeSettings {
             model: None,
             facts_block: DEFAULT_FACTS_BLOCK.to_owned(),
             max_pass_episodes: DEFAULT_MAX_PASS_EPISODES,
+            max_output_tokens: None,
         }
     }
 }
@@ -166,6 +170,14 @@ impl EpisodeSettings {
     #[must_use]
     pub fn model(mut self, name: impl Into<String>) -> Self {
         self.model = Some(name.into());
+        self
+    }
+
+    /// Cap the output of each pass model call at `tokens`. A pass sets no cap
+    /// by default.
+    #[must_use]
+    pub const fn max_output_tokens(mut self, tokens: u32) -> Self {
+        self.max_output_tokens = Some(tokens);
         self
     }
 
