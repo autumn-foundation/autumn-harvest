@@ -773,6 +773,10 @@ pub struct AgentProfile {
     /// [`context_reset`](crate::context_reset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_reset: Option<ContextReset>,
+    /// The sweep tool setting of each op (issue #2716). See
+    /// [`sweep_tool`](crate::sweep_tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<Box<crate::sweep_tool::SweepTool>>,
     /// The text that replaces the description of each named tool (issue
     /// #2373). See [`AgentTask::tool_guidance`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -828,6 +832,7 @@ impl AgentProfile {
             stream: false,
             workspace: false,
             context_reset: None,
+            sweep: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
             episodes: None,
@@ -847,6 +852,14 @@ impl AgentProfile {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Let the agents of the kind sweep a list of sources with the `sweep`
+    /// tool. Each call spends at most the ceiling of `setting`.
+    #[must_use]
+    pub fn sweep(mut self, setting: crate::sweep_tool::SweepTool) -> Self {
+        self.sweep = Some(Box::new(setting));
         self
     }
 
@@ -1039,6 +1052,7 @@ impl AgentProfile {
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
         task.context_reset = self.context_reset;
+        task.sweep.clone_from(&self.sweep);
         task.tool_guidance.clone_from(&self.tool_guidance);
         task.skills.clone_from(&self.skills);
         if self.workspace {

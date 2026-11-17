@@ -279,6 +279,10 @@ name = "sweep"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sweep_tool"
+required-features = ["sqlite"]
+
+[[test]]
 name = "sweep_crash"
 required-features = ["sqlite"]
 

@@ -179,6 +179,18 @@ pub struct SweepInput {
     /// The token budget of the whole sweep tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
+    /// The flow labels that the caller has exercised (issue #2716). Each
+    /// item passes them to its draws.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub flow_labels: std::collections::BTreeSet<String>,
+    /// The caller is read-only (issue #2716). Each item passes it to its
+    /// draws.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub read_only: bool,
+    /// The tool effects of the caller (issue #2716). Each item passes them
+    /// to its draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<std::collections::BTreeSet<crate::tool::ToolEffect>>,
 }
 
 impl SweepInput {
@@ -197,6 +209,9 @@ impl SweepInput {
             scorer,
             concurrency: None,
             max_total_tokens: None,
+            flow_labels: std::collections::BTreeSet::new(),
+            read_only: false,
+            allowed_effects: None,
         }
     }
 
@@ -269,6 +284,10 @@ pub struct SweepRow {
     /// child. `None` is the bare profile, or no child report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_version: Option<OverlayVersion>,
+    /// The flow labels that the draws of the item exercised (issue #2716).
+    /// A caller takes them, so the taint of an answer follows it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub flow_labels: std::collections::BTreeSet<String>,
 }
 
 impl SweepRow {
@@ -286,6 +305,7 @@ impl SweepRow {
             error: None,
             revision: None,
             overlay_version: None,
+            flow_labels: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -511,6 +531,9 @@ fn item_input(input: &SweepInput, item: &SweepItem, draws: u32) -> SampleInput {
     .concurrency(draws);
     sample.expected.clone_from(&item.expected);
     sample.brief = true;
+    sample.flow_labels.clone_from(&input.flow_labels);
+    sample.read_only = input.read_only;
+    sample.allowed_effects.clone_from(&input.allowed_effects);
     sample
 }
 
@@ -663,6 +686,7 @@ fn row_of(item: u32, result: Result<Value, String>) -> (SweepRow, bool) {
         let row = SweepRow {
             revision: Some(report.revision),
             overlay_version: report.overlay_version,
+            flow_labels: report.flow_labels,
             ..SweepRow::not_run(item)
         };
         return (row, true);
@@ -686,6 +710,7 @@ fn row_of(item: u32, result: Result<Value, String>) -> (SweepRow, bool) {
         error: None,
         revision: Some(report.revision),
         overlay_version: report.overlay_version,
+        flow_labels: report.flow_labels.clone(),
     };
     (row, report.refused)
 }

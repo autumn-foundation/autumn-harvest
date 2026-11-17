@@ -298,6 +298,8 @@ pub(super) fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -
         memory_in_state: false,
         parallel_children: 0,
         context_reset,
+        // A draw never starts a sweep, so a sweep never nests (issue #2716).
+        sweep: None,
         ..task.clone()
     }
 }
