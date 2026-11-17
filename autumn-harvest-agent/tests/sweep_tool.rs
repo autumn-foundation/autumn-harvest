@@ -298,3 +298,30 @@ async fn the_parent_history_replays_clean() {
         "{replay}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_takes_at_most_what_the_parent_has_left() {
+    // The parent cap is 13. Its first turn spends 3, so the sweep gets 10
+    // and not the ceiling of 1000.
+    let model = model(three_items());
+    let parent = task(Some(setting(1_000).concurrency(1))).max_total_tokens(13);
+    let (_, results) = run(&model, &parent).await;
+    let result: SweepToolResult = serde_json::from_value(results[0].clone()).unwrap();
+    assert_eq!(
+        result.spent.ceiling, 10,
+        "the ceiling is what the parent has left"
+    );
+    assert_eq!(result.items[2].status, SweepItemStatus::NotRun);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_with_no_token_left_starts_no_sweep() {
+    // The first turn spends the whole parent cap of 3.
+    let model = model(three_items());
+    let parent = task(Some(setting(1_000))).max_total_tokens(3);
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, harness(Arc::clone(&model)));
+    let exec = sqlite::start(&mut rt, &parent).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    assert_eq!(item_requests(&model), 0, "no item ran");
+}

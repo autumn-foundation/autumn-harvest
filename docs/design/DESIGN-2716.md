@@ -46,6 +46,7 @@ rule.
 |---|---|
 | A call goes out with no token cap. | The setting has no default ceiling, and the field is not optional. Each call sets `max_total_tokens`. |
 | The model widens the ceiling or the kind. | The call arguments deny unknown keys. Only the instruction and the items come from the call. |
+| A sweep passes the token cap of its parent. | The call cap is the ceiling or what the parent has left, whichever is lower. With none left, no child starts. |
 | A call asks for 1000 items. | `max_items` bounds a call. A wider call gets an error result, and no child starts. |
 | An item text passes the item cap. | The plan checks `MAX_SWEEP_ITEM_BYTES` and refuses the call. |
 | The whole input passes the child input cap. | The plan checks the activity input cap and refuses the call. |
@@ -121,4 +122,5 @@ noted.
 | No setting, no tool | `a_run_without_the_setting_does_not_offer_the_tool` |
 | An item never sweeps again | `an_item_run_never_offers_the_tool` |
 | A policy refusal leaves the run going | `a_policy_refusal_gives_an_error_result_and_the_run_goes_on` |
+| The parent cap bounds each sweep | `a_sweep_takes_at_most_what_the_parent_has_left`, `a_parent_with_no_token_left_starts_no_sweep` |
 | The history replays | `the_parent_history_replays_clean` |

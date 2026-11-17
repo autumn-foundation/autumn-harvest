@@ -239,6 +239,21 @@ pub(crate) fn plan(arguments: &serde_json::Value, settings: &SweepTool) -> Resul
     Ok(Planned { labels, input })
 }
 
+/// The token cap of one call: the ceiling of `settings`, or the tokens
+/// that the parent has left under `parent_cap` after `spent`, whichever is
+/// lower.
+#[must_use]
+pub const fn ceiling(settings: &SweepTool, parent_cap: Option<u32>, spent: u32) -> u32 {
+    let own = settings.max_total_tokens.get();
+    match parent_cap {
+        Some(cap) => {
+            let left = cap.saturating_sub(spent);
+            if left < own { left } else { own }
+        }
+        None => own,
+    }
+}
+
 /// The row of one item that the model reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SweepToolRow {
@@ -377,6 +392,15 @@ mod tests {
             "max_total_tokens": 9_999_999
         });
         assert!(plan(&widened, &settings()).is_err());
+    }
+
+    #[test]
+    fn the_ceiling_never_passes_what_the_parent_has_left() {
+        let settings = settings();
+        assert_eq!(ceiling(&settings, None, 500), 1_000);
+        assert_eq!(ceiling(&settings, Some(5_000), 500), 1_000);
+        assert_eq!(ceiling(&settings, Some(800), 500), 300);
+        assert_eq!(ceiling(&settings, Some(400), 500), 0);
     }
 
     #[test]

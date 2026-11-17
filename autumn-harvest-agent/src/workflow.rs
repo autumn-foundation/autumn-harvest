@@ -2604,10 +2604,18 @@ async fn sweep(
             "sweep does not run in a probe or a draw",
         ));
     }
-    let planned = match sweep_tool::plan(&call.arguments, settings) {
+    let mut planned = match sweep_tool::plan(&call.arguments, settings) {
         Ok(planned) => planned,
         Err(reason) => return Ok(ToolOutcome::error(&reason)),
     };
+    // The sweep takes at most the tokens that the parent has left, as a
+    // delegated child does. A zero cap would still let an item make one
+    // model call, so it starts no child.
+    let ceiling = sweep_tool::ceiling(settings, task.max_total_tokens, progress.usage.total());
+    if ceiling == 0 {
+        return Ok(ToolOutcome::error("the run has no token left for a sweep"));
+    }
+    planned.input.max_total_tokens = Some(ceiling);
     if crate::bounds::exceeds_activity_input(&planned.input) {
         return Ok(ToolOutcome::error(
             "the sweep items are too large for one call; split the list",
@@ -2637,7 +2645,7 @@ async fn sweep(
     };
     progress.usage = progress.usage.saturating_add(report.totals.usage);
     progress.add_cost(report.totals.cost_usd_micros);
-    let result = sweep_tool::result_of(&planned.labels, &report, settings.max_total_tokens.get());
+    let result = sweep_tool::result_of(&planned.labels, &report, ceiling);
     let content = serde_json::to_string(&result).map_err(|err| err.to_string())?;
     Ok(ToolOutcome::ok(content))
 }

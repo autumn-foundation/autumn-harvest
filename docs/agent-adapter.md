@@ -3931,7 +3931,9 @@ let profile = AgentProfile::new("assistant").sweep(sweep);
 - The workflow runs one `agent_sweep` child with a single draw for each
   item. No activity runs the call, so the tool timeout does not apply. A
   crash resumes the child.
-- Each call sets `max_total_tokens` to the ceiling of the setting. The call
+- Each call sets `max_total_tokens` to the ceiling of the setting, or to
+  the tokens that the parent has left under its own cap, whichever is
+  lower. With no token left, the call gets an error result. The call
   cannot change the kind, the ceiling, the scorer or the concurrency. A
   call with an unknown key, no item, a blank instruction or more items than
   `max_items` gets an error result, and no child starts.
