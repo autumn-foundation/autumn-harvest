@@ -7,7 +7,7 @@
 //! which activity to optimize first.
 
 use crate::dag::DagDefinition;
-use crate::dag_slack::DagSlackReport;
+use crate::dag_slack::{DagSlackReport, to_duration};
 use std::time::Duration;
 
 /// Effect of making one task instant.
@@ -108,14 +108,6 @@ impl<'a> DagLeverage<'a> {
         ranking.sort_by(|x, y| y.saved.cmp(&x.saved).then(x.index.cmp(&y.index)));
         ranking
     }
-}
-
-/// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
-fn to_duration(nanos: u128) -> Duration {
-    u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
-        // The remainder is below 1e9, so it fits in `u32`.
-        Duration::new(secs, (nanos % 1_000_000_000) as u32)
-    })
 }
 
 #[cfg(test)]
