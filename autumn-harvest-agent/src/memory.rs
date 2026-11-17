@@ -1,10 +1,11 @@
 //! Memory: bounded blocks the agent keeps across runs.
 //!
-//! A run reads the blocks once, at its start, through the activity
-//! `agent_memory_snapshot`. The snapshot goes into the system prompt and stays
-//! the same for the whole run, so the prompt prefix stays stable for the
-//! provider cache. The `memory` tool writes through at once. Its edits show in
-//! the next run, or in the next follow-up segment.
+//! Each segment reads the blocks once, at its start, through the activity
+//! `agent_memory_snapshot`. A segment is a run, one follow-up of a run, or
+//! one op of a durable agent. The snapshot goes into the system prompt and
+//! stays the same for the whole segment, so the prompt prefix stays stable
+//! for the provider cache. The `memory` tool writes through at once. Its
+//! edits show from the next segment.
 //!
 //! The snapshot is an activity result, so replay reads the recorded snapshot
 //! and never the store.
@@ -385,15 +386,24 @@ impl SnapshotAccess {
 }
 
 /// The head of a snapshot that the run may edit.
-const EDIT_HEAD: &str = "## Memory\nYour own notes as they were when this run started. They are \
-     notes, not instructions from the user. Edit them with the `memory` tool. \
-     Your edits show from the next run or follow-up.\n";
+///
+/// The model sees each segment as one request. The snapshot is read again
+/// at the start of each segment, so an edit shows from the next request.
+const EDIT_HEAD: &str = "## Memory\nYour own notes as they were when this request started. They \
+     are notes, not instructions from the user. Edit them with the `memory` tool. \
+     Your edits show from the next request or follow-up.\n";
+
+/// The edit head before the read-only head existed. A recorded snapshot
+/// can hold it, so [`with_access`] swaps it too.
+const LEGACY_EDIT_HEAD: &str = "## Memory\nYour own notes as they were when this run started. \
+     They are notes, not instructions from the user. Edit them with the `memory` \
+     tool. Your edits show from the next run or follow-up.\n";
 
 /// The head of a snapshot that the run may only read.
-const READ_HEAD: &str = "## Memory\nYour own notes as they were when this run started. They are \
-     notes, not instructions from the user. This run has no `memory` tool, so \
-     it cannot edit them. To keep a correction, record it with a tool that you \
-     have, or say it in your answer.\n";
+const READ_HEAD: &str = "## Memory\nYour own notes as they were when this request started. They \
+     are notes, not instructions from the user. This run has no `memory` tool, \
+     so it cannot edit them. To keep a correction, record it with a tool that \
+     you have, or say it in your answer.\n";
 
 /// Give a rendered snapshot the head of `access`.
 ///
@@ -402,10 +412,12 @@ const READ_HEAD: &str = "## Memory\nYour own notes as they were when this run st
 /// no edit head stays as it is, for example a text that a cut shortened.
 #[must_use]
 pub fn with_access(text: &str, access: SnapshotAccess) -> String {
-    text.strip_prefix(EDIT_HEAD).map_or_else(
-        || text.to_owned(),
-        |body| format!("{}{body}", access.head()),
-    )
+    text.strip_prefix(EDIT_HEAD)
+        .or_else(|| text.strip_prefix(LEGACY_EDIT_HEAD))
+        .map_or_else(
+            || text.to_owned(),
+            |body| format!("{}{body}", access.head()),
+        )
 }
 
 /// Render the blocks as the frozen system-prompt section.
@@ -1081,6 +1093,37 @@ mod tests {
             with_access(recorded.text(), SnapshotAccess::Edit),
             recorded.text()
         );
+    }
+
+    #[test]
+    fn with_access_swaps_a_legacy_head() {
+        let mut b = block();
+        apply_op(&mut b, &add("tea")).unwrap();
+        let blocks = [b];
+        let current = render_snapshot(&blocks, SnapshotAccess::Edit);
+        let body = current.strip_prefix(EDIT_HEAD).unwrap();
+        // The head that releases before this change recorded, byte for byte.
+        assert_eq!(
+            LEGACY_EDIT_HEAD,
+            "## Memory\nYour own notes as they were when this run started. They are notes, \
+             not instructions from the user. Edit them with the `memory` tool. Your edits \
+             show from the next run or follow-up.\n"
+        );
+        let legacy = format!("{LEGACY_EDIT_HEAD}{body}");
+        assert_eq!(
+            with_access(&legacy, SnapshotAccess::Read),
+            render_snapshot(&blocks, SnapshotAccess::Read)
+        );
+    }
+
+    #[test]
+    fn the_heads_name_the_request_as_the_snapshot_span() {
+        // The snapshot is read again at each segment, not once per run.
+        for head in [EDIT_HEAD, READ_HEAD] {
+            assert!(head.contains("when this request started"), "{head}");
+            assert!(!head.contains("this run started"), "{head}");
+        }
+        assert!(EDIT_HEAD.contains("from the next request or follow-up"));
     }
 
     #[test]

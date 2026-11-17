@@ -10,9 +10,15 @@ its tool list.
   head. `Read` says that the run has no `memory` tool and cannot edit the
   notes, and that it records a correction with another tool or in its
   answer.
+- Both heads now say "when this request started" and "from the next
+  request or follow-up". The snapshot is read again at the start of each
+  segment: a run, a follow-up, or one op of a durable agent. The old head
+  said "run", which was wrong for a durable agent. The module doc of
+  `memory.rs` says the same.
 - The snapshot activity `agent_memory_snapshot` still records the edit
   head, so its output does not change. A run without the tool swaps the
-  head with `memory::with_access`.
+  head with `memory::with_access`, which also swaps the old edit head of a
+  snapshot recorded before this change.
 - State memory (`AgentMemory::State`) renders the head of
   `AgentTask::memory_writable`. A draw always renders the read-only head.
 - **Breaking:** `render_snapshot` takes a second argument. Pass
