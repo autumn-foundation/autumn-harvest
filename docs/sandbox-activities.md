@@ -177,18 +177,72 @@ The process executor gives each run:
 - uid and gid `65534` when the worker runs as root. The executor refuses
   uid 0 and gid 0 for the code. It also refuses `u32::MAX`, which is
   `(uid_t)-1` and which `setuid` and `setgid` refuse. The launcher refuses
-  the same ids for the jail, and for `harvest.uid` and `harvest.gid`.
+  the same ids for the jail, and for `harvest.uid` and `harvest.gid`;
+- with `ExecOptions::fs`, a private file system (issue #2697). See below.
 
 The process backend has these limits. Inside a microVM, none of them
 matters, because the microVM ends after one run.
 
-- It has no seccomp filter, no mount namespace and no cgroup.
+- It has no seccomp filter. It has no mount namespace unless you set
+  `ExecOptions::fs`. It has no cgroup unless you set
+  `ExecOptions::cgroup_root`.
 - Without `ExecOptions::cgroup_root`, a process that calls `setsid` leaves
   the group, and the executor cannot kill it.
-- The code can write wherever its uid can write, such as `/tmp`. The
-  executor removes only the work directory, also when the code moves it.
+- With `FsIsolation::Shared`, the default, the code sees the whole file
+  system of the worker. It can write wherever its uid can write, such as
+  `/tmp`. The executor removes only the work directory, also when the code
+  moves it. Set `ExecOptions::fs` to change that.
 - On a root host, concurrent runs share the uid `nobody`, unless `run_as`
   names another uid. A non-root worker refuses `run_as`.
+
+### A private file system
+
+With the default `FsIsolation::Shared`, the code runs with the uid of the
+worker. It can read the databases of the app, write its config, and connect
+to each Unix socket that the app serves. `NetworkPolicy::Deny` does not stop
+a socket on the file system. Set `ExecOptions::fs` to close that:
+
+```rust,ignore
+use autumn_harvest::sandbox::exec::ExecOptions;
+use autumn_harvest::sandbox::fs_isolation::FsIsolation;
+use autumn_harvest::sandbox::process::ProcessBackend;
+
+let backend = ProcessBackend::new(ExecOptions {
+    fs: FsIsolation::pivot(),
+    ..ExecOptions::default()
+});
+```
+
+| Setting | The code sees | Use it when |
+|---|---|---|
+| `Shared` | The file system of the worker | Never for code that you do not trust |
+| `Mask(paths)` | The file system of the worker, minus `paths` | You know each path that holds secrets |
+| `Pivot { read_only }` | A new root: `read_only`, the work directory, a private `/tmp`, and some device nodes | You want a closed default |
+
+- **`Pivot`** fails closed. A path that nobody names stays hidden, and so
+  do the other runs in the scratch root. `FsIsolation::pivot()` lists
+  `PIVOT_READ_ONLY`: `/usr`, the library directories, and a few files of
+  `/etc`. It mounts no `/proc`. The code cannot write a `read_only` path.
+  A runtime in another directory, such as `/opt/node`, needs that directory
+  in `read_only`. A path that does not exist is skipped.
+- **`Mask`** fails open. A directory shows empty. A file, or a socket,
+  reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
+  a second path still reaches the data. It does not hide the other runs in
+  the scratch root, and it does not hide `/proc`. Each path must be
+  absolute and must exist. It must not hold `..` or cover the work
+  directory. Otherwise the run is refused with a config error.
+- Both settings need a mount namespace. A non-root worker enters it through
+  its user namespace. When the host refuses, the run fails closed with
+  `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
+  probes the host, as `network_isolation_available()` does for the network.
+  The probe tries the mount namespace only, so a `Pivot` run can still fail
+  closed.
+- Under `Pivot`, the code writes only the work directory and `/tmp`.
+- Neither setting hides abstract Unix sockets of the worker network
+  namespace when the policy allows the network. Deny the network to close
+  them.
+- `SandboxPolicy::for_development` does not set `ExecOptions::fs`. Set it
+  on the options of the backend.
 
 The process backend is the only backend that can give code a network. A
 runtime refuses a policy that allows the network on a backend without one.
