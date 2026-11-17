@@ -105,6 +105,13 @@ impl SweepTool {
         self
     }
 
+    /// The most items at the same time that the setting asks for. `None`
+    /// takes the cap of the policy, and the policy admits the ask.
+    #[must_use]
+    pub const fn item_concurrency(&self) -> Option<NonZeroU32> {
+        self.concurrency
+    }
+
     /// The item bound of one call.
     #[must_use]
     pub const fn item_bound(&self) -> u32 {
@@ -235,7 +242,7 @@ pub(crate) fn plan(arguments: &serde_json::Value, settings: &SweepTool) -> Resul
         settings.scorer.clone(),
     )
     .max_total_tokens(settings.max_total_tokens.get());
-    input.concurrency = settings.concurrency;
+    input.concurrency = settings.item_concurrency();
     Ok(Planned { labels, input })
 }
 
