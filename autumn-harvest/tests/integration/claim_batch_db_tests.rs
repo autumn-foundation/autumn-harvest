@@ -318,3 +318,207 @@ async fn concurrent_batches_take_each_row_exactly_once() {
         "every plain row and three keyed rows, the cap"
     );
 }
+
+/// A run whose deadline passes during the claim stops its own row only.
+///
+/// The first row spends a token from a bucket that a peer holds locked, so
+/// the claim reads its clock after the run deadline. The rows behind it have
+/// no run, and the claim still takes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_expires_during_the_claim_stops_only_its_own_row() {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_queue("batch-expiry");
+    let bucket = unique_queue("batch-expiry-bucket");
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket, 0.0, 1.0)
+        .await
+        .expect("bucket");
+
+    let run = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, input, state, deadline_at) \
+         VALUES ($1, 'batch-expiry', $2, 0, '{}'::jsonb, 'RUNNING', \
+                 NOW() + INTERVAL '2 seconds')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(run)
+    .bind::<diesel::sql_types::Text, _>(run.to_string())
+    .execute(&mut conn)
+    .await
+    .expect("insert run");
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(run);
+    params.activity_name = Some("noop".to_owned());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket.clone());
+    params.priority = 9;
+    let expiring = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    for priority in [3, 2, 1] {
+        enqueue(&mut conn, &queue, &plain(priority)).await;
+    }
+
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("begin holder");
+    diesel::sql_query("SELECT 1 FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Text, _>(&bucket)
+        .execute(&mut holder)
+        .await
+        .expect("hold the bucket lock");
+
+    let claim_url = url.clone();
+    let claim_queue = queue.clone();
+    let claimer = tokio::spawn(async move {
+        let mut claim_conn = connect(&claim_url).await;
+        claim(
+            &mut claim_conn,
+            &claim_queue,
+            "w-expiry",
+            None,
+            ClaimBatch::Four,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(!claimer.is_finished(), "the claim waits on the bucket lock");
+    holder.batch_execute("COMMIT").await.expect("release");
+
+    let taken = claimer.await.expect("claimer");
+    assert_eq!(
+        priorities(&taken),
+        [3, 2, 1],
+        "the other runs keep their rows"
+    );
+    assert!(taken.iter().all(|row| row.0 != expiring));
+
+    let row: State =
+        diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(expiring)
+            .get_result(&mut conn)
+            .await
+            .expect("expiring row");
+    assert_eq!((row.state.as_str(), row.attempt), ("PENDING", 0));
+    let tokens: Tokens =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket)
+            .get_result(&mut conn)
+            .await
+            .expect("bucket row");
+    assert!(
+        (tokens.tokens - 1.0).abs() < f64::EPSILON,
+        "the expired row spends no token"
+    );
+}
+
+/// One claim transaction, as a worker sends it, with the batch text run by
+/// hand so the test can read the locks before the commit.
+///
+/// `NOW()` stays at the transaction start, so the statement-start gate sees
+/// each run as live. The clock read after the bucket locks sees the runs that
+/// the sleep expired. Row 1 carries a capped concurrency key of an expiring
+/// run. Row 3 has no key and no bucket, so only the expiry check of
+/// `claimed` stops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_row_takes_no_key_lock_and_its_peers_still_claim() {
+    #[derive(diesel::QueryableByName)]
+    struct Claimed {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        id: Option<Uuid>,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_queue("batch-expiry-lock");
+    conn.batch_execute("BEGIN").await.expect("begin");
+
+    let run = |deadline: bool| {
+        let id = Uuid::new_v4();
+        let sql = format!(
+            "INSERT INTO harvest_workflow_executions \
+                 (id, workflow_name, workflow_id, shard_id, input, state, deadline_at) \
+             VALUES ($1, 'batch-expiry', $2, 0, '{{}}'::jsonb, 'RUNNING', {})",
+            if deadline {
+                "NOW() + INTERVAL '1 second'"
+            } else {
+                "NULL"
+            }
+        );
+        (id, sql)
+    };
+    let mut rows = Vec::new();
+    for (priority, deadline, key) in [
+        (9, true, true),
+        (5, false, false),
+        (4, true, false),
+        (3, false, false),
+    ] {
+        let (exec, sql) = run(deadline);
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Uuid, _>(exec)
+            .bind::<diesel::sql_types::Text, _>(exec.to_string())
+            .execute(&mut conn)
+            .await
+            .expect("insert run");
+        let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+        params.workflow_exec_id = Some(exec);
+        params.activity_name = Some("noop".to_owned());
+        params.activity_id = Some(Uuid::new_v4());
+        params.priority = priority;
+        if key {
+            params.concurrency_key = Some(format!("{queue}-k"));
+            params.max_concurrent = Some(1);
+        }
+        rows.push((
+            priority,
+            queue::enqueue(&mut conn, &params).await.expect("enqueue"),
+        ));
+    }
+    diesel::sql_query("SELECT pg_sleep(1.5)")
+        .execute(&mut conn)
+        .await
+        .expect("sleep");
+
+    let claimed: Vec<Claimed> =
+        diesel::sql_query(queue::batch_claim_query_for(None, false, ClaimBatch::Four))
+            .bind::<diesel::sql_types::Text, _>("w-expiry-lock")
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(vec![queue.clone()])
+            .bind::<diesel::sql_types::Text, _>("")
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(None::<i64>)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(Vec::<String>::new())
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(Vec::<String>::new())
+            .load(&mut conn)
+            .await
+            .expect("batch claim");
+    let taken: HashSet<Uuid> = claimed.into_iter().filter_map(|row| row.id).collect();
+    let expect: HashSet<Uuid> = rows
+        .iter()
+        .filter(|(priority, _)| *priority == 5 || *priority == 3)
+        .map(|(_, id)| *id)
+        .collect();
+    assert_eq!(taken, expect, "the rows of the expired runs stay PENDING");
+
+    let locks: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM pg_locks \
+         WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("locks");
+    assert_eq!(locks.n, 0, "a skipped row holds no concurrency-key lock");
+    conn.batch_execute("ROLLBACK").await.expect("rollback");
+}

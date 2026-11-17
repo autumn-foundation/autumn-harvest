@@ -64,7 +64,9 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::policy::ToolDecision;
+use crate::sampling::{MAX_SWEEP_REASON_BYTES, SWEEP_WORKFLOW_NAME, SweepReport};
 use crate::skill::{self, LOAD_SKILL_TOOL};
+use crate::sweep_tool::{self, SWEEP_TOOL, SweepTool};
 use crate::transcript::{PREFIX_MISSING, PrefixRef, Sent, TRANSCRIPT_DELTA_PATCH};
 use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
@@ -495,6 +497,7 @@ impl Run<'_> {
                     .as_ref()
                     .map(context_reset::definition),
             )
+            .chain(self.task.sweep.as_deref().map(sweep_tool::definition))
             .collect()
     }
 }
@@ -2253,6 +2256,11 @@ async fn run_tool(
     {
         return Ok(save_notes(&settings, progress, tree, &call));
     }
+    if let Some(settings) = task.sweep.as_deref().filter(|_| call.name == SWEEP_TOOL) {
+        // The sweep future holds a whole child result, so it goes on the
+        // heap. Each caller of the tool round keeps its size.
+        return Box::pin(sweep(ctx, task, progress, tree, settings, &call)).await;
+    }
     // State memory is edited in the workflow, so the edit commits with the
     // op (issue #2273).
     if call.name == MEMORY_TOOL
@@ -2573,6 +2581,88 @@ async fn delegate(
         is_error: stop != AgentStop::Completed,
         workspace: None,
     })
+}
+
+/// Run one `sweep` call as an `agent_sweep` child (issue #2716).
+///
+/// A refused call gets an error result, and no child starts. The parent
+/// counts the usage and the cost of the sweep tree, and takes the labels of
+/// the setting. A sweep that fails in the engine gives an error result, so
+/// the run goes on.
+async fn sweep(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    settings: &SweepTool,
+    call: &ToolCall,
+) -> Result<ToolOutcome, String> {
+    // A probe runs no child. A draw never gets the tool, so this is a second
+    // fence.
+    if task.probe.is_some() || task.draw.is_some() {
+        return Ok(ToolOutcome::error(
+            "sweep does not run in a probe or a draw",
+        ));
+    }
+    let mut planned = match sweep_tool::plan(&call.arguments, settings) {
+        Ok(planned) => planned,
+        Err(reason) => return Ok(ToolOutcome::error(&reason)),
+    };
+    // The sweep takes at most the tokens that the parent has left, as a
+    // delegated child does. A zero cap would still let an item make one
+    // model call, so it starts no child.
+    let ceiling = sweep_tool::ceiling(settings, task.max_total_tokens, progress.usage.total());
+    if ceiling == 0 {
+        return Ok(ToolOutcome::error("the run has no token left for a sweep"));
+    }
+    planned.input.max_total_tokens = Some(ceiling);
+    // Each draw starts with the labels of the parent, as a delegated child
+    // does. So a flow rule in a draw sees what the parent read.
+    planned.input.flow_labels.clone_from(&tree.exercised);
+    // A draw never runs a wider effect than the parent, as a delegated
+    // child never does.
+    planned.input.read_only = task.read_only;
+    planned
+        .input
+        .allowed_effects
+        .clone_from(&task.allowed_effects);
+    if crate::bounds::exceeds_activity_input(&planned.input) {
+        return Ok(ToolOutcome::error(
+            "the sweep items are too large for one call; split the list",
+        ));
+    }
+    let value = serde_json::to_value(&planned.input).map_err(|err| err.to_string())?;
+    let ended = ctx
+        .spawn_child_workflow_fan_out_collect_raw(vec![(SWEEP_WORKFLOW_NAME.to_owned(), value)])
+        .await
+        .map_err(|err| err.to_string())?;
+    // The labels apply once the child ran, whatever its end. An item can
+    // read outside text before a later item fails.
+    tree.exercised.extend(settings.flow_labels.iter().cloned());
+    let report = ended
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Err("the sweep returned no result".to_owned()))
+        .and_then(|value| {
+            serde_json::from_value::<SweepReport>(value).map_err(|err| err.to_string())
+        });
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            let error = crate::harness::truncate(&error, MAX_SWEEP_REASON_BYTES);
+            return Ok(ToolOutcome::error(&format!("the sweep failed: {error}")));
+        }
+    };
+    // The labels that the items exercised join the run, as the labels of a
+    // delegated child do.
+    for row in &report.rows {
+        tree.exercised.extend(row.flow_labels.iter().cloned());
+    }
+    progress.usage = progress.usage.saturating_add(report.totals.usage);
+    progress.add_cost(report.totals.cost_usd_micros);
+    let result = sweep_tool::result_of(&planned.labels, &report, ceiling);
+    let content = serde_json::to_string(&result).map_err(|err| err.to_string())?;
+    Ok(ToolOutcome::ok(content))
 }
 
 /// The room for one delegation answer in the next request of the parent
@@ -3368,6 +3458,9 @@ fn child_task(
         // A child keeps the setting. Its new run holds no notes of the
         // parent (issue #2453).
         context_reset: task.context_reset,
+        // A child sweeps nothing. Only the operator gives a run the tool, and
+        // the parent pays for its own sweeps (issue #2716).
+        sweep: None,
         // The peer has its own prompt, so the guidance and the skills of the
         // parent do not apply to it (issue #2373).
         tool_guidance: std::collections::BTreeMap::new(),

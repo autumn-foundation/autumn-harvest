@@ -327,6 +327,19 @@ pub struct SampleInput {
     /// sets it, so each child result in its history stays short.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub brief: bool,
+    /// The flow labels that the caller has exercised (issue #2716). Each
+    /// draw starts with them, so a flow rule sees the taint of the caller.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// Refuse each tool call that writes or acts outside the app in each
+    /// draw (issue #2716). A read-only caller sets it, so a draw never
+    /// widens the effects of its caller.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub read_only: bool,
+    /// The tool effects of the caller (issue #2716). Each draw keeps only
+    /// the effects in both this set and the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<crate::tool::ToolEffect>>,
 }
 
 impl SampleInput {
@@ -347,6 +360,9 @@ impl SampleInput {
             max_total_tokens: None,
             expected: None,
             brief: false,
+            flow_labels: BTreeSet::new(),
+            read_only: false,
+            allowed_effects: None,
         }
     }
 
@@ -363,6 +379,9 @@ impl SampleInput {
             max_total_tokens: None,
             expected: None,
             brief: false,
+            flow_labels: BTreeSet::new(),
+            read_only: false,
+            allowed_effects: None,
         }
     }
 
@@ -625,6 +644,15 @@ pub async fn agent_sample(
     };
     let mut task = profile_task(&profile, &input.input);
     task.max_total_tokens = tree_budget(task.max_total_tokens, input.max_total_tokens);
+    task.flow_labels.extend(input.flow_labels);
+    // A draw never runs a wider effect than its caller.
+    task.read_only |= input.read_only;
+    if let Some(caller) = input.allowed_effects {
+        task.allowed_effects = Some(match task.allowed_effects.take() {
+            Some(own) => own.intersection(&caller).copied().collect(),
+            None => caller,
+        });
+    }
     let sample = OpSample {
         strategy: input.strategy,
         scorer: input.scorer,
@@ -1419,6 +1447,7 @@ fn step_task(task: &AgentTask, beam: &Beam, round: u32) -> AgentTask {
         beam_step: true,
         answer_check: None,
         context_reset: None,
+        sweep: None,
         ..task.clone()
     }
 }

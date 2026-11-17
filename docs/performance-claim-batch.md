@@ -26,7 +26,7 @@ lets one statement take up to `n` rows, in batches of 2, 4 or 8.
 
 `queue::claim_task_batch_with_slots` sends the batch claim. Its text derives
 from the window form of the default claim, after the DR fence and the kind
-predicate are in it. Only two CTEs change:
+predicate are in it. These CTEs change:
 
 * `seek_candidate` locks up to 2, 4 or 8 rows with `FOR UPDATE SKIP LOCKED`.
   It also returns the claim key of each row: sticky rank, priority and due
@@ -35,11 +35,18 @@ predicate are in it. Only two CTEs change:
   row with a concurrency key or a rate-limit key. The cap re-check of
   `claimed` reads the statement snapshot, so two rows of one key would both
   pass it. One bucket row takes one debit, however many claims join it.
+* `run_expired_now` lists each row whose run passed its deadline by the clock
+  that `fresh_now` reads after the bucket lock. `claim_live` holds the other
+  rows, and `rate_limit_debit` and `claimed` read it in place of
+  `candidate`. The run can pass its deadline while the claim waits on the
+  bucket lock. Then that row stays `PENDING`, spends no token and takes no
+  concurrency-key lock, and the claim still takes the other rows of the
+  batch. `claim_live` is materialized, so `claimed` never tests the key lock
+  of a row that it then drops.
 
-`fresh_now`, `run_expired_now`, `rate_limit_debit` and `claimed` are the
-same text as in the window form. An expired run anywhere in a batch stops the
-whole batch, as it stops a single claim. When the batch finds no row and sets
-the fallback flag, the full statement runs and takes one row at most.
+`fresh_now` is the same text as in the window form. When the batch finds no
+row and sets the fallback flag, the full statement runs and takes one row at
+most.
 
 Each claimed row passes the post-claim rechecks of a single claim. The
 rechecks of all rows share one pipeline. A row that they give back is
@@ -80,6 +87,11 @@ three rounds
 | 2 | 1.077 | 0.538 |
 | 4 | 1.149 | 0.287 |
 | 8 | 1.233 | 0.154 |
+
+With the per-row expiry check, three more rounds give 1.014, 1.055, 1.104
+and 1.209 ms per statement for k = 1, 2, 4 and 8
+([`pgbench-results-row-expiry.txt`](perf-artifacts/claim-batch/pgbench-results-row-expiry.txt)).
+The k = 8 statement still costs 1.19x the k = 1 statement.
 
 ### Claim census
 

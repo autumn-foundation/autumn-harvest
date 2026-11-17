@@ -885,6 +885,64 @@ impl Scorer for ExactMatch {
     }
 }
 
+/// A scorer that accepts each completed run with a non-empty answer (issue
+/// #2716).
+///
+/// It fits a sweep whose items have no expected answer, such as a research
+/// sweep. A non-empty answer gives `Score(1.0)`. An empty answer or a run
+/// that does not complete gives a reject. It calls no model.
+#[derive(Debug, Clone)]
+pub struct Answered {
+    id: String,
+}
+
+impl Answered {
+    /// The default id.
+    pub const ID: &'static str = "answered";
+
+    /// The scorer under the id [`Self::ID`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            id: Self::ID.to_owned(),
+        }
+    }
+
+    /// Set the id, so a harness can keep more than one.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+}
+
+impl Default for Answered {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Scorer for Answered {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn score<'a>(
+        &'a self,
+        input: &'a ScoreInput,
+        _cx: &'a ScoreContext<'_>,
+    ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
+        let verdict = incomplete(input.stop).unwrap_or_else(|| {
+            if input.answer.trim().is_empty() {
+                Verdict::reject("the answer is empty")
+            } else {
+                Verdict::Score(FiniteF64::ONE)
+            }
+        });
+        Box::pin(std::future::ready(Ok(verdict)))
+    }
+}
+
 /// A scorer that accepts an answer that is JSON and matches a schema.
 ///
 /// It reads the answer as JSON. It drops a Markdown code fence around it.

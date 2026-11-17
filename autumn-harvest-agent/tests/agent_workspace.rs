@@ -21,8 +21,8 @@ use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentOp, AgentProfile, AgentState,
     BoxFuture, ChatRequest, ChatRole, ContentPart, Control, DirWorkspaceBlobs, ErrorKind,
-    FlowRules, FnTool, InMemoryWorkspaceBlobs, Mandate, Peer, Rule, Tool, ToolEffect,
-    WorkspaceBlobs, WorkspaceMount, WorkspaceStore, sqlite,
+    FlowRules, FnTool, InMemoryWorkspaceBlobs, Mandate, Peer, Rule, Tool, ToolCall,
+    ToolCallRequest, ToolEffect, WorkspaceBlobs, WorkspaceMount, WorkspaceStore, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{ScriptedModel, TryFnModel, answer, calls, runtime};
@@ -395,7 +395,8 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
     let model = ScriptedModel::new(vec![
         write("w1", "notes.txt", "the first draft"),
         answer("saved", 1),
-        // A tick is read-only. Its write runs, but the head stays.
+        // A tick is read-only. Its write runs, the tool call returns an error,
+        // and the head stays (issue #2692).
         write("w2", "notes.txt", "a draft from a tick"),
         answer("HEARTBEAT_OK", 1),
         read("r3", "notes.txt"),
@@ -668,4 +669,84 @@ async fn an_inline_child_gets_no_workspace() {
 async fn a_fan_out_child_gets_no_workspace() {
     let seen = probe_mounts(&["probe a", "probe b"], 2).await;
     assert_eq!(seen, [true, false, false]);
+}
+
+/// A tool-call request for `name` on the mount of a fresh scope.
+fn workspace_request(name: &str, path: &str, read_only: bool) -> ToolCallRequest {
+    ToolCallRequest {
+        run_id: "run-1".to_owned(),
+        session_id: None,
+        step: 0,
+        call: ToolCall {
+            id: "c1".to_owned(),
+            name: name.to_owned(),
+            arguments: json!({"path": path, "text": "a note"}),
+        },
+        memory_scope: None,
+        read_only,
+        allowed_tools: None,
+        labels: None,
+        flow_labels: std::collections::BTreeSet::new(),
+        workspace: Some(WorkspaceMount {
+            scope: "agent:coder/ro".to_owned(),
+            head: None,
+            generation: 1,
+        }),
+        skill: None,
+        allowed_effects: None,
+        probe_effects: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_call_that_changes_the_workspace_is_an_error() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(write_tool(runs.clone()))
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("write_file", "notes.txt", true))
+        .await
+        .unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the tool ran");
+    assert!(outcome.is_error, "got {}", outcome.content);
+    assert!(
+        outcome.content.contains("cannot change the workspace"),
+        "got {}",
+        outcome.content
+    );
+    assert_eq!(outcome.workspace, None, "no head moves");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attended_call_that_changes_the_workspace_still_saves() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(write_tool(runs))
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("write_file", "notes.txt", false))
+        .await
+        .unwrap();
+
+    assert!(!outcome.is_error, "got {}", outcome.content);
+    assert!(outcome.workspace.is_some(), "the head moves");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_call_that_only_reads_the_workspace_succeeds() {
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(read_tool())
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("read_file", "notes.txt", true))
+        .await
+        .unwrap();
+
+    assert!(!outcome.is_error, "got {}", outcome.content);
+    assert_eq!(outcome.workspace, None);
 }
