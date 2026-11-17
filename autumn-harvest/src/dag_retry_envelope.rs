@@ -16,7 +16,7 @@
 use crate::dag::DagDefinition;
 use crate::dag_slack::to_duration;
 use crate::policy::RetryPolicy;
-use crate::retry_envelope::analyze;
+use crate::retry_envelope::worst_case_without_deadline;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -153,8 +153,7 @@ impl DagRetryEnvelope {
                     .as_ref()
                     .or(self.fallback_policy.as_ref())
                     .map_or((1, Some(attempt_bound)), |policy| {
-                        let envelope = analyze(policy, Some(attempt_bound), None);
-                        (envelope.configured_attempts, envelope.worst_case_total())
+                        worst_case_without_deadline(policy, Some(attempt_bound))
                     });
                 TaskRetryEnvelope {
                     index,

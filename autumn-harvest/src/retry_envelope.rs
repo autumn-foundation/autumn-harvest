@@ -231,6 +231,32 @@ pub fn analyze(
     }
 }
 
+/// The longest time from schedule to the final outcome, with no deadline.
+///
+/// It returns the same value as `analyze(policy, start_to_close, None)`
+/// followed by [`RetryEnvelope::worst_case_total`], and the same
+/// `configured_attempts`. It lists no attempts, so it allocates nothing.
+/// A caller that needs only the total uses this function.
+#[must_use]
+pub fn worst_case_without_deadline(
+    policy: &RetryPolicy,
+    start_to_close: Option<Duration>,
+) -> (u32, Option<Duration>) {
+    let configured_attempts = policy.max_attempts.max(1);
+    if configured_attempts > MAX_LISTED_ATTEMPTS {
+        return (configured_attempts, None);
+    }
+    let Some(bound) = start_to_close else {
+        return (configured_attempts, None);
+    };
+    let mut finish = bound;
+    for retry in 1..configured_attempts {
+        let (_, max_backoff) = retry_delay_bounds(policy, retry);
+        finish = finish.saturating_add(max_backoff).saturating_add(bound);
+    }
+    (configured_attempts, Some(finish))
+}
+
 /// Analyze the retry envelope of the schedule-time values of one activity.
 ///
 /// It returns `None` when the values set no retry policy.
@@ -253,6 +279,46 @@ mod tests {
 
     fn exact(max_attempts: u32, initial: u64) -> RetryPolicy {
         RetryPolicy::exponential(max_attempts, secs(initial)).with_jitter(JitterPolicy::None)
+    }
+
+    #[test]
+    fn worst_case_without_deadline_matches_the_full_analysis() {
+        let bounds = [
+            None,
+            Some(Duration::ZERO),
+            Some(secs(7)),
+            Some(Duration::MAX),
+        ];
+        for jitter in [
+            JitterPolicy::None,
+            JitterPolicy::Full,
+            JitterPolicy::Equal,
+            JitterPolicy::Decorrelated,
+        ] {
+            for attempts in [
+                0,
+                1,
+                2,
+                3,
+                10,
+                40,
+                MAX_LISTED_ATTEMPTS,
+                MAX_LISTED_ATTEMPTS + 1,
+            ] {
+                for initial in [0, 1, 5] {
+                    let mut policy =
+                        RetryPolicy::exponential(attempts, secs(initial)).with_jitter(jitter);
+                    policy.max_interval = secs(300);
+                    for bound in bounds {
+                        let full = analyze(&policy, bound, None);
+                        assert_eq!(
+                            worst_case_without_deadline(&policy, bound),
+                            (full.configured_attempts, full.worst_case_total()),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
