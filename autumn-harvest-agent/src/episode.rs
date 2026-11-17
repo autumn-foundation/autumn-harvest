@@ -132,6 +132,11 @@ pub struct EpisodeSettings {
     pub facts_block: String,
     /// The most episodes that one pass reads, oldest first. 0 counts as 1.
     pub max_pass_episodes: u32,
+    /// The most tokens that the model may write in one pass. `None` sets
+    /// no cap, so the engine adds none and the provider default applies.
+    /// 0 counts as `None`. A reply that a cap cuts off does not parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pass_output_tokens: Option<u32>,
 }
 
 impl Default for EpisodeSettings {
@@ -143,6 +148,7 @@ impl Default for EpisodeSettings {
             model: None,
             facts_block: DEFAULT_FACTS_BLOCK.to_owned(),
             max_pass_episodes: DEFAULT_MAX_PASS_EPISODES,
+            max_pass_output_tokens: None,
         }
     }
 }
@@ -187,6 +193,13 @@ impl EpisodeSettings {
     #[must_use]
     pub const fn max_pass_episodes(mut self, n: u32) -> Self {
         self.max_pass_episodes = n;
+        self
+    }
+
+    /// Let the model write at most `n` tokens in one pass. 0 sets no cap.
+    #[must_use]
+    pub const fn max_pass_output_tokens(mut self, n: u32) -> Self {
+        self.max_pass_output_tokens = Some(n);
         self
     }
 }
@@ -758,5 +771,21 @@ mod tests {
         let settings: EpisodeSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings, EpisodeSettings::default());
         assert_eq!(settings.trigger, ConsolidationTrigger::Schedule);
+    }
+
+    #[test]
+    fn a_pass_has_no_output_cap_by_default() {
+        assert_eq!(EpisodeSettings::default().max_pass_output_tokens, None);
+        let json = serde_json::to_string(&EpisodeSettings::default()).unwrap();
+        assert!(!json.contains("max_pass_output_tokens"), "{json}");
+    }
+
+    #[test]
+    fn the_output_cap_is_set_and_round_trips() {
+        let settings = EpisodeSettings::default().max_pass_output_tokens(8_192);
+        assert_eq!(settings.max_pass_output_tokens, Some(8_192));
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: EpisodeSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
     }
 }
