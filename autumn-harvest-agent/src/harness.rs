@@ -2019,7 +2019,9 @@ fn guided(
 
 /// Whether `name` is the name of a built-in tool of the crate.
 fn is_builtin_name(name: &str) -> bool {
-    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL) || name == FOLLOWUP_TOOL
+    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL)
+        || name == FOLLOWUP_TOOL
+        || name == crate::sweep_tool::SWEEP_TOOL
 }
 
 /// Warn when an app tool takes the reserved name [`LOAD_SKILL_TOOL`]. The

@@ -23,6 +23,7 @@ use crate::message::{
 };
 use crate::policy::ToolDecision;
 use crate::skill::SkillText;
+use crate::sweep_tool::SweepTool;
 use crate::tool::ToolEffect;
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
@@ -270,6 +271,10 @@ pub struct AgentTask {
     /// [`context_reset`](crate::context_reset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_reset: Option<ContextReset>,
+    /// The sweep tool setting (issue #2716). With a setting, the run gets
+    /// the `sweep` tool. See [`sweep_tool`](crate::sweep_tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<Box<SweepTool>>,
     /// The text that replaces the description of each named tool (issue
     /// #2373). The key is a tool name. The tool keeps its effect.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -376,6 +381,7 @@ impl AgentTask {
             waiting: Vec::new(),
             report_failure: false,
             context_reset: None,
+            sweep: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
             allowed_effects: None,
@@ -400,6 +406,14 @@ impl AgentTask {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Let the run sweep a list of sources with the `sweep` tool. See
+    /// [`sweep_tool`](crate::sweep_tool).
+    #[must_use]
+    pub fn sweep(mut self, setting: SweepTool) -> Self {
+        self.sweep = Some(Box::new(setting));
         self
     }
 

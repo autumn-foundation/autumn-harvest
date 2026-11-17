@@ -1419,6 +1419,7 @@ fn step_task(task: &AgentTask, beam: &Beam, round: u32) -> AgentTask {
         beam_step: true,
         answer_check: None,
         context_reset: None,
+        sweep: None,
         ..task.clone()
     }
 }

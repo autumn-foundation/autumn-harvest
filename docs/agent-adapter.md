@@ -3905,6 +3905,52 @@ history holds no transcript. The sweep does not use continue-as-new.
 the draws of one sweep: set `max_total_tokens` to bound its spend. The
 design is in [`DESIGN-2448.md`](design/DESIGN-2448.md).
 
+### The sweep tool (issue #2716)
+
+A running agent can start a sweep with the `sweep` workflow tool. An
+operator turns it on for a run or a kind. The ceiling is required:
+
+```rust
+use std::num::NonZeroU32;
+
+use autumn_harvest_agent::sampling::ScorerRef;
+use autumn_harvest_agent::{AgentProfile, Answered, SweepTool};
+
+let scorer = ScorerRef::deterministic(Answered::ID).expect("a valid id");
+let ceiling = NonZeroU32::new(640_000).expect("not zero");
+let sweep = SweepTool::new("research", ceiling, scorer)
+    .max_items(40)
+    .flow_label("outside_text");
+let profile = AgentProfile::new("assistant").sweep(sweep);
+# let _ = profile;
+```
+
+- The model calls `sweep` with an `instruction` and `items`, a list of
+  `{label, source}`. Each item text is the instruction, the label and the
+  source.
+- The workflow runs one `agent_sweep` child with a single draw for each
+  item. No activity runs the call, so the tool timeout does not apply. A
+  crash resumes the child.
+- Each call sets `max_total_tokens` to the ceiling of the setting. The call
+  cannot change the kind, the ceiling, the scorer or the concurrency. A
+  call with an unknown key, no item, a blank instruction or more items than
+  `max_items` gets an error result, and no child starts.
+- The result holds `text`, the answers joined as `label: answer`, then one
+  row for each item (`label`, `ok`, `status`, `tokens`, `error`), `stopped`
+  and `spent`. `spent` names the ceiling, the tokens and the cost of the
+  sweep tree.
+- The parent counts the usage and the cost of the sweep tree in its own
+  report. A sweep that fails in the engine gives an error result. Its spend
+  is in the ledger only.
+- The result adds `flow_labels` of the setting to the run, so a rule sees
+  that the run read outside text.
+- A draw and a delegated child never get the tool, so a sweep never
+  nests. A call in a probe gets an error result.
+- `Answered` accepts each completed run with a non-empty answer. It fits
+  items with no expected answer.
+
+The design is in [`DESIGN-2716.md`](design/DESIGN-2716.md).
+
 ## 28. Inference strategies
 
 A strategy runs more than one draw of one task, scores each draw and

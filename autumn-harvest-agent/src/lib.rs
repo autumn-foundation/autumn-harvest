@@ -135,6 +135,7 @@ pub mod skill;
 pub mod sqlite;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod stores;
+pub mod sweep_tool;
 pub mod tool;
 pub mod transcript;
 pub mod types;
@@ -220,7 +221,7 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
+    Answered, ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
     ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_sample_score,
     agent_sample_score_info, agent_score, agent_score_info, select,
 };
@@ -229,6 +230,7 @@ pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use stores::{PostgresEpisodeStore, PostgresMemoryStore, PostgresTranscriptStore};
 #[cfg(feature = "sqlite")]
 pub use stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
+pub use sweep_tool::{SWEEP_TOOL, SweepSpend, SweepTool, SweepToolResult, SweepToolRow};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore, WindowOwner};
 pub use types::{
