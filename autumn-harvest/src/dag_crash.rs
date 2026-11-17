@@ -249,7 +249,7 @@ mod tests {
             .crashable("b", secs(1), 5)
             .plan(secs(13));
         assert!(plan.meets_target());
-        assert!(plan.steps.is_empty());
+        assert_eq!(plan.steps, Vec::new());
         assert_eq!(plan.total_cost, 0);
         assert_eq!(plan.durations, vec![secs(2), secs(10), secs(3), secs(1)]);
     }
@@ -277,7 +277,7 @@ mod tests {
             .crashable("c", secs(0), 1)
             .plan(secs(12));
         assert!(!plan.meets_target());
-        assert!(plan.steps.is_empty());
+        assert_eq!(plan.steps, Vec::new());
         assert_eq!(plan.achieved, secs(13));
     }
 
@@ -316,7 +316,7 @@ mod tests {
         let report = DagSlackAnalyzer::new(dag.clone()).analyze();
         let plan = DagCrashPlanner::new(&dag, &report).plan(Duration::ZERO);
         assert!(plan.meets_target());
-        assert!(plan.durations.is_empty());
+        assert_eq!(plan.durations, Vec::new());
     }
 
     #[test]
