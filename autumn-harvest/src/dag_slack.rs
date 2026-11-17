@@ -210,6 +210,27 @@ mod tests {
             .mock_duration("d", secs(1))
     }
 
+    /// Characterizes `to_duration` ahead of the Echo merge that routes
+    /// `dag_crash::to_duration` and `dag_leverage::to_duration` to this
+    /// copy. All three bodies are byte-identical, so one set of tests
+    /// covers every copy's behavior, including the saturation case none
+    /// of the three had tested before.
+    #[test]
+    fn to_duration_splits_whole_seconds_from_the_remainder() {
+        assert_eq!(to_duration(0), Duration::ZERO);
+        assert_eq!(to_duration(1), Duration::new(0, 1));
+        assert_eq!(to_duration(999_999_999), Duration::new(0, 999_999_999));
+        assert_eq!(to_duration(1_000_000_000), Duration::new(1, 0));
+        assert_eq!(to_duration(13_000_000_007), Duration::new(13, 7));
+    }
+
+    #[test]
+    fn to_duration_saturates_past_u64_seconds() {
+        let past_u64_secs = (u128::from(u64::MAX) + 1) * 1_000_000_000;
+        assert_eq!(to_duration(past_u64_secs), Duration::MAX);
+        assert_eq!(to_duration(u128::MAX), Duration::MAX);
+    }
+
     #[test]
     fn empty_dag_has_no_tasks_and_no_makespan() {
         let report = DagSlackAnalyzer::new(DagBuilder::new().build().unwrap()).analyze();
