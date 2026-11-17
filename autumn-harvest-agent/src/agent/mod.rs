@@ -2533,7 +2533,7 @@ impl AgentRun<'_> {
         let access = if task.memory_in_state && !state.memory.is_empty() {
             memory_access(self.ctx, false)
         } else {
-            SnapshotAccess::Read
+            None
         };
         draw_op_task(&mut task, &state, profile, peer.as_ref(), access);
         // Each draw carries the task in its input. A task over the input cap
@@ -2675,7 +2675,7 @@ fn draw_op_task(
     state: &AgentState,
     profile: &AgentProfile,
     peer: Option<&PeerSegment<'_>>,
-    access: SnapshotAccess,
+    access: Option<SnapshotAccess>,
 ) {
     if let Some(peer) = peer {
         let mandate = peer.member.mandate();
@@ -2705,7 +2705,7 @@ fn draw_op_task(
     }
     if task.memory_in_state && !state.memory.is_empty() {
         // A draw reads the state memory but cannot edit it.
-        let snapshot = crate::memory::render_snapshot(&state.memory, access);
+        let snapshot = render_state_memory(&state.memory, access);
         task.system = Some(match task.system.take() {
             Some(system) => format!("{system}\n\n{snapshot}"),
             None => snapshot,
@@ -2715,17 +2715,32 @@ fn draw_op_task(
     }
 }
 
-/// The snapshot access of a run that has the `memory` tool when
-/// `writable` is true.
+/// The snapshot access of a state-memory segment that has the `memory`
+/// tool when `writable` is true.
 ///
-/// A run without the tool asks the patch gate. A history from before the
-/// gate rendered the edit head, so its replay renders that head again.
-fn memory_access(ctx: &WorkflowContext, writable: bool) -> SnapshotAccess {
-    if writable || !ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
-        SnapshotAccess::Edit
+/// The workflow renders this snapshot, so a replay rebuilds the prompt. A
+/// history from before the patch gate rendered the legacy edit head, and
+/// `None` keeps that head. The gate is asked at each render, so a writable
+/// segment keeps the old wording too.
+fn memory_access(ctx: &WorkflowContext, writable: bool) -> Option<SnapshotAccess> {
+    if !ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        None
+    } else if writable {
+        Some(SnapshotAccess::Edit)
     } else {
-        SnapshotAccess::Read
+        Some(SnapshotAccess::Read)
     }
+}
+
+/// Render the state memory under `access`. `None` renders the legacy head.
+fn render_state_memory(
+    blocks: &[crate::memory::MemoryBlock],
+    access: Option<SnapshotAccess>,
+) -> String {
+    access.map_or_else(
+        || crate::memory::render_legacy_snapshot(blocks),
+        |access| crate::memory::render_snapshot(blocks, access),
+    )
 }
 
 /// The durable record of the selected answer of a strategy op, or `None`
@@ -2857,12 +2872,12 @@ fn open_memory(
     state: &mut AgentState,
     task: &mut AgentTask,
     tree: &mut Tree,
-    access: SnapshotAccess,
+    access: Option<SnapshotAccess>,
 ) -> Vec<crate::memory::MemoryBlock> {
     if state.memory.is_empty() {
         state.memory = crate::memory::MemoryBlock::defaults();
     }
-    let snapshot = crate::memory::render_snapshot(&state.memory, access);
+    let snapshot = render_state_memory(&state.memory, access);
     task.system = Some(match task.system.take() {
         Some(system) => format!("{system}\n\n{snapshot}"),
         None => snapshot,

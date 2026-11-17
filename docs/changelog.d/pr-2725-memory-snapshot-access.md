@@ -23,9 +23,11 @@ its tool list.
   `AgentTask::memory_writable`. A draw always renders the read-only head.
 - **Breaking:** `render_snapshot` takes a second argument. Pass
   `SnapshotAccess::Edit` for the old text.
-- **Replay:** the patch `agent_read_only_memory_snapshot` gates the
-  read-only head. A run asks it only when it has no `memory` tool. A
-  history from before the patch replays with the edit head. No new
+- **Replay:** the patch `agent_read_only_memory_snapshot` gates both new
+  heads. A store-memory run asks it only when it has no `memory` tool,
+  because its activity records the head. A state-memory segment asks it
+  at each render, so a history from before the patch rebuilds the old
+  edit head byte for byte, for a segment and for the inputs of its draws. No new
   `WorkflowEvent` variant, no migration.
 - Tests: unit tests in `memory.rs` for both heads and the swap.
   `always_on` checks the head of a tick with and without

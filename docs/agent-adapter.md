@@ -858,8 +858,8 @@ first two rules only. The memory rule has its own opt-in:
 A run without the `memory` tool still reads its memory snapshot. The head
 of that snapshot says that the run cannot edit it, so the prompt never
 names a tool that the run does not have. A run with the tool reads the
-edit head. The patch `agent_read_only_memory_snapshot` gates the read-only
-head, so a history from before it replays with the edit head.
+edit head. The patch `agent_read_only_memory_snapshot` gates both heads,
+so a history from before it replays with the old edit head.
 
 ### Heartbeats
 

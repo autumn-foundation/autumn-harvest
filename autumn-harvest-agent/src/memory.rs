@@ -354,9 +354,11 @@ fn find_unique(block: &MemoryBlock, old: &str) -> Result<usize, AgentError> {
     }
 }
 
-/// The patch that gates the read-only head of a memory snapshot. A history
-/// from before it recorded the edit head in each prompt, so its replay
-/// keeps that head. A run asks the gate only when it has no `memory` tool.
+/// The patch that gates both new snapshot heads. A history from before it
+/// recorded the legacy edit head in each prompt, so its replay keeps that
+/// head. A store-memory run asks the gate only when it has no `memory`
+/// tool, because its activity records the head. A state-memory segment
+/// renders the head in the workflow, so it asks the gate at each render.
 pub(crate) const READ_ONLY_SNAPSHOT_PATCH: &str = "agent_read_only_memory_snapshot";
 
 /// Whether the run that reads a snapshot may edit the memory.
@@ -427,7 +429,19 @@ pub fn with_access(text: &str, access: SnapshotAccess) -> String {
 /// without the `memory` tool is not told to use it.
 #[must_use]
 pub fn render_snapshot(blocks: &[MemoryBlock], access: SnapshotAccess) -> String {
-    let mut out = String::from(access.head());
+    render_with_head(blocks, access.head())
+}
+
+/// Render the blocks with the edit head of a release before the patch
+/// [`READ_ONLY_SNAPSHOT_PATCH`]. A replay of a history from before the
+/// patch renders this text, so the prompt it rebuilds stays the same.
+pub(crate) fn render_legacy_snapshot(blocks: &[MemoryBlock]) -> String {
+    render_with_head(blocks, LEGACY_EDIT_HEAD)
+}
+
+/// Render the blocks under `head`.
+fn render_with_head(blocks: &[MemoryBlock], head: &str) -> String {
+    let mut out = String::from(head);
     for block in blocks {
         let _ = write!(
             out,
@@ -1124,6 +1138,20 @@ mod tests {
             assert!(!head.contains("this run started"), "{head}");
         }
         assert!(EDIT_HEAD.contains("from the next request or follow-up"));
+    }
+
+    #[test]
+    fn the_legacy_render_keeps_the_old_head() {
+        let mut b = block();
+        apply_op(&mut b, &add("tea")).unwrap();
+        let blocks = [b];
+        let legacy = render_legacy_snapshot(&blocks);
+        let current = render_snapshot(&blocks, SnapshotAccess::Edit);
+        assert!(legacy.starts_with(LEGACY_EDIT_HEAD), "{legacy}");
+        assert_eq!(
+            legacy.strip_prefix(LEGACY_EDIT_HEAD),
+            current.strip_prefix(EDIT_HEAD)
+        );
     }
 
     #[test]
