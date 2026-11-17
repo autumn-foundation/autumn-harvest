@@ -844,3 +844,11 @@ harness = false
 [[bench]]
 name = "schedule_slot_walk_profile"
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count harness for
+# `DagRetryEnvelope::analyze`. Drive it under `valgrind --tool=callgrind` /
+# `--tool=dhat`.
+[[bench]]
+name = "dag_retry_envelope_profile"
+required-features = ["testing"]
+harness = false
