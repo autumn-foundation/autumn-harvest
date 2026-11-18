@@ -14,7 +14,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use jiff::Timestamp;
 use std::sync::Arc;
 
 use autumn_harvest_agent::model::BoxFuture;
@@ -30,6 +29,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, TryFnModel, answer, calls, recorded_tool, runtime};
 use futures::FutureExt as _;
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "researcher";
@@ -447,7 +447,7 @@ fn judged_run(judge_model: &str) -> (AgentHarness, SampleInput) {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-        rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 

@@ -208,7 +208,7 @@ async fn a_successful_body_finalized_past_the_total_deadline_records_timed_out_n
     let clock = Arc::new(AtomicI64::new(t0));
     let clock_for_rt = Arc::clone(&clock);
     rt.set_clock(move || {
-        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).ok().unwrap()
+        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap()
     });
 
     // The body SUCCEEDS but moves the clock 5s past the 1s deadline BEFORE it returns.
@@ -322,7 +322,7 @@ async fn a_queued_activity_whose_deadline_elapsed_while_an_earlier_body_ran_is_t
     let clock = Arc::new(AtomicI64::new(t0));
     let clock_for_rt = Arc::clone(&clock);
     rt.set_clock(move || {
-        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).ok().unwrap()
+        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap()
     });
 
     // `earlier_body` (seq 0, drained FIRST) moves the clock to t0+5s, then completes.
@@ -502,7 +502,7 @@ async fn late_reg_wf(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
 async fn schedule_to_close_survives_late_activity_registration() {
     // Deterministic clock (the `_as_of` seam). The activity is scheduled at t0. The
     // re-drive is 10s later, past the 1s deadline.
-    let t0: Timestamp = Timestamp::from_second(7_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(7_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&late_reg_wf_info());
@@ -579,7 +579,7 @@ async fn late_reg_ok_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 
 #[tokio::test]
 async fn late_registered_activity_within_deadline_completes_normally() {
-    let t0: Timestamp = Timestamp::from_second(8_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(8_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&late_reg_ok_wf_info());

@@ -28,7 +28,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use jiff::Timestamp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +52,7 @@ use autumn_harvest_agent::{
 use common::{Recorder, Reply, ScriptedModel, TryFnModel, answer, calls, recorded_tool};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
+use jiff::Timestamp;
 use serde_json::json;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;

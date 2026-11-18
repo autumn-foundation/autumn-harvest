@@ -611,7 +611,7 @@ async fn query_does_not_fire_a_due_timer() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&timed_info());
-    let t0 = Timestamp::from_second(1_000_000).ok().unwrap();
+    let t0 = Timestamp::from_second(1_000_000).unwrap();
     let exec = rt.start_workflow("timed", json!(0)).unwrap();
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");

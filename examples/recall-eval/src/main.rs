@@ -15,8 +15,8 @@ use autumn_harvest_agent::recall::{
 };
 use autumn_harvest_agent::{AgentModel, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
-use jiff::Timestamp;
 use clap::Parser;
+use jiff::Timestamp;
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -115,7 +115,7 @@ fn render(name: &str, window: u32, at: Timestamp, report: &recall::RecallReport)
          and `EpisodeSettings::default().every(1)`.\n\
          - Fixture: the built-in fixture, {items} items. Scorer: `ExactMatch`.\n\n\
          {table}",
-        date = at.format("%Y-%m-%d"),
+        date = at.strftime("%Y-%m-%d"),
         items = report.items.len(),
         table = report.to_markdown(),
     )
@@ -128,8 +128,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scripted_run_renders_the_model_the_date_the_config_and_the_table() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let at = ("2026-11-04T00:00:00Z").parse::<Timestamp>()
-            .expect("a date");
+        let at: Timestamp = "2026-11-04T00:00:00Z".parse().expect("a date");
         let section = run(
             ReaderModel::new(),
             "reader",

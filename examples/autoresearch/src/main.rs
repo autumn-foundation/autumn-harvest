@@ -499,7 +499,7 @@ fn pick_session(
     // a night that crossed midnight.
     match runtime::running_sessions(rt)?.as_slice() {
         [] => {
-            let tag = jiff::Timestamp::now().format("%Y%m%d").to_string();
+            let tag = jiff::Timestamp::now().strftime("%Y%m%d").to_string();
             start_session(rt, lab, session, &tag)
         }
         [(exec, tag)] => {

@@ -82,7 +82,7 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
     let exec = rt.start_workflow("activity_then_timer", json!(7)).unwrap();
 
     // t0 = the instant the drive starts.
-    let t0: Timestamp = Timestamp::from_second(5_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(5_000_000).unwrap();
 
     // Cycle 1 at t0: schedules + runs the activity (durable progress).
     assert!(
@@ -140,7 +140,7 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
 
     // Advancing clock: read #1 (the activity cycle) returns t0. Every later read
     // returns t0 + 2s. A once-captured `Timestamp::now()` would see t0 for the whole call.
-    let t0: Timestamp = Timestamp::from_second(6_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(6_000_000).unwrap();
     let two_s_later = t0 + jiff::SignedDuration::from_secs(2);
     let reads = Arc::new(AtomicUsize::new(0));
     let reads_for_clock = Arc::clone(&reads);

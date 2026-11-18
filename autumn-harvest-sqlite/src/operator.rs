@@ -134,9 +134,7 @@ pub struct PendingWork {
     pub signals: Vec<BufferedSignal>,
 }
 
-/// A time column in epoch microseconds.
-///
-/// A stored value past the jiff range reads clamped, so it never fails.
+/// A time column in epoch microseconds. A value past the jiff range clamps.
 fn micros(value: Option<i64>) -> Option<Timestamp> {
     value.map(autumn_harvest::time::from_microsecond_clamped)
 }

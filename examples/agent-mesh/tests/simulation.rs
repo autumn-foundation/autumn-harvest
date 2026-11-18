@@ -35,7 +35,6 @@ use std::sync::{Arc, Mutex};
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MeshConfig};
 use agent_mesh::scripted::{ScriptedDesk, TOKENS_PER_CALL, last_user};
-use jiff::SignedDuration;
 use autumn_harvest::dst::{SeedPlan, SeedVars, SplitMix64};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::approval::SIGNAL_TOOL_APPROVAL;
@@ -44,6 +43,7 @@ use autumn_harvest_agent::{
     ChatRole, ContentPart, PeerEnvelope, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+use jiff::{SignedDuration, Timestamp};
 
 const VARS: SeedVars = SeedVars {
     seed: "AGENT_MESH_SEED",
@@ -263,7 +263,8 @@ async fn run_seed(seed: u64) -> Seen {
                 // comes more often while a reply waits.
                 let long = rng.chance(if world.awaiting_approval { 75 } else { 5 });
                 clock += if long {
-                    SignedDuration::try_from(world.config.approval_timeout).unwrap() + SignedDuration::from_hours(1)
+                    SignedDuration::try_from(world.config.approval_timeout).unwrap()
+                        + SignedDuration::from_hours(1)
                 } else {
                     SignedDuration::from_mins(i64::try_from(1 + rng.below(40)).unwrap())
                 };

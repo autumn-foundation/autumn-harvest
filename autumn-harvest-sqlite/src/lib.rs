@@ -52,7 +52,7 @@
 //!   `…001.900`, not the floored `…001.001`. On any pass, timers whose deadline
 //!   has passed fire. There is no virtual clock to persist or reset, so timers are
 //!   naturally monotonic across restarts. The public drivers read
-//!   [`chrono::Utc::now`] **once per decision cycle** (issue #1069). So a timer
+//!   [`jiff::Timestamp::now`] **once per decision cycle** (issue #1069). So a timer
 //!   armed after a real-time activity anchors to its true arm instant, not the
 //!   start of the driver call. The `*_as_of` variants inject a single as-of time
 //!   for deterministic, sleep-free tests.

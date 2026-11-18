@@ -9,7 +9,6 @@
 mod common;
 
 use std::path::PathBuf;
-use jiff::Timestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,6 +20,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::runtime;
+use jiff::{SignedDuration, Timestamp};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -151,7 +151,7 @@ async fn an_idle_agent_wakes_on_its_timer_in_a_fresh_runtime() {
 
     let second = FixedModel::new("HEARTBEAT_OK");
     let mut rt = runtime(&db, harness(second.clone()));
-    drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_secs(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
     let woke = state(&rt, &agent).await;
     assert_eq!(woke.ticks, 1, "the booked tick ran in the fresh runtime");
     assert_eq!((first.calls(), second.calls()), (0, 1));

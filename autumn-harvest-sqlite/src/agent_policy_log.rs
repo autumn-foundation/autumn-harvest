@@ -158,7 +158,7 @@ fn read_in(conn: &Connection, kind: &str, policy: &str) -> SqliteResult<Option<P
             body,
             revision: to_revision(revision)?,
             updated_by,
-            updated_at: from_millis(updated_at_ms)?,
+            updated_at: from_millis(updated_at_ms),
         })
     })
     .transpose()
@@ -244,7 +244,7 @@ fn audit_in(
             actor,
             old,
             new,
-            at: from_millis(at_ms)?,
+            at: from_millis(at_ms),
         });
     }
     Ok(out)
@@ -255,7 +255,8 @@ fn to_revision(stored: i64) -> SqliteResult<u64> {
         .map_err(|_| SqliteError::Unsupported(format!("policy revision {stored} is negative")))
 }
 
-fn from_millis(ms: i64) -> SqliteResult<Timestamp> {
-    Some(autumn_harvest::time::from_millisecond_clamped(ms))
-        .ok_or_else(|| SqliteError::Unsupported(format!("policy time {ms} is out of range")))
+/// Reads a stored time. A value past the jiff range clamps to its end, so
+/// a row that `chrono` wrote still loads.
+fn from_millis(ms: i64) -> Timestamp {
+    autumn_harvest::time::from_millisecond_clamped(ms)
 }

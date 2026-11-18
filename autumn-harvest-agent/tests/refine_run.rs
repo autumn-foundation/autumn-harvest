@@ -1175,7 +1175,8 @@ async fn a_stage_that_fails_every_retry_falls_back_and_keeps_the_identity() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_hours(hour);
+        let at = autumn_harvest::jiff::Timestamp::now()
+            + autumn_harvest::jiff::SignedDuration::from_hours(hour);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     let report = report_of(state);
@@ -1277,7 +1278,8 @@ async fn a_failed_stage_keeps_the_spend_of_its_last_attempt() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_hours(hour);
+        let at = autumn_harvest::jiff::Timestamp::now()
+            + autumn_harvest::jiff::SignedDuration::from_hours(hour);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     let report = report_of(state);

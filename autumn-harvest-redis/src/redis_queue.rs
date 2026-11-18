@@ -37,7 +37,7 @@ use redis::{AsyncCommands, RedisError, Script};
 use uuid::Uuid;
 
 use crate::adapter::{ClaimedTask, TaskQueueAdapter};
-use crate::envelope::{EnqueueParams, TaskEnvelope};
+use crate::envelope::{EnqueueParams, TaskEnvelope, due_after};
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{dlq_key, scheduled_payloads_key, scheduled_zset_key, stream_key};
 
@@ -549,10 +549,8 @@ impl TaskQueueAdapter for RedisTaskQueue {
         // same task_id so consumers and DLQ records stay correlated across
         // attempts.
         self.ack(&task.envelope.queue_name, &task.entry_id).await?;
-        let chrono_delay = jiff::SignedDuration::try_from(delay)
-            .map_err(|e| RedisAdapterError::DurationOutOfRange(format!("retry delay: {e}")))?;
         let mut next = task.envelope.clone();
-        next.scheduled_at = Timestamp::now() + chrono_delay;
+        next.scheduled_at = due_after(Timestamp::now(), delay, "retry delay")?;
         if next.scheduled_at <= Timestamp::now() {
             self.enqueue_immediate(&next).await
         } else {

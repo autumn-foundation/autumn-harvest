@@ -448,7 +448,7 @@ async fn first_run(
     // A derived tag holds the year, so a nightly slot never meets the branch
     // of the same slot a year before.
     let tag = if config.tag.trim().is_empty() {
-        ctx.now().format("%Y%m%d-%H%M").to_string()
+        ctx.now().strftime("%Y%m%d-%H%M").to_string()
     } else {
         config.tag.clone()
     };
@@ -477,7 +477,10 @@ async fn first_run(
     // The wall-clock start, recorded once so replay reads the same value.
     let started = ctx.system_now();
     ctx.upsert_search_attrs([
-        ("started_at".to_string(), Some(json!(started.to_rfc3339()))),
+        (
+            "started_at".to_string(),
+            Some(json!(autumn_harvest::time::rfc3339(started))),
+        ),
         ("phase".to_string(), Some(json!("baseline"))),
     ])
     .map_err(|e| e.to_string())?;

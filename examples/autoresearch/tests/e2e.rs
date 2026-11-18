@@ -27,8 +27,8 @@ use autoresearch::workflows::{
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::{AgentTask, MemoryScope, sqlite};
 use autumn_harvest_sqlite::{ExecutionFilter, ExecutionOutcome, SqliteError};
-use jiff::Timestamp;
 use common::{Fixture, activities_of, input_of, run_to_approval, run_to_end, runs_of, signals_of};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 fn model() -> Arc<ScriptedResearcher> {

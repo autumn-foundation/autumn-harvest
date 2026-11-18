@@ -462,7 +462,7 @@ fn append_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(None);
     };
-    let created_at = from_millis(Timestamp::now().as_millisecond())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -524,7 +524,7 @@ fn append_policy_in(
         ));
     };
     let old_body = last.and_then(|row| row.new_body);
-    let changed_at = from_millis(Timestamp::now().as_millisecond())?;
+    let changed_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_refine_policies
              (kind, seq, old_body, new_body, actor_kind, actor, changed_at_ms)
@@ -604,7 +604,7 @@ fn auto_adopt_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(AutoAdoptRaw::Full);
     };
-    let created_at = from_millis(Timestamp::now().as_millisecond())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -728,16 +728,16 @@ fn activate_in(
 fn read_row(row: &Row<'_>) -> rusqlite::Result<SqliteResult<OverlayRow>> {
     let version: i64 = row.get(0)?;
     let created_at_ms: i64 = row.get(4)?;
-    let (version, created_at) = match (to_version(version), from_millis(created_at_ms)) {
-        (Ok(version), Ok(created_at)) => (version, created_at),
-        (Err(err), _) | (_, Err(err)) => return Ok(Err(err)),
+    let version = match to_version(version) {
+        Ok(version) => version,
+        Err(err) => return Ok(Err(err)),
     };
     Ok(Ok(OverlayRow {
         version,
         body: row.get(1)?,
         author_kind: row.get(2)?,
         author: row.get(3)?,
-        created_at,
+        created_at: from_millis(created_at_ms),
     }))
 }
 
@@ -753,10 +753,9 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
             to_version(seq)?,
             from.map(to_version).transpose()?,
             to_version(to)?,
-            from_millis(activated_at_ms)?,
         ))
     })();
-    let (seq, from, to, activated_at) = match decoded {
+    let (seq, from, to) = match decoded {
         Ok(decoded) => decoded,
         Err(err) => return Ok(Err(err)),
     };
@@ -766,7 +765,7 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
         to,
         actor_kind: row.get(3)?,
         actor: row.get(4)?,
-        activated_at,
+        activated_at: from_millis(activated_at_ms),
     }))
 }
 
@@ -775,9 +774,9 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
 fn read_policy(row: &Row<'_>) -> rusqlite::Result<SqliteResult<PolicyRow>> {
     let seq: i64 = row.get(0)?;
     let changed_at_ms: i64 = row.get(5)?;
-    let (seq, changed_at) = match (to_version(seq), from_millis(changed_at_ms)) {
-        (Ok(seq), Ok(changed_at)) => (seq, changed_at),
-        (Err(err), _) | (_, Err(err)) => return Ok(Err(err)),
+    let seq = match to_version(seq) {
+        Ok(seq) => seq,
+        Err(err) => return Ok(Err(err)),
     };
     Ok(Ok(PolicyRow {
         seq,
@@ -785,7 +784,7 @@ fn read_policy(row: &Row<'_>) -> rusqlite::Result<SqliteResult<PolicyRow>> {
         new_body: row.get(2)?,
         actor_kind: row.get(3)?,
         actor: row.get(4)?,
-        changed_at,
+        changed_at: from_millis(changed_at_ms),
     }))
 }
 
@@ -794,9 +793,10 @@ fn to_version(stored: i64) -> SqliteResult<u64> {
         .map_err(|_| SqliteError::Unsupported(format!("overlay version {stored} is negative")))
 }
 
-fn from_millis(ms: i64) -> SqliteResult<Timestamp> {
-    Some(autumn_harvest::time::from_millisecond_clamped(ms))
-        .ok_or_else(|| SqliteError::Unsupported(format!("overlay time {ms} is out of range")))
+/// Reads a stored time. A value past the jiff range clamps to its end, so
+/// a row that `chrono` wrote still loads.
+fn from_millis(ms: i64) -> Timestamp {
+    autumn_harvest::time::from_millisecond_clamped(ms)
 }
 
 #[cfg(test)]

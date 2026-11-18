@@ -19,6 +19,27 @@ use uuid::Uuid;
 
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 
+/// Returns the instant `delay` after `now`. `what` names the delay in an
+/// error.
+///
+/// A sum past the jiff range saturates to [`Timestamp::MAX`]. `chrono`
+/// reached the year 262142, so a delay of many thousand years did not fail
+/// there. A sum past that range panicked.
+///
+/// # Errors
+///
+/// Returns [`RedisAdapterError::DurationOutOfRange`] for a delay past the
+/// range of [`jiff::SignedDuration`].
+pub(crate) fn due_after(
+    now: Timestamp,
+    delay: Duration,
+    what: &str,
+) -> RedisAdapterResult<Timestamp> {
+    let span = jiff::SignedDuration::try_from(delay)
+        .map_err(|e| RedisAdapterError::DurationOutOfRange(format!("{what}: {e}")))?;
+    Ok(now.checked_add(span).unwrap_or(Timestamp::MAX))
+}
+
 /// Discriminator mirroring `autumn_harvest::queue::TaskType`.
 ///
 /// A string-valued enum keeps the wire format readable in `redis-cli`. It keeps
@@ -184,12 +205,7 @@ impl TaskEnvelope {
     /// Build an envelope from `EnqueueParams`, generating a new `task_id`.
     pub(crate) fn from_params(params: EnqueueParams, task_id: Uuid) -> RedisAdapterResult<Self> {
         let sticky_until = match (params.sticky_worker_id.as_ref(), params.sticky_timeout) {
-            (Some(_), Some(timeout)) => {
-                let chrono_timeout = jiff::SignedDuration::try_from(timeout).map_err(|e| {
-                    RedisAdapterError::DurationOutOfRange(format!("sticky_timeout: {e}"))
-                })?;
-                Some(Timestamp::now() + chrono_timeout)
-            }
+            (Some(_), Some(timeout)) => Some(due_after(Timestamp::now(), timeout, "sticky_timeout")?),
             _ => None,
         };
 

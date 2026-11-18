@@ -74,7 +74,7 @@ const MINUTE: i64 = 60_000;
 /// Make the clock of `rt` read `clock`, in epoch milliseconds.
 fn follow(rt: &mut SqliteRuntime, clock: &Arc<AtomicI64>) {
     let clock = clock.clone();
-    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).unwrap());
 }
 
 /// A runtime whose clock reads `clock`, with every test workflow registered.
@@ -519,7 +519,7 @@ async fn poll_once_as_of_fires_due_schedules() {
     let clock = Arc::new(AtomicI64::new(T0));
     let mut rt = runtime_at(&dir.path().join("asof.db"), &clock);
     rt.upsert_schedule(&every_minute("tick")).unwrap();
-    let at = Timestamp::from_millisecond(T0 + MINUTE).ok().unwrap();
+    let at = Timestamp::from_millisecond(T0 + MINUTE).unwrap();
     assert!(rt.poll_once_as_of(at).await.unwrap());
     assert_eq!(runs(&rt, "tick").len(), 1);
 }
@@ -678,7 +678,7 @@ async fn run_until_idle_quiesces_on_a_fast_clock() {
     let clock = Arc::new(AtomicI64::new(T0 + 1_000));
     let ticks = clock.clone();
     rt.set_clock(move || {
-        Timestamp::from_millisecond(ticks.fetch_add(1_000, Ordering::SeqCst)).ok().unwrap()
+        Timestamp::from_millisecond(ticks.fetch_add(1_000, Ordering::SeqCst)).unwrap()
     });
     rt.run_until_idle().await.expect("the call quiesces");
     assert_eq!(runs(&rt, "tick").len(), 1);

@@ -399,7 +399,7 @@ fn attempt_deadline(
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     }?;
-    let remaining = Some(jiff::SignedDuration::from_millis(at.saturating_sub(claim_ms)))?;
+    let remaining = jiff::SignedDuration::from_millis(at.saturating_sub(claim_ms));
     Timestamp::now().checked_add(remaining).ok()
 }
 

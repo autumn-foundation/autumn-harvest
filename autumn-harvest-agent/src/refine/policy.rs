@@ -263,11 +263,7 @@ pub enum GateState {
 ///
 /// A time before 1970 counts as 1970.
 #[must_use]
-pub fn gate_state(
-    requested_at: Timestamp,
-    now: Timestamp,
-    timeout: ApprovalTimeout,
-) -> GateState {
+pub fn gate_state(requested_at: Timestamp, now: Timestamp, timeout: ApprovalTimeout) -> GateState {
     let millis = |at: Timestamp| u64::try_from(at.as_millisecond()).unwrap_or(0);
     let timeout_ms = u64::try_from(timeout.get().as_millis()).unwrap_or(u64::MAX);
     if gate_timed_out(millis(requested_at), millis(now), timeout_ms) {

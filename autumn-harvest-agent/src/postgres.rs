@@ -38,6 +38,7 @@ use autumn_harvest::signal::{
     ByIdSignalOutcome, resolve_and_signal_by_workflow_id_with_codecs,
     send_signal_idempotent_with_codecs,
 };
+use autumn_harvest::time::Timestamp;
 use autumn_harvest::types::StartProvenance;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{ExecutionId, ShardId, WorkflowIdReusePolicy, WorkflowResultState};

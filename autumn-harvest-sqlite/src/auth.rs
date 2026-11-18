@@ -397,7 +397,10 @@ impl SqliteAuthStore {
     /// Delete the audit rows that the retention no longer keeps.
     fn purge_expired_audit(&self) -> SqliteResult<()> {
         if let Some(days) = self.audit_retention_days {
-            let cutoff = Timestamp::now() - autumn_harvest::time::days(days);
+            // A cutoff before the jiff range saturates, so it deletes no row.
+            let cutoff = Timestamp::now()
+                .checked_sub(autumn_harvest::time::days(days))
+                .unwrap_or(Timestamp::MIN);
             let deleted = self.purge_audit_before(cutoff)?;
             if deleted > 0 {
                 tracing::info!(deleted, days, "harvest: purged expired audit rows");
@@ -661,17 +664,8 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
     let expires_at: Option<i64> = row.get(5)?;
     let last_used_at: Option<i64> = row.get(6)?;
     let revoked_at: Option<i64> = row.get(7)?;
-    let decoded = (|| {
-        Ok((
-            parse_id(&id)?,
-            from_micros(created_at)?,
-            expires_at.map(from_micros).transpose()?,
-            last_used_at.map(from_micros).transpose()?,
-            revoked_at.map(from_micros).transpose()?,
-        ))
-    })();
-    let (id, created_at, expires_at, last_used_at, revoked_at) = match decoded {
-        Ok(fields) => fields,
+    let id = match parse_id(&id) {
+        Ok(id) => id,
         Err(error) => return Ok(Err(error)),
     };
     Ok(Ok(StoredToken {
@@ -679,10 +673,10 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
         name: row.get(1)?,
         token_hash: row.get(2)?,
         scope: row.get(3)?,
-        created_at,
-        expires_at,
-        last_used_at,
-        revoked_at,
+        created_at: from_micros(created_at),
+        expires_at: expires_at.map(from_micros),
+        last_used_at: last_used_at.map(from_micros),
+        revoked_at: revoked_at.map(from_micros),
         created_by: row.get(8)?,
         tenant: row.get(9)?,
     }))
@@ -693,13 +687,13 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
 fn read_audit(row: &Row<'_>) -> rusqlite::Result<SqliteResult<AuditRow>> {
     let id: String = row.get(0)?;
     let occurred_at: i64 = row.get(1)?;
-    let (id, occurred_at) = match (parse_id(&id), from_micros(occurred_at)) {
-        (Ok(id), Ok(occurred_at)) => (id, occurred_at),
-        (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
+    let id = match parse_id(&id) {
+        Ok(id) => id,
+        Err(error) => return Ok(Err(error)),
     };
     Ok(Ok(AuditRow {
         id,
-        occurred_at,
+        occurred_at: from_micros(occurred_at),
         actor: row.get(2)?,
         operation: row.get(3)?,
         target_type: row.get(4)?,
@@ -718,9 +712,10 @@ fn parse_id(raw: &str) -> SqliteResult<Uuid> {
     Uuid::parse_str(raw).map_err(|_| SqliteError::Corrupt(format!("a stored id {raw:?}")))
 }
 
-fn from_micros(micros: i64) -> SqliteResult<Timestamp> {
-    Some(autumn_harvest::time::from_microsecond_clamped(micros))
-        .ok_or_else(|| SqliteError::Corrupt(format!("a stored time {micros}")))
+/// Reads a stored time. A value past the jiff range clamps to its end, so
+/// a row that `chrono` wrote still loads.
+fn from_micros(micros: i64) -> Timestamp {
+    autumn_harvest::time::from_microsecond_clamped(micros)
 }
 
 #[cfg(test)]
@@ -733,7 +728,7 @@ mod tests {
     }
 
     fn at(seconds: i64) -> Timestamp {
-        Timestamp::from_second(1_800_000_000 + seconds).ok().unwrap()
+        Timestamp::from_second(1_800_000_000 + seconds).unwrap()
     }
 
     fn token<'a>(name: &'a str, hash: &'a str, created_at: Timestamp) -> NewToken<'a> {

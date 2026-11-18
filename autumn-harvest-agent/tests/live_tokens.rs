@@ -144,7 +144,7 @@ impl LiveSink for Watcher {
 /// completed turns.
 fn ledger_rows(db: &std::path::Path) -> usize {
     let now = autumn_harvest::jiff::Timestamp::now();
-    let day = autumn_harvest::autumn_harvest::time::days(1);
+    let day = autumn_harvest::time::days(1);
     SqliteReader::open(db)
         .unwrap()
         .llm_ledger_between(now - day, now + day)
@@ -192,8 +192,8 @@ async fn a_retry_starts_the_live_text_again() {
     // The retry waits on a durable backoff timer, so the drive moves past it.
     let mut state = rt.run_until_blocked(exec).await.unwrap();
     while matches!(state, autumn_harvest_sqlite::RunState::WaitingTimer) {
-        let later =
-            autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_mins(5);
+        let later = autumn_harvest::jiff::Timestamp::now()
+            + autumn_harvest::jiff::SignedDuration::from_mins(5);
         state = rt.run_until_blocked_as_of(exec, later).await.unwrap();
     }
     let report = report(state);
@@ -320,8 +320,8 @@ async fn live_text_never_reaches_history() {
         // The retry waits on a durable backoff timer, so the drive moves past it.
         let mut state = rt.run_until_blocked(exec).await.unwrap();
         while matches!(state, autumn_harvest_sqlite::RunState::WaitingTimer) {
-            let later =
-                autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_mins(5);
+            let later = autumn_harvest::jiff::Timestamp::now()
+                + autumn_harvest::jiff::SignedDuration::from_mins(5);
             state = rt.run_until_blocked_as_of(exec, later).await.unwrap();
         }
         assert_eq!(report(state).text, "a b");

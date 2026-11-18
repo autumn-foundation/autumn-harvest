@@ -102,7 +102,7 @@ async fn whole_second_timer_still_fires_at_its_deadline() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&one_second_timer_info());
 
-    let t0: Timestamp = Timestamp::from_second(4_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(4_000_000).unwrap();
     let exec = rt.start_workflow("one_second_timer", json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();

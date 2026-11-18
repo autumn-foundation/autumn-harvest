@@ -29,6 +29,8 @@ use std::time::Duration;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+#[cfg(feature = "eval")]
+use autumn_harvest::time::Timestamp;
 use autumn_harvest::types::ExecutionId;
 use serde::{Deserialize, Serialize};
 
@@ -714,7 +716,7 @@ impl Gate<'_> {
     async fn next(
         &self,
         name: &str,
-        opened: autumn_harvest::time::Timestamp,
+        opened: Timestamp,
         seen: Option<u64>,
         record: &mut GateRecord,
     ) -> Result<GateEvent, String> {
@@ -722,7 +724,7 @@ impl Gate<'_> {
         let GateState::Waiting { until } = self.policy.gate_state(opened, now) else {
             return Ok(GateEvent::Deadline);
         };
-        let left = std::time::Duration::try_from(until - now).unwrap_or(Duration::ZERO);
+        let left = Duration::try_from(until - now).unwrap_or(Duration::ZERO);
         let decision = await_decision::<RefineDecision>(self.ctx, name, left)
             .await
             .map_err(|err| {

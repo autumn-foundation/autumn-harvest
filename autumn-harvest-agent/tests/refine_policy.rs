@@ -10,7 +10,6 @@
 #![allow(clippy::used_underscore_binding)]
 
 use std::collections::BTreeSet;
-use jiff::Timestamp;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -27,6 +26,7 @@ use autumn_harvest_agent::{
     RefineStatus, SqliteOverlayStore, WaitReason, adopt, read_refine_policy, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "support";
@@ -55,8 +55,7 @@ fn policy(value: serde_json::Value) -> RefinePolicy {
 }
 
 fn noon() -> Timestamp {
-    ("2026-11-03T12:00:00Z").parse::<Timestamp>()
-        .expect("time")
+    "2026-11-03T12:00:00Z".parse().expect("time")
 }
 
 fn system(text: &str) -> ProfileOverlay {

@@ -5,8 +5,8 @@
 //! matches, in a fixed order. A single method routinely belongs to more than one
 //! table. `WorkflowContext::side_effect` is a sink (its closure must not be
 //! descended) *and* sanctioned (its return value is clean).
-//! `autumn_harvest::chrono::Utc::now` is a `[[source]]` inside a `[[trusted]]`
-//! crate.
+//! `autumn_harvest::time::Timestamp::now` is a `[[source]]` inside a
+//! `[[trusted]]` crate.
 //!
 //! # The matching semantics, exactly
 //!
@@ -47,8 +47,9 @@
 //! `Unclassified`. Within one table the rows are ordered most-specific first
 //! (`receiver` + `dest_type` > one of them > `path` alone), matching the model
 //! TOML header. **A `[[source]]` match is always reported, and always first,
-//! even when a `[[trusted]]` row also matches.** That precedence keeps `chrono` a
-//! trusted taint-propagator without making `Utc::now` clean.
+//! even when a `[[trusted]]` row also matches.** That precedence keeps `jiff`
+//! and `chrono` trusted taint-propagators. It does not make `Timestamp::now` or
+//! `Utc::now` clean.
 
 use super::callee::{self, CalleePath};
 use super::{
@@ -472,6 +473,7 @@ mod tests {
     fn a_jiff_clock_read_is_a_source_before_the_trusted_crate() {
         let m = model();
         for path in [
+            "autumn_harvest::time::Timestamp::now",
             "autumn_harvest::jiff::Timestamp::now",
             "jiff::Timestamp::now",
             "jiff::ZonedDateTime::now",

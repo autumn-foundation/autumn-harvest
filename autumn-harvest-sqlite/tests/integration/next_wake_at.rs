@@ -76,7 +76,7 @@ async fn bounded(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
 fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
     let clock = clock.clone();
-    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).unwrap());
     rt.register_workflow(&napper_info());
     rt.register_workflow(&waiter_info());
     rt.register_workflow(&retrier_info());

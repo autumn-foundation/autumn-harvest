@@ -89,7 +89,7 @@ async fn drifty(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
 #[tokio::test]
 async fn engine_nondeterminism_is_nonterminal_and_resumable() {
     let (_dir, path) = temp_db();
-    let t0: Timestamp = Timestamp::from_second(5_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(5_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&drifty_info());
@@ -417,7 +417,7 @@ async fn timer_and_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String
 #[tokio::test]
 async fn mixed_timer_activity_batch_completes_and_replays() {
     let (_dir, _path) = temp_db();
-    let t0: Timestamp = Timestamp::from_second(6_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(6_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&timer_and_activity_info());

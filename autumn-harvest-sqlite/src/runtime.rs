@@ -441,7 +441,7 @@ pub struct SqliteRuntime {
     /// timer can arm in a later cycle, e.g. after a real-time activity. It then
     /// anchors its deadline to its true arm time, not to the start of the outer
     /// call.
-    /// Defaults to [`Utc::now`]; tests install a controllable clock via
+    /// Defaults to [`Timestamp::now`]; tests install a controllable clock via
     /// [`set_clock`](Self::set_clock). The `_as_of`
     /// drivers bypass it: they take a caller-fixed timestamp, the
     /// deterministic-simulation seam.
@@ -647,7 +647,7 @@ impl SqliteRuntime {
     /// ([`run_until_blocked`](Self::run_until_blocked) /
     /// [`poll_once`](Self::poll_once) / [`run_until_idle`](Self::run_until_idle)),
     /// which read it **once per decision cycle**. A deterministic-test seam only;
-    /// production uses the [`Utc::now`] default. Prefer the `_as_of` drivers for
+    /// production uses the [`Timestamp::now`] default. Prefer the `_as_of` drivers for
     /// a caller-fixed single timestamp. Use this to assert that the *public* path
     /// re-reads the clock per cycle. For example, an advancing clock proves that a
     /// post-activity timer arms at its true, later instant.

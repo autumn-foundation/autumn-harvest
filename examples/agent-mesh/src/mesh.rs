@@ -2,7 +2,6 @@
 //! drive loop of the embedded SQLite runtime.
 
 use std::sync::{Arc, LazyLock};
-use jiff::Timestamp;
 use std::time::Duration;
 
 use autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX;
@@ -15,6 +14,7 @@ use autumn_harvest_agent::{
     ToolRules,
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteResult, SqliteRuntime};
+use jiff::Timestamp;
 
 use crate::desk::Desk;
 

@@ -7226,9 +7226,9 @@ fn emit_partition_report(
                             "    {:<40} {} .. {}",
                             p.name,
                             p.lower
-                                .map_or_else(|| "MINVALUE".into(), |t| autumn_harvest::time::rfc3339(t)),
+                                .map_or_else(|| "MINVALUE".into(), autumn_harvest::time::rfc3339),
                             p.upper
-                                .map_or_else(|| "MAXVALUE".into(), |t| autumn_harvest::time::rfc3339(t)),
+                                .map_or_else(|| "MAXVALUE".into(), autumn_harvest::time::rfc3339),
                         );
                     }
                 }
@@ -13685,6 +13685,46 @@ pub fn build_bootstrap_token(
     build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, None)
 }
 
+/// Returns whether `text` has the strict RFC 3339 shape.
+///
+/// jiff also reads shorter forms and an RFC 9557 time zone annotation.
+/// Postgres can refuse those. This check keeps the shape that `chrono` read:
+/// a full date, `T`, `t` or a space, a full time, an optional fraction, and
+/// `Z`, `z` or a `+HH:MM` offset.
+fn has_rfc3339_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| {
+        bytes.get(range).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+    };
+    let at = |index: usize, allowed: &[u8]| bytes.get(index).is_some_and(|b| allowed.contains(b));
+    let head = digits(0..4)
+        && at(4, b"-")
+        && digits(5..7)
+        && at(7, b"-")
+        && digits(8..10)
+        && at(10, b"Tt ")
+        && digits(11..13)
+        && at(13, b":")
+        && digits(14..16)
+        && at(16, b":")
+        && digits(17..19);
+    let Some(mut rest) = bytes.get(19..).filter(|_| head) else {
+        return false;
+    };
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let count = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
+        if count == 0 {
+            return false;
+        }
+        rest = &fraction[count..];
+    }
+    match rest {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 /// [`build_bootstrap_token`] with an optional tenant claim (issue #1977).
 ///
 /// # Errors
@@ -13709,11 +13749,15 @@ pub fn build_bootstrap_token_for_tenant(
     // Validate the expiry up front so we never print an INSERT that Postgres
     // rejects at run time.
     if let Some(e) = expires_at {
-        e.parse::<autumn_harvest::jiff::Timestamp>().map_err(|source| {
+        let invalid = |reason: &dyn std::fmt::Display| {
             CliError::InvalidInput(format!(
-                "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {source}"
+                "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {reason}"
             ))
-        })?;
+        };
+        e.parse::<autumn_harvest::jiff::Timestamp>().map_err(|source| invalid(&source))?;
+        if !has_rfc3339_shape(e) {
+            return Err(invalid(&"it is not in the strict RFC 3339 form"));
+        }
     }
 
     // `id`/`created_at` use the column defaults (gen_random_uuid()/NOW()); every
@@ -17924,7 +17968,7 @@ async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
 }
 
 fn bad_helper() -> i64 {
-    chrono::Utc::now().timestamp()
+    autumn_harvest::chrono::Utc::now().timestamp()
 }
 ";
         let text = format_det_findings_text(&report(src));
@@ -18267,6 +18311,31 @@ mod token_bootstrap_tests {
             !sql.contains(&token.secret),
             "the plaintext secret must not appear in the INSERT SQL: {sql}"
         );
+    }
+
+    /// The expiry check accepts each form that `chrono` read and refuses the
+    /// looser forms that jiff also reads.
+    #[test]
+    fn bootstrap_expiry_keeps_the_strict_rfc3339_shape() {
+        for good in [
+            "2027-01-01T00:00:00Z",
+            "2027-01-01t00:00:00z",
+            "2027-01-01 00:00:00.5+02:00",
+            "2027-01-01T00:00:00.123456789-05:30",
+        ] {
+            assert!(build_bootstrap_token("n", "read", Some(good), "op").is_ok(), "{good}");
+        }
+        for bad in [
+            "2027-01-01T00:00Z",
+            "2027-01-01T00Z",
+            "2027-01-01T00:00:00+02",
+            "2027-01-01T00:00:00Z[UTC]",
+            "2027-01-01T00:00:00.Z",
+            "2027-01-01T00:00:00",
+            "2027-02-30T00:00:00Z",
+        ] {
+            assert!(build_bootstrap_token("n", "read", Some(bad), "op").is_err(), "{bad}");
+        }
     }
 
     /// `--scope` defaults to `admin` (a seed must be able to mint others) and

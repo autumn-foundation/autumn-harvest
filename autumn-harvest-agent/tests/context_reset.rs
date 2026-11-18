@@ -862,7 +862,8 @@ async fn a_reset_in_a_followup_segment_keeps_the_followup_call() {
     let exec = sqlite::start(&mut rt, &task).unwrap();
     let waiting = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(waiting, RunState::WaitingTimer), "{waiting:?}");
-    let later = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(120);
+    let later = autumn_harvest::jiff::Timestamp::now()
+        + autumn_harvest::jiff::SignedDuration::from_secs(120);
     let report = report(rt.run_until_blocked_as_of(exec, later).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::Completed);
@@ -920,7 +921,8 @@ async fn a_reset_keeps_the_steers_of_the_op() {
     );
     sqlite::send(&mut rt, &agent, &steer, Some("s-1")).unwrap();
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
-    let later = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(60);
+    let later = autumn_harvest::jiff::Timestamp::now()
+        + autumn_harvest::jiff::SignedDuration::from_secs(60);
     rt.run_until_blocked_as_of(exec, later).await.unwrap();
     sqlite::drive(&mut rt, &agent).await.unwrap();
 
@@ -1641,7 +1643,8 @@ async fn a_full_round_reset_keeps_the_steers_of_the_op() {
     );
     sqlite::send(&mut rt, &agent, &steer, Some("s-1")).unwrap();
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
-    let later = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(60);
+    let later = autumn_harvest::jiff::Timestamp::now()
+        + autumn_harvest::jiff::SignedDuration::from_secs(60);
     rt.run_until_blocked_as_of(exec, later).await.unwrap();
     sqlite::drive(&mut rt, &agent).await.unwrap();
 

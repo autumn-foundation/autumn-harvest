@@ -38,9 +38,9 @@ use autumn_harvest::overlay_log::{
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
+use autumn_harvest::time::Timestamp;
 #[cfg(feature = "sqlite")]
 pub use autumn_harvest_sqlite::SqliteConnector;
-use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

@@ -13,7 +13,6 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use jiff::Timestamp;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::{Reply, ScriptedModel, answer, calls, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -219,7 +219,7 @@ async fn a_tick_without_memory_writes_cannot_edit_the_state_memory() {
         sqlite::send(&mut rt, &agent(), &AgentOp::Control(Control::Resume), None).unwrap();
         let exec = sqlite::current_run(&rt, &agent()).unwrap().unwrap();
         rt.run_until_blocked_as_of(exec, start).await.unwrap();
-        let later = start + jiff::SignedDuration::from_secs(90);
+        let later = start + SignedDuration::from_secs(90);
         rt.run_until_blocked_as_of(exec, later).await.unwrap();
 
         let state = state_of(&rt, &agent()).await;

@@ -82,7 +82,7 @@ async fn report_info(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
         "is_local": info.is_local,
         "queue_name": info.queue_name,
         "task_id": info.task_id.map(|id| id.to_string()),
-        "deadline": ctx.deadline().map(|d| autumn_harvest::time::rfc3339(d)),
+        "deadline": ctx.deadline().map(autumn_harvest::time::rfc3339),
         "idempotency_key": ctx.idempotency_key().map_err(|e| e.to_string())?.as_str(),
         "cancelled": ctx.is_cancelled(),
     }))
@@ -150,7 +150,7 @@ async fn the_deadline_is_on_the_real_clock_under_a_simulated_drive() {
     let exec = rt.start_workflow("info_flow", json!(1)).unwrap();
 
     let before = Timestamp::now();
-    let epoch = Timestamp::from_second(0).ok().unwrap();
+    let epoch = Timestamp::from_second(0).unwrap();
     let report = match rt.run_until_blocked_as_of(exec, epoch).await.unwrap() {
         RunState::Completed(v) => v,
         other => panic!("the run must complete, got {other:?}"),

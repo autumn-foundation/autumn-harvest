@@ -31,7 +31,6 @@
 //! [`EvalError::Unsupported`].
 
 use std::collections::BTreeSet;
-use autumn_harvest::time::Timestamp;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExecutionId;
@@ -364,7 +363,8 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-        use serde_json::json;
+    use autumn_harvest::time::Timestamp;
+    use serde_json::json;
 
     use super::*;
     use crate::draw::{Draw, DrawId};

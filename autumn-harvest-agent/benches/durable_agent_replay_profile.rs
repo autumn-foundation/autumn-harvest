@@ -287,7 +287,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 /// Record `n` ops of `shape` with `WorkflowTestEnv`, one op per drive.
 fn record(rt: &tokio::runtime::Runtime, shape: Shape, n: usize, result_bytes: usize) -> Recording {
-    let anchor = jiff::Timestamp::from_second(1_790_000_000).ok().expect("a fixed time");
+    let anchor = jiff::Timestamp::from_second(1_790_000_000).expect("a fixed time");
     let env = WorkflowTestEnv::new()
         .with_frozen_anchor(anchor)
         .with_workflow_id(AGENT_ID)

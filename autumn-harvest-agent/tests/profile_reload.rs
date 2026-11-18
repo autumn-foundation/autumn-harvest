@@ -10,7 +10,6 @@
 mod common;
 
 use std::path::PathBuf;
-use jiff::Timestamp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionFilter, ExecutionSummary, RunState, SqliteRuntime};
 use common::{ScriptedModel, answer, runtime};
+use jiff::Timestamp;
 use serde_json::json;
 
 const OLD: &str = "You are the old prompt.";

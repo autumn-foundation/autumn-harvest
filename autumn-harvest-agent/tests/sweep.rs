@@ -13,7 +13,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use jiff::Timestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,6 +33,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{MemStore, TryFnModel, answer, runtime};
 use futures::FutureExt as _;
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "researcher";
@@ -110,7 +110,7 @@ fn sweep_report(state: RunState) -> SweepReport {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-        rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 

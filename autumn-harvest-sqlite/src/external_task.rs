@@ -225,9 +225,10 @@ pub struct Task {
 
 /// The latest deadline that a handoff stores, in epoch milliseconds.
 ///
-/// A longer deadline saturates to it. A later instant has no `Timestamp`
-/// form. A row that `chrono` wrote can hold the old, later sentinel of the
-/// year 262142. Its read clamps it to [`Timestamp::MAX`].
+/// A longer deadline saturates to it. It is the millisecond of
+/// [`Timestamp::MAX`]. A row that `chrono` wrote can hold the later sentinel
+/// of the year 262142. A read clamps each stored deadline to
+/// [`Timestamp::MAX`], so both rows load.
 fn latest_deadline() -> i64 {
     Timestamp::MAX.as_millisecond()
 }
@@ -575,7 +576,10 @@ mod tests {
     fn a_deadline_stays_in_the_datetime_range() {
         assert_eq!(bounded_deadline(i64::MAX), latest_deadline());
         assert_eq!(bounded_deadline(5), 5);
-        assert_eq!(jiff::Timestamp::from_millisecond(latest_deadline()).ok(), Some(jiff::Timestamp::MAX));
+        let read = autumn_harvest::time::from_millisecond_clamped;
+        assert_eq!(read(latest_deadline()), jiff::Timestamp::MAX);
+        // The sentinel that `chrono` stored, `MAX_UTC` in milliseconds.
+        assert_eq!(read(8_210_266_876_799_999), jiff::Timestamp::MAX);
     }
 
     #[test]

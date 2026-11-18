@@ -14,7 +14,6 @@
 mod common;
 
 use std::path::PathBuf;
-use jiff::Timestamp;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +28,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, answer, calls, recorded_tool, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 const NOTICE_ACTIVITY: &str = "agent_approval_notice";
@@ -124,7 +124,7 @@ async fn settle(rt: &mut SqliteRuntime, agent: &AgentId) -> Option<RunState> {
             break;
         }
         let exec = sqlite::current_run(rt, agent).unwrap().unwrap();
-        let at = Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(pass * 5);
+        let at = Timestamp::now() + SignedDuration::from_secs(pass * 5);
         rt.run_until_blocked_as_of(exec, at).await.unwrap();
         state = sqlite::drive(rt, agent).await.unwrap();
     }
@@ -248,7 +248,7 @@ async fn a_gated_call_on_an_agent_sends_one_notice_that_decide_accepts() {
         notice.key(),
         format!("{}:{exec}:{signal}", notice.call.run_id.as_str())
     );
-    let window = autumn_harvest::jiff::SignedDuration::from_secs(600);
+    let window = SignedDuration::from_secs(600);
     assert!(notice.deadline >= before + window, "{notice:?}");
     assert!(notice.deadline <= after + window, "{notice:?}");
     assert!(recorder.runs().is_empty(), "the notice releases nothing");
@@ -434,7 +434,7 @@ async fn a_failed_notice_and_no_decision_deny_the_call() {
 
     // Nobody decides. The 600 s deadline passes.
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
-    let late = Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(601);
+    let late = Timestamp::now() + SignedDuration::from_secs(601);
     rt.run_until_blocked_as_of(exec, late).await.unwrap();
 
     assert!(recorder.runs().is_empty(), "a timeout runs nothing");
@@ -547,7 +547,7 @@ async fn a_decision_during_the_notice_releases_an_agent_loop_call() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = start + autumn_harvest::jiff::SignedDuration::from_secs(pass * 5);
+        let at = start + SignedDuration::from_secs(pass * 5);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");

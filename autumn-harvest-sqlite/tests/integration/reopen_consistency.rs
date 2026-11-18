@@ -177,7 +177,7 @@ fn assert_reopen_consistent(rt: &SqliteRuntime, path: &Path, exec: ExecutionId) 
 async fn reopen_consistency_across_every_persist_site() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("harvest.sqlite3");
-    let t0: Timestamp = Timestamp::from_second(2_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(2_000_000).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
 
     // Stage 1 — start (execution row + WorkflowStarted, one transaction).

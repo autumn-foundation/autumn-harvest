@@ -316,7 +316,7 @@ async fn double_timer_same_id(ctx: &WorkflowContext, _n: i64) -> Result<String, 
 #[tokio::test]
 async fn reused_timer_id_fires_again_after_a_prior_fire() {
     let (_dir, path) = temp_db();
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
 
     let exec;
     {

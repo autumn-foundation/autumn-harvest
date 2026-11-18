@@ -9,7 +9,6 @@
 mod common;
 
 use std::path::PathBuf;
-use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{ScriptedModel, TryFnModel, answer, calls, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -57,7 +57,7 @@ async fn say(rt: &mut SqliteRuntime, agent: &AgentId, text: &str) -> AgentState 
     let mut at = Timestamp::now();
     for _ in 0..5 {
         drive_at(rt, agent, at).await;
-        at += jiff::SignedDuration::from_mins(5);
+        at += SignedDuration::from_mins(5);
     }
     state(rt, agent).await
 }
@@ -419,14 +419,14 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
         .workspace
         .expect("the op saved a snapshot");
 
-    drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_secs(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
     let ticked = state(&rt, &agent).await;
     assert_eq!(ticked.ticks, 1);
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the tick ran the tool");
     assert_eq!(ticked.workspace, Some(head), "the tick keeps the head");
 
     sqlite::send(&mut rt, &agent, &AgentOp::message("read it"), None).unwrap();
-    drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_secs(100)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(100)).await;
     let results = tool_results(&state(&rt, &agent).await);
     assert!(
         results
@@ -533,7 +533,7 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
     let mut rt = runtime(&db, harness(model, store, &runs));
     let now = Timestamp::now();
     // The first life runs on a clock that is an hour fast.
-    let fast = now + jiff::SignedDuration::from_hours(1);
+    let fast = now + SignedDuration::from_hours(1);
     sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
     drive_at(&mut rt, &agent, fast).await;
     let scope = WorkspaceMount::agent_scope(agent.as_str());

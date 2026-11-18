@@ -10,7 +10,6 @@
 mod common;
 
 use std::path::PathBuf;
-use jiff::Timestamp;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionFilter, RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, answer, calls, recorded_tool, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -124,7 +124,7 @@ async fn a_thousand_agents_tick_on_their_own_intervals() {
     // Each pass moves the drive clock one minute and wakes each agent once.
     // The half-minute offset keeps each deadline clear of a pass.
     for pass in 1..=PASSES {
-        let at = start + jiff::SignedDuration::from_secs(60 * pass + 30);
+        let at = start + SignedDuration::from_secs(60 * pass + 30);
         for (exec, _) in &agents {
             rt.run_until_blocked_as_of(*exec, at).await.unwrap();
         }
@@ -179,7 +179,7 @@ async fn an_unattended_tick_cannot_run_a_write_tool() {
         let start = Timestamp::now();
         sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
         drive_at(&mut rt, &agent, start).await;
-        drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_secs(90)).await;
+        drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
         let state = state(&rt, &agent).await;
         assert_eq!(state.ticks, 1);
         assert_eq!(
@@ -211,7 +211,7 @@ async fn a_restart_during_a_wait_ticks_once_and_reports_once() {
     // The process stops while the agent waits on its timer.
     drop(rt);
 
-    let later = start + jiff::SignedDuration::from_secs(90);
+    let later = start + SignedDuration::from_secs(90);
     let mut rt = runtime(&db, harness(&delivery));
     drive_at(&mut rt, &agent, later).await;
     // A second drive and a second restart at the same time change nothing.
@@ -290,7 +290,7 @@ async fn the_followup_chain_cap_holds_across_checkpoints() {
     sqlite::send(&mut rt, &agent, &AgentOp::message("watch the queue"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     for minutes in [2, 4, 6, 8] {
-        drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_mins(minutes)).await;
+        drive_at(&mut rt, &agent, start + SignedDuration::from_mins(minutes)).await;
     }
     let state = state(&rt, &agent).await;
     assert_eq!(state.chain, 2, "two follow-ups ran");
@@ -419,7 +419,7 @@ async fn a_message_waits_for_a_tick_that_runs() {
     sqlite::send(&mut rt, &agent, &AgentOp::message("start"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     // The tick is due, and a message waits. The tick runs first and whole.
-    let later = start + jiff::SignedDuration::from_millis(1_500);
+    let later = start + SignedDuration::from_millis(1_500);
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
     let hello = Agent::payload(&AgentOp::message("hello"));
     rt.send_signal_as_of(exec, ENTITY_OP_SIGNAL, hello, later)
@@ -536,7 +536,7 @@ async fn a_tick_books_the_next_tick_one_interval_after_its_end() {
     let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
-    drive_at(&mut rt, &agent, start + jiff::SignedDuration::from_secs(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
 
     let state = state(&rt, &agent).await;
     assert_eq!(state.ticks, 1);
@@ -583,7 +583,7 @@ async fn a_followup_is_due_one_delay_after_its_segment_ends() {
     };
 
     // The segment resumes two minutes after it started.
-    let resumed = start + jiff::SignedDuration::from_mins(2);
+    let resumed = start + SignedDuration::from_mins(2);
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
     sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
     drive_at(&mut rt, &agent, resumed).await;
@@ -598,7 +598,7 @@ async fn a_followup_is_due_one_delay_after_its_segment_ends() {
         due - resumed.as_millisecond()
     );
 
-    drive_at(&mut rt, &agent, resumed + jiff::SignedDuration::from_mins(1)).await;
+    drive_at(&mut rt, &agent, resumed + SignedDuration::from_mins(1)).await;
     let ran = state(&rt, &agent).await;
     assert_eq!(ran.chain, 1, "the follow-up runs at its delay");
     assert_eq!(ran.last_answer.as_deref(), Some("checked"));

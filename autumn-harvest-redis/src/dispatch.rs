@@ -84,6 +84,7 @@ use redis::{AsyncCommands, FromRedisValue, RedisError, Script};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::envelope::due_after;
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{
     dispatch_delayed_key, dispatch_marker_key, dispatch_marker_prefix, dispatch_payloads_key,
@@ -1164,13 +1165,10 @@ impl RedisDispatch {
             .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
             .unwrap_or_else(|| DispatchRef::from_lease(lease));
         reference.redeliveries = lease.redeliveries.saturating_add(1);
-        let chrono_delay = jiff::SignedDuration::try_from(delay).map_err(|err| {
-            RedisAdapterError::DurationOutOfRange(format!("release delay: {err}"))
-        })?;
+        let due = due_after(Timestamp::now(), delay, "release delay")?;
         // `scheduled_at` stays the row's due time. Only the delivery time
         // moves, so a reconcile republish does not disturb the backoff (C1).
-        self.requeue(&lease.handle, &reference, Timestamp::now() + chrono_delay)
-            .await
+        self.requeue(&lease.handle, &reference, due).await
     }
 
     /// Drop several leases at once, one round trip per distinct queue in the
@@ -1284,14 +1282,10 @@ impl RedisDispatch {
                 .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
                 .unwrap_or_else(|| DispatchRef::from_lease(lease));
             reference.redeliveries = lease.redeliveries.saturating_add(1);
-            match jiff::SignedDuration::try_from(*delay) {
-                Ok(chrono_delay) => {
-                    entries.push((lease.handle.clone(), reference, now + chrono_delay));
-                }
+            match due_after(now, *delay, "release delay") {
+                Ok(due) => entries.push((lease.handle.clone(), reference, due)),
                 Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        RedisAdapterError::DurationOutOfRange(format!("release delay: {error}"))
-                    });
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -1976,8 +1970,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
             queue_name: "q".to_string(),
-            scheduled_at: ("2026-09-07T12:00:00Z").parse::<Timestamp>()
-                .unwrap(),
+            scheduled_at: "2026-09-07T12:00:00Z".parse().unwrap(),
             priority: 0,
             shard: None,
             kind: None,
@@ -1994,8 +1987,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
             queue_name: "q".to_string(),
-            scheduled_at: ("2026-09-07T12:00:00Z").parse::<Timestamp>()
-                .unwrap(),
+            scheduled_at: "2026-09-07T12:00:00Z".parse().unwrap(),
             priority: 0,
             shard: None,
             kind: None,

@@ -71,7 +71,7 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
 #[tokio::test]
 async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_timer() {
     let (_dir, path) = temp_db();
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&approval_gate_info());
@@ -147,7 +147,7 @@ async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_time
 async fn wait_for_signal_timeout_deadline_wins_returns_none() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     // Block on the signal (timer not yet due).
@@ -201,7 +201,7 @@ fn event_pos(history: &[WorkflowEvent], pred: impl Fn(&WorkflowEvent) -> bool) -
 async fn late_signal_does_not_beat_expired_timeout() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     // Block on the signal; the deadline is armed at t0 + 3600.
@@ -264,7 +264,7 @@ async fn on_time_signal_still_wins() {
     // not drive order.
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
@@ -353,7 +353,7 @@ async fn receive_signal_timeout_signal_wins_with_trailing_activity_completes() {
             Ok(json!(input.as_i64().unwrap_or_default()))
         }),
     );
-    let t0: Timestamp = Timestamp::from_second(3_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt
         .start_workflow("typed_approval_then_work", json!(5))
         .unwrap();

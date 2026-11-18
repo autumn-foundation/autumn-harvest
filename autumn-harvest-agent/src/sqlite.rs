@@ -18,6 +18,7 @@ use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
+use autumn_harvest::time::Timestamp;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteReader,
     SqliteResult, SqliteRuntime,
@@ -822,7 +823,8 @@ impl Directory {
                 .executions
                 .first()
                 .and_then(|summary| summary.started_at.value())
-                .map(DateTime::timestamp_millis))
+                .copied()
+                .map(Timestamp::as_millisecond))
         };
         if let Some(started_ms) = newest(&filter.clone().state("RUNNING"))? {
             return Ok(Some(LastPass {
@@ -965,7 +967,10 @@ pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<A
         }
     }
     targets.sort_by(|(_, a), (_, b)| a.as_str().cmp(b.as_str()));
-    let key = format!("reload-profiles:{kind}:{}", Timestamp::now().as_millisecond());
+    let key = format!(
+        "reload-profiles:{kind}:{}",
+        Timestamp::now().as_millisecond()
+    );
     let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
     let mut agents = Vec::with_capacity(targets.len());
     for (exec, id) in targets {

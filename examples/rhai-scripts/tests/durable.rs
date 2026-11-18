@@ -147,7 +147,7 @@ async fn sleep_is_a_durable_timer() {
     let dir = scratch();
     let mut rt = rhai_scripts::open(db(&dir)).expect("open");
     let exec = start(&mut rt, &dir, r#"sleep(60); sh("echo after")"#);
-    let t0 = Timestamp::from_second(1_800_000_000).ok().expect("a time");
+    let t0 = Timestamp::from_second(1_800_000_000).expect("a time");
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.expect("drive");
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");

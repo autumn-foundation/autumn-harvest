@@ -42,7 +42,7 @@ const MINUTE: i64 = 60_000;
 fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
     let clock = clock.clone();
-    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).unwrap());
     rt.register_workflow(&tick_info());
     rt.register_workflow(&hold_info());
     rt

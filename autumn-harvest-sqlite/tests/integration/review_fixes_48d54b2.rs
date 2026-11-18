@@ -52,7 +52,7 @@ async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
     rt.register_workflow(&two_timers_info());
     let exec = rt.start_workflow("two_timers", json!(0)).unwrap();
 
-    let t0: Timestamp = Timestamp::from_second(4_000_000).ok().unwrap();
+    let t0: Timestamp = Timestamp::from_second(4_000_000).unwrap();
     // First pass arms both timers (deadline t0+1) and blocks.
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");

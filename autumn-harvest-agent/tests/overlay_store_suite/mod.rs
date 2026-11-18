@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use autumn_harvest::ExecutionId;
-use jiff::{SignedDuration, Timestamp};
 use autumn_harvest_agent::agent::overlay::apply;
 use autumn_harvest_agent::agent::overlay_store::AutoAdoptOutcome;
 use autumn_harvest_agent::refine::policy::{OverlayPart, RefinePolicy};
@@ -17,6 +16,7 @@ use autumn_harvest_agent::{
     AgentProfile, OverlayError, OverlayStoreError, OverlayValidator, OverlayVersion,
     ProfileOverlay, ProfileOverlayStore, Provenance, Rollback, StoreClock,
 };
+use jiff::{SignedDuration, Timestamp};
 
 /// Makes a store that validates with the given validator.
 pub type MakeStore<'a> =
@@ -598,8 +598,7 @@ pub async fn an_activation_checks_its_actor(make: MakeStore<'_>) {
 
 /// A fixed time in one UTC day, so a cap test never spans midnight.
 fn noon() -> Timestamp {
-    ("2026-11-03T12:00:00Z").parse::<Timestamp>()
-        .expect("time")
+    "2026-11-03T12:00:00Z".parse().expect("time")
 }
 
 fn policy(json: serde_json::Value) -> RefinePolicy {

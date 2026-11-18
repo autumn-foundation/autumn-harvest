@@ -391,10 +391,7 @@ mod tests {
     fn the_deadline_is_now_plus_the_timeout() {
         let now = Timestamp::now();
         let notice = parked(90).notice(now);
-        assert_eq!(
-            notice.deadline,
-            now + SignedDuration::from_secs(90)
-        );
+        assert_eq!(notice.deadline, now + SignedDuration::from_secs(90));
         // A huge timeout saturates. It never wraps to an early deadline.
         let notice = parked(u64::MAX).notice(now);
         assert_eq!(notice.deadline, Timestamp::MAX);

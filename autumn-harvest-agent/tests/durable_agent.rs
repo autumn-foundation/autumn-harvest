@@ -9,7 +9,6 @@
 mod common;
 
 use std::io::Write as _;
-use jiff::Timestamp;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -27,6 +26,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, runtime};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {

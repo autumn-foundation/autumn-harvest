@@ -185,7 +185,7 @@ fn fixture() -> Fixture {
 fn open(db: &std::path::Path, harness: &AgentHarness, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(db).unwrap();
     let read = Arc::clone(clock);
-    rt.set_clock(move || Timestamp::from_millisecond(read.load(Ordering::SeqCst)).ok().unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     sqlite::register(&mut rt, Arc::new(harness.clone()));
     rt
 }
