@@ -18,7 +18,7 @@ autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlit
 # a recorded proposal with a candidate `program.md`. `anthropic` is the
 # Claude model. `openai` reaches any OpenAI-compatible server.
 autumn-harvest-agent = { version = "0.10.0", path = "../../autumn-harvest-agent", features = ["sqlite", "eval", "anthropic", "openai"] }
-chrono = { workspace = true }
+jiff = { workspace = true }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

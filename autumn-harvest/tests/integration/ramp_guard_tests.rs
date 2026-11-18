@@ -1265,7 +1265,7 @@ async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
         .expect("set ramp");
 }
 
-async fn policy_step(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+async fn policy_step(conn: &mut AsyncPgConnection) -> jiff::Timestamp {
     get_build_policy(conn, QUEUE)
         .await
         .expect("read policy")

@@ -20,7 +20,7 @@ use autumn_harvest_sqlite::{
     ExternalActivityToken, ExternalHandoffFilter, ExternalTaskState, RunState, SqliteError,
     SqliteRuntime,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// The epoch-second start of every clock in this file.
@@ -42,13 +42,15 @@ impl Clock {
     fn install(&self, rt: &mut SqliteRuntime) {
         let millis = Arc::clone(&self.0);
         rt.set_clock(move || {
-            DateTime::from_timestamp_millis(millis.load(Ordering::SeqCst)).unwrap_or_default()
+            Timestamp::from_millisecond(millis.load(Ordering::SeqCst))
+                .ok()
+                .unwrap_or_default()
         });
     }
 }
 
-const fn at(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, 0).unwrap()
+const fn at(secs: i64) -> Timestamp {
+    Timestamp::constant(secs, 0)
 }
 
 /// Await one external activity. The input is its deadline in seconds.
@@ -841,7 +843,7 @@ async fn a_purge_removes_the_handoff_rows_of_a_run() {
 
     let purged = rt
         .purge_terminal_as_of(
-            Utc::now() + chrono::Duration::hours(2),
+            Timestamp::now() + jiff::SignedDuration::from_hours(2),
             Duration::from_secs(3600),
         )
         .unwrap();

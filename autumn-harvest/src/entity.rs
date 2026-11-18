@@ -115,7 +115,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -329,7 +329,7 @@ pub struct EntitySnapshot<S> {
 #[non_exhaustive]
 pub struct Wake<O> {
     /// When the op is due.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The op that the loop runs at `at`.
     pub op: O,
 }
@@ -337,7 +337,7 @@ pub struct Wake<O> {
 impl<O> Wake<O> {
     /// A wake that runs `op` at `at`.
     #[must_use]
-    pub const fn new(at: DateTime<Utc>, op: O) -> Self {
+    pub const fn new(at: Timestamp, op: O) -> Self {
         Self { at, op }
     }
 }
@@ -693,8 +693,8 @@ async fn next_step<O>(
 /// The time from `now` to `at`, rounded up to whole milliseconds.
 ///
 /// The result is at least 1 ms, so the race always arms a timer.
-fn time_until(at: DateTime<Utc>, now: DateTime<Utc>) -> std::time::Duration {
-    let delta = (at - now).to_std().unwrap_or_default();
+fn time_until(at: Timestamp, now: Timestamp) -> std::time::Duration {
+    let delta = std::time::Duration::try_from(at - now).unwrap_or_default();
     let millis = delta.as_millis() + u128::from(!delta.subsec_nanos().is_multiple_of(1_000_000));
     std::time::Duration::from_millis(u64::try_from(millis.max(1)).unwrap_or(u64::MAX))
 }
@@ -1786,7 +1786,7 @@ mod tests {
     #[tokio::test]
     async fn the_deadline_probe_and_the_decision_replay_together() {
         let outcome = env_with(&[op(1), op(2), delete()])
-            .with_execution_timeout(chrono::Duration::hours(1))
+            .with_execution_timeout(jiff::SignedDuration::from_hours(1))
             .run(counter, json!({}))
             .await;
         assert_eq!(outcome.result, Ok(json!(3)));
@@ -2450,7 +2450,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2501,7 +2501,7 @@ mod tests {
     fn ticker(
         ctx: &WorkflowContext,
         input: Value,
-        offset: chrono::Duration,
+        offset: jiff::SignedDuration,
         max_ticks: u32,
         max_ops: Option<u64>,
     ) -> BoxedRun<'_> {
@@ -2528,17 +2528,17 @@ mod tests {
 
     /// One wake, one minute after the start of the run.
     fn late_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(1), 1, None)
+        ticker(ctx, input, jiff::SignedDuration::from_mins(1), 1, None)
     }
 
     /// One wake, one minute before the start of the run. It is due at once.
     fn due_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(-1), 1, None)
+        ticker(ctx, input, jiff::SignedDuration::from_mins(-1), 1, None)
     }
 
     /// Two wakes in all, with a checkpoint after each op.
     fn chained_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(1), 2, Some(1))
+        ticker(ctx, input, jiff::SignedDuration::from_mins(1), 2, Some(1))
     }
 
     /// A counter entity on the wake path with a hook that never wakes.
@@ -2790,18 +2790,18 @@ mod tests {
     /// The wait rounds up to whole milliseconds and is at least 1 ms.
     #[test]
     fn the_wait_for_a_wake_rounds_up_to_a_millisecond() {
-        let now = DateTime::UNIX_EPOCH;
-        let wait = |delta: chrono::Duration| time_until(now + delta, now);
+        let now = Timestamp::UNIX_EPOCH;
+        let wait = |delta: jiff::SignedDuration| time_until(now + delta, now);
         let ms = std::time::Duration::from_millis;
-        assert_eq!(wait(chrono::Duration::milliseconds(2)), ms(2));
-        assert_eq!(wait(chrono::Duration::microseconds(1500)), ms(2));
-        assert_eq!(wait(chrono::Duration::nanoseconds(1)), ms(1));
-        assert_eq!(wait(chrono::Duration::zero()), ms(1), "never a zero wait");
+        assert_eq!(wait(jiff::SignedDuration::from_millis(2)), ms(2));
+        assert_eq!(wait(jiff::SignedDuration::from_micros(1500)), ms(2));
+        assert_eq!(wait(jiff::SignedDuration::from_nanos(1)), ms(1));
+        assert_eq!(wait(jiff::SignedDuration::ZERO), ms(1), "never a zero wait");
         assert_eq!(
-            wait(chrono::Duration::seconds(-5)),
+            wait(jiff::SignedDuration::from_secs(-5)),
             ms(1),
             "never a negative wait"
         );
-        assert_eq!(wait(chrono::Duration::days(400)), ms(400 * 86_400_000));
+        assert_eq!(wait(crate::time::days(400)), ms(400 * 86_400_000));
     }
 }

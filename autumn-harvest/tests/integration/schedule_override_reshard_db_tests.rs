@@ -20,6 +20,7 @@
 //! load-bearing: a shard is the pool that it reads. The colocated tests
 //! share one database on purpose.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +31,11 @@ use autumn_harvest::schedule_override::{
 };
 use autumn_harvest::scheduler::{DagCatalog, RegisteredDag, SchedulerMonitor, tick_once_sharded};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -509,15 +512,16 @@ async fn colocated_shards_keep_the_override() {
 async fn schedule_row(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
-) -> Option<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> {
+) -> Option<(uuid::Uuid, Option<jiff::Timestamp>)> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     dsl::harvest_schedules
         .filter(dsl::dag_name.eq(dag_name))
         .select((dsl::id, dsl::next_run_at))
-        .first(conn)
+        .first::<(uuid::Uuid, Option<SqlTimestamp>)>(conn)
         .await
         .optional()
         .expect("read schedule row")
+        .map(|(id, next_run_at)| (id, next_run_at.map(SqlTimestamp::to_jiff)))
 }
 
 /// A pool that two shards share.
@@ -1024,7 +1028,7 @@ async fn a_fenced_carry_writes_nothing() {
 // Issue #2602: a routing change can land while a carry is not settled.
 
 /// The `updated_at` of the override row of `dag_name`, if any.
-async fn version(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<DateTime<Utc>> {
+async fn version(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<Timestamp> {
     get_dag_override(conn, dag_name)
         .await
         .expect("read override")
@@ -1032,26 +1036,27 @@ async fn version(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<DateTim
 }
 
 /// The floor of `dag_name` on this database, if any.
-async fn floor_of(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<DateTime<Utc>> {
+async fn floor_of(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<Timestamp> {
     use autumn_harvest::schema::harvest_schedule_override_receipts::dsl;
     dsl::harvest_schedule_override_receipts
         .filter(dsl::kind.eq("dag"))
         .filter(dsl::name.eq(dag_name))
         .select(dsl::row_updated_at)
-        .first(conn)
+        .first::<SqlTimestamp>(conn)
         .await
         .optional()
         .expect("read the floor")
+        .map(SqlTimestamp::to_jiff)
 }
 
 /// Set the floor of `dag_name` on this database to `at`.
-async fn put_floor(conn: &mut AsyncPgConnection, dag_name: &str, at: DateTime<Utc>) {
+async fn put_floor(conn: &mut AsyncPgConnection, dag_name: &str, at: Timestamp) {
     use autumn_harvest::schema::harvest_schedule_override_receipts::dsl;
     diesel::insert_into(dsl::harvest_schedule_override_receipts)
         .values((
             dsl::kind.eq("dag"),
             dsl::name.eq(dag_name),
-            dsl::row_updated_at.eq(at),
+            dsl::row_updated_at.eq(at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -1450,7 +1455,7 @@ async fn a_set_takes_a_version_above_the_floor() {
     let shards = setup_shards().await;
     let dag = code_dag("future_floor_dag");
     let mut conn = shards.conn(OLD).await;
-    let ahead = Utc::now() + chrono::Duration::hours(1);
+    let ahead = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     put_floor(&mut conn, &dag.name, ahead).await;
     let floor = floor_of(&mut conn, &dag.name).await.expect("a floor");
 
@@ -1467,26 +1472,31 @@ async fn a_set_takes_a_version_above_the_floor() {
         schedule: Some(Some(Schedule::Interval(Duration::from_secs(3600)))),
         ..ScheduleOverridePatch::default()
     };
-    put_floor_over(&mut conn, &dag.name, floor + chrono::Duration::hours(1)).await;
+    put_floor_over(
+        &mut conn,
+        &dag.name,
+        floor + jiff::SignedDuration::from_hours(1),
+    )
+    .await;
     update_dag_override(&mut conn, &dag, &hourly, "ops", None)
         .await
         .expect("replace");
     assert_eq!(
         floor_of(&mut conn, &dag.name).await,
-        Some(floor + chrono::Duration::hours(1)),
+        Some(floor + jiff::SignedDuration::from_hours(1)),
         "the floor keeps its higher value"
     );
 }
 
 /// Replace the floor of `dag_name` on this database with `at`.
-async fn put_floor_over(conn: &mut AsyncPgConnection, dag_name: &str, at: DateTime<Utc>) {
+async fn put_floor_over(conn: &mut AsyncPgConnection, dag_name: &str, at: Timestamp) {
     use autumn_harvest::schema::harvest_schedule_override_receipts::dsl;
     diesel::update(
         dsl::harvest_schedule_override_receipts
             .filter(dsl::kind.eq("dag"))
             .filter(dsl::name.eq(dag_name)),
     )
-    .set(dsl::row_updated_at.eq(at))
+    .set(dsl::row_updated_at.eq(at.to_diesel()))
     .execute(conn)
     .await
     .expect("replace the floor");

@@ -18,7 +18,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::scheduler::compile_dag_catalog;
 use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // The migration-version-uniqueness guard that used to live here was gated
@@ -159,7 +159,7 @@ async fn lowered_handler_replays_linear_dag_all_success() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -213,7 +213,7 @@ async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -269,7 +269,7 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -324,7 +324,7 @@ async fn lowered_handler_propagates_activity_replay_mismatch() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -360,7 +360,7 @@ async fn assert_root_trigger_rule_skips_without_upstreams(
 ) {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -479,7 +479,7 @@ async fn lowered_handler_merges_dag_task_into_object_workflow_input() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -516,7 +516,7 @@ async fn lowered_handler_wraps_scalar_workflow_input_with_conf_and_dag_task() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!("manual-run"),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -731,7 +731,7 @@ async fn lowered_handler_replays_fanout_dag() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -787,7 +787,7 @@ async fn lowered_handler_leaves_queue_empty_when_dag_task_has_no_queue() {
         ExecutionId::new(),
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -915,7 +915,7 @@ async fn condition_false_branch_replays_with_skip_marker() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -994,7 +994,7 @@ async fn condition_true_branch_schedules_activity() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1130,7 +1130,7 @@ async fn condition_flip_is_reported_as_nondeterminism() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1259,7 +1259,7 @@ async fn condition_branch_replay_sweep_1000() {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

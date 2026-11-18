@@ -183,12 +183,16 @@ macro_rules! split_table {
 ///
 /// The generated `build` names every field of the struct. A field that the
 /// lists miss, or a wrong type, fails to compile.
+///
+/// A field whose type has no Diesel impl names a wrapper after `as`, for
+/// example `at: Option<Timestamp> as NullableTimestamp`. The row reads the
+/// wrapper, and `build` converts it to the field type with `From`.
 #[macro_export]
 macro_rules! split_queryable {
     (
         $ty:ty,
-        core $core:ident { $($cf:ident: $ct:ty),* $(,)? },
-        ext $ext:ident { $($ef:ident: $et:ty),* $(,)? }
+        core $core:ident { $($cf:ident: $ct:ty $(as $cw:ty)?),* $(,)? },
+        ext $ext:ident { $($ef:ident: $et:ty $(as $ew:ty)?),* $(,)? }
         $(, embed { $($mf:ident: $mt:ty),* $(,)? })? $(,)?
     ) => {
         impl diesel::Selectable<diesel::pg::Pg> for $ty {
@@ -213,20 +217,50 @@ macro_rules! split_queryable {
 
         impl<__ST> diesel::Queryable<__ST, diesel::pg::Pg> for $ty
         where
-            (($($ct,)*), ($($et,)* $($($mt,)*)?)):
-                diesel::deserialize::FromStaticSqlRow<__ST, diesel::pg::Pg>,
+            (
+                ($($crate::__split_row_ty!($ct $(, $cw)?),)*),
+                ($($crate::__split_row_ty!($et $(, $ew)?),)* $($($mt,)*)?),
+            ): diesel::deserialize::FromStaticSqlRow<__ST, diesel::pg::Pg>,
         {
-            type Row = (($($ct,)*), ($($et,)* $($($mt,)*)?));
+            type Row = (
+                ($($crate::__split_row_ty!($ct $(, $cw)?),)*),
+                ($($crate::__split_row_ty!($et $(, $ew)?),)* $($($mt,)*)?),
+            );
 
             fn build(row: Self::Row) -> diesel::deserialize::Result<Self> {
                 let (($($cf,)*), ($($ef,)* $($($mf,)*)?)) = row;
                 Ok(Self {
-                    $($cf,)*
-                    $($ef,)*
+                    $($cf: $crate::__split_from_row!($cf $(, $cw)?),)*
+                    $($ef: $crate::__split_from_row!($ef $(, $ew)?),)*
                     $($($mf,)*)?
                 })
             }
         }
+    };
+}
+
+/// The row type of one `split_queryable!` field: its wrapper, if it names
+/// one, else the field type.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __split_row_ty {
+    ($field:ty) => {
+        $field
+    };
+    ($field:ty, $wrapper:ty) => {
+        $wrapper
+    };
+}
+
+/// Converts one `split_queryable!` row value to its field type.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __split_from_row {
+    ($value:ident) => {
+        $value
+    };
+    ($value:ident, $wrapper:ty) => {
+        ::core::convert::From::<$wrapper>::from($value)
     };
 }
 
@@ -246,6 +280,12 @@ macro_rules! split_queryable {
 /// left out of an insert by mistake.
 ///
 /// The impl covers `&Struct` only. Pass a reference, or a slice for a batch.
+///
+/// A field whose type has no Diesel impl names a wrapper after `as`, for
+/// example `at: Option<Timestamp> as crate::time::sql::SqlTimestamp`. The view then
+/// holds the wrapper by value, converted with `From`. For an `Option` field,
+/// name the wrapper of the inner value. The view field is then
+/// `Option<Wrapper>`, so `None` still inserts `DEFAULT`.
 #[macro_export]
 macro_rules! split_insertable {
     (
@@ -261,7 +301,7 @@ macro_rules! split_insertable {
             use super::*;
 
             $crate::split_insertable!(
-                @view $ty, $a, CoreInsert, $core, [], [], [], [], { $ext { $($efields)* } },
+                @view $ty, $a, CoreInsert, $core, [], [], [], [], [], [], { $ext { $($efields)* } },
                 $($cfields)*
             );
 
@@ -284,47 +324,71 @@ macro_rules! split_insertable {
     };
 
     // Each step moves one field into the view. A plain field and an `Option`
-    // field borrow differently, so each kind has its own list. The fourth
-    // list carries the field names of the core view into the extension view.
+    // field borrow differently, so each kind has its own list. A field with a
+    // wrapper converts instead, in two more lists. The last list carries the
+    // field names of the core view into the extension view.
     (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
-        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*], [$($done:ident)*], $next:tt,
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*], $next:tt,
+        $name:ident: Option<$inner:ty> as $wrapper:ty, $($rest:tt)*) => {
+        $crate::split_insertable!(@view $ty, $a, $view, $table,
+            [$($field)* $name: Option<$wrapper>,], [$($plain)*], [$($opt)*],
+            [$($conv)*], [$($copt)* $name], [$($done)*], $next, $($rest)*);
+    };
+    (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*], $next:tt,
+        $name:ident: $kind:ty as $wrapper:ty, $($rest:tt)*) => {
+        $crate::split_insertable!(@view $ty, $a, $view, $table,
+            [$($field)* $name: $wrapper,], [$($plain)*], [$($opt)*],
+            [$($conv)* $name], [$($copt)*], [$($done)*], $next, $($rest)*);
+    };
+    (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*], $next:tt,
         $name:ident: Option<$inner:ty>, $($rest:tt)*) => {
         $crate::split_insertable!(@view $ty, $a, $view, $table,
             [$($field)* $name: Option<&'r $inner>,], [$($plain)*], [$($opt)* $name],
-            [$($done)*], $next, $($rest)*);
+            [$($conv)*], [$($copt)*], [$($done)*], $next, $($rest)*);
     };
     (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
-        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*], [$($done:ident)*], $next:tt,
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*], $next:tt,
         $name:ident: $kind:ty, $($rest:tt)*) => {
         $crate::split_insertable!(@view $ty, $a, $view, $table,
             [$($field)* $name: &'r $kind,], [$($plain)* $name], [$($opt)*],
-            [$($done)*], $next, $($rest)*);
+            [$($conv)*], [$($copt)*], [$($done)*], $next, $($rest)*);
     };
     // The core view is complete. Start the extension view.
     (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
-        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*], [$($done:ident)*],
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*],
         { $ext:ident { $($efields:tt)* } },) => {
         $crate::split_insertable!(@struct $ty, $a, $view, $table,
-            [$($field)*], [$($plain)*], [$($opt)*]);
-        $crate::split_insertable!(@view $ty, $a, ExtInsert, $ext, [], [], [],
-            [$($done)* $($plain)* $($opt)*], {}, $($efields)*);
+            [$($field)*], [$($plain)*], [$($opt)*], [$($conv)*], [$($copt)*]);
+        $crate::split_insertable!(@view $ty, $a, ExtInsert, $ext, [], [], [], [], [],
+            [$($done)* $($plain)* $($opt)* $($conv)* $($copt)*], {}, $($efields)*);
     };
     // The extension view is complete. Check that the lists cover the struct.
     (@view $ty:ident, $a:lifetime, $view:ident, $table:ident,
-        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*], [$($done:ident)*], {},) => {
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*], [$($done:ident)*], {},) => {
         $crate::split_insertable!(@struct $ty, $a, $view, $table,
-            [$($field)*], [$($plain)*], [$($opt)*]);
+            [$($field)*], [$($plain)*], [$($opt)*], [$($conv)*], [$($copt)*]);
 
         /// Fails to compile when the struct has a field that no list names.
         /// rustc reports that as "pattern requires `..` due to inaccessible
         /// fields". Add the field to the core or the extension list.
         #[allow(dead_code)]
         const fn every_field_is_inserted(row: &$ty<'_>) {
-            let $ty { $($done: _,)* $($plain: _,)* $($opt: _,)* } = row;
+            let $ty {
+                $($done: _,)* $($plain: _,)* $($opt: _,)* $($conv: _,)* $($copt: _,)*
+            } = row;
         }
     };
     (@struct $ty:ident, $a:lifetime, $view:ident, $table:ident,
-        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*]) => {
+        [$($field:tt)*], [$($plain:ident)*], [$($opt:ident)*],
+        [$($conv:ident)*], [$($copt:ident)*]) => {
         /// The columns of one declaration, borrowed from a row to insert.
         #[derive(diesel::Insertable)]
         #[diesel(table_name = $table)]
@@ -337,10 +401,15 @@ macro_rules! split_insertable {
 
         impl<'r, $a> $view<'r, $a> {
             /// Borrow the columns of this declaration from `row`.
-            const fn view(row: &'r $ty<$a>) -> Self {
+            // A view with a converted column calls `From::from`, which is not
+            // `const`. A view without one could be `const`, so the lint fires.
+            #[allow(clippy::missing_const_for_fn)]
+            fn view(row: &'r $ty<$a>) -> Self {
                 Self {
                     $($plain: &row.$plain,)*
                     $($opt: row.$opt.as_ref(),)*
+                    $($conv: ::core::convert::From::from(row.$conv),)*
+                    $($copt: row.$copt.map(::core::convert::From::from),)*
                     row: ::core::marker::PhantomData,
                 }
             }

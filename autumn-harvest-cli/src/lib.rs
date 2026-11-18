@@ -2096,8 +2096,8 @@ enum ShardCommand {
         /// `next_scan_cursor`. Without this, a shard whose oldest rows are
         /// permanently blocked (an active session, a parked child) makes
         /// every repeated call re-examine the same rows forever.
-        #[arg(long, requires = "after_execution_id")]
-        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        #[arg(long, requires = "after_execution_id", value_parser = autumn_harvest::time::parse::relaxed)]
+        after_created_at: Option<jiff::Timestamp>,
         /// See `--after-created-at`; both must be supplied together.
         #[arg(long, requires = "after_created_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
@@ -2168,8 +2168,8 @@ enum ShardCommand {
         /// this, a shard whose oldest seals are permanently still-live or
         /// unreachable makes every repeated call re-examine the same rows
         /// forever. Copy both fields verbatim from a prior run's resume hint.
-        #[arg(long, requires = "after_execution_id")]
-        after_migrated_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        #[arg(long, requires = "after_execution_id", value_parser = autumn_harvest::time::parse::relaxed)]
+        after_migrated_at: Option<jiff::Timestamp>,
         /// See `--after-migrated-at`; both must be supplied together.
         #[arg(long, requires = "after_migrated_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
@@ -6841,7 +6841,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                 "{}",
                 autumn_harvest::partition::migration_plan(
                     &opts,
-                    autumn_harvest::chrono::Utc::now()
+                    autumn_harvest::jiff::Timestamp::now()
                 )
             );
             Ok(())
@@ -6946,7 +6946,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                     // straggler delete.
                     match autumn_harvest::partition::evaluate(
                         &mut conn,
-                        autumn_harvest::chrono::Utc::now(),
+                        autumn_harvest::jiff::Timestamp::now(),
                         &autumn_harvest::partition::SweepOptions::default(),
                         None,
                     )
@@ -7095,7 +7095,7 @@ async fn run_partition_maintain(
                 autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
             autumn_harvest::partition::maintain(
                 &mut conn,
-                autumn_harvest::chrono::Utc::now(),
+                autumn_harvest::jiff::Timestamp::now(),
                 lookahead_cohorts,
                 &sweep,
                 None,
@@ -7226,9 +7226,9 @@ fn emit_partition_report(
                             "    {:<40} {} .. {}",
                             p.name,
                             p.lower
-                                .map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
+                                .map_or_else(|| "MINVALUE".into(), autumn_harvest::time::rfc3339),
                             p.upper
-                                .map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
+                                .map_or_else(|| "MAXVALUE".into(), autumn_harvest::time::rfc3339),
                         );
                     }
                 }
@@ -11419,7 +11419,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                         "reconciled": reconciled,
                         "failures": failures,
                         "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
-                            "migrated_at": at.to_rfc3339(),
+                            "migrated_at": autumn_harvest::time::rfc3339(at),
                             "execution_id": id.as_uuid(),
                         })),
                     }))
@@ -11434,7 +11434,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                     println!(
                         "more may remain past this window; resume with:\n  \
                          --after-migrated-at {} --after-execution-id {}",
-                        at.to_rfc3339(),
+                        autumn_harvest::time::rfc3339(at),
                         id.as_uuid()
                     );
                 }
@@ -11478,7 +11478,7 @@ fn format_rebalance_report(
             out,
             "more may remain past this window; resume with:\n  \
              --after-created-at {} --after-execution-id {}",
-            at.to_rfc3339(),
+            autumn_harvest::time::rfc3339(at),
             id.as_uuid()
         );
     }
@@ -13685,6 +13685,57 @@ pub fn build_bootstrap_token(
     build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, None)
 }
 
+/// Returns whether `text` has the strict RFC 3339 shape.
+///
+/// jiff also reads shorter forms and an RFC 9557 time zone annotation.
+/// Postgres can refuse those. This check keeps the shape that `chrono` read.
+/// That shape is a full date, `T`, `t` or a space, a full time, an optional
+/// fraction, and `Z`, `z` or a `+HH:MM` offset. Like `chrono`, it refuses an offset hour
+/// past 23 and an offset minute past 59. jiff reads an offset hour up to 25.
+///
+/// One difference from `chrono` is deliberate. `chrono` also read a U+2212
+/// minus sign in the offset. This check refuses it, because Postgres gets
+/// the raw text and does not read that sign.
+fn has_rfc3339_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| {
+        bytes
+            .get(range)
+            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+    };
+    let at = |index: usize, allowed: &[u8]| bytes.get(index).is_some_and(|b| allowed.contains(b));
+    let head = digits(0..4)
+        && at(4, b"-")
+        && digits(5..7)
+        && at(7, b"-")
+        && digits(8..10)
+        && at(10, b"Tt ")
+        && digits(11..13)
+        && at(13, b":")
+        && digits(14..16)
+        && at(16, b":")
+        && digits(17..19);
+    let Some(mut rest) = bytes.get(19..).filter(|_| head) else {
+        return false;
+    };
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let count = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
+        if count == 0 {
+            return false;
+        }
+        rest = &fraction[count..];
+    }
+    match rest {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) =>
+        {
+            (h1 - b'0') * 10 + (h2 - b'0') <= 23 && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
+        _ => false,
+    }
+}
+
 /// [`build_bootstrap_token`] with an optional tenant claim (issue #1977).
 ///
 /// # Errors
@@ -13709,11 +13760,18 @@ pub fn build_bootstrap_token_for_tenant(
     // Validate the expiry up front so we never print an INSERT that Postgres
     // rejects at run time.
     if let Some(e) = expires_at {
-        autumn_harvest::chrono::DateTime::parse_from_rfc3339(e).map_err(|source| {
+        let invalid = |reason: &dyn std::fmt::Display| {
             CliError::InvalidInput(format!(
-                "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {source}"
+                "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {reason}"
             ))
-        })?;
+        };
+        // This parse reads what `chrono` read, such as a fraction of more than
+        // 9 digits or a year 9999 instant past the jiff range. Postgres still
+        // receives the raw text.
+        autumn_harvest::time::parse::rfc3339(e).map_err(|source| invalid(&source))?;
+        if !has_rfc3339_shape(e) {
+            return Err(invalid(&"it is not in the strict RFC 3339 form"));
+        }
     }
 
     // `id`/`created_at` use the column defaults (gen_random_uuid()/NOW()); every
@@ -18267,6 +18325,94 @@ mod token_bootstrap_tests {
             !sql.contains(&token.secret),
             "the plaintext secret must not appear in the INSERT SQL: {sql}"
         );
+    }
+
+    /// The expiry check accepts each form that `chrono` read and refuses the
+    /// looser forms that jiff also reads.
+    #[test]
+    fn bootstrap_expiry_keeps_the_strict_rfc3339_shape() {
+        for good in [
+            "2027-01-01T00:00:00Z",
+            "2027-01-01t00:00:00z",
+            "2027-01-01 00:00:00.5+02:00",
+            "2027-01-01T00:00:00.123456789-05:30",
+        ] {
+            assert!(
+                build_bootstrap_token("n", "read", Some(good), "op").is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "2027-01-01T00:00Z",
+            "2027-01-01T00Z",
+            "2027-01-01T00:00:00+02",
+            "2027-01-01T00:00:00Z[UTC]",
+            "2027-01-01T00:00:00.Z",
+            "2027-01-01T00:00:00",
+            "2027-02-30T00:00:00Z",
+        ] {
+            assert!(
+                build_bootstrap_token("n", "read", Some(bad), "op").is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `--after-created-at` reads the `chrono` display form, as the `chrono`
+    /// argument type did.
+    #[test]
+    fn rebalance_cursor_reads_the_chrono_display_form() {
+        let cli = Cli::try_parse_from([
+            "harvest",
+            "shard",
+            "rebalance",
+            "--shard",
+            "1=postgres://a",
+            "--from",
+            "1",
+            "--to",
+            "2",
+            "--after-created-at",
+            "2026-12-01 09:00:00 UTC",
+            "--after-execution-id",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .expect("the chrono display form should parse");
+        let Commands::Shard {
+            command: ShardCommand::Rebalance {
+                after_created_at, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected shard rebalance");
+        };
+        let expected = "2026-12-01T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(after_created_at, Some(expected));
+    }
+
+    /// The expiry check accepts and refuses what `chrono` `parse_from_rfc3339` did.
+    /// It also refuses a U+2212 offset sign, which Postgres does not read.
+    #[test]
+    fn bootstrap_expiry_keeps_the_chrono_accepted_set() {
+        for good in [
+            "2027-01-01T00:00:00.1234567890Z",
+            "9999-12-31T23:59:59Z",
+            "2027-01-01T00:00:00+23:59",
+        ] {
+            let token = build_bootstrap_token("n", "read", Some(good), "op");
+            assert!(token.is_ok_and(|t| t.insert_sql.contains(good)), "{good}");
+        }
+        for bad in [
+            "2027-01-01T00:00:00+24:30",
+            "2027-01-01T00:00:00+25:00",
+            "2027-01-01T00:00:00+01:60",
+            "2027-01-01T00:00:00\u{2212}05:00",
+        ] {
+            assert!(
+                build_bootstrap_token("n", "read", Some(bad), "op").is_err(),
+                "{bad}"
+            );
+        }
     }
 
     /// `--scope` defaults to `admin` (a seed must be able to mint others) and

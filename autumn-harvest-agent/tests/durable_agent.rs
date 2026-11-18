@@ -14,7 +14,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
@@ -27,6 +26,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, runtime};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -549,7 +549,7 @@ impl MeshSpend for SpentBudget {
     fn spent<'a>(
         &'a self,
         _mesh: &'a str,
-        _since: DateTime<Utc>,
+        _since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         let spend = if read <= self.max_reads {

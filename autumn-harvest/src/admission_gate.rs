@@ -94,7 +94,7 @@
 //! [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
 //! accepting the gate.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::fmt;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -216,9 +216,9 @@ pub struct AdmissionGate {
     /// Identity of the operator who created the gate.
     pub created_by: String,
     /// Wall-clock time the gate was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Optional expiry; `None` = no expiry.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl AdmissionGate {
@@ -226,7 +226,7 @@ impl AdmissionGate {
     ///
     /// A gate is inactive when `expires_at` is `Some` and in the past.
     #[must_use]
-    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_active_at(&self, now: Timestamp) -> bool {
         self.expires_at.is_none_or(|exp| exp > now)
     }
 
@@ -262,7 +262,7 @@ impl AdmissionGate {
 /// # Arguments
 ///
 /// * `gates` – slice of active gates (may include expired ones; they are
-///   filtered out internally against `Utc::now()`).
+///   filtered out internally against `Timestamp::now()`).
 /// * `workflow_name` – the workflow type name being started.
 /// * `queue_name` – the task queue the execution would be routed to.
 /// * `shard_id` – the Postgres shard the execution would land on.
@@ -275,7 +275,7 @@ pub fn check_admission<'a>(
     shard_id: i32,
     owner: Option<&str>,
 ) -> Option<&'a AdmissionGate> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     gates
         .iter()
         .find(|g| g.is_active_at(now) && g.matches(workflow_name, queue_name, shard_id, owner))
@@ -933,12 +933,13 @@ pub fn resolve_metrics_with_global_fallback(
 
 #[cfg(feature = "db")]
 pub mod db {
-    use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
+    use super::{AdmissionGate, AdmissionGateId, GateScope, MAX_ACTIVE_GATES, Timestamp, Uuid};
     use crate::error::{HarvestResult, database_error};
     use crate::models::{AdmissionGateRow, NewAdmissionGateRow};
     use crate::schema::harvest_admission_gates;
     use diesel::{BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, QueryDsl};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff_diesel::ToDiesel;
 
     /// Convert a DB row into an in-memory [`AdmissionGate`].
     ///
@@ -970,14 +971,14 @@ pub mod db {
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Vec<AdmissionGate>> {
         use harvest_admission_gates::dsl as g;
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let rows = g::harvest_admission_gates
             .filter(g::lifted_at.is_null())
             .filter(
                 g::expires_at
                     .is_null()
-                    .or(g::expires_at.assume_not_null().gt(now)),
+                    .or(g::expires_at.assume_not_null().gt(now.to_diesel())),
             )
             .order_by(g::created_at.asc())
             .load::<AdmissionGateRow>(conn)
@@ -1006,7 +1007,7 @@ pub mod db {
         reason: &str,
         message: Option<&str>,
         actor: &str,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
     ) -> HarvestResult<AdmissionGate> {
         use crate::error::HarvestError;
 
@@ -1034,13 +1035,13 @@ pub mod db {
                 .await
                 .map_err(database_error)?;
 
-            let now = Utc::now();
+            let now = Timestamp::now();
             let active_count: i64 = g::harvest_admission_gates
                 .filter(g::lifted_at.is_null())
                 .filter(
                     g::expires_at
                         .is_null()
-                        .or(g::expires_at.assume_not_null().gt(now)),
+                        .or(g::expires_at.assume_not_null().gt(now.to_diesel())),
                 )
                 .count()
                 .get_result::<i64>(conn)
@@ -1066,7 +1067,7 @@ pub mod db {
             };
 
             let row: AdmissionGateRow = diesel::insert_into(g::harvest_admission_gates)
-                .values(&new_gate)
+                .values(new_gate)
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;
@@ -1094,14 +1095,17 @@ pub mod db {
         use diesel::OptionalExtension;
         use harvest_admission_gates::dsl as g;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let row: Option<AdmissionGateRow> = diesel::update(
             g::harvest_admission_gates
                 .find(gate_id)
                 .filter(g::lifted_at.is_null()),
         )
-        .set((g::lifted_at.eq(Some(now)), g::lifted_by.eq(Some(actor))))
+        .set((
+            g::lifted_at.eq(Some(now).to_diesel()),
+            g::lifted_by.eq(Some(actor)),
+        ))
         .get_result(conn)
         .await
         .optional()
@@ -1138,15 +1142,15 @@ pub struct AdmissionGateView {
     pub reason: String,
     pub message: Option<String>,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
     /// `true` when the gate is currently blocking (active + not expired).
     pub is_active: bool,
 }
 
 impl From<AdmissionGate> for AdmissionGateView {
     fn from(g: AdmissionGate) -> Self {
-        let is_active = g.is_active_at(Utc::now());
+        let is_active = g.is_active_at(Timestamp::now());
         Self {
             id: g.id.0,
             scope_kind: g.scope.kind_str().to_string(),
@@ -1164,7 +1168,7 @@ impl From<AdmissionGate> for AdmissionGateView {
 #[cfg(feature = "db")]
 impl From<&crate::models::AdmissionGateRow> for AdmissionGateView {
     fn from(row: &crate::models::AdmissionGateRow) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let is_active = row.lifted_at.is_none() && row.expires_at.is_none_or(|exp| exp > now);
         Self {
             id: row.id,
@@ -1191,7 +1195,7 @@ mod tests {
             reason: reason.to_string(),
             message: None,
             created_by: "test".to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
         }
     }
@@ -1235,22 +1239,22 @@ mod tests {
     #[test]
     fn active_gate_with_no_expiry_matches() {
         let g = fleet_gate("test");
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(g.is_active_at(now));
     }
 
     #[test]
     fn gate_with_future_expiry_is_active() {
         let mut g = fleet_gate("test");
-        g.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
-        assert!(g.is_active_at(Utc::now()));
+        g.expires_at = Some(Timestamp::now() + jiff::SignedDuration::from_hours(1));
+        assert!(g.is_active_at(Timestamp::now()));
     }
 
     #[test]
     fn gate_with_past_expiry_is_inactive() {
         let mut g = fleet_gate("test");
-        g.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
-        assert!(!g.is_active_at(Utc::now()));
+        g.expires_at = Some(Timestamp::now() - jiff::SignedDuration::from_secs(1));
+        assert!(!g.is_active_at(Timestamp::now()));
     }
 
     #[test]

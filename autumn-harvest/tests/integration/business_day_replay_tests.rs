@@ -30,7 +30,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::TimerId;
-use chrono::{DateTime, NaiveDate, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -39,12 +39,12 @@ use serde_json::Value;
 
 const FREEZE_NAME: &str = "__harvest_business_day:1:sla";
 
-fn utc(s: &str) -> DateTime<Utc> {
-    s.parse::<DateTime<Utc>>().expect("valid RFC 3339 instant")
+fn utc(s: &str) -> Timestamp {
+    s.parse::<Timestamp>().expect("valid RFC 3339 instant")
 }
 
-const fn day(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+const fn day(y: i16, m: i8, d: i8) -> jiff::civil::Date {
+    jiff::civil::date(y, m, d)
 }
 
 /// The workflow under test: arm a single business-day timer, then complete.
@@ -66,9 +66,9 @@ fn sla_workflow<'a>(
 
 /// Build the `SideEffectRecorded` payload a live run would have frozen.
 fn frozen_resolution(
-    anchor: DateTime<Utc>,
-    deadline: DateTime<Utc>,
-    skipped: &[NaiveDate],
+    anchor: Timestamp,
+    deadline: Timestamp,
+    skipped: &[jiff::civil::Date],
 ) -> Value {
     serde_json::json!({
         "v": 1,
@@ -82,11 +82,11 @@ fn frozen_resolution(
 
 /// A complete, already-fired history for `sla_workflow`.
 fn history(
-    anchor: DateTime<Utc>,
-    deadline: DateTime<Utc>,
-    skipped: &[NaiveDate],
+    anchor: Timestamp,
+    deadline: Timestamp,
+    skipped: &[jiff::civil::Date],
 ) -> Vec<WorkflowEvent> {
-    let duration_secs = u64::try_from((deadline - anchor).num_seconds().max(0)).expect("in range");
+    let duration_secs = u64::try_from((deadline - anchor).as_secs().max(0)).expect("in range");
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -195,22 +195,27 @@ async fn replay_business_day_1000_distinct_fixtures_all_succeed() {
         // Vary the anchor across ~200 calendar days and the full clock face, so
         // weekday, time-of-day, and the weekend-skip pattern all differ.
         let anchor = base
-            + chrono::Duration::days(i64::from(i % 200))
-            + chrono::Duration::minutes(i64::from(i % 1440));
+            + autumn_harvest::time::days(i64::from(i % 200))
+            + jiff::SignedDuration::from_mins(i64::from(i % 1440));
         // Vary the recorded deadline between 1 and 6 calendar days out. The
         // recorded duration is (deadline - anchor), exactly what a live run
         // would record for THAT frozen pair.
-        let deadline = anchor + chrono::Duration::days(1 + i64::from(i % 6));
+        let deadline = anchor + autumn_harvest::time::days(1 + i64::from(i % 6));
         // Vary the recorded skip set too, so no two fixtures share a payload.
         // An all-identical corpus would make 1000 iterations no stronger than 1.
-        let skipped: Vec<NaiveDate> = (0..(i % 3))
-            .map(|k| (anchor + chrono::Duration::days(i64::from(k) + 1)).date_naive())
+        let skipped: Vec<jiff::civil::Date> = (0..(i % 3))
+            .map(|k| {
+                autumn_harvest::time::utc_date(
+                    anchor + autumn_harvest::time::days(i64::from(k) + 1),
+                )
+            })
             .collect();
         let events = history(anchor, deadline, &skipped);
 
         // A calendar that excludes the frozen deadline's own date guarantees a
         // recompute would differ.
-        let hostile = BusinessCalendars::new().with_calendar("biz", [deadline.date_naive()]);
+        let hostile = BusinessCalendars::new()
+            .with_calendar("biz", [autumn_harvest::time::utc_date(deadline)]);
 
         let report = replayer(Some(hostile)).replay_from_events(events).await;
         assert!(

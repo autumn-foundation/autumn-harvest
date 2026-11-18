@@ -463,7 +463,6 @@ mod end_to_end {
     use autumn_harvest::testing::HistorySnapshot;
     use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
     use autumn_harvest::upgrade_check::{self, FindingKind, UpgradeCheck, Verdict};
-    use chrono::Utc;
     use serde_json::{Value, json};
 
     type WfFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -513,7 +512,7 @@ mod end_to_end {
             events: vec![
                 WorkflowEvent::WorkflowStarted {
                     input: Value::Null,
-                    timestamp: Utc::now(),
+                    timestamp: jiff::Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,

@@ -25,8 +25,9 @@
 use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use chrono::Utc;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
@@ -178,7 +179,7 @@ async fn append_event(
 }
 
 async fn seed_retention_summary(conn: &mut AsyncPgConnection, exec_id: ExecutionId, shard_id: i32) {
-    let now = Utc::now();
+    let now = Timestamp::now();
     diesel::sql_query(
         "INSERT INTO harvest_execution_summaries \
          (execution_id, workflow_name, workflow_id, state, started_at, completed_at, shard_id) \
@@ -186,7 +187,7 @@ async fn seed_retention_summary(conn: &mut AsyncPgConnection, exec_id: Execution
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
-    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
     .bind::<diesel::sql_types::Integer, _>(shard_id)
     .execute(conn)
     .await

@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -28,10 +29,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -262,17 +263,17 @@ async fn insert(conn: &mut AsyncPgConnection, spec: Spec<'_>) -> ExecutionId {
         .await
         .expect("insert execution");
 
-    let started_at = Utc::now() + Duration::seconds(spec.offset_secs);
+    let started_at = Timestamp::now() + SignedDuration::from_secs(spec.offset_secs);
     let completed_at = if spec.state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(1))
+        Some(started_at + SignedDuration::from_secs(1))
     };
     diesel::update(wfx::table.find(exec_id.as_uuid()))
         .set((
             wfx::state.eq(spec.state),
-            wfx::started_at.eq(started_at),
-            wfx::completed_at.eq(completed_at),
+            wfx::started_at.eq(started_at.to_diesel()),
+            wfx::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

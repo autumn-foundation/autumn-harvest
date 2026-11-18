@@ -43,6 +43,7 @@
 
 use autumn_harvest::schema::harvest_task_queue_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -70,10 +71,10 @@ use autumn_harvest::worker::{
 };
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -392,7 +393,7 @@ async fn seed_execution(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -415,7 +416,7 @@ async fn seed_workflow(
     let exec_id = seed_execution(conn, workflow_name, input.clone()).await;
     let mut params = EnqueueParams::new(queue_name, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -752,7 +753,7 @@ async fn wait_for_terminal(
                  execution state={} error={:?}\n  now={}\n  {}",
                 execution.state,
                 execution.error,
-                Utc::now(),
+                Timestamp::now(),
                 rows.join("\n  "),
             )
         }
@@ -2417,13 +2418,13 @@ const Q_LOST_CLAIM: &str = "q804-lost-claim";
 /// escalation path under test would never be reached. `claim_task` gates on
 /// `scheduled_at <= NOW()`. So deferring the row is the precise, race-free way
 /// to phase "this worker came up" ahead of "this worker polled".
-async fn set_task_scheduled_at(url: &str, exec_id: ExecutionId, at: chrono::DateTime<Utc>) {
+async fn set_task_scheduled_at(url: &str, exec_id: ExecutionId, at: jiff::Timestamp) {
     let mut conn = connect(url).await;
     diesel::update(
         harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
     )
-    .set(harvest_task_queue::scheduled_at.eq(at))
+    .set(harvest_task_queue::scheduled_at.eq(at.to_diesel()))
     .execute(&mut conn)
     .await
     .expect("reschedule task");
@@ -2521,6 +2522,7 @@ async fn stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates(
 /// reads as a completed fleet sweep. The execution lands in `FAILED` with a
 /// `no_capable_worker:` reason instead of the task returning to `PENDING`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     // Budget 1, already spent by the seeded miss. The very next miss escalates
     // unless the evidence is invalidated. So the two outcomes are one claim
@@ -2545,7 +2547,12 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     // Phase 1: `pod-a` restarts onto a build that DOES register the handler.
     // Deferred out of claim range so it registers without claiming — a claim
     // would simply run the workflow and never reach the decision under test.
-    set_task_scheduled_at(&url, exec_id, Utc::now() + chrono::Duration::hours(1)).await;
+    set_task_scheduled_at(
+        &url,
+        exec_id,
+        Timestamp::now() + jiff::SignedDuration::from_hours(1),
+    )
+    .await;
     let restart_metrics = Arc::new(CapabilityMetrics::default());
     let pod_a = build_worker(
         "pod-a",
@@ -2591,7 +2598,12 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
 
     // Phase 2: the task becomes eligible and the still-incapable `pod-b` wins
     // the claim. `pod-a` remains a live peer (fresh heartbeat, shut down or not).
-    set_task_scheduled_at(&url, exec_id, Utc::now() - chrono::Duration::seconds(5)).await;
+    set_task_scheduled_at(
+        &url,
+        exec_id,
+        Timestamp::now() - jiff::SignedDuration::from_secs(5),
+    )
+    .await;
     let metrics = Arc::new(CapabilityMetrics::default());
     let pod_b = build_worker(
         "pod-b",
@@ -3746,7 +3758,7 @@ async fn session_pinned_capability_miss_escalates_immediately() {
     params.session_id = Some(Uuid::new_v4());
     params.sticky_worker_id = Some(worker_id.to_string());
     params.sticky_timeout = Some(Duration::from_secs(300));
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue session-pinned activity task");
@@ -4577,7 +4589,7 @@ async fn releasing_a_rate_limited_activity_refunds_its_token() {
     params.activity_name = Some("rate_limited_activity".to_string());
     params.activity_id = Some(Uuid::new_v4());
     params.rate_limit_key = Some(key.clone());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue rate-limited activity task");
@@ -4666,7 +4678,7 @@ async fn stale_dispatcher_refund_leaves_one_debit_for_the_live_claim() {
     params.activity_name = Some("stale_refund_activity".to_string());
     params.activity_id = Some(Uuid::new_v4());
     params.rate_limit_key = Some(key.clone());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue rate-limited activity task");
@@ -4973,7 +4985,7 @@ async fn seed_claimed_task(
     .set((
         harvest_task_queue::state.eq("RUNNING"),
         harvest_task_queue::worker_id.eq(Some(worker_id)),
-        harvest_task_queue::started_at.eq(Some(Utc::now())),
+        harvest_task_queue::started_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await

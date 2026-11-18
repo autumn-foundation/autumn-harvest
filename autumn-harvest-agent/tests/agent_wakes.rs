@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::entity::ENTITY_OP_SIGNAL;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::delivery::{Delivery, Report};
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionFilter, RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, answer, calls, recorded_tool, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -44,7 +44,7 @@ fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState
 }
 
 /// Drive the agent at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -108,7 +108,7 @@ async fn a_thousand_agents_tick_on_their_own_intervals() {
     let model = FixedModel::new("HEARTBEAT_OK");
     let harness = AgentHarness::new(model.clone()).agent(AgentProfile::new("watch"));
     let mut rt = runtime(&db, harness);
-    let start = Utc::now();
+    let start = Timestamp::now();
     let mut agents = Vec::new();
     for n in 0..AGENTS {
         let agent = id(&format!("a{n}"));
@@ -124,7 +124,7 @@ async fn a_thousand_agents_tick_on_their_own_intervals() {
     // Each pass moves the drive clock one minute and wakes each agent once.
     // The half-minute offset keeps each deadline clear of a pass.
     for pass in 1..=PASSES {
-        let at = start + chrono::Duration::seconds(60 * pass + 30);
+        let at = start + SignedDuration::from_secs(60 * pass + 30);
         for (exec, _) in &agents {
             rt.run_until_blocked_as_of(*exec, at).await.unwrap();
         }
@@ -176,10 +176,10 @@ async fn an_unattended_tick_cannot_run_a_write_tool() {
             .agent(AgentProfile::new("watch").heartbeat(beat));
         let mut rt = runtime(&db, harness);
         let agent = id("rw");
-        let start = Utc::now();
+        let start = Timestamp::now();
         sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
         drive_at(&mut rt, &agent, start).await;
-        drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+        drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
         let state = state(&rt, &agent).await;
         assert_eq!(state.ticks, 1);
         assert_eq!(
@@ -204,14 +204,14 @@ async fn a_restart_during_a_wait_ticks_once_and_reports_once() {
                     .heartbeat(AgentHeartbeat::every(Duration::from_secs(60))),
             )
     };
-    let start = Utc::now();
+    let start = Timestamp::now();
     let mut rt = runtime(&db, harness(&delivery));
     sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     // The process stops while the agent waits on its timer.
     drop(rt);
 
-    let later = start + chrono::Duration::seconds(90);
+    let later = start + SignedDuration::from_secs(90);
     let mut rt = runtime(&db, harness(&delivery));
     drive_at(&mut rt, &agent, later).await;
     // A second drive and a second restart at the same time change nothing.
@@ -286,11 +286,11 @@ async fn the_followup_chain_cap_holds_across_checkpoints() {
     let harness = AgentHarness::new(model.clone()).agent(profile);
     let mut rt = runtime(&db, harness);
     let agent = id("chain");
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("watch the queue"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     for minutes in [2, 4, 6, 8] {
-        drive_at(&mut rt, &agent, start + chrono::Duration::minutes(minutes)).await;
+        drive_at(&mut rt, &agent, start + SignedDuration::from_mins(minutes)).await;
     }
     let state = state(&rt, &agent).await;
     assert_eq!(state.chain, 2, "two follow-ups ran");
@@ -415,11 +415,11 @@ async fn a_message_waits_for_a_tick_that_runs() {
         answer("the reply", 1),
     ]);
     let agent = id("overlap-1");
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("start"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     // The tick is due, and a message waits. The tick runs first and whole.
-    let later = start + chrono::Duration::milliseconds(1_500);
+    let later = start + SignedDuration::from_millis(1_500);
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
     let hello = Agent::payload(&AgentOp::message("hello"));
     rt.send_signal_as_of(exec, ENTITY_OP_SIGNAL, hello, later)
@@ -510,7 +510,7 @@ impl AgentModel for SlowModel {
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
-            let now = Utc::now().timestamp_millis();
+            let now = Timestamp::now().as_millisecond();
             self.answered_ms.store(now, Ordering::SeqCst);
             Ok(ChatResponse {
                 content: vec![ContentPart::Text("HEARTBEAT_OK".to_owned())],
@@ -533,10 +533,10 @@ async fn a_tick_books_the_next_tick_one_interval_after_its_end() {
         .agent(AgentProfile::new("watch").heartbeat(AgentHeartbeat::every(every)));
     let mut rt = runtime(&db, harness);
     let agent = id("slow");
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
 
     let state = state(&rt, &agent).await;
     assert_eq!(state.ticks, 1);
@@ -576,14 +576,14 @@ async fn a_followup_is_due_one_delay_after_its_segment_ends() {
         .agent(AgentProfile::new("watch").followups(Followups::new(Duration::from_secs(3_600))));
     let mut rt = runtime(&db, harness);
     let agent = id("late");
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("save it"), None).unwrap();
     let RunState::WaitingSignal(signal) = drive_at(&mut rt, &agent, start).await else {
         panic!("the segment waits on its approval");
     };
 
     // The segment resumes two minutes after it started.
-    let resumed = start + chrono::Duration::minutes(2);
+    let resumed = start + SignedDuration::from_mins(2);
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
     sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
     drive_at(&mut rt, &agent, resumed).await;
@@ -593,12 +593,12 @@ async fn a_followup_is_due_one_delay_after_its_segment_ends() {
     assert_eq!(booked.chain, 0, "the follow-up waits for its delay");
     let due = booked.followup_due_ms.expect("the follow-up is booked");
     assert!(
-        due >= resumed.timestamp_millis() + 60_000,
+        due >= resumed.as_millisecond() + 60_000,
         "the follow-up is due {}ms after the segment ended",
-        due - resumed.timestamp_millis()
+        due - resumed.as_millisecond()
     );
 
-    drive_at(&mut rt, &agent, resumed + chrono::Duration::minutes(1)).await;
+    drive_at(&mut rt, &agent, resumed + SignedDuration::from_mins(1)).await;
     let ran = state(&rt, &agent).await;
     assert_eq!(ran.chain, 1, "the follow-up runs at its delay");
     assert_eq!(ran.last_answer.as_deref(), Some("checked"));

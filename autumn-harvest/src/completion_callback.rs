@@ -39,8 +39,10 @@
 //! link-local, and other non-routable IP literals are always rejected unless
 //! explicitly allowed.
 
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -830,14 +832,14 @@ pub struct CompletionEnvelope {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
-    pub completed_at: DateTime<Utc>,
+    pub completed_at: Timestamp,
 }
 
 /// Build the fixed envelope for a terminal execution.
 ///
 /// `result` is populated only for [`TerminalState::Completed`] (from
 /// `execution_output`); `error` is populated for every other terminal state
-/// (from `execution_error`). `completed_at` defaults to `Utc::now()` when
+/// (from `execution_error`). `completed_at` defaults to `Timestamp::now()` when
 /// the row has none. A terminal row normally has one. The default keeps this
 /// a total function.
 #[must_use]
@@ -850,7 +852,7 @@ pub fn build_envelope(
     state: TerminalState,
     execution_output: Option<serde_json::Value>,
     execution_error: Option<&str>,
-    completed_at: Option<DateTime<Utc>>,
+    completed_at: Option<Timestamp>,
 ) -> CompletionEnvelope {
     let (result, error) = if matches!(state, TerminalState::Completed) {
         (execution_output, None)
@@ -868,7 +870,7 @@ pub fn build_envelope(
         state: state.as_str().to_string(),
         result,
         error,
-        completed_at: completed_at.unwrap_or_else(Utc::now),
+        completed_at: completed_at.unwrap_or_else(Timestamp::now),
     }
 }
 
@@ -951,11 +953,11 @@ pub fn delivery_headers(
     secret: &CallbackSecret,
     body: &[u8],
     delivery_id: Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(&'static str, String)> {
     vec![
         (SIGNATURE_HEADER, sign(secret, body)),
-        (TIMESTAMP_HEADER, now.to_rfc3339()),
+        (TIMESTAMP_HEADER, crate::time::rfc3339(now)),
         (DELIVERY_ID_HEADER, delivery_id.to_string()),
     ]
 }
@@ -975,9 +977,7 @@ mod envelope_tests {
     #[test]
     fn completed_envelope_has_result_and_no_error() {
         let (delivery_id, exec_id) = sample_ids();
-        let completed_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let completed_at = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let envelope = build_envelope(
             delivery_id,
             exec_id,
@@ -1012,7 +1012,7 @@ mod envelope_tests {
             TerminalState::Failed,
             None,
             Some("card declined"),
-            Some(Utc::now()),
+            Some(Timestamp::now()),
         );
         assert_eq!(envelope.state, "FAILED");
         assert_eq!(envelope.result, None);
@@ -1038,7 +1038,7 @@ mod envelope_tests {
             TerminalState::Completed,
             Some(json!(42)),
             None,
-            Some(Utc::now()),
+            Some(Timestamp::now()),
         );
         let body = serialize_body(&envelope).unwrap();
         let text = String::from_utf8(body).unwrap();
@@ -1099,7 +1099,7 @@ mod envelope_tests {
         let secret = CallbackSecret::new(b"k".to_vec());
         let body = b"payload-bytes";
         let delivery_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let headers = delivery_headers(&secret, body, delivery_id, now);
 
         let get = |name: &str| {
@@ -1109,7 +1109,7 @@ mod envelope_tests {
                 .map(|(_, v)| v.clone())
         };
         assert_eq!(get(SIGNATURE_HEADER), Some(sign(&secret, body)));
-        assert_eq!(get(TIMESTAMP_HEADER), Some(now.to_rfc3339()));
+        assert_eq!(get(TIMESTAMP_HEADER), Some(crate::time::rfc3339(now)));
         assert_eq!(get(DELIVERY_ID_HEADER), Some(delivery_id.to_string()));
     }
 
@@ -1126,7 +1126,7 @@ mod envelope_tests {
             TerminalState::Completed,
             Some(json!({"a": 1})),
             None,
-            Some(Utc::now()),
+            Some(Timestamp::now()),
         );
         let body = serialize_body(&envelope).unwrap();
         let secret = CallbackSecret::new(b"shared-secret".to_vec());
@@ -1501,7 +1501,7 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
 /// All three HTTP-date forms are read: IMF-fixdate, RFC 850 and asctime.
 /// A date in the past gives a zero delay. Any other value gives `None`.
 #[must_use]
-pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
+pub fn parse_retry_after(value: &str, now: Timestamp) -> Option<std::time::Duration> {
     let value = value.trim();
     if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
         // All digits, so only overflow fails. Overflow saturates.
@@ -1509,17 +1509,90 @@ pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::D
         return Some(std::time::Duration::from_secs(secs));
     }
     let at = parse_http_date(value, now)?;
-    Some((at - now).to_std().unwrap_or(std::time::Duration::ZERO))
+    Some(std::time::Duration::try_from(at - now).unwrap_or(std::time::Duration::ZERO))
+}
+
+/// Zone names that the `chrono` RFC 2822 parser accepted.
+const RFC2822_ZONE_NAMES: [&str; 11] = [
+    "GMT", "UT", "Z", "EST", "EDT", "CST", "CDT", "MST", "MDT", "PST", "PDT",
+];
+
+/// Returns `false` for a trailing zone that `chrono` refused.
+///
+/// jiff reads any name of three or more letters as UTC, such as `CET`.
+/// `chrono` accepted only the names above and a military letter other than
+/// `J`. jiff also reads an offset hour of 24 or 25. `chrono` refused an
+/// offset of one day or more. A date that `chrono` refused gives no delay,
+/// so a 413 stays permanent.
+fn rfc2822_zone_is_known(value: &str) -> bool {
+    let zone = value
+        .rsplit(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
+    if let [b'+' | b'-', h1, h2, m1, m2] = zone.as_bytes()
+        && [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit())
+    {
+        return (h1 - b'0') * 10 + (h2 - b'0') <= 23;
+    }
+    if zone.is_empty() || !zone.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return true;
+    }
+    RFC2822_ZONE_NAMES
+        .iter()
+        .any(|name| zone.eq_ignore_ascii_case(name))
+        || (zone.len() == 1 && !zone.eq_ignore_ascii_case("j"))
+}
+
+/// Removes the trailing RFC 2822 comments of `value`, as `chrono` skipped them.
+///
+/// A comment is `(...)`. It can nest, and `\` escapes the next byte. The
+/// comments start at the first `(`, because no other part of the date holds
+/// one. Text that is not a complete run of comments is kept, so the parse
+/// refuses it.
+fn strip_rfc2822_comments(value: &str) -> &str {
+    let Some(start) = value.find('(') else {
+        return value;
+    };
+    let mut rest = &value.as_bytes()[start..];
+    while !rest.is_empty() {
+        let Some(after) = rest.trim_ascii_start().strip_prefix(b"(") else {
+            return value;
+        };
+        let mut depth = 1_usize;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, byte) in after.iter().enumerate() {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'(') => depth += 1,
+                (false, b')') if depth == 1 => {
+                    end = Some(index);
+                    break;
+                }
+                (false, b')') => depth -= 1,
+                (false, _) => {}
+            }
+        }
+        let Some(end) = end else {
+            return value;
+        };
+        rest = &after[end + 1..];
+    }
+    value[..start].trim_end()
 }
 
 /// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
-fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    if let Ok(at) = DateTime::parse_from_rfc2822(value) {
-        return Some(at.with_timezone(&Utc));
+fn parse_http_date(value: &str, now: Timestamp) -> Option<Timestamp> {
+    let without_comments = strip_rfc2822_comments(value);
+    if rfc2822_zone_is_known(without_comments)
+        && let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(without_comments)
+    {
+        return Some(at);
     }
     // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
-        return Some(naive.and_utc());
+    if let Ok(naive) = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", value) {
+        return crate::time::from_utc_datetime(naive);
     }
     parse_rfc850_date(value, now)
 }
@@ -1529,9 +1602,9 @@ fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 /// The two-digit year gives the latest date that is not more than 50 years
 /// after `now` (RFC 9110 section 5.6.7). The cutoff compares the full
 /// timestamp, not only the year, and the window slides across a century
-/// boundary. Chrono's `%y` uses a fixed pivot instead, so this code sets the
+/// boundary. A `%y` parse uses a fixed pivot instead, so this code sets the
 /// century itself. The weekday must match the date that results.
-fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn parse_rfc850_date(value: &str, now: Timestamp) -> Option<Timestamp> {
     let (weekday, rest) = value.split_once(", ")?;
     let (date, time) = rest.split_once(' ')?;
     let (day_month, two_digit_year) = date.rsplit_once('-')?;
@@ -1540,26 +1613,20 @@ fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     }
     let yy: i32 = two_digit_year.parse().ok()?;
     let at_year = |year: i32| {
-        chrono::NaiveDateTime::parse_from_str(
-            &format!("{day_month}-{year} {time}"),
+        jiff::civil::DateTime::strptime(
             "%d-%b-%Y %H:%M:%S GMT",
+            format!("{day_month}-{year} {time}"),
         )
         .ok()
-        .map(|naive| naive.and_utc())
     };
-    let now_year = chrono::Datelike::year(&now);
+    let now = crate::time::utc_datetime(now);
+    let now_year = i32::from(now.year());
     let century = now_year - now_year.rem_euclid(100);
-    let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
+    // A calendar month add clamps the day to the end of a short month.
+    let cutoff = now.checked_add(jiff::Span::new().months(50 * 12)).ok()?;
     // Read the month, day and time in a leap year, so 29 February parses.
     let in_leap_year = at_year(2000)?;
-    let key = |at: DateTime<Utc>| {
-        (
-            chrono::Datelike::year(&at),
-            chrono::Datelike::month(&at),
-            chrono::Datelike::day(&at),
-            at.time(),
-        )
-    };
+    let key = |at: jiff::civil::DateTime| (i32::from(at.year()), at.month(), at.day(), at.time());
     let (_, month, day, time) = key(in_leap_year);
     let cutoff_key = key(cutoff);
     // The candidates are 100 years apart, so the latest one at or before
@@ -1570,8 +1637,31 @@ fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .map(|base| base + yy)
         .find(|year| (*year, month, day, time) <= cutoff_key)?;
     let at = at_year(year)?;
-    let weekday: chrono::Weekday = weekday.parse().ok()?;
-    (chrono::Datelike::weekday(&at) == weekday).then_some(at)
+    if at.weekday() != parse_weekday(weekday)? {
+        return None;
+    }
+    crate::time::from_utc_datetime(at)
+}
+
+/// Parse an English weekday name, short or long, in any letter case.
+///
+/// This accepts the names that the `FromStr` impl of `chrono::Weekday`
+/// accepted, for example `Sun`, `sunday` and `SUNDAY`.
+fn parse_weekday(name: &str) -> Option<jiff::civil::Weekday> {
+    use jiff::civil::Weekday;
+    const NAMES: [(&str, Weekday); 7] = [
+        ("monday", Weekday::Monday),
+        ("tuesday", Weekday::Tuesday),
+        ("wednesday", Weekday::Wednesday),
+        ("thursday", Weekday::Thursday),
+        ("friday", Weekday::Friday),
+        ("saturday", Weekday::Saturday),
+        ("sunday", Weekday::Sunday),
+    ];
+    NAMES.iter().find_map(|&(long, weekday)| {
+        (name.eq_ignore_ascii_case(long) || name.eq_ignore_ascii_case(&long[..3]))
+            .then_some(weekday)
+    })
 }
 
 #[cfg(test)]
@@ -1607,10 +1697,8 @@ mod deliverer_trait_tests {
         );
     }
 
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn now() -> Timestamp {
+        "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
     }
 
     #[test]
@@ -1629,6 +1717,76 @@ mod deliverer_trait_tests {
         // 2026-01-01T00:00:00Z is a Thursday.
         assert_eq!(
             parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// `chrono` refused a zone name outside RFC 2822, so the delay is `None`.
+    /// A 413 with such a date then stays a permanent failure.
+    #[test]
+    fn parse_retry_after_refuses_a_zone_name_that_chrono_refused() {
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 UTC", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 CET", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 J", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 ut", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 19:00:30 EST", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 +0000", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// `chrono` skipped trailing RFC 2822 comments, then checked the zone.
+    #[test]
+    fn parse_retry_after_checks_the_zone_before_a_comment() {
+        let thirty = Some(std::time::Duration::from_secs(30));
+        for refused in [
+            "Thu, 01 Jan 2026 00:00:30 CET (Central European Time)",
+            "Thu, 01 Jan 2026 00:00:30 UTC (x)",
+            "Thu, 01 Jan 2026 00:00:30 CET(x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (x) trailing",
+        ] {
+            assert_eq!(parse_retry_after(refused, now()), None, "{refused}");
+        }
+        for accepted in [
+            "Thu, 01 Jan 2026 00:00:30 GMT(x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (a (nested) \\) comment) (y)",
+            "Thu, 01 Jan 2026 00:00:30 +0000(x)",
+        ] {
+            assert_eq!(parse_retry_after(accepted, now()), thirty, "{accepted}");
+        }
+    }
+
+    /// `chrono` refused a numeric offset of one day or more. jiff reads an
+    /// offset hour up to 25.
+    #[test]
+    fn parse_retry_after_refuses_an_offset_of_a_day_or_more() {
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 +2400", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 -2459", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 23:59:30 +2359", now()),
             Some(std::time::Duration::from_secs(30))
         );
     }
@@ -1662,9 +1820,7 @@ mod deliverer_trait_tests {
     #[test]
     fn parse_retry_after_applies_the_rfc_850_cutoff_to_the_full_date() {
         // The cutoff is 50 years after `now` to the second, not to the year.
-        let now = DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = "2026-10-06T00:00:00Z".parse::<Timestamp>().unwrap();
         // 2076-10-07 is past the cutoff, so `76` means 1976.
         assert_eq!(
             parse_retry_after("Thursday, 07-Oct-76 00:00:00 GMT", now),
@@ -1679,9 +1835,7 @@ mod deliverer_trait_tests {
     #[test]
     fn parse_retry_after_resolves_an_rfc_850_year_across_a_century() {
         // In 2076, `10` means 2110: 34 years ahead, inside the window.
-        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = "2076-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
             .expect("a valid RFC 850 date");
         assert!(ahead > std::time::Duration::from_hours(289_080));
@@ -1691,9 +1845,7 @@ mod deliverer_trait_tests {
     fn parse_retry_after_rejects_a_date_that_does_not_exist_in_its_year() {
         // In 2076, `00` means 2100, which has no 29 February. The parser must
         // not fall back to 2000, where the date and the weekday are valid.
-        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = "2076-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         assert_eq!(
             parse_retry_after("Tuesday, 29-Feb-00 00:00:00 GMT", now),
             None
@@ -1736,7 +1888,7 @@ pub enum OutcomeAction {
     /// Non-2xx or transport error, and `attempt < max_attempts` — reschedule
     /// with the given absolute backoff deadline.
     Backoff {
-        next_attempt_at: DateTime<Utc>,
+        next_attempt_at: Timestamp,
         last_status: Option<u16>,
         last_error: Option<String>,
     },
@@ -1793,7 +1945,7 @@ pub fn classify_outcome(
     max_attempts: u32,
     retry_policy: &crate::policy::RetryPolicy,
     seed: u64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> OutcomeAction {
     if let Some(status) = outcome.status
         && outcome.is_success()
@@ -1815,8 +1967,9 @@ pub fn classify_outcome(
     if let Some(retry_after) = outcome.retry_after {
         delay = delay.max(retry_after.min(crate::builder::DEFAULT_RETRY_AFTER_CEILING));
     }
-    let next_attempt_at =
-        now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
+    let delay = jiff::SignedDuration::try_from(delay).unwrap_or(jiff::SignedDuration::ZERO);
+    // A delay past the jiff range saturates and does not panic.
+    let next_attempt_at = now.checked_add(delay).unwrap_or(Timestamp::MAX);
 
     OutcomeAction::Backoff {
         next_attempt_at,
@@ -1837,10 +1990,8 @@ mod classify_outcome_tests {
             .with_jitter(crate::policy::JitterPolicy::None)
     }
 
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn now() -> Timestamp {
+        "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
     }
 
     #[test]
@@ -1921,7 +2072,7 @@ mod classify_outcome_tests {
             else {
                 panic!("expected Backoff");
             };
-            let delay = (next_attempt_at - now()).to_std().unwrap();
+            let delay = std::time::Duration::try_from(next_attempt_at - now()).unwrap();
             assert!(
                 delay >= prev_delay,
                 "delay must be monotonically non-decreasing across attempts"
@@ -1986,7 +2137,7 @@ mod classify_outcome_tests {
             else {
                 panic!("expected Backoff");
             };
-            delays.insert((next_attempt_at - now()).num_nanoseconds());
+            delays.insert(crate::time::num_nanoseconds(next_attempt_at - now()));
         }
         assert!(
             delays.len() > 1,
@@ -2002,7 +2153,7 @@ mod classify_outcome_tests {
         else {
             panic!("expected Backoff, got {action:?}");
         };
-        (*next_attempt_at - now()).to_std().unwrap()
+        std::time::Duration::try_from(*next_attempt_at - now()).unwrap()
     }
 
     #[test]
@@ -2654,11 +2805,11 @@ pub async fn enqueue_completion_deliveries(
             payload,
             max_attempts: max_attempts_i32,
             retry_policy: retry_policy_json,
-            next_attempt_at: Utc::now(),
+            next_attempt_at: Timestamp::now(),
         };
 
         diesel::insert_into(crate::schema::harvest_completion_deliveries::table)
-            .values(&new_row)
+            .values(new_row)
             .on_conflict((
                 crate::schema::harvest_completion_deliveries::workflow_exec_id,
                 crate::schema::harvest_completion_deliveries::callback_index,
@@ -2728,12 +2879,12 @@ struct ClaimedDeliveryRow {
 #[cfg(feature = "db")]
 async fn claim_due_deliveries(
     conn: &mut diesel_async::AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     shard_id: Option<i32>,
 ) -> crate::error::HarvestResult<Vec<ClaimedDeliveryRow>> {
     use diesel_async::RunQueryDsl;
 
-    let lease_until = now + chrono::Duration::seconds(INFLIGHT_LEASE_SECS);
+    let lease_until = now + jiff::SignedDuration::from_secs(INFLIGHT_LEASE_SECS);
 
     if let Some(sid) = shard_id {
         let sql = "
@@ -2751,9 +2902,9 @@ async fn claim_due_deliveries(
             RETURNING d.id, d.workflow_exec_id, d.target_url, d.payload, d.attempt, d.max_attempts, d.retry_policy
         ";
         diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
-            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until.to_diesel())
             .bind::<diesel::sql_types::Integer, _>(sid)
             .load(conn)
             .await
@@ -2774,9 +2925,9 @@ async fn claim_due_deliveries(
             RETURNING d.id, d.workflow_exec_id, d.target_url, d.payload, d.attempt, d.max_attempts, d.retry_policy
         ";
         diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
-            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until.to_diesel())
             .load(conn)
             .await
             .map_err(crate::error::database_error)
@@ -2883,7 +3034,7 @@ async fn dead_letter_entry_with_current_payload(
 async fn apply_delivered_outcomes_batch(
     conn: &mut diesel_async::AsyncPgConnection,
     rows: &[(Uuid, i32, u16)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
@@ -2902,7 +3053,7 @@ async fn apply_delivered_outcomes_batch(
          FROM unnest($2::uuid[], $3::int4[], $4::int4[]) AS v(id, attempt, last_status) \
          WHERE d.id = v.id AND d.attempt = v.attempt",
     )
-    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(statuses)
@@ -2917,7 +3068,7 @@ async fn apply_delivered_outcomes_batch(
 /// [`apply_backoff_outcomes_batch`]: `(id, attempt, next_attempt_at,
 /// last_status, last_error)`.
 #[cfg(feature = "db")]
-type BackoffOutcomeRow = (Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>);
+type BackoffOutcomeRow = (Uuid, i32, Timestamp, Option<u16>, Option<String>);
 
 /// Bulk-record every `Backoff` outcome from one scanner tick in a single
 /// round trip. Same join-on-`(id, attempt)` guard as
@@ -2926,7 +3077,7 @@ type BackoffOutcomeRow = (Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>)
 async fn apply_backoff_outcomes_batch(
     conn: &mut diesel_async::AsyncPgConnection,
     rows: &[BackoffOutcomeRow],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
@@ -2936,7 +3087,8 @@ async fn apply_backoff_outcomes_batch(
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
-    let next_attempt_ats: Vec<DateTime<Utc>> = rows.iter().map(|r| r.2).collect();
+    let next_attempt_ats: Vec<jiff_diesel::Timestamp> =
+        rows.iter().map(|r| r.2.to_diesel()).collect();
     let last_statuses: Vec<Option<i32>> = rows.iter().map(|r| r.3.map(i32::from)).collect();
     let last_errors: Vec<Option<String>> = rows.iter().map(|r| r.4.clone()).collect();
 
@@ -2948,7 +3100,7 @@ async fn apply_backoff_outcomes_batch(
               AS v(id, attempt, next_attempt_at, last_status, last_error) \
          WHERE d.id = v.id AND d.attempt = v.attempt",
     )
-    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(next_attempt_ats)
@@ -3012,8 +3164,8 @@ async fn apply_outcome(
                 dsl::state.eq("DELIVERED"),
                 dsl::last_status.eq(Some(i32::from(status))),
                 dsl::last_error.eq(None::<String>),
-                dsl::delivered_at.eq(Some(Utc::now())),
-                dsl::updated_at.eq(Utc::now()),
+                dsl::delivered_at.eq(Some(Timestamp::now()).to_diesel()),
+                dsl::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await
@@ -3031,10 +3183,10 @@ async fn apply_outcome(
             )
             .set((
                 dsl::state.eq("PENDING"),
-                dsl::next_attempt_at.eq(next_attempt_at),
+                dsl::next_attempt_at.eq(next_attempt_at.to_diesel()),
                 dsl::last_status.eq(last_status.map(i32::from)),
                 dsl::last_error.eq(last_error),
-                dsl::updated_at.eq(Utc::now()),
+                dsl::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await
@@ -3058,7 +3210,7 @@ async fn apply_outcome(
                         dsl::state.eq("FAILED"),
                         dsl::last_status.eq(last_status.map(i32::from)),
                         dsl::last_error.eq(last_error),
-                        dsl::updated_at.eq(Utc::now()),
+                        dsl::updated_at.eq(Timestamp::now().to_diesel()),
                     ))
                     .execute(conn)
                     .await
@@ -3124,7 +3276,7 @@ async fn fire_due_on_conn(
         return Ok(0);
     }
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let claimed = claim_due_deliveries(conn, now, shard_id).await?;
     let mut processed = 0usize;
 
@@ -3262,7 +3414,7 @@ async fn fire_due_on_conn(
     // `join_all` is a barrier, so every attempt in this batch has completed
     // here. One fresh capture anchors backoff to "after this attempt
     // finished" for the whole batch.
-    let backoff_now = Utc::now();
+    let backoff_now = Timestamp::now();
 
     // Classify every attempt's outcome first, sorting rows into three
     // buckets by action kind. Then write each bucket in one round trip,
@@ -3548,7 +3700,7 @@ pub async fn redrive_delivery_at(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
     delivery_id: Uuid,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
@@ -3593,10 +3745,10 @@ pub async fn redrive_delivery_at(
             .set((
                 dsl::state.eq("PENDING"),
                 dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Utc::now)),
+                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Timestamp::now).to_diesel()),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
-                dsl::updated_at.eq(Utc::now()),
+                dsl::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await

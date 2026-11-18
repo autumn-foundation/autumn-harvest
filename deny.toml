@@ -358,6 +358,17 @@ ignore = [
     # links it. Revisit: Rhai moves to compact_str or smol_str, or the example
     # drops Rhai.
     { id = "RUSTSEC-2026-0249", reason = "unmaintained, not a vulnerability, no safe upgrade: smartstring arrives only through rhai in examples/rhai-scripts (publish = false). No published crate links it. Revisit: rhai drops smartstring, or the example drops rhai." },
+
+    # RUSTSEC-2026-0543 and RUSTSEC-2026-0555: chrono 0.4.45 and chrono-tz
+    # 0.10.4 are unmaintained. They report no vulnerability, and no safe
+    # upgrade exists. Harvest moved to jiff (ADR 0018), and the `bans` deny
+    # list keeps both crates out of every Harvest crate. autumn-web 0.10
+    # still pulls them, through its own API and tokio-cron-scheduler. So
+    # `autumn-harvest-plugin` reaches them through autumn-web, and converts
+    # at that boundary behind its `webhooks` and `sqlite` features.
+    # Revisit: autumn-web moves to jiff.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability, no safe upgrade: Harvest uses jiff (ADR 0018) and bans chrono. chrono arrives only through autumn-web 0.10 and the crates it pulls. Revisit: autumn-web moves to jiff." },
+    { id = "RUSTSEC-2026-0555", reason = "unmaintained, not a vulnerability, no safe upgrade: Harvest uses jiff (ADR 0018) and bans chrono-tz. chrono-tz arrives only through autumn-web 0.10 and tokio-cron-scheduler. Revisit: autumn-web moves to jiff." },
 ]
 
 # ---------------------------------------------------------------------------
@@ -484,7 +495,26 @@ allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
-deny = []
+# ADR 0018: Harvest uses `jiff` for dates and times. These bans keep `chrono`
+# and `chrono-tz` out of every crate that Harvest writes. A crate may depend
+# on them only when it is a listed wrapper. `autumn-harvest-plugin` converts at
+# the `autumn-web` boundary, whose API holds `chrono` types. The other
+# wrappers are third-party crates that Harvest does not control.
+deny = [
+    { crate = "chrono", wrappers = [
+        "autumn-harvest-plugin",
+        "autumn-web",
+        "chrono-tz",
+        "croner",
+        "diesel",
+        "smop",
+        "tokio-cron-scheduler",
+    ], reason = "Harvest uses jiff (ADR 0018)" },
+    { crate = "chrono-tz", wrappers = [
+        "autumn-web",
+        "tokio-cron-scheduler",
+    ], reason = "Harvest uses jiff (ADR 0018)" },
+]
 skip = []
 skip-tree = []
 

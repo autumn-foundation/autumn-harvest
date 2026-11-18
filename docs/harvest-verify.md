@@ -442,7 +442,7 @@ Suppose your codebase wraps the recorded clock:
 ```rust
 impl<'a> MyCtxExt for WorkflowContext<'a> {
     /// Records its result via `ctx.side_effect`, so it replays verbatim.
-    async fn business_now(&self) -> DateTime<Utc> { /* ... */ }
+    async fn business_now(&self) -> jiff::Timestamp { /* ... */ }
 }
 ```
 

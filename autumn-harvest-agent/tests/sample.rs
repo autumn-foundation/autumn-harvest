@@ -29,6 +29,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, TryFnModel, answer, calls, recorded_tool, runtime};
 use futures::FutureExt as _;
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "researcher";
@@ -446,8 +447,7 @@ fn judged_run(judge_model: &str) -> (AgentHarness, SampleInput) {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-    use autumn_harvest::chrono::{DateTime, Utc};
-    rt.llm_ledger_between(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 

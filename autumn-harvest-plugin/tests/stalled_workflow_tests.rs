@@ -15,12 +15,13 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
 use diesel::ExpressionMethods;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -146,11 +147,11 @@ async fn seed_stalled_workflow(
     .expect("seed workflow");
 
     // Backdate the WorkflowStarted event that was just appended.
-    let backdated_ts = Utc::now() - Duration::hours(hours_ago);
+    let backdated_ts = Timestamp::now() - SignedDuration::from_hours(hours_ago);
     autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
         diesel::update(harvest_events::table)
             .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-            .set(harvest_events::timestamp.eq(backdated_ts))
+            .set(harvest_events::timestamp.eq(backdated_ts.to_diesel()))
             .execute(c)
             .await
     })

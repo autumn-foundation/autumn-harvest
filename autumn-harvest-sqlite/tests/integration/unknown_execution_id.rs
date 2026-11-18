@@ -11,7 +11,7 @@
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteError, SqliteResult, SqliteRuntime};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
 /// Blocks on a signal, so the run is live but schedules no activity.
@@ -48,7 +48,7 @@ async fn run_until_blocked_as_of_on_unknown_id_is_execution_not_found() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     let bogus = ExecutionId::new();
 
-    let result = rt.run_until_blocked_as_of(bogus, Utc::now()).await;
+    let result = rt.run_until_blocked_as_of(bogus, Timestamp::now()).await;
     assert_not_found("run_until_blocked_as_of", result, bogus);
 }
 

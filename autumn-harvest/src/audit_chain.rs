@@ -65,8 +65,10 @@
 //! can. This control protects against database-level tampering, not against
 //! a compromised Harvest process.
 
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use sha2::Sha256;
 
 use crate::audit_export::AuditExportRecord;
@@ -162,7 +164,7 @@ pub const CHECKPOINT_DOMAIN: &[u8] = b"harvest-audit-chain-checkpoint-v1";
 ///
 /// A time counts as old when it is older than the cutoff plus this slack. The
 /// slack absorbs late commits near the cutoff.
-pub const RETENTION_SLACK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+pub const RETENTION_SLACK: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
 
 /// Length marker for an absent field in [`canonical_record`].
 const ABSENT: u32 = u32::MAX;
@@ -253,7 +255,7 @@ impl DecimalBuf {
 pub fn link(
     key: &CallbackSecret,
     prev: &ChainHash,
-    newest_before: Option<DateTime<Utc>>,
+    newest_before: Option<Timestamp>,
     record: &AuditExportRecord,
 ) -> ChainHash {
     link_with(&keyed_mac(key), prev, newest_before, record)
@@ -272,7 +274,7 @@ fn keyed_mac(key: &CallbackSecret) -> Hmac<Sha256> {
 fn link_with(
     keyed: &Hmac<Sha256>,
     prev: &ChainHash,
-    newest_before: Option<DateTime<Utc>>,
+    newest_before: Option<Timestamp>,
     record: &AuditExportRecord,
 ) -> ChainHash {
     let mut mac = keyed.clone();
@@ -285,8 +287,8 @@ fn link_with(
 }
 
 /// A time as the canonical encoding writes it: RFC 3339, UTC, six digits.
-fn canonical_time(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+fn canonical_time(at: Timestamp) -> String {
+    crate::time::rfc3339_opts(at, crate::time::SecondsFormat::Micros, true)
 }
 
 /// Append one length-prefixed field, or the absent marker.
@@ -303,7 +305,7 @@ fn push_field(sink: &mut impl FnMut(&[u8]), field: Option<&str>) {
 }
 
 /// The newest of `newest_before` and `at`.
-fn newest_through(newest_before: Option<DateTime<Utc>>, at: DateTime<Utc>) -> DateTime<Utc> {
+fn newest_through(newest_before: Option<Timestamp>, at: Timestamp) -> Timestamp {
     newest_before.map_or(at, |newest| newest.max(at))
 }
 
@@ -335,7 +337,7 @@ pub struct ChainCheckpoint {
     /// The link of the newest chained row.
     pub head: ChainHash,
     /// The newest `occurred_at` of every chained row, through the head.
-    pub newest_at: DateTime<Utc>,
+    pub newest_at: Timestamp,
 }
 
 impl ChainCheckpoint {
@@ -353,7 +355,7 @@ impl ChainCheckpoint {
         mac.update(&self.start_seq.to_be_bytes());
         mac.update(&self.head_seq.to_be_bytes());
         mac.update(&self.head);
-        mac.update(&self.newest_at.timestamp_micros().to_be_bytes());
+        mac.update(&self.newest_at.as_microsecond().to_be_bytes());
         mac.finalize().into_bytes().into()
     }
 }
@@ -368,7 +370,7 @@ pub struct ChainRow {
     /// The stored `chain_hash`, if the row is chained.
     pub hash: Option<ChainHash>,
     /// The stored `chain_newest_before`. It is `None` for the first link.
-    pub newest_before: Option<DateTime<Utc>>,
+    pub newest_before: Option<Timestamp>,
 }
 
 /// One problem the verifier found.
@@ -496,7 +498,7 @@ pub struct ChainVerifier<'k> {
     /// The keyed HMAC state of each accepted key.
     macs: Vec<Hmac<Sha256>>,
     keys: std::marker::PhantomData<&'k [CallbackSecret]>,
-    retention_cutoff: Option<DateTime<Utc>>,
+    retention_cutoff: Option<Timestamp>,
     report: ChainReport,
     /// The previous row, once the chain starts. See [`Previous`].
     previous: Option<Previous>,
@@ -514,7 +516,7 @@ struct Previous {
     /// The stored hash. `None` for an unchained row.
     hash: Option<ChainHash>,
     /// The newest `occurred_at` through this row. `None` for an unchained row.
-    newest: Option<DateTime<Utc>>,
+    newest: Option<Timestamp>,
 }
 
 impl<'k> ChainVerifier<'k> {
@@ -555,7 +557,7 @@ impl<'k> ChainVerifier<'k> {
     /// Treat a gap at the old end of the chain as retention. `cutoff` is
     /// `now - audit_retention_days`.
     #[must_use]
-    pub const fn with_retention_cutoff(mut self, cutoff: Option<DateTime<Utc>>) -> Self {
+    pub const fn with_retention_cutoff(mut self, cutoff: Option<Timestamp>) -> Self {
         self.retention_cutoff = cutoff;
         self
     }
@@ -571,7 +573,7 @@ impl<'k> ChainVerifier<'k> {
     }
 
     /// `true` when retention may have deleted a row that occurred at `at`.
-    fn is_old(&self, at: DateTime<Utc>) -> bool {
+    fn is_old(&self, at: Timestamp) -> bool {
         self.retention_cutoff
             .is_some_and(|cutoff| at < cutoff + RETENTION_SLACK)
     }
@@ -580,7 +582,7 @@ impl<'k> ChainVerifier<'k> {
     ///
     /// Retention explains a gap only when `newest_before`, the verified
     /// newest time before the row after the gap, is old.
-    fn gap(&mut self, after_seq: i64, before_seq: i64, newest_before: Option<DateTime<Utc>>) {
+    fn gap(&mut self, after_seq: i64, before_seq: i64, newest_before: Option<Timestamp>) {
         let gap = ChainFinding::Gap {
             after_seq,
             before_seq,
@@ -754,7 +756,7 @@ pub(crate) struct Stamped {
     /// The link of the newest row.
     pub(crate) head: ChainHash,
     /// The newest `occurred_at` of the chain, through the newest row.
-    pub(crate) newest_at: DateTime<Utc>,
+    pub(crate) newest_at: Timestamp,
 }
 
 /// Rows the verifier reads per query.
@@ -804,7 +806,7 @@ pub(crate) struct ChainAnchor {
     /// The first chained `export_seq`, or `None` for a new chain.
     pub(crate) start_seq: Option<i64>,
     /// The newest time of the chain so far, or `None` for a new chain.
-    pub(crate) newest_at: Option<DateTime<Utc>>,
+    pub(crate) newest_at: Option<Timestamp>,
 }
 
 /// The anchor for the next stamp on `cursor`, or `None` to refuse the stamp.
@@ -914,7 +916,7 @@ pub(crate) async fn write_checkpoint(
             cur::chain_start_seq.eq(checkpoint.start_seq),
             cur::chain_head_seq.eq(checkpoint.head_seq),
             cur::chain_head.eq(checkpoint.head.to_vec()),
-            cur::chain_newest_at.eq(checkpoint.newest_at),
+            cur::chain_newest_at.eq(checkpoint.newest_at.to_diesel()),
             cur::chain_mac.eq(mac.to_vec()),
         ))
         .execute(conn)
@@ -969,7 +971,7 @@ pub async fn reanchor_shard_chain(
                 start_seq: last_assigned_seq + 1,
                 head_seq: last_assigned_seq,
                 head: GENESIS,
-                newest_at: Utc::now(),
+                newest_at: Timestamp::now(),
             };
             write_checkpoint(conn, shard_id, &checkpoint, key).await?;
             Ok(Some(checkpoint))
@@ -1025,7 +1027,7 @@ pub(crate) async fn stamp_chain(
         let hash = link(key, &prev, newest, &record);
         ids.push(id);
         prevs.push(prev.to_vec());
-        newests.push(newest);
+        newests.push(newest.map(crate::time::sql::SqlTimestamp::from));
         hashes.push(hash.to_vec());
         prev = hash;
         let newest_at = newest_through(newest, record.occurred_at);
@@ -1067,7 +1069,7 @@ pub struct ChainVerifyOptions<'a> {
     pub keys: &'a [CallbackSecret],
     /// The audit retention cutoff, `now - audit_retention_days`. `None` when
     /// retention does not run. Rows missing before it count as retention.
-    pub retention_cutoff: Option<DateTime<Utc>>,
+    pub retention_cutoff: Option<Timestamp>,
     /// The newest link a check outside the database saw. A signed checkpoint
     /// cannot prove that it is the newest one. So only this link detects a
     /// restored older state.
@@ -1254,8 +1256,8 @@ mod tests {
         CallbackSecret::new(vec![7_u8; MIN_CHAIN_KEY_BYTES])
     }
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(seconds, 123_456_000).unwrap_or_default()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 123_456_000).unwrap_or_default()
     }
 
     fn rec(seq: i64) -> AuditExportRecord {
@@ -1323,7 +1325,7 @@ mod tests {
     fn verify_with(
         rows: &[ChainRow],
         checkpoint: Option<ChainCheckpoint>,
-        cutoff: Option<DateTime<Utc>>,
+        cutoff: Option<Timestamp>,
     ) -> ChainReport {
         let key = key();
         let mut verifier = ChainVerifier::new(&key)
@@ -1884,7 +1886,7 @@ mod tests {
         let cp = checkpoint(&rows);
         // Retention kept row 3, a lifecycle record, and purged rows 1, 2 and 4.
         let survivors = [rows[2].clone(), rows[4].clone()];
-        let cutoff = at(1_700_000_000 + 5) + RETENTION_SLACK + chrono::TimeDelta::seconds(1);
+        let cutoff = at(1_700_000_000 + 5) + RETENTION_SLACK + jiff::SignedDuration::from_secs(1);
         let report = verify_with(&survivors, cp, Some(cutoff));
         assert!(report.is_intact(), "{report:?}");
         assert_eq!(
@@ -1908,7 +1910,7 @@ mod tests {
         let cp = checkpoint(&rows);
         let survivors = [rows[0].clone(), rows[2].clone()];
         // Row 1 is newer than the cutoff, so retention did not purge row 2.
-        let cutoff = at(1_700_000_000) - RETENTION_SLACK - chrono::TimeDelta::hours(1);
+        let cutoff = at(1_700_000_000) - RETENTION_SLACK - jiff::SignedDuration::from_hours(1);
         let report = verify_with(&survivors, cp, Some(cutoff));
         assert_eq!(
             report.findings,
@@ -1923,7 +1925,7 @@ mod tests {
     fn retention_explains_a_purged_tail_only_when_the_head_is_old() {
         let rows = chain(&[1, 2, 3]);
         let cp = checkpoint(&rows);
-        let old = at(1_700_000_000 + 3) + RETENTION_SLACK + chrono::TimeDelta::seconds(1);
+        let old = at(1_700_000_000 + 3) + RETENTION_SLACK + jiff::SignedDuration::from_secs(1);
         let purged = verify_with(&rows[..1], cp, Some(old));
         assert!(purged.is_intact(), "{purged:?}");
         assert_eq!(
@@ -1934,7 +1936,7 @@ mod tests {
             }]
         );
 
-        let early = at(1_700_000_000) - RETENTION_SLACK - chrono::TimeDelta::hours(1);
+        let early = at(1_700_000_000) - RETENTION_SLACK - jiff::SignedDuration::from_hours(1);
         let deleted = verify_with(&rows[..1], cp, Some(early));
         assert_eq!(
             deleted.findings,

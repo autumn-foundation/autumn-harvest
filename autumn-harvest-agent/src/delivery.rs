@@ -19,7 +19,7 @@
 //! [`Delivery`]. [`LogDelivery`] is the default.
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, Utc};
+use autumn_harvest::time::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -184,11 +184,11 @@ impl ParkedCall {
 
     /// The notice for this call. The deadline is `now` plus the timeout.
     #[must_use]
-    pub fn notice(self, now: DateTime<Utc>) -> ApprovalNotice {
+    pub fn notice(self, now: Timestamp) -> ApprovalNotice {
         let secs = i64::try_from(self.timeout_secs).unwrap_or(i64::MAX);
-        let deadline = autumn_harvest::chrono::Duration::try_seconds(secs)
-            .and_then(|timeout| now.checked_add_signed(timeout))
-            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let deadline = now
+            .checked_add(SignedDuration::from_secs(secs))
+            .unwrap_or(Timestamp::MAX);
         ApprovalNotice {
             call: self,
             deadline,
@@ -208,7 +208,7 @@ pub struct ApprovalNotice {
     /// The earliest time that the wait can end with no decision. The worker
     /// reads its clock before the wait starts, so the wait ends at this time
     /// or a little later.
-    pub deadline: DateTime<Utc>,
+    pub deadline: Timestamp,
 }
 
 impl ApprovalNotice {
@@ -376,7 +376,7 @@ mod tests {
     fn the_notice_key_names_the_run_and_the_signal() {
         let call = parked(60);
         let key = format!("r:{}:tool_approval:0:0:w1", call.execution_id);
-        let notice = call.clone().notice(Utc::now());
+        let notice = call.clone().notice(Timestamp::now());
         assert_eq!(notice.key(), key);
         assert_eq!(notice.key(), notice.call.key());
         // A reset or a fork keeps the run id. The new execution gets a new key.
@@ -389,24 +389,21 @@ mod tests {
 
     #[test]
     fn the_deadline_is_now_plus_the_timeout() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let notice = parked(90).notice(now);
-        assert_eq!(
-            notice.deadline,
-            now + autumn_harvest::chrono::Duration::seconds(90)
-        );
+        assert_eq!(notice.deadline, now + SignedDuration::from_secs(90));
         // A huge timeout saturates. It never wraps to an early deadline.
         let notice = parked(u64::MAX).notice(now);
-        assert_eq!(notice.deadline, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(notice.deadline, Timestamp::MAX);
         // A timeout that is a valid duration but passes the last date
         // saturates too.
         let notice = parked(1_000_000_000_000_000).notice(now);
-        assert_eq!(notice.deadline, DateTime::<Utc>::MAX_UTC);
+        assert_eq!(notice.deadline, Timestamp::MAX);
     }
 
     #[test]
     fn the_notice_round_trips_as_flat_json() {
-        let notice = parked(60).notice(Utc::now());
+        let notice = parked(60).notice(Timestamp::now());
         let value = serde_json::to_value(&notice).unwrap();
         assert_eq!(value["signal"], "tool_approval:0:0:w1");
         assert!(value.get("deadline").is_some(), "{value}");
@@ -455,7 +452,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .with_ansi(false)
             .finish();
-        let notice = parked(60).notice(Utc::now());
+        let notice = parked(60).notice(Timestamp::now());
         let _guard = tracing::subscriber::set_default(subscriber);
         LogDelivery.notify_approval(&notice).await.unwrap();
         let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();

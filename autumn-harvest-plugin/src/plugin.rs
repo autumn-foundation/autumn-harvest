@@ -2798,8 +2798,8 @@ async fn start_harvest_runtime(
                 // the default chain cap.
                 let ceiling = |d: Option<std::time::Duration>| {
                     d.map(|d| {
-                        autumn_harvest::chrono::Duration::from_std(d)
-                            .unwrap_or(autumn_harvest::chrono::Duration::MAX)
+                        autumn_harvest::time::from_std_bounded(d)
+                            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
                     })
                 };
                 let max_execution_timeout_ceiling =
@@ -3351,9 +3351,9 @@ struct WebhookRunDefaults {
     owner: Option<&'static str>,
     runbook_url: Option<&'static str>,
     severity: Option<&'static str>,
-    execution_timeout: Option<autumn_harvest::chrono::Duration>,
-    chain_execution_timeout: Option<autumn_harvest::chrono::Duration>,
-    sla: Option<autumn_harvest::chrono::Duration>,
+    execution_timeout: Option<autumn_harvest::jiff::SignedDuration>,
+    chain_execution_timeout: Option<autumn_harvest::jiff::SignedDuration>,
+    sla: Option<autumn_harvest::jiff::SignedDuration>,
     retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
 }
 
@@ -3366,9 +3366,8 @@ struct WebhookRunDefaults {
 fn webhook_run_defaults(
     registry: Option<&autumn_harvest::worker::HandlerRegistry>,
 ) -> WebhookRunDefaults {
-    let to_chrono = |d: Option<std::time::Duration>| {
-        d.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok())
-    };
+    let to_signed =
+        |d: Option<std::time::Duration>| d.and_then(autumn_harvest::time::from_std_bounded);
     registry
         .and_then(|registry| {
             registry.workflows.get("webhook_delivery").map(|wf| {
@@ -3378,9 +3377,9 @@ fn webhook_run_defaults(
                     owner: wf.owner,
                     runbook_url: wf.runbook_url,
                     severity: wf.severity,
-                    execution_timeout: to_chrono(execution_timeout),
-                    chain_execution_timeout: to_chrono(registry.chain_execution_timeout(wf.name)),
-                    sla: to_chrono(sla),
+                    execution_timeout: to_signed(execution_timeout),
+                    chain_execution_timeout: to_signed(registry.chain_execution_timeout(wf.name)),
+                    sla: to_signed(sla),
                     retry_policy: wf.retry_policy.clone(),
                 }
             })
@@ -3403,8 +3402,8 @@ mod webhook_run_defaults_tests {
         HandlerRegistry::new(vec![info], vec![])
     }
 
-    const fn minutes(n: i64) -> Option<autumn_harvest::chrono::Duration> {
-        autumn_harvest::chrono::Duration::try_minutes(n)
+    const fn minutes(n: i64) -> Option<autumn_harvest::jiff::SignedDuration> {
+        autumn_harvest::jiff::SignedDuration::try_from_mins(n)
     }
 
     /// With no override, the start takes the declared timeout and SLA.

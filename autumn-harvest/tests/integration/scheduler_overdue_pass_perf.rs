@@ -44,9 +44,9 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest::scheduler::overdue_schedule_pass;
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -302,7 +302,7 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64) -> SizePoint {
         .expect("stats connection");
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
-    let result = overdue_schedule_pass(&mut pass_conn, Utc::now())
+    let result = overdue_schedule_pass(&mut pass_conn, Timestamp::now())
         .await
         .expect("overdue_schedule_pass should succeed");
     assert_eq!(
@@ -491,7 +491,7 @@ async fn overdue_schedule_pass_matches_the_original_per_schedule_loop() {
             s.id
         );
 
-        let empty: Vec<chrono::NaiveDate> = Vec::new();
+        let empty: Vec<jiff::civil::Date> = Vec::new();
         let actual_effective_fire_at = s.calendar_name.as_deref().and_then(|cal_name| {
             let excluded = exclusions.get(cal_name).unwrap_or(&empty);
             let exclude_weekends = autumn_harvest::calendar::calendar_excludes_weekends(cal_name);

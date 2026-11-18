@@ -46,9 +46,9 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::{Duration, Utc};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
 use crate::integration_e2e::{
@@ -1240,7 +1240,13 @@ async fn cancel_timer_co_batched_with_a_local_activity_deletes_its_row_and_keeps
         .expect("connect");
 
     let exec_id = insert_workflow_execution(&mut conn).await;
-    seed_pending_timer_row(&mut conn, exec_id, "idle", Utc::now() + Duration::hours(1)).await;
+    seed_pending_timer_row(
+        &mut conn,
+        exec_id,
+        "idle",
+        Timestamp::now() + SignedDuration::from_hours(1),
+    )
+    .await;
     enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
 
     let reg = registry(

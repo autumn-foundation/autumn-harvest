@@ -10,6 +10,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::Ext;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -531,7 +532,7 @@ async fn test_trigger_evaluations_same_shard() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -784,7 +785,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"ignored": true}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -885,7 +886,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
                     }
                 }
             }))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1008,7 +1009,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             harvest_workflow_executions::state.eq("FAILED"),
             harvest_workflow_executions::output.eq(None::<Value>),
             harvest_workflow_executions::error.eq(Some("payment declined: insufficient funds")),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1179,7 +1180,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(source_output.clone())),
             harvest_workflow_executions::error.eq(None::<String>),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1298,7 +1299,7 @@ async fn test_trigger_state_matching_and_deduplication() {
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1492,7 +1493,7 @@ async fn test_trigger_cross_shard() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"status": "ok"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn0)
         .await
@@ -1738,7 +1739,7 @@ async fn test_trigger_with_custom_queue() {
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1941,7 +1942,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"out": "yes"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn0)
         .await
@@ -2003,7 +2004,10 @@ async fn test_trigger_outbox_retry_and_sweep() {
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
     )
-    .set(outbox_dsl::next_attempt_at.eq(chrono::Utc::now() - chrono::Duration::seconds(1)))
+    .set(
+        outbox_dsl::next_attempt_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(&mut conn0)
     .await
     .unwrap();
@@ -2195,7 +2199,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn1)
         .await
@@ -2695,7 +2699,7 @@ async fn test_trigger_evaluations_schema_validation() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"email": "test@example.com"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -2785,7 +2789,7 @@ async fn test_trigger_evaluations_schema_validation() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"username": "not_an_email"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -2916,7 +2920,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -3052,7 +3056,7 @@ async fn start_and_complete_source(
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(output)),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

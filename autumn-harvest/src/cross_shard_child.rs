@@ -44,9 +44,10 @@
 //! - Placement never falls back silently: an unreachable target shard fails the
 //!   spawn with the typed, retryable [`HarvestError::ShardUnavailable`].
 
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
@@ -437,7 +438,8 @@ pub async fn request_cross_shard_cancel(
                 harvest_cross_shard_children::cancel_reason,
                 reason,
             )),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<DateTime<Utc>>),
+            harvest_cross_shard_children::last_attempt_at
+                .eq(None::<crate::time::sql::SqlTimestamp>),
             harvest_cross_shard_children::attempts.eq(0),
         ))
         .execute(conn)
@@ -849,7 +851,7 @@ async fn mark_swept(conn: &mut AsyncPgConnection, ids: &[uuid::Uuid]) {
         harvest_cross_shard_children::table
             .filter(harvest_cross_shard_children::child_exec_id.eq_any(ids)),
     )
-    .set(harvest_cross_shard_children::last_attempt_at.eq(Some(Utc::now())))
+    .set(harvest_cross_shard_children::last_attempt_at.eq(Some(Timestamp::now()).to_diesel()))
     .execute(conn)
     .await;
 }
@@ -1342,7 +1344,7 @@ async fn record_attempt_failure(
         .set((
             harvest_cross_shard_children::attempts.eq(harvest_cross_shard_children::attempts + 1),
             harvest_cross_shard_children::last_error.eq(Some(truncated)),
-            harvest_cross_shard_children::last_attempt_at.eq(Some(Utc::now())),
+            harvest_cross_shard_children::last_attempt_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await;
@@ -1462,20 +1464,20 @@ async fn start_child_on_target(
                 // spec, and they become absolute here. Issue #1263 item 7
                 // extended this to the chain deadline, which used to be the
                 // one exception.
-                let created_at = Utc::now();
-                // `checked_add_signed` (not `+`): `DateTime + Duration` panics
+                let created_at = Timestamp::now();
+                // `checked_add` (not `+`): `Timestamp + SignedDuration` panics
                 // on overflow, and these seconds values are caller-supplied.
                 // `execution::start_or_load_workflow_execution`'s chain-ceiling
                 // computation uses the same guard for the same reason. `None`
                 // on overflow means no deadline, not a crashed relay sweep.
                 let deadline_at = spec.execution_timeout_secs.and_then(|secs| {
-                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                    created_at.checked_add(jiff::SignedDuration::from_secs(secs)).ok()
                 });
                 let sla_deadline_at = spec.sla_secs.and_then(|secs| {
-                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                    created_at.checked_add(jiff::SignedDuration::from_secs(secs)).ok()
                 });
                 let chain_deadline_at = spec.chain_execution_timeout_secs.and_then(|secs| {
-                    created_at.checked_add_signed(chrono::Duration::seconds(secs))
+                    created_at.checked_add(jiff::SignedDuration::from_secs(secs)).ok()
                 });
 
                 let child_row = NewWorkflowExecution {
@@ -1483,7 +1485,7 @@ async fn start_child_on_target(
                     first_exec_id: None,
                     chain_execution_timeout: spec
                         .chain_execution_timeout_secs
-                        .map(chrono::Duration::seconds),
+                        .map(jiff::SignedDuration::from_secs),
                     chain_deadline_at,
                     id: child_exec_id.as_uuid(),
                     workflow_name: &workflow_name,
@@ -1497,9 +1499,9 @@ async fn start_child_on_target(
                     input: codecs.encode_column(&spec.input)?.into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
-                    execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
+                    execution_timeout: spec.execution_timeout_secs.map(jiff::SignedDuration::from_secs),
                     deadline_at,
-                    sla: spec.sla_secs.map(chrono::Duration::seconds),
+                    sla: spec.sla_secs.map(jiff::SignedDuration::from_secs),
                     sla_deadline_at,
                     memo: None,
                     search_attrs: None,
@@ -1616,7 +1618,7 @@ async fn start_child_on_target(
                         harvest_workflow_executions::state.eq("CANCELLED"),
                         harvest_workflow_executions::error
                             .eq(Some(born_cancelled_reason)),
-                        harvest_workflow_executions::completed_at.eq(Some(created_at)),
+                        harvest_workflow_executions::completed_at.eq(Some(created_at).to_diesel()),
                     ))
                     .execute(conn)
                     .await

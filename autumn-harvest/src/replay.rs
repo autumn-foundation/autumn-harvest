@@ -470,7 +470,7 @@ pub enum MutexGrantMatch {
         /// The fencing token recorded with the grant.
         lock_seq: i64,
         /// The wall-clock instant the lock was granted.
-        acquired_at: chrono::DateTime<chrono::Utc>,
+        acquired_at: jiff::Timestamp,
     },
     /// The cursor is past end of history (first live acquire) — the caller
     /// suspends on an `AcquireMutex` command.
@@ -7806,7 +7806,7 @@ mod tests {
     use super::*;
     use crate::error::TimeoutType;
     use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     fn update_done(update_id: UpdateId, n: u64) -> WorkflowEvent {
         WorkflowEvent::UpdateCompleted {
@@ -8595,7 +8595,7 @@ mod tests {
         // Old workflow has a different event at this position — no marker
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -9464,7 +9464,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10672,12 +10672,12 @@ mod tests {
                 duration_secs: 30,
             },
             WorkflowEvent::WorkflowExecutionPaused {
-                paused_at: chrono::Utc::now(),
+                paused_at: jiff::Timestamp::now(),
                 reason: Some("incident".into()),
                 actor: "oncall".into(),
             },
             WorkflowEvent::WorkflowExecutionResumed {
-                resumed_at: chrono::Utc::now(),
+                resumed_at: jiff::Timestamp::now(),
                 actor: "oncall".into(),
             },
             WorkflowEvent::TimerFired { timer_id },
@@ -10702,18 +10702,18 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             WorkflowEvent::WorkflowExecutionPaused {
-                paused_at: chrono::Utc::now(),
+                paused_at: jiff::Timestamp::now(),
                 reason: None,
                 actor: "oncall".into(),
             },
             WorkflowEvent::WorkflowExecutionResumed {
-                resumed_at: chrono::Utc::now(),
+                resumed_at: jiff::Timestamp::now(),
                 actor: "oncall".into(),
             },
         ];
@@ -10737,12 +10737,12 @@ mod tests {
                 queue: "default".into(),
             },
             WorkflowEvent::WorkflowExecutionPaused {
-                paused_at: chrono::Utc::now(),
+                paused_at: jiff::Timestamp::now(),
                 reason: None,
                 actor: "oncall".into(),
             },
             WorkflowEvent::WorkflowExecutionResumed {
-                resumed_at: chrono::Utc::now(),
+                resumed_at: jiff::Timestamp::now(),
                 actor: "oncall".into(),
             },
             WorkflowEvent::ActivityCompleted {
@@ -10773,7 +10773,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10794,7 +10794,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("downstream down"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: Some("downstream fixed".into()),
             },
@@ -10823,14 +10823,14 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -10855,7 +10855,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10879,7 +10879,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10908,7 +10908,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10917,7 +10917,7 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: chrono::Utc::now(),
+                fire_at: jiff::Timestamp::now(),
             },
         ];
         let matcher = HistoryMatcher::new(events);
@@ -10941,7 +10941,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -10978,7 +10978,7 @@ mod tests {
             let events = vec![
                 WorkflowEvent::WorkflowStarted {
                     input: Value::Null,
-                    timestamp: chrono::Utc::now(),
+                    timestamp: jiff::Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -11003,14 +11003,14 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11034,7 +11034,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11155,7 +11155,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11188,7 +11188,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11220,7 +11220,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11243,7 +11243,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11270,7 +11270,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11281,7 +11281,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11311,7 +11311,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11338,7 +11338,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11365,7 +11365,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11392,7 +11392,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11416,7 +11416,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11440,7 +11440,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11466,7 +11466,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11497,7 +11497,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11528,7 +11528,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11563,7 +11563,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11592,7 +11592,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11617,7 +11617,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11646,7 +11646,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11669,7 +11669,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11720,7 +11720,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11752,7 +11752,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11785,7 +11785,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11804,7 +11804,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11859,7 +11859,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11896,7 +11896,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11931,7 +11931,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -11958,7 +11958,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -11983,7 +11983,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12004,7 +12004,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -12028,7 +12028,7 @@ mod tests {
             },
             WorkflowEvent::workflow_failed("budget exceeded"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -12056,7 +12056,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12095,7 +12095,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12104,10 +12104,10 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: chrono::Utc::now(),
+                fire_at: jiff::Timestamp::now(),
             },
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -12130,7 +12130,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12139,10 +12139,10 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: chrono::Utc::now(),
+                fire_at: jiff::Timestamp::now(),
             },
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -12171,7 +12171,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12196,10 +12196,10 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: chrono::Utc::now(),
+                fire_at: jiff::Timestamp::now(),
             },
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -12225,7 +12225,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -12267,14 +12267,14 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             WorkflowEvent::workflow_failed("boom"),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -15408,7 +15408,7 @@ mod tests {
         let grant = WorkflowEvent::MutexGranted {
             key: "account-1".into(),
             lock_seq: 1,
-            acquired_at: Utc::now(),
+            acquired_at: Timestamp::now(),
         };
         let m = HistoryMatcher::new(vec![external]);
         assert_eq!(
@@ -15493,7 +15493,7 @@ mod tests {
     }
 
     fn started_event() -> WorkflowEvent {
-        WorkflowEvent::workflow_started(Value::Null, chrono::Utc::now())
+        WorkflowEvent::workflow_started(Value::Null, jiff::Timestamp::now())
     }
 
     /// One history that uses each main command kind once.
@@ -15618,7 +15618,7 @@ mod tests {
             WorkflowEvent::workflow_failed("boom"),
             decision_boundary(),
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: chrono::Utc::now(),
+                redriven_at: jiff::Timestamp::now(),
                 dead_letter_id: uuid::Uuid::new_v4(),
                 reason: None,
             },
@@ -15761,7 +15761,7 @@ mod tests {
             update_id,
             name: "handler".into(),
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         }
     }
 
@@ -17051,7 +17051,7 @@ mod activity_scan_tests {
                 update_id: UpdateId::new(),
                 name: "u".into(),
                 input: Value::Null,
-                timestamp: chrono::DateTime::UNIX_EPOCH,
+                timestamp: jiff::Timestamp::UNIX_EPOCH,
             })
             .collect()
     }
@@ -17486,10 +17486,10 @@ mod activity_scan_tests {
                     update_id: UpdateId::new(),
                     name: "u".into(),
                     input: Value::Null,
-                    timestamp: chrono::DateTime::UNIX_EPOCH,
+                    timestamp: jiff::Timestamp::UNIX_EPOCH,
                 },
                 Ev::Paused => WorkflowEvent::WorkflowExecutionPaused {
-                    paused_at: chrono::DateTime::UNIX_EPOCH,
+                    paused_at: jiff::Timestamp::UNIX_EPOCH,
                     reason: None,
                     actor: "op".into(),
                 },
@@ -18862,7 +18862,7 @@ mod scan_fanout_tests {
                 update_id: UpdateId::new(),
                 name: "u".into(),
                 input: Value::Null,
-                timestamp: chrono::DateTime::UNIX_EPOCH,
+                timestamp: jiff::Timestamp::UNIX_EPOCH,
             })
             .collect()
     }

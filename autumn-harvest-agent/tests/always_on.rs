@@ -28,8 +28,8 @@ fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 /// A delivery channel that keeps every report.

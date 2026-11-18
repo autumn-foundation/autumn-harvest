@@ -33,8 +33,8 @@
 //! [`ModuleRegistry::load_module`]: crate::hot_swap::ModuleRegistry::load_module
 //! [`ModuleRegistry::unload_build`]: crate::hot_swap::ModuleRegistry::unload_build
 
-use chrono::{DateTime, Utc};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
 use std::sync::Arc;
@@ -64,7 +64,8 @@ pub struct WorkflowModuleRow {
     pub signature: Option<String>,
     /// When the row was written.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    pub published_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    pub published_at: Timestamp,
 }
 
 impl From<&WorkflowModuleRow> for ModuleDescriptor {

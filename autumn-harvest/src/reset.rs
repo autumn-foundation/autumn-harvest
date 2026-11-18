@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1470,10 +1471,10 @@ async fn terminate_source_execution(
                 "workflow reset to {new_exec_id}: {}",
                 request.reason
             ))),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             // Clear the now-stale pause metadata when sealing a PAUSED source so
             // the sealed row carries no residual pause state (issue #383).
-            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
@@ -1564,20 +1565,28 @@ pub(crate) async fn insert_fork_row(
 ) -> Result<WorkflowExecution, diesel::result::Error> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
-    let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // jiff stops at year 9999, far below the `chrono` limit. A sum that
+    // `chrono` held saturates to `Timestamp::MAX`, as on the start path. A sum
+    // past the `chrono` range yields no deadline rather than a panic.
+    let now = jiff::Timestamp::now();
+    let deadline_at = source
+        .execution_timeout
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Re-anchor the soft SLA deadline per-fork (issue #487).
-    let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
+    let sla_deadline_at = source
+        .sla
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Reset deliberately starts a NEW chain origin (issue #617), like
     // `first_exec_id: None` / `schedule_id: None` below. An operator reset breaks
     // the continue-as-new lineage, as in the #488 lineage-break precedent. So the
     // chain deadline is RE-ANCHORED to the start of the fork, not carried
     // verbatim. A source with no chain cap yields `None` for both.
-    // `checked_add_signed` (not `+`): an absurd operator ceiling can make the
-    // `chain_execution_timeout` of the source reach `chrono::Duration::MAX`.
-    // `DateTime + Duration` panics on overflow; yield `None` instead (issue #617).
+    // A checked sum (not `+`): an absurd operator ceiling can make the
+    // `chain_execution_timeout` of the source reach `jiff::SignedDuration::MAX`.
+    // `Timestamp + SignedDuration` panics on overflow. Yield `None` instead (issue #617).
     let chain_deadline_at = source
         .chain_execution_timeout
-        .and_then(|d| chrono::Utc::now().checked_add_signed(d));
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Provenance ref for a reset fork is the source execution id (#740).
     let source_exec_id_str = source.id.to_string();
     // Strip the six replay-non-determinism diagnostic keys unconditionally
@@ -1856,7 +1865,7 @@ async fn cancel_pending_external_tasks(
     )
     .set((
         harvest_external_tasks::state.eq("CANCELLED"),
-        harvest_external_tasks::updated_at.eq(chrono::Utc::now()),
+        harvest_external_tasks::updated_at.eq(jiff::Timestamp::now().to_diesel()),
     ))
     .execute(conn)
     .await
@@ -1872,7 +1881,8 @@ struct SignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
-    received_at: chrono::DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    received_at: jiff::Timestamp,
 }
 
 /// A buffered signal on the fork.
@@ -1889,7 +1899,8 @@ struct NewSignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
-    received_at: chrono::DateTime<Utc>,
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
+    received_at: jiff::Timestamp,
 }
 
 async fn reapply_or_drop_signals(
@@ -1928,7 +1939,7 @@ async fn reapply_or_drop_signals(
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)
-            .values(&new_rows)
+            .values(new_rows)
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -1994,7 +2005,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::Value;
 
     use crate::event::WorkflowEvent;
@@ -2024,7 +2035,7 @@ pub(crate) mod tests {
                 "type": event_type,
                 "data": { "activity_id": uuid::Uuid::new_v4(), "signal_name": "go", field: envelope },
             }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         }
     }
 
@@ -2056,7 +2067,7 @@ pub(crate) mod tests {
             parent_id: None,
             sticky_worker_id: None,
             queue_name: "default".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             completed_at: None,
             execution_timeout: None,
             deadline_at: None,
@@ -2064,7 +2075,7 @@ pub(crate) mod tests {
             chain_deadline_at: None,
             memo: None,
             search_attrs: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             assigned_build_id: None,
             parent_close_policy: None,
             owner: None,
@@ -2075,7 +2086,7 @@ pub(crate) mod tests {
             sla_deadline_at: None,
             sla_breached: false,
             sla_breached_at: None,
-            paused_at: Some(Utc::now()),
+            paused_at: Some(Timestamp::now()),
             pause_reason: Some("operator pause".into()),
             pause_actor: Some("oncall".into()),
             current_details: None,
@@ -2152,7 +2163,7 @@ pub(crate) mod tests {
     fn reset_point_allows_workflow_started_boundary() {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2173,7 +2184,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2212,7 +2223,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2248,7 +2259,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2273,7 +2284,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2315,7 +2326,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2343,7 +2354,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2396,7 +2407,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2433,7 +2444,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2472,7 +2483,7 @@ pub(crate) mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2518,7 +2529,7 @@ pub(crate) mod tests {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2719,8 +2730,8 @@ pub(crate) mod tests {
             },
             activity_completed(act_id),
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
         ];
         assert_eq!(
@@ -2752,7 +2763,7 @@ pub(crate) mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id,
                 attempt: 2,
-                fire_at: Utc::now(),
+                fire_at: Timestamp::now(),
             },
         ];
         assert_eq!(

@@ -311,13 +311,25 @@ impl HarvestFleet {
     /// # Errors
     ///
     /// [`HarvestSqliteError::Fleet`] when the fleet refuses the restore.
+    /// [`HarvestSqliteError::Tenant`] when `target` has no `chrono` value.
+    /// Each `jiff` instant has one, so that error does not occur.
     pub async fn restore(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<jiff::Timestamp>,
     ) -> Result<autumn_web::replication::RestoreOutcome, HarvestSqliteError> {
+        // `DatabaseFleet::restore` takes a `chrono` target.
+        let fleet_target = target
+            .map(|at| {
+                crate::chrono_boundary::to_chrono(at).ok_or_else(|| {
+                    HarvestSqliteError::Tenant(format!(
+                        "the restore target {at} has no chrono value"
+                    ))
+                })
+            })
+            .transpose()?;
         let Some(replicas) = &self.shared.replicas else {
-            let restored = self.shared.fleet.restore(key, target).await?;
+            let restored = self.shared.fleet.restore(key, fleet_target).await?;
             self.shared.wake_now(key);
             return Ok(restored);
         };
@@ -328,7 +340,7 @@ impl HarvestFleet {
         let task = tokio::spawn(async move {
             let _turn = shared.restore_turn.lock().await;
             replicas.request_restore(&owned, target);
-            let restored = shared.fleet.restore(&owned, target).await;
+            let restored = shared.fleet.restore(&owned, fleet_target).await;
             replicas.restore_returned(&owned);
             // The end waits for an open that holds the target lock.
             let (ended, ok) = (owned.clone(), restored.is_ok());
@@ -457,7 +469,7 @@ impl Shared {
     /// Ask the next sweep to open `key`.
     fn wake_now(&self, key: &FleetDbKey) {
         if let Some(wakes) = &self.wakes {
-            wakes.record(key, Some(chrono::Utc::now().timestamp_millis()));
+            wakes.record(key, Some(jiff::Timestamp::now().as_millisecond()));
         }
     }
 

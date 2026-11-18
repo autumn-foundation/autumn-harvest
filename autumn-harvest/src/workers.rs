@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -135,14 +136,13 @@ impl WorkerHealth {
     /// A worker is considered stale when it has not sent a heartbeat within
     /// `stale_threshold` (typically `2 × heartbeat_interval`).
     #[must_use]
-    pub fn classify(last_heartbeat_at: DateTime<Utc>, stale_threshold: Duration) -> Self {
+    pub fn classify(last_heartbeat_at: Timestamp, stale_threshold: Duration) -> Self {
         // Negative durations arise from clock skew (worker host slightly ahead of
         // the API host). Treat them as zero elapsed time so a freshly-heartbeating
         // worker is never misclassified as stale.
-        let elapsed = Utc::now()
-            .signed_duration_since(last_heartbeat_at)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+        let elapsed =
+            std::time::Duration::try_from(Timestamp::now().duration_since(last_heartbeat_at))
+                .unwrap_or(Duration::ZERO);
         if elapsed > stale_threshold {
             Self::Stale
         } else {
@@ -336,7 +336,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
         .do_update()
         .set((
             harvest_workers::started_at.eq(excluded(harvest_workers::started_at)),
-            // The shard database's own clock, never this host's `Utc::now()`
+            // The shard database's own clock, never this host's `Timestamp::now()`
             // -- see the matching rationale on `heartbeat_worker` below.
             harvest_workers::last_heartbeat_at.eq(diesel::dsl::now),
             harvest_workers::queues.eq(excluded(harvest_workers::queues)),
@@ -351,7 +351,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
             // Clear any stale drain deadline so a re-registering worker does not
             // inherit the deadline left behind by a prior Draining/Stopped cycle.
-            harvest_workers::drain_deadline_at.eq(Option::<DateTime<Utc>>::None),
+            harvest_workers::drain_deadline_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             harvest_workers::max_concurrent_sessions
                 .eq(excluded(harvest_workers::max_concurrent_sessions)),
             // A re-registering worker starts with zero in-use sessions -- any
@@ -578,7 +578,7 @@ pub async fn heartbeat_worker_status(
     diesel::update(harvest_workers::table.find(worker_id))
         .set((
             // The shard database's own clock, never this host's
-            // `Utc::now()`. `codec_rotation::blocking_workers` computes
+            // `Timestamp::now()`. `codec_rotation::blocking_workers` computes
             // liveness as `NOW() - last_heartbeat_at`, entirely on the
             // database side.
             //
@@ -2022,7 +2022,7 @@ pub async fn transition_status(
 async fn transition_active_to_draining(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-    drain_deadline: Option<DateTime<Utc>>,
+    drain_deadline: Option<Timestamp>,
 ) -> HarvestResult<()> {
     diesel::update(
         harvest_workers::table
@@ -2031,7 +2031,7 @@ async fn transition_active_to_draining(
     )
     .set((
         harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
-        harvest_workers::drain_deadline_at.eq(drain_deadline),
+        harvest_workers::drain_deadline_at.eq(drain_deadline.to_diesel()),
     ))
     .execute(conn)
     .await
@@ -2465,7 +2465,7 @@ pub struct DrainResponse {
     pub in_flight_count: i32,
     /// When this worker must have finished draining (echoed from the request or
     /// derived from the configured shutdown timeout).
-    pub drain_deadline_at: Option<DateTime<Utc>>,
+    pub drain_deadline_at: Option<Timestamp>,
     /// Shard IDs this worker was serving at drain time.
     pub shard_ids: Vec<i32>,
     /// Shards that could not be contacted during this request.
@@ -2553,10 +2553,10 @@ pub struct PinnedExecutionRow {
     /// Task queue the parked task is waiting on.
     pub queue_name: String,
     /// Wall-clock start time of this execution.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the affinity lease expires (UTC). After this the task becomes
     /// claimable by any eligible worker.
-    pub sticky_until: DateTime<Utc>,
+    pub sticky_until: Timestamp,
 }
 
 /// List workflow executions currently soft-pinned to `worker_id` via the
@@ -2582,14 +2582,14 @@ pub async fn list_pinned_executions(
     use diesel::sql_types::Timestamptz;
 
     type Row = (
-        Uuid,                  // harvest_task_queue.workflow_exec_id
-        Option<DateTime<Utc>>, // harvest_task_queue.sticky_until
-        Uuid,                  // harvest_workflow_executions.id
-        String,                // workflow_name
-        String,                // workflow_id
-        String,                // state
-        String,                // queue_name (from execution)
-        DateTime<Utc>,         // started_at
+        Uuid,                                   // harvest_task_queue.workflow_exec_id
+        Option<crate::time::sql::SqlTimestamp>, // harvest_task_queue.sticky_until
+        Uuid,                                   // harvest_workflow_executions.id
+        String,                                 // workflow_name
+        String,                                 // workflow_id
+        String,                                 // state
+        String,                                 // queue_name (from execution)
+        crate::time::sql::SqlTimestamp,         // started_at
     );
 
     let rows: Vec<Row> = harvest_task_queue::table
@@ -2631,8 +2631,8 @@ pub async fn list_pinned_executions(
                     workflow_id,
                     state,
                     queue_name,
-                    started_at,
-                    sticky_until: su,
+                    started_at: started_at.to_jiff(),
+                    sticky_until: su.to_jiff(),
                 })
             },
         )
@@ -2668,15 +2668,15 @@ pub async fn read_worker_status(
 pub async fn read_worker_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-) -> HarvestResult<Option<DateTime<Utc>>> {
-    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+) -> HarvestResult<Option<Timestamp>> {
+    let row: Option<Option<crate::time::sql::SqlTimestamp>> = harvest_workers::table
         .find(worker_id)
         .select(harvest_workers::drain_deadline_at)
         .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(row.flatten())
+    Ok(row.flatten().map(crate::time::sql::SqlTimestamp::to_jiff))
 }
 
 /// Read the `drain_deadline_at` for a worker that is currently `Draining`.
@@ -2691,8 +2691,8 @@ pub async fn read_worker_drain_deadline(
 pub async fn read_draining_worker_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-) -> HarvestResult<Option<DateTime<Utc>>> {
-    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+) -> HarvestResult<Option<Timestamp>> {
+    let row: Option<Option<crate::time::sql::SqlTimestamp>> = harvest_workers::table
         .find(worker_id)
         .filter(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
         .select(harvest_workers::drain_deadline_at)
@@ -2700,7 +2700,7 @@ pub async fn read_draining_worker_deadline(
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(row.flatten())
+    Ok(row.flatten().map(crate::time::sql::SqlTimestamp::to_jiff))
 }
 
 /// Request a graceful drain for the worker identified by `worker_id`.
@@ -2723,7 +2723,7 @@ pub async fn read_draining_worker_deadline(
 pub async fn request_drain(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-    deadline_at: Option<DateTime<Utc>>,
+    deadline_at: Option<Timestamp>,
     // true = operator supplied an explicit value; false = computed default.
     // AlreadyDraining only refreshes the stored deadline for explicit values.
     deadline_is_explicit: bool,
@@ -2779,7 +2779,7 @@ pub async fn request_drain(
         )
         .set((
             harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
-            harvest_workers::drain_deadline_at.eq(deadline_at),
+            harvest_workers::drain_deadline_at.eq(deadline_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -2800,7 +2800,7 @@ pub async fn request_drain(
         // Refresh an explicit deadline on a Draining worker. Operators can then
         // extend or correct the window without a new status transition.
         diesel::update(harvest_workers::table.find(worker_id))
-            .set(harvest_workers::drain_deadline_at.eq(deadline_at))
+            .set(harvest_workers::drain_deadline_at.eq(deadline_at.to_diesel()))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -3050,7 +3050,7 @@ pub async fn do_heartbeat_tick(
     in_flight: i32,
     labels_json: &serde_json::Value,
     worker_shutdown: &CancellationToken,
-    drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
+    drain_deadline_max: &Mutex<Option<Timestamp>>,
     remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
     in_use_sessions: i32,
     registration_pending: &AtomicBool,
@@ -3220,7 +3220,7 @@ pub fn spawn_worker_heartbeat(
     // shared across this worker's per-shard heartbeat tasks. The maximum, not a
     // full set, stops a shard with a stale row from reverting the cell. Stale
     // shorter values are rejected. Genuine extensions always advance the cell.
-    drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
+    drain_deadline_max: Arc<Mutex<Option<Timestamp>>>,
     // In-process worker-session registry (issue #606), sampled fresh each tick
     // like `in_flight`. So `harvest_workers.in_use_sessions` reflects the live
     // session count of this worker. It was previously always a literal `0`.
@@ -3374,7 +3374,7 @@ pub fn spawn_worker_heartbeat(
 /// (T1 < T2 = current max). The in-process cell does not reflect an
 /// operator-driven shortening. The local `shutdown_timeout` fallback still
 /// bounds the drain, and an operator who needs a hard stop can send SIGTERM.
-fn classify_drain_deadline(max: &mut Option<DateTime<Utc>>, deadline: DateTime<Utc>) -> bool {
+fn classify_drain_deadline(max: &mut Option<Timestamp>, deadline: Timestamp) -> bool {
     if max.is_none_or(|m| deadline > m) {
         *max = Some(deadline);
         true
@@ -3394,7 +3394,7 @@ async fn sync_drain_deadline(
     // Maximum `drain_deadline_at` value applied to `cell` so far, shared across
     // this worker's per-shard heartbeat tasks. A new deadline is applied only
     // when it is strictly greater than the current max (issue #522).
-    max_applied: &Mutex<Option<DateTime<Utc>>>,
+    max_applied: &Mutex<Option<Timestamp>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
@@ -3404,9 +3404,7 @@ async fn sync_drain_deadline(
         if !classify_drain_deadline(&mut max_guard, deadline) {
             return;
         }
-        let remaining = deadline
-            .signed_duration_since(Utc::now())
-            .to_std()
+        let remaining = std::time::Duration::try_from(deadline.duration_since(Timestamp::now()))
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
         // Update the cell while still holding `max_guard`. Then two shards that
@@ -5091,8 +5089,8 @@ mod tests {
 
     #[test]
     fn classify_drain_deadline_applies_initial_and_skips_same_value() {
-        let mut max: Option<DateTime<Utc>> = None;
-        let d1 = Utc::now();
+        let mut max: Option<Timestamp> = None;
+        let d1 = Timestamp::now();
         // Initial drain: first shard to observe it applies.
         assert!(classify_drain_deadline(&mut max, d1));
         assert_eq!(max, Some(d1));
@@ -5105,9 +5103,9 @@ mod tests {
         // Shard A applies D1 (initial), then D2 (operator extension).
         // Shard B was offline during D2 so its row still holds D1.
         // When B recovers it must NOT revert the cell back to D1.
-        let mut max: Option<DateTime<Utc>> = None;
-        let d1 = Utc::now();
-        let d2 = d1 + chrono::Duration::minutes(5);
+        let mut max: Option<Timestamp> = None;
+        let d1 = Timestamp::now();
+        let d2 = d1 + jiff::SignedDuration::from_mins(5);
         assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
         assert!(classify_drain_deadline(&mut max, d2)); // shard A applies D2
         // Shard B recovers; stale D1 < D2 (current max) → rejected.
@@ -5120,10 +5118,10 @@ mod tests {
         // Shard A applied D1. Shard A then goes unreachable and the operator
         // re-drains with D2 > D1 that reaches only shard B. Shard B's first
         // observation of D2 must advance the cell even though it is already set.
-        let mut max: Option<DateTime<Utc>> = None;
-        let d1 = Utc::now();
-        let d2 = d1 + chrono::Duration::minutes(5); // extension
-        let d_short = d1 - chrono::Duration::minutes(2); // would be a shorten
+        let mut max: Option<Timestamp> = None;
+        let d1 = Timestamp::now();
+        let d2 = d1 + jiff::SignedDuration::from_mins(5); // extension
+        let d_short = d1 - jiff::SignedDuration::from_mins(2); // would be a shorten
         assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
         assert!(classify_drain_deadline(&mut max, d2)); // shard B first-sees D2 > D1
         assert_eq!(max, Some(d2));
@@ -5145,7 +5143,7 @@ mod tests {
     #[test]
     fn worker_health_healthy_when_recently_seen() {
         let threshold = Duration::from_secs(10);
-        let recent = Utc::now() - chrono::Duration::seconds(3);
+        let recent = Timestamp::now() - jiff::SignedDuration::from_secs(3);
         assert_eq!(
             WorkerHealth::classify(recent, threshold),
             WorkerHealth::Healthy
@@ -5155,7 +5153,7 @@ mod tests {
     #[test]
     fn worker_health_stale_when_past_threshold() {
         let threshold = Duration::from_secs(10);
-        let old = Utc::now() - chrono::Duration::seconds(15);
+        let old = Timestamp::now() - jiff::SignedDuration::from_secs(15);
         assert_eq!(WorkerHealth::classify(old, threshold), WorkerHealth::Stale);
     }
 
@@ -5163,7 +5161,7 @@ mod tests {
     fn worker_health_stale_at_exact_threshold_boundary() {
         let threshold = Duration::from_secs(10);
         // exactly at the threshold boundary is still stale (> check)
-        let at_boundary = Utc::now() - chrono::Duration::seconds(11);
+        let at_boundary = Timestamp::now() - jiff::SignedDuration::from_secs(11);
         assert_eq!(
             WorkerHealth::classify(at_boundary, threshold),
             WorkerHealth::Stale
@@ -5184,7 +5182,7 @@ mod tests {
         // Clock skew: last_heartbeat_at is slightly ahead of "now".
         // Should be treated as zero elapsed time (Healthy), not Duration::MAX (Stale).
         let threshold = Duration::from_secs(10);
-        let future = Utc::now() + chrono::Duration::seconds(2);
+        let future = Timestamp::now() + jiff::SignedDuration::from_secs(2);
         assert_eq!(
             WorkerHealth::classify(future, threshold),
             WorkerHealth::Healthy
@@ -5301,8 +5299,8 @@ mod tests {
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: worker_id.to_string(),
-                started_at: Utc::now(),
-                last_heartbeat_at: Utc::now(),
+                started_at: Timestamp::now(),
+                last_heartbeat_at: Timestamp::now(),
                 queues: serde_json::json!([queue]),
                 shard_assignments: serde_json::json!([0]),
                 max_concurrency: 10,
@@ -5505,8 +5503,8 @@ mod tests {
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: "test-worker".to_string(),
-                started_at: Utc::now(),
-                last_heartbeat_at: Utc::now(),
+                started_at: Timestamp::now(),
+                last_heartbeat_at: Timestamp::now(),
                 queues: serde_json::json!(["default"]),
                 shard_assignments: serde_json::json!([0]),
                 max_concurrency: 10,
@@ -5631,7 +5629,7 @@ mod tests {
             worker_id: "w-abc".to_string(),
             outcome: DrainOutcome::Accepted,
             in_flight_count: 3,
-            drain_deadline_at: Some(Utc::now()),
+            drain_deadline_at: Some(Timestamp::now()),
             shard_ids: vec![0, 1],
             unavailable_shards: vec![],
         };
@@ -5721,8 +5719,8 @@ mod tests {
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: worker_id.to_string(),
-                started_at: Utc::now(),
-                last_heartbeat_at: Utc::now(),
+                started_at: Timestamp::now(),
+                last_heartbeat_at: Timestamp::now(),
                 queues: serde_json::json!(queues),
                 shard_assignments: serde_json::json!(shards),
                 max_concurrency: 10,

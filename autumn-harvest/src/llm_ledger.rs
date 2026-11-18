@@ -12,6 +12,8 @@
 //! reports can sum it without a key. The model id and the counts are in
 //! clear. See `docs/security-posture.md`.
 
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use std::time::{Duration, Instant};
 
 /// The longest model id the ledger accepts, in bytes.
@@ -399,13 +401,13 @@ struct LedgerTotalRow {
 pub async fn spend_for_search_attrs(
     conn: &mut diesel_async::AsyncPgConnection,
     attrs: &serde_json::Value,
-    since: chrono::DateTime<chrono::Utc>,
+    since: jiff::Timestamp,
 ) -> crate::error::HarvestResult<LedgerTotal> {
     use diesel_async::RunQueryDsl as _;
 
     let row = diesel::sql_query(SPEND_FOR_SEARCH_ATTRS_SQL)
         .bind::<diesel::sql_types::Jsonb, _>(attrs)
-        .bind::<diesel::sql_types::Timestamptz, _>(since)
+        .bind::<diesel::sql_types::Timestamptz, _>(since.to_diesel())
         .get_result::<LedgerTotalRow>(conn)
         .await
         .map_err(crate::error::database_error)?;

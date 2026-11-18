@@ -11,7 +11,7 @@ use autumn_harvest::prelude::*;
 #[workflow]
 pub async fn wf_ctx_system_now(ctx: &WorkflowContext, order: String) -> Result<i64, String> {
     let now = ctx.system_now();
-    let ts = now.timestamp();
+    let ts = now.as_second();
     ctx.execute_activity_raw(
         "receipt",
         serde_json::json!({ "order": order, "ts": ts }),

@@ -21,8 +21,8 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
-use chrono::Utc;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -169,7 +169,7 @@ async fn persist_canonical_history(
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -313,8 +313,8 @@ async fn insert_execution_with_deadline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     name: &str,
-    execution_timeout: chrono::Duration,
-    deadline_at: chrono::DateTime<Utc>,
+    execution_timeout: jiff::SignedDuration,
+    deadline_at: jiff::Timestamp,
 ) {
     let row = NewWorkflowExecution {
         quota_key: None,
@@ -388,8 +388,8 @@ fn deadline_can_probe_workflow<'a>(
 async fn persist_deadline_probe_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    started_at: chrono::DateTime<Utc>,
-    now_capture: chrono::DateTime<Utc>,
+    started_at: jiff::Timestamp,
+    now_capture: jiff::Timestamp,
 ) -> Vec<WorkflowEvent> {
     let id1 = ActivityExecId::new();
     let events = vec![
@@ -405,7 +405,7 @@ async fn persist_deadline_probe_history(
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::event::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: serde_json::json!(now_capture.timestamp_millis()),
+            value: serde_json::json!(now_capture.as_millisecond()),
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -436,12 +436,12 @@ async fn replay_from_db_threads_per_row_execution_timeout_for_deadline_branch() 
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = ExecutionId::new();
 
-    let started_at = Utc::now();
-    let timeout = chrono::Duration::minutes(30);
+    let started_at = Timestamp::now();
+    let timeout = jiff::SignedDuration::from_mins(30);
     // A resume-shifted deadline far in the future, so the branch never trips.
-    let deadline_at = started_at + timeout + chrono::Duration::hours(2);
+    let deadline_at = started_at + timeout + jiff::SignedDuration::from_hours(2);
     // The clock read is captured near start, well within budget.
-    let now_capture = started_at + chrono::Duration::seconds(5);
+    let now_capture = started_at + jiff::SignedDuration::from_secs(5);
 
     insert_execution_with_deadline(
         &mut conn,

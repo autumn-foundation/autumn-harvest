@@ -52,7 +52,7 @@ use autumn_harvest::codec_rotation::{
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
 use autumn_harvest::types::ActivityExecId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// A cheap, deterministic stand-in for an embedder-supplied encryption codec
@@ -110,10 +110,10 @@ fn order_payload(i: usize) -> Value {
     })
 }
 
-fn fixed_timestamp() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+fn fixed_timestamp() -> Timestamp {
+    "2026-08-29T12:00:00Z"
+        .parse::<Timestamp>()
         .expect("fixed timestamp")
-        .with_timezone(&Utc)
 }
 
 /// One serialized event, encoded under `key_id`.

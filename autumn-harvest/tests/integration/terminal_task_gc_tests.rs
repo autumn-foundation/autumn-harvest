@@ -27,6 +27,7 @@
 //! with `--test-threads=1`: each test empties the shared tables. Otherwise
 //! the suite starts a testcontainers Postgres.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,10 +39,10 @@ use autumn_harvest::retention::{
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -117,8 +118,8 @@ async fn scrub(conn: &mut AsyncPgConnection) {
     .expect("scrub");
 }
 
-fn days_ago(days: i64) -> DateTime<Utc> {
-    Utc::now() - chrono::Duration::days(days)
+fn days_ago(days: i64) -> Timestamp {
+    Timestamp::now() - autumn_harvest::time::days(days)
 }
 
 const WEEK: Duration = Duration::from_hours(168);
@@ -148,7 +149,7 @@ fn task_gc_only(window: Duration) -> RetentionConfig {
 async fn insert_activity_rows(
     conn: &mut AsyncPgConnection,
     state: &str,
-    completed_at: Option<DateTime<Utc>>,
+    completed_at: Option<Timestamp>,
     count: i64,
 ) {
     diesel::sql_query(
@@ -158,7 +159,7 @@ async fn insert_activity_rows(
          FROM generate_series(1, $3)",
     )
     .bind::<Text, _>(state)
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<BigInt, _>(count)
     .execute(conn)
     .await
@@ -196,7 +197,7 @@ async fn insert_task_for(
     exec_id: uuid::Uuid,
     task_type: &str,
     state: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
 ) -> uuid::Uuid {
     #[derive(diesel::QueryableByName)]
     struct IdRow {
@@ -214,7 +215,7 @@ async fn insert_task_for(
     .bind::<Text, _>(task_type)
     .bind::<SqlUuid, _>(exec_id)
     .bind::<Text, _>(state)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert task")
@@ -462,7 +463,7 @@ async fn an_unvalidated_sub_floor_age_deletes_nothing() {
     insert_activity_rows(
         &mut conn,
         "COMPLETED",
-        Some(Utc::now() - chrono::Duration::minutes(1)),
+        Some(Timestamp::now() - jiff::SignedDuration::from_mins(1)),
         3,
     )
     .await;
@@ -980,7 +981,7 @@ async fn a_row_without_completed_at_or_at_the_cutoff_stays() {
     insert_activity_rows(
         &mut conn,
         "CANCELLED",
-        Some(cutoff - chrono::Duration::microseconds(1)),
+        Some(cutoff - jiff::SignedDuration::from_micros(1)),
         1,
     )
     .await;
@@ -1036,7 +1037,7 @@ async fn every_execution_state_decides_whether_its_workflow_row_stays() {
              VALUES ('janitor-q', 'workflow', '{}'::jsonb, 'COMPLETED', $1) \
              RETURNING id",
         )
-        .bind::<Timestamptz, _>(days_ago(30))
+        .bind::<Timestamptz, _>(days_ago(30).to_diesel())
         .get_result::<IdRow>(&mut conn)
         .await
         .expect("insert orphan workflow row")

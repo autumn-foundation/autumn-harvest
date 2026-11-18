@@ -19,7 +19,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime};
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 const fn no_jitter(max_attempts: u32, secs: u64) -> RetryPolicy {
@@ -188,7 +188,7 @@ async fn the_retry_waits_for_its_backoff() {
     let mut rt = runtime(&info);
     let clock = Arc::new(AtomicI64::new(1_000_000));
     let read = clock.clone();
-    rt.set_clock(move || Utc.timestamp_opt(read.load(Ordering::SeqCst), 0).unwrap());
+    rt.set_clock(move || Timestamp::new(read.load(Ordering::SeqCst), 0).unwrap());
     let first = rt.start_workflow(info.name, json!(0)).unwrap();
 
     rt.run_until_blocked(first).await.unwrap();
@@ -255,7 +255,7 @@ async fn the_retry_receives_the_signals_again() {
 fn install_clock(rt: &mut SqliteRuntime) -> Arc<AtomicI64> {
     let clock = Arc::new(AtomicI64::new(1_000_000));
     let read = clock.clone();
-    rt.set_clock(move || Utc.timestamp_opt(read.load(Ordering::SeqCst), 0).unwrap());
+    rt.set_clock(move || Timestamp::new(read.load(Ordering::SeqCst), 0).unwrap());
     clock
 }
 
@@ -342,7 +342,7 @@ async fn the_retry_starts_at_its_backoff() {
     let started = rt.load_history(second).unwrap();
     assert!(
         matches!(&started[0], WorkflowEvent::WorkflowStarted { timestamp, .. }
-            if timestamp.timestamp() == 1_000_010),
+            if timestamp.as_second() == 1_000_010),
         "got {:?}",
         started[0]
     );
@@ -364,10 +364,7 @@ async fn slow_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
 async fn the_retry_delay_counts_from_the_failure() {
     let info = slow_failure_info();
     let mut rt = runtime(&info);
-    rt.set_clock(|| {
-        Utc.timestamp_opt(SLOW_CLOCK.load(Ordering::SeqCst), 0)
-            .unwrap()
-    });
+    rt.set_clock(|| Timestamp::new(SLOW_CLOCK.load(Ordering::SeqCst), 0).unwrap());
     let first = rt.start_workflow(info.name, json!(0)).unwrap();
     let start = SLOW_CLOCK.load(Ordering::SeqCst);
     rt.run_until_blocked(first).await.unwrap();
@@ -377,7 +374,7 @@ async fn the_retry_delay_counts_from_the_failure() {
         .unwrap()
         .iter()
         .find_map(|e| match e {
-            WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } => Some(fire_at.timestamp()),
+            WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } => Some(fire_at.as_second()),
             _ => None,
         })
         .expect("a retry");

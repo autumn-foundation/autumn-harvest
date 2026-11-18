@@ -118,7 +118,7 @@ async fn start_root(
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         chain_execution_timeout: registry
             .chain_execution_timeout(name)
-            .and_then(|d| chrono::Duration::from_std(d).ok()),
+            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
         ..StartWorkflowParams::new(name, &workflow_id, ExecutionId::new(), input, "default")
     };
     start_or_load_workflow_execution(conn, params, None)
@@ -186,7 +186,7 @@ async fn assert_keeps_the_chain(
     let after = load(conn, successor).await;
     assert_eq!(
         before.chain_execution_timeout,
-        chrono::Duration::from_std(HOUR).ok(),
+        jiff::SignedDuration::try_from(HOUR).ok(),
         "the root took the code value"
     );
     assert_eq!(
@@ -220,7 +220,7 @@ async fn a_same_type_successor_keeps_the_stored_chain_deadline() {
     let next = start_root(&mut conn, &registry, name, serde_json::json!({})).await;
     assert_eq!(
         load(&mut conn, next).await.chain_execution_timeout,
-        chrono::Duration::from_std(3 * HOUR).ok()
+        jiff::SignedDuration::try_from(3 * HOUR).ok()
     );
 }
 

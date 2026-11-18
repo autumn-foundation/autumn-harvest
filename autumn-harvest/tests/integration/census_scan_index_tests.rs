@@ -216,7 +216,8 @@ struct CanaryRow {
     #[diesel(sql_type = Text)]
     queue_name: String,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    completed_at: Option<jiff::Timestamp>,
 }
 
 /// The canary read returns canary runs only, newest first, and honours its cap.

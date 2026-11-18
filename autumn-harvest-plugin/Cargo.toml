@@ -13,7 +13,9 @@ categories = ["asynchronous", "database"]
 
 [features]
 unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
-webhooks = ["autumn-harvest/db"]
+# `chrono` is here only for the `autumn-web` webhook delivery log, whose
+# `timestamp` field has a `chrono` type. The plugin itself uses `jiff`.
+webhooks = ["autumn-harvest/db", "dep:chrono"]
 # MCP tool exposure for #[workflow(mcp)] workflows (issue #597). Enables
 # autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
 # as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
@@ -96,7 +98,9 @@ oidc = ["autumn-web/oauth2"]
 # application may enable it. Cargo unifies features across the graph, so a
 # library that turns it on flips `autumn-web` to SQLite for every crate in the
 # build. See `docs/sqlite-plugin.md`.
-sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
+# `chrono` is here only for the `autumn-web` tenant restore target, which
+# has a `chrono` type.
+sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite", "dep:chrono"]
 
 
 [dependencies]
@@ -113,10 +117,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
+# Only the `webhooks` and `sqlite` features need it, at the `autumn-web`
+# boundary. See `src/chrono_boundary.rs`.
+chrono = { workspace = true, optional = true }
+jiff = { workspace = true }
 tracing = { workspace = true }
 diesel = { workspace = true }
+jiff-diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }

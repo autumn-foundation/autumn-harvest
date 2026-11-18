@@ -679,13 +679,13 @@ fn an_unencoded_execution_id_still_resolves_to_the_default_shard() {
 // and every test that merely compares it to itself. So these tests pin that it
 // *separates* histories that replay to different next-command states.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
 fn started(input: serde_json::Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

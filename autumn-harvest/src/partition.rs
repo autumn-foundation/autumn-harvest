@@ -108,12 +108,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{Array, BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
@@ -408,12 +410,13 @@ pub const SWEEP_REASONS: &[&str] = &[
 /// rather than dividing by zero. [`EnableOptions::validate`] rejects such a
 /// width long before it can reach the database.
 #[must_use]
-pub fn cohort_start(ts: DateTime<Utc>, width_secs: i64) -> DateTime<Utc> {
+pub fn cohort_start(ts: Timestamp, width_secs: i64) -> Timestamp {
     let width = width_secs.max(1);
-    let floored = ts.timestamp().div_euclid(width) * width;
-    Utc.timestamp_opt(floored, 0)
-        .single()
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+    // Floor to the whole second below, as `chrono` did. jiff truncates toward
+    // zero, so a negative instant with a fraction moves down one second.
+    let seconds = ts.as_second() - i64::from(ts.subsec_nanosecond() < 0);
+    let floored = seconds.div_euclid(width) * width;
+    Timestamp::new(floored, 0).unwrap_or(Timestamp::MIN)
 }
 
 /// The partition table name for a cohort start.
@@ -422,8 +425,11 @@ pub fn cohort_start(ts: DateTime<Utc>, width_secs: i64) -> DateTime<Utc> {
 /// harvest_events*` can tell at a glance what each partition holds. Unique for
 /// any width down to one second.
 #[must_use]
-pub fn partition_name(cohort_start: DateTime<Utc>) -> String {
-    format!("{PARTITION_PREFIX}{}", cohort_start.format("%Y%m%d%H%M%S"))
+pub fn partition_name(cohort_start: Timestamp) -> String {
+    format!(
+        "{PARTITION_PREFIX}{}",
+        cohort_start.strftime("%Y%m%d%H%M%S")
+    )
 }
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -552,7 +558,7 @@ pub enum EnableMode {
         /// existed at conversion time has a cohort strictly below this. So all
         /// of its events stay in the legacy partition together, including
         /// ones appended *after* the conversion.
-        cutover: DateTime<Utc>,
+        cutover: Timestamp,
     },
 }
 
@@ -574,9 +580,9 @@ pub struct PartitionInfo {
     pub name: String,
     /// Inclusive lower bound; `None` for `MINVALUE` (the legacy partition) and
     /// for the `DEFAULT` partition.
-    pub lower: Option<DateTime<Utc>>,
+    pub lower: Option<Timestamp>,
     /// Exclusive upper bound; `None` for `MAXVALUE` and for `DEFAULT`.
-    pub upper: Option<DateTime<Utc>>,
+    pub upper: Option<Timestamp>,
     /// Whether this is the catch-all `DEFAULT` partition.
     pub is_default: bool,
 }
@@ -709,7 +715,7 @@ pub struct SweepOutcome {
     /// partition to still exist at that name, only the ordering the
     /// sweep already relies on (oldest first, by cohort upper bound).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_resume: Option<DateTime<Utc>>,
+    pub next_resume: Option<Timestamp>,
     /// The fixed horizon a multi-pass catch-up cycle must reach before
     /// [`Self::next_resume`] is allowed to reset to `None`.
     ///
@@ -736,7 +742,7 @@ pub struct SweepOutcome {
     /// the pass reaches the true end of its own list first. The next
     /// cycle, if one starts, snapshots a fresh target.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub catch_up_target: Option<DateTime<Utc>>,
+    pub catch_up_target: Option<Timestamp>,
 }
 
 // ── Layout detection ───────────────────────────────────────────────────────
@@ -766,7 +772,8 @@ struct BoolRow {
 #[derive(diesel::QueryableByName)]
 struct CohortCountRow {
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    v: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    v: Option<Timestamp>,
     #[diesel(sql_type = BigInt)]
     n: i64,
 }
@@ -847,7 +854,7 @@ pub fn parse_cohort_width(function_def: &str) -> Option<i64> {
 /// `FOR VALUES FROM (MINVALUE) TO ('2026-08-31 00:00:00+00')`. Pure, so the
 /// parsing is unit-tested rather than only exercised through a live catalog.
 #[must_use]
-pub fn parse_partition_bound(expr: &str) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool) {
+pub fn parse_partition_bound(expr: &str) -> (Option<Timestamp>, Option<Timestamp>, bool) {
     let expr = expr.trim();
     if expr.eq_ignore_ascii_case("DEFAULT") {
         return (None, None, true);
@@ -865,7 +872,7 @@ fn between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
 }
 
 /// `MINVALUE`/`MAXVALUE` become `None`; a quoted timestamp is parsed.
-fn parse_bound_literal(raw: &str) -> Option<DateTime<Utc>> {
+fn parse_bound_literal(raw: &str) -> Option<Timestamp> {
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("MINVALUE") || raw.eq_ignore_ascii_case("MAXVALUE") {
         return None;
@@ -874,19 +881,16 @@ fn parse_bound_literal(raw: &str) -> Option<DateTime<Utc>> {
     if inner.eq_ignore_ascii_case("-infinity") || inner.eq_ignore_ascii_case("infinity") {
         return None;
     }
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%:z",
-    ] {
-        if let Ok(dt) = DateTime::parse_from_str(inner, fmt) {
-            return Some(dt.with_timezone(&Utc));
-        }
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(inner, fmt) {
-            return Some(Utc.from_utc_datetime(&naive));
+    // A space in a jiff format matches zero or more whitespace. `%:::z` reads
+    // `+HH`, `+HH:MM` and `+HH:MM:SS`. `%z` reads `+HHMM`.
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f %:::z", "%Y-%m-%d %H:%M:%S%.f %z"] {
+        if let Ok(ts) = Timestamp::strptime(fmt, inner) {
+            return Some(ts);
         }
     }
-    None
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", inner)
+        .ok()
+        .and_then(crate::time::from_utc_datetime)
 }
 
 // ── Catalog helpers ────────────────────────────────────────────────────────
@@ -996,10 +1000,10 @@ fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Orderin
 /// Format a timestamp as a SQL literal.
 ///
 /// The only value interpolated into partition DDL. RFC 3339 output from
-/// `chrono` cannot contain a quote, so this is not an injection vector. The
+/// [`crate::time::rfc3339`] cannot contain a quote, so this is not an injection vector. The
 /// value still goes through one audited helper, not ad hoc at each call site.
-fn ts_literal(ts: DateTime<Utc>) -> String {
-    format!("'{}'", ts.to_rfc3339())
+fn ts_literal(ts: Timestamp) -> String {
+    format!("'{}'", crate::time::rfc3339(ts))
 }
 
 /// Create the partition covering `ts`'s cohort if it does not already exist.
@@ -1015,7 +1019,7 @@ fn ts_literal(ts: DateTime<Utc>) -> String {
 #[doc(hidden)]
 pub async fn ensure_cohort(
     conn: &mut AsyncPgConnection,
-    ts: DateTime<Utc>,
+    ts: Timestamp,
 ) -> HarvestResult<(String, bool)> {
     let width = match detect_layout(conn).await? {
         EventLayout::Unpartitioned => return Ok((String::new(), false)),
@@ -1027,14 +1031,18 @@ pub async fn ensure_cohort(
 #[cfg(feature = "db")]
 async fn ensure_cohort_with_width(
     conn: &mut AsyncPgConnection,
-    ts: DateTime<Utc>,
+    ts: Timestamp,
     width: i64,
     lock_timeout: Duration,
 ) -> HarvestResult<(String, bool)> {
     let lower = cohort_start(ts, width);
-    let Some(upper) = lower.checked_add_signed(chrono::Duration::seconds(width)) else {
+    let Some(upper) = lower
+        .checked_add(jiff::SignedDuration::from_secs(width))
+        .ok()
+    else {
         return Err(HarvestError::Database(format!(
-            "cohort starting at {lower} overflows when advanced by {width}s"
+            "cohort starting at {} overflows when advanced by {width}s",
+            crate::time::utc_display(lower)
         )));
     };
     let name = partition_name(lower);
@@ -1192,8 +1200,8 @@ pub fn is_deadlock(msg: &str) -> bool {
 async fn cohort_partition_is_attached(
     conn: &mut AsyncPgConnection,
     name: &str,
-    lower: DateTime<Utc>,
-    upper: DateTime<Utc>,
+    lower: Timestamp,
+    upper: Timestamp,
 ) -> HarvestResult<bool> {
     Ok(list_partitions(conn)
         .await?
@@ -1221,7 +1229,7 @@ async fn cohort_partition_is_attached(
 #[cfg(feature = "db")]
 pub async fn ensure_partitions(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     lock_timeout: Duration,
 ) -> HarvestResult<(Vec<String>, Vec<String>)> {
@@ -1242,7 +1250,7 @@ pub async fn ensure_partitions(
 #[cfg(feature = "db")]
 async fn ensure_partitions_inner(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     lock_timeout: Duration,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
@@ -1255,7 +1263,10 @@ async fn ensure_partitions_inner(
     let mut blocked: Vec<String> = Vec::new();
     let mut attempted = 0usize;
     for step in 0..=i64::from(lookahead_cohorts) {
-        let Some(at) = now.checked_add_signed(chrono::Duration::seconds(width * step)) else {
+        let Some(at) = now
+            .checked_add(jiff::SignedDuration::from_secs(width * step))
+            .ok()
+        else {
             break;
         };
         attempted += 1;
@@ -1286,7 +1297,7 @@ async fn ensure_partitions_inner(
                     "harvest could not create a cohort partition; continuing with the rest \
                      of the lookahead window"
                 );
-                blocked.push(cohort_start(at, width).to_rfc3339());
+                blocked.push(crate::time::rfc3339(cohort_start(at, width)));
             }
         }
     }
@@ -2504,7 +2515,7 @@ pub async fn enable_partitioning(
     refuse_if_unreplayable_constraints(conn, "convert").await?;
 
     let width = opts.cohort_width_secs;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // `enable_sql` is the single implementation of the conversion. The test
     // harness feeds the same string to a container's init SQL. So no second
@@ -4074,9 +4085,9 @@ pub struct DisableReport {
 #[cfg(feature = "db")]
 pub async fn evaluate(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
 ) -> HarvestResult<SweepOutcome> {
     sweep_inner(conn, now, opts, false, resume_after, None, None, None).await
 }
@@ -4126,9 +4137,9 @@ pub async fn evaluate(
 #[cfg(feature = "db")]
 pub async fn sweep(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
 ) -> HarvestResult<SweepOutcome> {
     sweep_inner(conn, now, opts, true, resume_after, None, None, None).await
 }
@@ -4154,9 +4165,9 @@ pub async fn sweep(
 #[cfg(feature = "db")]
 pub async fn sweep_exporting(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
     export: &crate::partition_archive::PartitionExport,
 ) -> HarvestResult<SweepOutcome> {
     sweep_inner(
@@ -4170,6 +4181,18 @@ pub async fn sweep_exporting(
         None,
     )
     .await
+}
+
+/// Returns `true` when the straggler `grace` after `upper` has passed.
+///
+/// A grace past the `chrono` range, `i64::MAX` milliseconds, never passes,
+/// as `chrono::Duration::from_std` failed for it. A due time past the jiff
+/// range has not passed either, so the check cannot panic.
+#[cfg(feature = "db")]
+fn straggler_grace_elapsed(upper: Timestamp, grace: Duration, now: Timestamp) -> bool {
+    crate::time::from_std_bounded(grace)
+        .and_then(|grace| upper.checked_add(grace).ok())
+        .is_some_and(|due| due <= now)
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
@@ -4195,11 +4218,11 @@ pub async fn sweep_exporting(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     opts: &SweepOptions,
     apply: bool,
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
     export: Option<&crate::partition_archive::PartitionExport>,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<SweepOutcome> {
@@ -4220,7 +4243,7 @@ async fn sweep_inner(
     let mut skipping = resume_after.is_some();
 
     let mut attempts = 0usize;
-    let mut last_attempted: Option<DateTime<Utc>> = None;
+    let mut last_attempted: Option<Timestamp> = None;
     let mut reached_end = true;
     // Issue #2009: resolve the export gate once per applying pass. It can
     // hold a session lock, so every path below must reach the release.
@@ -4310,8 +4333,7 @@ async fn sweep_inner(
                     && gate.allows_straggler_delete()
                     && reason != SCAN_BUDGET_REASON
                     && let Some(grace) = opts.straggler_grace
-                    && let Ok(grace) = chrono::Duration::from_std(grace)
-                    && upper + grace <= now
+                    && straggler_grace_elapsed(upper, grace, now)
                 {
                     outcome.straggler_rows_deleted += delete_orphan_rows(
                         conn,
@@ -4431,7 +4453,7 @@ async fn export_and_drop(
     conn: &mut AsyncPgConnection,
     export: &crate::partition_archive::PartitionExport,
     part: &PartitionInfo,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
     opts: &SweepOptions,
     exports: &mut usize,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
@@ -4509,7 +4531,7 @@ impl EventScope {
     /// reclaimable. It would DROP the entire pre-conversion history of a
     /// deployment that had just opted in, running executions and legal holds
     /// included.
-    fn cohort(lower: Option<DateTime<Utc>>, upper: DateTime<Utc>) -> Self {
+    fn cohort(lower: Option<Timestamp>, upper: Timestamp) -> Self {
         use std::fmt::Write as _;
         let mut cohort_pred = String::new();
         if let Some(lower) = lower {
@@ -4580,7 +4602,7 @@ impl EventScope {
 async fn cohort_occupancy(
     conn: &mut AsyncPgConnection,
     scope: &EventScope,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
     opts: &SweepOptions,
 ) -> HarvestResult<Option<String>> {
     // ── Tier 1 ────────────────────────────────────────────────────────────
@@ -4589,7 +4611,7 @@ async fn cohort_occupancy(
              SELECT 1 FROM harvest_workflow_executions WHERE created_at < $1
          ) AS v",
     )
-    .bind::<Timestamptz, _>(upper)
+    .bind::<Timestamptz, _>(upper.to_diesel())
     .get_result::<BoolRow>(conn)
     .await
     .map_err(database_error)?
@@ -4605,7 +4627,7 @@ async fn cohort_occupancy(
     let survivors = diesel::sql_query(
         "SELECT id FROM harvest_workflow_executions WHERE created_at < $1 LIMIT $2",
     )
-    .bind::<Timestamptz, _>(upper)
+    .bind::<Timestamptz, _>(upper.to_diesel())
     .bind::<BigInt, _>(cap + 1)
     .load::<UuidRow>(conn)
     .await
@@ -4862,7 +4884,7 @@ async fn await_with_heartbeat<F: Future>(
 async fn drop_partition(
     conn: &mut AsyncPgConnection,
     part: &PartitionInfo,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
     opts: &SweepOptions,
     manifest: Option<&crate::partition_archive::PartitionManifest>,
 ) -> HarvestResult<DropOutcome> {
@@ -5023,8 +5045,8 @@ impl DropOutcome {
 #[cfg(feature = "db")]
 async fn delete_orphan_rows(
     conn: &mut AsyncPgConnection,
-    lower: Option<DateTime<Utc>>,
-    upper: DateTime<Utc>,
+    lower: Option<Timestamp>,
+    upper: Timestamp,
     batch: usize,
     timeout: Duration,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
@@ -5099,10 +5121,13 @@ async fn delete_orphan_rows(
                 .v;
             exec(conn, &format!("SET LOCAL statement_timeout = '{ms}ms'")).await?;
             let query = diesel::sql_query(sql)
-                .bind::<Timestamptz, _>(upper)
+                .bind::<Timestamptz, _>(upper.to_diesel())
                 .bind::<BigInt, _>(batch);
             let deleted = if let Some(lower) = lower {
-                query.bind::<Timestamptz, _>(lower).execute(conn).await
+                query
+                    .bind::<Timestamptz, _>(lower.to_diesel())
+                    .execute(conn)
+                    .await
             } else {
                 query.execute(conn).await
             }
@@ -5261,7 +5286,7 @@ async fn drain_default_bounded_inner(
     // partition cannot exist while `DEFAULT` still holds rows in its range. A
     // half-moved cohort would make the re-`ATTACH` below fail its constraint
     // check and roll the whole pass back.
-    let mut work: Vec<DateTime<Utc>> = Vec::new();
+    let mut work: Vec<Timestamp> = Vec::new();
     let mut cutoff = None;
     let mut budget = 0usize;
     for c in &census {
@@ -5309,8 +5334,8 @@ async fn drain_default_bounded_inner(
             // data loss, but a drain that never converges on a shard whose write
             // window is uncovered, which is the shard that needs it.
             if let Some(cutoff) = cutoff {
-                let now = Utc::now();
-                for ts in [now, now + chrono::Duration::seconds(width)] {
+                let now = Timestamp::now();
+                for ts in [now, now + jiff::SignedDuration::from_secs(width)] {
                     if cohort_start(ts, width) <= cutoff {
                         ensure_cohort_with_width(conn, ts, width, Duration::from_secs(2)).await?;
                     }
@@ -5530,11 +5555,11 @@ async fn maintenance_owner_gap(
 #[cfg(feature = "db")]
 pub async fn maintain(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
 ) -> HarvestResult<MaintenanceOutcome> {
     let mut progress: Option<&mut (dyn FnMut() + Send)> = None;
     maintain_inner(
@@ -5577,11 +5602,11 @@ pub async fn maintain(
 #[cfg(feature = "db")]
 pub async fn maintain_with_progress(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
     progress: &mut (dyn FnMut() + Send),
 ) -> HarvestResult<MaintenanceOutcome> {
     let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(progress);
@@ -5620,11 +5645,11 @@ pub async fn maintain_with_progress(
 #[allow(clippy::too_many_arguments)]
 pub async fn maintain_exporting(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
     export: Option<&crate::partition_archive::PartitionExport>,
     progress: &mut (dyn FnMut() + Send),
 ) -> HarvestResult<MaintenanceOutcome> {
@@ -5671,11 +5696,11 @@ fn reborrow_progress<'a>(
 #[allow(clippy::too_many_arguments)]
 async fn maintain_inner(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lookahead_cohorts: u32,
     sweep_opts: &SweepOptions,
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
     export: Option<&crate::partition_archive::PartitionExport>,
     progress: &mut Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<MaintenanceOutcome> {
@@ -5683,7 +5708,7 @@ async fn maintain_inner(
         // Still stamped: a caller polling for "maintenance has run" must not
         // hang forever on an unpartitioned shard, where there is nothing to do.
         return Ok(MaintenanceOutcome {
-            at: Some(Utc::now()),
+            at: Some(Timestamp::now()),
             partitioned: Some(false),
             ..MaintenanceOutcome::default()
         });
@@ -5763,7 +5788,7 @@ async fn maintain_inner(
         Some(drain_error.map_or_else(|| msg.clone(), |prev| format!("{prev}; {msg}")))
     };
     Ok(MaintenanceOutcome {
-        at: Some(Utc::now()),
+        at: Some(Timestamp::now()),
         partitioned: Some(true),
         created,
         lookahead_blocked,
@@ -5783,7 +5808,7 @@ pub struct MaintenanceOutcome {
     /// droppable once the candidate loop has collected its executions. So "the
     /// tick ran" and "maintenance ran" are different instants. An operator
     /// who asks "why is space not coming back?" needs to know which one this is.
-    pub at: Option<DateTime<Utc>>,
+    pub at: Option<Timestamp>,
     /// Whether the shard was on the partitioned layout, per this pass's own
     /// probe -- the same probe that gates every step below.
     ///
@@ -5842,7 +5867,7 @@ impl MaintenanceOutcome {
     #[must_use]
     pub fn failed(error: String) -> Self {
         Self {
-            at: Some(Utc::now()),
+            at: Some(Timestamp::now()),
             last_error: Some(error),
             ..Self::default()
         }
@@ -6298,7 +6323,7 @@ pub struct PlanStep {
 // to be read (and executed) top to bottom across helpers that only concatenate.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-pub fn migration_plan_steps(opts: &EnableOptions, now: DateTime<Utc>) -> Vec<PlanStep> {
+pub fn migration_plan_steps(opts: &EnableOptions, now: Timestamp) -> Vec<PlanStep> {
     let width = opts.cohort_width_secs.max(1);
     let lookahead = opts.lookahead_cohorts;
     let lock_ms = opts.lock_timeout.as_millis().max(1);
@@ -6986,7 +7011,7 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
 /// takes `ACCESS EXCLUSIVE`, and everything it does is metadata-only, so it is
 /// a seconds-long window rather than a scan.
 #[must_use]
-pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
+pub fn migration_plan(opts: &EnableOptions, now: Timestamp) -> String {
     let width = opts.cohort_width_secs.max(1);
     let cutover_lit = ts_literal(cohort_start(now, width));
     let mut out = format!(
@@ -7057,6 +7082,29 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn straggler_grace_elapsed_never_panics_on_a_huge_grace() {
+        let upper = Timestamp::constant(1_700_000_000, 0);
+        let now = upper + jiff::SignedDuration::from_secs(120);
+        assert!(straggler_grace_elapsed(upper, Duration::from_secs(60), now));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(600),
+            now
+        ));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(400_000_000_000),
+            now
+        ));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(i64::MAX as u64),
+            now
+        ));
+    }
+
     /// Each layout path installs the entity projection trigger next to the
     /// guard, and drops the old copy before the legacy table attaches (issue
     /// #2259).
@@ -7064,7 +7112,7 @@ mod tests {
     fn every_layout_path_reinstalls_the_projection_trigger() {
         use crate::entity_state::{PROJECTION_TRIGGER, create_projection_trigger_sql};
         let create = create_projection_trigger_sql();
-        let steps = migration_plan_steps(&EnableOptions::default(), Utc::now());
+        let steps = migration_plan_steps(&EnableOptions::default(), Timestamp::now());
         let position = |needle: &str| {
             steps
                 .iter()
@@ -7114,14 +7162,14 @@ mod tests {
 
     #[test]
     fn cohort_start_floors_to_the_width() {
-        let ts = Utc.with_ymd_and_hms(2026, 8, 31, 17, 42, 9).unwrap();
+        let ts = crate::time::utc_ymd_hms(2026, 8, 31, 17, 42, 9).unwrap();
         assert_eq!(
             cohort_start(ts, 86_400),
-            Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap()
+            crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap()
         );
         assert_eq!(
             cohort_start(ts, 3_600),
-            Utc.with_ymd_and_hms(2026, 8, 31, 17, 0, 0).unwrap()
+            crate::time::utc_ymd_hms(2026, 8, 31, 17, 0, 0).unwrap()
         );
     }
 
@@ -7130,16 +7178,16 @@ mod tests {
         // `/` truncates toward zero, which would round this UP into 1970-01-01
         // and route a pre-epoch execution's events to the wrong partition.
         // `div_euclid` is what makes this correct.
-        let ts = Utc.with_ymd_and_hms(1969, 12, 31, 23, 0, 0).unwrap();
+        let ts = crate::time::utc_ymd_hms(1969, 12, 31, 23, 0, 0).unwrap();
         assert_eq!(
             cohort_start(ts, 86_400),
-            Utc.with_ymd_and_hms(1969, 12, 31, 0, 0, 0).unwrap()
+            crate::time::utc_ymd_hms(1969, 12, 31, 0, 0, 0).unwrap()
         );
     }
 
     #[test]
     fn cohort_start_is_idempotent() {
-        let ts = Utc.with_ymd_and_hms(2026, 2, 14, 6, 30, 0).unwrap();
+        let ts = crate::time::utc_ymd_hms(2026, 2, 14, 6, 30, 0).unwrap();
         let once = cohort_start(ts, 86_400);
         assert_eq!(cohort_start(once, 86_400), once);
     }
@@ -7148,21 +7196,21 @@ mod tests {
     fn cohort_start_never_divides_by_zero() {
         // Defence in depth: `validate` rejects this long before it can reach
         // the database, but a panic here would take down a worker.
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ts = crate::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
         assert_eq!(cohort_start(ts, 0), ts);
     }
 
     #[test]
     fn partition_names_carry_their_cohort() {
-        let name = partition_name(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
+        let name = partition_name(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
         assert_eq!(name, "harvest_events_p_20260831000000");
         assert!(name.starts_with(PARTITION_PREFIX));
     }
 
     #[test]
     fn partition_names_are_distinct_at_second_granularity() {
-        let a = partition_name(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
-        let b = partition_name(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 1).unwrap());
+        let a = partition_name(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
+        let b = partition_name(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 1).unwrap());
         assert_ne!(a, b);
     }
 
@@ -7198,9 +7246,12 @@ mod tests {
         assert!(!default);
         assert_eq!(
             lo,
-            Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap())
+            Some(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap())
         );
-        assert_eq!(hi, Some(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()));
+        assert_eq!(
+            hi,
+            Some(crate::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]
@@ -7211,7 +7262,7 @@ mod tests {
         assert_eq!(lo, None, "MINVALUE is an open lower bound");
         assert_eq!(
             hi,
-            Some(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap())
+            Some(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap())
         );
     }
 
@@ -7264,7 +7315,7 @@ mod tests {
     #[test]
     fn the_migration_plan_keeps_the_expensive_steps_out_of_the_lock_window() {
         let opts = EnableOptions::default();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let plan = migration_plan(&opts, now);
         let steps = migration_plan_steps(&opts, now);
 
@@ -7322,7 +7373,7 @@ mod tests {
         // with the ROW EXCLUSIVE that every insert, state update and retention
         // delete takes. So on the large tables this plan exists for, a
         // non-concurrent build is an outage.
-        let step = migration_plan_steps(&EnableOptions::default(), Utc::now())
+        let step = migration_plan_steps(&EnableOptions::default(), Timestamp::now())
             .into_iter()
             .find(|s| s.sql.contains("idx_harvest_we_created_at") && s.sql.contains("CREATE INDEX"))
             .expect("the plan must build the drop gate's index");
@@ -7336,7 +7387,7 @@ mod tests {
 
     #[test]
     fn the_migration_plan_tells_the_operator_to_recheck_the_cutover() {
-        let plan = migration_plan(&EnableOptions::default(), Utc::now());
+        let plan = migration_plan(&EnableOptions::default(), Timestamp::now());
         assert!(
             plan.contains("Recheck the cutover"),
             "a cutover computed when the plan was generated can be stale by the \
@@ -7353,7 +7404,7 @@ mod tests {
         // on `plan`, the only path large deployments are told to use. That
         // operator has done the supported thing: run the partitioned
         // layout on the subscriber too.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let default_steps = migration_plan_steps(&EnableOptions::default(), now);
         assert!(
             default_steps
@@ -7449,7 +7500,7 @@ mod tests {
     #[test]
     fn the_operator_plan_performs_the_same_conversion_as_the_executed_script() {
         let opts = EnableOptions::default();
-        let plan = migration_plan(&opts, Utc::now());
+        let plan = migration_plan(&opts, Timestamp::now());
         let script = enable_sql(&opts);
 
         for needle in [
@@ -7508,11 +7559,11 @@ mod tests {
     /// with no partition) or an overlap (`ATTACH` fails).
     #[test]
     fn the_plans_cutover_is_the_current_cohort_boundary() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 31, 17, 42, 9).unwrap();
+        let now = crate::time::utc_ymd_hms(2026, 8, 31, 17, 42, 9).unwrap();
         let plan = migration_plan(&EnableOptions::default(), now);
         let expected = cohort_start(now, DEFAULT_COHORT_WIDTH_SECS);
         assert!(
-            plan.contains(&expected.to_rfc3339()),
+            plan.contains(&crate::time::rfc3339(expected)),
             "the plan must attach legacy at the CURRENT cohort boundary \
              ({expected}), the same value `harvest_event_cohort(now())` \
              produces inside the script"
@@ -7550,7 +7601,7 @@ mod tests {
 
     #[test]
     fn timestamp_literals_cannot_contain_a_quote() {
-        let lit = ts_literal(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
+        let lit = ts_literal(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
         assert_eq!(
             lit.matches('\'').count(),
             2,
@@ -7579,14 +7630,14 @@ mod tests {
             },
             PartitionInfo {
                 name: "harvest_events_p_20260902000000".to_string(),
-                lower: Some(Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()),
-                upper: Some(Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap()),
+                lower: Some(crate::time::utc_ymd_hms(2026, 9, 2, 0, 0, 0).unwrap()),
+                upper: Some(crate::time::utc_ymd_hms(2026, 9, 3, 0, 0, 0).unwrap()),
                 is_default: false,
             },
             PartitionInfo {
                 name: "harvest_events_p_20260901000000".to_string(),
-                lower: Some(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()),
-                upper: Some(Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()),
+                lower: Some(crate::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap()),
+                upper: Some(crate::time::utc_ymd_hms(2026, 9, 2, 0, 0, 0).unwrap()),
                 is_default: false,
             },
         ];

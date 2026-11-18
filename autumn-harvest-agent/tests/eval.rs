@@ -41,8 +41,8 @@ fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// A wall-clock instant `seconds` from now, to fire a durable timer early.
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 /// A delivery that keeps every report.
@@ -438,7 +438,7 @@ async fn an_approval_sent_during_the_notice_is_sent_again() {
         .delivery(pager.clone());
     let mut rt = runtime(&db, harness);
     let exec = sqlite::start(&mut rt, &AgentTask::new("pay it")).unwrap();
-    let start = chrono::Utc::now();
+    let start = jiff::Timestamp::now();
     let mut state = rt.run_until_blocked_as_of(exec, start).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
     let signal = pager.seen.lock().unwrap()[0].call.signal.clone();
@@ -447,7 +447,7 @@ async fn an_approval_sent_during_the_notice_is_sent_again() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = start + chrono::Duration::seconds(pass * 5);
+        let at = start + jiff::SignedDuration::from_secs(pass * 5);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     assert_eq!(report(state).text, "paid");
@@ -485,7 +485,7 @@ async fn an_erased_source_is_refused() {
 async fn a_history_that_is_not_an_agent_run_is_refused() {
     let source = vec![WorkflowEvent::WorkflowStarted {
         input: json!({"order": 7}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -514,7 +514,7 @@ async fn a_current_thread_runtime_is_refused() {
     let source = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::to_value(AgentTask::new("hi")).unwrap(),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -722,7 +722,7 @@ async fn a_redriven_source_that_has_not_ended_is_refused() {
     let redriven = json!({
         "type": "WorkflowRedriven",
         "data": {
-            "redriven_at": chrono::Utc::now(),
+            "redriven_at": jiff::Timestamp::now(),
             "dead_letter_id": "00000000-0000-0000-0000-000000000000",
         },
     });

@@ -10,6 +10,7 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise the suite starts a testcontainers Postgres.
 
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,9 +24,9 @@ use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
-use chrono::Utc;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -210,7 +211,7 @@ async fn statement_timeout_cancels_a_slow_persist() {
             exec_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1023,7 +1024,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionI
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1287,7 +1288,8 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -1335,7 +1337,7 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
             shards: Arc::from([0]),
         },
     );
-    let sent_at = Utc::now();
+    let sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 1})));
 
     // Several flushes fail while the pool is full. Then the slot frees.
@@ -1353,7 +1355,7 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
         .expect("the retry wrote the heartbeat");
     let lag = beat - sent_at;
     assert!(
-        lag < chrono::Duration::milliseconds(1_500),
+        lag < jiff::SignedDuration::from_millis(1_500),
         "the heartbeat time moved to the retry: {lag}"
     );
 }
@@ -1366,7 +1368,8 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -1413,7 +1416,7 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
             shards: Arc::from([0]),
         },
     );
-    let sent_at = Utc::now();
+    let sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 1})));
     // Synchronous handler work holds the only runtime thread.
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1429,7 +1432,7 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
         .expect("the flusher wrote the heartbeat");
     let lag = beat - sent_at;
     assert!(
-        lag < chrono::Duration::milliseconds(1_000),
+        lag < jiff::SignedDuration::from_millis(1_000),
         "the heartbeat time moved to when the runtime got free: {lag}"
     );
 }
@@ -1658,13 +1661,13 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
             // Any retry delay crosses a deadline in the past, so the write
             // takes the schedule-to-close timeout branch. The retry delay is
             // jittered, so a future deadline could miss it.
-            let deadline = Utc::now() - chrono::Duration::seconds(1);
+            let deadline = Timestamp::now() - jiff::SignedDuration::from_secs(1);
             stale.schedule_to_close_at = Some(deadline);
             diesel::sql_query(
                 "UPDATE harvest_task_queue SET schedule_to_close_at = $2 WHERE id = $1",
             )
             .bind::<diesel::sql_types::Uuid, _>(task_id)
-            .bind::<diesel::sql_types::Timestamptz, _>(deadline)
+            .bind::<diesel::sql_types::Timestamptz, _>(deadline.to_diesel())
             .execute(&mut conn)
             .await
             .expect("set the deadline");
@@ -1871,7 +1874,8 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -1921,7 +1925,7 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
     assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and waits until about 4 s.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let sent_at = Utc::now();
+    let sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     drop(held);
@@ -1937,7 +1941,7 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
         .expect("a flush wrote the heartbeat");
     let lag = beat - sent_at;
     assert!(
-        lag < chrono::Duration::milliseconds(1_000),
+        lag < jiff::SignedDuration::from_millis(1_000),
         "the heartbeat time moved past its arrival: {lag}"
     );
 }
@@ -1950,7 +1954,8 @@ async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -2000,7 +2005,7 @@ async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
     assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and blocks on the held pool.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let newer_sent_at = Utc::now();
+    let newer_sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     drop(held);
@@ -2040,7 +2045,8 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -2090,7 +2096,7 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
     assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and blocks on the held pool.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let newer_sent_at = Utc::now();
+    let newer_sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -2109,7 +2115,7 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
     drop(scanner);
     cancel.cancel();
     assert!(
-        beat >= newer_sent_at - chrono::Duration::milliseconds(50),
+        beat >= newer_sent_at - jiff::SignedDuration::from_millis(50),
         "the scanner saw the old send time {beat}; the newer heartbeat was sent at {newer_sent_at}"
     );
 }
@@ -2317,7 +2323,7 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
         &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
     )
     .expect("engine pool");
-    let expires_at = Utc::now() + chrono::Duration::minutes(5);
+    let expires_at = Timestamp::now() + jiff::SignedDuration::from_mins(5);
 
     for (case, recorded_host, kept) in [
         ("hosted here", Some("w-1"), true),
@@ -2364,7 +2370,8 @@ async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
     #[derive(diesel::QueryableByName)]
     struct Beat {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
 
     let (url, _container) = setup_db().await;
@@ -2428,7 +2435,7 @@ async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
     assert!(tx.send(serde_json::json!({"progress": 1})));
     // The write starts at about 1 s and times out at about 2.5 s.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let newer_sent_at = Utc::now();
+    let newer_sent_at = Timestamp::now();
     assert!(tx.send(serde_json::json!({"progress": 2})));
 
     // The scanner waits for the only slot behind the flush.
@@ -2454,7 +2461,7 @@ async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
     let beat = scanner.await.expect("the scanner joins");
     cancel.cancel();
     assert!(
-        beat >= newer_sent_at - chrono::Duration::milliseconds(50),
+        beat >= newer_sent_at - jiff::SignedDuration::from_millis(50),
         "the scanner saw the old stamp {beat}; the newer heartbeat was sent at {newer_sent_at}"
     );
 }
@@ -2497,7 +2504,7 @@ async fn a_session_recheck_waits_for_an_insert_in_progress() {
         exec_id,
         "w-1",
         &queue_name,
-        Utc::now() + chrono::Duration::minutes(5),
+        Timestamp::now() + jiff::SignedDuration::from_mins(5),
     )
     .await
     .expect("insert the session in an open transaction");

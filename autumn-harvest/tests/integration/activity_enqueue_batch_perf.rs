@@ -33,9 +33,9 @@ use std::time::Duration as StdDuration;
 use autumn_harvest::context::{WorkflowCommand, WorkflowContext};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::types::ExecutionId;
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -132,8 +132,8 @@ fn build_fanout_params(exec_id: uuid::Uuid, n: usize) -> Vec<EnqueueParams> {
                 "backoff_coefficient": 2.0,
                 "max_interval_ms": 30_000,
             }));
-            params.heartbeat_timeout = Some(chrono::Duration::seconds(30));
-            params.start_to_close = Some(chrono::Duration::seconds(60));
+            params.heartbeat_timeout = Some(jiff::SignedDuration::from_secs(30));
+            params.start_to_close = Some(jiff::SignedDuration::from_secs(60));
             params.context_headers = Some(json!({"trace_id": format!("perf-trace-{i}")}));
             params
         })
@@ -583,7 +583,7 @@ async fn fan_out_handler_emits_ten_schedule_activity_commands_in_one_suspension(
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

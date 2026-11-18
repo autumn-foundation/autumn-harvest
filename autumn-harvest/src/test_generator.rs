@@ -172,7 +172,7 @@ impl TestHarnessGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     #[test]
     fn test_generator_successful_workflow() {
@@ -180,7 +180,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"user": "alice"}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -220,7 +220,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

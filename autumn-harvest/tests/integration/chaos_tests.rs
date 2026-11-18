@@ -40,6 +40,7 @@ use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::worker::{
     DbPool, HandlerRegistry, chaos_drive_one_workflow_task,
     chaos_drive_one_workflow_task_cancel_at_hold,
@@ -48,13 +49,14 @@ use autumn_harvest::{
     DagCatalog, ExecutionId, SchedulerMonitor, ShardId, StartWorkflowParams, WorkflowIdReusePolicy,
     tick_once,
 };
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
@@ -307,7 +309,7 @@ fn make_pool(url: &str) -> DbPool {
 /// `scheduler_ha_tests` helper so the fired execution counts are comparable.
 async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> uuid::Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = uuid::Uuid::new_v4();
     diesel::insert_into(dsl::harvest_schedules)
         .values((
@@ -318,7 +320,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> uui
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -375,14 +377,13 @@ async fn schedule_claim(
     id: uuid::Uuid,
 ) -> (Option<uuid::Uuid>, bool) {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let (token, until): (Option<uuid::Uuid>, Option<chrono::DateTime<Utc>>) =
-        dsl::harvest_schedules
-            .find(id)
-            .select((dsl::fire_claim_token, dsl::fire_claimed_until))
-            .first(conn)
-            .await
-            .expect("load schedule claim");
-    let live = token.is_some() && until.is_some_and(|u| u > Utc::now());
+    let (token, until) = dsl::harvest_schedules
+        .find(id)
+        .select((dsl::fire_claim_token, dsl::fire_claimed_until))
+        .first::<(Option<uuid::Uuid>, NullableTimestamp)>(conn)
+        .await
+        .expect("load schedule claim");
+    let live = token.is_some() && until.0.is_some_and(|u| u > Timestamp::now());
     (token, live)
 }
 
@@ -1328,7 +1329,7 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
     // An `ACTIVE` session whose lease is already in the past — the AC1(d)
     // early-lease-expiry we are exercising.
     let session_id = autumn_harvest::types::SessionId::new();
-    let expired_at = Utc::now() - chrono::Duration::seconds(60);
+    let expired_at = Timestamp::now() - jiff::SignedDuration::from_secs(60);
     let outcome = autumn_harvest::sessions::record_session_acquired(
         &mut conn, session_id, exec_id, host, "default", expired_at,
     )

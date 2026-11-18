@@ -128,7 +128,7 @@ pub async fn reload_profiles(
     agents.dedup();
     let key = format!(
         "reload-profiles:{kind}:{}",
-        chrono::Utc::now().timestamp_millis()
+        jiff::Timestamp::now().as_millisecond()
     );
     let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
     for id in &agents {

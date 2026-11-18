@@ -265,7 +265,7 @@ async fn seed_terminal_rows(conn: &mut AsyncPgConnection, rows: u64) {
 
 /// Run the real janitor sweep until it finds nothing.
 async fn run_janitor(conn: &mut AsyncPgConnection) -> SweepRun {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+    let cutoff = jiff::Timestamp::now() - autumn_harvest::time::days(7);
     let started = Instant::now();
     let mut deleted = 0;
     let mut passes = 0;

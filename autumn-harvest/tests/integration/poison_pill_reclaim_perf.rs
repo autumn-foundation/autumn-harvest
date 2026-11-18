@@ -413,7 +413,8 @@ struct TaskRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     crash_strikes: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     error: Option<String>,
 }

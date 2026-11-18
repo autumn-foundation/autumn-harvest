@@ -25,6 +25,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,9 +47,9 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -469,7 +470,7 @@ fn sealed_mid_activity_history(
     let input = json!({ "items": items, "should_fail": false });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -503,7 +504,7 @@ fn progress_history(items: &[&str], should_fail: bool) -> (Value, Vec<WorkflowEv
     let input = json!({ "items": items, "should_fail": should_fail });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -629,8 +630,8 @@ async fn ac2_failed_cancelled_timed_out_answer_200_with_internal_state() {
         (
             "TIMED_OUT",
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
         ),
     ] {
@@ -696,7 +697,7 @@ async fn running_partial_history_serves_query_with_partial_state() {
     let input = json!({ "items": ["a", "b", "c"], "should_fail": false });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -783,7 +784,7 @@ async fn ac5_released_and_erased_histories_are_410_unknown_is_404() {
     let released_input = json!({ "items": ["a", "b"], "should_fail": false });
     let released_events = vec![WorkflowEvent::WorkflowStarted {
         input: released_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -831,7 +832,7 @@ async fn ac6_spinning_replay_returns_408() {
     let input = json!({});
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -869,7 +870,7 @@ async fn seed_execution_with_deadline(
     input: Value,
     events: Vec<WorkflowEvent>,
     timeout_secs: f64,
-    deadline_at: chrono::DateTime<Utc>,
+    deadline_at: jiff::Timestamp,
 ) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
@@ -886,7 +887,7 @@ async fn seed_execution_with_deadline(
     .bind::<diesel::sql_types::Jsonb, _>(input)
     .bind::<diesel::sql_types::Text, _>(state)
     .bind::<diesel::sql_types::Double, _>(timeout_secs)
-    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at.to_diesel())
     .execute(&mut conn)
     .await
     .expect("seed execution with deadline");
@@ -903,10 +904,10 @@ async fn seed_execution_with_deadline(
 fn deadline_probe_history(
     items: &[&str],
     completed: bool,
-) -> (Value, Vec<WorkflowEvent>, chrono::DateTime<Utc>) {
-    let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-    let deadline = t0 + chrono::Duration::hours(24);
-    let recorded_now = t0 + chrono::Duration::seconds(1);
+) -> (Value, Vec<WorkflowEvent>, jiff::Timestamp) {
+    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+    let deadline = t0 + jiff::SignedDuration::from_hours(24);
+    let recorded_now = t0 + jiff::SignedDuration::from_secs(1);
     let input = json!({ "items": items });
     let mut events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -919,7 +920,7 @@ fn deadline_probe_history(
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: json!(recorded_now.timestamp_millis()),
+            value: json!(recorded_now.as_millisecond()),
         },
     ];
     for item in items {

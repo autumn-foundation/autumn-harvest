@@ -22,7 +22,7 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure, decode_workflow_failure};
 use autumn_harvest::types::ExecutionId;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ async fn observe_typed_child_failure(error_type: &str, message: &str) -> Harvest
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -140,7 +140,7 @@ async fn legacy_untyped_child_failure_routes_to_the_untyped_fallback() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

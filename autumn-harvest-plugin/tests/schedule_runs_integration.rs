@@ -18,11 +18,12 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -143,9 +144,9 @@ async fn seed_run(
     shard: i32,
     schedule_id: Uuid,
     origin: Option<&str>,
-    scheduled_for: Option<DateTime<Utc>>,
+    scheduled_for: Option<Timestamp>,
     state: &str,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
@@ -201,13 +202,13 @@ async fn seed_run(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(5))
+        Some(started_at + SignedDuration::from_secs(5))
     };
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -218,7 +219,7 @@ async fn seed_run(
 /// Insert a minimal `harvest_schedules` row so the runs endpoint can resolve the
 /// schedule (existence gate + `next_run_at` echo, issue #762). All other columns
 /// rely on their migration-level DB defaults.
-async fn seed_schedule(url: &str, schedule_id: Uuid, next_run_at: Option<DateTime<Utc>>) {
+async fn seed_schedule(url: &str, schedule_id: Uuid, next_run_at: Option<Timestamp>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
@@ -227,7 +228,7 @@ async fn seed_schedule(url: &str, schedule_id: Uuid, next_run_at: Option<DateTim
     )
     .bind::<diesel::sql_types::Uuid, _>(schedule_id)
     .bind::<diesel::sql_types::Text, _>("nightly_etl")
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run_at.to_diesel())
     .execute(&mut conn)
     .await
     .expect("insert schedule");
@@ -249,7 +250,7 @@ async fn next_run_at_is_echoed() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let sid = Uuid::new_v4();
-    let next = Utc::now() + Duration::hours(3);
+    let next = Timestamp::now() + SignedDuration::from_hours(3);
     seed_schedule(&url, sid, Some(next)).await;
     let (status, body) = get_json(&app, &format!("/admin/schedules/{sid}/runs")).await;
     assert_eq!(status, StatusCode::OK);
@@ -270,7 +271,7 @@ async fn outcome_and_error_are_surfaced_per_run() {
     let app = single_app(&url);
     let sid = Uuid::new_v4();
     seed_schedule(&url, sid, None).await;
-    let base = Utc::now() - Duration::hours(2);
+    let base = Timestamp::now() - SignedDuration::from_hours(2);
 
     let ok = seed_run(
         &url,
@@ -287,9 +288,9 @@ async fn outcome_and_error_are_surfaced_per_run() {
         0,
         sid,
         Some("scheduled"),
-        Some(base + Duration::hours(1)),
+        Some(base + SignedDuration::from_hours(1)),
         "FAILED",
-        base + Duration::hours(1),
+        base + SignedDuration::from_hours(1),
     )
     .await;
     // Give the failed run a multi-line error to prove first-line truncation.
@@ -333,14 +334,14 @@ async fn runs_ordered_by_slot_across_page_boundary() {
     let app = single_app(&url);
     let sid = Uuid::new_v4();
     seed_schedule(&url, sid, None).await;
-    let base = Utc::now() - Duration::hours(12);
+    let base = Timestamp::now() - SignedDuration::from_hours(12);
 
     // Slots strictly decrease; start times deliberately shuffled so slot != start.
     let starts = [4, 1, 7, 2, 9];
     let mut expected_by_slot: Vec<(i64, Uuid)> = Vec::new();
     for (i, s) in starts.iter().enumerate() {
         let i = i64::try_from(i).unwrap();
-        let slot = base + Duration::hours(10 - i);
+        let slot = base + SignedDuration::from_hours(10 - i);
         let id = seed_run(
             &url,
             0,
@@ -348,7 +349,7 @@ async fn runs_ordered_by_slot_across_page_boundary() {
             Some("scheduled"),
             Some(slot),
             "COMPLETED",
-            base + Duration::hours(*s),
+            base + SignedDuration::from_hours(*s),
         )
         .await;
         expected_by_slot.push((10 - i, id));
@@ -408,7 +409,7 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
     let app = single_app(&url);
     let sid = Uuid::new_v4();
     seed_schedule(&url, sid, None).await;
-    let base = Utc::now() - Duration::hours(4);
+    let base = Timestamp::now() - SignedDuration::from_hours(4);
 
     // Scheduled cadence: 2 succeeded, 1 failed.
     seed_run(
@@ -426,9 +427,9 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
         0,
         sid,
         Some("scheduled"),
-        Some(base + Duration::hours(1)),
+        Some(base + SignedDuration::from_hours(1)),
         "COMPLETED",
-        base + Duration::hours(1),
+        base + SignedDuration::from_hours(1),
     )
     .await;
     seed_run(
@@ -436,9 +437,9 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
         0,
         sid,
         Some("scheduled"),
-        Some(base + Duration::hours(2)),
+        Some(base + SignedDuration::from_hours(2)),
         "FAILED",
-        base + Duration::hours(2),
+        base + SignedDuration::from_hours(2),
     )
     .await;
     // A backfill FAILED and a manual FAILED — attributed, but NOT cadence.
@@ -447,9 +448,9 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
         0,
         sid,
         Some("backfill"),
-        Some(base - Duration::hours(1)),
+        Some(base - SignedDuration::from_hours(1)),
         "FAILED",
-        base + Duration::hours(3),
+        base + SignedDuration::from_hours(3),
     )
     .await;
     seed_run(
@@ -459,7 +460,7 @@ async fn origins_are_separated_and_summary_is_cadence_only() {
         Some("manual_trigger"),
         None,
         "FAILED",
-        base + Duration::hours(3) + Duration::minutes(30),
+        base + SignedDuration::from_hours(3) + SignedDuration::from_mins(30),
     )
     .await;
 
@@ -490,7 +491,7 @@ async fn state_filter_and_newest_first_ordering() {
     let app = single_app(&url);
     let sid = Uuid::new_v4();
     seed_schedule(&url, sid, None).await;
-    let base = Utc::now() - Duration::hours(6);
+    let base = Timestamp::now() - SignedDuration::from_hours(6);
 
     seed_run(
         &url,
@@ -507,9 +508,9 @@ async fn state_filter_and_newest_first_ordering() {
         0,
         sid,
         Some("scheduled"),
-        Some(base + Duration::hours(1)),
+        Some(base + SignedDuration::from_hours(1)),
         "FAILED",
-        base + Duration::hours(1),
+        base + SignedDuration::from_hours(1),
     )
     .await;
     seed_run(
@@ -517,9 +518,9 @@ async fn state_filter_and_newest_first_ordering() {
         0,
         sid,
         Some("scheduled"),
-        Some(base + Duration::hours(2)),
+        Some(base + SignedDuration::from_hours(2)),
         "TIMED_OUT",
-        base + Duration::hours(2),
+        base + SignedDuration::from_hours(2),
     )
     .await;
 
@@ -555,7 +556,7 @@ async fn limit_reported_and_cursor_paginates() {
     let app = single_app(&url);
     let sid = Uuid::new_v4();
     seed_schedule(&url, sid, None).await;
-    let base = Utc::now() - Duration::hours(8);
+    let base = Timestamp::now() - SignedDuration::from_hours(8);
 
     for i in 0..5 {
         seed_run(
@@ -563,9 +564,9 @@ async fn limit_reported_and_cursor_paginates() {
             0,
             sid,
             Some("scheduled"),
-            Some(base + Duration::minutes(i)),
+            Some(base + SignedDuration::from_mins(i)),
             "COMPLETED",
-            base + Duration::minutes(i),
+            base + SignedDuration::from_mins(i),
         )
         .await;
     }
@@ -605,7 +606,7 @@ async fn merges_across_shards() {
     let sid = Uuid::new_v4();
     // The schedule row lives on one shard (shard 0); runs may spread across both.
     seed_schedule(&url0, sid, None).await;
-    let base = Utc::now() - Duration::hours(2);
+    let base = Timestamp::now() - SignedDuration::from_hours(2);
 
     seed_run(
         &url0,
@@ -622,9 +623,9 @@ async fn merges_across_shards() {
         1,
         sid,
         Some("scheduled"),
-        Some(base + Duration::minutes(30)),
+        Some(base + SignedDuration::from_mins(30)),
         "FAILED",
-        base + Duration::minutes(30),
+        base + SignedDuration::from_mins(30),
     )
     .await;
 
@@ -647,7 +648,7 @@ async fn one_shard_down_is_partial_not_500() {
     let sid = Uuid::new_v4();
     // Schedule + healthy run on shard 0, which is queried before the down shard 1.
     seed_schedule(&url0, sid, None).await;
-    let base = Utc::now() - Duration::hours(1);
+    let base = Timestamp::now() - SignedDuration::from_hours(1);
     seed_run(
         &url0,
         0,

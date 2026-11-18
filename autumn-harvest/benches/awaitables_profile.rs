@@ -88,11 +88,11 @@ use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_a
 use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalActivityToken, TimerId};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
-fn now() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::new(1_800_000_000, 0).unwrap()
 }
 
 /// A representative per-activity input/output record — small enough to be
@@ -123,13 +123,13 @@ const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
 #[allow(clippy::too_many_lines, reason = "one straight-line event list")]
 fn build_workload(
     n: usize,
-    start: DateTime<Utc>,
-) -> (Vec<(DateTime<Utc>, WorkflowEvent)>, Vec<WorkflowCommand>) {
-    let mut rows: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::new();
+    start: Timestamp,
+) -> (Vec<(Timestamp, WorkflowEvent)>, Vec<WorkflowCommand>) {
+    let mut rows: Vec<(Timestamp, WorkflowEvent)> = Vec::new();
     let mut commands: Vec<WorkflowCommand> = Vec::new();
     let mut t = start;
     let mut tick = || {
-        t += chrono::Duration::milliseconds(50);
+        t += jiff::SignedDuration::from_millis(50);
         t
     };
 

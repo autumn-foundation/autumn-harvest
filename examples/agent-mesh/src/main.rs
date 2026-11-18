@@ -6,12 +6,12 @@ use std::sync::Arc;
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MESH, MeshConfig, PrintSink};
 use agent_mesh::scripted::ScriptedDesk;
-use autumn_harvest::chrono::{DateTime, Duration, Utc};
 use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest_agent::openai::{OPENAI_BASE_URL, OpenAiModel};
 use autumn_harvest_agent::{AgentModel, AgentOp, Approval, Control, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
 use clap::{Parser, Subcommand, ValueEnum};
+use jiff::{SignedDuration, Timestamp};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -95,12 +95,19 @@ enum Command {
 
 /// The desk clock: the wall clock, moved on by each `tick`. It never runs
 /// back, so a timer that a tick fired stays fired.
-fn now(desk: &Desk) -> DateTime<Utc> {
+fn now(desk: &Desk) -> Timestamp {
     let offset = std::fs::read_to_string(desk.root().join("clock.txt"))
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    Utc::now() + Duration::minutes(offset)
+    moved_clock(Timestamp::now(), offset)
+}
+
+/// Moves `base` on by `offset_mins` minutes. A far offset saturates, so the
+/// desk stays usable.
+fn moved_clock(base: Timestamp, offset_mins: i64) -> Timestamp {
+    autumn_harvest::time::checked_add_chrono_range(base, SignedDuration::from_mins(offset_mins))
+        .unwrap_or(Timestamp::MAX)
 }
 
 fn move_clock(desk: &Desk, minutes: i64) -> std::io::Result<()> {
@@ -293,5 +300,17 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_far_desk_clock_offset_saturates() {
+        let base = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(moved_clock(base, 5_000_000_000), Timestamp::MAX);
+        assert_eq!(moved_clock(base, 60), base + SignedDuration::from_hours(1));
     }
 }

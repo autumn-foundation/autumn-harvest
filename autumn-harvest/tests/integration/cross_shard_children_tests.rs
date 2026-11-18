@@ -19,6 +19,7 @@
 //! Each test names the acceptance criterion it discharges.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -35,16 +36,17 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::{ChildPlacement, ShardRouter, ShardedDbPool};
 use autumn_harvest::telemetry::TelemetryConfig;
+use autumn_harvest::time::sql::{NullableTimestamp, SqlTimestamp};
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, start_or_load_workflow_execution,
 };
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -641,24 +643,24 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     }
 
     let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
-    let (created_at, chain_deadline_at): (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>) =
+    let (SqlTimestamp(created_at), NullableTimestamp(chain_deadline_at)) =
         harvest_workflow_executions::table
             .find(child_id.as_uuid())
             .select((
                 harvest_workflow_executions::created_at,
                 harvest_workflow_executions_ext::chain_deadline_at,
             ))
-            .first(&mut *child_conn)
+            .first::<(SqlTimestamp, NullableTimestamp)>(&mut *child_conn)
             .await
             .expect("child row must exist on its target shard");
 
     let chain_deadline_at = chain_deadline_at.expect("chain deadline must be set");
     assert!(
-        chain_deadline_at > Utc::now(),
+        chain_deadline_at > Timestamp::now(),
         "the chain deadline must be in the future — carried-over stale value was {chain_deadline_at}"
     );
-    let expected = created_at + chrono::Duration::seconds(chain_execution_timeout_secs);
-    let drift = (chain_deadline_at - expected).num_seconds().abs();
+    let expected = created_at + jiff::SignedDuration::from_secs(chain_execution_timeout_secs);
+    let drift = (chain_deadline_at - expected).as_secs().abs();
     assert!(
         drift <= 5,
         "the chain deadline must be anchored at the child's own creation \
@@ -1209,7 +1211,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1260,7 +1262,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
                 harvest_workflow_executions::output.eq(Some(&secret_output)),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await
@@ -1339,7 +1341,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1389,7 +1391,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
         diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await
@@ -1471,7 +1473,7 @@ async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec()
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1589,7 +1591,7 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut *parent_conn)
         .await
@@ -1697,7 +1699,7 @@ async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retenti
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut *parent_conn)
         .await
@@ -3128,7 +3130,7 @@ async fn a_retry_for_an_existing_child_needs_no_key() {
         .set((
             harvest_cross_shard_children::status.eq("PENDING_START"),
             harvest_cross_shard_children::attempts.eq(0),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<jiff_diesel::Timestamp>),
         ))
         .execute(&mut *conn)
         .await
@@ -3168,7 +3170,7 @@ async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -3202,7 +3204,7 @@ async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
         diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await

@@ -18,6 +18,9 @@
 //! `TimerStarted` diverges deterministically.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
+
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -442,7 +445,7 @@ async fn get_nd_block_row(
     exec_id: ExecutionId,
 ) -> (bool, Option<String>, i32, Option<Value>) {
     let (blocked_at, reason, count, attrs): (
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<SqlTimestamp>,
         Option<String>,
         i32,
         Option<Value>,
@@ -463,24 +466,27 @@ async fn get_nd_block_row(
 /// The requeue delay of the latest block: `scheduled_at - nd_blocked_at`.
 ///
 /// One block writes both columns, so poll lag does not enter the value.
-async fn nd_requeue_delay(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> chrono::Duration {
-    let blocked_at: Option<chrono::DateTime<chrono::Utc>> = harvest_workflow_executions::table
+async fn nd_requeue_delay(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> jiff::SignedDuration {
+    let blocked_at: Option<SqlTimestamp> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select(harvest_workflow_executions::nd_blocked_at)
         .first(conn)
         .await
         .expect("execution must exist");
     let (_, scheduled_at, _, _) = get_workflow_task(conn, exec_id).await;
-    scheduled_at - blocked_at.expect("nd_blocked_at must be set")
+    scheduled_at - blocked_at.expect("nd_blocked_at must be set").to_jiff()
 }
 
 /// Assert that `delay` is in the Equal-jitter band `[base/2, base]` (issue #1792).
 ///
 /// The worker clock writes `nd_blocked_at` and the database clock writes
 /// `scheduled_at`, so the band has a small slop.
-fn assert_in_equal_jitter_band(delay: chrono::Duration, base_secs: i64) {
-    let slop = chrono::Duration::milliseconds(250);
-    let base = chrono::Duration::seconds(base_secs);
+fn assert_in_equal_jitter_band(delay: jiff::SignedDuration, base_secs: i64) {
+    let slop = jiff::SignedDuration::from_millis(250);
+    let base = jiff::SignedDuration::from_secs(base_secs);
     assert!(
         delay >= base / 2 - slop && delay <= base + slop,
         "delay {delay} is outside [{}, {base}]",
@@ -500,13 +506,8 @@ async fn get_history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<
 async fn get_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (
-    String,
-    chrono::DateTime<chrono::Utc>,
-    Option<String>,
-    Option<String>,
-) {
-    harvest_task_queue::table
+) -> (String, jiff::Timestamp, Option<String>, Option<String>) {
+    let (state, scheduled_at, sticky_worker_id, error) = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("workflow"))
         .select((
@@ -515,9 +516,10 @@ async fn get_workflow_task(
             harvest_task_queue::sticky_worker_id,
             harvest_task_queue::error,
         ))
-        .first(conn)
+        .first::<(String, SqlTimestamp, Option<String>, Option<String>)>(conn)
         .await
-        .expect("workflow task row must exist")
+        .expect("workflow task row must exist");
+    (state, scheduled_at.to_jiff(), sticky_worker_id, error)
 }
 
 /// Wait until the execution's history contains a `TimerStarted` event —
@@ -543,7 +545,10 @@ async fn fire_timer_now(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
             .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
             .filter(harvest_timers::fired.eq(false)),
     )
-    .set(harvest_timers::fires_at.eq(chrono::Utc::now() - chrono::Duration::seconds(1)))
+    .set(
+        harvest_timers::fires_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("backdate timer");
@@ -557,7 +562,10 @@ async fn make_task_claimable_now(conn: &mut AsyncPgConnection, exec_id: Executio
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(harvest_task_queue::task_type.eq("workflow")),
     )
-    .set(harvest_task_queue::scheduled_at.eq(chrono::Utc::now() - chrono::Duration::seconds(1)))
+    .set(
+        harvest_task_queue::scheduled_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("backdate task scheduled_at");
@@ -690,7 +698,7 @@ async fn divergent_replay_blocks_instead_of_failing() {
         get_workflow_task(&mut conn, exec_id).await;
     assert_eq!(task_state, "PENDING");
     assert!(
-        scheduled_at > chrono::Utc::now(),
+        scheduled_at > jiff::Timestamp::now(),
         "re-dispatch must be deferred"
     );
     assert_in_equal_jitter_band(nd_requeue_delay(&mut conn, exec_id).await, 5);
@@ -1789,7 +1797,7 @@ async fn wait_for_reparked_after(
         let (state, scheduled_at, _, _) = get_workflow_task(conn, exec_id).await;
         if metrics.dispatch_count() >= dispatches
             && state == "PENDING"
-            && scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(60)
+            && scheduled_at > jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60)
         {
             return;
         }

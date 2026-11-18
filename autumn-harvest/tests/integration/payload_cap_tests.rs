@@ -524,7 +524,7 @@ fn replay_does_not_recheck_cap_on_existing_events() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!(null),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

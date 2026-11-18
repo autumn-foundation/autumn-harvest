@@ -700,7 +700,7 @@ mod tests {
     async fn resident() -> ResidentWorkflow {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -804,14 +804,14 @@ mod tests {
     #[test]
     fn cached_state_stores_events_and_next_event_id() {
         use crate::event::WorkflowEvent;
-        use chrono::Utc;
+        use jiff::Timestamp;
         let mut cache = WorkflowCache::new(5);
         let id = Uuid::new_v4();
 
         let state = CachedWorkflowState {
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

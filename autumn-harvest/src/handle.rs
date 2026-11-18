@@ -96,7 +96,7 @@ pub struct WorkflowResult {
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<jiff::Timestamp>,
 }
 
 impl WorkflowResult {
@@ -134,7 +134,7 @@ impl WorkflowResult {
     pub const fn completed(
         state: WorkflowResultState,
         output: Value,
-        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<jiff::Timestamp>,
     ) -> Self {
         Self {
             state,
@@ -1264,29 +1264,29 @@ impl WorkflowHandleClient {
         // Issue #2387: an operator override wins over the declared value.
         let (execution_timeout, sla) =
             self.apply_run_defaults(info.name, info.execution_timeout, info.sla);
-        let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+        let execution_timeout = execution_timeout.and_then(crate::time::from_std_bounded);
         // Effective SLA clamped to at most the hard execution timeout, mirroring
         // the HTTP start route's resolution (never a soft deadline past the hard
         // one).
         let sla = sla
-            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .and_then(crate::time::from_std_bounded)
             .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
         // Issue #2406: the operator override of the chain cap wins too.
         let chain_execution_timeout = self
             .apply_chain_run_default(info.name, info.chain_execution_timeout)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_input_bytes = self.max_workflow_input_bytes(info.max_input_bytes);
         let max_workflow_execution_timeout_ceiling = self
             .inner
             .max_workflow_execution_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_chain_timeout_ceiling = self
             .inner
             .max_workflow_chain_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_start_delay =
-            chrono::Duration::from_std(self.inner.max_workflow_start_delay)
-                .unwrap_or_else(|_| chrono::Duration::days(365));
+            crate::time::from_std_bounded(self.inner.max_workflow_start_delay)
+                .unwrap_or_else(|| crate::time::days(365));
 
         ResolvedStartDefaults {
             concurrency_key,
@@ -1519,13 +1519,13 @@ struct ResolvedStartDefaults {
     concurrency_key: Option<String>,
     concurrency_limit: Option<u32>,
     concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
-    execution_timeout: Option<chrono::Duration>,
-    sla: Option<chrono::Duration>,
-    chain_execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    sla: Option<jiff::SignedDuration>,
+    chain_execution_timeout: Option<jiff::SignedDuration>,
     max_workflow_input_bytes: u64,
-    max_workflow_execution_timeout_ceiling: Option<chrono::Duration>,
-    max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
-    max_workflow_start_delay: chrono::Duration,
+    max_workflow_execution_timeout_ceiling: Option<jiff::SignedDuration>,
+    max_workflow_chain_timeout_ceiling: Option<jiff::SignedDuration>,
+    max_workflow_start_delay: jiff::SignedDuration,
 }
 
 /// The three kinds of post-commit follow-up work a transactional start can

@@ -130,7 +130,7 @@ struct TaskRow {
     state: String,
     attempt: i32,
     worker_id: Option<String>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<jiff::Timestamp>,
 }
 
 async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
@@ -144,7 +144,8 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         worker_id: Option<String>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        started_at: Option<jiff::Timestamp>,
     }
     let row: Row = diesel::sql_query(
         "SELECT state, attempt, worker_id, started_at FROM harvest_task_queue WHERE id = $1",

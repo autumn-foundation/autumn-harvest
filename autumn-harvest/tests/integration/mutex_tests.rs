@@ -699,11 +699,12 @@ async fn lock_holder(url: &str, key: &str) -> Option<Uuid> {
 }
 
 /// The lease end of the lock on `key`, when a row exists.
-async fn lease_end(url: &str, key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+async fn lease_end(url: &str, key: &str) -> Option<jiff::Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        lease_expires_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        lease_expires_at: jiff::Timestamp,
     }
     let mut conn = connect(url).await;
     diesel::sql_query("SELECT lease_expires_at FROM harvest_mutex_locks WHERE lock_key = $1")

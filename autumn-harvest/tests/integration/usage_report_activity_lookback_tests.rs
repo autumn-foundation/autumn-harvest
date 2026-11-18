@@ -49,6 +49,7 @@
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::usage::{UsageGroupBy, UsageQuery, load_usage_grouped, usage_sql};
 
@@ -92,8 +93,10 @@ async fn run_usage_query(conn: &mut AsyncPgConnection, row_limit: i64) -> Vec<Us
     let mut rows: Vec<UsageRow> = diesel::sql_query(usage_sql())
         .bind::<Integer, _>(SHARD_ID)
         .bind::<Nullable<Text>, _>(None::<String>)
-        .bind::<Timestamptz, _>(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
-        .bind::<Timestamptz, _>(chrono::Utc::now() + chrono::Duration::days(1))
+        .bind::<Timestamptz, _>(jiff::Timestamp::UNIX_EPOCH.to_diesel())
+        .bind::<Timestamptz, _>(
+            (jiff::Timestamp::now() + autumn_harvest::time::days(1)).to_diesel(),
+        )
         .bind::<BigInt, _>(row_limit)
         .load(conn)
         .await
@@ -109,7 +112,7 @@ async fn run_usage_query(conn: &mut AsyncPgConnection, row_limit: i64) -> Vec<Us
 async fn seed_workflow(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
-    started_at: chrono::DateTime<chrono::Utc>,
+    started_at: jiff::Timestamp,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::new_v4();
     conn.batch_execute(&format!(
@@ -118,7 +121,7 @@ async fn seed_workflow(
               started_at, created_at) \
          VALUES ('{id}', '{workflow_name}', 'wf-{id}', gen_random_uuid(), {SHARD_ID}, \
                  'COMPLETED', '{{}}'::jsonb, 'default', '{ts}', '{ts}')",
-        ts = started_at.to_rfc3339(),
+        ts = autumn_harvest::time::rfc3339(started_at),
     ))
     .await
     .expect("seed workflow execution");
@@ -131,7 +134,7 @@ async fn seed_event(
     event_id: i32,
     event_type: &str,
     activity_id: Option<uuid::Uuid>,
-    ts: chrono::DateTime<chrono::Utc>,
+    ts: jiff::Timestamp,
 ) {
     let data = activity_id.map_or_else(
         || "{}".to_string(),
@@ -141,7 +144,7 @@ async fn seed_event(
         "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
          VALUES ('{exec_id}', {event_id}, '{event_type}', \
                  '{{\"type\":\"{event_type}\",\"data\":{data}}}'::jsonb, '{ts}')",
-        ts = ts.to_rfc3339(),
+        ts = autumn_harvest::time::rfc3339(ts),
     ))
     .await
     .expect("seed event");
@@ -177,7 +180,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         .await
         .expect("connect");
 
-    let base = chrono::Utc::now() - chrono::Duration::hours(1);
+    let base = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     // Unique per invocation. `usage_sql()` groups by workflow_name over a
     // window that spans this whole test. A fixed name would also count the
@@ -206,7 +209,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         1,
         "ActivityStarted",
         Some(retry_activity),
-        base + chrono::Duration::seconds(10),
+        base + jiff::SignedDuration::from_secs(10),
     )
     .await;
     seed_event(
@@ -215,7 +218,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         2,
         "ActivityCompleted",
         Some(retry_activity),
-        base + chrono::Duration::seconds(20),
+        base + jiff::SignedDuration::from_secs(20),
     )
     .await;
 
@@ -227,7 +230,7 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
         0,
         "ActivityTimedOut",
         Some(uuid::Uuid::new_v4()),
-        base + chrono::Duration::seconds(5),
+        base + jiff::SignedDuration::from_secs(5),
     )
     .await;
 
@@ -237,8 +240,8 @@ async fn usage_report_activity_lookback_index_does_not_change_the_result_set() {
 
     let query = UsageQuery {
         group_by: UsageGroupBy::WorkflowName,
-        from: base - chrono::Duration::minutes(5),
-        to: chrono::Utc::now(),
+        from: base - jiff::SignedDuration::from_mins(5),
+        to: jiff::Timestamp::now(),
     };
 
     // A high row_limit, not the caller-facing default. `usage_sql()` applies
@@ -420,8 +423,8 @@ async fn explain_and_result_set(
     ))
     .bind::<Integer, _>(SHARD_ID)
     .bind::<Nullable<Text>, _>(None::<String>)
-    .bind::<Timestamptz, _>(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
-    .bind::<Timestamptz, _>(chrono::Utc::now() + chrono::Duration::days(1))
+    .bind::<Timestamptz, _>(jiff::Timestamp::UNIX_EPOCH.to_diesel())
+    .bind::<Timestamptz, _>((jiff::Timestamp::now() + autumn_harvest::time::days(1)).to_diesel())
     .bind::<BigInt, _>(row_limit)
     .load(conn)
     .await

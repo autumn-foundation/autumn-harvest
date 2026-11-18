@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -89,7 +89,7 @@ async fn drifty(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
 #[tokio::test]
 async fn engine_nondeterminism_is_nonterminal_and_resumable() {
     let (_dir, path) = temp_db();
-    let t0: DateTime<Utc> = DateTime::from_timestamp(5_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(5_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&drifty_info());
@@ -148,7 +148,7 @@ async fn engine_nondeterminism_is_nonterminal_and_resumable() {
     // fire the durable timer past its deadline.
     DRIFT_PHASE.store(1, Ordering::SeqCst);
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3601))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3601))
         .await
         .unwrap();
     assert!(
@@ -417,7 +417,7 @@ async fn timer_and_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String
 #[tokio::test]
 async fn mixed_timer_activity_batch_completes_and_replays() {
     let (_dir, _path) = temp_db();
-    let t0: DateTime<Utc> = DateTime::from_timestamp(6_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(6_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&timer_and_activity_info());
@@ -437,7 +437,7 @@ async fn mixed_timer_activity_batch_completes_and_replays() {
     // Drive 2 at t0+5: the timer is now due, fires, and the joined workflow
     // resolves to completion.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(5))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(5))
         .await
         .unwrap();
     assert!(

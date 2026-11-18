@@ -883,7 +883,7 @@ SqliteAuthStore::open("app.harvest.db")?.insert_token(&NewToken {
     name: "bootstrap",
     token_hash: &autumn_harvest::api_token::hash_secret(&secret),
     scope: "admin",
-    created_at: chrono::Utc::now(),
+    created_at: jiff::Timestamp::now(),
     expires_at: None,
     created_by: "bootstrap",
     tenant: None,

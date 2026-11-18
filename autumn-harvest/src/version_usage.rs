@@ -1,9 +1,9 @@
 //! Read-only inventory for recorded workflow version-gate markers.
 
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarvestError, HarvestResult, database_error};
@@ -65,8 +65,8 @@ pub struct VersionUsageShardRow {
     pub recorded_version: u32,
     pub active_executions: i64,
     pub terminal_executions: i64,
-    pub oldest_matching_started_at: DateTime<Utc>,
-    pub newest_matching_started_at: DateTime<Utc>,
+    pub oldest_matching_started_at: Timestamp,
+    pub newest_matching_started_at: Timestamp,
     pub shard_id: i32,
 }
 
@@ -83,9 +83,11 @@ struct VersionUsageSqlRow {
     #[diesel(sql_type = BigInt)]
     terminal_executions: i64,
     #[diesel(sql_type = Timestamptz)]
-    oldest_matching_started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    oldest_matching_started_at: Timestamp,
     #[diesel(sql_type = Timestamptz)]
-    newest_matching_started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    newest_matching_started_at: Timestamp,
     #[diesel(sql_type = Integer)]
     shard_id: i32,
 }

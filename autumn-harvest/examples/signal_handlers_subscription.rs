@@ -189,7 +189,7 @@ mod tests {
     fn started_event(input: &str) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!(input),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

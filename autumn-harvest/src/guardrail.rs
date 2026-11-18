@@ -45,7 +45,7 @@ pub enum Severity {
 /// The determinism category a rule belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleCategory {
-    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `chrono::Utc::now()`).
+    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `jiff::Timestamp::now()`).
     WallClock,
     /// Random number generation or ad-hoc UUID creation (`rand`, `Uuid::new_v4()`).
     Randomness,
@@ -98,15 +98,15 @@ static CATALOG: &[RuleEntry] = &[
         severity: Severity::HardBlocker,
         category: RuleCategory::WallClock,
         explanation: "Reading wall-clock time inside a workflow (std::time::Instant::now(), \
-            SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every \
-            replay. The workflow engine re-executes the function body deterministically against \
-            recorded history; a fresh timestamp breaks that contract and causes a \
-            non-determinism error.",
+            SystemTime::now(), jiff::Timestamp::now(), chrono::Utc::now(), etc.) produces a \
+            different value on every replay. The workflow engine re-executes the function \
+            body deterministically against recorded history; a fresh timestamp breaks that \
+            contract and causes a non-determinism error.",
         alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, \
             which returns the WorkflowStarted timestamp and replays identically on every \
             subsequent run. For a real wall-clock instant captured at the call site (e.g. \
             \"skip the notification if the event is older than 24h *now*\"), use \
-            ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which \
+            ctx.system_now() -> jiff::Timestamp (or ctx.system_time_now() -> SystemTime), which \
             captures the current time once and replays it deterministically via a recorded \
             SideEffectRecorded event.",
     },

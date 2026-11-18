@@ -10,7 +10,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ async fn fan_out_raw_three_parallel_all_succeed() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -235,7 +235,7 @@ async fn fan_out_raw_fail_fast_on_first_failure() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -305,7 +305,7 @@ async fn fan_out_collect_all_returns_per_slot_results() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -381,7 +381,7 @@ async fn fan_out_empty_activities_returns_empty_vec() {
 
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -410,7 +410,7 @@ async fn fan_out_raw_live_execution_emits_marker_and_schedule_commands() {
     // Only WorkflowStarted — no activity history, no marker
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -463,7 +463,7 @@ async fn fan_out_count_mismatch_returns_non_deterministic_error() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -531,7 +531,7 @@ async fn fan_out_dynamic_from_prior_activity_replays_correctly() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -607,7 +607,7 @@ async fn fan_out_cancelled_workflow_returns_cancelled_error() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -671,7 +671,7 @@ async fn fan_out_typed_single_activity_type_replays_correctly() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -748,7 +748,7 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -837,7 +837,7 @@ async fn fan_out_two_groups_in_same_workflow() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -972,7 +972,7 @@ where
     let exec_id = ExecutionId::new();
     let mut history = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1046,7 +1046,7 @@ async fn windowed_fan_out_first_wave_schedules_at_most_window() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: json!({ "n": 5, "w": 2 }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1165,7 +1165,7 @@ async fn windowed_window_ge_count_identical_history_to_unbounded() {
     let started = |input: Value| {
         vec![WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1370,7 +1370,7 @@ async fn windowed_fan_out_empty_records_marker_and_returns_empty() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1407,7 +1407,7 @@ async fn windowed_fan_out_count_mismatch_non_deterministic() {
     let mut history = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!({ "n": 2, "w": 2 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1459,7 +1459,7 @@ async fn windowed_fan_out_cancellation_returns_cancelled() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!({ "n": 3, "w": 2 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1614,7 +1614,7 @@ async fn windowed_fan_out_resumes_under_increased_window() {
     let partial = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1745,7 +1745,7 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
     let mut partial = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1829,7 +1829,7 @@ where
     let mut history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1965,7 +1965,7 @@ async fn windowed_fan_out_mid_wave_cancellation_does_not_dispatch_next_wave() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2063,7 +2063,7 @@ async fn windowed_typed_methods_reject_local_activities() {
         exec_id,
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

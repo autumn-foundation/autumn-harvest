@@ -48,6 +48,7 @@
 //! `start_or_load` insert test proves that the insert path writes
 //! `request.start_source` verbatim.
 
+use jiff_diesel::ToDiesel;
 use std::sync::Mutex;
 
 use std::sync::Arc;
@@ -723,7 +724,10 @@ async fn schedule_tick_records_schedule_source_referencing_schedule_id() {
         .await
         .expect("register schedule");
     diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(wf_name)))
-        .set(harvest_schedules::next_run_at.eq(chrono::Utc::now() - chrono::Duration::seconds(300)))
+        .set(
+            harvest_schedules::next_run_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(300)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("arm slot");

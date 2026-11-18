@@ -970,13 +970,14 @@ fn apply_model(model: &mut Model, op: Op, db: &Res) -> Res {
 async fn due_tasks(
     conn: &mut AsyncPgConnection,
     queue: &str,
-) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>, String> {
+) -> Result<Vec<(Uuid, jiff::Timestamp)>, String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = SqlUuid)]
         id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        claim_due: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        claim_due: jiff::Timestamp,
     }
     diesel::sql_query(format!(
         "SELECT id, {CLAIM_ORDER_DUE_SQL} AS claim_due FROM harvest_task_queue \

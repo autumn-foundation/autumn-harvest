@@ -10,7 +10,7 @@ fn test_integer_overflow_in_event_id_returns_error() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

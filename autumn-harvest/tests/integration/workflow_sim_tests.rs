@@ -300,7 +300,7 @@ async fn a_timer_can_win_or_lose_against_an_activity() {
             sometimes!(won == Some(json!(1)), "the timer beats the activity");
             if won == Some(json!(1)) {
                 always!(
-                    outcome.elapsed() == chrono::Duration::seconds(60),
+                    outcome.elapsed() == jiff::SignedDuration::from_secs(60),
                     "a timer fires only at its deadline"
                 );
             }
@@ -625,15 +625,15 @@ async fn a_seeded_mock_sees_the_virtual_clock() {
         })
     }
     let env = WorkflowTestEnv::new()
-        .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().timestamp())));
+        .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().as_second())));
     let outcome = env.simulation().run(1, wf, json!(null)).await;
     let started = |events: &[WorkflowEvent]| match events.first() {
-        Some(WorkflowEvent::WorkflowStarted { timestamp, .. }) => timestamp.timestamp(),
+        Some(WorkflowEvent::WorkflowStarted { timestamp, .. }) => timestamp.as_second(),
         other => panic!("{other:?}"),
     };
     assert_eq!(outcome.result(), &Ok(json!(started(outcome.events()) + 30)));
     let default = env.run(wf, json!(null)).await;
-    assert_eq!(default.result, Ok(json!(env.now().timestamp() + 30)));
+    assert_eq!(default.result, Ok(json!(env.now().as_second() + 30)));
 }
 
 #[tokio::test]
@@ -701,7 +701,7 @@ fn coin_and_clock(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
             "next": next,
             "id": id.to_string(),
             "version": id.get_version_num(),
-            "now": ctx.system_now().timestamp(),
+            "now": ctx.system_now().as_second(),
         }))
     })
 }
@@ -1055,7 +1055,7 @@ async fn a_seeded_local_activity_mock_sees_the_sim_clock() {
         })
     }
     let env = WorkflowTestEnv::new()
-        .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().timestamp())));
+        .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().as_second())));
     let outcome = env.simulation().run(1, wf, json!(null)).await;
     // Monday 2024-01-01 00:00 UTC, the fixed start of a run.
     assert_eq!(outcome.result(), &Ok(json!(1_704_067_200)));

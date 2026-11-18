@@ -265,7 +265,7 @@ impl AnalyzerRule for LargePayloadRule {
 mod tests {
     use super::*;
     use crate::types::{ActivityExecId, TimerId};
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     #[test]
     fn excessive_retries_flags_activities_over_threshold() {
@@ -386,7 +386,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: small_json,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

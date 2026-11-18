@@ -1,4 +1,4 @@
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 use std::pin::Pin;
 
@@ -114,7 +114,7 @@ fn executor_emits_harvest_workflow_execute_span() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -146,7 +146,7 @@ fn executor_no_longer_emits_old_harvest_workflow_run_span() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -179,7 +179,7 @@ fn executor_span_has_attr_execution_id_field() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -219,7 +219,7 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -293,7 +293,7 @@ fn live_executor_span_has_replay_false() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

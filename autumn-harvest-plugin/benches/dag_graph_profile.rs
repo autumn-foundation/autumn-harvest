@@ -83,7 +83,7 @@ use autumn_harvest::dag::{
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, TimerId, WorkerId};
 use autumn_harvest_plugin::dag_graph::build_run_graph;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ── DAG activity functions ──────────────────────────────────────────────
@@ -185,8 +185,8 @@ fn t088() {}
 // Same idioms as `dag_graph.rs`'s own `mod tests` (`sched`, `completed`,
 // `failed`, `activity_started`, `skip_marker_full`).
 
-fn ts(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+fn ts(secs: i64) -> Timestamp {
+    Timestamp::new(1_700_000_000 + secs, 0).unwrap()
 }
 
 fn workflow_started() -> WorkflowEvent {
@@ -854,15 +854,14 @@ const BACKBONE_END: usize = 24;
 /// still-progressing `RUNNING` history of a run whose gates all resolved.
 /// `dag_graph.rs`'s own unit tests cover the `is_compensation_dispatch`
 /// exclusion.
-fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
+fn build_events(def: &DagDefinition) -> Vec<(Timestamp, WorkflowEvent)> {
     let tasks = def.tasks();
-    let mut events: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
+    let mut events: Vec<(Timestamp, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
     let mut t: i64 = 0;
-    let push =
-        |t: &mut i64, events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>, ev: WorkflowEvent| {
-            events.push((ts(*t), ev));
-            *t += 1;
-        };
+    let push = |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
+        events.push((ts(*t), ev));
+        *t += 1;
+    };
 
     push(&mut t, &mut events, workflow_started());
 
@@ -980,15 +979,14 @@ fn build_events(def: &DagDefinition) -> Vec<(DateTime<Utc>, WorkflowEvent)> {
 ///   `SignalWon`.
 fn push_gate_resolution(
     t: &mut i64,
-    events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>,
+    events: &mut Vec<(Timestamp, WorkflowEvent)>,
     gate: &DagSignalGate,
     scenario: usize,
 ) -> bool {
-    let push =
-        |t: &mut i64, events: &mut Vec<(DateTime<Utc>, WorkflowEvent)>, ev: WorkflowEvent| {
-            events.push((ts(*t), ev));
-            *t += 1;
-        };
+    let push = |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
+        events.push((ts(*t), ev));
+        *t += 1;
+    };
     match scenario {
         // gate_0, gate_2 (plain `signal_gate`) and gate_3
         // (`signal_gate_with_timeout`, resolved by its signal arriving

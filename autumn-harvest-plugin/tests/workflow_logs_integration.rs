@@ -408,7 +408,7 @@ async fn since_bounds_by_occurred_at_and_a_bad_value_is_a_400() {
         .await
         .expect("append new");
 
-    let since = boundary.to_rfc3339();
+    let since = autumn_harvest::time::rfc3339(boundary);
     let (status, body) = get_json(
         &app,
         &format!(

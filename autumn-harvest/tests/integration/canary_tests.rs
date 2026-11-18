@@ -14,6 +14,7 @@
 //! `is_canary_workflow` matches. Like the real probe, its body dispatches one
 //! non-local activity, then waits on a short durable timer.
 
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -496,7 +497,7 @@ async fn expire_deadline_now(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
     )
     .set(
         harvest_workflow_executions::deadline_at
-            .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(5))),
+            .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
     )
     .execute(conn)
     .await

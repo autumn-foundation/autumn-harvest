@@ -49,13 +49,14 @@
 
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
+use jiff_diesel::ToDiesel;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -156,10 +157,10 @@ pub struct TokenView {
     pub id: Uuid,
     pub name: String,
     pub scope: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    pub last_used_at: Option<Timestamp>,
+    pub revoked_at: Option<Timestamp>,
     /// Tenant claim of the token (issue #1977). `null` means not
     /// tenant-bound.
     pub tenant: Option<String>,
@@ -233,7 +234,7 @@ impl std::fmt::Debug for MintResult {
 ///
 /// The boundary is inclusive: a token whose `expires_at == now` is expired.
 #[must_use]
-pub(crate) fn is_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+pub(crate) fn is_expired(expires_at: Option<Timestamp>, now: Timestamp) -> bool {
     expires_at.is_some_and(|at| at <= now)
 }
 
@@ -274,7 +275,7 @@ pub(crate) async fn create_token(
     conn: &mut AsyncPgConnection,
     name: &str,
     scope: TokenScope,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
     created_by: &str,
     tenant: Option<&str>,
 ) -> HarvestResult<MintResult> {
@@ -289,7 +290,7 @@ pub(crate) async fn create_token(
         tenant,
     };
     let row: ApiToken = diesel::insert_into(harvest_api_tokens::table)
-        .values(&new)
+        .values(new)
         .returning(ApiToken::as_returning())
         .get_result(conn)
         .await?;
@@ -316,7 +317,7 @@ pub(crate) async fn revoke_token(conn: &mut AsyncPgConnection, id: Uuid) -> Harv
             .filter(dsl::id.eq(id))
             .filter(dsl::revoked_at.is_null()),
     )
-    .set(dsl::revoked_at.eq(Utc::now()))
+    .set(dsl::revoked_at.eq(Timestamp::now().to_diesel()))
     .execute(conn)
     .await?;
     Ok(n > 0)
@@ -366,7 +367,7 @@ pub(crate) async fn touch_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> H
 async fn write_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
     use harvest_api_tokens::dsl;
     diesel::update(dsl::harvest_api_tokens.filter(dsl::id.eq(id)))
-        .set(dsl::last_used_at.eq(Utc::now()))
+        .set(dsl::last_used_at.eq(Timestamp::now().to_diesel()))
         .execute(conn)
         .await?;
     Ok(())
@@ -508,7 +509,7 @@ pub async fn enforce_token_scope(
     if token.revoked_at.is_some() {
         return unauthorized("api token revoked");
     }
-    if is_expired(token.expires_at, Utc::now()) {
+    if is_expired(token.expires_at, Timestamp::now()) {
         return unauthorized("api token expired");
     }
 
@@ -570,10 +571,10 @@ pub async fn enforce_token_scope(
     // second-connection UPDATE spawns only when it is NULL or older than
     // `LAST_USED_DEBOUNCE_SECS`. A repeated request skips the write: no extra
     // pool checkout, and no read turned into a write for a high-rate client.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let stale = token
         .last_used_at
-        .is_none_or(|at| now.signed_duration_since(at).num_seconds() >= LAST_USED_DEBOUNCE_SECS);
+        .is_none_or(|at| now.duration_since(at).as_secs() >= LAST_USED_DEBOUNCE_SECS);
     if stale {
         let id = token.id;
         tokio::spawn(async move {
@@ -647,7 +648,7 @@ pub async fn enforce_token_scope_mcp_mutation(
     if token.revoked_at.is_some() {
         return unauthorized("api token revoked");
     }
-    if is_expired(token.expires_at, Utc::now()) {
+    if is_expired(token.expires_at, Timestamp::now()) {
         return unauthorized("api token expired");
     }
     // A generated tool starts or changes a run with no tenant check, so a
@@ -743,7 +744,7 @@ mod tests {
             id: Uuid::nil(),
             name: "ci".to_string(),
             scope: "read".to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
             last_used_at: None,
             revoked_at: None,
@@ -771,7 +772,7 @@ mod tests {
             name: "ci".to_string(),
             token_hash: "DEADBEEFHASHVALUE".to_string(),
             scope: "read".to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
             last_used_at: None,
             revoked_at: None,
@@ -886,9 +887,15 @@ mod tests {
 
     #[test]
     fn expiry_predicate() {
-        let now = Utc::now();
-        assert!(is_expired(Some(now - chrono::Duration::hours(1)), now));
-        assert!(!is_expired(Some(now + chrono::Duration::hours(1)), now));
+        let now = Timestamp::now();
+        assert!(is_expired(
+            Some(now - jiff::SignedDuration::from_hours(1)),
+            now
+        ));
+        assert!(!is_expired(
+            Some(now + jiff::SignedDuration::from_hours(1)),
+            now
+        ));
         assert!(!is_expired(None, now));
         // Exactly-now counts as expired (boundary is inclusive).
         assert!(is_expired(Some(now), now));

@@ -741,9 +741,10 @@ mod db {
 
     use crate::cached_stmt::CachePreparedDsl as _;
 
-    use chrono::{DateTime, Utc};
     use diesel::sql_types::{Array, BigInt, Double, Integer, Jsonb, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
 
@@ -898,11 +899,14 @@ mod db {
         #[diesel(sql_type = BigInt)]
         unresolved_rows: i64,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        completed_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        completed_at: Option<Timestamp>,
         #[diesel(sql_type = Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        updated_at: Timestamp,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        next_revalidation_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        next_revalidation_at: Option<Timestamp>,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -931,18 +935,18 @@ mod db {
         /// Set only when a pass reached the end of the shard and converted
         /// everything it saw. It means "this key is safe to gate on", not
         /// merely "the scan ran off the end".
-        pub completed_at: Option<DateTime<Utc>>,
+        pub completed_at: Option<Timestamp>,
         /// Last time this row was written (issue #1258). Cursor liveness, for
         /// an operator to read — NOT the revalidation deadline. An ordinary
         /// advancing write updates this on every batch, including on a
         /// converged shard that is still busy.
-        pub updated_at: DateTime<Utc>,
+        pub updated_at: Timestamp,
         /// Deadline for the next re-census of a completed pass (issue #1258).
         /// `None` while a pass has not completed. Armed when a pass first
         /// completes. Rearmed only by the claim that wins each interval —
         /// never by an ordinary advancing write. So busy traffic on a
         /// converged shard cannot starve revalidation.
-        pub next_revalidation_at: Option<DateTime<Utc>>,
+        pub next_revalidation_at: Option<Timestamp>,
     }
 
     /// One shard's answer to "how far along is the rotation?" (issue #948, AC7).
@@ -1447,7 +1451,7 @@ mod db {
                     0,
                     resumed
                         .and_then(|cursor| cursor.completed_at)
-                        .or_else(|| Some(Utc::now())),
+                        .or_else(|| Some(Timestamp::now())),
                 )
             } else {
                 // Something the scan could not see is still on an outgoing key.
@@ -1871,7 +1875,7 @@ mod db {
     /// Two more properties, both of which a read-then-decide check gets wrong:
     ///
     /// - **The comparison happens on the database clock.** The deadline is
-    ///   written with `NOW()`. Testing it against the worker's `Utc::now()`
+    ///   written with `NOW()`. Testing it against the worker's `Timestamp::now()`
     ///   would measure host clock skew as much as elapsed time. A worker
     ///   running five minutes fast would find the cursor due right after
     ///   every refresh, and census on every tick. That is precisely the
@@ -2020,7 +2024,7 @@ mod db {
         last_event_id: i64,
         rows_reencrypted: i64,
         unresolved_rows: i64,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<Timestamp>,
     ) -> HarvestResult<bool> {
         use diesel_async::AsyncConnection as _;
 
@@ -2062,7 +2066,7 @@ mod db {
         last_event_id: i64,
         rows_reencrypted: i64,
         unresolved_rows: i64,
-        completed_at: Option<DateTime<Utc>>,
+        completed_at: Option<Timestamp>,
     ) -> HarvestResult<bool> {
         let applied = diesel::sql_query(
             "INSERT INTO harvest_codec_rotation_cursor \
@@ -2100,7 +2104,7 @@ mod db {
         .bind::<BigInt, _>(last_event_id)
         .bind::<BigInt, _>(rows_reencrypted)
         .bind::<BigInt, _>(unresolved_rows)
-        .bind::<Nullable<Timestamptz>, _>(completed_at)
+        .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
         .bind::<Double, _>(super::COMPLETED_CURSOR_REVALIDATION_SECS)
         .execute(conn)
         .await
@@ -2166,11 +2170,12 @@ mod db {
         #[diesel(sql_type = Text)]
         state: String,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        retiring_since: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        retiring_since: Option<Timestamp>,
         /// Seconds since `retiring_since`, computed entirely on this shard's
         /// own database clock. `NULL` when `retiring_since` is `NULL`.
         ///
-        /// [`staleness_gate`] uses this, never `Utc::now() -
+        /// [`staleness_gate`] uses this, never `Timestamp::now() -
         /// retiring_since`. Comparing a DB-stamped timestamp against the
         /// *caller's* host clock is only correct when the two clocks agree.
         ///
@@ -2583,7 +2588,7 @@ mod db {
         // own window must have elapsed, so the whole gate is only as stale
         // as its freshest transition. Kept alongside its own
         // `retiring_since` purely for the error message below.
-        let mut least_elapsed: Option<(f64, DateTime<Utc>)> = None;
+        let mut least_elapsed: Option<(f64, Timestamp)> = None;
         for shard in expected_shards {
             let shard_id = shard.as_i32();
             let mut conn = match resolve_shard_conn(sharded_pool, *shard).await {
@@ -2600,7 +2605,7 @@ mod db {
             };
             match read_key_state(&mut conn, key_id).await {
                 Ok(Some(row)) if row.state == "retiring" => {
-                    let since = row.retiring_since.unwrap_or_else(Utc::now);
+                    let since = row.retiring_since.unwrap_or_else(Timestamp::now);
                     // A `NULL` `elapsed_secs` (retiring_since somehow NULL on a
                     // "retiring" row) fails closed as zero elapsed, never as
                     // "already stale enough".
@@ -3150,9 +3155,9 @@ mod tests {
         let event = codecs
             .encode_event(&crate::event::WorkflowEvent::WorkflowStarted {
                 input,
-                timestamp: chrono::DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
-                    .expect("fixed timestamp")
-                    .with_timezone(&chrono::Utc),
+                timestamp: "2026-08-29T12:00:00Z"
+                    .parse::<jiff::Timestamp>()
+                    .expect("fixed timestamp"),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

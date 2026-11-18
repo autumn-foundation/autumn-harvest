@@ -83,7 +83,7 @@ await-completion long-poll for the final result.
 - **No new `WorkflowEvent` variant. No migration. No shard-routing change.**
 - **Chunk content MAY be non-deterministic.** Because a chunk is never recorded
   and never replayed, it is *safe* to publish values that would break replay if
-  they entered the event log — LLM tokens, `chrono::Utc::now()`, a sampled
+  they entered the event log — LLM tokens, `jiff::Timestamp::now()`, a sampled
   metric, a random id. This is the opposite of an activity input or a workflow
   command, where non-determinism corrupts replay. Publish freely.
 

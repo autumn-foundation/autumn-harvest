@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::policy::Schedule;
 use crate::schedule_plan::SlotWalker;
@@ -268,12 +268,12 @@ pub fn forecast(
 pub fn forecast_schedules(
     policy: &ThrottlePolicy,
     schedules: &[Schedule],
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
+    from: Timestamp,
+    until: Timestamp,
 ) -> Result<ThrottleForecast, ForecastError> {
     // Validate before the walk, so a bad policy fails fast.
     Bucket::new(policy)?;
-    let mut slots: BTreeMap<DateTime<Utc>, u64> = BTreeMap::new();
+    let mut slots: BTreeMap<Timestamp, u64> = BTreeMap::new();
     let mut read = 0usize;
     let mut truncated = false;
     'walk: for schedule in schedules {
@@ -292,7 +292,7 @@ pub fn forecast_schedules(
     let arrivals: Vec<Arrival> = slots
         .into_iter()
         .map(|(slot, count)| Arrival {
-            at: (slot - from).to_std().unwrap_or_default(),
+            at: std::time::Duration::try_from(slot - from).unwrap_or_default(),
             count,
         })
         .collect();
@@ -341,7 +341,6 @@ pub fn steady_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn policy(rate: &str, burst: Option<f64>, sts: Option<Duration>) -> ThrottlePolicy {
         ThrottlePolicy::from_rate_str(rate, burst, None, sts).unwrap()
@@ -442,8 +441,8 @@ mod tests {
     fn aligned_hourly_schedules_share_one_bucket() {
         // 300 tenants on one hourly cron, a 100/m throttle with a burst of 100.
         let schedules = vec![Schedule::Cron("0 0 * * * *".into()); 300];
-        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 30, 0).unwrap();
-        let until = Utc.with_ymd_and_hms(2026, 1, 1, 2, 30, 0).unwrap();
+        let from = crate::time::utc_ymd_hms(2026, 1, 1, 0, 30, 0).unwrap();
+        let until = crate::time::utc_ymd_hms(2026, 1, 1, 2, 30, 0).unwrap();
         let f = forecast_schedules(&policy("100/m", None, None), &schedules, from, until).unwrap();
         assert_eq!(f.batches.len(), 2);
         assert_eq!(f.batches[0].at, secs(30 * 60));
@@ -460,8 +459,8 @@ mod tests {
             Schedule::Cron("0 0 * * * *".into()),
             Schedule::Cron("0 30 * * * *".into()),
         ];
-        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let until = Utc.with_ymd_and_hms(2026, 1, 1, 3, 0, 0).unwrap();
+        let from = crate::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let until = crate::time::utc_ymd_hms(2026, 1, 1, 3, 0, 0).unwrap();
         let f = forecast_schedules(&policy("1/h", None, None), &schedules, from, until).unwrap();
         // Slots at 0:30, 1:00, 1:30, ... are 30 minutes apart; 1/h cannot keep up.
         assert!(f.max_wait() > Duration::ZERO);
@@ -472,8 +471,8 @@ mod tests {
     #[test]
     fn the_slot_walk_is_capped() {
         let schedules = [Schedule::Interval(secs(1))];
-        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let until = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        let from = crate::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let until = crate::time::utc_ymd_hms(2026, 2, 1, 0, 0, 0).unwrap();
         let f = forecast_schedules(&policy("10/s", None, None), &schedules, from, until).unwrap();
         assert!(f.truncated);
         assert_eq!(f.batches.len(), MAX_FORECAST_SLOTS);
@@ -481,8 +480,8 @@ mod tests {
 
     #[test]
     fn manual_schedules_have_no_slots() {
-        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let until = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let from = crate::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let until = crate::time::utc_ymd_hms(2026, 1, 2, 0, 0, 0).unwrap();
         let f = forecast_schedules(&policy("1/s", None, None), &[Schedule::Manual], from, until)
             .unwrap();
         assert_eq!(f.batches, Vec::new());

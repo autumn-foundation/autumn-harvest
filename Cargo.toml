@@ -50,8 +50,14 @@ serde_json = "1"
 toml = "1.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+# Only `autumn-harvest-plugin` uses `chrono`, at the `autumn-web` boundary
+# (ADR 0018). `deny.toml` bans it everywhere else.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Date and time (ADR 0018). `tzdb-bundle-always` embeds the IANA database, so
+# a host without `/usr/share/zoneinfo` still resolves a zone name.
+jiff = { version = "1.0.1", features = ["serde", "tzdb-bundle-always"] }
+# Diesel wrapper types for jiff. Diesel has no native jiff feature.
+jiff-diesel = { version = "1.0.0", features = ["postgres"] }
 tracing = "0.1"
 futures = "0.3"
 rand = "0.10"
@@ -60,7 +66,7 @@ rand = "0.10"
 # The default 32-column tier only: every `table!` fits it (issue #2492).
 # `table_split` bridges a wide table over two declarations. Its insert bridge
 # needs the trait that the long feature below exposes.
-diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "serde_json", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
 diesel_migrations = "2"
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }

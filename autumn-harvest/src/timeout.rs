@@ -16,13 +16,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::cached_stmt::CachePreparedDsl as _;
-use chrono::Utc;
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
 };
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
@@ -434,9 +435,9 @@ pub enum TimeoutKind {
 /// when a workflow under-specifies.
 #[must_use]
 pub fn effective_chain_timeout(
-    workflow: Option<chrono::Duration>,
-    ceiling: Option<chrono::Duration>,
-) -> Option<chrono::Duration> {
+    workflow: Option<jiff::SignedDuration>,
+    ceiling: Option<jiff::SignedDuration>,
+) -> Option<jiff::SignedDuration> {
     match (workflow, ceiling) {
         (Some(w), Some(c)) => Some(w.min(c)),
         (Some(w), None) => Some(w),
@@ -457,11 +458,11 @@ pub fn effective_chain_timeout(
 /// Returns `None` when no deadline fired before `now` (issue #1821).
 #[must_use]
 pub fn classify_workflow_timeout(
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<(chrono::DateTime<chrono::Utc>, TimeoutKind)> {
-    let fired = |deadline: Option<chrono::DateTime<chrono::Utc>>| deadline.filter(|d| *d < now);
+    deadline_at: Option<jiff::Timestamp>,
+    chain_deadline_at: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+) -> Option<(jiff::Timestamp, TimeoutKind)> {
+    let fired = |deadline: Option<jiff::Timestamp>| deadline.filter(|d| *d < now);
     fired(chain_deadline_at)
         .map(|chain| (chain, TimeoutKind::Chain))
         .or_else(|| fired(deadline_at).map(|run| (run, TimeoutKind::Run)))
@@ -702,9 +703,9 @@ struct ProbedId {
 struct LaneClaim {
     /// The lane's sweep clock. `None` when its sweep is over, so its next
     /// sweep starts later with a newer clock.
-    clock: Option<chrono::DateTime<chrono::Utc>>,
+    clock: Option<jiff::Timestamp>,
     /// The last row the lane has read. `None` means every row is ahead.
-    read_to: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    read_to: Option<(jiff::Timestamp, uuid::Uuid)>,
     /// The ids in the lane's queue, moved list and retry list. The lane
     /// holds them also after its sweep is over.
     held: Vec<uuid::Uuid>,
@@ -778,11 +779,11 @@ fn timeout_scan_bounds(limit: i64) -> (i64, i64) {
 struct TimeoutScanLane {
     /// The key and id of the last row of the last full page. `None` starts
     /// the sweep from its first row.
-    after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    after: Option<(jiff::Timestamp, uuid::Uuid)>,
     /// The database clock when the current sweep started. It stays until the
     /// next sweep starts. Refills read rows created by then, and test expiry
     /// against it.
-    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    as_of: Option<jiff::Timestamp>,
     /// Expired ids from the last refill, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
     /// Ids that failed to enforce, with the tries each has had. The next
@@ -969,13 +970,15 @@ fn refill_groups(lanes: &[TimeoutScanLane; 4]) -> Vec<Vec<usize>> {
 #[derive(diesel::QueryableByName)]
 struct SweepStart {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    as_of: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    as_of: jiff::Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
 struct Refill {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    last_key: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    last_key: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     last_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -1020,8 +1023,12 @@ async fn refill_lanes(
         })
         .collect();
     let earlier = || claims[..first].iter().chain(&between);
-    let clocks: Vec<_> = earlier().map(|c| c.clock.unwrap_or(as_of)).collect();
-    let keys: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.0)).collect();
+    let clocks: Vec<_> = earlier()
+        .map(|c| c.clock.unwrap_or(as_of).to_diesel())
+        .collect();
+    let keys: Vec<_> = earlier()
+        .map(|c| c.read_to.map(|r| r.0.to_diesel()))
+        .collect();
     let ids: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.1)).collect();
     let (held, owners): (Vec<uuid::Uuid>, Vec<i32>) = (0_i32..)
         .zip(earlier())
@@ -1030,10 +1037,10 @@ async fn refill_lanes(
     let refill: Vec<Refill> = match lanes[first].after {
         Some((after_key, after_id)) => {
             diesel::sql_query(timeout_refill_query(group, true))
-                .bind::<Timestamptz, _>(after_key)
+                .bind::<Timestamptz, _>(after_key.to_diesel())
                 .bind::<Uuid, _>(after_id)
                 .bind::<BigInt, _>(page_rows)
-                .bind::<Timestamptz, _>(as_of)
+                .bind::<Timestamptz, _>(as_of.to_diesel())
                 .bind::<Array<Timestamptz>, _>(&clocks)
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
@@ -1045,7 +1052,7 @@ async fn refill_lanes(
         None => {
             diesel::sql_query(timeout_refill_query(group, false))
                 .bind::<BigInt, _>(page_rows)
-                .bind::<Timestamptz, _>(as_of)
+                .bind::<Timestamptz, _>(as_of.to_diesel())
                 .bind::<Array<Timestamptz>, _>(&clocks)
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
@@ -1478,7 +1485,7 @@ struct LockedTask {
     /// The row-current deadline. The frozen-row half of the PAUSED re-check
     /// ([`pause_suppresses_timeout_enforcement`]) and the retry deadline
     /// check (issue #1809) read it, not the scan-time snapshot.
-    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    schedule_to_close_at: Option<jiff::Timestamp>,
     /// The row-current poison-pill count. A timeout retry keeps it.
     crash_strikes: i32,
     /// The row is `RUNNING` under the claim that the scan saw (issue #1809).
@@ -1488,7 +1495,7 @@ struct LockedTask {
     /// The `started_at` of the `RUNNING` claim that holds the row now, when
     /// its handler started (issue #1809). A schedule-to-close timeout ends
     /// this claim, which can be later than the scanned one.
-    current_started_claim: Option<chrono::DateTime<Utc>>,
+    current_started_claim: Option<jiff::Timestamp>,
     /// How long the handler of the claim that holds the row now has run, when
     /// it started (issue #1809). The database clock measures it, because that
     /// clock also wrote the start.
@@ -1518,7 +1525,8 @@ struct LockedTaskRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    schedule_to_close_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     crash_strikes: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -1526,7 +1534,8 @@ struct LockedTaskRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     attempt: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    started_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    started_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     handler_started_attempt: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
@@ -1589,7 +1598,7 @@ struct ActivityTimeoutOutcome {
     scanned_claim: bool,
     /// The `started_at` of the timed-out claim, when its handler started.
     /// The enforcer then counts that attempt as a failed one.
-    started_attempt: Option<chrono::DateTime<Utc>>,
+    started_attempt: Option<jiff::Timestamp>,
     /// How long the handler of the timed-out attempt ran. The attempt
     /// duration counts from its start, as on the worker path.
     handler_elapsed_secs: Option<f64>,
@@ -1771,8 +1780,8 @@ const fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&
 fn pause_suppresses_timeout_enforcement(
     reason: &TimeoutReason,
     execution_state: &str,
-    row_schedule_to_close_at: Option<chrono::DateTime<Utc>>,
-    now: chrono::DateTime<Utc>,
+    row_schedule_to_close_at: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
 ) -> bool {
     if execution_state != "PAUSED" {
         return false;
@@ -1803,8 +1812,8 @@ fn pause_suppresses_timeout_enforcement(
 /// [`enforce_external_task_timeouts`].
 fn external_task_timeout_still_due(
     state: &str,
-    schedule_to_close_at: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
+    schedule_to_close_at: jiff::Timestamp,
+    now: jiff::Timestamp,
 ) -> bool {
     state == "PENDING" && schedule_to_close_at < now
 }
@@ -1869,15 +1878,15 @@ async fn update_workflow_execution_timed_out(
         dsl::state.eq("TIMED_OUT"),
         dsl::output.eq(None::<serde_json::Value>),
         dsl::error.eq(Some(error.to_string())),
-        dsl::completed_at.eq(Some(Utc::now())),
-        dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
+        dsl::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
         dsl::pause_reason.eq(None::<String>),
         dsl::pause_actor.eq(None::<String>),
         // Belt-and-braces ND-block reset (issue #603). A TIMED_OUT
         // execution closes out permanently, so a stale block marker must
         // not survive on a terminal row. The two terminal writers in
         // worker.rs do the same.
-        dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -2009,7 +2018,7 @@ async fn commit_workflow_execution_timeout(
             .set((
                 harvest_task_queue::state.eq("FAILED"),
                 harvest_task_queue::error.eq(Some(&task_error)),
-                harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                harvest_task_queue::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(conn)
             .await
@@ -2299,7 +2308,7 @@ async fn enforce_activity_timeout(
                 reason,
                 &execution.state,
                 locked.schedule_to_close_at,
-                Utc::now(),
+                Timestamp::now(),
             ) {
                 return Ok(None);
             }
@@ -2470,8 +2479,7 @@ async fn enforce_activity_timeout(
         let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
         let duration_secs = enforced.handler_elapsed_secs.map_or_else(
             || {
-                (Utc::now() - started_at)
-                    .to_std()
+                std::time::Duration::try_from(Timestamp::now() - started_at)
                     .unwrap_or_default()
                     .as_secs_f64()
             },
@@ -2505,7 +2513,7 @@ async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     attempt: i32,
-    started_at: Option<chrono::DateTime<Utc>>,
+    started_at: Option<jiff::Timestamp>,
 ) -> HarvestResult<()> {
     match started_at {
         Some(started_at) => queue::record_timed_out_claim(conn, task_id, attempt, started_at).await,
@@ -3207,7 +3215,7 @@ async fn enforce_workflow_timeout(
 pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
     let expired: Vec<ExternalTask> = harvest_external_tasks::table
         .filter(harvest_external_tasks::state.eq("PENDING"))
-        .filter(harvest_external_tasks::schedule_to_close_at.lt(Utc::now()))
+        .filter(harvest_external_tasks::schedule_to_close_at.lt(Timestamp::now().to_diesel()))
         .filter(diesel::dsl::not(diesel::dsl::exists(
             harvest_workflow_executions::table
                 .filter(
@@ -3277,7 +3285,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                 // The locked re-read below replaces trust in the scan
                 // snapshot. Older code re-verified the snapshot with filters
                 // on the claiming UPDATE.
-                let locked_row: Option<(String, chrono::DateTime<Utc>)> =
+                let locked_row: Option<(String, crate::time::sql::SqlTimestamp)> =
                     harvest_external_tasks::table
                         .find(task_id)
                         .for_update()
@@ -3289,7 +3297,9 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                         .await
                         .optional()
                         .map_err(crate::error::database_error)?;
-                let Some((task_state, deadline)) = locked_row else {
+                let Some((task_state, deadline)) =
+                    locked_row.map(|(task_state, deadline)| (task_state, deadline.to_jiff()))
+                else {
                     // Row vanished after the scan (e.g. retention
                     // cascade-deleted the owning execution): skip.
                     return Ok(false);
@@ -3300,7 +3310,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                 //    #609) extended the deadline after the scan →
                 //    schedule_to_close_at is now in the future.
                 // Either way: skip — no flip, no event, not counted.
-                if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                if !external_task_timeout_still_due(&task_state, deadline, Timestamp::now()) {
                     return Ok(false);
                 }
 
@@ -3326,7 +3336,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                         &TimeoutReason::ScheduleToClose,
                         state,
                         None,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                 }) {
                     // Pause won the race: leave the row PENDING and
@@ -3339,7 +3349,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                 diesel::update(harvest_external_tasks::table.find(task_id))
                     .set((
                         harvest_external_tasks::state.eq("TIMED_OUT"),
-                        harvest_external_tasks::updated_at.eq(Utc::now()),
+                        harvest_external_tasks::updated_at.eq(Timestamp::now().to_diesel()),
                     ))
                     .execute(conn)
                     .await
@@ -3390,7 +3400,7 @@ pub async fn enforce_workflow_execution_timeouts(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Select rows where EITHER the per-run deadline (issue #243) OR the chain
     // deadline (issue #617) has fired. The chain cap is carried verbatim across
     // continue-as-new, so a runaway loop cannot escape it by continuing.
@@ -3399,10 +3409,13 @@ pub async fn enforce_workflow_execution_timeouts(
         .filter(
             harvest_workflow_executions::deadline_at
                 .is_not_null()
-                .and(harvest_workflow_executions::deadline_at.lt(Some(now)))
+                .and(harvest_workflow_executions::deadline_at.lt(Some(now).to_diesel()))
                 .or(harvest_workflow_executions_ext::chain_deadline_at
                     .is_not_null()
-                    .and(harvest_workflow_executions_ext::chain_deadline_at.lt(Some(now)))),
+                    .and(
+                        harvest_workflow_executions_ext::chain_deadline_at
+                            .lt(Some(now).to_diesel()),
+                    )),
         )
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -3422,7 +3435,7 @@ pub async fn enforce_workflow_execution_timeouts(
             tracing::warn!(exec_id = %exec_id, "timed-out row has no fired deadline; skipping");
             continue;
         };
-        let timed_out_at = Utc::now();
+        let timed_out_at = Timestamp::now();
 
         let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline,
@@ -3609,7 +3622,7 @@ pub async fn enforce_workflow_sla_breaches(
     use diesel::dsl::sql;
     use diesel::sql_types::Bool;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let breached: Vec<(uuid::Uuid, String, String)> =
         diesel::update(harvest_workflow_executions::table)
             // Exclude only PAUSED (pause suspends the SLA clock); RUNNING and all
@@ -3633,7 +3646,7 @@ pub async fn enforce_workflow_sla_breaches(
             ))
             .set((
                 SetExt(harvest_workflow_executions_ext::sla_breached.eq(true)),
-                SetExt(harvest_workflow_executions_ext::sla_breached_at.eq(Some(now))),
+                SetExt(harvest_workflow_executions_ext::sla_breached_at.eq(Some(now).to_diesel())),
             ))
             .returning((
                 harvest_workflow_executions::id,
@@ -4330,14 +4343,16 @@ async fn attempt_signal_delivery(
 /// exclusion list. It is not reclaimed this sweep, but it is not lost
 /// either: the next full sweep tick reclaims it with a fresh, larger `age`.
 #[derive(Clone, Debug, Default)]
-struct OldestPendingIndeterminateAge(std::sync::Arc<std::sync::Mutex<Option<chrono::Duration>>>);
+struct OldestPendingIndeterminateAge(
+    std::sync::Arc<std::sync::Mutex<Option<jiff::SignedDuration>>>,
+);
 
 impl OldestPendingIndeterminateAge {
     fn new() -> Self {
         Self::default()
     }
 
-    fn observe(&self, age: chrono::Duration) {
+    fn observe(&self, age: jiff::SignedDuration) {
         if let Ok(mut guard) = self.0.lock() {
             *guard = Some(guard.map_or(age, |oldest| oldest.max(age)));
         }
@@ -4352,7 +4367,9 @@ impl OldestPendingIndeterminateAge {
             .lock()
             .ok()
             .and_then(|guard| *guard)
-            .map_or(0.0, |age| age.num_milliseconds() as f64 / 1000.0)
+            .map_or(0.0, |age| {
+                crate::time::num_milliseconds(age) as f64 / 1000.0
+            })
     }
 }
 
@@ -4457,10 +4474,10 @@ pub async fn enforce_external_signals_outbox(
 
                 let (signal_id, target, signal_name, payload, idempotency_key) = event;
 
-                let age = Utc::now() - row.timestamp;
-                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .unwrap_or(chrono::Duration::MAX);
-                let grace_expired = age > grace_chrono;
+                let age = Timestamp::now() - row.timestamp;
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                    .unwrap_or(jiff::SignedDuration::MAX);
+                let grace_expired = age > grace;
 
                 // A NotFound delivery attempt only becomes a permanent
                 // `target_unknown` failure once the grace window has elapsed.
@@ -4978,10 +4995,10 @@ pub async fn enforce_external_cancels_outbox(
                     }
                 };
 
-                let age = Utc::now() - row.timestamp;
-                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .unwrap_or(chrono::Duration::MAX);
-                let grace_expired = age > grace_chrono;
+                let age = Timestamp::now() - row.timestamp;
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                    .unwrap_or(jiff::SignedDuration::MAX);
+                let grace_expired = age > grace;
 
                 // A NotFound delivery attempt only becomes a permanent
                 // `target_unknown` failure once the grace window has elapsed.
@@ -5630,10 +5647,10 @@ pub async fn enforce_external_awaits_outbox(
                     }
                 };
 
-                let age = Utc::now() - row.timestamp;
-                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .unwrap_or(chrono::Duration::MAX);
-                let grace_expired = age > grace_chrono;
+                let age = Timestamp::now() - row.timestamp;
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                    .unwrap_or(jiff::SignedDuration::MAX);
+                let grace_expired = age > grace;
 
                 let active_sharded_pool = sharded_pool
                     .clone()
@@ -6949,7 +6966,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                         harvest_workflow_executions::state.eq("FAILED"),
                         harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                         harvest_workflow_executions::error.eq(Some(error_msg.clone())),
-                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                        harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
                     ))
                     .execute(conn)
                     .await
@@ -6968,7 +6985,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 .set((
                     harvest_task_queue::state.eq("FAILED"),
                     harvest_task_queue::error.eq(Some(&error_msg)),
-                    harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                    harvest_task_queue::completed_at.eq(Some(Timestamp::now()).to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -7726,7 +7743,7 @@ mod tests {
             uuid::Uuid::new_v4(),
         );
         let lane = TimeoutScanLane {
-            as_of: Some(chrono::Utc::now()),
+            as_of: Some(jiff::Timestamp::now()),
             queued: [queued].into(),
             retry: vec![(retried, 1)],
             moved: [moved].into(),
@@ -7985,8 +8002,8 @@ mod tests {
     fn a_cursor_starts_a_new_sweep_after_a_tick_without_a_pass() {
         let mut cursor = TimeoutScanCursor::default();
         cursor.lanes[1] = TimeoutScanLane {
-            after: Some((chrono::Utc::now(), uuid::Uuid::new_v4())),
-            as_of: Some(chrono::Utc::now()),
+            after: Some((jiff::Timestamp::now(), uuid::Uuid::new_v4())),
+            as_of: Some(jiff::Timestamp::now()),
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
             retry: vec![(uuid::Uuid::new_v4(), 1)],
             loaded_retries: [(uuid::Uuid::new_v4(), 1)].into(),
@@ -8005,7 +8022,7 @@ mod tests {
     /// Lanes that each need a refill at one sweep clock and one cursor.
     fn lanes_in_step() -> [TimeoutScanLane; 4] {
         let lane = TimeoutScanLane {
-            as_of: Some(chrono::Utc::now()),
+            as_of: Some(jiff::Timestamp::now()),
             ..TimeoutScanLane::default()
         };
         std::array::from_fn(|_| lane.clone())
@@ -8030,11 +8047,13 @@ mod tests {
         // Lane 2 refills at another cursor. Its claim is known only after
         // its own refill, so lane 3 cannot join lane 0 across it.
         let mut lanes = lanes_in_step();
-        lanes[2].after = Some((chrono::Utc::now(), uuid::Uuid::new_v4()));
+        lanes[2].after = Some((jiff::Timestamp::now(), uuid::Uuid::new_v4()));
         assert_eq!(refill_groups(&lanes), [vec![0, 1], vec![2], vec![3]]);
         // A lane with another sweep clock is at another position too.
         let mut lanes = lanes_in_step();
-        lanes[1].as_of = lanes[0].as_of.map(|t| t - chrono::Duration::seconds(1));
+        lanes[1].as_of = lanes[0]
+            .as_of
+            .map(|t| t - jiff::SignedDuration::from_secs(1));
         assert_eq!(refill_groups(&lanes), [vec![0], vec![1], vec![2, 3]]);
     }
 
@@ -8470,8 +8489,8 @@ mod tests {
 
     #[test]
     fn pause_recheck_never_suppresses_a_running_execution() {
-        let now = Utc::now();
-        let elapsed = Some(now - chrono::Duration::minutes(1));
+        let now = Timestamp::now();
+        let elapsed = Some(now - jiff::SignedDuration::from_mins(1));
         for reason in [
             TimeoutReason::Heartbeat,
             TimeoutReason::StartToClose,
@@ -8491,11 +8510,11 @@ mod tests {
         // or while enforcement waits on the execution row lock. It suspends
         // the cross-retry deadline clock. So ScheduleToClose enforcement must
         // always yield to it.
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(pause_suppresses_timeout_enforcement(
             &TimeoutReason::ScheduleToClose,
             "PAUSED",
-            Some(now - chrono::Duration::minutes(1)),
+            Some(now - jiff::SignedDuration::from_mins(1)),
             now
         ));
         // The external-task path carries no separate row deadline argument —
@@ -8515,12 +8534,12 @@ mod tests {
         // row. The re-check must spare exactly the now-frozen row, and only
         // it. An unfrozen pending row of a paused execution stays claimable
         // by design, so its schedule-to-start signal stays enforced.
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(
             pause_suppresses_timeout_enforcement(
                 &TimeoutReason::ScheduleToStart,
                 "PAUSED",
-                Some(now - chrono::Duration::seconds(1)),
+                Some(now - jiff::SignedDuration::from_secs(1)),
                 now
             ),
             "frozen (deadline elapsed) rows must be spared"
@@ -8529,7 +8548,7 @@ mod tests {
             !pause_suppresses_timeout_enforcement(
                 &TimeoutReason::ScheduleToStart,
                 "PAUSED",
-                Some(now + chrono::Duration::minutes(10)),
+                Some(now + jiff::SignedDuration::from_mins(10)),
                 now
             ),
             "an unfrozen row (deadline still ahead) stays enforced"
@@ -8550,8 +8569,8 @@ mod tests {
         // Already-dispatched work runs to completion under pause (issue
         // #383): a hung in-flight activity of a paused execution still times
         // out on its own merits.
-        let now = Utc::now();
-        let elapsed = Some(now - chrono::Duration::minutes(1));
+        let now = Timestamp::now();
+        let elapsed = Some(now - jiff::SignedDuration::from_mins(1));
         assert!(!pause_suppresses_timeout_enforcement(
             &TimeoutReason::Heartbeat,
             "PAUSED",
@@ -8571,9 +8590,13 @@ mod tests {
 
     #[test]
     fn external_task_recheck_enforces_a_still_open_expired_row() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(
-            external_task_timeout_still_due("PENDING", now - chrono::Duration::seconds(1), now),
+            external_task_timeout_still_due(
+                "PENDING",
+                now - jiff::SignedDuration::from_secs(1),
+                now
+            ),
             "a still-PENDING row past its deadline is an enforceable timeout"
         );
     }
@@ -8582,8 +8605,8 @@ mod tests {
     fn external_task_recheck_skips_a_concurrently_resolved_row() {
         // A completion/failure that won the race after the scan snapshot must
         // make the scanner skip: no flip, no ActivityTimedOut, not counted.
-        let now = Utc::now();
-        let elapsed = now - chrono::Duration::seconds(1);
+        let now = Timestamp::now();
+        let elapsed = now - jiff::SignedDuration::from_secs(1);
         for state in ["COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"] {
             assert!(
                 !external_task_timeout_still_due(state, elapsed, now),
@@ -8597,10 +8620,10 @@ mod tests {
         // extend_deadline — or a resume's pause-span shift (issue #609) —
         // pushing schedule_to_close_at past NOW() after the scan snapshot
         // must make the scanner skip the row.
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(!external_task_timeout_still_due(
             "PENDING",
-            now + chrono::Duration::minutes(5),
+            now + jiff::SignedDuration::from_mins(5),
             now
         ));
         // Boundary: a deadline exactly at NOW() is not yet elapsed (the scan
@@ -8689,9 +8712,9 @@ mod tests {
 
     #[test]
     fn effective_chain_timeout_truth_table() {
-        use chrono::Duration;
-        let w = Duration::hours(10);
-        let c = Duration::hours(3);
+        use jiff::SignedDuration;
+        let w = SignedDuration::from_hours(10);
+        let c = SignedDuration::from_hours(3);
         // both → min
         assert_eq!(effective_chain_timeout(Some(w), Some(c)), Some(c));
         assert_eq!(
@@ -8709,10 +8732,10 @@ mod tests {
 
     #[test]
     fn classify_workflow_timeout_chain_takes_precedence() {
-        use chrono::Duration;
-        let now = Utc::now();
-        let run = now - Duration::seconds(10);
-        let chain = now - Duration::seconds(5);
+        use jiff::{SignedDuration, Timestamp};
+        let now = Timestamp::now();
+        let run = now - SignedDuration::from_secs(10);
+        let chain = now - SignedDuration::from_secs(5);
         // Both fired → chain wins (precedence).
         let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Chain);
@@ -8721,11 +8744,11 @@ mod tests {
 
     #[test]
     fn classify_workflow_timeout_run_only() {
-        use chrono::Duration;
-        let now = Utc::now();
-        let run = now - Duration::seconds(10);
+        use jiff::{SignedDuration, Timestamp};
+        let now = Timestamp::now();
+        let run = now - SignedDuration::from_secs(10);
         // Chain deadline in the future (not fired) → run wins.
-        let future_chain = now + Duration::hours(1);
+        let future_chain = now + SignedDuration::from_hours(1);
         let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Run);
         assert_eq!(fired, run);
@@ -8737,9 +8760,9 @@ mod tests {
 
     #[test]
     fn classify_workflow_timeout_chain_only_does_not_panic() {
-        use chrono::Duration;
-        let now = Utc::now();
-        let chain = now - Duration::seconds(5);
+        use jiff::{SignedDuration, Timestamp};
+        let now = Timestamp::now();
+        let chain = now - SignedDuration::from_secs(5);
         // A chain-only expiry has no per-run deadline_at — must NOT panic.
         let (fired, kind) = classify_workflow_timeout(None, Some(chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Chain);
@@ -8749,8 +8772,8 @@ mod tests {
     // Issue #1821: a scanned row with no fired deadline must not panic the scanner.
     #[test]
     fn classify_workflow_timeout_without_a_fired_deadline_does_not_panic_1821() {
-        let now = Utc::now();
-        let future = now + chrono::Duration::hours(1);
+        let now = Timestamp::now();
+        let future = now + jiff::SignedDuration::from_hours(1);
         for (run, chain) in [
             (None, None),
             (None, Some(future)),
@@ -8761,31 +8784,31 @@ mod tests {
             let result = std::panic::catch_unwind(|| classify_workflow_timeout(run, chain, now));
             assert_eq!(result.ok(), Some(None), "run={run:?} chain={chain:?}");
         }
-        let past = now - chrono::Duration::seconds(1);
+        let past = now - jiff::SignedDuration::from_secs(1);
         let fired = classify_workflow_timeout(Some(future), Some(past), now);
         assert_eq!(fired, Some((past, TimeoutKind::Chain)));
     }
 
     #[test]
     fn chain_deadline_checked_add_overflow_yields_none_not_panic() {
-        use chrono::Duration;
+        use jiff::{SignedDuration, Timestamp};
         // Because the chain ceiling doubles as the effective value (AC4), an
-        // absurd operator ceiling can reach `Duration::MAX`, and
+        // absurd operator ceiling can reach `SignedDuration::MAX`, and
         // `effective_chain_timeout(None, ceiling)` returns it verbatim.
-        let effective = effective_chain_timeout(None, Some(Duration::MAX));
-        assert_eq!(effective, Some(Duration::MAX));
-        // The start path adds it to the start instant with `checked_add_signed`.
+        let effective = effective_chain_timeout(None, Some(SignedDuration::MAX));
+        assert_eq!(effective, Some(SignedDuration::MAX));
+        // The start path adds it to the start instant with `checked_add`.
         // An overflow then yields `None` (no chain cap), not a panic. The
         // fresh-start / reset / child sites do exactly that.
-        let start = Utc::now();
-        let chain_deadline_at = effective.and_then(|d| start.checked_add_signed(d));
+        let start = Timestamp::now();
+        let chain_deadline_at = effective.and_then(|d| start.checked_add(d).ok());
         assert_eq!(
             chain_deadline_at, None,
-            "Duration::MAX must overflow to None, never panic"
+            "SignedDuration::MAX must overflow to None, never panic"
         );
         // A sane duration must still produce a deadline.
-        let sane = effective_chain_timeout(None, Some(Duration::hours(1)));
-        let ok = sane.and_then(|d| start.checked_add_signed(d));
+        let sane = effective_chain_timeout(None, Some(SignedDuration::from_hours(1)));
+        let ok = sane.and_then(|d| start.checked_add(d).ok());
         assert!(
             ok.is_some(),
             "a representable chain cap must yield a deadline"

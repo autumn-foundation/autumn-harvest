@@ -42,8 +42,8 @@ use autumn_harvest::WorkflowTypeNonTerminalCount;
 use autumn_harvest::execution::non_terminal_counts_by_workflow_name;
 use autumn_harvest::worker::DbPool;
 use autumn_web::error::AutumnError;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
@@ -99,7 +99,7 @@ pub struct WorkflowReachabilityReport {
     /// this is `complete`.
     pub status: ReachabilityReportStatus,
     /// When the report was assembled.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Echo of the `workflow_type` filter, if any.
     pub filter: Option<String>,
     /// Top-level summary (issue #700 AC3): `true` when any type is `orphaned`.
@@ -176,7 +176,7 @@ pub struct ReachabilityShardInspection {
 /// capped to the plugin cap on read (see [`Self::samples`]).
 #[derive(Debug)]
 struct ReachabilityAccumulator {
-    per_shard: BTreeMap<i32, (i64, DateTime<Utc>)>,
+    per_shard: BTreeMap<i32, (i64, Timestamp)>,
     /// Sample execution ids, appended per contributing shard in ascending
     /// `shard_id` order.
     ///
@@ -209,7 +209,7 @@ impl ReachabilityAccumulator {
         self.per_shard.values().map(|(count, _)| count).sum()
     }
 
-    fn oldest_started_at(&self) -> Option<DateTime<Utc>> {
+    fn oldest_started_at(&self) -> Option<Timestamp> {
         self.per_shard
             .values()
             .map(|(_, oldest)| *oldest)
@@ -235,7 +235,7 @@ pub async fn build_workflow_reachability_report(
     api_state: &HarvestApiState,
     query: WorkflowReachabilityQuery,
 ) -> Result<WorkflowReachabilityReport, AutumnError> {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
 
     // The handler registry is the authoritative source for `registered`.
     let runtime = api_state.runtime().map_err(map_error)?;
@@ -352,7 +352,7 @@ pub async fn build_reachability_report_for_shards(
     shards: &BTreeMap<i32, Option<DbPool>>,
     filter: Option<String>,
 ) -> WorkflowReachabilityReport {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let observations = join_all(shards.iter().map(|(shard_id, pool)| {
         let filter = filter.clone();
         let pool = pool.clone();
@@ -422,7 +422,7 @@ async fn observe_shard(
 }
 
 fn build_report_from_observations(
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     filter: Option<String>,
     registered: &BTreeSet<String>,
     observations: Vec<ShardObservation<WorkflowTypeNonTerminalCount>>,
@@ -603,10 +603,10 @@ pub fn startup_orphan_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(workflow_name: &str, count: i64, oldest: i64) -> WorkflowTypeNonTerminalCount {

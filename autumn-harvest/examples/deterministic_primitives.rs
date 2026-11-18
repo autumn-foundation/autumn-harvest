@@ -61,7 +61,7 @@ pub async fn notify_decision(
 ) -> Result<NotificationDecision, String> {
     // 1. Wall-clock decision — captured once, replayed verbatim.
     let now = ctx.system_now();
-    let age_secs = now.timestamp() - event.occurred_at_epoch_secs;
+    let age_secs = now.as_second() - event.occurred_at_epoch_secs;
     let fresh = age_secs < 24 * 60 * 60;
 
     // 2. Idempotency key — a UUIDv7 captured once. Safe to reuse across retries.

@@ -15,6 +15,8 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, ToPgInterval};
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -41,11 +43,11 @@ use autumn_harvest::{
     ResetSignalReapplyPolicy, WorkflowContext, WorkflowInfo, WorkflowResetRequest,
     reset_workflow_execution,
 };
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -159,13 +161,19 @@ async fn connect(url: &str) -> AsyncPgConnection {
 async fn set_chain_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    chain_timeout: Option<ChronoDuration>,
-    chain_deadline_at: Option<chrono::DateTime<Utc>>,
+    chain_timeout: Option<SignedDuration>,
+    chain_deadline_at: Option<jiff::Timestamp>,
 ) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            SetExt(harvest_workflow_executions_ext::chain_execution_timeout.eq(chain_timeout)),
-            SetExt(harvest_workflow_executions_ext::chain_deadline_at.eq(chain_deadline_at)),
+            SetExt(
+                harvest_workflow_executions_ext::chain_execution_timeout
+                    .eq(chain_timeout.to_pg_interval()),
+            ),
+            SetExt(
+                harvest_workflow_executions_ext::chain_deadline_at
+                    .eq(chain_deadline_at.to_diesel()),
+            ),
         ))
         .execute(conn)
         .await
@@ -175,15 +183,16 @@ async fn set_chain_columns(
 async fn load_chain_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (Option<ChronoDuration>, Option<chrono::DateTime<Utc>>) {
+) -> (Option<SignedDuration>, Option<jiff::Timestamp>) {
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select((
             harvest_workflow_executions_ext::chain_execution_timeout,
             harvest_workflow_executions_ext::chain_deadline_at,
         ))
-        .first(conn)
+        .first::<(NullablePgDuration, NullableTimestamp)>(conn)
         .await
+        .map(|(timeout, deadline)| (timeout.0, deadline.0))
         .expect("load chain columns")
 }
 
@@ -257,17 +266,20 @@ async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
     // Per-run deadline is comfortably in the FUTURE (would never fire); chain
     // deadline already crossed. This models a run whose current attempt is fine
     // but whose whole continue-as-new chain has outlived its lifetime cap.
-    let now = Utc::now();
+    let now = Timestamp::now();
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::deadline_at.eq(Some(now + ChronoDuration::hours(1))))
+        .set(
+            harvest_workflow_executions::deadline_at
+                .eq(Some(now + SignedDuration::from_hours(1)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("set future per-run deadline");
     set_chain_columns(
         &mut conn,
         exec_id,
-        Some(ChronoDuration::days(7)),
-        Some(now - ChronoDuration::seconds(5)),
+        Some(autumn_harvest::time::days(7)),
+        Some(now - SignedDuration::from_secs(5)),
     )
     .await;
 
@@ -316,8 +328,8 @@ async fn chain_only_expiry_times_out_without_panicking() {
     set_chain_columns(
         &mut conn,
         exec_id,
-        Some(ChronoDuration::days(1)),
-        Some(Utc::now() - ChronoDuration::seconds(1)),
+        Some(autumn_harvest::time::days(1)),
+        Some(Timestamp::now() - SignedDuration::from_secs(1)),
     )
     .await;
 
@@ -341,7 +353,7 @@ async fn per_run_timeout_increments_run_counter_not_chain() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set(
             harvest_workflow_executions::deadline_at
-                .eq(Some(Utc::now() - ChronoDuration::seconds(1))),
+                .eq(Some(Timestamp::now() - SignedDuration::from_secs(1)).to_diesel()),
         )
         .execute(&mut conn)
         .await
@@ -373,19 +385,19 @@ async fn origin_start_anchors_chain_deadline() {
     let exec_id = ExecutionId::new();
     let wid = format!("chain-origin-{}", Uuid::new_v4());
     let mut params = default_params(exec_id, &wid);
-    params.chain_execution_timeout = Some(ChronoDuration::days(7));
-    let before = Utc::now();
+    params.chain_execution_timeout = Some(autumn_harvest::time::days(7));
+    let before = Timestamp::now();
     start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("start");
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     let (chain_timeout, chain_deadline) = load_chain_columns(&mut conn, exec_id).await;
-    assert_eq!(chain_timeout, Some(ChronoDuration::days(7)));
+    assert_eq!(chain_timeout, Some(autumn_harvest::time::days(7)));
     let dl = chain_deadline.expect("chain_deadline_at must be set");
     // chain_deadline_at ≈ started_at + 7d.
-    assert!(dl >= before + ChronoDuration::days(7) - ChronoDuration::seconds(5));
-    assert!(dl <= after + ChronoDuration::days(7) + ChronoDuration::seconds(5));
+    assert!(dl >= before + autumn_harvest::time::days(7) - SignedDuration::from_secs(5));
+    assert!(dl <= after + autumn_harvest::time::days(7) + SignedDuration::from_secs(5));
 }
 
 // ── inherited_chain_deadline_at is used VERBATIM (the workflow-retry #523 carry
@@ -396,11 +408,11 @@ async fn inherited_chain_deadline_is_used_verbatim() {
     let mut conn = connect(&url).await;
 
     // A deliberately PAST absolute deadline: proves it is NOT re-anchored to now.
-    let frozen = Utc::now() - ChronoDuration::hours(3);
+    let frozen = Timestamp::now() - SignedDuration::from_hours(3);
     let exec_id = ExecutionId::new();
     let wid = format!("chain-inherit-{}", Uuid::new_v4());
     let mut params = default_params(exec_id, &wid);
-    params.chain_execution_timeout = Some(ChronoDuration::days(7));
+    params.chain_execution_timeout = Some(autumn_harvest::time::days(7));
     params.inherited_chain_deadline_at = Some(frozen);
     start_or_load_workflow_execution(&mut conn, params, None)
         .await
@@ -411,14 +423,14 @@ async fn inherited_chain_deadline_is_used_verbatim() {
     // compare within a tiny tolerance rather than exact equality.
     let dl = chain_deadline.expect("inherited chain deadline must be set");
     assert!(
-        (dl - frozen).num_milliseconds().abs() < 10,
+        autumn_harvest::time::num_milliseconds(dl - frozen).abs() < 10,
         "inherited chain deadline must be copied verbatim, not recomputed: got \
          {dl}, expected {frozen}"
     );
     // Falsify the re-anchor hypothesis: a re-anchored (now + 7d) deadline would be
     // far in the future; the verbatim value is 3h in the PAST.
     assert!(
-        dl < Utc::now(),
+        dl < Timestamp::now(),
         "a re-anchored now+7d deadline would be in the future; verbatim is 3h ago"
     );
 }
@@ -435,8 +447,8 @@ async fn ceiling_acts_as_fleet_wide_default() {
     let mut params = default_params(exec_id, &wid);
     // No workflow-declared chain cap, only the fleet-wide ceiling.
     params.chain_execution_timeout = None;
-    params.max_workflow_chain_timeout_ceiling = Some(ChronoDuration::days(3));
-    let before = Utc::now();
+    params.max_workflow_chain_timeout_ceiling = Some(autumn_harvest::time::days(3));
+    let before = Timestamp::now();
     start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("start");
@@ -444,11 +456,11 @@ async fn ceiling_acts_as_fleet_wide_default() {
     let (chain_timeout, chain_deadline) = load_chain_columns(&mut conn, exec_id).await;
     assert_eq!(
         chain_timeout,
-        Some(ChronoDuration::days(3)),
+        Some(autumn_harvest::time::days(3)),
         "ceiling becomes the effective chain cap (fleet-wide default)"
     );
     let dl = chain_deadline.expect("ceiling-derived chain deadline");
-    assert!(dl >= before + ChronoDuration::days(3) - ChronoDuration::seconds(5));
+    assert!(dl >= before + autumn_harvest::time::days(3) - SignedDuration::from_secs(5));
 }
 
 // ── AC4: when both are present, the effective chain cap is the MIN (ceiling caps).
@@ -460,8 +472,8 @@ async fn ceiling_caps_a_larger_workflow_declared_chain_timeout() {
     let exec_id = ExecutionId::new();
     let wid = format!("chain-cap-min-{}", Uuid::new_v4());
     let mut params = default_params(exec_id, &wid);
-    params.chain_execution_timeout = Some(ChronoDuration::days(30)); // workflow asks 30d
-    params.max_workflow_chain_timeout_ceiling = Some(ChronoDuration::days(7)); // ceiling 7d
+    params.chain_execution_timeout = Some(autumn_harvest::time::days(30)); // workflow asks 30d
+    params.max_workflow_chain_timeout_ceiling = Some(autumn_harvest::time::days(7)); // ceiling 7d
     start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("start");
@@ -469,7 +481,7 @@ async fn ceiling_caps_a_larger_workflow_declared_chain_timeout() {
     let (chain_timeout, _dl) = load_chain_columns(&mut conn, exec_id).await;
     assert_eq!(
         chain_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "effective chain cap is min(workflow, ceiling)"
     );
 }
@@ -537,11 +549,11 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     let origin = insert_workflow_execution(&mut conn).await;
     // Stamp the origin's chain cap: a FUTURE absolute deadline so the successor
     // is not immediately timed out; we assert the successor copies it exactly.
-    let frozen_chain_deadline = Utc::now() + ChronoDuration::hours(6);
+    let frozen_chain_deadline = Timestamp::now() + SignedDuration::from_hours(6);
     set_chain_columns(
         &mut conn,
         origin,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         Some(frozen_chain_deadline),
     )
     .await;
@@ -569,13 +581,13 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     let (succ_timeout, succ_deadline) = load_chain_columns(&mut conn, successor).await;
     assert_eq!(
         succ_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "successor inherits the chain cap duration verbatim"
     );
     // The load truncates sub-microsecond precision on round-trip; compare within
     // a tiny tolerance rather than exact equality.
     let dl = succ_deadline.expect("successor chain deadline");
-    let delta = (dl - frozen_chain_deadline).num_milliseconds().abs();
+    let delta = autumn_harvest::time::num_milliseconds(dl - frozen_chain_deadline).abs();
     assert!(
         delta < 1000,
         "successor's chain_deadline_at must equal the predecessor's absolute \
@@ -585,7 +597,7 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     // Falsify the re-anchor hypothesis: a re-anchored deadline would be ~now+7d,
     // far in the future; the verbatim value is only +6h from the origin start.
     assert!(
-        dl < Utc::now() + ChronoDuration::days(1),
+        dl < Timestamp::now() + autumn_harvest::time::days(1),
         "a re-anchored (now + 7d) deadline would be days out; verbatim is ~6h"
     );
 }
@@ -706,18 +718,18 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
     let wf_name = format!("chain_pause_{}", Uuid::new_v4().simple());
     let exec_id = insert_named_running(&mut conn, &wf_name, "wf-1").await;
 
-    let now = Utc::now();
-    let run_deadline_before = now + ChronoDuration::minutes(30);
-    let chain_deadline_before = now + ChronoDuration::days(7);
+    let now = Timestamp::now();
+    let run_deadline_before = now + SignedDuration::from_mins(30);
+    let chain_deadline_before = now + autumn_harvest::time::days(7);
     diesel::update(e::table.find(exec_id.as_uuid()))
-        .set(e::deadline_at.eq(Some(run_deadline_before)))
+        .set(e::deadline_at.eq(Some(run_deadline_before).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("set per-run deadline");
     set_chain_columns(
         &mut conn,
         exec_id,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         Some(chain_deadline_before),
     )
     .await;
@@ -727,9 +739,9 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
         .expect("pause should succeed");
 
     // Backdate `paused_at` 30 minutes so resume computes a deterministic span.
-    let paused_at = now - ChronoDuration::minutes(30);
+    let paused_at = now - SignedDuration::from_mins(30);
     diesel::update(e::table.find(exec_id.as_uuid()))
-        .set(e::paused_at.eq(Some(paused_at)))
+        .set(e::paused_at.eq(Some(paused_at).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("backdate paused_at");
@@ -739,16 +751,16 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
         .expect("resume should succeed");
 
     // Per-run deadline advanced by ~30 min pause span.
-    let run_after: Option<chrono::DateTime<Utc>> = e::table
+    let run_after = e::table
         .find(exec_id.as_uuid())
         .select(e::deadline_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load deadline_at");
-    let run_after = run_after.expect("per-run deadline must remain set");
-    let expected = run_deadline_before + ChronoDuration::minutes(30);
+    let run_after = run_after.0.expect("per-run deadline must remain set");
+    let expected = run_deadline_before + SignedDuration::from_mins(30);
     assert!(
-        (run_after - expected).num_seconds().abs() <= 5,
+        (run_after - expected).as_secs().abs() <= 5,
         "per-run deadline_at must advance by the pause span: after={run_after}, expected≈{expected}"
     );
 
@@ -756,10 +768,7 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
     let (_chain_timeout, chain_after) = load_chain_columns(&mut conn, exec_id).await;
     let chain_after = chain_after.expect("chain_deadline_at must remain set");
     assert!(
-        (chain_after - chain_deadline_before)
-            .num_milliseconds()
-            .abs()
-            < 10,
+        autumn_harvest::time::num_milliseconds(chain_after - chain_deadline_before).abs() < 10,
         "chain_deadline_at must NOT be shifted by pause/resume: after={chain_after}, \
          before={chain_deadline_before}"
     );
@@ -777,19 +786,19 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
     let wid = format!("chain-reset-{}", Uuid::new_v4());
     // Source has a 7d chain cap whose deadline is already 3h in the PAST.
     let mut params = default_params(exec_id, &wid);
-    params.chain_execution_timeout = Some(ChronoDuration::days(7));
+    params.chain_execution_timeout = Some(autumn_harvest::time::days(7));
     start_or_load_workflow_execution(&mut conn, params, None)
         .await
         .expect("start source");
     set_chain_columns(
         &mut conn,
         exec_id,
-        Some(ChronoDuration::days(7)),
-        Some(Utc::now() - ChronoDuration::hours(3)),
+        Some(autumn_harvest::time::days(7)),
+        Some(Timestamp::now() - SignedDuration::from_hours(3)),
     )
     .await;
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let res = reset_workflow_execution(
         &mut conn,
         exec_id,
@@ -809,19 +818,19 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
     let (fork_timeout, fork_deadline) = load_chain_columns(&mut conn, res.new_exec_id).await;
     assert_eq!(
         fork_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "fork carries the chain-cap DURATION"
     );
     let dl = fork_deadline.expect("fork chain deadline must be set");
     // Fresh anchor: ≈ now + 7d, so > now + 6d and in the FUTURE. A
     // carry-instead-of-reanchor mutant yields the source's 3-hours-ago value.
     assert!(
-        dl > before + ChronoDuration::days(6),
+        dl > before + autumn_harvest::time::days(6),
         "reset must RE-ANCHOR the chain deadline to the fork start (now + 7d), \
          not carry the source's past value: got {dl}"
     );
     assert!(
-        dl > Utc::now(),
+        dl > Timestamp::now(),
         "re-anchored fork deadline must be in the future"
     );
 }
@@ -836,7 +845,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
     let wf_name = format!("sws_chain_{}", Uuid::new_v4().simple());
     let wid = format!("sws-chain-{}", Uuid::new_v4());
     let exec_id = ExecutionId::new();
-    let before = Utc::now();
+    let before = Timestamp::now();
     let outcome = signal_with_start_workflow_execution_with_metrics(
         &mut conn,
         SignalWithStartParams {
@@ -854,7 +863,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
             max_execution_timeout_ceiling: None,
             // No workflow-declared chain cap, only the fleet-wide ceiling.
             chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: Some(ChronoDuration::days(3)),
+            max_workflow_chain_timeout_ceiling: Some(autumn_harvest::time::days(3)),
             concurrency_key: None,
             concurrency_limit: None,
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
@@ -886,12 +895,12 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
     let (chain_timeout, chain_deadline) = load_chain_columns(&mut conn, outcome.exec_id).await;
     assert_eq!(
         chain_timeout,
-        Some(ChronoDuration::days(3)),
+        Some(autumn_harvest::time::days(3)),
         "the fleet-wide ceiling becomes the effective chain cap (fleet-wide default)"
     );
     let dl = chain_deadline.expect("ceiling-derived chain deadline");
     assert!(
-        dl >= before + ChronoDuration::days(3) - ChronoDuration::seconds(5),
+        dl >= before + autumn_harvest::time::days(3) - SignedDuration::from_secs(5),
         "chain_deadline_at ≈ start + ceiling: got {dl}"
     );
 }
@@ -955,14 +964,14 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     )
     .set(
         autumn_harvest::schema::harvest_schedules::next_run_at
-            .eq(Some(Utc::now() - ChronoDuration::seconds(1))),
+            .eq(Some(Timestamp::now() - SignedDuration::from_secs(1)).to_diesel()),
     )
     .execute(&mut conn)
     .await
     .expect("force due");
 
     let pool = build_test_pool(&url);
-    let before = Utc::now();
+    let before = Timestamp::now();
     tick_once(
         pool,
         Arc::clone(&registry),
@@ -974,28 +983,27 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     .expect("scheduler tick should succeed");
 
     // Find the fired execution for this unique workflow name.
-    let row: Option<(Uuid, Option<ChronoDuration>, Option<chrono::DateTime<Utc>>)> =
-        harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions_ext::chain_execution_timeout,
-                harvest_workflow_executions_ext::chain_deadline_at,
-            ))
-            .first(&mut conn)
-            .await
-            .optional()
-            .expect("query fired execution");
-    let (_id, chain_timeout, chain_deadline) =
+    let row = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions_ext::chain_execution_timeout,
+            harvest_workflow_executions_ext::chain_deadline_at,
+        ))
+        .first::<(Uuid, NullablePgDuration, NullableTimestamp)>(&mut conn)
+        .await
+        .optional()
+        .expect("query fired execution");
+    let (_id, NullablePgDuration(chain_timeout), NullableTimestamp(chain_deadline)) =
         row.expect("scheduler tick must have fired an execution for this workflow");
     assert_eq!(
         chain_timeout,
-        Some(ChronoDuration::days(3)),
+        Some(autumn_harvest::time::days(3)),
         "scheduled run inherits the fleet-wide chain ceiling as its effective cap"
     );
     let dl = chain_deadline.expect("scheduled run chain deadline");
     assert!(
-        dl >= before + ChronoDuration::days(3) - ChronoDuration::seconds(10),
+        dl >= before + autumn_harvest::time::days(3) - SignedDuration::from_secs(10),
         "scheduled run chain_deadline_at ≈ start + ceiling: got {dl}"
     );
 }
@@ -1010,11 +1018,11 @@ async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
     let wf_name = leaked_name("chain_can3");
     let origin = insert_named_running(&mut conn, wf_name, "chain-can3-1").await;
     // A FUTURE chain deadline so the hops complete without timing out.
-    let frozen_chain_deadline = Utc::now() + ChronoDuration::hours(6);
+    let frozen_chain_deadline = Timestamp::now() + SignedDuration::from_hours(6);
     set_chain_columns(
         &mut conn,
         origin,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         Some(frozen_chain_deadline),
     )
     .await;
@@ -1041,11 +1049,11 @@ async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
     let (succ_timeout, succ_deadline) = load_chain_columns(&mut conn, succ3).await;
     assert_eq!(
         succ_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "3rd successor carries the chain-cap DURATION verbatim"
     );
     let dl = succ_deadline.expect("3rd successor chain deadline");
-    let delta = (dl - frozen_chain_deadline).num_milliseconds().abs();
+    let delta = autumn_harvest::time::num_milliseconds(dl - frozen_chain_deadline).abs();
     assert!(
         delta < 1000,
         "3rd successor chain_deadline_at must equal the origin's absolute value \
@@ -1053,7 +1061,7 @@ async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
     );
     // Falsify a re-anchor: now+7d would be days out; verbatim is ~6h from origin.
     assert!(
-        dl < Utc::now() + ChronoDuration::days(1),
+        dl < Timestamp::now() + autumn_harvest::time::days(1),
         "a re-anchored (now + 7d) deadline would be days out; verbatim is ~6h"
     );
 }
@@ -1073,8 +1081,8 @@ async fn chain_cap_fires_on_a_can_successor_not_the_origin() {
     set_chain_columns(
         &mut conn,
         origin,
-        Some(ChronoDuration::days(7)),
-        Some(Utc::now() + ChronoDuration::hours(6)),
+        Some(autumn_harvest::time::days(7)),
+        Some(Timestamp::now() + SignedDuration::from_hours(6)),
     )
     .await;
     enqueue_started_workflow_task(&mut conn, origin, serde_json::json!({"count": 0})).await;
@@ -1103,14 +1111,14 @@ async fn chain_cap_fires_on_a_can_successor_not_the_origin() {
     set_chain_columns(
         &mut conn,
         succ3,
-        Some(ChronoDuration::days(7)),
-        Some(Utc::now() - ChronoDuration::seconds(5)),
+        Some(autumn_harvest::time::days(7)),
+        Some(Timestamp::now() - SignedDuration::from_secs(5)),
     )
     .await;
     diesel::update(harvest_workflow_executions::table.find(succ3.as_uuid()))
         .set(
             harvest_workflow_executions::deadline_at
-                .eq(Some(Utc::now() + ChronoDuration::hours(1))),
+                .eq(Some(Timestamp::now() + SignedDuration::from_hours(1)).to_diesel()),
         )
         .execute(&mut conn)
         .await

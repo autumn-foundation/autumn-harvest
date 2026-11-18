@@ -17,11 +17,11 @@
 //! [`SideEffectKind::EntityState`]: crate::event::SideEffectKind::EntityState
 
 #[cfg(feature = "db")]
-use chrono::{DateTime, Utc};
-#[cfg(feature = "db")]
 use diesel::sql_types::{Bool, Integer, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "db")]
+use jiff::Timestamp;
 use serde_json::Value;
 
 #[cfg(feature = "db")]
@@ -159,7 +159,7 @@ pub struct EntityStateRow {
     /// The snapshot.
     pub snapshot: ProjectedSnapshot,
     /// The time of the write.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -178,7 +178,8 @@ struct RawRow {
     #[diesel(sql_type = Jsonb)]
     snapshot: Value,
     #[diesel(sql_type = Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    updated_at: Timestamp,
 }
 
 #[cfg(feature = "db")]

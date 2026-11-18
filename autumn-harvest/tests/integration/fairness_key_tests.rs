@@ -18,8 +18,8 @@
 use autumn_harvest::models::TaskQueueItem;
 use autumn_harvest::queue::{self, ClaimFairness, EnqueueParams, TaskType};
 
-use chrono::{Duration, Utc};
 use diesel_async::{AsyncConnection, AsyncPgConnection};
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::setup_test_database_url_or_env;
@@ -51,11 +51,11 @@ async fn enqueue_keyed(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
     key: Option<&str>,
-    age: Duration,
+    age: SignedDuration,
 ) -> Uuid {
     let mut params = EnqueueParams::new(queue_name, TaskType::Activity, serde_json::json!({}));
     params.activity_name = Some("fair_noop".to_owned());
-    params.scheduled_at = Utc::now() - age;
+    params.scheduled_at = Timestamp::now() - age;
     params.fairness_key = key.map(str::to_owned);
     queue::enqueue(conn, &params).await.expect("enqueue")
 }
@@ -90,7 +90,8 @@ async fn claims_before_tenant_b(fairness: ClaimFairness) -> usize {
 
     // The flood is older than B, so it wins every tie on due time.
     for i in 0..FLOOD {
-        let age = Duration::seconds(600) - Duration::milliseconds(i64::try_from(i).unwrap());
+        let age =
+            SignedDuration::from_secs(600) - SignedDuration::from_millis(i64::try_from(i).unwrap());
         enqueue_keyed(&mut conn, &queue_name, Some("tenant-a"), age).await;
     }
     claim(&mut conn, &queue_name, fairness)
@@ -101,7 +102,7 @@ async fn claims_before_tenant_b(fairness: ClaimFairness) -> usize {
         &mut conn,
         &queue_name,
         Some("tenant-b"),
-        Duration::seconds(1),
+        SignedDuration::from_secs(1),
     )
     .await;
 
@@ -188,7 +189,13 @@ async fn fair_claim_matches_the_model_sequence() {
         for (j, (key, _)) in weights.iter().enumerate() {
             let age_ms = 10_000 - (4 * i + i64::try_from(j).unwrap()) * 10;
             let k = (!key.is_empty()).then_some(*key);
-            enqueue_keyed(&mut conn, &queue_name, k, Duration::milliseconds(age_ms)).await;
+            enqueue_keyed(
+                &mut conn,
+                &queue_name,
+                k,
+                SignedDuration::from_millis(age_ms),
+            )
+            .await;
             backlogs
                 .entry((*key).to_owned())
                 .or_default()
@@ -235,7 +242,7 @@ async fn weight_override_changes_share_at_runtime() {
     let (mut conn, _container) = connect().await;
     let queue_name = fresh_queue("runtime");
     for i in 0..400i64 {
-        let age = Duration::seconds(1_000) - Duration::milliseconds(i);
+        let age = SignedDuration::from_secs(1_000) - SignedDuration::from_millis(i);
         enqueue_keyed(&mut conn, &queue_name, Some("a"), age).await;
         enqueue_keyed(&mut conn, &queue_name, Some("b"), age).await;
     }
@@ -366,11 +373,17 @@ async fn prune_keeps_the_clock_row_and_active_keys() {
     .execute(&mut conn)
     .await
     .expect("seed state");
-    enqueue_keyed(&mut conn, &queue_name, Some("busy"), Duration::seconds(1)).await;
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("busy"),
+        SignedDuration::from_secs(1),
+    )
+    .await;
 
     // The janitor's idle window is at least 1 h. Rows 30 min old thus stay
     // out of its reach while this test runs on a shared database.
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let preview = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, true)
         .await
         .unwrap();
@@ -414,11 +427,11 @@ async fn prune_bounds_one_shot_keys_on_a_queue_that_never_drains() {
         &mut conn,
         &queue_name,
         Some("waiting"),
-        Duration::seconds(1),
+        SignedDuration::from_secs(1),
     )
     .await;
 
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let deleted = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 500, false)
         .await
         .unwrap();
@@ -446,8 +459,14 @@ async fn prune_keeps_the_debt_of_a_key_with_a_pending_task() {
     .execute(&mut conn)
     .await
     .expect("seed state");
-    enqueue_keyed(&mut conn, &queue_name, Some("a"), Duration::seconds(1)).await;
-    let cutoff = Utc::now() - Duration::minutes(10);
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("a"),
+        SignedDuration::from_secs(1),
+    )
+    .await;
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let deleted = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, false)
         .await
         .unwrap();
@@ -485,7 +504,7 @@ async fn prune_resets_a_queue_with_no_pending_task() {
     .execute(&mut conn)
     .await
     .expect("seed state");
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let clock = |rows: &[autumn_harvest::fairness_keys::FairnessKeyState]| {
         rows.iter().map(|r| r.last_start).fold(f64::MIN, f64::max)
     };
@@ -561,7 +580,7 @@ async fn a_held_lower_row_keeps_the_clock_row_in_an_idle_reset() {
     .await
     .expect("hold the low row");
 
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
         .await
         .unwrap();
@@ -606,7 +625,7 @@ async fn prune_preview_matches_the_live_count_across_batches() {
     .execute(&mut conn)
     .await
     .expect("seed state");
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let preview = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, true)
         .await
         .unwrap();
@@ -645,7 +664,7 @@ async fn a_preview_takes_no_lock_on_the_state_rows() {
     .await
     .expect("seed state");
 
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let name = queue_name.clone();
     let preview = tokio::spawn(async move {
         let n = prune_fairness_state(&mut conn, Some(&name), cutoff, 1_000, true)
@@ -690,7 +709,7 @@ async fn a_preview_nests_in_a_caller_transaction() {
     .execute(&mut conn)
     .await
     .expect("seed state");
-    let cutoff = Utc::now() - Duration::minutes(10);
+    let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
     let name = queue_name.clone();
     let counted = conn
         .transaction::<u64, autumn_harvest::error::HarvestError, _>(async move |conn| {
@@ -753,7 +772,7 @@ async fn a_fair_claim_refuses_an_unaddressable_queue_name() {
     }
     // A bad name after a good one still fails before any statement.
     let good = fresh_queue("good");
-    enqueue_keyed(&mut conn, &good, Some("a"), Duration::seconds(1)).await;
+    enqueue_keyed(&mut conn, &good, Some("a"), SignedDuration::from_secs(1)).await;
     let err = queue::claim_task_with_fairness(
         &mut conn,
         &[good.clone(), "..".to_owned()],
@@ -785,7 +804,13 @@ async fn a_fair_claim_refuses_an_unaddressable_queue_name() {
 async fn fairness_off_writes_no_state() {
     let (mut conn, _container) = connect().await;
     let queue_name = fresh_queue("off");
-    enqueue_keyed(&mut conn, &queue_name, Some("a"), Duration::seconds(1)).await;
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("a"),
+        SignedDuration::from_secs(1),
+    )
+    .await;
     claim(&mut conn, &queue_name, ClaimFairness::Off)
         .await
         .unwrap();
@@ -803,8 +828,14 @@ async fn fairness_off_writes_no_state() {
 async fn by_id_claim_and_unkeyed_rows_charge_their_keys() {
     let (mut conn, _container) = connect().await;
     let queue_name = fresh_queue("byid");
-    let keyed = enqueue_keyed(&mut conn, &queue_name, Some("k"), Duration::seconds(2)).await;
-    enqueue_keyed(&mut conn, &queue_name, None, Duration::seconds(1)).await;
+    let keyed = enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("k"),
+        SignedDuration::from_secs(2),
+    )
+    .await;
+    enqueue_keyed(&mut conn, &queue_name, None, SignedDuration::from_secs(1)).await;
 
     let task = queue::claim_task_by_id_with_fairness(
         &mut conn,
@@ -869,7 +900,7 @@ async fn multi_queue_fair_claim_starves_no_queue() {
         .await
         .unwrap();
     for i in 0..60 {
-        let age = Duration::seconds(1_000 - i);
+        let age = SignedDuration::from_secs(1_000 - i);
         enqueue_keyed(&mut conn, &q1, Some("a"), age).await;
         enqueue_keyed(&mut conn, &q1, Some("b"), age).await;
         enqueue_keyed(&mut conn, &q2, Some("k"), age).await;
@@ -901,12 +932,18 @@ async fn priority_sorts_before_the_fairness_lag() {
             serde_json::json!({}),
         );
         params.activity_name = Some("fair_noop".to_owned());
-        params.scheduled_at = Utc::now() - Duration::seconds(100 - i);
+        params.scheduled_at = Timestamp::now() - SignedDuration::from_secs(100 - i);
         params.fairness_key = Some("high".to_owned());
         params.priority = 10;
         queue::enqueue(&mut conn, &params).await.unwrap();
     }
-    enqueue_keyed(&mut conn, &queue_name, Some("low"), Duration::seconds(500)).await;
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("low"),
+        SignedDuration::from_secs(500),
+    )
+    .await;
     let first: Vec<String> = drain_keys(&mut conn, &queue_name).await;
     assert_eq!(first, ["high", "high", "high", "high", "high", "low"]);
 }
@@ -920,7 +957,7 @@ async fn a_weight_below_one_gives_a_smaller_share() {
         .await
         .unwrap();
     for i in 0..100i64 {
-        let age = Duration::seconds(1_000) - Duration::milliseconds(i);
+        let age = SignedDuration::from_secs(1_000) - SignedDuration::from_millis(i);
         enqueue_keyed(&mut conn, &queue_name, Some("slow"), age).await;
         enqueue_keyed(&mut conn, &queue_name, Some("fast"), age).await;
     }
@@ -973,7 +1010,13 @@ async fn every_fair_statement_variant_prepares() {
 async fn kind_filtered_fair_claim_charges_its_key() {
     let (mut conn, _container) = connect().await;
     let queue_name = fresh_queue("kind");
-    enqueue_keyed(&mut conn, &queue_name, Some("k"), Duration::seconds(5)).await;
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("k"),
+        SignedDuration::from_secs(5),
+    )
+    .await;
     let task = queue::claim_task_with_fairness(
         &mut conn,
         std::slice::from_ref(&queue_name),
@@ -1002,11 +1045,17 @@ async fn concurrent_fair_claims_keep_every_charge() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     let queue_name = fresh_queue("conc");
     for i in 0..300i64 {
-        let age = Duration::seconds(600) - Duration::milliseconds(i);
+        let age = SignedDuration::from_secs(600) - SignedDuration::from_millis(i);
         enqueue_keyed(&mut conn, &queue_name, Some("a"), age).await;
     }
     for _ in 0..5 {
-        enqueue_keyed(&mut conn, &queue_name, Some("b"), Duration::seconds(1)).await;
+        enqueue_keyed(
+            &mut conn,
+            &queue_name,
+            Some("b"),
+            SignedDuration::from_secs(1),
+        )
+        .await;
     }
 
     let order = Arc::new(AtomicUsize::new(0));
@@ -1082,5 +1131,5 @@ async fn enqueue_rejects_an_invalid_fairness_key() {
         .await
         .expect("count rows");
     assert_eq!(rows, 0, "a rejected batch inserts no row");
-    enqueue_keyed(&mut conn, &q, Some("tenant-a"), Duration::zero()).await;
+    enqueue_keyed(&mut conn, &q, Some("tenant-a"), SignedDuration::ZERO).await;
 }

@@ -2836,10 +2836,10 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
     // valid Postgres value that sorts after every finite timestamp. But the
     // drain loop below calls the real `queue::claim_task()`. Its `claimed`
     // CTE `RETURNING`s the claimed row, including `schedule_to_close_at`,
-    // for Diesel to deserialize into a `chrono::DateTime<Utc>`. Chrono has
+    // for Diesel to deserialize into a `jiff::Timestamp`. Chrono has
     // no `infinity` sentinel, so that deserialization panics: "Tried to
     // deserialize a timestamp that is too large for Chrono". A hundred
-    // years is comfortably inside `chrono::DateTime<Utc>`'s representable
+    // years is comfortably inside `jiff::Timestamp`'s representable
     // range -- roughly to the year 262,000. That is still far longer than
     // any realistic drain duration.
     //

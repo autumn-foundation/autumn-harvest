@@ -16,8 +16,8 @@
 
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::jiff::Timestamp;
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest_agent::anthropic::reqwest::StatusCode;
 use autumn_harvest_agent::anthropic::reqwest::header::HeaderValue;
@@ -187,8 +187,7 @@ impl ModelConfig {
 /// calls no model, so it returns no call.
 pub fn activity_body(
     config: ModelConfig,
-) -> impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static
-{
+) -> impl Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static {
     move |input, _now| {
         let request: TurnRequest =
             serde_json::from_value(input).map_err(|e| format!("malformed turn request: {e}"))?;

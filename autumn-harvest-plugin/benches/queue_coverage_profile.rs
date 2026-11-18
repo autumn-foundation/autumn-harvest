@@ -73,7 +73,7 @@ use autumn_harvest::models::HarvestWorker;
 use autumn_harvest::queue::PendingQueueDemand;
 use autumn_harvest::workers::{WorkerHealth, WorkerRow, WorkerStatus};
 use autumn_harvest_plugin::queue_coverage::partition_uncovered_and_paused;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 /// Reads `key` as a `usize`. Only an *absent* variable gives `default`. A
@@ -90,8 +90,8 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-fn at(seconds: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(seconds, 0).unwrap()
+fn at(seconds: i64) -> Timestamp {
+    Timestamp::new(seconds, 0).unwrap()
 }
 
 fn queue_name(i: usize) -> String {

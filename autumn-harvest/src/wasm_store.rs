@@ -204,7 +204,7 @@ pub struct WasmModuleRow {
     /// Whether this is the active version for its activity name.
     pub active: bool,
     /// When this version was published (or last (re)activated).
-    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub published_at: jiff::Timestamp,
 }
 
 /// Where a prepared activity's compiled module comes from.
@@ -819,7 +819,7 @@ pub async fn list_wasm_modules(
     use diesel_async::RunQueryDsl;
 
     use crate::schema::harvest_wasm_modules::dsl as m;
-    let rows: Vec<(String, String, bool, chrono::DateTime<chrono::Utc>)> = m::harvest_wasm_modules
+    let rows: Vec<(String, String, bool, crate::time::sql::SqlTimestamp)> = m::harvest_wasm_modules
         .select((m::hash, m::activity_name, m::active, m::published_at))
         .order(m::published_at.desc())
         .load(conn)
@@ -832,7 +832,7 @@ pub async fn list_wasm_modules(
                 hash,
                 activity_name,
                 active,
-                published_at,
+                published_at: published_at.to_jiff(),
             },
         )
         .collect())

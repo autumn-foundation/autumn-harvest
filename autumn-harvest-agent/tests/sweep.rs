@@ -33,6 +33,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{MemStore, TryFnModel, answer, runtime};
 use futures::FutureExt as _;
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "researcher";
@@ -109,8 +110,7 @@ fn sweep_report(state: RunState) -> SweepReport {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-    use autumn_harvest::chrono::{DateTime, Utc};
-    rt.llm_ledger_between(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 
@@ -320,7 +320,7 @@ impl MeshSpend for Counted {
     fn spent<'a>(
         &'a self,
         _mesh: &'a str,
-        _since: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        _since: jiff::Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         let tokens = self.0.load(Ordering::SeqCst);
         Box::pin(std::future::ready(Ok(Spend {

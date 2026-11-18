@@ -175,6 +175,9 @@ const RULES: &[Rule] = &[
             "Local::now()",
             "chrono::Utc::now",
             "chrono::Local::now",
+            "Timestamp::now()",
+            "ZonedDateTime::now()",
+            "Zoned::now()",
             "OffsetDateTime::now_utc()",
         ],
         message: "Wall-clock time read inside a workflow function breaks replay determinism. \

@@ -6,7 +6,7 @@ static GLOBAL_MUTEX: Mutex<u32> = Mutex::new(0);
 
 #[workflow(allow_nondeterministic_apis)]
 async fn bypass_workflow(ctx: &WorkflowContext) -> Result<(), String> {
-    let _ = chrono::Utc::now();
+    let _ = jiff::Timestamp::now();
     let _ = rand::random::<u64>();
     let _ = std::env::var("PORT");
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;

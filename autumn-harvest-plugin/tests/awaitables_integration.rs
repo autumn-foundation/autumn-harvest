@@ -28,6 +28,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,7 +49,6 @@ use autumn_harvest_plugin::ui::harvest_ui_router;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{TimeZone, Utc};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -336,7 +336,7 @@ async fn seed_execution(
 fn started_event(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap(),
+        timestamp: autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 0, 0).unwrap(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -416,7 +416,7 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
     .await;
 
     // Task row carrying the cross-retry deadline (#378).
-    let deadline = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+    let deadline = autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 13, 0, 0).unwrap();
     {
         let mut conn = pool.get().await.expect("pooled conn");
         diesel::sql_query(
@@ -429,7 +429,7 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(deadline)
+        .bind::<diesel::sql_types::Timestamptz, _>(deadline.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed task row");
@@ -464,7 +464,9 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         )
         .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
         .bind::<diesel::sql_types::Timestamptz, _>(
-            Utc.with_ymd_and_hms(2026, 7, 1, 12, 30, 0).unwrap(),
+            autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 30, 0)
+                .unwrap()
+                .to_diesel(),
         )
         .execute(&mut conn)
         .await

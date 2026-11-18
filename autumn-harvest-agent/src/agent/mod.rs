@@ -49,6 +49,7 @@ use std::time::Duration;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::consolidate::{
@@ -1484,15 +1485,30 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
             |state, op: AgentOp| handle_op(&run, state, op),
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
-                Some(Wake::new(
-                    autumn_harvest::chrono::DateTime::from_timestamp_millis(at)?,
-                    op,
-                ))
+                Some(Wake::new(wake_time(at)?, op))
             },
             |state: &mut AgentState| std::mem::take(&mut state.reload_requested),
         )
         .await
         .map_err(|err| err.to_string())
+}
+
+/// The first millisecond that `chrono` could hold, in the year -262143.
+const CHRONO_MIN_MS: i64 = -8_334_601_315_200_000;
+
+/// The last millisecond that `chrono` could hold, in the year 262142.
+const CHRONO_MAX_MS: i64 = 8_210_266_876_799_999;
+
+/// The time of a wake at `at_ms` epoch milliseconds.
+///
+/// Replay calls the wake hook again, so the hook must give a wake for each
+/// time that `chrono` gave one. A recorded run then keeps its clock reads
+/// and timers. `chrono` gave `None` outside its own range. Inside that
+/// range, a time past the range of jiff clamps to its first or last instant.
+fn wake_time(at_ms: i64) -> Option<Timestamp> {
+    (CHRONO_MIN_MS..=CHRONO_MAX_MS)
+        .contains(&at_ms)
+        .then(|| autumn_harvest::time::from_millisecond_clamped(at_ms))
 }
 
 /// Book the next heartbeat of `profile`. See [`wake::next_heartbeat`].
@@ -1526,7 +1542,7 @@ impl AgentRun<'_> {
             state.incarnation = self.ctx.new_uuid().to_string();
         }
         // One recorded clock read per op. Replay reads the same time.
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
         let mut reload = None;
@@ -1554,7 +1570,7 @@ impl AgentRun<'_> {
         // longer than the interval then never makes the next one due at
         // once, so waiting ops run first.
         let booked_at = if ticked {
-            self.ctx.system_now().timestamp_millis()
+            self.ctx.system_now().as_millisecond()
         } else {
             now
         };
@@ -1952,7 +1968,7 @@ impl AgentRun<'_> {
             );
             return;
         }
-        let at_ms = self.ctx.system_now().timestamp_millis();
+        let at_ms = self.ctx.system_now().as_millisecond();
         let max_text = usize::try_from(settings.max_text_bytes).unwrap_or(usize::MAX);
         let append = EpisodeAppend {
             scope: episode_scope(id),
@@ -2057,7 +2073,7 @@ impl AgentRun<'_> {
         scope: &str,
     ) -> Result<u64, String> {
         self.workspace_floor(state, scope).await?;
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         state.workspace_generation = next_generation(state.workspace_generation, now);
         Ok(state.workspace_generation)
     }
@@ -2465,7 +2481,7 @@ impl AgentRun<'_> {
                 {
                     let delay =
                         i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                    let ended = self.ctx.system_now().timestamp_millis();
+                    let ended = self.ctx.system_now().as_millisecond();
                     state.followup_due_ms = Some(ended.saturating_add(delay));
                 }
                 if task.deliver {
@@ -3155,6 +3171,19 @@ mod tests {
         assert_eq!(next_generation(5_000, 1_000), 5_001, "a clock behind");
         assert_eq!(next_generation(7, -1), 8, "a time before 1970");
         assert_eq!(next_generation(u64::MAX, 0), u64::MAX);
+    }
+
+    #[test]
+    fn a_wake_exists_where_chrono_gave_one() {
+        assert_eq!(
+            wake_time(1_700_000_000_123),
+            Some(Timestamp::constant(1_700_000_000, 123_000_000))
+        );
+        assert_eq!(wake_time(CHRONO_MAX_MS), Some(Timestamp::MAX));
+        assert_eq!(wake_time(CHRONO_MIN_MS), Some(Timestamp::MIN));
+        assert_eq!(wake_time(CHRONO_MAX_MS + 1), None);
+        assert_eq!(wake_time(CHRONO_MIN_MS - 1), None);
+        assert_eq!(wake_time(i64::MAX), None);
     }
 
     #[test]

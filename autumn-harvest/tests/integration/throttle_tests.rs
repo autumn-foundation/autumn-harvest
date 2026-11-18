@@ -29,6 +29,8 @@
 
 use autumn_harvest::schema::harvest_schedules_ext;
 use autumn_harvest::table_split::Ext;
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1964,7 +1966,7 @@ async fn insert_schedule_with_input(
 ) -> Uuid {
     use diesel_async::RunQueryDsl;
     use harvest_schedules::dsl;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -1975,7 +1977,7 @@ async fn insert_schedule_with_input(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -1992,18 +1994,19 @@ async fn insert_schedule_with_input(
 async fn schedule_row(
     conn: &mut AsyncPgConnection,
     id: Uuid,
-) -> (
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<chrono::DateTime<chrono::Utc>>,
-) {
+) -> (Option<jiff::Timestamp>, Option<jiff::Timestamp>) {
     use diesel_async::RunQueryDsl;
     use harvest_schedules::dsl;
-    dsl::harvest_schedules
+    let (last_run_at, next_run_at) = dsl::harvest_schedules
         .filter(dsl::id.eq(id))
         .select((harvest_schedules_ext::last_run_at, dsl::next_run_at))
-        .first(conn)
+        .first::<(Option<SqlTimestamp>, Option<SqlTimestamp>)>(conn)
         .await
-        .expect("schedule row")
+        .expect("schedule row");
+    (
+        last_run_at.map(SqlTimestamp::to_jiff),
+        next_run_at.map(SqlTimestamp::to_jiff),
+    )
 }
 
 /// A scheduled fire whose input exceeds the effective byte cap fails fast
@@ -2225,9 +2228,9 @@ async fn insert_schedule_with_buffered_slot(
 ) -> Uuid {
     use diesel_async::RunQueryDsl;
     use harvest_schedules::dsl;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let id = Uuid::new_v4();
-    let buffered_slot = now - chrono::Duration::seconds(30);
+    let buffered_slot = now - jiff::SignedDuration::from_secs(30);
     diesel::insert_into(harvest_schedules::table)
         .values((
             dsl::id.eq(id),
@@ -2237,10 +2240,12 @@ async fn insert_schedule_with_buffered_slot(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now + chrono::Duration::seconds(3600)),
+            dsl::next_run_at.eq((now + jiff::SignedDuration::from_secs(3600)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("buffer_all"),
-            dsl::buffered_runs.eq(serde_json::json!([buffered_slot.to_rfc3339()])),
+            dsl::buffered_runs.eq(serde_json::json!([autumn_harvest::time::rfc3339(
+                buffered_slot
+            )])),
             dsl::buffer_all_max.eq(10),
             dsl::skip_policy.eq("skip"),
             Ext(harvest_schedules_ext::workflow_input.eq(input)),
@@ -2343,9 +2348,9 @@ async fn throttled_buffered_deferral_counts_against_max_active_runs() {
     // Simulate a second buffered slot arriving later (without waiting real
     // wall-clock time) by re-populating buffered_runs directly.
     diesel::sql_query("UPDATE harvest_schedules SET buffered_runs = $1 WHERE id = $2")
-        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([(chrono::Utc::now()
-            - chrono::Duration::seconds(10))
-        .to_rfc3339()]))
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339(
+            jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10)
+        )]))
         .bind::<diesel::sql_types::Uuid, _>(sched_id)
         .execute(&mut conn)
         .await

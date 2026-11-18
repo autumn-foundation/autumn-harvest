@@ -716,7 +716,8 @@ struct Beat {
     #[diesel(sql_type = Nullable<Jsonb>)]
     heartbeat_details: Option<Value>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
 }
 
 async fn read_beat(conn: &mut AsyncPgConnection, task_id: uuid::Uuid) -> Beat {

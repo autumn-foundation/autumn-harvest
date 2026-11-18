@@ -599,6 +599,8 @@ pub mod testing;
 pub mod throttle;
 /// Forecast when each throttled start runs, from bursts or real schedules.
 pub mod throttle_forecast;
+/// Date and time helpers over jiff (ADR 0018).
+pub mod time;
 /// Per-execution timeline read model (issue #739).
 pub mod timeline;
 #[cfg(any(test, feature = "testing"))]
@@ -994,8 +996,11 @@ pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_
 pub use serde_json;
 // Allow macro-generated code to use ::autumn_harvest::serde
 pub use serde;
-// Allow macro-generated code to use ::autumn_harvest::chrono
-pub use chrono;
+// Allow macro-generated code to use ::autumn_harvest::jiff
+pub use jiff;
+// Diesel wrapper types for jiff, for crates that query Harvest tables.
+#[cfg(feature = "db")]
+pub use jiff_diesel;
 // Allow macro-generated code to use ::autumn_harvest::uuid (e.g. update_with_start UUIDv5 derivation)
 pub use uuid;
 // Allow macro-generated code to use ::autumn_harvest::futures.

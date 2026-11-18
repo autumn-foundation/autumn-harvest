@@ -18,6 +18,7 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -103,7 +104,7 @@ async fn force_state(
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::state.eq(state),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
+            dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

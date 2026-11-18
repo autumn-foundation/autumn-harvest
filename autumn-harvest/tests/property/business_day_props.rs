@@ -3,20 +3,25 @@
 //! Contract under test:
 //! - `add_business_days` is monotone in `n`: when `n` resolves, each `m < n`
 //!   resolves too.
-//! - `apply_skip_policy` does not panic, also at the `NaiveDate` range limits.
+//! - `apply_skip_policy` does not panic, also at the `jiff::civil::Date`
+//!   range limits.
 
 use std::collections::BTreeSet;
 
 use autumn_harvest::policy::SkipPolicy;
 use autumn_harvest::{add_business_days, apply_skip_policy};
-use chrono::{Days, NaiveDate};
 use proptest::prelude::*;
 
 use super::prop_config::config;
 
 /// The first date of the generated calendars.
-const fn origin() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+const fn origin() -> jiff::civil::Date {
+    jiff::civil::date(2026, 1, 1)
+}
+
+/// Returns `offset` days of elapsed time.
+fn days(offset: u64) -> jiff::SignedDuration {
+    autumn_harvest::time::days(i64::try_from(offset).unwrap())
 }
 
 /// Holiday closures as `(start offset, length)` pairs, in days from
@@ -25,11 +30,11 @@ fn closures() -> impl Strategy<Value = Vec<(u64, u64)>> {
     prop::collection::vec((0u64..120, 1u64..45), 0..4)
 }
 
-fn calendar(closures: &[(u64, u64)]) -> BTreeSet<NaiveDate> {
+fn calendar(closures: &[(u64, u64)]) -> BTreeSet<jiff::civil::Date> {
     closures
         .iter()
         .flat_map(|&(start, len)| start..start + len)
-        .map(|offset| origin() + Days::new(offset))
+        .map(|offset| origin() + days(offset))
         .collect()
 }
 
@@ -52,10 +57,8 @@ proptest! {
         n in 1u32..20,
     ) {
         let cal = calendar(&closures);
-        let anchor = (origin() + Days::new(anchor_offset))
-            .and_hms_opt(9, 0, 0)
-            .unwrap()
-            .and_utc();
+        let anchor = autumn_harvest::time::from_utc_datetime((origin() + days(anchor_offset)).at(9, 0, 0, 0))
+            .unwrap();
         if add_business_days(anchor, n, &cal).is_ok() {
             for m in 0..n {
                 prop_assert!(
@@ -66,7 +69,8 @@ proptest! {
         }
     }
 
-    /// The skip scan does not panic near `NaiveDate::MAX` or `NaiveDate::MIN`.
+    /// The skip scan does not panic near `jiff::civil::Date::MAX` or
+    /// `jiff::civil::Date::MIN`.
     /// The proptest harness makes a panic a failed case.
     #[test]
     fn apply_skip_policy_is_total_at_the_range_limits(
@@ -78,12 +82,12 @@ proptest! {
     ) {
         let at = |o: u64| {
             if near_max {
-                NaiveDate::MAX - Days::new(o)
+                jiff::civil::Date::MAX - days(o)
             } else {
-                NaiveDate::MIN + Days::new(o)
+                jiff::civil::Date::MIN + days(o)
             }
         };
-        let excluded: Vec<NaiveDate> = excluded_offsets.iter().map(|&o| at(o)).collect();
+        let excluded: Vec<jiff::civil::Date> = excluded_offsets.iter().map(|&o| at(o)).collect();
         let _ = apply_skip_policy(at(offset), policy, &excluded, exclude_weekends);
     }
 }

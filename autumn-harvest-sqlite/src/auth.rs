@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, params, params_from_iter};
 use uuid::Uuid;
@@ -131,7 +131,7 @@ pub struct NewDeadLetter<'a> {
     /// The raw message body.
     pub payload: &'a [u8],
     /// When the message was dead-lettered.
-    pub failed_at: DateTime<Utc>,
+    pub failed_at: Timestamp,
 }
 
 /// A token to store.
@@ -146,9 +146,9 @@ pub struct NewToken<'a> {
     /// `read`, `mutate` or `admin`.
     pub scope: &'a str,
     /// The mint time.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The expiry, if any.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// The actor that minted the token.
     pub created_by: &'a str,
     /// The tenant claim, if any.
@@ -180,13 +180,13 @@ pub struct StoredToken {
     /// `read`, `mutate` or `admin`.
     pub scope: String,
     /// The mint time.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The expiry, if any.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// The last use, if any. The write is best effort.
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<Timestamp>,
     /// The revocation time, if any.
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
     /// The actor that minted the token.
     pub created_by: String,
     /// The tenant claim, if any.
@@ -211,7 +211,7 @@ impl std::fmt::Debug for StoredToken {
 #[derive(Debug, Clone)]
 pub struct NewAuditRow<'a> {
     /// The time of the call.
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     /// Who made the call.
     pub actor: &'a str,
     /// The operation, for example `token.create`.
@@ -242,7 +242,7 @@ pub struct AuditRow {
     /// The row id. It is a UUID v7, so it sorts by time.
     pub id: Uuid,
     /// The time of the call.
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     /// Who made the call.
     pub actor: String,
     /// The operation.
@@ -281,9 +281,9 @@ pub struct AuditFilter {
     /// Only this status.
     pub status: Option<String>,
     /// Only rows at or after this time.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Only rows before this time.
-    pub before: Option<DateTime<Utc>>,
+    pub before: Option<Timestamp>,
     /// With `before`, also rows at `before` with a smaller id.
     pub before_id: Option<Uuid>,
     /// The most rows to read. It is clamped to 1 through [`MAX_AUDIT_PAGE`].
@@ -385,11 +385,11 @@ impl SqliteAuthStore {
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when the delete fails.
-    pub fn purge_audit_before(&self, cutoff: DateTime<Utc>) -> SqliteResult<usize> {
+    pub fn purge_audit_before(&self, cutoff: Timestamp) -> SqliteResult<usize> {
         self.with_conn(|conn| {
             Ok(conn.execute(
                 "DELETE FROM harvest_audit_log WHERE occurred_at_us < ?1",
-                params![cutoff.timestamp_micros()],
+                params![cutoff.as_microsecond()],
             )?)
         })
     }
@@ -397,7 +397,10 @@ impl SqliteAuthStore {
     /// Delete the audit rows that the retention no longer keeps.
     fn purge_expired_audit(&self) -> SqliteResult<()> {
         if let Some(days) = self.audit_retention_days {
-            let cutoff = Utc::now() - chrono::Duration::days(days);
+            // A cutoff before the jiff range saturates, so it deletes no row.
+            let cutoff = Timestamp::now()
+                .checked_sub(autumn_harvest::time::days(days))
+                .unwrap_or(Timestamp::MIN);
             let deleted = self.purge_audit_before(cutoff)?;
             if deleted > 0 {
                 tracing::info!(deleted, days, "harvest: purged expired audit rows");
@@ -423,8 +426,8 @@ impl SqliteAuthStore {
                     token.name,
                     token.token_hash,
                     token.scope,
-                    token.created_at.timestamp_micros(),
-                    token.expires_at.map(|at| at.timestamp_micros()),
+                    token.created_at.as_microsecond(),
+                    token.expires_at.map(jiff::Timestamp::as_microsecond),
                     token.created_by,
                     token.tenant,
                 ],
@@ -467,12 +470,12 @@ impl SqliteAuthStore {
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when the update fails.
-    pub fn revoke_token(&self, id: Uuid, now: DateTime<Utc>) -> SqliteResult<bool> {
+    pub fn revoke_token(&self, id: Uuid, now: Timestamp) -> SqliteResult<bool> {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 "UPDATE harvest_api_tokens SET revoked_at_us = ?2
                  WHERE id = ?1 AND revoked_at_us IS NULL",
-                params![id.to_string(), now.timestamp_micros()],
+                params![id.to_string(), now.as_microsecond()],
             )?;
             Ok(changed > 0)
         })
@@ -483,11 +486,11 @@ impl SqliteAuthStore {
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when the update fails.
-    pub fn touch_token(&self, id: Uuid, now: DateTime<Utc>) -> SqliteResult<()> {
+    pub fn touch_token(&self, id: Uuid, now: Timestamp) -> SqliteResult<()> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE harvest_api_tokens SET last_used_at_us = ?2 WHERE id = ?1",
-                params![id.to_string(), now.timestamp_micros()],
+                params![id.to_string(), now.as_microsecond()],
             )?;
             Ok(())
         })
@@ -509,7 +512,7 @@ impl SqliteAuthStore {
                 ),
                 params![
                     id.to_string(),
-                    row.occurred_at.timestamp_micros(),
+                    row.occurred_at.as_microsecond(),
                     row.actor,
                     row.operation,
                     row.target_type,
@@ -559,7 +562,7 @@ impl SqliteAuthStore {
                     row.detail,
                     row.attempts,
                     row.payload,
-                    row.failed_at.timestamp_micros(),
+                    row.failed_at.as_microsecond(),
                 ],
             )?;
             Ok(inserted > 0)
@@ -610,18 +613,18 @@ impl SqliteAuthStore {
         }
         if let Some(since) = filter.since {
             clauses.push("occurred_at_us >= ?");
-            values.push(SqlValue::Integer(since.timestamp_micros()));
+            values.push(SqlValue::Integer(since.as_microsecond()));
         }
         match (filter.before, filter.before_id) {
             (Some(before), Some(before_id)) => {
                 clauses.push("(occurred_at_us < ? OR (occurred_at_us = ? AND id < ?))");
-                values.push(SqlValue::Integer(before.timestamp_micros()));
-                values.push(SqlValue::Integer(before.timestamp_micros()));
+                values.push(SqlValue::Integer(before.as_microsecond()));
+                values.push(SqlValue::Integer(before.as_microsecond()));
                 values.push(SqlValue::Text(before_id.to_string()));
             }
             (Some(before), None) => {
                 clauses.push("occurred_at_us < ?");
-                values.push(SqlValue::Integer(before.timestamp_micros()));
+                values.push(SqlValue::Integer(before.as_microsecond()));
             }
             (None, _) => {}
         }
@@ -661,17 +664,8 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
     let expires_at: Option<i64> = row.get(5)?;
     let last_used_at: Option<i64> = row.get(6)?;
     let revoked_at: Option<i64> = row.get(7)?;
-    let decoded = (|| {
-        Ok((
-            parse_id(&id)?,
-            from_micros(created_at)?,
-            expires_at.map(from_micros).transpose()?,
-            last_used_at.map(from_micros).transpose()?,
-            revoked_at.map(from_micros).transpose()?,
-        ))
-    })();
-    let (id, created_at, expires_at, last_used_at, revoked_at) = match decoded {
-        Ok(fields) => fields,
+    let id = match parse_id(&id) {
+        Ok(id) => id,
         Err(error) => return Ok(Err(error)),
     };
     Ok(Ok(StoredToken {
@@ -679,10 +673,10 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
         name: row.get(1)?,
         token_hash: row.get(2)?,
         scope: row.get(3)?,
-        created_at,
-        expires_at,
-        last_used_at,
-        revoked_at,
+        created_at: from_micros(created_at),
+        expires_at: expires_at.map(from_micros),
+        last_used_at: last_used_at.map(from_micros),
+        revoked_at: revoked_at.map(from_micros),
         created_by: row.get(8)?,
         tenant: row.get(9)?,
     }))
@@ -693,13 +687,13 @@ fn read_token(row: &Row<'_>) -> rusqlite::Result<SqliteResult<StoredToken>> {
 fn read_audit(row: &Row<'_>) -> rusqlite::Result<SqliteResult<AuditRow>> {
     let id: String = row.get(0)?;
     let occurred_at: i64 = row.get(1)?;
-    let (id, occurred_at) = match (parse_id(&id), from_micros(occurred_at)) {
-        (Ok(id), Ok(occurred_at)) => (id, occurred_at),
-        (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
+    let id = match parse_id(&id) {
+        Ok(id) => id,
+        Err(error) => return Ok(Err(error)),
     };
     Ok(Ok(AuditRow {
         id,
-        occurred_at,
+        occurred_at: from_micros(occurred_at),
         actor: row.get(2)?,
         operation: row.get(3)?,
         target_type: row.get(4)?,
@@ -718,25 +712,26 @@ fn parse_id(raw: &str) -> SqliteResult<Uuid> {
     Uuid::parse_str(raw).map_err(|_| SqliteError::Corrupt(format!("a stored id {raw:?}")))
 }
 
-fn from_micros(micros: i64) -> SqliteResult<DateTime<Utc>> {
-    DateTime::from_timestamp_micros(micros)
-        .ok_or_else(|| SqliteError::Corrupt(format!("a stored time {micros}")))
+/// Reads a stored time. A value past the jiff range clamps to its end, so
+/// a row that `chrono` wrote still loads.
+fn from_micros(micros: i64) -> Timestamp {
+    autumn_harvest::time::from_microsecond_clamped(micros)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use jiff::{SignedDuration, Timestamp};
 
     fn store() -> SqliteAuthStore {
         SqliteAuthStore::open_in_memory().unwrap()
     }
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_800_000_000 + seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + seconds).unwrap()
     }
 
-    fn token<'a>(name: &'a str, hash: &'a str, created_at: DateTime<Utc>) -> NewToken<'a> {
+    fn token<'a>(name: &'a str, hash: &'a str, created_at: Timestamp) -> NewToken<'a> {
         NewToken {
             id: Uuid::new_v4(),
             name,
@@ -749,7 +744,7 @@ mod tests {
         }
     }
 
-    fn audit<'a>(actor: &'a str, operation: &'a str, at: DateTime<Utc>) -> NewAuditRow<'a> {
+    fn audit<'a>(actor: &'a str, operation: &'a str, at: Timestamp) -> NewAuditRow<'a> {
         NewAuditRow {
             occurred_at: at,
             actor,
@@ -968,7 +963,7 @@ mod tests {
         let newest = store
             .list_audit(&AuditFilter {
                 limit: 1,
-                since: Some(at(0) - Duration::seconds(1)),
+                since: Some(at(0) - SignedDuration::from_secs(1)),
                 ..AuditFilter::default()
             })
             .unwrap();
@@ -985,10 +980,12 @@ mod tests {
     fn the_retention_purges_at_open_and_after_each_batch_of_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.db");
-        let old = Utc::now() - Duration::days(10);
+        let old = Timestamp::now() - autumn_harvest::time::days(10);
         let store = SqliteAuthStore::open(&path).unwrap();
         store.insert_audit(&audit("a", "old", old)).unwrap();
-        store.insert_audit(&audit("a", "new", Utc::now())).unwrap();
+        store
+            .insert_audit(&audit("a", "new", Timestamp::now()))
+            .unwrap();
         drop(store);
 
         let ops = |store: &SqliteAuthStore| -> Vec<String> {
@@ -1012,14 +1009,18 @@ mod tests {
 
         // The write that ends a batch of `PURGE_EVERY` runs the purge.
         for _ in 0..PURGE_EVERY - 2 {
-            store.insert_audit(&audit("a", "fill", Utc::now())).unwrap();
+            store
+                .insert_audit(&audit("a", "fill", Timestamp::now()))
+                .unwrap();
         }
         store.insert_audit(&audit("a", "late", old)).unwrap();
         assert!(
             ops(&store).contains(&"late".to_owned()),
             "before the batch ends"
         );
-        store.insert_audit(&audit("a", "end", Utc::now())).unwrap();
+        store
+            .insert_audit(&audit("a", "end", Timestamp::now()))
+            .unwrap();
         assert!(
             !ops(&store).contains(&"late".to_owned()),
             "the batch purges it"

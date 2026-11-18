@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionFilter, ExecutionSummary, RunState, SqliteRuntime};
 use common::{ScriptedModel, answer, runtime};
+use jiff::Timestamp;
 use serde_json::json;
 
 const OLD: &str = "You are the old prompt.";
@@ -322,9 +322,9 @@ async fn a_reload_books_the_new_heartbeat() {
         Arc::new(AgentHarness::new(model(0)).agent(profile)),
     );
     reload(&mut rt, &agent);
-    let before = Utc::now().timestamp_millis();
+    let before = Timestamp::now().as_millisecond();
     sqlite::drive(&mut rt, &agent).await.unwrap();
-    let after = Utc::now().timestamp_millis();
+    let after = Timestamp::now().as_millisecond();
     let state = state(&rt, &agent).await;
     assert_eq!(state.failures, 0, "{:?}", state.last_error);
     assert_eq!(runs(&rt, &agent).len(), 2, "the reload ended the first run");
@@ -536,9 +536,9 @@ async fn a_reload_rebooks_a_changed_heartbeat() {
         Arc::new(AgentHarness::new(model(0)).agent(profile)),
     );
     reload(&mut rt, &agent);
-    let before = Utc::now().timestamp_millis();
+    let before = Timestamp::now().as_millisecond();
     sqlite::drive(&mut rt, &agent).await.unwrap();
-    let after = Utc::now().timestamp_millis();
+    let after = Timestamp::now().as_millisecond();
     let booked = state(&rt, &agent)
         .await
         .next_heartbeat_ms

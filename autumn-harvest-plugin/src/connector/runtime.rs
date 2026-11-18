@@ -28,7 +28,7 @@
 //! runtime naturally stops pulling faster than harvest can absorb.
 
 use autumn_harvest::telemetry::{ConnectorOutcome, MetricsRecorder, PoisonReason};
-use chrono::Utc;
+use jiff::Timestamp;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -1379,7 +1379,7 @@ impl ConnectorRuntime {
             // operator it had been retried twice when it never was.
             attempts: i32::try_from(attempts.max(1)).unwrap_or(i32::MAX),
             payload: message.payload.clone(),
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
         }
     }
 

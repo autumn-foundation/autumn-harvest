@@ -29,7 +29,7 @@
 //! - [`WorkflowContext::time_until_deadline`] — remaining time to the nominal
 //!   deadline, measured against the replay-safe recorded clock
 //!   ([`WorkflowContext::system_now`], issue #384), **never**
-//!   `chrono::Utc::now()`.
+//!   `jiff::Timestamp::now()`.
 //!
 //! Contract: when `should_continue_as_new()` returns `true`, the workflow **must**
 //! call `continue_as_new` (as below) rather than continue running.
@@ -128,7 +128,7 @@ mod tests {
     use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
     use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
     use autumn_harvest::types::ExecutionId;
-    use chrono::{DateTime, Duration, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use serde_json::{Value, json};
 
     /// AC4 — opt-in-safe: a live run WITHOUT an execution timeout behaves exactly
@@ -171,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn entity_with_a_far_deadline_still_completes_normally() {
         let outcome = WorkflowTestEnv::new()
-            .with_execution_timeout(Duration::hours(24))
+            .with_execution_timeout(SignedDuration::from_hours(24))
             .run(
                 subscription_entity_info().handler,
                 json!(SubState { cycles: 0 }),
@@ -188,10 +188,10 @@ mod tests {
     /// consumed ~90% of a 30s budget when it checked `should_continue_as_new()`.
     #[tokio::test]
     async fn crossed_deadline_replays_to_continue_as_new() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ the deadline branch tripped
         // and the run forked, carrying its state forward.
-        let recorded_now = t0 + Duration::seconds(27);
+        let recorded_now = t0 + SignedDuration::from_secs(27);
         let state = json!(SubState { cycles: 7 });
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -206,7 +206,7 @@ mod tests {
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Now,
                 name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-                value: json!(recorded_now.timestamp_millis()),
+                value: json!(recorded_now.as_millisecond()),
             },
             // The checkpoint fork carrying the state forward.
             WorkflowEvent::WorkflowContinuedAsNew {
@@ -219,7 +219,7 @@ mod tests {
         ];
 
         let report = WorkflowReplayer::new()
-            .with_execution_timeout(Duration::seconds(30))
+            .with_execution_timeout(SignedDuration::from_secs(30))
             .register_fn("subscription_entity", subscription_entity_info().handler)
             .replay_from_events(events)
             .await;
@@ -235,7 +235,7 @@ mod tests {
     /// pure, event-free read of the recorded start clock.
     #[test]
     fn deadline_helpers_are_pure_and_event_free() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = WorkflowContext::for_replay(
             ExecutionId::new(),
             vec![WorkflowEvent::WorkflowStarted {
@@ -246,12 +246,12 @@ mod tests {
                 scheduled_time: None,
             }],
         )
-        .with_execution_timeout(Some(Duration::hours(2)));
+        .with_execution_timeout(Some(SignedDuration::from_hours(2)));
 
-        assert_eq!(ctx.deadline(), Some(t0 + Duration::hours(2)));
+        assert_eq!(ctx.deadline(), Some(t0 + SignedDuration::from_hours(2)));
         // deadline() records nothing.
         assert!(ctx.drain_commands().is_empty());
         // Sanity: the wall-clock instant used above is a valid timestamp.
-        let _ = Utc::now();
+        let _ = Timestamp::now();
     }
 }

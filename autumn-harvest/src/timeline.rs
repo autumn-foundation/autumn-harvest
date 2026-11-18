@@ -94,7 +94,6 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::event::WorkflowEvent;
@@ -109,7 +108,7 @@ use crate::types::{ActivityExecId, ExecutionId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEventRow {
     /// The `harvest_events.timestamp` of the row that stored this event.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: jiff::Timestamp,
     /// The recorded workflow event.
     pub event: WorkflowEvent,
 }
@@ -177,9 +176,9 @@ pub struct TimelineStep {
     /// where not applicable (e.g. an unnamed side effect).
     pub name: Option<String>,
     /// When the unit was scheduled/started, from the scheduling event's row.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: jiff::Timestamp,
     /// When the unit reached a terminal state; `None` while still open.
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<jiff::Timestamp>,
     /// `ended_at - scheduled_at` in ms (to "now" for open steps), clamped `>= 0`.
     pub total_ms: i64,
     /// Queue-wait split (`start_ts - scheduled_at`); `Some` only when a start
@@ -280,9 +279,9 @@ pub struct Timeline {
 #[must_use]
 pub fn derive_timeline(
     rows: &[TimelineEventRow],
-    started_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    started_at: jiff::Timestamp,
+    now: jiff::Timestamp,
+    completed_at: Option<jiff::Timestamp>,
     exec_id: String,
     workflow_id: String,
     workflow_name: String,
@@ -350,14 +349,14 @@ impl std::hash::Hash for AccKey {
 /// This is a wide dispatch match over the event variants that map to timeline
 /// steps; all other events are ignored.
 #[allow(clippy::too_many_lines)]
-fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> {
+fn build_accs(rows: &[TimelineEventRow], started_at: jiff::Timestamp) -> Vec<Acc> {
     // `keyed` maps a stable key → index into `accs`; `accs` preserves first
     // appearance so the final ordering can break `scheduled_at` ties stably.
     let mut accs: Vec<Acc> = Vec::new();
     let mut keyed: std::collections::HashMap<AccKey, usize> = std::collections::HashMap::new();
 
     // Timestamp of the previous recorded row, for signal-wait measurement.
-    let mut prev_ts: Option<DateTime<Utc>> = None;
+    let mut prev_ts: Option<jiff::Timestamp> = None;
 
     // Timers are paired by OCCURRENCE, not whole-history dedup: the idiomatic
     // poll-loop reuses a constant `timer_id` (`ctx.timer("poll", 60)` per
@@ -621,8 +620,8 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
 /// Aggregate the finalized steps into a [`TimelineRollup`].
 fn compute_rollup(
     steps: &[TimelineStep],
-    clock_end: DateTime<Utc>,
-    started_at: DateTime<Utc>,
+    clock_end: jiff::Timestamp,
+    started_at: jiff::Timestamp,
 ) -> TimelineRollup {
     let mut busy_ms: i64 = 0;
     let mut wait_ms: i64 = 0;
@@ -671,7 +670,7 @@ fn compute_rollup(
     }
 
     TimelineRollup {
-        total_wall_clock_ms: (clock_end - started_at).num_milliseconds().max(0),
+        total_wall_clock_ms: crate::time::num_milliseconds(clock_end - started_at).max(0),
         busy_ms,
         wait_ms,
         slowest_step: slowest,
@@ -681,8 +680,8 @@ fn compute_rollup(
 
 /// Non-negative milliseconds from `a` to `b` (clamped at 0 to tolerate clock
 /// skew / out-of-order timestamps).
-fn ms_between(a: DateTime<Utc>, b: DateTime<Utc>) -> i64 {
-    (b - a).num_milliseconds().max(0)
+fn ms_between(a: jiff::Timestamp, b: jiff::Timestamp) -> i64 {
+    crate::time::num_milliseconds(b - a).max(0)
 }
 
 /// Insert a freshly-scheduled accumulator under `key` iff none exists yet,
@@ -712,11 +711,11 @@ fn lookup_mut<'a>(
 struct Acc {
     step_kind: StepKind,
     name: Option<String>,
-    scheduled_at: DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
     first_index: usize,
     /// Only meaningful for regular activities: the last recorded start instant.
-    start_ts: Option<DateTime<Utc>>,
-    ended_at: Option<DateTime<Utc>>,
+    start_ts: Option<jiff::Timestamp>,
+    ended_at: Option<jiff::Timestamp>,
     outcome: Option<StepOutcome>,
     max_failed_attempt: Option<i32>,
     /// `ActivityStarted` events seen. A completed or timed-out step reports at
@@ -732,7 +731,7 @@ impl Acc {
     const fn scheduled(
         step_kind: StepKind,
         name: Option<String>,
-        scheduled_at: DateTime<Utc>,
+        scheduled_at: jiff::Timestamp,
         first_index: usize,
         split_applicable: bool,
         retrying: bool,
@@ -767,12 +766,12 @@ impl Acc {
     }
 
     /// Mark this step terminated (last-writer-wins).
-    const fn close(&mut self, ended_at: DateTime<Utc>, outcome: StepOutcome) {
+    const fn close(&mut self, ended_at: jiff::Timestamp, outcome: StepOutcome) {
         self.ended_at = Some(ended_at);
         self.outcome = Some(outcome);
     }
 
-    fn finalize(self, clock_end: DateTime<Utc>) -> TimelineStep {
+    fn finalize(self, clock_end: jiff::Timestamp) -> TimelineStep {
         let (ended_at, outcome) = match self.outcome {
             Some(o) => (self.ended_at, o),
             None => (None, StepOutcome::Pending),
@@ -818,15 +817,15 @@ mod tests {
     use super::*;
     use crate::event::SideEffectKind;
     use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
-    use chrono::{Duration, TimeZone};
+    use jiff::SignedDuration;
 
     /// Base instant; step timestamps are `base + ms`.
-    fn base() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    fn base() -> jiff::Timestamp {
+        crate::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap()
     }
 
-    fn at(ms: i64) -> DateTime<Utc> {
-        base() + Duration::milliseconds(ms)
+    fn at(ms: i64) -> jiff::Timestamp {
+        base() + SignedDuration::from_millis(ms)
     }
 
     fn row(ms: i64, event: WorkflowEvent) -> TimelineEventRow {

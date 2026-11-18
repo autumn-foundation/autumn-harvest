@@ -19,6 +19,7 @@
 //!   - leave the task row exactly as `"thief"` left it (state and
 //!     `worker_id` both unchanged).
 
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::dlq::DeadLetterReason;
@@ -36,9 +37,9 @@ use autumn_harvest::worker::{
     persist_workflow_failure,
 };
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -132,7 +133,7 @@ async fn seed_execution(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -154,7 +155,7 @@ async fn seed_workflow(
     let exec_id = seed_execution(conn, workflow_name, input.clone()).await;
     let mut params = EnqueueParams::new(queue_name, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -178,7 +179,7 @@ async fn seed_claimed_task(
     .set((
         harvest_task_queue::state.eq("RUNNING"),
         harvest_task_queue::worker_id.eq(Some(worker_id)),
-        harvest_task_queue::started_at.eq(Some(Utc::now())),
+        harvest_task_queue::started_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await

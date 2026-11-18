@@ -69,14 +69,14 @@ async fn seed_worker(
     worker_id: &str,
     build_id: &str,
     status: &str,
-    heartbeat_age: chrono::Duration,
+    heartbeat_age: jiff::SignedDuration,
 ) {
-    let heartbeat_at = chrono::Utc::now() - heartbeat_age;
+    let heartbeat_at = jiff::Timestamp::now() - heartbeat_age;
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workers \
              (worker_id, max_concurrency, host, build_id, status, last_heartbeat_at) \
          VALUES ('{worker_id}', 4, 'h', '{build_id}', '{status}', '{}')",
-        heartbeat_at.to_rfc3339(),
+        autumn_harvest::time::rfc3339(heartbeat_at),
     ))
     .await
     .expect("seed worker");
@@ -112,7 +112,7 @@ async fn all_build_reachability_agrees_with_the_per_build_helper() {
         &format!("w_{build_open}"),
         &build_open,
         "Active",
-        chrono::Duration::seconds(5),
+        jiff::SignedDuration::from_secs(5),
     )
     .await;
 
@@ -130,7 +130,7 @@ async fn all_build_reachability_agrees_with_the_per_build_helper() {
         &format!("w_{build_retired}"),
         &build_retired,
         "Active",
-        chrono::Duration::seconds(600),
+        jiff::SignedDuration::from_secs(600),
     )
     .await;
 
@@ -140,7 +140,7 @@ async fn all_build_reachability_agrees_with_the_per_build_helper() {
         &format!("w_{build_worker_only}"),
         &build_worker_only,
         "Active",
-        chrono::Duration::seconds(1),
+        jiff::SignedDuration::from_secs(1),
     )
     .await;
 

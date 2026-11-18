@@ -37,10 +37,10 @@ use autumn_harvest::{
     UpdateWithStartParams, signal_with_start_workflow_execution_with_metrics,
     start_or_load_workflow_execution, tick_once, update_with_start_workflow_execution_with_metrics,
 };
-use chrono::Utc;
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -345,11 +345,12 @@ async fn throttle_rows_for(conn: &mut AsyncPgConnection, workflow_id: &str) -> i
 async fn throttle_deferred_at_for(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
-) -> chrono::DateTime<Utc> {
+) -> jiff::Timestamp {
     #[derive(diesel::QueryableByName)]
     struct DeferredRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        deferred_at: chrono::DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        deferred_at: jiff::Timestamp,
     }
     diesel::sql_query("SELECT deferred_at FROM harvest_start_throttle WHERE workflow_id = $1")
         .bind::<Text, _>(workflow_id)
@@ -397,7 +398,7 @@ fn fleet_cache(reason: &str) -> Arc<AdmissionGateCache> {
         reason: reason.to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     cache
@@ -411,7 +412,7 @@ fn scoped_cache(scope: GateScope) -> Arc<AdmissionGateCache> {
         reason: "scoped-incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     cache
@@ -1077,7 +1078,7 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
          (before={deferred_before}, after={deferred_after})"
     );
     assert!(
-        deferred_after > Utc::now(),
+        deferred_after > Timestamp::now(),
         "the backed-off deferred_at is now in the future (behind newly-arriving un-gated rows)"
     );
     assert_eq!(

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{PurgePolicy, RunState, SqliteError, SqliteRuntime};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
 #[workflow]
@@ -54,8 +54,8 @@ async fn finish(rt: &mut SqliteRuntime, workflow: &str) -> autumn_harvest::Execu
 }
 
 /// Two hours from now, so a run closed now is two hours old.
-fn two_hours_on() -> chrono::DateTime<Utc> {
-    Utc::now() + chrono::Duration::hours(2)
+fn two_hours_on() -> jiff::Timestamp {
+    Timestamp::now() + jiff::SignedDuration::from_hours(2)
 }
 
 fn gone(rt: &SqliteRuntime, exec: autumn_harvest::ExecutionId) -> bool {

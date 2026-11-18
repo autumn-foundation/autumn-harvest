@@ -34,10 +34,10 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -316,7 +316,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -328,7 +328,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
 
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -456,7 +456,7 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     );
     assert_eq!(
         task.start_to_close,
-        Some(chrono::Duration::from_std(DEFAULT_ACTIVITY_START_TO_CLOSE).unwrap()),
+        Some(jiff::SignedDuration::try_from(DEFAULT_ACTIVITY_START_TO_CLOSE).unwrap()),
         "the task row must carry the shipped default"
     );
     timeout::enforce_timeouts_once(
@@ -574,7 +574,7 @@ async fn declared_start_to_close_wins_over_the_default() {
     let task = running_row_under_default(hang_info("hang_stc", Some(stc), None, None)).await;
     assert_eq!(
         task.start_to_close,
-        Some(chrono::Duration::from_std(stc).unwrap())
+        Some(jiff::SignedDuration::try_from(stc).unwrap())
     );
 }
 
@@ -586,7 +586,7 @@ async fn heartbeat_timeout_activity_skips_the_default() {
     assert_eq!(task.start_to_close, None);
     assert_eq!(
         task.heartbeat_timeout,
-        Some(chrono::Duration::from_std(hb).unwrap())
+        Some(jiff::SignedDuration::try_from(hb).unwrap())
     );
 }
 

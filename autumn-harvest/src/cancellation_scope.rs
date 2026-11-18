@@ -1103,7 +1103,7 @@ impl WorkflowContext {
 mod tests {
     use std::time::Duration;
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::{Value, json};
 
     use crate::context::{WorkflowCommand, WorkflowContext};
@@ -1114,7 +1114,7 @@ mod tests {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

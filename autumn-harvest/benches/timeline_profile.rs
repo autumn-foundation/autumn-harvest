@@ -52,11 +52,11 @@
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 use autumn_harvest::{TimelineEventRow, derive_timeline};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
-fn now() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::new(1_800_000_000, 0).unwrap()
 }
 
 /// A representative per-activity input/output record — small enough to be
@@ -77,7 +77,7 @@ const ACTIVITY_NAMES: [&str; 4] = [
 ];
 const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
 
-const fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow {
+const fn row(timestamp: Timestamp, event: WorkflowEvent) -> TimelineEventRow {
     TimelineEventRow { timestamp, event }
 }
 
@@ -95,11 +95,11 @@ const fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow
 /// history outlast a hardcoded horizon. Its events are then in the "future"
 /// of the clock that the timeline is derived against.
 #[allow(clippy::too_many_lines, reason = "one straight-line event list")]
-fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, DateTime<Utc>) {
+fn build_workload(n: usize, start: Timestamp) -> (Vec<TimelineEventRow>, Timestamp) {
     let mut rows: Vec<TimelineEventRow> = Vec::new();
     let mut t = start;
     let mut tick = || {
-        t += chrono::Duration::milliseconds(50);
+        t += jiff::SignedDuration::from_millis(50);
         t
     };
     let worker = WorkerId::new("worker-a");
@@ -318,7 +318,7 @@ fn main() {
     let (rows, last_event_ts) = build_workload(n, start);
     // Always after every generated event, however large TIMELINE_PROFILE_N
     // gets -- see build_workload's doc comment.
-    let now_ts = last_event_ts + chrono::Duration::hours(1);
+    let now_ts = last_event_ts + jiff::SignedDuration::from_hours(1);
 
     // Sanity-check the fixture once, unmeasured. The timeline must contain
     // both open and closed steps in every category. Otherwise this harness

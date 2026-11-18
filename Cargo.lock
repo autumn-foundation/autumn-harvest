@@ -73,11 +73,11 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
  "deadpool",
  "diesel",
  "diesel-async",
+ "jiff 1.0.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -430,8 +430,8 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
+ "jiff 1.0.1",
  "proptest",
  "rustix",
  "serde",
@@ -454,8 +454,6 @@ dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-macros",
  "base64 0.23.1",
- "chrono",
- "chrono-tz",
  "criterion",
  "croner 4.0.3",
  "deadpool",
@@ -467,6 +465,8 @@ dependencies = [
  "futures",
  "ghash",
  "hmac 0.13.0",
+ "jiff 1.0.1",
+ "jiff-diesel",
  "libc",
  "loom",
  "lru 0.19.0",
@@ -515,12 +515,13 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
  "base64 0.23.1",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
  "flate2",
  "futures",
+ "jiff 1.0.1",
+ "jiff-diesel",
  "proptest",
  "reqwest",
  "rusqlite",
@@ -543,11 +544,11 @@ name = "autumn-harvest-cli"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "clap",
  "crossterm",
  "diesel-async",
  "futures",
+ "jiff 1.0.1",
  "percent-encoding",
  "ratatui",
  "reqwest",
@@ -568,10 +569,10 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
+ "jiff 1.0.1",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
@@ -604,13 +605,14 @@ dependencies = [
  "aws-sdk-sqs",
  "base64 0.23.1",
  "chrono",
- "chrono-tz",
  "deadpool",
  "diesel",
  "diesel-async",
  "diesel_migrations",
  "ed25519-dalek 3.0.0",
  "futures",
+ "jiff 1.0.1",
+ "jiff-diesel",
  "jsonwebtoken",
  "matchit 0.9.2",
  "maud",
@@ -643,10 +645,11 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
+ "jiff 1.0.1",
+ "jiff-diesel",
  "rcgen",
  "redis",
  "rustls",
@@ -675,7 +678,7 @@ name = "autumn-harvest-sqlite"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
+ "jiff 1.0.1",
  "rusqlite",
  "serde",
  "serde_json",
@@ -692,8 +695,8 @@ name = "autumn-harvest-verify"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "clap",
+ "jiff 1.0.1",
  "proc-macro2",
  "serde",
  "serde_json",
@@ -1755,7 +1758,6 @@ version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
- "arbitrary",
  "iana-time-zone",
  "js-sys",
  "num-traits",
@@ -3767,9 +3769,9 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
  "diesel",
  "diesel-async",
+ "jiff 1.0.1",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -4284,9 +4286,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ac703058abac89e5c39b0b879dce2b6b14a4ba36600c7e7e3d0c60a6883ef3c"
 dependencies = [
  "defmt",
- "jiff-core",
- "jiff-static",
- "jiff-tzdb-platform",
+ "jiff-core 0.1.2",
+ "jiff-static 0.2.39",
+ "jiff-tzdb-platform 0.1.3",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "windows-link",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5d126d72eb017f10b302e73bdeca446bea405ee449af4d9e7866d6b082d83e"
+dependencies = [
+ "arbitrary",
+ "jiff-core 1.0.1",
+ "jiff-static 1.0.1",
+ "jiff-tzdb 1.0.0",
+ "jiff-tzdb-platform 1.0.0",
  "log",
  "portable-atomic",
  "portable-atomic-util",
@@ -4305,15 +4325,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+dependencies = [
+ "arbitrary",
+ "log",
+]
+
+[[package]]
+name = "jiff-diesel"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6b5ecd45a915436964f1bc65d62b1a32e9212dc10bf3af42ab051cfcfb5e0ee"
+dependencies = [
+ "diesel",
+ "jiff 1.0.1",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dc32470c67eb7d0e9ccb74303fa925313dc04cecb1aa048beaa6f391e36a93d"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.2",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0127e9bde3c6130d6169e7d8d68676e4be69c4bf7573c308b6f960a5089c428"
+dependencies = [
+ "jiff-core 1.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4323,12 +4375,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
 
 [[package]]
+name = "jiff-tzdb"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e71a1b68a875a44a33bb7a1dd84392cb77145a3367a552a3cfe6a4f5cf3afc"
+
+[[package]]
 name = "jiff-tzdb-platform"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
- "jiff-tzdb",
+ "jiff-tzdb 0.1.9",
+]
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc65b284afcfa8f6cf189c7274c805505314a7ab975c60e1f548bff56525420e"
+dependencies = [
+ "jiff-tzdb 1.0.0",
 ]
 
 [[package]]
@@ -6147,8 +6214,8 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
+ "jiff 1.0.1",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -6411,7 +6478,7 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
+ "jiff 1.0.1",
  "rhai",
  "rusqlite",
  "serde",
@@ -6656,7 +6723,7 @@ name = "saga-choreography"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
+ "jiff 1.0.1",
  "serde_json",
  "tokio",
 ]
@@ -6953,7 +7020,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.39",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
@@ -7674,7 +7741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -14,7 +14,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
 use autumn_harvest::types::ActivityExecId;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ async fn bound_etl_history_replays_successfully() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -298,7 +298,7 @@ async fn bound_etl_replay_sweep_1000() {
         let mut history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -391,7 +391,7 @@ async fn merged_three_source_replay_sweep_1000() {
         let mut history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -582,7 +582,7 @@ async fn bound_to_failed_upstream_yields_null() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

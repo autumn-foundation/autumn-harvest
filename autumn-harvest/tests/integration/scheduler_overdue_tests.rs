@@ -19,12 +19,13 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_OVERDUE, MetricsRecorder};
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -110,9 +111,9 @@ async fn insert_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
     schedule_expr: &str,
-    next_run_at: DateTime<Utc>,
+    next_run_at: Timestamp,
     is_paused: bool,
-    exhausted_at: Option<DateTime<Utc>>,
+    exhausted_at: Option<Timestamp>,
     max_active_runs: i32,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -126,13 +127,13 @@ async fn insert_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(max_active_runs),
             dsl::is_paused.eq(is_paused),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(exhausted_at),
+            dsl::exhausted_at.eq(exhausted_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -158,13 +159,13 @@ async fn insert_running_execution(conn: &mut AsyncPgConnection, wf_name: &str) {
 async fn insert_schedule_bounded(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
-    next_run_at: DateTime<Utc>,
+    next_run_at: Timestamp,
     max_active_runs: i32,
     overlap_policy: &str,
     catchup: bool,
     max_runs: Option<i32>,
     runs_started: i32,
-    end_at: Option<DateTime<Utc>>,
+    end_at: Option<Timestamp>,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let id = Uuid::new_v4();
@@ -177,16 +178,16 @@ async fn insert_schedule_bounded(
             dsl::catchup.eq(catchup),
             dsl::max_active_runs.eq(max_active_runs),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq(overlap_policy),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick has not stamped it
+            dsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>), // NULL — tick has not stamped it
             dsl::max_runs.eq(max_runs),
             dsl::runs_started.eq(runs_started),
-            dsl::end_at.eq(end_at),
+            dsl::end_at.eq(end_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -201,7 +202,7 @@ async fn insert_schedule_bounded(
 async fn insert_calendar_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
-    next_run_at: DateTime<Utc>,
+    next_run_at: Timestamp,
     calendar_name: Option<&str>,
     skip_policy: &str,
 ) -> Uuid {
@@ -216,7 +217,7 @@ async fn insert_calendar_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -255,13 +256,13 @@ fn metric_constant_schedule_overdue_is_defined() {
 #[tokio::test]
 async fn wedged_schedule_is_reported_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // interval:60 => grace = 60 + 0 + 1 = 61s. 200s past its slot => overdue.
     insert_schedule(
         &mut conn,
         "wedged_wf",
         "interval:60",
-        now - chrono::Duration::seconds(200),
+        now - jiff::SignedDuration::from_secs(200),
         false,
         None,
         10,
@@ -286,13 +287,13 @@ async fn wedged_schedule_is_reported_overdue() {
 #[tokio::test]
 async fn healthy_paused_exhausted_are_not_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Healthy: just fired, well within grace.
     insert_schedule(
         &mut conn,
         "healthy_wf",
         "interval:60",
-        now - chrono::Duration::seconds(10),
+        now - jiff::SignedDuration::from_secs(10),
         false,
         None,
         10,
@@ -303,7 +304,7 @@ async fn healthy_paused_exhausted_are_not_overdue() {
         &mut conn,
         "paused_wf",
         "interval:60",
-        now - chrono::Duration::seconds(5000),
+        now - jiff::SignedDuration::from_secs(5000),
         true,
         None,
         10,
@@ -314,7 +315,7 @@ async fn healthy_paused_exhausted_are_not_overdue() {
         &mut conn,
         "exhausted_wf",
         "interval:60",
-        now - chrono::Duration::seconds(5000),
+        now - jiff::SignedDuration::from_secs(5000),
         false,
         Some(now),
         10,
@@ -336,14 +337,14 @@ async fn healthy_paused_exhausted_are_not_overdue() {
 #[tokio::test]
 async fn at_capacity_schedule_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
     // catchup is the tick's DEFERRING config. So at-capacity holds next_run_at
     // in the past, and the predicate suppresses.
     insert_schedule_bounded(
         &mut conn,
         "busy_wf",
-        now - chrono::Duration::seconds(5000),
+        now - jiff::SignedDuration::from_secs(5000),
         1,      // max_active_runs = 1
         "skip", // deferring policy
         true,   // catchup
@@ -371,12 +372,12 @@ async fn at_capacity_schedule_is_not_overdue() {
 #[tokio::test]
 async fn overdue_schedule_samples_reports_lag() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     insert_schedule(
         &mut conn,
         "lag_wf",
         "interval:60",
-        now - chrono::Duration::seconds(300),
+        now - jiff::SignedDuration::from_secs(300),
         false,
         None,
         10,
@@ -409,13 +410,13 @@ async fn overdue_schedule_samples_reports_lag() {
 #[tokio::test]
 async fn backfill_in_progress_does_not_flag_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Healthy: just fired, within grace. next_run_at is NOT touched by backfill.
     insert_schedule(
         &mut conn,
         "backfill_wf",
         "interval:60",
-        now - chrono::Duration::seconds(10),
+        now - jiff::SignedDuration::from_secs(10),
         false,
         None,
         10,
@@ -448,13 +449,13 @@ async fn backfill_in_progress_does_not_flag_overdue() {
 #[tokio::test]
 async fn throttle_pending_at_capacity_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Stale next_run_at that WOULD be overdue if the schedule were free. Skip +
     // catchup so the tick defers and at-capacity suppresses.
     insert_schedule_bounded(
         &mut conn,
         "throttled_wf",
-        now - chrono::Duration::seconds(5000),
+        now - jiff::SignedDuration::from_secs(5000),
         1,      // max_active_runs = 1
         "skip", // deferring policy
         true,   // catchup
@@ -487,11 +488,11 @@ async fn throttle_pending_at_capacity_is_not_overdue() {
 #[tokio::test]
 async fn bounded_out_by_max_runs_with_null_exhausted_at_is_not_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     insert_schedule_bounded(
         &mut conn,
         "budget_wf",
-        now - chrono::Duration::seconds(5000), // stale (would be overdue if active)
+        now - jiff::SignedDuration::from_secs(5000), // stale (would be overdue if active)
         10,
         "skip",
         false,
@@ -522,15 +523,15 @@ async fn bounded_out_by_max_runs_with_null_exhausted_at_is_not_overdue() {
 #[tokio::test]
 async fn non_deferring_policy_at_capacity_is_overdue() {
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // CancelOther cancels + proceeds (advances next_run_at); it never retains.
     insert_schedule_bounded(
         &mut conn,
         "cancel_wf",
-        now - chrono::Duration::seconds(5000), // stale
-        1,                                     // max_active_runs = 1
-        "cancel_other",                        // NON-deferring policy
-        true,                                  // catchup on, but cancel_other still advances
+        now - jiff::SignedDuration::from_secs(5000), // stale
+        1,                                           // max_active_runs = 1
+        "cancel_other",                              // NON-deferring policy
+        true,                                        // catchup on, but cancel_other still advances
         None,
         0,
         None,
@@ -564,8 +565,8 @@ async fn calendar_deferred_weekend_schedule_is_not_overdue_via_sampler() {
     // Fixed weekend so the rebase is deterministic:
     //   2026-01-03 = Sat, 2026-01-04 = Sun, 2026-01-05 = Mon.
     // Slot on Sat midnight; run_next_business_day → Mon 2026-01-05 00:00 (future).
-    let sat_slot: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().expect("sat slot");
-    let now: DateTime<Utc> = "2026-01-04T12:00:00Z".parse().expect("now (sun)");
+    let sat_slot: Timestamp = "2026-01-03T00:00:00Z".parse().expect("sat slot");
+    let now: Timestamp = "2026-01-04T12:00:00Z".parse().expect("now (sun)");
 
     // Calendar-deferred: next fire is Monday (future) → not overdue.
     insert_calendar_schedule(
@@ -604,9 +605,9 @@ async fn calendar_deferred_weekend_schedule_is_not_overdue_via_sampler() {
 async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
     let (mut conn, _c) = setup_db().await;
     // Slot on Sat 2026-01-03; run_next_business_day → Mon 2026-01-05 00:00.
-    let sat_slot: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().expect("sat slot");
+    let sat_slot: Timestamp = "2026-01-03T00:00:00Z".parse().expect("sat slot");
     // now = Wed 2026-01-07 12:00 → the Monday fire is ~2.5 days past (> ~1d grace).
-    let now: DateTime<Utc> = "2026-01-07T12:00:00Z".parse().expect("now (wed)");
+    let now: Timestamp = "2026-01-07T12:00:00Z".parse().expect("now (wed)");
 
     insert_calendar_schedule(
         &mut conn,
@@ -637,7 +638,7 @@ async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
 /// pass_complete)`. Single-shard, so a pass is complete iff the read succeeded.
 async fn run_and_emit_overdue_pass(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     previous_emitted: &std::collections::HashSet<(String, String)>,
     metrics: &RecordingMetrics,
 ) -> (std::collections::HashSet<(String, String)>, bool) {
@@ -674,13 +675,13 @@ async fn run_and_emit_overdue_pass(
 async fn deleted_overdue_schedule_is_zeroed_on_next_complete_pass() {
     use std::collections::HashSet;
     let (mut conn, _c) = setup_db().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Wedged (interval:60, next_run_at 5000s ago) → overdue.
     insert_schedule(
         &mut conn,
         "disappear_wf",
         "interval:60",
-        now - chrono::Duration::seconds(5000),
+        now - jiff::SignedDuration::from_secs(5000),
         false,
         None,
         10,

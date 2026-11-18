@@ -21,7 +21,7 @@ use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{LlmLedgerRow, RunState, SqliteError, SqliteReader, SqliteRuntime};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// The stub of a ledger closure. Its body never runs on this backend.
@@ -224,7 +224,7 @@ async fn a_ledger_closure_writes_one_row_per_call_with_its_completion() {
 async fn a_window_read_returns_the_rows_inside_it() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     register(&mut rt, &Arc::new(AtomicU32::new(0)), 0);
-    let at = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let at = autumn_harvest::time::utc_ymd_hms(2026, 10, 1, 12, 0, 0).unwrap();
     let exec = rt.start_workflow("one_thought", json!(2)).unwrap();
     assert!(matches!(
         rt.run_until_blocked_as_of(exec, at).await.unwrap(),
@@ -233,7 +233,7 @@ async fn a_window_read_returns_the_rows_inside_it() {
 
     let rows = rt.llm_ledger(exec).unwrap();
     assert!(rows.iter().all(|row| row.recorded_at == at), "{rows:?}");
-    let second = chrono::Duration::seconds(1);
+    let second = jiff::SignedDuration::from_secs(1);
     assert_eq!(rt.llm_ledger_between(at, at + second).unwrap(), rows);
     assert_eq!(rt.llm_ledger_between(at - second, at).unwrap(), Vec::new());
     assert_eq!(
@@ -255,7 +255,7 @@ async fn a_ledger_closure_gets_the_drive_clock_of_its_claim() {
         let n = input.as_i64().ok_or("the input is not a number")?;
         Ok((json!(n), calls_for(n)))
     });
-    let at = Utc.with_ymd_and_hms(2031, 2, 3, 4, 5, 6).unwrap();
+    let at = autumn_harvest::time::utc_ymd_hms(2031, 2, 3, 4, 5, 6).unwrap();
     let exec = rt.start_workflow("one_thought", json!(2)).unwrap();
     assert!(matches!(
         rt.run_until_blocked_as_of(exec, at).await.unwrap(),
@@ -395,7 +395,7 @@ async fn an_older_file_gains_the_ledger_on_open() {
     assert_eq!(reader.llm_ledger(old_run).unwrap(), Vec::new());
     assert_eq!(
         reader
-            .llm_ledger_between(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)
+            .llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
             .unwrap(),
         Vec::new()
     );
@@ -463,7 +463,7 @@ async fn retention_removes_the_rows_with_their_run() {
 
     let removed = rt
         .purge_terminal_as_of(
-            Utc::now() + chrono::Duration::hours(2),
+            Timestamp::now() + jiff::SignedDuration::from_hours(2),
             Duration::from_secs(3600),
         )
         .unwrap();

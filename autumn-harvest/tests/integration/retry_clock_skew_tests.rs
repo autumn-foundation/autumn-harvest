@@ -26,10 +26,10 @@
 //! with the full migration bundle.
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use chrono::{DateTime, Duration, Utc};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -111,10 +111,11 @@ async fn claim_one(conn: &mut AsyncPgConnection, queue: &str) -> Uuid {
 #[derive(diesel::QueryableByName)]
 struct ScheduledAtRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: DateTime<Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    scheduled_at: Timestamp,
 }
 
-async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> DateTime<Utc> {
+async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> Timestamp {
     diesel::sql_query("SELECT scheduled_at FROM harvest_task_queue WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(id)
         .get_result::<ScheduledAtRow>(conn)
@@ -126,11 +127,12 @@ async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> DateTime<Utc> {
 #[derive(diesel::QueryableByName)]
 struct NowRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    now: DateTime<Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    now: Timestamp,
 }
 
 /// Postgres's own clock, queried directly — never the host clock.
-async fn db_now(conn: &mut AsyncPgConnection) -> DateTime<Utc> {
+async fn db_now(conn: &mut AsyncPgConnection) -> Timestamp {
     diesel::sql_query("SELECT NOW() AS now")
         .get_result::<NowRow>(conn)
         .await
@@ -154,12 +156,12 @@ const TOLERANCE_MS: i64 = 750;
 async fn assert_scheduled_at_matches_delay_on_db_clock(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: Duration,
+    delay: SignedDuration,
 ) {
     let now = db_now(conn).await;
     let deadline = scheduled_at(conn, task_id).await;
     let held = deadline - now;
-    let drift = (held - delay).num_milliseconds().abs();
+    let drift = autumn_harvest::time::num_milliseconds(held - delay).abs();
     assert!(
         drift <= TOLERANCE_MS,
         "expected scheduled_at ({deadline}) to land within {TOLERANCE_MS}ms of \
@@ -175,7 +177,7 @@ async fn requeue_for_retry_computes_scheduled_at_on_the_db_clock() {
     let task = enqueue_activity_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     queue::requeue_for_retry(&mut conn, task, delay, "boom")
         .await
         .expect("requeue for retry");
@@ -190,7 +192,7 @@ async fn requeue_workflow_task_nd_blocked_computes_scheduled_at_on_the_db_clock(
     let task = enqueue_workflow_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     queue::requeue_workflow_task_nd_blocked(&mut conn, task, delay, "non-determinism")
         .await
         .expect("requeue nd-blocked");
@@ -216,7 +218,7 @@ async fn requeue_workflow_task_nd_blocked_uses_the_live_clock_inside_a_transacti
     let task = enqueue_workflow_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     Box::pin(
         conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
             // Stand-in for real prior work inside the same transaction (a row
@@ -242,7 +244,7 @@ async fn requeue_workflow_task_after_panic_computes_scheduled_at_on_the_db_clock
     let task = enqueue_workflow_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     queue::requeue_workflow_task_after_panic(&mut conn, task, delay, "handler panic")
         .await
         .expect("requeue after panic");
@@ -260,7 +262,7 @@ async fn requeue_workflow_task_for_quota_retry_computes_scheduled_at_on_the_db_c
     let task = enqueue_workflow_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     queue::requeue_workflow_task_for_quota_retry(&mut conn, task, delay, "quota exceeded")
         .await
         .expect("requeue for quota retry");
@@ -283,7 +285,7 @@ async fn defer_claimed_retry_for_budget_computes_scheduled_at_on_the_db_clock() 
         worker_id: "w1".to_string(),
         attempt: 1,
     };
-    let delay = Duration::seconds(2);
+    let delay = SignedDuration::from_secs(2);
     let write = queue::defer_claimed_retry_for_budget(&mut conn, &claim, delay)
         .await
         .expect("defer for budget");
@@ -304,9 +306,9 @@ async fn requeue_for_retry_zero_delay_computes_scheduled_at_on_the_db_clock() {
     let task = enqueue_activity_task(&mut conn, &q).await;
     assert_eq!(claim_one(&mut conn, &q).await, task);
 
-    queue::requeue_for_retry(&mut conn, task, Duration::zero(), "boom")
+    queue::requeue_for_retry(&mut conn, task, SignedDuration::ZERO, "boom")
         .await
         .expect("requeue for retry");
 
-    assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, Duration::zero()).await;
+    assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, SignedDuration::ZERO).await;
 }

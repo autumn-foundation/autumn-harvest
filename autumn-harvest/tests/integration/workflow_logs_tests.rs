@@ -721,7 +721,7 @@ use autumn_harvest::context::{WorkflowContext, WorkflowLogPolicy};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -813,7 +813,7 @@ async fn run_logging_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -825,7 +825,7 @@ async fn run_logging_workflow(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params).await.expect("enqueue");
 
     let mut registry = HandlerRegistry::new(vec![workflow_info(workflow_name, handler)], vec![]);
@@ -1121,12 +1121,12 @@ async fn drive_once(
 /// unchanged history length and both encodings look identical.
 fn grow_history_replay_transparently(history: &mut Vec<WorkflowEvent>) {
     history.push(WorkflowEvent::WorkflowExecutionPaused {
-        paused_at: Utc::now(),
+        paused_at: Timestamp::now(),
         reason: Some("randomized interleaving".to_string()),
         actor: "test".to_string(),
     });
     history.push(WorkflowEvent::WorkflowExecutionResumed {
-        resumed_at: Utc::now(),
+        resumed_at: Timestamp::now(),
         actor: "test".to_string(),
     });
 }
@@ -1193,7 +1193,7 @@ async fn randomized_replay_interleavings_never_duplicate_or_reorder_lines() {
 
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

@@ -214,7 +214,7 @@ impl Retention {
                 (
                     Instant::now(),
                     RetentionTickResult {
-                        ran_at: Some(chrono::Utc::now()),
+                        ran_at: Some(jiff::Timestamp::now()),
                         ..RetentionTickResult::default()
                     },
                 )
@@ -686,7 +686,7 @@ async fn drive_loop(
                 Err(mpsc::error::TryRecvError::Empty) => break,
             }
         }
-        let pass_started = chrono::Utc::now().timestamp_millis();
+        let pass_started = jiff::Timestamp::now().as_millisecond();
         // A pass can move a healthy run while another run fails. The
         // progress then still counts, so a woken tenant never settles over
         // due work.
@@ -1251,7 +1251,7 @@ mod tests {
         runtime
             .upsert_schedule(&every_second())
             .expect("admin upsert");
-        let later = chrono::Utc::now() + chrono::Duration::seconds(5);
+        let later = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(5);
         runtime.poll_once_as_of(later).await.expect("poll");
         let runs = runtime
             .list_executions(&autumn_harvest_sqlite::ExecutionFilter::new())
@@ -1297,7 +1297,7 @@ mod tests {
         let stop = CancellationToken::new();
         let report = super::super::wake::WakeReport::new(Arc::clone(&book), key.clone());
         book.flush().await.expect("flush");
-        let first = chrono::Utc::now().timestamp_millis();
+        let first = jiff::Timestamp::now().as_millisecond();
         let due = |at: i64| {
             let book = Arc::clone(&book);
             async move { book.due_names(at).await.expect("due") }
@@ -1312,7 +1312,7 @@ mod tests {
             Box::new(|| {}),
             Some(report),
         );
-        let before = chrono::Utc::now().timestamp_millis();
+        let before = jiff::Timestamp::now().as_millisecond();
         let (reply, started) = oneshot::channel();
         sender
             .send(Command::Start {

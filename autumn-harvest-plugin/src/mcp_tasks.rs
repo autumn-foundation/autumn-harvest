@@ -27,13 +27,14 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_web::reexports::axum;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse as _, Response};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use autumn_harvest::payload_codec::PayloadCodecs;
@@ -536,14 +537,16 @@ pub fn tasks_path(tools_prefix: &str) -> String {
 /// that holds the task id, because the sweep deletes that row.
 #[must_use]
 pub fn ttl_ms(
-    created_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
     retention: Option<std::time::Duration>,
 ) -> Option<u64> {
     let completed_at = completed_at?;
-    let retention = chrono::Duration::from_std(retention?).ok()?;
-    let expires_at = completed_at.checked_add_signed(retention)?;
-    u64::try_from((expires_at - created_at).num_milliseconds()).ok()
+    let retention = jiff::SignedDuration::try_from(retention?).ok()?;
+    // jiff ends in the year 9999, so a long retention cannot form the
+    // expiry instant. The sum of two durations keeps such a TTL finite.
+    let ttl = (completed_at - created_at).checked_add(retention)?;
+    u64::try_from(autumn_harvest::time::num_milliseconds(ttl)).ok()
 }
 
 /// `true` when the live run keeps the start row from retention.
@@ -577,9 +580,9 @@ pub struct TaskSnapshot {
     /// The live run of the chain.
     pub run_id: uuid::Uuid,
     /// When the task was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the run last changed.
-    pub last_updated_at: DateTime<Utc>,
+    pub last_updated_at: Timestamp,
     /// The state of the live run.
     pub state: String,
     /// The progress text of the live run.
@@ -627,8 +630,8 @@ impl TaskSnapshot {
     }
 }
 
-fn rfc3339(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+fn rfc3339(at: Timestamp) -> String {
+    autumn_harvest::time::rfc3339_opts(at, autumn_harvest::time::SecondsFormat::AutoSi, true)
 }
 
 /// The `Task` object, with no status payload.
@@ -1567,9 +1570,10 @@ async fn load_task(
             .filter(wfe::workflow_name.eq(&origin.workflow_name))
             .filter(wfe::workflow_id.eq(&origin.workflow_id))
             .select(diesel::dsl::max(wfe::completed_at))
-            .first::<Option<DateTime<Utc>>>(&mut conn)
+            .first::<Option<SqlTimestamp>>(&mut conn)
             .await
             .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+            .map(SqlTimestamp::to_jiff)
     } else {
         None
     };
@@ -1749,7 +1753,7 @@ async fn last_events(
 async fn history_head(
     api_state: &HarvestApiState,
     run: uuid::Uuid,
-) -> Result<Option<(i32, DateTime<Utc>)>, RpcError> {
+) -> Result<Option<(i32, Timestamp)>, RpcError> {
     use autumn_harvest::schema::harvest_events;
     use diesel::{ExpressionMethods as _, QueryDsl as _};
     use diesel_async::RunQueryDsl as _;
@@ -1758,7 +1762,7 @@ async fn history_head(
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    let (position, at): (Option<i32>, Option<DateTime<Utc>>) = harvest_events::table
+    let (position, at): (Option<i32>, Option<SqlTimestamp>) = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(run))
         .select((
             diesel::dsl::max(harvest_events::event_id),
@@ -1767,7 +1771,7 @@ async fn history_head(
         .first(&mut conn)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    Ok(position.zip(at))
+    Ok(position.zip(at.map(SqlTimestamp::to_jiff)))
 }
 
 /// The open signal waits of a live run, and the time it last changed.
@@ -1782,7 +1786,7 @@ async fn open_signal_waits(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
     live: &autumn_harvest::models::WorkflowExecution,
-) -> Result<(Vec<SignalWait>, Option<DateTime<Utc>>), RpcError> {
+) -> Result<(Vec<SignalWait>, Option<Timestamp>), RpcError> {
     use autumn_harvest::awaitables::AwaitableKind;
     use autumn_harvest::schema::harvest_signals;
     use diesel::{ExpressionMethods as _, QueryDsl as _};
@@ -1830,13 +1834,16 @@ async fn open_signal_waits(
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    let queued: Vec<(String, DateTime<Utc>)> = harvest_signals::table
+    let queued: Vec<(String, Timestamp)> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(live.id))
         .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
-        .load(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
-        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(name, at)| (name, at.to_jiff()))
+        .collect();
     drop(conn);
 
     let mut last_updated_at = last_event_at;
@@ -1958,7 +1965,7 @@ mod sqlite_tasks {
         flags: &HarvestApiState,
         handle: &HarvestSqlite,
         exec: autumn_harvest::ExecutionId,
-    ) -> Result<(Vec<SignalWait>, Option<chrono::DateTime<chrono::Utc>>), RpcError> {
+    ) -> Result<(Vec<SignalWait>, Option<jiff::Timestamp>), RpcError> {
         let read = open_waits(handle, flags, exec)
             .await
             .map_err(|e| internal(&e))?;
@@ -2059,7 +2066,7 @@ mod sqlite_tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone as _, Utc};
+    use jiff::Timestamp;
     use serde_json::json;
 
     const ALL: [TaskStatus; 5] = [
@@ -2070,8 +2077,8 @@ mod tests {
         TaskStatus::Cancelled,
     ];
 
-    fn at(secs: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(1_800_000_000 + secs, 0).unwrap()
+    fn at(secs: i64) -> jiff::Timestamp {
+        Timestamp::new(1_800_000_000 + secs, 0).unwrap()
     }
 
     fn snapshot(state: &str) -> TaskSnapshot {

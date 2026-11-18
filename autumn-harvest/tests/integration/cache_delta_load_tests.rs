@@ -23,8 +23,8 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 
-use chrono::Utc;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -141,7 +141,7 @@ async fn cold_path_reads_full_history_every_task() {
     // Append a WorkflowStarted event followed by 24 activity pairs = 49 events.
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -189,7 +189,7 @@ async fn warm_path_delta_load_reads_only_new_events() {
     // Append 50 initial events: 1 WorkflowStarted + 24 activity pairs + 1 extra.
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -282,7 +282,7 @@ async fn sticky_routing_on_vs_off_reload_count() {
 
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

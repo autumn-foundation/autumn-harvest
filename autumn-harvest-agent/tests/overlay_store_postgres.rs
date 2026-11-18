@@ -17,6 +17,7 @@ use autumn_harvest_agent::{PostgresOverlayStore, ProfileOverlay, ProfileOverlayS
 use diesel::sql_types::Text;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -612,7 +613,6 @@ async fn postgres_races_pass_the_cap_and_the_revision_once() {
 /// read, under the policy lock. A stale revision moves nothing.
 #[tokio::test]
 async fn postgres_refuses_an_auto_move_over_a_stale_policy() {
-    use autumn_harvest::chrono::Utc;
     use autumn_harvest::overlay_log::{AutoAdoptRaw, AutoAdoptRequest, auto_adopt_overlay};
     use autumn_harvest_agent::RefinePolicy;
 
@@ -635,7 +635,7 @@ async fn postgres_refuses_an_auto_move_over_a_stale_policy() {
         expected: None,
         actor: "00000000-0000-0000-0000-000000000001",
         cap: None,
-        at: Utc::now(),
+        at: Timestamp::now(),
         policy_revision,
     };
     for stale in [None, Some(2)] {

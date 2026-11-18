@@ -208,7 +208,7 @@ impl SampleWorkflowCoverage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampleManifest {
     /// When the sample was drawn.
-    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub generated_at: jiff::Timestamp,
     /// Cross-shard completeness of the sample.
     pub status: SampleStatus,
     /// The normalized non-terminal states the sample was drawn from.
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn manifest_round_trips_through_json() {
         let manifest = SampleManifest {
-            generated_at: chrono::Utc::now(),
+            generated_at: jiff::Timestamp::now(),
             status: SampleStatus::Partial,
             states: vec!["RUNNING".into()],
             per_workflow: vec![SampleWorkflowCoverage {
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn incomplete_export_covers_both_a_size_cut_and_dropped_candidates() {
         let base = SampleManifest {
-            generated_at: chrono::Utc::now(),
+            generated_at: jiff::Timestamp::now(),
             status: SampleStatus::Complete,
             states: vec!["RUNNING".into()],
             per_workflow: vec![],

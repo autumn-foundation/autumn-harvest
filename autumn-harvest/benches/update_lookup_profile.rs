@@ -48,7 +48,7 @@ fn history(n: usize) -> (Vec<WorkflowEvent>, Vec<UpdateId>) {
             update_id,
             name: "bump".into(),
             input: json!({ "i": i }),
-            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            timestamp: jiff::Timestamp::from_second(1_700_000_000).unwrap(),
         });
         events.push(WorkflowEvent::ActivityScheduled {
             activity_id,

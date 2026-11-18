@@ -72,7 +72,7 @@
 //! ```
 
 use autumn_harvest::run_chain::{RunChainRow, assemble_run_chain};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 /// Reads `key` as a `usize`, using `default` only when the variable is
@@ -90,9 +90,8 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-fn day(offset_days: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000 + offset_days * 86_400, 0)
-        .unwrap()
+fn day(offset_days: i64) -> Timestamp {
+    Timestamp::new(1_800_000_000 + offset_days * 86_400, 0).unwrap()
 }
 
 /// Build a fully-linked, `n`-long continue-as-new chain and the origin's
@@ -124,7 +123,9 @@ fn build_chain(n: usize) -> (Vec<RunChainRow>, Uuid) {
             completed_at: if is_tail {
                 None
             } else {
-                Some(day(i64::try_from(i).unwrap_or(i64::MAX)) + chrono::Duration::hours(1))
+                Some(
+                    day(i64::try_from(i).unwrap_or(i64::MAX)) + jiff::SignedDuration::from_hours(1),
+                )
             },
             continued_from_exec_id: previous_exec_id,
             first_exec_id: if i == 0 { None } else { Some(origin_exec_id) },

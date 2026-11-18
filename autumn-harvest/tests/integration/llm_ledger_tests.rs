@@ -23,6 +23,7 @@
 //!   [`replay_of_a_history_with_llm_steps_is_unchanged`].
 //! - Retention — [`retention_deletes_the_ledger_rows_with_the_run`].
 
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,10 +42,10 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfi
 use autumn_harvest::{ActivityContext, ExecutionId, ShardId, StartWorkflowParams, WorkflowContext};
 
 use crate::integration_e2e::{insert_workflow_execution, setup_test_database_url_or_env};
-use chrono::Utc;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1072,7 +1073,9 @@ async fn seed_ledger_row(
     .bind::<BigInt, _>(output_tokens)
     .bind::<Nullable<BigInt>, _>(cost)
     .bind::<BigInt, _>(latency_ms)
-    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - chrono::Duration::hours(hours_ago))
+    .bind::<diesel::sql_types::Timestamptz, _>(
+        (Timestamp::now() - jiff::SignedDuration::from_hours(hours_ago)).to_diesel(),
+    )
     .execute(conn)
     .await
     .expect("seed ledger row");
@@ -1106,8 +1109,8 @@ async fn usage_rolls_the_ledger_up_per_workflow_type_and_per_tenant() {
 
     let window = |group_by| UsageQuery {
         group_by,
-        from: Utc::now() - chrono::Duration::hours(1),
-        to: Utc::now() + chrono::Duration::hours(1),
+        from: Timestamp::now() - jiff::SignedDuration::from_hours(1),
+        to: Timestamp::now() + jiff::SignedDuration::from_hours(1),
     };
 
     let by_type = load_usage_grouped(&mut conn, 0, &window(UsageGroupBy::WorkflowName), 10_000)
@@ -1168,8 +1171,8 @@ async fn usage_reports_a_run_that_started_before_the_window() {
 
     let query = UsageQuery {
         group_by: UsageGroupBy::WorkflowName,
-        from: Utc::now() - chrono::Duration::hours(1),
-        to: Utc::now() + chrono::Duration::hours(1),
+        from: Timestamp::now() - jiff::SignedDuration::from_hours(1),
+        to: Timestamp::now() + jiff::SignedDuration::from_hours(1),
     };
     let rows = load_usage_grouped(&mut conn, 0, &query, 10_000)
         .await
@@ -1225,8 +1228,8 @@ async fn usage_counts_a_moving_run_on_one_shard_in_every_phase() {
 
     let query = UsageQuery {
         group_by: UsageGroupBy::WorkflowName,
-        from: Utc::now() - chrono::Duration::hours(1),
-        to: Utc::now() + chrono::Duration::hours(1),
+        from: Timestamp::now() - jiff::SignedDuration::from_hours(1),
+        to: Timestamp::now() + jiff::SignedDuration::from_hours(1),
     };
     let rows = load_usage_grouped(&mut conn, 0, &query, 10_000)
         .await

@@ -18,10 +18,10 @@ use autumn_harvest::poison_pill::reclaim_orphaned_tasks;
 use autumn_harvest::queue::{self, EnqueueParams, TaskClaim, TaskType};
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout::heartbeat_timeout_query;
-use chrono::{DateTime, Duration, Utc};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -99,7 +99,7 @@ async fn live_worker(conn: &mut AsyncPgConnection) -> String {
 async fn enqueue_activity(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
-    heartbeat_timeout: Option<Duration>,
+    heartbeat_timeout: Option<SignedDuration>,
 ) -> Uuid {
     let exec_id = insert_execution(conn).await;
     let mut params = EnqueueParams::new(queue_name, TaskType::Activity, serde_json::json!({}));
@@ -115,11 +115,12 @@ async fn enqueue_activity(
 #[derive(diesel::QueryableByName)]
 struct TimestampRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    at: Timestamp,
 }
 
 /// Postgres's own clock, queried directly. Never the host clock.
-async fn db_now(conn: &mut AsyncPgConnection) -> DateTime<Utc> {
+async fn db_now(conn: &mut AsyncPgConnection) -> Timestamp {
     diesel::sql_query("SELECT clock_timestamp() AS at")
         .get_result::<TimestampRow>(conn)
         .await
@@ -127,7 +128,7 @@ async fn db_now(conn: &mut AsyncPgConnection) -> DateTime<Utc> {
         .at
 }
 
-async fn read_column(conn: &mut AsyncPgConnection, column: &str, id: Uuid) -> DateTime<Utc> {
+async fn read_column(conn: &mut AsyncPgConnection, column: &str, id: Uuid) -> Timestamp {
     diesel::sql_query(format!(
         "SELECT {column} AS at FROM harvest_task_queue WHERE id = $1"
     ))
@@ -146,11 +147,11 @@ async fn read_column(conn: &mut AsyncPgConnection, column: &str, id: Uuid) -> Da
 async fn assert_on_db_clock(
     conn: &mut AsyncPgConnection,
     what: &str,
-    before: DateTime<Utc>,
-    stamp: DateTime<Utc>,
+    before: Timestamp,
+    stamp: Timestamp,
 ) {
     let after = db_now(conn).await;
-    let slack = Duration::milliseconds(SLACK_MS);
+    let slack = SignedDuration::from_millis(SLACK_MS);
     assert!(
         stamp >= before - slack && stamp <= after + slack,
         "{what} ({stamp}) is outside the database clock window [{before}, {after}]; \
@@ -186,7 +187,7 @@ impl MetricsRecorder for NoMetrics {}
 async fn record_heartbeat_stamps_the_database_clock() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-clock");
-    let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
+    let task = enqueue_activity(&mut conn, &q, Some(SignedDuration::from_secs(30))).await;
     let worker = live_worker(&mut conn).await;
     let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
@@ -212,7 +213,7 @@ async fn record_heartbeat_stamps_the_database_clock() {
 async fn an_aged_heartbeat_stamps_the_database_clock_minus_its_age() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-aged");
-    let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
+    let task = enqueue_activity(&mut conn, &q, Some(SignedDuration::from_secs(30))).await;
     let worker = live_worker(&mut conn).await;
     let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
@@ -220,14 +221,14 @@ async fn an_aged_heartbeat_stamps_the_database_clock_minus_its_age() {
         .expect("claimable");
     assert_eq!(claimed.id, task);
     let claim = TaskClaim::of(&claimed).expect("claim");
-    let age = Duration::seconds(20);
+    let age = SignedDuration::from_secs(20);
 
     let before = db_now(&mut conn).await;
     let write = queue::record_heartbeat_sent_ago(
         &mut conn,
         &claim,
         serde_json::json!({}),
-        age.to_std().expect("age"),
+        std::time::Duration::try_from(age).expect("age"),
     )
     .await
     .expect("heartbeat");
@@ -250,7 +251,7 @@ async fn an_aged_heartbeat_stamps_the_database_clock_minus_its_age() {
 async fn a_fresh_heartbeat_is_not_a_false_heartbeat_timeout() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-scan");
-    let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
+    let task = enqueue_activity(&mut conn, &q, Some(SignedDuration::from_secs(30))).await;
     let worker = live_worker(&mut conn).await;
     let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
@@ -291,7 +292,7 @@ async fn record_heartbeat_uses_the_live_clock_inside_a_transaction() {
 
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-txn");
-    let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
+    let task = enqueue_activity(&mut conn, &q, Some(SignedDuration::from_secs(30))).await;
     let worker = live_worker(&mut conn).await;
     let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await

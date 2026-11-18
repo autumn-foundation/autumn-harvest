@@ -487,7 +487,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::executor::run_workflow_strict;
     use autumn_harvest::types::ActivityExecId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::collections::HashMap;
 
     #[allow(clippy::type_complexity)]
@@ -549,7 +549,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                 let history = vec![
                     WorkflowEvent::WorkflowStarted {
                         input: Value::Null,
-                        timestamp: Utc::now(),
+                        timestamp: Timestamp::now(),
                         last_completion_result: None,
                         last_error: None,
                         scheduled_time: None,

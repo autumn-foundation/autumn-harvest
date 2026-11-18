@@ -2,6 +2,8 @@
 #![allow(clippy::literal_string_with_formatting_args)]
 
 use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -109,9 +111,10 @@ use autumn_harvest::schedule_override::{self, ScheduleOverridePatch};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowOverrideRequest,
-    WorkflowSchedulePatch, ensure_dag_schedule, parse_schedule_from_expr_pub,
-    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
-    update_code_declared_workflow_schedule, update_workflow_schedule_with_codecs,
+    WorkflowSchedulePatch, ensure_dag_schedule, legacy_scheduled_workflow_id,
+    parse_schedule_from_expr_pub, plan_backfill_timestamps, scheduled_workflow_id_pub,
+    trigger_unified_dag, update_code_declared_workflow_schedule,
+    update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -1596,7 +1599,7 @@ struct WorkflowDetailsResponse {
     last_error: Option<String>,
     /// Nominal scheduled fire-time (logical slot) for this run, or `None` for manual starts (issue #508).
     #[serde(skip_serializing_if = "Option::is_none")]
-    scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    scheduled_time: Option<jiff::Timestamp>,
     /// `true` when the execution has more events than the embedded `history` slice (issue #529).
     history_truncated: bool,
     /// URL path of the paginated history endpoint for this execution (issue #529).
@@ -1658,7 +1661,7 @@ pub struct StalledWorkflowRow {
     #[serde(flatten)]
     pub execution: WorkflowExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_event_at: Option<jiff::Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1730,7 +1733,7 @@ pub(crate) struct LastFailure {
     /// `LocalActivityFailed` event. `None` and omitted for the regular
     /// task-row path, which has no failure timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) failed_at: Option<jiff::Timestamp>,
     /// Optional structured failure details (`ActivityFailure::with_details`).
     /// Both sources leave it `None` today: the task row has no structured
     /// detail, and `LocalActivityFailed` carries none. The field stays for
@@ -1755,7 +1758,7 @@ pub(crate) struct LastFailure {
 /// So `error_type` defaults to `"Error"`, `non_retryable` to `false`, and
 /// `details` to `None`. `failed_at` is the event timestamp.
 pub(crate) fn latest_failures_by_activity(
-    events: &[(i64, WorkflowEvent, chrono::DateTime<chrono::Utc>)],
+    events: &[(i64, WorkflowEvent, jiff::Timestamp)],
 ) -> std::collections::HashMap<uuid::Uuid, LastFailure> {
     let mut map: std::collections::HashMap<uuid::Uuid, (i64, LastFailure)> =
         std::collections::HashMap::new();
@@ -1796,7 +1799,7 @@ pub(crate) struct PendingActivity {
     pub(crate) activity_exec_id: String,
     pub(crate) activity_name: String,
     pub(crate) queue: String,
-    pub(crate) scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) scheduled_at: jiff::Timestamp,
     pub(crate) attempt: i32,
     pub(crate) max_attempts: i32,
     pub(crate) task_status: String,
@@ -1829,7 +1832,7 @@ pub(crate) struct PendingActivity {
     /// activity, not an external handoff).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_bytes: Option<u64>,
-    pub(crate) last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) last_heartbeat_at: Option<jiff::Timestamp>,
     /// Latest heartbeat checkpoint payload reported by the activity via
     /// `ctx.heartbeat(...)` — the current value of
     /// `harvest_task_queue.heartbeat_details` (issue #503). `null` when no
@@ -1850,10 +1853,10 @@ pub(crate) struct PendingActivity {
     pub(crate) heartbeat_details_omitted_for_budget: bool,
     /// Observed byte size of the stored heartbeat payload, when one exists.
     pub(crate) heartbeat_details_bytes: Option<u64>,
-    pub(crate) next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) next_retry_at: Option<jiff::Timestamp>,
+    pub(crate) schedule_to_start_deadline: Option<jiff::Timestamp>,
+    pub(crate) start_to_close_deadline: Option<jiff::Timestamp>,
+    pub(crate) heartbeat_deadline: Option<jiff::Timestamp>,
     /// The most recent recorded failure for this activity (issue #773),
     /// derived from the task-row `error` column. Omitted when the
     /// activity has never failed (AC3). `None` for external-handoff rows.
@@ -2016,7 +2019,7 @@ fn apply_input_response_budget(activities: &mut [PendingActivity], budget: u64) 
 /// Postgres and the SQLite stack (issue #2468) both call it, so the two
 /// lists cannot drift.
 pub(crate) fn fold_pending_local_activities(
-    rows: impl IntoIterator<Item = (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+    rows: impl IntoIterator<Item = (String, serde_json::Value, jiff::Timestamp)>,
     failures_by_activity: &std::collections::HashMap<uuid::Uuid, LastFailure>,
 ) -> Vec<PendingLocalActivity> {
     rows.into_iter()
@@ -2094,14 +2097,14 @@ pub(crate) fn fold_pending_local_activities(
 pub(crate) struct PendingLocalActivity {
     pub(crate) activity_exec_id: String,
     pub(crate) activity_name: String,
-    pub(crate) scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) scheduled_at: jiff::Timestamp,
     pub(crate) attempt: i32,
     pub(crate) max_attempts: i32,
     pub(crate) task_status: String,
-    pub(crate) last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) last_heartbeat_at: Option<jiff::Timestamp>,
+    pub(crate) next_retry_at: Option<jiff::Timestamp>,
+    pub(crate) start_to_close_deadline: Option<jiff::Timestamp>,
+    pub(crate) heartbeat_deadline: Option<jiff::Timestamp>,
     /// The most recent recorded failure for this local activity (issue #773),
     /// derived from the latest `LocalActivityFailed` event. Omitted when the
     /// activity has never failed (AC3).
@@ -2113,22 +2116,22 @@ pub(crate) struct PendingLocalActivity {
 pub(crate) struct PendingTimer {
     pub(crate) timer_id: String,
     pub(crate) name: Option<String>,
-    pub(crate) fires_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) fires_at: jiff::Timestamp,
+    pub(crate) created_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PendingSignal {
     pub(crate) signal_name: String,
     pub(crate) waiters: i64,
-    pub(crate) oldest_waiter_since: chrono::DateTime<chrono::Utc>,
+    pub(crate) oldest_waiter_since: jiff::Timestamp,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct BufferedSignal {
     pub(crate) signal_name: String,
     pub(crate) buffered: i64,
-    pub(crate) oldest_received_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) oldest_received_at: jiff::Timestamp,
 }
 
 #[derive(Debug, Serialize)]
@@ -2173,9 +2176,9 @@ pub(crate) struct ExternalHandoffResponse {
     workflow: ExternalHandoffWorkflow,
     activity: ExternalHandoffActivity,
     state: String,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deadline_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
+    updated_at: jiff::Timestamp,
+    deadline_at: jiff::Timestamp,
     complete_path: String,
     fail_path: String,
     heartbeat_path: String,
@@ -2295,7 +2298,7 @@ struct DagSummary {
     name: String,
     schedule_expr: Option<String>,
     is_paused: bool,
-    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_run_at: Option<jiff::Timestamp>,
     max_active_runs: i32,
     catchup: bool,
     task_count: usize,
@@ -2374,7 +2377,7 @@ struct PauseWorkflowResponse {
     newly_paused: bool,
     /// When the pause took effect (issue #609): this request's timestamp for a
     /// fresh pause, the original pause instant for an idempotent repeat.
-    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2396,7 +2399,7 @@ struct RetryActivityNowResponse {
     activity_exec_id: String,
     queue: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_retry_at: Option<jiff::Timestamp>,
     advanced: bool,
     /// Only meaningful when `advanced` is `false`. `true` = task was already
     /// claimable (idempotent no-op). `false` = a concurrent worker claimed the
@@ -2432,14 +2435,14 @@ struct CompletionDeliveryResponse {
     state: String,
     attempt: i32,
     max_attempts: i32,
-    next_attempt_at: chrono::DateTime<chrono::Utc>,
+    next_attempt_at: jiff::Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_status: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
-    delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+    delivered_at: Option<jiff::Timestamp>,
 }
 
 impl From<autumn_harvest::models::CompletionDelivery> for CompletionDeliveryResponse {
@@ -2580,8 +2583,11 @@ pub(crate) struct StartWorkflowRequest {
     /// with it also returns `400`. Such a start is deferred, so it has no
     /// active prior to resolve at request time.
     conflict_policy: Option<String>,
-    #[serde(default)]
-    start_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    start_at: Option<jiff::Timestamp>,
     #[serde(default)]
     delay: Option<String>,
     batch_key: Option<String>,
@@ -3201,8 +3207,8 @@ pub(crate) enum ScheduleKind {
 struct BackfillSummary {
     id: uuid::Uuid,
     actor: String,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
+    to: jiff::Timestamp,
     dry_run: bool,
     total: i32,
     dispatched: i32,
@@ -3210,8 +3216,8 @@ struct BackfillSummary {
     failed: i32,
     status: String,
     error_summary: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: jiff::Timestamp,
+    completed_at: Option<jiff::Timestamp>,
 }
 
 impl From<BackfillLogRow> for BackfillSummary {
@@ -3245,11 +3251,11 @@ struct ScheduleEntry {
     /// Always `"UTC"` for `Schedule::Cron` and non-cron schedules.
     timezone: String,
     is_paused: bool,
-    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_at: Option<jiff::Timestamp>,
     paused_by: Option<String>,
     pause_reason: Option<String>,
-    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
-    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_run_at: Option<jiff::Timestamp>,
+    last_run_at: Option<jiff::Timestamp>,
     max_active_runs: i32,
     catchup: bool,
     last_backfill: Option<BackfillSummary>,
@@ -3261,7 +3267,7 @@ struct ScheduleEntry {
     jitter_secs: i64,
     /// Effective next fire time = `next_run_at` + deterministic jitter offset.
     /// `None` when `next_run_at` is `None` or jitter is zero.
-    effective_fire_time: Option<chrono::DateTime<chrono::Utc>>,
+    effective_fire_time: Option<jiff::Timestamp>,
     /// Overlap policy for this schedule (e.g. `"skip"`, `"buffer_one"`).
     overlap_policy: String,
     /// Number of firings currently buffered (non-zero only for `buffer_one` / `buffer_all`).
@@ -3277,9 +3283,9 @@ struct ScheduleEntry {
     /// Current consecutive failure count (issue #360). Resets to 0 on success or resume.
     consecutive_failure_count: i32,
     /// Timestamp when the schedule was automatically paused (issue #360). `null` = not auto-paused.
-    auto_paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    auto_paused_at: Option<jiff::Timestamp>,
     /// Absolute UTC cutoff for this schedule (issue #478). `null` = no cutoff (fires forever).
-    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    end_at: Option<jiff::Timestamp>,
     /// Total run budget for this schedule (issue #478). `null` = no limit (fires forever).
     max_runs: Option<i32>,
     /// Number of executions actually started by this schedule (issue #478).
@@ -3288,7 +3294,7 @@ struct ScheduleEntry {
     /// `null` when `max_runs` is `null` (issue #478).
     remaining_runs: Option<i32>,
     /// Timestamp when the schedule was exhausted (issue #478). `null` = not yet exhausted.
-    exhausted_at: Option<chrono::DateTime<chrono::Utc>>,
+    exhausted_at: Option<jiff::Timestamp>,
     /// Machine-readable exhaustion reason (issue #478). One of `"end_at_reached"` or
     /// `"max_runs_exhausted"`. `null` when not exhausted.
     exhausted_reason: Option<String>,
@@ -3304,7 +3310,7 @@ struct ScheduleEntry {
     catchup_dropped_last_recovery: i32,
     /// Timestamp of the most recent recovery tick that produced drops (issue #484).
     /// `null` when `catchup_dropped_last_recovery` is 0.
-    last_catchup_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_catchup_at: Option<jiff::Timestamp>,
     /// Schedule-level workflow retry policy (issue #523), `null` when unset.
     /// Exposed so a read-modify-write client can echo it back on the upsert
     /// endpoint without silently clearing the stored policy.
@@ -3395,8 +3401,11 @@ struct CreateWorkflowScheduleRequest {
     /// Absolute UTC cutoff for this schedule (issue #478).
     /// When `next_run_at >= end_at` the scheduler stops firing and marks the schedule
     /// exhausted. `null` (the default) = no cutoff.
-    #[serde(default)]
-    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    end_at: Option<jiff::Timestamp>,
     /// Total run budget for this schedule (issue #478).
     /// Once `runs_started` reaches `max_runs` the schedule is exhausted. `null` = no limit.
     #[serde(default)]
@@ -3487,8 +3496,11 @@ struct UpdateWorkflowScheduleRequest {
     skip_policy: Option<String>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     consecutive_failure_limit: Option<Option<u32>>,
-    #[serde(default, deserialize_with = "deserialize_tristate")]
-    end_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::tristate"
+    )]
+    end_at: Option<Option<jiff::Timestamp>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     max_runs: Option<Option<u32>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
@@ -3624,7 +3636,7 @@ pub(crate) enum SearchAttrPredicate {
 /// Decoded keyset cursor for `GET /workflows` (issue #498).
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowListCursor {
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: jiff::Timestamp,
     pub(crate) exec_id: uuid::Uuid,
 }
 
@@ -3657,8 +3669,8 @@ pub(crate) struct WorkflowFilters {
     /// Parsed `filter` expressions (issue #1982). Each one joins the query
     /// with `AND`.
     pub(crate) filter: Vec<crate::visibility_query::Expr>,
-    pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) started_after: Option<jiff::Timestamp>,
+    pub(crate) started_before: Option<jiff::Timestamp>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
     pub(crate) exec_id_prefix: Option<String>,
     pub(crate) owner: Option<String>,
@@ -3721,8 +3733,8 @@ struct HistoryBatchExportQuery {
     max_bytes: usize,
     workflow_name: Option<String>,
     states: Vec<String>,
-    updated_after: Option<chrono::DateTime<chrono::Utc>>,
-    updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    updated_after: Option<jiff::Timestamp>,
+    updated_before: Option<jiff::Timestamp>,
     shard_id: Option<i32>,
     limit: usize,
 }
@@ -3730,7 +3742,7 @@ struct HistoryBatchExportQuery {
 #[derive(Debug, Serialize)]
 struct HistoryBatchExportResponse {
     status: String,
-    observed_at: chrono::DateTime<chrono::Utc>,
+    observed_at: jiff::Timestamp,
     payload_policy: HistoryPayloadPolicy,
     filters: HistoryBatchExportFiltersResponse,
     exports: Vec<HistoryExportDocument>,
@@ -3755,7 +3767,7 @@ struct HistorySampleExportQuery {
 #[derive(Debug, Serialize)]
 struct HistorySampleExportResponse {
     status: String,
-    observed_at: chrono::DateTime<chrono::Utc>,
+    observed_at: jiff::Timestamp,
     payload_policy: HistoryPayloadPolicy,
     filters: HistorySampleExportFiltersResponse,
     /// The portable coverage record written verbatim into the bundle as
@@ -3782,8 +3794,8 @@ struct HistorySampleExportFiltersResponse {
 struct HistoryBatchExportFiltersResponse {
     workflow_name: Option<String>,
     states: Vec<String>,
-    updated_after: Option<chrono::DateTime<chrono::Utc>>,
-    updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    updated_after: Option<jiff::Timestamp>,
+    updated_before: Option<jiff::Timestamp>,
     shard_id: Option<i32>,
     limit: usize,
     max_bytes: usize,
@@ -3815,14 +3827,17 @@ struct HistoryExportCandidate {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    last_history_event_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    last_history_event_at: jiff::Timestamp,
     // Issue #772: the per-execution replay deadline budget. The batch export
     // carries it, so `harvest-replay` / `replay_from_json` threads the
     // continue-as-new deadline, as the single-execution export does.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    execution_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullablePgDuration)]
+    execution_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the spawning parent's execution id. The batch export carries
     // it, so `harvest-replay` / `replay_from_json` gives the replayed
     // `WorkflowContext` its spawner, as the single-execution export does.
@@ -3872,11 +3887,14 @@ struct HistorySampleCandidate {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    started_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    execution_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullablePgDuration)]
+    execution_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    deadline_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     parent_id: Option<uuid::Uuid>,
     // Issue #798: the per-execution `context_headers`, carried into the export
@@ -4023,7 +4041,7 @@ impl Default for WorkflowChildrenFilters {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowChildrenCursor {
-    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) started_at: jiff::Timestamp,
     pub(crate) exec_id: uuid::Uuid,
 }
 
@@ -4054,8 +4072,8 @@ pub(crate) struct WorkflowChildResponse {
     pub(crate) exec_id: String,
     pub(crate) workflow_name: String,
     pub(crate) status: String,
-    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) started_at: jiff::Timestamp,
+    pub(crate) completed_at: Option<jiff::Timestamp>,
     pub(crate) error_summary: Option<String>,
     pub(crate) shard_id: i32,
     pub(crate) depth: u8,
@@ -4081,7 +4099,11 @@ struct CreateGateRequest {
     /// Optional extended message for the Vantage UI.
     message: Option<String>,
     /// ISO 8601 timestamp after which the gate self-clears.
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    expires_at: Option<jiff::Timestamp>,
 }
 
 /// `GET /admin/gates` — list all active (non-lifted) gates.
@@ -4385,8 +4407,11 @@ struct CreateTokenRequest {
     #[serde(default = "default_token_scope")]
     scope: String,
     /// Optional expiry; an expired token is rejected 401 on the next request.
-    #[serde(default)]
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    expires_at: Option<jiff::Timestamp>,
     /// Optional tenant claim (issue #1977). A tenant-bound token reaches only
     /// the runs of its tenant, through the tenant-scoped routes. It must be 1
     /// to 128 bytes of visible ASCII, with no spaces.
@@ -7305,12 +7330,12 @@ async fn inflate_and_decode_events(
 /// narrow cross-version display inaccuracy that the filter exists to fix.
 /// That is strictly better than failing the page.
 pub(crate) async fn decode_graph_history(
-    rows: Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>,
+    rows: Vec<(jiff::Timestamp, WorkflowEvent)>,
     exec_id: ExecutionId,
     codecs: &PayloadCodecs,
     offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
     surface: &'static str,
-) -> Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)> {
+) -> Vec<(jiff::Timestamp, WorkflowEvent)> {
     let events: Vec<WorkflowEvent> = rows.iter().map(|(_, e)| e.clone()).collect();
     if !graph_history_needs_inflation(&events) {
         return rows;
@@ -10917,14 +10942,12 @@ async fn list_audit_records(
     Ok(Json(records))
 }
 
-fn parse_audit_datetime(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|_| {
-            AutumnError::bad_request_msg(format!(
-                "invalid datetime '{raw}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
-            ))
-        })
+fn parse_audit_datetime(raw: &str) -> Result<jiff::Timestamp, AutumnError> {
+    autumn_harvest::time::parse::rfc3339(raw).map_err(|_| {
+        AutumnError::bad_request_msg(format!(
+            "invalid datetime '{raw}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
+        ))
+    })
 }
 
 // ── Audit emission helpers ─────────────────────────────────────────────────────
@@ -11176,9 +11199,9 @@ pub(crate) struct SummaryListFilters {
     pub(crate) workflow_name: Option<String>,
     pub(crate) workflow_id: Option<String>,
     pub(crate) search_attrs: Vec<Value>,
-    pub(crate) completed_after: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) completed_before: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) cursor: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    pub(crate) completed_after: Option<jiff::Timestamp>,
+    pub(crate) completed_before: Option<jiff::Timestamp>,
+    pub(crate) cursor: Option<(jiff::Timestamp, uuid::Uuid)>,
     /// Sort direction (issue #752, AC4 — parity with `GET /workflows`). Defaults
     /// to `Desc` (newest-first).
     pub(crate) order: WorkflowSortOrder,
@@ -11250,23 +11273,21 @@ pub(crate) fn parse_summary_filters(
                 filters.search_attrs.push(Value::Object(object));
             }
             "completed_after" => {
-                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid completed_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
                         ))
-                    })?
-                    .with_timezone(&chrono::Utc);
+                    })?;
                 filters.completed_after = Some(dt);
             }
             "completed_before" => {
-                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid completed_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
                         ))
-                    })?
-                    .with_timezone(&chrono::Utc);
+                    })?;
                 filters.completed_before = Some(dt);
             }
             "cursor" => {
@@ -11458,7 +11479,7 @@ async fn usage_report(
 ) -> Result<Json<UsageResponse>, AutumnError> {
     let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let ceiling = api_state.usage_window_ceiling();
-    let params = UsageParams::from_query_pairs(&pairs, chrono::Utc::now(), ceiling)
+    let params = UsageParams::from_query_pairs(&pairs, jiff::Timestamp::now(), ceiling)
         .map_err(AutumnError::bad_request_msg)?;
     let response = usage::build_usage_report(&api_state, params)
         .await
@@ -11923,23 +11944,21 @@ pub(crate) fn parse_workflow_filters(
             }
             // ── Issue #498: time-range, prefix, and pagination params ────────
             "started_after" => {
-                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid started_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
                         ))
-                    })?
-                    .with_timezone(&chrono::Utc);
+                    })?;
                 filters.started_after = Some(dt);
             }
             "started_before" => {
-                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid started_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
                         ))
-                    })?
-                    .with_timezone(&chrono::Utc);
+                    })?;
                 filters.started_before = Some(dt);
             }
             "exec_id_prefix" => {
@@ -12209,14 +12228,12 @@ fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
     Ok(parsed)
 }
 
-fn parse_history_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|_| {
-            AutumnError::bad_request_msg(format!(
-                "invalid datetime '{value}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
-            ))
-        })
+fn parse_history_datetime(value: &str) -> Result<jiff::Timestamp, AutumnError> {
+    autumn_harvest::time::parse::rfc3339(value).map_err(|_| {
+        AutumnError::bad_request_msg(format!(
+            "invalid datetime '{value}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
+        ))
+    })
 }
 
 fn states_for_history_state_group(value: &str) -> Result<Vec<String>, AutumnError> {
@@ -12541,7 +12558,7 @@ async fn get_workflow(
     let legal_hold = autumn_harvest::legal_hold_active(
         execution.legal_hold_set_at,
         execution.legal_hold_until,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
 
     Ok(Json(WorkflowDetailsResponse {
@@ -12570,7 +12587,7 @@ struct WorkflowHistoryEntry {
     /// Sequential event index within this execution.
     event_id: i32,
     /// RFC 3339 timestamp recorded when the event was appended.
-    timestamp: chrono::DateTime<chrono::Utc>,
+    timestamp: jiff::Timestamp,
     /// Adjacently-tagged event type name.
     #[serde(rename = "type")]
     event_type: String,
@@ -13169,6 +13186,29 @@ fn load_shed_response(
         axum::http::HeaderValue::from(retry_after_secs),
     );
     response
+}
+
+/// Returns `secs` seconds, or `None` past `i64::MAX` milliseconds.
+///
+/// That bound is the range of `chrono::Duration::try_seconds`, which the start
+/// routes used before jiff. A jiff duration holds more. The bound stays, so a
+/// start route accepts exactly the request values that it accepted before.
+fn try_seconds(secs: i64) -> Option<jiff::SignedDuration> {
+    const MAX_SECS: i64 = i64::MAX / 1_000;
+    (-MAX_SECS..=MAX_SECS)
+        .contains(&secs)
+        .then(|| jiff::SignedDuration::from_secs(secs))
+}
+
+/// Converts `duration`, or returns `None` past `i64::MAX` milliseconds.
+///
+/// That bound is the range of `chrono::Duration::from_std`. The start routes
+/// keep it, so a delay or a delay cap converts exactly as it did before jiff.
+fn std_to_bounded_duration(duration: Duration) -> Option<jiff::SignedDuration> {
+    if duration > autumn_harvest::builder::MAX_WORKFLOW_DURATION {
+        return None;
+    }
+    jiff::SignedDuration::try_from(duration).ok()
 }
 
 /// Map a failed start to a response.
@@ -13891,9 +13931,8 @@ fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, A
     let (started_at, exec_id) = raw.split_once('|').ok_or_else(|| {
         AutumnError::bad_request_msg("invalid cursor; expected '<started_at>|<exec_id>'")
     })?;
-    let started_at = chrono::DateTime::parse_from_rfc3339(started_at)
-        .map_err(|_| AutumnError::bad_request_msg("invalid cursor timestamp"))?
-        .with_timezone(&chrono::Utc);
+    let started_at = autumn_harvest::time::parse::rfc3339(started_at)
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor timestamp"))?;
     let exec_id = exec_id
         .parse::<uuid::Uuid>()
         .map_err(|_| AutumnError::bad_request_msg("invalid cursor execution id"))?;
@@ -13943,8 +13982,11 @@ pub(crate) fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
 pub(crate) fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
     format!(
         "{}|{}",
-        row.started_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        autumn_harvest::time::rfc3339_opts(
+            row.started_at,
+            autumn_harvest::time::SecondsFormat::Micros,
+            true
+        ),
         row.exec_id
     )
 }
@@ -13954,12 +13996,16 @@ pub(crate) fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> 
 /// Encode a `(created_at, exec_id)` cursor pair into the opaque token format
 /// `"<rfc3339_micros>|<uuid>"`.
 pub(crate) fn encode_workflow_list_cursor_raw(
-    created_at: &chrono::DateTime<chrono::Utc>,
+    created_at: &jiff::Timestamp,
     exec_id: &uuid::Uuid,
 ) -> String {
     format!(
         "{}|{}",
-        created_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        autumn_harvest::time::rfc3339_opts(
+            *created_at,
+            autumn_harvest::time::SecondsFormat::Micros,
+            true
+        ),
         exec_id
     )
 }
@@ -13972,9 +14018,8 @@ pub(crate) fn parse_workflow_cursor(raw: &str) -> Result<WorkflowListCursor, Aut
     let (ts_part, id_part) = raw.split_once('|').ok_or_else(|| {
         AutumnError::bad_request_msg("invalid cursor; expected '<created_at>|<exec_id>'")
     })?;
-    let created_at = chrono::DateTime::parse_from_rfc3339(ts_part)
-        .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad timestamp"))?
-        .with_timezone(&chrono::Utc);
+    let created_at = autumn_harvest::time::parse::rfc3339(ts_part)
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad timestamp"))?;
     let exec_id = id_part
         .parse::<uuid::Uuid>()
         .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad execution id"))?;
@@ -14188,17 +14233,12 @@ fn parse_external_handoff_state(raw: &str) -> Result<String, AutumnError> {
     Ok(state.to_string())
 }
 
-fn parse_external_handoff_datetime(
-    raw: &str,
-    label: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|_| {
-            AutumnError::bad_request_msg(format!(
-                "invalid {label} '{raw}'; expected RFC 3339 format, e.g. 2026-05-08T00:00:00Z"
-            ))
-        })
+fn parse_external_handoff_datetime(raw: &str, label: &str) -> Result<jiff::Timestamp, AutumnError> {
+    autumn_harvest::time::parse::rfc3339(raw).map_err(|_| {
+        AutumnError::bad_request_msg(format!(
+            "invalid {label} '{raw}'; expected RFC 3339 format, e.g. 2026-05-08T00:00:00Z"
+        ))
+    })
 }
 
 async fn load_external_handoffs_from_shards(
@@ -14339,7 +14379,7 @@ async fn get_workflow_timeline(
         .await
         .map_err(map_error)?;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let timeline = autumn_harvest::derive_timeline(
         &rows,
         execution.started_at,
@@ -14369,7 +14409,7 @@ pub(crate) struct WorkflowLogLineResponse {
     /// The author-emitted message (capped at write time).
     pub message: String,
     /// Wall-clock instant the line was persisted.
-    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub occurred_at: jiff::Timestamp,
     /// `true` for the synthetic per-execution cap marker (issue #790, AC4).
     /// Omitted for ordinary lines.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -14394,12 +14434,7 @@ pub(crate) struct WorkflowLogsResponse {
 }
 
 /// Parsed `GET /workflows/{id}/logs` query: `(limit, cursor, levels, since)`.
-type WorkflowLogsQueryParams = (
-    i64,
-    Option<i64>,
-    Vec<String>,
-    Option<chrono::DateTime<chrono::Utc>>,
-);
+type WorkflowLogsQueryParams = (i64, Option<i64>, Vec<String>, Option<jiff::Timestamp>);
 
 /// Parse query parameters for `GET /workflows/{id}/logs`.
 ///
@@ -14412,7 +14447,7 @@ pub(crate) fn parse_workflow_logs_query(
     let mut limit = DEFAULT_WORKFLOW_LOG_PAGE;
     let mut cursor: Option<i64> = None;
     let mut levels: Vec<String> = Vec::new();
-    let mut since: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut since: Option<jiff::Timestamp> = None;
 
     for (k, v) in pairs {
         match k.as_str() {
@@ -14703,7 +14738,7 @@ pub(crate) async fn build_awaitables_report(
     // Best-effort: this query only *enriches* activity awaitables with a
     // deadline. Its failure degrades to no-deadline rather than failing the
     // whole triage report.
-    let activity_deadlines: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+    let activity_deadlines: std::collections::HashMap<String, jiff::Timestamp> =
         harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(harvest_task_queue::task_type.eq("activity"))
@@ -14726,7 +14761,7 @@ pub(crate) async fn build_awaitables_report(
             .filter_map(|task| {
                 let activity_id = task.activity_id?;
                 let start_to_close_deadline = match (task.started_at, task.start_to_close) {
-                    (Some(started), Some(stc)) => started.checked_add_signed(stc),
+                    (Some(started), Some(stc)) => started.checked_add(stc).ok(),
                     _ => None,
                 };
                 let deadline = match (task.schedule_to_close_at, start_to_close_deadline) {
@@ -14943,7 +14978,7 @@ pub(crate) async fn build_awaitables_report(
 pub(crate) fn classify_replayed_wait_set(
     ctx: &WorkflowContext,
     outcome: QueryReplayOutcome,
-    rows: &[(chrono::DateTime<chrono::Utc>, WorkflowEvent)],
+    rows: &[(jiff::Timestamp, WorkflowEvent)],
     fire_eligible_timer_ids: Option<&std::collections::HashSet<String>>,
 ) -> (
     &'static str,
@@ -15032,7 +15067,7 @@ pub(crate) fn classify_replayed_wait_set(
 /// derived none. Timers and handoffs carry their own.
 pub(crate) fn enrich_activity_deadlines(
     projection: &mut autumn_harvest::awaitables::AwaitablesProjection,
-    activity_deadlines: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    activity_deadlines: &std::collections::HashMap<String, jiff::Timestamp>,
 ) {
     for awaitable in &mut projection.awaitables {
         if awaitable.kind == autumn_harvest::awaitables::AwaitableKind::Activity
@@ -15077,7 +15112,7 @@ pub(crate) struct TerminalOutcomeResponse {
     pub error: Option<String>,
     /// When the run reached its terminal state.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<jiff::Timestamp>,
 }
 
 /// Response of `GET /workflows/{id}/diagnose`.
@@ -15105,7 +15140,7 @@ pub(crate) struct WorkflowDiagnoseResponse {
     pub last_event_age_seconds: Option<f64>,
     /// Timestamp of the most recent recorded event.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_event_at: Option<jiff::Timestamp>,
     /// Present only for a terminal execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_outcome: Option<TerminalOutcomeResponse>,
@@ -15132,44 +15167,44 @@ const WAIT_SET_NOT_CONSULTED: &str = "not_consulted";
 
 /// The column tuple [`build_diagnosis_report`]'s narrow task projection loads.
 type DiagnoseTaskRow = (
-    String,                        // state
-    Option<String>,                // activity_name
-    String,                        // queue_name
-    i32,                           // attempt
-    Option<String>,                // error
-    chrono::DateTime<chrono::Utc>, // scheduled_at
-    Option<String>,                // rate_limit_key
-    Option<String>,                // concurrency_key
-    Option<i32>,                   // concurrency_cap
-    String,                        // task_type
-    Option<String>,                // required_build_id
-    Option<serde_json::Value>,     // required_capabilities
-    Option<uuid::Uuid>,            // session_id
-    Option<String>,                // sticky_worker_id
-    Option<String>,                // worker_id
+    String,                    // state
+    Option<String>,            // activity_name
+    String,                    // queue_name
+    i32,                       // attempt
+    Option<String>,            // error
+    SqlTimestamp,              // scheduled_at
+    Option<String>,            // rate_limit_key
+    Option<String>,            // concurrency_key
+    Option<i32>,               // concurrency_cap
+    String,                    // task_type
+    Option<String>,            // required_build_id
+    Option<serde_json::Value>, // required_capabilities
+    Option<uuid::Uuid>,        // session_id
+    Option<String>,            // sticky_worker_id
+    Option<String>,            // worker_id
 );
 
 /// The run's own workflow-task row, with the claim requirements its liveness
 /// answer depends on.
 type WorkflowTaskRow = (
-    String,                        // state
-    Option<String>,                // worker_id
-    String,                        // queue_name
-    chrono::DateTime<chrono::Utc>, // scheduled_at
-    Option<String>,                // required_build_id
-    Option<serde_json::Value>,     // required_capabilities
-    Option<uuid::Uuid>,            // session_id
-    Option<String>,                // sticky_worker_id
+    String,                    // state
+    Option<String>,            // worker_id
+    String,                    // queue_name
+    SqlTimestamp,              // scheduled_at
+    Option<String>,            // required_build_id
+    Option<serde_json::Value>, // required_capabilities
+    Option<uuid::Uuid>,        // session_id
+    Option<String>,            // sticky_worker_id
     // `harvest_task_queue.created_at` is `Nullable<Timestamptz>` (issue
     // #501: pre-upgrade rows have none). This stays `Option` for that
     // reason, even though every row this endpoint's own writes produce
     // sets it.
-    Option<chrono::DateTime<chrono::Utc>>, // created_at
+    Option<SqlTimestamp>, // created_at
     // Issue #1402: the timer-provenance marker `is_the_missed_timer_wake`
     // checks. `scheduled_at` alone can stop proving ownership: a
     // queue-pause resume credit, an orphan reclaim, or a capability-miss
     // release can each drift it.
-    Option<chrono::DateTime<chrono::Utc>>, // timer_fires_at
+    Option<SqlTimestamp>, // timer_fires_at
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -15184,7 +15219,7 @@ struct DiagnoseTask {
     queue_name: String,
     attempt: i32,
     error: Option<String>,
-    scheduled_at: chrono::DateTime<chrono::Utc>,
+    scheduled_at: jiff::Timestamp,
     rate_limit_key: Option<String>,
     concurrency_key: Option<String>,
     concurrency_cap: Option<i32>,
@@ -15704,18 +15739,17 @@ pub(crate) async fn build_diagnosis_report(
     // therefore run slightly ahead of `now`, captured further down. `now`
     // (issue #1368) is the single instant every deadline, age and backoff
     // COMPARISON in this response is judged against.
-    let report_started_at = chrono::Utc::now();
+    let report_started_at = jiff::Timestamp::now();
 
-    let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
+    let last_event_at: Option<jiff::Timestamp> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .select(diesel::dsl::max(harvest_events::timestamp))
-        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
+        .first::<Option<SqlTimestamp>>(&mut conn)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .map(SqlTimestamp::to_jiff);
     let last_event_age_seconds = last_event_at.map(|ts| {
-        (report_started_at - ts)
-            .to_std()
-            .map_or(0.0, |d| d.as_secs_f64())
+        std::time::Duration::try_from(report_started_at - ts).map_or(0.0, |d| d.as_secs_f64())
     });
 
     let is_terminal = is_terminal_state(&execution.state);
@@ -15829,7 +15863,7 @@ pub(crate) async fn build_diagnosis_report(
                 queue_name,
                 attempt,
                 error,
-                scheduled_at,
+                scheduled_at: scheduled_at.to_jiff(),
                 rate_limit_key,
                 concurrency_key,
                 concurrency_cap,
@@ -15913,7 +15947,7 @@ pub(crate) async fn build_diagnosis_report(
     // `now`, so the "already cleared" comparison could never succeed. One
     // `now`, used everywhere a comparison needs it, keeps that from
     // recurring.
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let (cb_phase, cb_tracked): (
         std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
         Vec<String>,
@@ -16140,7 +16174,7 @@ pub(crate) async fn build_diagnosis_report(
             // Authoritative, straight from the registry's own flag. It is NEVER
             // inferred from whether `circuit_cooldown_until` could be computed
             // (issue #1193). A policy cooldown outside the representable range
-            // of `chrono` ALSO makes `circuit_cooldown_until` return `None`.
+            // of `jiff` ALSO makes `circuit_cooldown_until` return `None`.
             // That happens for a breaker that was tripped organically. Without
             // the flag, it would be indistinguishable from a genuinely
             // operator-forced one.
@@ -16263,11 +16297,13 @@ pub(crate) async fn build_diagnosis_report(
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))
         .select(harvest_timers::fires_at)
-        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
+        .load::<SqlTimestamp>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
-        .map(|fires_at| PendingTimerFacts { fires_at })
+        .map(|fires_at| PendingTimerFacts {
+            fires_at: fires_at.to_jiff(),
+        })
         .collect();
 
     let workflow_task = workflow_task_row.map(
@@ -16312,9 +16348,9 @@ pub(crate) async fn build_diagnosis_report(
                 ),
                 state,
                 queue_name,
-                scheduled_at,
-                created_at,
-                timer_fires_at,
+                scheduled_at: scheduled_at.to_jiff(),
+                created_at: created_at.map(SqlTimestamp::to_jiff),
+                timer_fires_at: timer_fires_at.map(SqlTimestamp::to_jiff),
             }
         },
     );
@@ -16490,7 +16526,7 @@ pub(crate) async fn build_diagnosis_report(
 /// must not appear once the headline verdict stops reporting it.
 fn contributing_reasons_for(
     activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> Vec<String> {
     // Derived from the FACTS, never from the raw in-process snapshot. A phase
     // reaches a fact only when the local breaker is authoritative for that row
@@ -16589,17 +16625,15 @@ fn contributing_reasons_for(
 /// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
 /// timestamp, so the endpoint derives one. Every failure mode resolves to
 /// `None`, never a panic or a wrapped instant. The modes are a NaN, negative
-/// or huge value (`try_from_secs_f64`), a duration outside `chrono`'s range
-/// (`from_std`), and an overflowing instant (`checked_add_signed`). A missing
+/// or huge value (`try_from_secs_f64`), a duration outside the range of
+/// `jiff::SignedDuration` (`try_from`), and an overflowing instant
+/// (`checked_add`). A missing
 /// `cooldown_until` is already the documented shape for a force-opened
 /// breaker, so `None` is never a lie.
-fn circuit_cooldown_until(
-    now: chrono::DateTime<chrono::Utc>,
-    secs: f64,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+fn circuit_cooldown_until(now: jiff::Timestamp, secs: f64) -> Option<jiff::Timestamp> {
     let std_dur = std::time::Duration::try_from_secs_f64(secs).ok()?;
-    let delta = chrono::Duration::from_std(std_dur).ok()?;
-    now.checked_add_signed(delta)
+    let delta = jiff::SignedDuration::try_from(std_dur).ok()?;
+    now.checked_add(delta).ok()
 }
 
 /// The two distinct ways `claim_task`'s rate-limit gate can refuse a key.
@@ -17090,6 +17124,47 @@ async fn get_run_chain(
     Ok(Json(response))
 }
 
+/// Returns the deadline `timeout` after `from` for a pending activity.
+///
+/// An activity timeout can be up to `i64::MAX` milliseconds, and a stored
+/// time can read clamped to the end of the jiff range. A plain sum then
+/// panics, where `chrono` reached a far year. A sum past the jiff range
+/// saturates to [`jiff::Timestamp::MAX`] or [`jiff::Timestamp::MIN`].
+fn pending_activity_deadline(
+    from: jiff::Timestamp,
+    timeout: jiff::SignedDuration,
+) -> jiff::Timestamp {
+    from.checked_add(timeout).unwrap_or_else(|_| {
+        if timeout.is_negative() {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        }
+    })
+}
+
+#[cfg(test)]
+mod pending_activity_deadline_tests {
+    use super::pending_activity_deadline;
+    use jiff::{SignedDuration, Timestamp};
+
+    #[test]
+    fn a_deadline_past_the_jiff_range_saturates() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let huge = SignedDuration::from_secs(400_000_000_000);
+        assert_eq!(pending_activity_deadline(now, huge), Timestamp::MAX);
+        assert_eq!(
+            pending_activity_deadline(Timestamp::MAX, SignedDuration::from_secs(1)),
+            Timestamp::MAX
+        );
+        assert_eq!(pending_activity_deadline(now, -huge), Timestamp::MIN);
+        assert_eq!(
+            pending_activity_deadline(now, SignedDuration::from_secs(30)),
+            Timestamp::constant(1_700_000_030, 0)
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
@@ -17169,14 +17244,14 @@ async fn get_workflow_stack(
                 harvest_events::event_data,
                 harvest_events::timestamp,
             ))
-            .load::<(i32, serde_json::Value, chrono::DateTime<chrono::Utc>)>(&mut conn)
+            .load::<(i32, serde_json::Value, SqlTimestamp)>(&mut conn)
             .await
             .map_err(database_error)?
             .into_iter()
             .filter_map(|(event_id, data, ts)| {
                 serde_json::from_value::<WorkflowEvent>(data)
                     .ok()
-                    .map(|event| (i64::from(event_id), event, ts))
+                    .map(|event| (i64::from(event_id), event, ts.to_jiff()))
             })
             .collect::<Vec<_>>();
         latest_failures_by_activity(&failure_events)
@@ -17235,7 +17310,7 @@ async fn get_workflow_stack(
     );
     // Snapshot the current time once above the loop so all tasks in the same
     // response are judged against a consistent instant (Finding 7 / #516).
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     // Accumulated across every decoded field on this response (issue #608).
     // The surfaced #773 `last_failure` errors are decoded inline at each join
     // site below. A regular one comes from the task-row `error`. A local one
@@ -17363,12 +17438,17 @@ async fn get_workflow_stack(
                 heartbeat_details_omitted_for_budget: false,
                 heartbeat_details_bytes,
                 next_retry_at,
-                schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
-                start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
+                schedule_to_start_deadline: t
+                    .schedule_to_start
+                    .map(|d| pending_activity_deadline(t.scheduled_at, d)),
+                start_to_close_deadline: t
+                    .started_at
+                    .zip(t.start_to_close)
+                    .map(|(s, d)| pending_activity_deadline(s, d)),
                 heartbeat_deadline: t
                     .last_heartbeat_at
                     .zip(t.heartbeat_timeout)
-                    .map(|(h, d)| h + d),
+                    .map(|(h, d)| pending_activity_deadline(h, d)),
                 last_failure,
             }
         })
@@ -17450,10 +17530,11 @@ async fn get_workflow_stack(
             harvest_events::event_data,
             harvest_events::timestamp,
         ))
-        .load::<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .load::<(String, serde_json::Value, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
-        .into_iter();
+        .into_iter()
+        .map(|(event_type, data, ts)| (event_type, data, ts.to_jiff()));
     let mut pending_local_activities =
         fold_pending_local_activities(local_rows, &failures_by_activity);
     // Decode each SURVIVING pending local activity's `last_failure` error
@@ -17476,7 +17557,7 @@ async fn get_workflow_stack(
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))
         .select((harvest_timers::timer_id, harvest_timers::fires_at))
-        .load::<(String, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
@@ -17484,20 +17565,21 @@ async fn get_workflow_stack(
             timer_id,
             name: None,
             created_at: None,
-            fires_at,
+            fires_at: fires_at.to_jiff(),
         })
         .collect::<Vec<_>>();
     let buffered_signals = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
         .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
-        .load::<(String, chrono::DateTime<chrono::Utc>)>(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
         .fold(
-            std::collections::BTreeMap::<String, (i64, chrono::DateTime<chrono::Utc>)>::new(),
+            std::collections::BTreeMap::<String, (i64, jiff::Timestamp)>::new(),
             |mut acc, (name, ts)| {
+                let ts = ts.to_jiff();
                 acc.entry(name)
                     .and_modify(|entry| {
                         entry.0 += 1;
@@ -17624,16 +17706,16 @@ fn parse_delay_duration(raw: &str) -> Result<std::time::Duration, AutumnError> {
 /// Resolve a workflow's declared default SLA, clamped against its declared
 /// `execution_timeout` (issue #487). An SLA softer than the hard timeout could
 /// never fire (the timeout kills the run first), so cap it. Returns the
-/// effective chrono SLA, or `None` when the workflow declares no SLA.
+/// effective SLA, or `None` when the workflow declares no SLA.
 pub(crate) fn clamp_info_default_sla(
     info_sla: Option<std::time::Duration>,
     info_execution_timeout: Option<std::time::Duration>,
-) -> Option<chrono::Duration> {
+) -> Option<jiff::SignedDuration> {
     info_sla
-        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .and_then(autumn_harvest::time::from_std_bounded)
         .map(|sla| {
             info_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map_or(sla, |hard| sla.min(hard))
         })
 }
@@ -19248,18 +19330,22 @@ pub(crate) async fn start_workflow(
             }
             return AutumnError::bad_request_msg(err_msg).into_response();
         }
-        let Ok(chrono_d) = chrono::Duration::from_std(std_d) else {
+        let Some(delay) = std_to_bounded_duration(std_d) else {
             return AutumnError::bad_request_msg("delay duration overflow").into_response();
         };
-        Some(chrono_d)
+        Some(delay)
     } else {
         None
     };
 
     if let Some(sa) = request.start_at {
-        let max_delay_chrono =
-            chrono::Duration::from_std(max_delay).unwrap_or_else(|_| chrono::Duration::days(365));
-        let max_start_at = chrono::Utc::now() + max_delay_chrono;
+        let max_delay_bound =
+            std_to_bounded_duration(max_delay).unwrap_or_else(|| autumn_harvest::time::days(365));
+        // jiff ends in the year 9999. A later cap saturates, so every
+        // `start_at` is within it, as it was under chrono.
+        let max_start_at = jiff::Timestamp::now()
+            .checked_add(max_delay_bound)
+            .unwrap_or(jiff::Timestamp::MAX);
         if sa > max_start_at {
             let err_msg = format!(
                 "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
@@ -19286,7 +19372,7 @@ pub(crate) async fn start_workflow(
         }
     }
 
-    let max_delay_chrono = chrono::Duration::from_std(max_delay).ok();
+    let max_delay_bound = std_to_bounded_duration(max_delay);
 
     // Issue #252: compute effective cap; enforcement happens inside
     // start_or_load_workflow_execution so duplicate-resolution (409) runs first.
@@ -19409,7 +19495,7 @@ pub(crate) async fn start_workflow(
             // clamp `None`. Reject the bad value here instead (issue #499). Negative is
             // also rejected; a non-positive deadline is never a meaningful timeout.
             if let Some(secs) = request.execution_timeout_secs
-                && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+                && (secs < 0 || try_seconds(secs).is_none())
             {
                 if let Ok(pool) = api_state.storage_pool()
                     && let Ok(mut c) = acquire_conn(pool.default_pool()).await
@@ -19473,27 +19559,27 @@ pub(crate) async fn start_workflow(
             let effective_sla_secs = request
                 .sla_secs
                 .filter(|&secs| secs >= 0)
-                .and_then(chrono::Duration::try_seconds)
-                .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+                .and_then(try_seconds)
+                .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
                 .map(|sla| {
                     info_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .and_then(autumn_harvest::time::from_std_bounded)
                         .map_or(sla, |hard| sla.min(hard))
                 })
-                .map(|d| d.num_seconds());
+                .map(|d| d.as_secs());
 
             // Effective execution timeout: request override → WorkflowInfo default.
             let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
                 info_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
-                    .map(|d| d.num_seconds())
+                    .and_then(autumn_harvest::time::from_std_bounded)
+                    .map(|d| d.as_secs())
             });
 
             // Effective server-side ceiling captured so the fire path cannot bypass it.
             let effective_ceiling_secs = api_state
                 .max_workflow_execution_timeout()
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .map(|d| d.num_seconds());
+                .and_then(autumn_harvest::time::from_std_bounded)
+                .map(|d| d.as_secs());
             // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
             // default + fleet-wide ceiling-as-default so a debounced start does not
             // silently drop a declared chain cap. The operator override wins
@@ -19501,12 +19587,12 @@ pub(crate) async fn start_workflow(
             let effective_chain_execution_timeout_secs = runtime
                 .registry
                 .chain_execution_timeout(&workflow_name)
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .map(|d| d.num_seconds());
+                .and_then(autumn_harvest::time::from_std_bounded)
+                .map(|d| d.as_secs());
             let effective_chain_ceiling_secs = api_state
                 .max_workflow_chain_timeout()
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .map(|d| d.num_seconds());
+                .and_then(autumn_harvest::time::from_std_bounded)
+                .map(|d| d.as_secs());
 
             // Route to the shard that owns this debounce key (shard-local, consistent with #247).
             // The eventual execution is created on this shard. So this shard, not the
@@ -19760,7 +19846,7 @@ pub(crate) async fn start_workflow(
         }
 
         if let Some(secs) = request.execution_timeout_secs
-            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+            && (secs < 0 || try_seconds(secs).is_none())
         {
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut c) = acquire_conn(pool.default_pool()).await
@@ -19820,25 +19906,25 @@ pub(crate) async fn start_workflow(
         let effective_sla_secs = request
             .sla_secs
             .filter(|&secs| secs >= 0)
-            .and_then(chrono::Duration::try_seconds)
-            .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+            .and_then(try_seconds)
+            .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
             .map(|sla| {
                 info_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .and_then(autumn_harvest::time::from_std_bounded)
                     .map_or(sla, |hard| sla.min(hard))
             })
-            .map(|d| d.num_seconds());
+            .map(|d| d.as_secs());
 
         let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
             info_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .map(|d| d.num_seconds())
+                .and_then(autumn_harvest::time::from_std_bounded)
+                .map(|d| d.as_secs())
         });
 
         let effective_ceiling_secs = api_state
             .max_workflow_execution_timeout()
-            .and_then(|d| chrono::Duration::from_std(d).ok())
-            .map(|d| d.num_seconds());
+            .and_then(autumn_harvest::time::from_std_bounded)
+            .map(|d| d.as_secs());
         // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
         // default + fleet-wide ceiling-as-default so a batched start does not
         // silently drop a declared chain cap. The operator override wins
@@ -19846,12 +19932,12 @@ pub(crate) async fn start_workflow(
         let effective_chain_execution_timeout_secs = runtime
             .registry
             .chain_execution_timeout(&workflow_name)
-            .and_then(|d| chrono::Duration::from_std(d).ok())
-            .map(|d| d.num_seconds());
+            .and_then(autumn_harvest::time::from_std_bounded)
+            .map(|d| d.as_secs());
         let effective_chain_ceiling_secs = api_state
             .max_workflow_chain_timeout()
-            .and_then(|d| chrono::Duration::from_std(d).ok())
-            .map(|d| d.num_seconds());
+            .and_then(autumn_harvest::time::from_std_bounded)
+            .map(|d| d.as_secs());
 
         let batch_shard = runtime
             .router
@@ -20100,11 +20186,12 @@ pub(crate) async fn start_workflow(
     // at parity with `info_execution_timeout` above. The fleet-wide ceiling from
     // `api_state.max_workflow_chain_timeout()` doubles as a default, applied by
     // `effective_chain_timeout` in the core start path.
-    let info_chain_timeout_chrono =
-        info_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    let max_chain_timeout_ceiling = api_state
-        .max_workflow_chain_timeout()
-        .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
+    let info_chain_timeout =
+        info_chain_execution_timeout.and_then(autumn_harvest::time::from_std_bounded);
+    let max_chain_timeout_ceiling = api_state.max_workflow_chain_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
 
     // Resolve effective SLA: request override → WorkflowInfo default → None.
     // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
@@ -20116,11 +20203,11 @@ pub(crate) async fn start_workflow(
     let effective_sla = request
         .sla_secs
         .filter(|&secs| secs >= 0)
-        .and_then(chrono::Duration::try_seconds)
-        .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+        .and_then(try_seconds)
+        .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
         .map(|sla| {
             info_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map_or(sla, |hard| sla.min(hard))
         });
 
@@ -20369,12 +20456,12 @@ pub(crate) async fn start_workflow(
             reuse_policy: request.reuse_policy.clone(),
             execution_timeout_secs: request.execution_timeout_secs.or_else(|| {
                 info_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
-                    .map(|d| d.num_seconds())
+                    .and_then(autumn_harvest::time::from_std_bounded)
+                    .map(|d| d.as_secs())
             }),
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
-            sla_secs: effective_sla.map(|d| d.num_seconds()),
+            sla_secs: effective_sla.map(|d| d.as_secs()),
             context_headers: request.context_headers.clone(),
             priority: request.priority.map(Priority::as_i32),
             concurrency_key: concurrency_key.clone(),
@@ -20385,13 +20472,12 @@ pub(crate) async fn start_workflow(
             severity: severity.map(str::to_string),
             max_execution_timeout_ceiling_secs: api_state
                 .max_workflow_execution_timeout()
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .map(|d| d.num_seconds()),
+                .and_then(autumn_harvest::time::from_std_bounded)
+                .map(|d| d.as_secs()),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling captured so the deferred fire keeps the cap.
-            chain_execution_timeout_secs: info_chain_timeout_chrono.map(|d| d.num_seconds()),
-            max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
-                .map(|d| d.num_seconds()),
+            chain_execution_timeout_secs: info_chain_timeout.map(|d| d.as_secs()),
+            max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling.map(|d| d.as_secs()),
             max_workflow_input_bytes: Some(effective_wf_cap),
             trace_context: trace_ctx.clone(),
             workflow_retry_policy: workflow_retry_policy
@@ -20522,11 +20608,11 @@ pub(crate) async fn start_workflow(
     if let Some(ref key) = idempotency_key {
         // Validate execution_timeout_secs BEFORE building params (issue #808). The
         // range guard inside the debounce/batch blocks is skipped for keyed starts,
-        // because they are mutually exclusive. `chrono::Duration::seconds` panics on
-        // an out-of-range i64. Mirror the existing 400 guard, so an untrusted value is
-        // a clean bad request, never a 500.
+        // because they are mutually exclusive. The guard keeps the value inside the
+        // range of `try_seconds`. Mirror the existing 400 guard, so an untrusted value
+        // is a clean bad request, never a 500.
         if let Some(secs) = request.execution_timeout_secs
-            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+            && (secs < 0 || try_seconds(secs).is_none())
         {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -20556,21 +20642,24 @@ pub(crate) async fn start_workflow(
             StartWorkflowParams {
                 execution_timeout: request
                     .execution_timeout_secs
-                    .map(chrono::Duration::seconds)
+                    .map(jiff::SignedDuration::from_secs)
                     .or_else(|| {
-                        info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                        info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)
                     }),
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 reuse_policy,
                 conflict_policy,
                 trace_context: trace_ctx,
-                max_execution_timeout_ceiling: api_state
-                    .max_workflow_execution_timeout()
-                    .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+                max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(
+                    |d| {
+                        autumn_harvest::time::from_std_bounded(d)
+                            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+                    },
+                ),
                 // Chain-scoped lifetime cap (issue #617): workflow-type default +
                 // fleet-wide ceiling-as-default, at parity with the per-run timeout.
-                chain_execution_timeout: info_chain_timeout_chrono,
+                chain_execution_timeout: info_chain_timeout,
                 max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
                 concurrency_key,
                 concurrency_limit,
@@ -20580,7 +20669,7 @@ pub(crate) async fn start_workflow(
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
                 delay,
-                max_workflow_start_delay: max_delay_chrono,
+                max_workflow_start_delay: max_delay_bound,
                 owner,
                 runbook_url,
                 severity,
@@ -20787,19 +20876,20 @@ pub(crate) async fn start_workflow(
     let start_params = StartWorkflowParams {
         execution_timeout: request
             .execution_timeout_secs
-            .map(chrono::Duration::seconds)
-            .or_else(|| info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())),
+            .map(jiff::SignedDuration::from_secs)
+            .or_else(|| info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)),
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         reuse_policy,
         conflict_policy,
         trace_context: trace_ctx,
-        max_execution_timeout_ceiling: api_state
-            .max_workflow_execution_timeout()
-            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+        max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         // Chain-scoped lifetime cap (issue #617): workflow-type default +
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
-        chain_execution_timeout: info_chain_timeout_chrono,
+        chain_execution_timeout: info_chain_timeout,
         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
         concurrency_key,
         concurrency_limit,
@@ -20809,7 +20899,7 @@ pub(crate) async fn start_workflow(
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
         delay,
-        max_workflow_start_delay: max_delay_chrono,
+        max_workflow_start_delay: max_delay_bound,
         owner,
         runbook_url,
         severity,
@@ -21288,14 +21378,16 @@ async fn batch_start_workflows(
         .cloned()
         .unwrap_or_else(|| "default".to_string());
     let max_wf_input_bytes = runtime.registry.max_workflow_input_bytes;
-    let max_exec_timeout_ceiling = api_state
-        .max_workflow_execution_timeout()
-        .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
+    let max_exec_timeout_ceiling = api_state.max_workflow_execution_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
     // Chain-scoped lifetime cap ceiling / fleet-wide default (issue #617),
     // resolved once for every batch item.
-    let max_chain_timeout_ceiling = api_state
-        .max_workflow_chain_timeout()
-        .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
+    let max_chain_timeout_ceiling = api_state.max_workflow_chain_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
 
     // ── OTel batch span (issue #357 telemetry AC) ──────────────────────────────
     // Created before any DB work. Code after the loop records the dynamic
@@ -21803,7 +21895,7 @@ async fn batch_start_workflows(
             // Both start paths take this timeout. The start caps it at the
             // fleet ceiling, and clamps the SLA to the result.
             let execution_timeout =
-                info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+                info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded);
             let item_workflow_retry_policy = info_retry_policy;
 
             // Start-throttle admission (issue #607) — best-effort batches only.
@@ -21915,10 +22007,10 @@ async fn batch_start_workflows(
                 }
                 let start_options = autumn_harvest::debounce::DebounceStartOptions {
                     reuse_policy: None,
-                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
+                    execution_timeout_secs: execution_timeout.map(|d| d.as_secs()),
                     memo: None,
                     search_attrs: item.search_attributes.clone(),
-                    sla_secs: sla.map(|d| d.num_seconds()),
+                    sla_secs: sla.map(|d| d.as_secs()),
                     context_headers: item.context_headers.clone(),
                     priority: item.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
@@ -21928,14 +22020,14 @@ async fn batch_start_workflows(
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
                     max_execution_timeout_ceiling_secs: max_exec_timeout_ceiling
-                        .map(|d| d.num_seconds()),
+                        .map(|d| d.as_secs()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
                     // + fleet-wide ceiling captured so a batched fire keeps the cap.
                     chain_execution_timeout_secs: info_chain_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                        .and_then(autumn_harvest::time::from_std_bounded)
+                        .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
-                        .map(|d| d.num_seconds()),
+                        .map(|d| d.as_secs()),
                     max_workflow_input_bytes: Some(effective_wf_cap),
                     trace_context: trace_ctx.clone(),
                     workflow_retry_policy: item_workflow_retry_policy
@@ -22035,7 +22127,7 @@ async fn batch_start_workflows(
                         // + fleet-wide ceiling-as-default, at parity with the per-run
                         // ceiling threaded above.
                         chain_execution_timeout: info_chain_execution_timeout
-                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                            .and_then(autumn_harvest::time::from_std_bounded),
                         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
                         concurrency_key,
                         concurrency_limit,
@@ -23258,24 +23350,26 @@ pub(crate) async fn signal_with_start_workflow(
             queue_name: &queue_name,
             execution_timeout: request
                 .execution_timeout_secs
-                .map(chrono::Duration::seconds)
+                .map(jiff::SignedDuration::from_secs)
                 .or_else(|| {
-                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                    info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)
                 }),
             memo: request.memo,
             search_attrs: request.search_attrs,
             reuse_policy,
             trace_context: trace_ctx,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling-as-default, at parity with the per-run timeout.
             chain_execution_timeout: info_chain_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok()),
-            max_workflow_chain_timeout_ceiling: api_state
-                .max_workflow_chain_timeout()
-                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+                .and_then(autumn_harvest::time::from_std_bounded),
+            max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
@@ -24084,22 +24178,24 @@ async fn update_with_start_workflow(
         queue_name: &queue_name,
         execution_timeout: request
             .execution_timeout_secs
-            .map(chrono::Duration::seconds)
-            .or_else(|| info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())),
+            .map(jiff::SignedDuration::from_secs)
+            .or_else(|| info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)),
         memo: request.memo,
         search_attrs: request.search_attrs,
         reuse_policy,
         trace_context: trace_ctx,
-        max_execution_timeout_ceiling: api_state
-            .max_workflow_execution_timeout()
-            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+        max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         // Chain-scoped lifetime cap (issue #617): workflow-type default +
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
         chain_execution_timeout: info_chain_execution_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok()),
-        max_workflow_chain_timeout_ceiling: api_state
-            .max_workflow_chain_timeout()
-            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            .and_then(autumn_harvest::time::from_std_bounded),
+        max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         concurrency_key,
         concurrency_limit,
         concurrency_on_conflict,
@@ -25129,10 +25225,10 @@ async fn rerun_workflow(
         max_workflow_input_bytes: effective_wf_cap,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
-            .and_then(|d| chrono::Duration::from_std(d).ok()),
+            .and_then(autumn_harvest::time::from_std_bounded),
         max_workflow_chain_timeout_ceiling: api_state
             .max_workflow_chain_timeout()
-            .and_then(|d| chrono::Duration::from_std(d).ok()),
+            .and_then(autumn_harvest::time::from_std_bounded),
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         trace_context: runtime.registry.telemetry().capture_trace_context(),
     };
@@ -25832,16 +25928,12 @@ async fn set_legal_hold_handler(
         .map(truncate_operator_reason)
         .unwrap_or_default();
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let hold_until = match request.hold_until.as_deref() {
         None => None,
-        Some(raw) => Some(
-            chrono::DateTime::parse_from_rfc3339(raw)
-                .map_err(|e| {
-                    AutumnError::bad_request_msg(format!("invalid hold_until (RFC3339): {e}"))
-                })?
-                .with_timezone(&chrono::Utc),
-        ),
+        Some(raw) => Some(autumn_harvest::time::parse::rfc3339(raw).map_err(|e| {
+            AutumnError::bad_request_msg(format!("invalid hold_until (RFC3339): {e}"))
+        })?),
     };
 
     // Reject a `hold_until` already in the past (issue #747). For a compliance
@@ -25946,7 +26038,7 @@ async fn release_legal_hold_handler(
     let result = ::autumn_harvest::shard_rebalance::release_legal_hold_forwarded(
         pool.sharded_pool(),
         exec_id,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await;
 
@@ -28661,7 +28753,7 @@ async fn patch_dag(
             diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
                 .set((
                     dsl::is_paused.eq(paused),
-                    dsl::updated_at.eq(chrono::Utc::now()),
+                    dsl::updated_at.eq(jiff::Timestamp::now().to_diesel()),
                 ))
                 .execute(&mut conn)
                 .await
@@ -28693,16 +28785,30 @@ async fn patch_dag(
 
 pub(crate) fn effective_fire_time(
     schedule_id: uuid::Uuid,
-    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_run_at: Option<jiff::Timestamp>,
     jitter_secs: i64,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Option<jiff::Timestamp> {
     let t = next_run_at?;
     if jitter_secs <= 0 {
         return None;
     }
     let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
     let offset = compute_jitter_offset(schedule_id, t, jitter_window);
-    chrono::Duration::from_std(offset).ok().map(|d| t + d)
+    add_jitter_offset(t, offset)
+}
+
+/// Adds a jitter offset to a fire time, as the `chrono` sum did.
+///
+/// An offset past the `chrono` duration range gives `None`. A stored fire
+/// time can read back as [`jiff::Timestamp::MAX`]. A sum past the jiff range
+/// saturates to that value, so a far fire time stays far and never panics.
+pub(crate) fn add_jitter_offset(
+    t: jiff::Timestamp,
+    offset: std::time::Duration,
+) -> Option<jiff::Timestamp> {
+    autumn_harvest::time::from_std_bounded(offset).map(|d| {
+        autumn_harvest::time::checked_add_chrono_range(t, d).unwrap_or(jiff::Timestamp::MAX)
+    })
 }
 
 /// Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
@@ -28826,7 +28932,7 @@ async fn get_schedule(
     // read agrees with the gauge and the tick — never a cross-shard sum.
     let mut at_capacity = false;
     // Calendar-adjusted fire time (issue #696), resolved on the same shard.
-    let mut effective_fire_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut effective_fire_at: Option<jiff::Timestamp> = None;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let row: Option<HarvestSchedule> = dsl::harvest_schedules
@@ -28917,7 +29023,7 @@ async fn get_schedule_decisions(
         q = q.filter(dsl::schedule_id.eq(id));
 
         if let Some(ref since_dt) = since {
-            q = q.filter(dsl::occurred_at.ge(*since_dt));
+            q = q.filter(dsl::occurred_at.ge((*since_dt).to_diesel()));
         }
         if let Some(ref dec_val) = query.decision {
             q = q.filter(dsl::decision.eq(dec_val));
@@ -29104,8 +29210,8 @@ async fn observe_schedule_runs_shard(
     pool: Option<DbPool>,
     schedule_id: uuid::Uuid,
     query: &autumn_harvest::ScheduleRunQuery,
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<jiff::Timestamp>,
+    until: Option<jiff::Timestamp>,
 ) -> schedule_runs::ShardRunsObservation {
     let unavailable = |error: String| schedule_runs::ShardRunsObservation {
         shard_id,
@@ -29164,8 +29270,9 @@ async fn list_schedule_runs_handler(
 ) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
     let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let schedule_id = parse_uuid(&id_str, "schedule id")?;
-    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
-        .map_err(AutumnError::bad_request_msg)?;
+    let params =
+        schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, jiff::Timestamp::now())
+            .map_err(AutumnError::bad_request_msg)?;
 
     Ok(Json(
         load_schedule_runs(&api_state, schedule_id, params).await?,
@@ -29277,7 +29384,7 @@ async fn list_fleet_decisions(
             q = q.filter(dsl::schedule_name.eq(name_val));
         }
         if let Some(ref since_dt) = since {
-            q = q.filter(dsl::occurred_at.ge(*since_dt));
+            q = q.filter(dsl::occurred_at.ge((*since_dt).to_diesel()));
         }
         if let Some(ref dec_val) = query.decision {
             q = q.filter(dsl::decision.eq(dec_val));
@@ -29812,8 +29919,7 @@ fn resolve_schedule_deadline_secs(
     };
     let execution_timeout_secs =
         effective_execution_timeout.and_then(|d| i64::try_from(d.as_secs()).ok());
-    let sla_secs =
-        clamp_info_default_sla(sla, effective_execution_timeout).map(|d| d.num_seconds());
+    let sla_secs = clamp_info_default_sla(sla, effective_execution_timeout).map(|d| d.as_secs());
     (execution_timeout_secs, sla_secs)
 }
 
@@ -29822,7 +29928,7 @@ fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
     at_capacity: bool,
-    effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    effective_fire_at: Option<jiff::Timestamp>,
     registry: Option<&HandlerRegistry>,
 ) -> ScheduleEntry {
     // Overdue detection (issue #696): computed from the schedule's own
@@ -29849,7 +29955,7 @@ fn schedule_entry_from_row(
         autumn_harvest::scheduler::schedule_overdue(&autumn_harvest::scheduler::OverdueInputs {
             schedule: overdue_schedule.as_ref(),
             next_run_at: s.next_run_at,
-            now: chrono::Utc::now(),
+            now: jiff::Timestamp::now(),
             jitter: std::time::Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0)),
             tick_interval: autumn_harvest::scheduler::SCHEDULER_TICK_INTERVAL,
             is_paused: s.is_paused,
@@ -29936,7 +30042,7 @@ fn schedule_entry_from_row(
 #[derive(Clone, Copy, Default)]
 struct ScheduleOverdueAux {
     at_capacity: bool,
-    effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    effective_fire_at: Option<jiff::Timestamp>,
 }
 
 /// Build a per-schedule overdue-aux map (keyed by schedule id) for the overdue
@@ -30036,7 +30142,7 @@ async fn load_schedule_overdue_aux_by_shard(
             // exclusions" guess.
             let effective_fire_at = exclusions.as_ref().and_then(|exclusions| {
                 s.calendar_name.as_deref().and_then(|cal_name| {
-                    let empty: Vec<chrono::NaiveDate> = Vec::new();
+                    let empty: Vec<jiff::civil::Date> = Vec::new();
                     let excluded = exclusions.get(cal_name).unwrap_or(&empty);
                     let exclude_weekends =
                         autumn_harvest::calendar::calendar_excludes_weekends(cal_name);
@@ -30659,7 +30765,6 @@ async fn create_completion_trigger(
     Json(request): Json<CreateCompletionTriggerRequest>,
 ) -> Result<(StatusCode, Json<CompletionTriggerDb>), AutumnError> {
     use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
-    use chrono::Utc;
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
@@ -30761,8 +30866,8 @@ async fn create_completion_trigger(
                                 triggers_dsl::input_mapping.eq(&old_row.input_mapping),
                                 triggers_dsl::queue_name.eq(&old_row.queue_name),
                                 triggers_dsl::is_static.eq(old_row.is_static),
-                                triggers_dsl::created_at.eq(old_row.created_at),
-                                triggers_dsl::updated_at.eq(old_row.updated_at),
+                                triggers_dsl::created_at.eq(old_row.created_at.to_diesel()),
+                                triggers_dsl::updated_at.eq(old_row.updated_at.to_diesel()),
                                 triggers_dsl::condition.eq(&old_row.condition),
                             ))
                             .execute(&mut rollback_conn)
@@ -30793,7 +30898,7 @@ async fn create_completion_trigger(
                     triggers_dsl::input_mapping.eq(&new_row.input_mapping),
                     triggers_dsl::queue_name.eq(&new_row.queue_name),
                     triggers_dsl::condition.eq(&new_row.condition),
-                    triggers_dsl::updated_at.eq(Utc::now()),
+                    triggers_dsl::updated_at.eq(jiff::Timestamp::now().to_diesel()),
                 ))
                 .get_result::<CompletionTriggerDb>(&mut conn)
                 .await
@@ -30817,8 +30922,8 @@ async fn create_completion_trigger(
                                     triggers_dsl::input_mapping.eq(&old_row.input_mapping),
                                     triggers_dsl::queue_name.eq(&old_row.queue_name),
                                     triggers_dsl::is_static.eq(old_row.is_static),
-                                    triggers_dsl::created_at.eq(old_row.created_at),
-                                    triggers_dsl::updated_at.eq(old_row.updated_at),
+                                    triggers_dsl::created_at.eq(old_row.created_at.to_diesel()),
+                                    triggers_dsl::updated_at.eq(old_row.updated_at.to_diesel()),
                                     triggers_dsl::condition.eq(&old_row.condition),
                                 ))
                                 .execute(&mut rollback_conn)
@@ -30895,7 +31000,7 @@ async fn set_schedule_paused(
     };
     let pool = api_state.storage_pool().map_err(map_error)?;
     let id_str_owned = id.to_string();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     let mut found_count = 0usize;
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -30914,10 +31019,10 @@ async fn set_schedule_paused(
             )
             .set((
                 dsl::is_paused.eq(true),
-                dsl::paused_at.eq(Some(now)),
+                dsl::paused_at.eq(Some(now).to_diesel()),
                 dsl::paused_by.eq(Some(actor.as_str())),
                 dsl::pause_reason.eq(reason),
-                dsl::updated_at.eq(now),
+                dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(&mut conn)
             .await
@@ -30939,12 +31044,12 @@ async fn set_schedule_paused(
             )
             .set((
                 dsl::is_paused.eq(false),
-                dsl::paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
                 dsl::paused_by.eq(None::<&str>),
                 dsl::pause_reason.eq(None::<&str>),
-                dsl::auto_paused_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
                 dsl::consecutive_failure_count.eq(0),
-                dsl::updated_at.eq(now),
+                dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(&mut conn)
             .await
@@ -31247,7 +31352,7 @@ struct ScheduleTriggerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     execution_id: Option<uuid::Uuid>,
     workflow_id: String,
-    triggered_at: chrono::DateTime<chrono::Utc>,
+    triggered_at: jiff::Timestamp,
     /// `"fired"` when a new execution was started, `"skipped_overlap"` when the
     /// effective overlap policy suppressed the run.
     outcome: String,
@@ -31317,7 +31422,7 @@ async fn trigger_schedule_now(
     // as when next_run_at > end_at or max_runs was tightened mid-flight. So
     // exhausted_at can be NULL while the bounds are already violated.
     {
-        let trigger_now = chrono::Utc::now();
+        let trigger_now = jiff::Timestamp::now();
         let live_end_at_exceeded = schedule.end_at.is_some_and(|end| trigger_now >= end);
         let live_budget_exhausted = schedule
             .max_runs
@@ -31406,12 +31511,12 @@ async fn trigger_schedule_now(
 
     // Pre-generate triggered_at and workflow_id so the gate check uses the
     // actual execution shard (router-determined) rather than a hard-coded 0.
-    let triggered_at = chrono::Utc::now();
+    let triggered_at = jiff::Timestamp::now();
     // Append a UUID v4 so concurrent trigger calls within the same millisecond
     // each produce a distinct workflow_id and start independent executions.
     let workflow_id = format!(
         "manual-{schedule_id}-{}-{}",
-        triggered_at.timestamp_millis(),
+        triggered_at.as_millisecond(),
         uuid::Uuid::new_v4().simple()
     );
     let trigger_exec_shard = if schedule.dag_name.is_some() {
@@ -31559,7 +31664,7 @@ async fn trigger_schedule_now(
         )
         .set((
             sdsl::runs_started.eq(sdsl::runs_started + 1),
-            sdsl::updated_at.eq(triggered_at),
+            sdsl::updated_at.eq(triggered_at.to_diesel()),
         ))
         .execute(&mut sched_conn)
         .await
@@ -31615,14 +31720,14 @@ async fn trigger_schedule_now(
         .and_then(|(execution_timeout, sla)| clamp_info_default_sla(sla, execution_timeout));
     let info_execution_timeout = effective_info_defaults
         .and_then(|(execution_timeout, _)| execution_timeout)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     // Chain-scoped lifetime cap default (issue #617): only registered workflows
     // carry it; DAGs have no chain-cap concept. The operator override wins
     // (issue #2406).
     let info_chain_execution_timeout = runtime
         .registry
         .chain_execution_timeout(&workflow_name)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
         runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
@@ -31745,10 +31850,10 @@ async fn trigger_schedule_now(
         }
         let start_options = autumn_harvest::debounce::DebounceStartOptions {
             reuse_policy: Some("allow_duplicate".to_string()),
-            execution_timeout_secs: info_execution_timeout.map(|d| d.num_seconds()),
+            execution_timeout_secs: info_execution_timeout.map(|d| d.as_secs()),
             memo: None,
             search_attrs: None,
-            sla_secs: sla.map(|d| d.num_seconds()),
+            sla_secs: sla.map(|d| d.as_secs()),
             context_headers: None,
             priority: None,
             concurrency_key: concurrency_key.clone(),
@@ -31763,7 +31868,7 @@ async fn trigger_schedule_now(
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling captured so a throttled manual-trigger fire keeps
             // the cap.
-            chain_execution_timeout_secs: info_chain_execution_timeout.map(|d| d.num_seconds()),
+            chain_execution_timeout_secs: info_chain_execution_timeout.map(|d| d.as_secs()),
             max_workflow_chain_timeout_ceiling_secs: api_state
                 .max_workflow_chain_timeout()
                 .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
@@ -31838,10 +31943,10 @@ async fn trigger_schedule_now(
                                 .filter(sdsl::exhausted_at.is_null()),
                         )
                         .set((
-                            sdsl::exhausted_at.eq(Some(triggered_at)),
+                            sdsl::exhausted_at.eq(Some(triggered_at).to_diesel()),
                             sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                            sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                            sdsl::updated_at.eq(triggered_at),
+                            sdsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
+                            sdsl::updated_at.eq(triggered_at.to_diesel()),
                         ))
                         .execute(&mut sched_conn)
                         .await;
@@ -31900,15 +32005,17 @@ async fn trigger_schedule_now(
         &mut exec_conn,
         StartWorkflowParams {
             execution_timeout: info_execution_timeout,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling-as-default, at parity with the per-run timeout.
             chain_execution_timeout: info_chain_execution_timeout,
-            max_workflow_chain_timeout_ceiling: api_state
-                .max_workflow_chain_timeout()
-                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
@@ -32035,10 +32142,10 @@ async fn trigger_schedule_now(
                     .filter(sdsl::exhausted_at.is_null()),
             )
             .set((
-                sdsl::exhausted_at.eq(Some(triggered_at)),
+                sdsl::exhausted_at.eq(Some(triggered_at).to_diesel()),
                 sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                sdsl::updated_at.eq(triggered_at),
+                sdsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
+                sdsl::updated_at.eq(triggered_at.to_diesel()),
             ))
             .execute(&mut sched_conn)
             .await;
@@ -32074,13 +32181,13 @@ async fn trigger_schedule_now(
 async fn rollback_manual_trigger_budget(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    at: chrono::DateTime<chrono::Utc>,
+    at: jiff::Timestamp,
 ) {
     use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
     let _ = diesel::update(sdsl::harvest_schedules.find(schedule_id))
         .set((
             sdsl::runs_started.eq(sdsl::runs_started - 1),
-            sdsl::updated_at.eq(at),
+            sdsl::updated_at.eq(at.to_diesel()),
         ))
         .execute(sched_conn)
         .await;
@@ -32097,9 +32204,9 @@ async fn rollback_manual_trigger_budget(
             ),
     )
     .set((
-        sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        sdsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>),
         sdsl::exhausted_reason.eq(None::<String>),
-        sdsl::updated_at.eq(at),
+        sdsl::updated_at.eq(at.to_diesel()),
     ))
     .execute(sched_conn)
     .await;
@@ -32133,7 +32240,7 @@ macro_rules! reserve_backfill_budget_slot_stmt {
         )
         .set((
             sdsl::runs_started.eq(sdsl::runs_started + 1),
-            sdsl::updated_at.eq($at),
+            sdsl::updated_at.eq(($at).to_diesel()),
         ))
         .returning(sdsl::runs_started)
     }};
@@ -32165,9 +32272,9 @@ macro_rules! clear_stale_max_runs_exhaustion_stmt {
                 )),
         )
         .set((
-            sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            sdsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>),
             sdsl::exhausted_reason.eq(None::<String>),
-            sdsl::updated_at.eq($at),
+            sdsl::updated_at.eq(($at).to_diesel()),
         ))
     }};
 }
@@ -32195,7 +32302,10 @@ macro_rules! rearm_backfill_next_run_stmt {
                 .filter(sdsl::exhausted_at.is_null())
                 .filter(sdsl::next_run_at.is_null()),
         )
-        .set((sdsl::next_run_at.eq($next), sdsl::updated_at.eq($at)))
+        .set((
+            sdsl::next_run_at.eq(($next).to_diesel()),
+            sdsl::updated_at.eq(($at).to_diesel()),
+        ))
     }};
 }
 
@@ -32208,7 +32318,7 @@ macro_rules! rearm_backfill_next_run_stmt {
 async fn reserve_backfill_budget_slot(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    at: chrono::DateTime<chrono::Utc>,
+    at: jiff::Timestamp,
 ) -> Result<Option<i32>, diesel::result::Error> {
     reserve_backfill_budget_slot_stmt!(schedule_id, at)
         .get_result::<i32>(sched_conn)
@@ -32253,14 +32363,14 @@ async fn reserve_backfill_budget_slot(
 async fn release_backfill_budget_slot(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    at: chrono::DateTime<chrono::Utc>,
-    rearm_next: Option<chrono::DateTime<chrono::Utc>>,
+    at: jiff::Timestamp,
+    rearm_next: Option<jiff::Timestamp>,
 ) {
     use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
     if let Err(e) = diesel::update(sdsl::harvest_schedules.find(schedule_id))
         .set((
             sdsl::runs_started.eq(sdsl::runs_started - 1),
-            sdsl::updated_at.eq(at),
+            sdsl::updated_at.eq(at.to_diesel()),
         ))
         .execute(sched_conn)
         .await
@@ -32338,9 +32448,9 @@ macro_rules! transition_backfill_exhausted_stmt {
                 )),
         )
         .set((
-            sdsl::exhausted_at.eq(Some($at)),
+            sdsl::exhausted_at.eq(Some($at).to_diesel()),
             sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-            sdsl::updated_at.eq($at),
+            sdsl::updated_at.eq(($at).to_diesel()),
         ))
     }};
 }
@@ -32358,7 +32468,7 @@ macro_rules! transition_backfill_exhausted_stmt {
 async fn transition_backfill_exhausted_if_reached(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    at: chrono::DateTime<chrono::Utc>,
+    at: jiff::Timestamp,
 ) {
     if let Err(e) = transition_backfill_exhausted_stmt!(schedule_id, at)
         .execute(sched_conn)
@@ -32377,8 +32487,10 @@ async fn transition_backfill_exhausted_if_reached(
 /// Request body for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleBackfillRequest {
-    pub from: chrono::DateTime<chrono::Utc>,
-    pub to: chrono::DateTime<chrono::Utc>,
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::required")]
+    pub from: jiff::Timestamp,
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::required")]
+    pub to: jiff::Timestamp,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -32429,9 +32541,9 @@ pub(crate) struct ScheduleBackfillResponse {
     pub schedule_id: uuid::Uuid,
     pub kind: ScheduleKind,
     pub name: String,
-    pub from: chrono::DateTime<chrono::Utc>,
-    pub to: chrono::DateTime<chrono::Utc>,
-    pub planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
+    pub from: jiff::Timestamp,
+    pub to: jiff::Timestamp,
+    pub planned_timestamps: Vec<jiff::Timestamp>,
     pub total: usize,
     pub dispatched: usize,
     pub skipped: usize,
@@ -32499,7 +32611,7 @@ pub(crate) async fn schedule_backfill_inner(
     route: &str,
 ) -> Result<ScheduleBackfillResponse, AutumnError> {
     let (actor, source, req_id) = audit_context(headers, api_state);
-    let started_at = chrono::Utc::now();
+    let started_at = jiff::Timestamp::now();
 
     let schedule_id = parse_uuid(id, "schedule id")?;
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -32525,7 +32637,7 @@ pub(crate) async fn schedule_backfill_inner(
     // should start via any path (issue #478). Also check live bounds in case
     // the scheduler has not yet processed an already-violated row.
     {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let live_end_at_exceeded = schedule.end_at.is_some_and(|end| now >= end);
         let live_budget_exhausted = schedule
             .max_runs
@@ -32598,8 +32710,7 @@ pub(crate) async fn schedule_backfill_inner(
     };
 
     // fire_times is the calendar-adjusted list used for display and dedup checks.
-    let fire_times: Vec<chrono::DateTime<chrono::Utc>> =
-        timestamp_pairs.iter().map(|(_, ft)| *ft).collect();
+    let fire_times: Vec<jiff::Timestamp> = timestamp_pairs.iter().map(|(_, ft)| *ft).collect();
 
     let total = timestamp_pairs.len();
     let (kind, name) = if let Some(ref dag_name) = schedule.dag_name {
@@ -32983,19 +33094,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // Use original_slot (pre-calendar-rebase) for ID so that two distinct
                 // logical slots that calendar-adjust to the same fire_time do not collide.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &wf_name, *original_slot);
-                let legacy_workflow_id = {
-                    let micros = original_slot.timestamp_subsec_micros();
-                    if micros == 0 {
-                        format!("sched:{}:{}", wf_name, original_slot.timestamp())
-                    } else {
-                        format!(
-                            "sched:{}:{}.{:06}",
-                            wf_name,
-                            original_slot.timestamp(),
-                            micros
-                        )
-                    }
-                };
+                let legacy_workflow_id = legacy_scheduled_workflow_id(&wf_name, *original_slot);
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -33129,7 +33228,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // and admission checks, so only a run that will try to start reserves
                 // a slot. Every non-committing path below releases it through
                 // `release_backfill_budget_slot`.
-                let now = chrono::Utc::now();
+                let now = jiff::Timestamp::now();
                 // Re-arm target for a release that clears a tick-nulled exhaustion.
                 // Restore the pre-tick due `next_run_at` snapshot from backfill request
                 // start, NOT a recompute from `now`. A recompute advances PAST an
@@ -33239,10 +33338,10 @@ pub(crate) async fn schedule_backfill_inner(
                         // execution_timeout and the fleet-wide ceiling. This
                         // matches the non-throttled backfill start path above
                         // and the `chain_execution_timeout_secs` field below.
-                        execution_timeout_secs: workflow_execution_timeout.map(|d| d.num_seconds()),
+                        execution_timeout_secs: workflow_execution_timeout.map(|d| d.as_secs()),
                         memo: None,
                         search_attrs: None,
-                        sla_secs: sla.map(|d| d.num_seconds()),
+                        sla_secs: sla.map(|d| d.as_secs()),
                         context_headers: None,
                         priority: None,
                         concurrency_key: None,
@@ -33252,18 +33351,18 @@ pub(crate) async fn schedule_backfill_inner(
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
                         max_execution_timeout_ceiling_secs: workflow_max_execution_timeout_ceiling
-                            .map(|d| d.num_seconds()),
+                            .map(|d| d.as_secs()),
                         // Chain-scoped lifetime cap (issue #617): capture the
                         // workflow-type default and the fleet-wide ceiling. A
                         // throttled backfill fire then keeps the cap, like the
                         // non-throttled backfill start path.
                         chain_execution_timeout_secs: info_chain_execution_timeout
-                            .and_then(|d| chrono::Duration::from_std(d).ok())
-                            .map(|d| d.num_seconds()),
+                            .and_then(autumn_harvest::time::from_std_bounded)
+                            .map(|d| d.as_secs()),
                         max_workflow_chain_timeout_ceiling_secs: api_state
                             .max_workflow_chain_timeout()
-                            .and_then(|d| chrono::Duration::from_std(d).ok())
-                            .map(|d| d.num_seconds()),
+                            .and_then(autumn_harvest::time::from_std_bounded)
+                            .map(|d| d.as_secs()),
                         max_workflow_input_bytes: Some(effective_cap),
                         trace_context: None,
                         workflow_retry_policy: effective_retry,
@@ -33392,11 +33491,12 @@ pub(crate) async fn schedule_backfill_inner(
                         // ceiling-as-default. So a whole scheduled chain is capped
                         // even when a workflow under-specifies (AC4).
                         chain_execution_timeout: info_chain_execution_timeout
-                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                            .and_then(autumn_harvest::time::from_std_bounded),
                         max_workflow_chain_timeout_ceiling: api_state
                             .max_workflow_chain_timeout()
                             .map(|d| {
-                                chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+                                autumn_harvest::time::from_std_bounded(d)
+                                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
                             }),
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
@@ -33552,19 +33652,7 @@ pub(crate) async fn schedule_backfill_inner(
                 };
                 // Use original_slot for ID, same as the workflow path above.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &dag_name, *original_slot);
-                let legacy_workflow_id = {
-                    let micros = original_slot.timestamp_subsec_micros();
-                    if micros == 0 {
-                        format!("sched:{}:{}", dag_name, original_slot.timestamp())
-                    } else {
-                        format!(
-                            "sched:{}:{}.{:06}",
-                            dag_name,
-                            original_slot.timestamp(),
-                            micros
-                        )
-                    }
-                };
+                let legacy_workflow_id = legacy_scheduled_workflow_id(&dag_name, *original_slot);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -33667,7 +33755,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // Atomically reserve one max_runs slot on the schedule's own shard
                 // BEFORE committing to a start (issue #688). Placed after the prior-run
                 // and admission checks; every non-committing path below releases it.
-                let now = chrono::Utc::now();
+                let now = jiff::Timestamp::now();
                 // Re-arm target for a release that clears a tick-nulled exhaustion.
                 // Restore the pre-tick due `next_run_at` snapshot from backfill request
                 // start, NOT a recompute from `now`. A recompute advances PAST an
@@ -33978,7 +34066,7 @@ async fn count_existing_in_window(
     kind: &ScheduleKind,
     schedule_id: uuid::Uuid,
     name: &str,
-    timestamps: &[chrono::DateTime<chrono::Utc>],
+    timestamps: &[jiff::Timestamp],
 ) -> usize {
     if timestamps.is_empty() {
         return 0;
@@ -33992,14 +34080,7 @@ async fn count_existing_in_window(
                 .collect();
             let legacy_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| {
-                    let micros = ts.timestamp_subsec_micros();
-                    if micros == 0 {
-                        format!("sched:{}:{}", name, ts.timestamp())
-                    } else {
-                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
-                    }
-                })
+                .map(|ts| legacy_scheduled_workflow_id(name, *ts))
                 .collect();
             workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
@@ -34023,14 +34104,7 @@ async fn count_existing_in_window(
                 .collect();
             let legacy_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| {
-                    let micros = ts.timestamp_subsec_micros();
-                    if micros == 0 {
-                        format!("sched:{}:{}", name, ts.timestamp())
-                    } else {
-                        format!("sched:{}:{}.{:06}", name, ts.timestamp(), micros)
-                    }
-                })
+                .map(|ts| legacy_scheduled_workflow_id(name, *ts))
                 .collect();
             workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
@@ -34058,8 +34132,8 @@ async fn write_backfill_log(
     schedule_id: uuid::Uuid,
     actor: &str,
     source: &str,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
+    to: jiff::Timestamp,
     dry_run: bool,
     total: usize,
     dispatched: usize,
@@ -34067,7 +34141,7 @@ async fn write_backfill_log(
     failed: usize,
     status: &str,
     error_summary: Option<&str>,
-    started_at: chrono::DateTime<chrono::Utc>,
+    started_at: jiff::Timestamp,
 ) {
     let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
         return;
@@ -34087,10 +34161,10 @@ async fn write_backfill_log(
         status: status.to_string(),
         error_summary: error_summary.map(str::to_string),
         started_at,
-        completed_at: Some(chrono::Utc::now()),
+        completed_at: Some(jiff::Timestamp::now()),
     };
     let _ = diesel::insert_into(harvest_backfill_log::table)
-        .values(&row)
+        .values(row)
         .execute(&mut conn)
         .await;
 }
@@ -34333,7 +34407,7 @@ async fn aggregate_dead_letters(
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
     let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
-    let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
+    let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, jiff::Timestamp::now())
         .map_err(AutumnError::bad_request_msg)?;
 
     let observations = observe_shards(&api_state, |_shard_id, mut conn| {
@@ -34500,10 +34574,16 @@ struct BulkDlqApiBody {
     min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
-    #[serde(default)]
-    failed_after: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    failed_after: Option<jiff::Timestamp>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    failed_before: Option<jiff::Timestamp>,
     #[serde(default)]
     error_class: Option<String>,
     #[serde(default)]
@@ -34642,10 +34722,16 @@ struct RedriveApiBody {
     queue: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
-    #[serde(default)]
-    dead_lettered_after: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    dead_lettered_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    dead_lettered_after: Option<jiff::Timestamp>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    dead_lettered_before: Option<jiff::Timestamp>,
     #[serde(default)]
     error_contains: Option<String>,
     #[serde(default)]
@@ -34885,15 +34971,10 @@ fn parse_dlq_task_type_filter(value: &str) -> Result<String, AutumnError> {
     }
 }
 
-fn parse_utc_datetime(
-    value: &str,
-    field: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|_| {
-            AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
-        })
+fn parse_utc_datetime(value: &str, field: &str) -> Result<jiff::Timestamp, AutumnError> {
+    autumn_harvest::time::parse::rfc3339(value).map_err(|_| {
+        AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
+    })
 }
 
 fn parse_u32_field(value: &str, field: &str) -> Result<u32, AutumnError> {
@@ -35693,10 +35774,10 @@ fn apply_api_bulk_filters<'a>(
         query = query.filter(harvest_dead_letters::attempts.ge(min));
     }
     if let Some(after) = selector.filter.failed_after {
-        query = query.filter(harvest_dead_letters::failed_at.ge(after));
+        query = query.filter(harvest_dead_letters::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = selector.filter.failed_before {
-        query = query.filter(harvest_dead_letters::failed_at.lt(before));
+        query = query.filter(harvest_dead_letters::failed_at.lt(before.to_diesel()));
     }
     if let Some(ref workflow_name) = selector.filter.workflow_name {
         query = query.filter(
@@ -36750,7 +36831,7 @@ async fn get_start_throttle_pacing_override(
             .into_response();
     }
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let is_active = |row: &Option<RateLimitBucket>| {
         row.as_ref()
             .is_some_and(|b| b.override_expires_at > Some(now))
@@ -37202,7 +37283,7 @@ async fn set_start_throttle_pacing_override(
                 request.refill_per_sec,
             )
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
-            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
             .get_results::<PersistedBaseline>(&mut conn)
             .await
         {
@@ -37572,7 +37653,7 @@ async fn list_rate_limits(
         }
     }
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     Ok(Json(
         per_key
             .into_values()
@@ -37604,7 +37685,7 @@ async fn list_rate_limits(
 fn build_rate_limit_bucket_view(
     rows: &[RateLimitBucket],
     shard_count: usize,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> RateLimitBucketView {
     let mut effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
         .iter()
@@ -37659,14 +37740,13 @@ fn build_rate_limit_bucket_view(
 #[cfg(test)]
 mod build_rate_limit_bucket_view_tests {
     use super::{RateLimitBucket, build_rate_limit_bucket_view};
-    use chrono::{TimeZone as _, Utc};
 
     fn bucket(
         override_refill_rate: Option<f64>,
         override_burst: Option<f64>,
-        override_expires_at: Option<chrono::DateTime<Utc>>,
+        override_expires_at: Option<jiff::Timestamp>,
     ) -> RateLimitBucket {
-        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        let ts = autumn_harvest::time::utc_ymd_hms(2026, 7, 24, 12, 0, 0).unwrap();
         RateLimitBucket {
             key: "send_email".to_string(),
             refill_rate: 5.0,
@@ -37685,7 +37765,7 @@ mod build_rate_limit_bucket_view_tests {
 
     #[test]
     fn agrees_when_every_shard_has_a_row() {
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let rows = [bucket(None, None, None)];
         let view = build_rate_limit_bucket_view(&rows, rows.len(), now);
         assert!(!view.shard_disagreement);
@@ -37698,8 +37778,8 @@ mod build_rate_limit_bucket_view_tests {
     /// count as disagreement, the same as an explicit inactive row would.
     #[test]
     fn disagrees_when_a_shard_has_no_row_at_all() {
-        let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(300);
+        let now = jiff::Timestamp::now();
+        let expires = now + jiff::SignedDuration::from_secs(300);
         let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
         let shard_count = rows.len() + 1;
         let view = build_rate_limit_bucket_view(&rows, shard_count, now);
@@ -37715,7 +37795,7 @@ mod build_rate_limit_bucket_view_tests {
     /// with the one row that already exists.
     #[test]
     fn agrees_when_a_shard_has_no_row_and_no_override_is_active() {
-        let now = Utc::now();
+        let now = jiff::Timestamp::now();
         let rows = [bucket(None, None, None)];
         let shard_count = rows.len() + 1;
         let view = build_rate_limit_bucket_view(&rows, shard_count, now);
@@ -37729,8 +37809,8 @@ mod build_rate_limit_bucket_view_tests {
     /// `missing_shards` must count every absent shard, not just one.
     #[test]
     fn disagrees_when_multiple_shards_have_no_row() {
-        let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(300);
+        let now = jiff::Timestamp::now();
+        let expires = now + jiff::SignedDuration::from_secs(300);
         let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
         let shard_count = rows.len() + 2;
         let view = build_rate_limit_bucket_view(&rows, shard_count, now);
@@ -37741,8 +37821,8 @@ mod build_rate_limit_bucket_view_tests {
     /// values -- only `shard_disagreement` reflects it.
     #[test]
     fn missing_shard_does_not_change_representative_fields() {
-        let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(300);
+        let now = jiff::Timestamp::now();
+        let expires = now + jiff::SignedDuration::from_secs(300);
         let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
         let view = build_rate_limit_bucket_view(&rows, rows.len() + 1, now);
         assert!((view.effective_refill_rate - 50.0).abs() < 1e-9);
@@ -37873,7 +37953,7 @@ async fn set_rate_limit(
 /// durable change. It must not exceed [`queue::MAX_PACING_OVERRIDE_TTL_SECS`].
 /// That server-side ceiling stops a forgotten override from silently outliving
 /// the incident it was meant to mitigate.
-fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+fn pacing_override_expiry(ttl_secs: u64) -> Result<jiff::Timestamp, AutumnError> {
     if ttl_secs == 0 {
         return Err(AutumnError::bad_request_msg(
             "ttl_secs must be greater than zero",
@@ -37886,9 +37966,9 @@ fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>
             max / 3600
         )));
     }
-    let delta = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
-    let now = chrono::Utc::now();
-    Ok(now.checked_add_signed(delta).unwrap_or(now))
+    let delta = jiff::SignedDuration::from_secs(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+    let now = jiff::Timestamp::now();
+    Ok(now.checked_add(delta).unwrap_or(now))
 }
 
 /// Response body for the TTL'd pacing-override SET/CLEAR/GET routes (issue
@@ -37923,7 +38003,7 @@ struct PacingOverrideResponse {
     override_active: bool,
     effective_refill_rate: f64,
     effective_burst: f64,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<jiff::Timestamp>,
 }
 
 impl PacingOverrideResponse {
@@ -37933,7 +38013,7 @@ impl PacingOverrideResponse {
         declared_burst: f64,
         override_refill_rate: Option<f64>,
         override_burst: Option<f64>,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        expires_at: Option<jiff::Timestamp>,
     ) -> Self {
         let effective = queue::resolve_effective_rate_limit(
             declared_refill_rate,
@@ -37941,7 +38021,7 @@ impl PacingOverrideResponse {
             override_refill_rate,
             override_burst,
             expires_at,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         Self {
             key,
@@ -37976,12 +38056,12 @@ struct RateLimitBucketView {
     refill_rate: f64,
     burst: f64,
     tokens: f64,
-    last_refilled_at: chrono::DateTime<chrono::Utc>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+    last_refilled_at: jiff::Timestamp,
+    created_at: jiff::Timestamp,
+    updated_at: jiff::Timestamp,
     override_refill_rate: Option<f64>,
     override_burst: Option<f64>,
-    override_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    override_expires_at: Option<jiff::Timestamp>,
     /// Whether `override_expires_at` is set and strictly in the future
     /// (issue #945).
     override_active: bool,
@@ -38004,11 +38084,11 @@ struct RateLimitBucketView {
     /// `POST /admin/rate-limits/{key}`. Non-`null` also means the row is
     /// **exempt** from the idle rate-limit-bucket GC (issue #1127) — the
     /// answer to "why has this bucket never been collected?".
-    baseline_set_at: Option<chrono::DateTime<chrono::Utc>>,
+    baseline_set_at: Option<jiff::Timestamp>,
     /// When the engine last (re-)registered this bucket (issue #1127). With
     /// `last_refilled_at` and `updated_at` this is the GC's idleness clock, so
     /// it is also the answer to "why has this bucket not been collected yet?".
-    last_registered_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_registered_at: Option<jiff::Timestamp>,
 }
 
 impl From<RateLimitBucket> for RateLimitBucketView {
@@ -38019,7 +38099,7 @@ impl From<RateLimitBucket> for RateLimitBucketView {
             b.override_refill_rate,
             b.override_burst,
             b.override_expires_at,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         Self {
             key: b.key,
@@ -38045,14 +38125,13 @@ impl From<RateLimitBucket> for RateLimitBucketView {
 #[cfg(test)]
 mod rate_limit_bucket_view_tests {
     use super::{RateLimitBucket, RateLimitBucketView};
-    use chrono::{TimeZone as _, Utc};
 
     fn bucket(
         override_refill_rate: Option<f64>,
         override_burst: Option<f64>,
-        override_expires_at: Option<chrono::DateTime<Utc>>,
+        override_expires_at: Option<jiff::Timestamp>,
     ) -> RateLimitBucket {
-        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        let ts = autumn_harvest::time::utc_ymd_hms(2026, 7, 24, 12, 0, 0).unwrap();
         RateLimitBucket {
             key: "send_email".to_string(),
             refill_rate: 5.0,
@@ -38087,7 +38166,7 @@ mod rate_limit_bucket_view_tests {
 
     #[test]
     fn active_override_reports_override_as_effective() {
-        let expires = Utc::now() + chrono::Duration::seconds(300);
+        let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
         let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expires)));
         assert!(view.override_active);
         assert!((view.refill_rate - 5.0).abs() < 1e-9);
@@ -38099,7 +38178,7 @@ mod rate_limit_bucket_view_tests {
 
     #[test]
     fn expired_override_falls_back_to_declared_as_effective() {
-        let expired = Utc::now() - chrono::Duration::seconds(1);
+        let expired = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
         let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expired)));
         assert!(!view.override_active);
         assert!((view.effective_refill_rate - 5.0).abs() < 1e-9);
@@ -38408,7 +38487,7 @@ async fn set_rate_limit_pacing_override(
             .bind::<diesel::sql_types::Double, _>(declared_burst)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.refill_rate)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
-            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
             .get_results::<PersistedBaseline>(&mut conn)
             .await
         {
@@ -39456,7 +39535,7 @@ type HeldHoldKey = (String, String);
 /// reports.
 struct HeldGroupFold {
     shard_ids: Vec<i32>,
-    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_at: jiff::Timestamp,
     anchor_shard_id: i32,
 }
 
@@ -39466,7 +39545,7 @@ impl HeldGroupFold {
     const fn new() -> Self {
         Self {
             shard_ids: Vec::new(),
-            anchor_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            anchor_at: jiff::Timestamp::MAX,
             anchor_shard_id: i32::MAX,
         }
     }
@@ -39474,7 +39553,7 @@ impl HeldGroupFold {
     /// Fold in one shard's hold, keeping the group's EARLIEST stamp as the
     /// anchor. A tie goes to the lowest shard id, matching the `min_by_key`
     /// that the response's top-level provenance uses.
-    fn observe(&mut self, shard_id: i32, paused_at: chrono::DateTime<chrono::Utc>) {
+    fn observe(&mut self, shard_id: i32, paused_at: jiff::Timestamp) {
         self.shard_ids.push(shard_id);
         if (paused_at, shard_id) < (self.anchor_at, self.anchor_shard_id) {
             self.anchor_at = paused_at;
@@ -39513,7 +39592,7 @@ struct HeldHoldGroup {
     /// Ordering groups by `(anchor_at, anchor_shard_id)` ascending reproduces
     /// exactly the single-anchor `min_by_key` the response's top-level fields
     /// use, so `held_groups[0]` is always the shard the response reports.
-    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_at: jiff::Timestamp,
     anchor_shard_id: i32,
 }
 
@@ -39546,7 +39625,7 @@ impl HeldHoldGroup {
 /// per-activity pause (#807) share one definition. Their audit rows can never
 /// drift on the same situation.
 fn group_held_holds<'a>(
-    per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, chrono::DateTime<chrono::Utc>)>,
+    per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, jiff::Timestamp)>,
 ) -> Vec<HeldHoldGroup> {
     // Keyed by the hold's identity so shards sharing one incident collapse;
     // `BTreeMap` so groups that tie on the sort key below resolve
@@ -40729,7 +40808,7 @@ struct QuotaOverrideView {
     limits: ::autumn_harvest::quota::QuotaLimits,
     reason: Option<String>,
     updated_by: Option<String>,
-    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: Option<jiff::Timestamp>,
 }
 
 /// The stored quota overrides, by type, and their source (issue #2408).
@@ -40972,7 +41051,7 @@ async fn audit_export_status_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Value>, AutumnError> {
     let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         match ::autumn_harvest::audit_export::export_status(&mut conn, shard_id, now).await {
             Ok(Some(status)) => Ok(vec![serde_json::json!(status)]),
             Ok(None) => {
@@ -41024,7 +41103,11 @@ struct AuditExportRedriveRequest {
     /// Rewind to this exact sequence: records with `seq > to_seq` re-export.
     to_seq: Option<i64>,
     /// Rewind so every record at or after this instant re-exports.
-    before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    before: Option<jiff::Timestamp>,
 }
 
 /// Appended to the redrive audit detail and refusal when retention cut the window.
@@ -41101,7 +41184,7 @@ async fn audit_export_redrive_handler(
         ),
         (None, Some(before)) => (
             ::autumn_harvest::audit_export::RewindRequest::Before(before),
-            format!("before={}", before.to_rfc3339()),
+            format!("before={}", autumn_harvest::time::rfc3339(before)),
         ),
         (Some(_), Some(_)) => {
             return AutumnError::bad_request_msg(
@@ -41163,7 +41246,7 @@ async fn audit_export_redrive_handler(
                         conn,
                         request.shard,
                         target,
-                        chrono::Utc::now(),
+                        jiff::Timestamp::now(),
                     )
                     .await?;
 
@@ -41407,7 +41490,7 @@ async fn audit_export_decommission_handler(
                         let outcome = ::autumn_harvest::audit_export::decommission_cursor_locked(
                             conn,
                             request.shard,
-                            chrono::Utc::now(),
+                            jiff::Timestamp::now(),
                         )
                         .await?;
 
@@ -41610,7 +41693,7 @@ async fn audit_export_reactivate_handler(
                         let outcome = ::autumn_harvest::audit_export::reactivate_cursor_locked(
                             conn,
                             request.shard,
-                            chrono::Utc::now(),
+                            jiff::Timestamp::now(),
                         )
                         .await?;
 
@@ -44168,7 +44251,7 @@ fn workflow_list_query(
                 sql::<Bool>(
                     "(harvest_workflow_executions.created_at, harvest_workflow_executions.id) < (",
                 )
-                .bind::<Timestamptz, _>(ts)
+                .bind::<Timestamptz, _>(ts.to_diesel())
                 .sql(", ")
                 .bind::<SqlUuid, _>(id)
                 .sql(")"),
@@ -44177,7 +44260,7 @@ fn workflow_list_query(
                 sql::<Bool>(
                     "(harvest_workflow_executions.created_at, harvest_workflow_executions.id) > (",
                 )
-                .bind::<Timestamptz, _>(ts)
+                .bind::<Timestamptz, _>(ts.to_diesel())
                 .sql(", ")
                 .bind::<SqlUuid, _>(id)
                 .sql(")"),
@@ -44225,10 +44308,10 @@ fn workflow_list_query(
     // list unless the caller explicitly filters to a canary workflow name.
     query = apply_canary_list_exclusion(query, filters);
     if let Some(after) = filters.started_after {
-        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+        query = query.filter(harvest_workflow_executions::started_at.ge(after.to_diesel()));
     }
     if let Some(before) = filters.started_before {
-        query = query.filter(harvest_workflow_executions::started_at.le(before));
+        query = query.filter(harvest_workflow_executions::started_at.le(before.to_diesel()));
     }
     if let Some(prefix) = &filters.exec_id_prefix {
         // Cast the UUID column to text and apply a case-insensitive prefix match.
@@ -44271,13 +44354,13 @@ fn workflow_list_query(
         // Active-hold predicate (issue #747, mirrors `legal_hold_active`):
         // set_at IS NOT NULL AND (until IS NULL OR until > now). Plain column
         // predicates, cross-shard safe. Composes (AND) with all other filters.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         query = query
             .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     if let Some(src) = &filters.start_source {
@@ -44689,13 +44772,13 @@ pub(crate) async fn load_stalled_workflows(
     // Honor the legal-hold filter on the stalled path too (issue #747), for the
     // same bypass reason as sla_breached/nd_blocked above.
     if filters.legal_hold {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         query = query
             .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     // Honor the start_source provenance filter (issue #740) on the stalled path
@@ -44718,10 +44801,10 @@ pub(crate) async fn load_stalled_workflows(
     // `?no_progress_minutes=N&started_after=…` (or `&exec_id_prefix=…`) would
     // return rows outside the requested bounds.
     if let Some(after) = filters.started_after {
-        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+        query = query.filter(harvest_workflow_executions::started_at.ge(after.to_diesel()));
     }
     if let Some(before) = filters.started_before {
-        query = query.filter(harvest_workflow_executions::started_at.le(before));
+        query = query.filter(harvest_workflow_executions::started_at.le(before.to_diesel()));
     }
     if let Some(prefix) = &filters.exec_id_prefix {
         let pattern = format!("{}%", prefix.to_lowercase());
@@ -44795,18 +44878,18 @@ pub(crate) async fn load_stalled_workflows(
     let exec_ids: Vec<uuid::Uuid> = candidates.iter().map(|e| e.id).collect();
 
     // ── Step 2: batch-fetch last_event_at per execution ────────────────────
-    let last_event_ats: HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = harvest_events::table
+    let last_event_ats: HashMap<uuid::Uuid, jiff::Timestamp> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
         .group_by(harvest_events::workflow_exec_id)
         .select((
             harvest_events::workflow_exec_id,
             max(harvest_events::timestamp),
         ))
-        .load::<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)>(conn)
+        .load::<(uuid::Uuid, Option<SqlTimestamp>)>(conn)
         .await
         .map_err(database_error)?
         .into_iter()
-        .filter_map(|(id, ts)| ts.map(|t| (id, t)))
+        .filter_map(|(id, ts)| ts.map(|t| (id, t.to_jiff())))
         .collect();
 
     // Issue #704 (PR #1139 review): `history_event_count` is populated ONLY
@@ -44880,7 +44963,7 @@ pub(crate) async fn load_stalled_workflows(
 
     // Capture now once — reused for timer comparison and age calculation to
     // ensure temporal consistency across both.
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     // ── Step 6: any unfired timer (future-dated OR overdue) ─────────────────
     // The sleeping-filter SQL restricts "correctly sleeping" to fires_at > NOW().
@@ -44903,8 +44986,8 @@ pub(crate) async fn load_stalled_workflows(
         .map(|execution| {
             let id = execution.id;
             let last_event_at = last_event_ats.get(&id).copied();
-            let last_event_age_seconds =
-                last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+            let last_event_age_seconds = last_event_at
+                .map(|ts| std::time::Duration::try_from(now - ts).map_or(0.0, |d| d.as_secs_f64()));
             let stall_reason = Some(if has_activity.contains(&id) {
                 StallReason::PendingActivity
             } else if has_child.contains(&id) {
@@ -45079,13 +45162,13 @@ pub(crate) async fn load_history_bloat_workflows(
             .filter(harvest_workflow_executions::state.eq("RUNNING"));
     }
     if filters.legal_hold {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         query = query
             .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     if let Some(src) = &filters.start_source {
@@ -45100,10 +45183,10 @@ pub(crate) async fn load_history_bloat_workflows(
         }
     }
     if let Some(after) = filters.started_after {
-        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+        query = query.filter(harvest_workflow_executions::started_at.ge(after.to_diesel()));
     }
     if let Some(before) = filters.started_before {
-        query = query.filter(harvest_workflow_executions::started_at.le(before));
+        query = query.filter(harvest_workflow_executions::started_at.le(before.to_diesel()));
     }
     if let Some(prefix) = &filters.exec_id_prefix {
         let pattern = format!("{}%", prefix.to_lowercase());
@@ -45285,7 +45368,7 @@ fn export_history_for_execution(
             shard_id: execution.shard_id,
             state: execution.state.clone(),
             events,
-            exported_at: chrono::Utc::now(),
+            exported_at: jiff::Timestamp::now(),
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
             context_headers,
@@ -45333,7 +45416,7 @@ fn export_history_for_candidate(
             shard_id: candidate.shard_id,
             state: candidate.state.clone(),
             events,
-            exported_at: chrono::Utc::now(),
+            exported_at: jiff::Timestamp::now(),
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
             // Issue #798: carry the execution's own ambient headers. A
@@ -45474,24 +45557,20 @@ async fn export_selected_history_candidates(
 async fn reload_execution_deadline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> Result<
-    Option<(
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )>,
-    diesel::result::Error,
-> {
+) -> Result<Option<(Option<jiff::SignedDuration>, Option<jiff::Timestamp>)>, diesel::result::Error>
+{
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
     dsl::harvest_workflow_executions
         .find(exec_id.as_uuid())
         .select((dsl::execution_timeout, dsl::deadline_at))
         .first::<(
-            Option<chrono::Duration>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            autumn_harvest::time::sql::NullablePgDuration,
+            autumn_harvest::time::sql::NullableTimestamp,
         )>(conn)
         .await
         .optional()
+        .map(|row| row.map(|(timeout, deadline)| (timeout.into(), deadline.into())))
 }
 
 async fn export_history_candidate(
@@ -45596,7 +45675,7 @@ fn history_batch_export_response(
 ) -> HistoryBatchExportResponse {
     HistoryBatchExportResponse {
         status: work.status(),
-        observed_at: chrono::Utc::now(),
+        observed_at: jiff::Timestamp::now(),
         payload_policy: query.payload_policy,
         filters: HistoryBatchExportFiltersResponse {
             workflow_name: query.workflow_name.clone(),
@@ -45661,10 +45740,10 @@ async fn load_history_export_candidates(
         )
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            filters.updated_after,
+            filters.updated_after.to_diesel(),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            filters.updated_before,
+            filters.updated_before.to_diesel(),
         )
         .bind::<diesel::sql_types::BigInt, _>(limit)
         .load(conn)
@@ -46210,7 +46289,7 @@ fn build_sample_manifest(
     let in_flight_total = per_workflow.iter().map(|entry| entry.in_flight_total).sum();
 
     autumn_harvest::replay_sample::SampleManifest {
-        generated_at: chrono::Utc::now(),
+        generated_at: jiff::Timestamp::now(),
         status: autumn_harvest::replay_sample::SampleStatus::from_counts(
             work.batch.inspected_shards.len(),
             work.batch.unavailable_shards.len(),
@@ -46260,7 +46339,7 @@ async fn load_history_sample_from_shards(
     let manifest = build_sample_manifest(query, &work);
     Ok(HistorySampleExportResponse {
         status: work.batch.status(),
-        observed_at: chrono::Utc::now(),
+        observed_at: jiff::Timestamp::now(),
         payload_policy: query.payload_policy,
         filters: HistorySampleExportFiltersResponse {
             workflow_name: query.workflow_name.clone(),
@@ -48564,8 +48643,8 @@ struct CalendarResponse {
     name: String,
     description: Option<String>,
     built_in: bool,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
+    updated_at: jiff::Timestamp,
 }
 
 impl From<HarvestCalendar> for CalendarResponse {
@@ -48597,9 +48676,9 @@ struct CalendarDetailResponse {
     name: String,
     description: Option<String>,
     built_in: bool,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    exclusion_dates: Vec<chrono::NaiveDate>,
+    created_at: jiff::Timestamp,
+    updated_at: jiff::Timestamp,
+    exclusion_dates: Vec<jiff::civil::Date>,
 }
 
 async fn get_calendar_handler(
@@ -48708,7 +48787,54 @@ async fn create_calendar_handler(
 #[derive(Debug, Deserialize)]
 struct UpdateCalendarRequest {
     /// Complete set of exclusion dates (replaces existing). Format: `"YYYY-MM-DD"`.
-    exclusion_dates: Vec<chrono::NaiveDate>,
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::dates")]
+    exclusion_dates: Vec<jiff::civil::Date>,
+}
+
+#[cfg(test)]
+mod chrono_input_grammar_tests {
+    use super::{CreateTokenRequest, UpdateCalendarRequest};
+
+    /// The calendar body reads a date as `chrono::NaiveDate` did. It refuses
+    /// a date with a time, where jiff would drop the time and the offset.
+    #[test]
+    fn exclusion_dates_keep_the_chrono_grammar() {
+        let body: UpdateCalendarRequest =
+            serde_json::from_str(r#"{"exclusion_dates":["2026-7-4"," 2026-07-05 "]}"#).unwrap();
+        assert_eq!(
+            body.exclusion_dates,
+            vec![jiff::civil::date(2026, 7, 4), jiff::civil::date(2026, 7, 5)]
+        );
+        // A date past the jiff range is refused, as the upgrade guide records.
+        for bad in [
+            r#"["2026-07-04T23:30:00-05:00"]"#,
+            r#"["20260704"]"#,
+            r#"["+10000-01-01"]"#,
+        ] {
+            let json = format!(r#"{{"exclusion_dates":{bad}}}"#);
+            assert!(
+                serde_json::from_str::<UpdateCalendarRequest>(&json).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A far-future sentinel that `chrono` held clamps to the end of the jiff range.
+    #[test]
+    fn token_expiry_reads_a_far_future_sentinel() {
+        let body: CreateTokenRequest =
+            serde_json::from_str(r#"{"name":"ci","expires_at":"9999-12-31T23:59:59Z"}"#).unwrap();
+        assert_eq!(body.expires_at, Some(jiff::Timestamp::MAX));
+        let display: CreateTokenRequest =
+            serde_json::from_str(r#"{"name":"ci","expires_at":"2026-12-01 09:00:00 UTC"}"#)
+                .unwrap();
+        assert_eq!(
+            display.expires_at,
+            Some("2026-12-01T09:00:00Z".parse().unwrap())
+        );
+        let absent: CreateTokenRequest = serde_json::from_str(r#"{"name":"ci"}"#).unwrap();
+        assert_eq!(absent.expires_at, None);
+    }
 }
 
 /// `PUT /calendars/{name}` — replace the exclusion set for a calendar.
@@ -48834,13 +48960,13 @@ const fn default_preview_count() -> usize {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScheduleFirePreviewEntry {
     /// UTC wall-clock instant the cron/interval computed.
-    pub scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: jiff::Timestamp,
     /// `scheduled_at` rendered in the schedule's configured timezone (RFC 3339).
     pub local_at: String,
     /// Effective fire time after calendar adjustment and jitter application.
     /// `None` means the firing is suppressed (calendar exclusion with `skip` policy).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub effective_at: Option<jiff::Timestamp>,
     /// `effective_at` rendered in the schedule's timezone. Omitted when `effective_at` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_local_at: Option<String>,
@@ -48853,11 +48979,11 @@ pub(crate) struct ScheduleFirePreviewEntry {
     /// Earliest possible fire time when jitter is enabled (`= scheduled_at`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_earliest_at: Option<jiff::Timestamp>,
     /// Latest possible fire time when jitter is enabled (`= scheduled_at + jitter_secs`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_latest_at: Option<jiff::Timestamp>,
     /// `true` when the overlap policy (`"skip"` or `"buffer_one"`) could silently drop this
     /// firing if `max_active_runs` is already running at dispatch time. Preview is stateless
     /// and cannot know the future run count; treat this as an advisory warning.
@@ -48912,7 +49038,7 @@ struct CandidateSchedulePreviewRequest {
 /// correct (adjusted) day, not the original excluded date.
 fn build_preview_entry(
     raw: &autumn_harvest::calendar::ScheduleFirePreview,
-    pre_jitter_base: Option<chrono::DateTime<chrono::Utc>>,
+    pre_jitter_base: Option<jiff::Timestamp>,
     jitter_secs: i64,
     timezone: &str,
     overlap_policy: &str,
@@ -48933,12 +49059,13 @@ fn build_preview_entry(
     // Jitter bounds: [pre_jitter_base, pre_jitter_base + jitter_window].
     // Using the calendar-adjusted base (not raw.scheduled_at) ensures deferred
     // entries show bounds on the correct day, not the original excluded date.
-    // try_seconds + checked_add_signed guard against oversized stored values
-    // (e.g. a saturated i64::MAX written by the schedule create path).
+    // `checked_add` guards against oversized stored values (e.g. a saturated
+    // i64::MAX written by the schedule create path).
     let (jitter_earliest_at, jitter_latest_at) = if has_jitter {
         pre_jitter_base.map_or((None, None), |base| {
-            let latest =
-                chrono::Duration::try_seconds(jitter_secs).and_then(|d| base.checked_add_signed(d));
+            let latest = base
+                .checked_add(jiff::SignedDuration::from_secs(jitter_secs))
+                .ok();
             (Some(base), latest)
         })
     } else {
@@ -48984,7 +49111,7 @@ fn build_preview_entry(
 /// wall-clock time than this truncation shows, never less.
 fn truncate_preview_entries_by_bounds(
     entries: Vec<ScheduleFirePreviewEntry>,
-    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    end_at: Option<jiff::Timestamp>,
     remaining_budget: Option<i32>,
 ) -> Vec<ScheduleFirePreviewEntry> {
     let mut budget = remaining_budget;
@@ -49015,30 +49142,56 @@ fn truncate_preview_entries_by_bounds(
 
 /// Format a UTC timestamp in the given IANA timezone as RFC 3339.
 /// Falls back to UTC representation when the timezone name is unknown.
-fn format_in_timezone(utc: chrono::DateTime<chrono::Utc>, tz_name: &str) -> String {
-    tz_name.parse::<chrono_tz::Tz>().map_or_else(
-        |_| utc.to_rfc3339(),
-        |tz| utc.with_timezone(&tz).to_rfc3339(),
-    )
+fn format_in_timezone(utc: jiff::Timestamp, tz_name: &str) -> String {
+    autumn_harvest::time::zone(tz_name)
+        .and_then(|tz| rfc3339_in_zone(utc, &tz))
+        .unwrap_or_else(|| autumn_harvest::time::rfc3339(utc))
+}
+
+/// Writes `at` in `tz` as `chrono::DateTime::<Tz>::to_rfc3339` wrote it.
+///
+/// The wall clock time takes the fraction digits of
+/// [`autumn_harvest::time::rfc3339`]. `chrono` rounded the offset to the
+/// nearest minute, so this function does too. It returns `None` when the
+/// wall clock time is outside the jiff range.
+fn rfc3339_in_zone(at: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Option<String> {
+    let offset = tz.to_offset(at).seconds();
+    let wall = at
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(offset)))
+        .ok()?;
+    let text = autumn_harvest::time::rfc3339(wall);
+    let body = text.strip_suffix("+00:00")?;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let minutes = (offset.abs() + 30) / 60;
+    Some(format!(
+        "{body}{sign}{:02}:{:02}",
+        minutes / 60,
+        minutes % 60
+    ))
 }
 
 /// Parse an optional ISO-8601 `from` string.
 ///
-/// Returns the instant when present, `Utc::now()` when absent, and
+/// Returns the instant when present, `jiff::Timestamp::now()` when absent, and
 /// `Err(String)` when malformed or too far in the future. The caller maps the
 /// error to a 400.
 ///
 /// Years above 9000 are rejected. Interval schedules add `period` to `from`
 /// repeatedly, and a very large `from` can overflow `DateTime` arithmetic. It
 /// can also produce RFC 3339 strings (year > 9999) that most clients cannot parse.
-fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>, String> {
+fn parse_from_param(from: Option<&str>) -> Result<jiff::Timestamp, String> {
     from.map_or_else(
-        || Ok(chrono::Utc::now()),
+        || Ok(jiff::Timestamp::now()),
         |s| {
-            let dt = chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
+            // jiff reads a signed six-digit year. chrono read four digits only.
+            if s.starts_with(['+', '-']) {
+                return Err(format!(
+                    "invalid `from` timestamp '{s}': expected a four-digit year"
+                ));
+            }
+            let dt = autumn_harvest::time::parse::rfc3339(s)
                 .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))?;
-            if chrono::Datelike::year(&dt) > 9000 {
+            if autumn_harvest::time::utc_date(dt).year() > 9000 {
                 return Err(format!(
                     "invalid `from` timestamp '{s}': year must be \u{2264} 9000"
                 ));
@@ -49068,12 +49221,12 @@ pub(crate) struct SchedulePreview {
     /// gets a generated reason instead (#360).
     pub pause_reason: Option<String>,
     /// The instant the preview was projected from.
-    pub from: chrono::DateTime<chrono::Utc>,
+    pub from: jiff::Timestamp,
     /// The requested entry count, after clamping.
     pub count_requested: usize,
     /// Absolute cutoff for this schedule (issue #478), echoed so a caller can see
     /// why a preview is short.
-    pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_at: Option<jiff::Timestamp>,
     /// Remaining run budget (issue #478), `None` when the schedule is unlimited.
     pub remaining_runs: Option<i32>,
     /// Machine-readable exhaustion reason (issue #478), `None` when not exhausted.
@@ -49090,7 +49243,7 @@ pub(crate) struct SchedulePreview {
 fn empty_preview_response(
     schedule: &HarvestSchedule,
     remaining_runs: Option<i32>,
-    from: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
     count: usize,
 ) -> SchedulePreview {
     // `is_paused` mirrors the column. An auto-paused row has it `false` but
@@ -49191,7 +49344,7 @@ pub(crate) struct HerdScheduleRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct HerdSpotEntry {
     /// The start of the bucket.
-    pub at: chrono::DateTime<chrono::Utc>,
+    pub at: jiff::Timestamp,
     /// The number of distinct schedules in the bucket.
     pub size: usize,
     /// The schedules in the bucket.
@@ -49215,9 +49368,9 @@ pub(crate) struct HerdOffender {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScheduleHerdReport {
     /// The start of the window.
-    pub from: chrono::DateTime<chrono::Utc>,
+    pub from: jiff::Timestamp,
     /// The end of the window. It is not included.
-    pub until: chrono::DateTime<chrono::Utc>,
+    pub until: jiff::Timestamp,
     /// The bucket width in seconds.
     pub bucket_secs: u64,
     /// The fewest schedules that make a herd.
@@ -49273,8 +49426,8 @@ const HERD_MAX_SLOTS_BEFORE: i32 = 100_000;
 /// budget at the window is then unknown, so the caller does not forecast it.
 fn slots_before(
     schedule: &Schedule,
-    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
-    from: chrono::DateTime<chrono::Utc>,
+    next_run_at: Option<jiff::Timestamp>,
+    from: jiff::Timestamp,
     cap: i32,
 ) -> Option<i32> {
     let Some(first) = next_run_at.filter(|&first| first < from) else {
@@ -49315,9 +49468,9 @@ fn slots_before(
 #[allow(clippy::type_complexity)]
 fn project_herd_budgets(
     candidates: Vec<(&HarvestSchedule, Schedule)>,
-    now: chrono::DateTime<chrono::Utc>,
-    from: chrono::DateTime<chrono::Utc>,
-    until: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
+    from: jiff::Timestamp,
+    until: jiff::Timestamp,
 ) -> (
     Vec<(&HarvestSchedule, Schedule)>,
     Vec<Option<i32>>,
@@ -49358,14 +49511,17 @@ fn project_herd_budgets(
 fn jitter_crosses_a_slot(
     row: &HarvestSchedule,
     schedule: &Schedule,
-    from: chrono::DateTime<chrono::Utc>,
-    until: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
+    until: jiff::Timestamp,
 ) -> bool {
     if row.jitter_secs <= 0 {
         return false;
     }
     let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
-    let mut slot = match walker.next_after(from - chrono::Duration::seconds(1)) {
+    let before = from
+        .checked_sub(jiff::SignedDuration::from_secs(1))
+        .unwrap_or(from);
+    let mut slot = match walker.next_after(before) {
         Some(slot) if slot < until => slot,
         _ => return false,
     };
@@ -49391,17 +49547,17 @@ fn jitter_crosses_a_slot(
 /// window. So the walk looks back by the widest jitter of `candidates`.
 fn herd_lookback(
     candidates: &[(&HarvestSchedule, Schedule)],
-    from: chrono::DateTime<chrono::Utc>,
-) -> (std::time::Duration, chrono::DateTime<chrono::Utc>) {
+    from: jiff::Timestamp,
+) -> (std::time::Duration, jiff::Timestamp) {
     let widest = candidates
         .iter()
         .map(|(row, _)| row.jitter_secs.max(0).cast_unsigned())
         .max()
         .unwrap_or(0);
     let lookback = std::time::Duration::from_secs(widest);
-    let walk_from = chrono::Duration::from_std(lookback)
+    let walk_from = jiff::SignedDuration::try_from(lookback)
         .ok()
-        .and_then(|back| from.checked_sub_signed(back))
+        .and_then(|back| from.checked_sub(back).ok())
         .unwrap_or(from);
     (lookback, walk_from)
 }
@@ -49445,8 +49601,8 @@ fn partition_herd_rows(
 /// applied.
 pub(crate) fn build_herd_report(
     rows: &[HarvestSchedule],
-    now: chrono::DateTime<chrono::Utc>,
-    from: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
+    from: jiff::Timestamp,
     hours: u32,
     bucket_secs: u64,
     min_herd: usize,
@@ -49458,7 +49614,7 @@ pub(crate) fn build_herd_report(
     let bucket_secs = bucket_secs.clamp(1, HERD_MAX_BUCKET_SECS);
     let min_herd = min_herd.max(2);
     let limit = limit.clamp(1, HERD_MAX_LIMIT);
-    let until = from + chrono::Duration::hours(i64::from(hours));
+    let until = from + jiff::SignedDuration::from_hours(i64::from(hours));
 
     let (candidates, inactive) = partition_herd_rows(rows);
     let (lookback, walk_from) = herd_lookback(&candidates, from);
@@ -49577,7 +49733,7 @@ async fn schedule_herd_handler(
     let mut report = tokio::task::spawn_blocking(move || {
         build_herd_report(
             &rows,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             from,
             params.hours,
             params.bucket_secs,
@@ -49608,7 +49764,7 @@ pub(crate) async fn compute_schedule_preview(
     api_state: &HarvestApiState,
     id: uuid::Uuid,
     count: usize,
-    from: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
 ) -> Result<SchedulePreview, AutumnError> {
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
     let schedule = load_schedule_by_id(api_state, id).await?;
@@ -49630,7 +49786,7 @@ pub(crate) async fn compute_schedule_preview_for(
     api_state: &HarvestApiState,
     schedule: HarvestSchedule,
     count: usize,
-    from: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
 ) -> Result<SchedulePreview, AutumnError> {
     use autumn_harvest::policy::SkipPolicy;
     use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
@@ -49708,7 +49864,7 @@ pub(crate) async fn compute_schedule_preview_for(
 
     // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
     // These become the lower bound of the jitter window for deferred-calendar entries.
-    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+    let pre_jitter_bases: Vec<Option<jiff::Timestamp>> =
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     // Apply jitter to each effective_at (mirrors effective_fire_time logic).
@@ -49717,8 +49873,8 @@ pub(crate) async fn compute_schedule_preview_for(
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_window);
-                if let Ok(d) = chrono::Duration::from_std(offset) {
-                    entry.effective_at = Some(t + d);
+                if let Some(jittered) = add_jitter_offset(t, offset) {
+                    entry.effective_at = Some(jittered);
                 }
             }
         }
@@ -49811,7 +49967,7 @@ async fn preview_candidate_schedule_handler(
     }
 
     // Validate jitter before the i64 conversion. A u64 second count can
-    // overflow chrono::Duration::seconds and panic.
+    // overflow that conversion.
     let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
@@ -49892,15 +50048,15 @@ async fn preview_candidate_schedule_handler(
     );
 
     // Capture pre-jitter calendar-adjusted bases before modifying entries in-place.
-    let pre_jitter_bases: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+    let pre_jitter_bases: Vec<Option<jiff::Timestamp>> =
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
-                if let Ok(d) = chrono::Duration::from_std(offset) {
-                    entry.effective_at = Some(t + d);
+                if let Some(jittered) = add_jitter_offset(t, offset) {
+                    entry.effective_at = Some(jittered);
                 }
             }
         }
@@ -50669,19 +50825,23 @@ async fn request_drain_handler(
     // Track whether the deadline is operator-supplied so we can avoid
     // shortening an existing window when re-draining without --deadline.
     let (deadline_at, deadline_is_explicit) = if let Some(raw) = &request.deadline_at {
-        let dt = chrono::DateTime::parse_from_rfc3339(raw).map_err(|_| {
+        let dt = autumn_harvest::time::parse::rfc3339(raw).map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid deadline_at '{raw}'; expected RFC 3339 (e.g. 2026-05-09T12:00:00Z)"
             ))
         })?;
-        (Some(dt.with_timezone(&chrono::Utc)), true)
+        (Some(dt), true)
     } else {
         // Compute a default deadline from the configured worker shutdown timeout so
         // operators always get a finite drain window even when they omit the field.
         let timeout = api_state.worker_shutdown_timeout();
-        let computed = chrono::Duration::from_std(timeout)
-            .ok()
-            .map(|d| chrono::Utc::now() + d);
+        // The bound keeps the `chrono` range. A deadline past the jiff range
+        // saturates, where `chrono` reached a far year.
+        let computed = autumn_harvest::time::from_std_bounded(timeout).map(|d| {
+            jiff::Timestamp::now()
+                .checked_add(d)
+                .unwrap_or(jiff::Timestamp::MAX)
+        });
         (computed, false)
     };
 
@@ -50693,7 +50853,7 @@ async fn request_drain_handler(
     let deadline_at = if deadline_is_explicit {
         deadline_at
     } else {
-        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut earliest: Option<jiff::Timestamp> = None;
         for (_, shard_pool) in pool.iter_shards() {
             let Ok(mut conn) = acquire_conn(shard_pool).await else {
                 continue;
@@ -52995,12 +53155,10 @@ async fn evaluate_eligibility_for_shard(
         tasks = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
-            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
-            .filter(
-                harvest_task_queue::schedule_to_close_at
-                    .is_null()
-                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
-            )
+            .filter(harvest_task_queue::scheduled_at.le(jiff::Timestamp::now().to_diesel()))
+            .filter(harvest_task_queue::schedule_to_close_at.is_null().or(
+                harvest_task_queue::schedule_to_close_at.gt(jiff::Timestamp::now().to_diesel()),
+            ))
             .order((
                 harvest_task_queue::priority.desc(),
                 harvest_task_queue::scheduled_at.asc(),
@@ -53015,20 +53173,18 @@ async fn evaluate_eligibility_for_shard(
     let pending_count = if target_task_id.is_some() {
         i64::from(tasks.iter().any(|t| {
             t.state == "PENDING"
-                && t.scheduled_at <= chrono::Utc::now()
+                && t.scheduled_at <= jiff::Timestamp::now()
                 && t.schedule_to_close_at
-                    .is_none_or(|at| at > chrono::Utc::now())
+                    .is_none_or(|at| at > jiff::Timestamp::now())
         }))
     } else {
         let count: i64 = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
-            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
-            .filter(
-                harvest_task_queue::schedule_to_close_at
-                    .is_null()
-                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
-            )
+            .filter(harvest_task_queue::scheduled_at.le(jiff::Timestamp::now().to_diesel()))
+            .filter(harvest_task_queue::schedule_to_close_at.is_null().or(
+                harvest_task_queue::schedule_to_close_at.gt(jiff::Timestamp::now().to_diesel()),
+            ))
             .count()
             .get_result(&mut conn)
             .await
@@ -53042,33 +53198,32 @@ async fn evaluate_eligibility_for_shard(
             .first()
             .filter(|&t| {
                 t.state == "PENDING"
-                    && t.scheduled_at <= chrono::Utc::now()
+                    && t.scheduled_at <= jiff::Timestamp::now()
                     && t.schedule_to_close_at
-                        .is_none_or(|at| at > chrono::Utc::now())
+                        .is_none_or(|at| at > jiff::Timestamp::now())
             })
             .map(|t| {
-                let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);
-                age.num_seconds()
+                let age = jiff::Timestamp::now().duration_since(t.scheduled_at);
+                age.as_secs()
             })
     } else {
-        let oldest_scheduled: Option<chrono::DateTime<chrono::Utc>> = harvest_task_queue::table
+        let oldest_scheduled: Option<jiff::Timestamp> = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
-            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
-            .filter(
-                harvest_task_queue::schedule_to_close_at
-                    .is_null()
-                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
-            )
+            .filter(harvest_task_queue::scheduled_at.le(jiff::Timestamp::now().to_diesel()))
+            .filter(harvest_task_queue::schedule_to_close_at.is_null().or(
+                harvest_task_queue::schedule_to_close_at.gt(jiff::Timestamp::now().to_diesel()),
+            ))
             .select(harvest_task_queue::scheduled_at)
             .order(harvest_task_queue::scheduled_at.asc())
-            .first::<chrono::DateTime<chrono::Utc>>(&mut conn)
+            .first::<SqlTimestamp>(&mut conn)
             .await
             .optional()
-            .map_err(database_error)?;
+            .map_err(database_error)?
+            .map(SqlTimestamp::to_jiff);
         oldest_scheduled.map(|ts| {
-            let age = chrono::Utc::now().signed_duration_since(ts);
-            age.num_seconds()
+            let age = jiff::Timestamp::now().duration_since(ts);
+            age.as_secs()
         })
     };
 
@@ -53267,9 +53422,9 @@ async fn evaluate_eligibility_for_shard(
         .iter()
         .filter(|t| {
             t.state == "PENDING"
-                && t.scheduled_at <= chrono::Utc::now()
+                && t.scheduled_at <= jiff::Timestamp::now()
                 && t.schedule_to_close_at
-                    .is_none_or(|at| at > chrono::Utc::now())
+                    .is_none_or(|at| at > jiff::Timestamp::now())
         })
         .collect();
 
@@ -53393,7 +53548,9 @@ async fn evaluate_eligibility_for_shard(
                 if let (Some(sticky_worker), Some(sticky_until)) =
                     (&t.sticky_worker_id, &t.sticky_until)
                 {
-                    if *sticky_until > chrono::Utc::now() && w.worker.worker_id != *sticky_worker {
+                    if *sticky_until > jiff::Timestamp::now()
+                        && w.worker.worker_id != *sticky_worker
+                    {
                         reasons.push("sticky_owned_by_other_worker".to_string());
                     }
                 }
@@ -54529,7 +54686,7 @@ mod tests {
             queue_name: queue.to_string(),
             reason: reason.to_string(),
             paused_by: actor.to_string(),
-            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            paused_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago),
             scope_shard_id: scope,
             held_task_count: held,
         }
@@ -54630,7 +54787,7 @@ mod tests {
             newly_paused: false,
             reason: reason.to_string(),
             paused_by: actor.to_string(),
-            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            paused_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago),
             scope_shard_id: scope,
             held_task_count: held,
         }
@@ -54869,7 +55026,7 @@ mod tests {
             activity_name: activity.to_string(),
             reason: reason.to_string(),
             paused_by: actor.to_string(),
-            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            paused_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago),
             scope_shard_id: scope,
             held_task_count: held,
         }
@@ -55204,7 +55361,7 @@ mod tests {
             newly_paused: false,
             reason: reason.to_string(),
             paused_by: actor.to_string(),
-            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            paused_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago),
             scope_shard_id: None,
             held_task_count: held,
         }
@@ -55631,7 +55788,7 @@ mod tests {
             reason: "reload-fail-incident".to_string(),
             message: None,
             created_by: "test".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             expires_at: None,
         }
     }
@@ -55946,8 +56103,8 @@ mod tests {
         use autumn_harvest::models::HarvestWorker;
         use autumn_harvest::workers::WorkerHealth;
 
-        let now = chrono::Utc::now();
-        let mk = |hb: chrono::DateTime<chrono::Utc>, health: WorkerHealth| WorkerRow {
+        let now = jiff::Timestamp::now();
+        let mk = |hb: jiff::Timestamp, health: WorkerHealth| WorkerRow {
             worker: HarvestWorker {
                 worker_id: "w1".to_string(),
                 started_at: now,
@@ -55972,7 +56129,10 @@ mod tests {
 
         // Shard 0's copy (read first, lowest shard) is stale; shard 1's copy is
         // fresh. The dedup must keep the fresh snapshot, not the first-seen one.
-        let stale = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let stale = mk(
+            now - jiff::SignedDuration::from_hours(1),
+            WorkerHealth::Stale,
+        );
         let fresh = mk(now, WorkerHealth::Healthy);
         let deduped = dedup_workers_by_freshest(vec![stale, fresh]);
         assert_eq!(deduped.len(), 1);
@@ -55980,7 +56140,10 @@ mod tests {
         assert_eq!(deduped[0].worker.last_heartbeat_at, now);
 
         // Order-independent: fresh first, stale second → still keeps fresh.
-        let stale2 = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let stale2 = mk(
+            now - jiff::SignedDuration::from_hours(1),
+            WorkerHealth::Stale,
+        );
         let fresh2 = mk(now, WorkerHealth::Healthy);
         let deduped_rev = dedup_workers_by_freshest(vec![fresh2, stale2]);
         assert_eq!(deduped_rev.len(), 1);
@@ -55993,7 +56156,7 @@ mod tests {
     /// Build a minimal `WorkerRow` for `by_shard` merge-layer tests.
     fn worker_row_for_shard_test(
         worker_id: &str,
-        hb: chrono::DateTime<chrono::Utc>,
+        hb: jiff::Timestamp,
         shard_assignments: serde_json::Value,
     ) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
@@ -56025,12 +56188,12 @@ mod tests {
 
     #[test]
     fn dedup_worker_sources_by_freshest_keeps_the_freshest_rows_source_shard() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let stale_on_shard_0 = (
             0,
             worker_row_for_shard_test(
                 "w1",
-                now - chrono::Duration::hours(1),
+                now - jiff::SignedDuration::from_hours(1),
                 serde_json::json!([]),
             ),
         );
@@ -56049,7 +56212,7 @@ mod tests {
             0,
             worker_row_for_shard_test(
                 "w1",
-                now - chrono::Duration::hours(1),
+                now - jiff::SignedDuration::from_hours(1),
                 serde_json::json!([]),
             ),
         );
@@ -56061,7 +56224,7 @@ mod tests {
 
     #[test]
     fn tally_by_shard_attributes_an_empty_assignment_worker_to_its_source_shard() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let rows = vec![(
             7,
             worker_row_for_shard_test("auto", now, serde_json::json!([])),
@@ -56073,7 +56236,7 @@ mod tests {
 
     #[test]
     fn tally_by_shard_attributes_a_non_empty_assignment_worker_literally() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         // Source shard (3) is irrelevant once the list is non-empty: the
         // worker's explicit claim wins, exactly as before this fix.
         let rows = vec![(
@@ -56093,7 +56256,7 @@ mod tests {
 
     #[test]
     fn tally_by_shard_attributes_a_malformed_assignment_to_nothing() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let rows = vec![(
             2,
             worker_row_for_shard_test("corrupt", now, serde_json::json!("not-an-array")),
@@ -56107,7 +56270,7 @@ mod tests {
 
     #[test]
     fn tally_by_shard_does_not_double_count_a_multi_shard_worker_across_the_fanout() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         // The same worker_id shows up once per assigned shard (replicated row),
         // as it would after the fan-out but before dedup collapses it to one.
         // Dedup must run first so the literal `[1, 3]` claim is counted once
@@ -56193,7 +56356,7 @@ mod tests {
             activity_exec_id: "a".to_string(),
             activity_name: "act".to_string(),
             queue: "default".to_string(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             attempt: 0,
             max_attempts: 1,
             task_status: "RUNNING".to_string(),
@@ -58003,16 +58166,15 @@ mod tests {
         // (workflow_name, workflow_id) and this row is left RUNNING.
         let workflow_id = format!("deadline-{exec_id}");
         // Whole seconds: Postgres `timestamptz` has microsecond precision. A
-        // nanosecond `Utc::now()` would not round-trip exactly, and the
+        // nanosecond `jiff::Timestamp::now()` would not round-trip exactly, and the
         // comparison below would fail on precision, not on staleness.
-        let started_at = chrono::DateTime::from_timestamp(
-            (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp(),
-            0,
+        let started_at = jiff::Timestamp::from_second(
+            (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2)).as_second(),
         )
         .expect("valid timestamp");
         // The value a resume left behind: an hour further out than discovery saw.
-        let fresh_deadline = started_at + chrono::Duration::hours(3);
-        let fresh_timeout = chrono::Duration::hours(3);
+        let fresh_deadline = started_at + jiff::SignedDuration::from_hours(3);
+        let fresh_timeout = jiff::SignedDuration::from_hours(3);
 
         diesel::sql_query(
             "INSERT INTO harvest_workflow_executions \
@@ -58022,9 +58184,11 @@ mod tests {
                      '{}'::jsonb, 'default', $2, $3, $4, 1)",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(started_at)
-        .bind::<diesel::sql_types::Interval, _>(fresh_timeout)
-        .bind::<diesel::sql_types::Timestamptz, _>(fresh_deadline)
+        .bind::<diesel::sql_types::Timestamptz, _>(started_at.to_diesel())
+        .bind::<diesel::sql_types::Interval, _>(autumn_harvest::time::sql::PgDuration(
+            fresh_timeout,
+        ))
+        .bind::<diesel::sql_types::Timestamptz, _>(fresh_deadline.to_diesel())
         .bind::<diesel::sql_types::Text, _>(workflow_id.clone())
         .execute(&mut conn)
         .await
@@ -58043,7 +58207,7 @@ mod tests {
         .expect("append history");
 
         // What discovery captured *before* the resume: an hour too early.
-        let stale_deadline = fresh_deadline - chrono::Duration::hours(1);
+        let stale_deadline = fresh_deadline - jiff::SignedDuration::from_hours(1);
         let candidate = HistoryExportCandidate {
             id: exec_id.as_uuid(),
             workflow_name: "deadline_wf".to_string(),
@@ -58161,7 +58325,7 @@ mod tests {
     fn test_history_export_candidate(
         id: uuid::Uuid,
         shard_id: i32,
-        last_history_event_at: chrono::DateTime<chrono::Utc>,
+        last_history_event_at: jiff::Timestamp,
     ) -> HistoryExportCandidate {
         HistoryExportCandidate {
             id,
@@ -58182,9 +58346,9 @@ mod tests {
 
     #[test]
     fn sort_history_export_candidates_orders_globally_before_limit() {
-        let base = chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
-            .expect("valid timestamp")
-            .with_timezone(&chrono::Utc);
+        let base = "2026-05-08T00:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .expect("valid timestamp");
         let older_shard0 =
             uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("valid uuid");
         let newer_shard0 =
@@ -58193,8 +58357,16 @@ mod tests {
             uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000003").expect("valid uuid");
         let mut candidates = vec![
             test_history_export_candidate(older_shard0, 0, base),
-            test_history_export_candidate(newer_shard0, 0, base + chrono::Duration::minutes(1)),
-            test_history_export_candidate(newest_shard1, 1, base + chrono::Duration::minutes(2)),
+            test_history_export_candidate(
+                newer_shard0,
+                0,
+                base + jiff::SignedDuration::from_mins(1),
+            ),
+            test_history_export_candidate(
+                newest_shard1,
+                1,
+                base + jiff::SignedDuration::from_mins(2),
+            ),
         ];
 
         sort_history_export_candidates(&mut candidates);
@@ -58224,7 +58396,7 @@ mod tests {
     fn sample_row(
         workflow_name: &str,
         seq: u128,
-        started_at: chrono::DateTime<chrono::Utc>,
+        started_at: jiff::Timestamp,
         in_flight_total: i64,
     ) -> HistorySampleCandidate {
         HistorySampleCandidate {
@@ -58245,10 +58417,10 @@ mod tests {
         }
     }
 
-    fn sample_base() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
+    fn sample_base() -> jiff::Timestamp {
+        "2026-05-08T00:00:00Z"
+            .parse::<jiff::Timestamp>()
             .expect("valid timestamp")
-            .with_timezone(&chrono::Utc)
     }
 
     /// AC1: the per-type cap applies **per workflow name**. So a noisy type can
@@ -58262,14 +58434,14 @@ mod tests {
             rows.push(sample_row(
                 "noisy",
                 index,
-                base + chrono::Duration::seconds(i64::try_from(index).expect("fits")),
+                base + jiff::SignedDuration::from_secs(i64::try_from(index).expect("fits")),
                 5,
             ));
         }
         rows.push(sample_row(
             "quiet",
             100,
-            base + chrono::Duration::hours(1),
+            base + jiff::SignedDuration::from_hours(1),
             1,
         ));
 
@@ -58303,12 +58475,12 @@ mod tests {
         let mut rows = vec![
             // Shard 0's own top-3.
             sample_row("wf", 1, base, 3),
-            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
-            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+            sample_row("wf", 2, base + jiff::SignedDuration::from_secs(2), 3),
+            sample_row("wf", 3, base + jiff::SignedDuration::from_secs(4), 3),
             // Shard 1's own top-3, interleaved in time.
-            sample_row("wf", 4, base + chrono::Duration::seconds(1), 3),
-            sample_row("wf", 5, base + chrono::Duration::seconds(3), 3),
-            sample_row("wf", 6, base + chrono::Duration::seconds(5), 3),
+            sample_row("wf", 4, base + jiff::SignedDuration::from_secs(1), 3),
+            sample_row("wf", 5, base + jiff::SignedDuration::from_secs(3), 3),
+            sample_row("wf", 6, base + jiff::SignedDuration::from_secs(5), 3),
         ];
 
         stratify_sample_rows(
@@ -58330,8 +58502,8 @@ mod tests {
         let base = sample_base();
         let mut rows = vec![
             sample_row("wf", 1, base, 3),
-            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
-            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+            sample_row("wf", 2, base + jiff::SignedDuration::from_secs(2), 3),
+            sample_row("wf", 3, base + jiff::SignedDuration::from_secs(4), 3),
         ];
 
         stratify_sample_rows(
@@ -58370,7 +58542,7 @@ mod tests {
                 rows.push(sample_row(
                     &format!("wf_type_{type_index:02}"),
                     id,
-                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    base + jiff::SignedDuration::from_secs(i64::try_from(row_index).expect("fits")),
                     i64::try_from(per_workflow).expect("fits"),
                 ));
             }
@@ -58422,7 +58594,7 @@ mod tests {
                 rows.push(sample_row(
                     &format!("wf_{type_index}"),
                     type_index * 100 + row_index,
-                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    base + jiff::SignedDuration::from_secs(i64::try_from(row_index).expect("fits")),
                     10,
                 ));
             }
@@ -58445,7 +58617,7 @@ mod tests {
         let base = sample_base();
         let rows = vec![
             sample_row("alpha", 1, base, 40),
-            sample_row("alpha", 2, base + chrono::Duration::seconds(1), 40),
+            sample_row("alpha", 2, base + jiff::SignedDuration::from_secs(1), 40),
             sample_row("beta", 3, base, 2),
         ];
 
@@ -59154,7 +59326,7 @@ mod tests {
 
     #[test]
     fn parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected() {
-        // Adding this period to a timestamp overflows chrono (issue #2048).
+        // Adding this period to a timestamp overflows (issue #2048).
         let err = parse_schedule_expr_with_tz("interval:9000000000000000", "UTC")
             .expect_err("a period over the cap must be rejected");
         assert!(err.contains("must not exceed"), "{err}");
@@ -59269,6 +59441,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_from_param_rejects_a_signed_year() {
+        assert!(parse_from_param(Some("-009999-01-02T01:59:59Z")).is_err());
+        assert!(parse_from_param(Some("+002026-06-01T09:00:00Z")).is_err());
+    }
+
+    #[test]
     fn parse_from_param_accepts_year_9000() {
         let result = parse_from_param(Some("9000-12-31T23:59:59Z"));
         assert!(
@@ -59332,8 +59510,7 @@ mod tests {
     #[test]
     fn build_preview_entry_reason_is_cron_without_jitter() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(fire),
@@ -59349,9 +59526,8 @@ mod tests {
     #[test]
     fn build_preview_entry_reason_is_cron_plus_jitter_with_jitter() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let effective = fire + chrono::Duration::seconds(120);
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let effective = fire + jiff::SignedDuration::from_secs(120);
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(effective), // post-jitter effective_at
@@ -59378,7 +59554,7 @@ mod tests {
         );
         assert_eq!(
             entry.jitter_latest_at.unwrap(),
-            fire + chrono::Duration::seconds(300),
+            fire + jiff::SignedDuration::from_secs(300),
             "jitter_latest_at must equal pre_jitter_base + jitter_secs"
         );
     }
@@ -59386,11 +59562,10 @@ mod tests {
     #[test]
     fn build_preview_entry_jitter_bounds_use_deferred_date_not_original() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
         // Simulates a July 4 holiday deferred to July 5 with jitter applied.
-        let original = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
-        let deferred_base = chrono::Utc.with_ymd_and_hms(2026, 7, 5, 9, 0, 0).unwrap();
-        let deferred_jittered = deferred_base + chrono::Duration::seconds(42);
+        let original = autumn_harvest::time::utc_ymd_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let deferred_base = autumn_harvest::time::utc_ymd_hms(2026, 7, 5, 9, 0, 0).unwrap();
+        let deferred_jittered = deferred_base + jiff::SignedDuration::from_secs(42);
         let preview = ScheduleFirePreview {
             scheduled_at: original,
             effective_at: Some(deferred_jittered), // calendar-adjusted + jitter
@@ -59405,7 +59580,7 @@ mod tests {
         );
         assert_eq!(
             entry.jitter_latest_at.unwrap(),
-            deferred_base + chrono::Duration::seconds(300),
+            deferred_base + jiff::SignedDuration::from_secs(300),
             "jitter_latest_at must be deferred_base + jitter_secs"
         );
     }
@@ -59413,8 +59588,7 @@ mod tests {
     #[test]
     fn build_preview_entry_reason_is_skipped_calendar_excluded() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 7, 4, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: None,
@@ -59432,9 +59606,8 @@ mod tests {
     #[test]
     fn build_preview_entry_reason_is_deferred_calendar() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
-        let deferred = chrono::Utc.with_ymd_and_hms(2026, 7, 5, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let deferred = autumn_harvest::time::utc_ymd_hms(2026, 7, 5, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(deferred),
@@ -59450,8 +59623,7 @@ mod tests {
     #[test]
     fn build_preview_entry_would_skip_true_when_overlap_is_skip() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(fire),
@@ -59467,8 +59639,7 @@ mod tests {
     #[test]
     fn build_preview_entry_would_skip_false_when_overlap_is_cancel_other() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(fire),
@@ -59484,8 +59655,7 @@ mod tests {
     #[test]
     fn build_preview_entry_would_skip_false_when_suppressed_by_calendar() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 7, 4, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: None, // suppressed
@@ -59502,8 +59672,7 @@ mod tests {
     #[test]
     fn build_preview_entry_would_skip_true_when_max_active_runs_is_zero() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(fire),
@@ -59521,14 +59690,13 @@ mod tests {
     #[test]
     fn build_preview_entry_jitter_latest_at_is_none_for_oversized_jitter() {
         use autumn_harvest::calendar::ScheduleFirePreview;
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let preview = ScheduleFirePreview {
             scheduled_at: fire,
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        // i64::MAX seconds overflows chrono Duration creation; must not panic.
+        // i64::MAX seconds overflows the jitter bound. It must not panic.
         let entry = build_preview_entry(&preview, Some(fire), i64::MAX, "UTC", "skip");
         assert!(
             entry.jitter_earliest_at.is_some(),
@@ -59566,7 +59734,7 @@ mod tests {
         // plus exhausted_at IS NULL, and sets exhausted_at/exhausted_reason. The
         // live `transition_backfill_exhausted_if_reached` runs the SAME macro, so
         // an edit to the guard or the SET clause there breaks this test.
-        let at = chrono::Utc::now();
+        let at = jiff::Timestamp::now();
         let stmt = transition_backfill_exhausted_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
         assert!(
@@ -59595,7 +59763,7 @@ mod tests {
         // so the caller can decide exhaustion. The live
         // `reserve_backfill_budget_slot` runs the SAME macro, so an edit to the
         // guard, the increment or the RETURNING clause there breaks this test.
-        let at = chrono::Utc::now();
+        let at = jiff::Timestamp::now();
         let stmt = reserve_backfill_budget_slot_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
         assert!(
@@ -59625,7 +59793,7 @@ mod tests {
         // exhausted_at/exhausted_reason. The live `release_backfill_budget_slot`
         // runs the SAME macro, so an edit to the guard or the SET clause there
         // breaks this test.
-        let at = chrono::Utc::now();
+        let at = jiff::Timestamp::now();
         let stmt = clear_stale_max_runs_exhaustion_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
         assert!(
@@ -59658,8 +59826,8 @@ mod tests {
         // (exhausted_at IS NULL). It must SET next_run_at. The live
         // `release_backfill_budget_slot` runs the SAME macro, so an edit to the
         // guard or the SET clause there breaks this test.
-        let at = chrono::Utc::now();
-        let next = at + chrono::Duration::seconds(120);
+        let at = jiff::Timestamp::now();
+        let next = at + jiff::SignedDuration::from_secs(120);
         let stmt = rearm_backfill_next_run_stmt!(uuid::Uuid::nil(), next, at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
         assert!(
@@ -59678,10 +59846,7 @@ mod tests {
 
     // ── Preview bound truncation (issue #543 — end_at / remaining-run budget) ──
 
-    fn preview_entry_at(
-        fire: chrono::DateTime<chrono::Utc>,
-        fires: bool,
-    ) -> ScheduleFirePreviewEntry {
+    fn preview_entry_at(fire: jiff::Timestamp, fires: bool) -> ScheduleFirePreviewEntry {
         use autumn_harvest::calendar::ScheduleFirePreview;
         let raw = ScheduleFirePreview {
             scheduled_at: fire,
@@ -59698,7 +59863,7 @@ mod tests {
     /// Minimal `HarvestSchedule` fixture for `empty_preview_response` tests. Callers
     /// override only the fields they care about via struct-update syntax.
     fn test_harvest_schedule() -> autumn_harvest::models::HarvestSchedule {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         autumn_harvest::models::HarvestSchedule {
             id: uuid::Uuid::nil(),
             dag_name: None,
@@ -59751,8 +59916,8 @@ mod tests {
         }
     }
 
-    fn herd_epoch() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(0, 0).unwrap()
+    fn herd_epoch() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(0).unwrap()
     }
 
     #[test]
@@ -59829,7 +59994,7 @@ mod tests {
         let ending = [
             herd_row(1, "a", "cron:0 * * * *"),
             autumn_harvest::models::HarvestSchedule {
-                end_at: Some(herd_epoch() + chrono::Duration::hours(2)),
+                end_at: Some(herd_epoch() + jiff::SignedDuration::from_hours(2)),
                 ..herd_row(2, "b", "cron:0 * * * *")
             },
         ];
@@ -59840,7 +60005,7 @@ mod tests {
 
     #[test]
     fn the_herd_report_spends_the_budget_on_slots_before_the_window() {
-        let tomorrow = herd_epoch() + chrono::Duration::hours(24);
+        let tomorrow = herd_epoch() + jiff::SignedDuration::from_hours(24);
         let row = |n: u128, max_runs: i32| autumn_harvest::models::HarvestSchedule {
             max_runs: Some(max_runs),
             next_run_at: Some(herd_epoch()),
@@ -59877,7 +60042,7 @@ mod tests {
 
     #[test]
     fn the_herd_report_does_not_project_a_budget_too_far_ahead() {
-        let far = herd_epoch() + chrono::Duration::days(2);
+        let far = herd_epoch() + autumn_harvest::time::days(2);
         let dense = autumn_harvest::models::HarvestSchedule {
             max_runs: Some(2_000_000_000),
             next_run_at: Some(herd_epoch()),
@@ -59896,7 +60061,7 @@ mod tests {
 
     #[test]
     fn the_herd_report_does_not_guess_the_budget_of_an_overdue_schedule() {
-        let now = herd_epoch() + chrono::Duration::hours(10);
+        let now = herd_epoch() + jiff::SignedDuration::from_hours(10);
         let overdue = autumn_harvest::models::HarvestSchedule {
             max_runs: Some(3),
             next_run_at: Some(herd_epoch()),
@@ -59926,7 +60091,7 @@ mod tests {
             .collect();
         // Start the window one second after the 00:00 slot. Each slot starts
         // somewhere in the hour after it, by its own jitter.
-        let from = herd_epoch() + chrono::Duration::seconds(1);
+        let from = herd_epoch() + jiff::SignedDuration::from_secs(1);
         let starts: Vec<_> = rows
             .iter()
             .map(|row| effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap())
@@ -59941,8 +60106,8 @@ mod tests {
 
     #[test]
     fn the_herd_lookback_does_not_spend_a_budget_on_processed_slots() {
-        let now = herd_epoch() + chrono::Duration::minutes(630);
-        let eleven = herd_epoch() + chrono::Duration::hours(11);
+        let now = herd_epoch() + jiff::SignedDuration::from_mins(630);
+        let eleven = herd_epoch() + jiff::SignedDuration::from_hours(11);
         let once = |n: u128| autumn_harvest::models::HarvestSchedule {
             max_runs: Some(1),
             next_run_at: Some(eleven),
@@ -59995,7 +60160,7 @@ mod tests {
 
     #[test]
     fn the_herd_report_drops_a_fire_that_jitter_pushes_past_the_end() {
-        let end_at = herd_epoch() + chrono::Duration::seconds(1);
+        let end_at = herd_epoch() + jiff::SignedDuration::from_secs(1);
         let row = autumn_harvest::models::HarvestSchedule {
             jitter_secs: 3_600,
             end_at: Some(end_at),
@@ -60005,6 +60170,39 @@ mod tests {
         assert!(fire >= end_at, "the fixture needs jitter past the end");
         let report = build_herd_report(&[row], herd_epoch(), herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 0, "the scheduler never dispatches this slot");
+    }
+
+    #[test]
+    fn a_jittered_fire_time_at_the_end_of_the_range_saturates() {
+        let row = herd_row(1, "far", "cron:0 * * * *");
+        let fire = effective_fire_time(row.id, Some(jiff::Timestamp::MAX), 3_600);
+        assert_eq!(fire, Some(jiff::Timestamp::MAX));
+        let one_second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            add_jitter_offset(jiff::Timestamp::MAX, one_second),
+            Some(jiff::Timestamp::MAX)
+        );
+        let late = jiff::Timestamp::MAX - jiff::SignedDuration::from_secs(10);
+        let year = std::time::Duration::from_hours(8_760);
+        assert_eq!(add_jitter_offset(late, year), Some(jiff::Timestamp::MAX));
+        let near = herd_epoch() + jiff::SignedDuration::from_secs(1);
+        assert_eq!(add_jitter_offset(herd_epoch(), one_second), Some(near));
+    }
+
+    #[test]
+    fn the_legacy_backfill_id_keeps_the_chrono_split_before_the_epoch() {
+        let half_before = jiff::Timestamp::new(0, -500_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", half_before),
+            "sched:wf:-1.500000"
+        );
+        let earlier = jiff::Timestamp::new(-1, -750_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", earlier),
+            "sched:wf:-2.250000"
+        );
+        let whole = jiff::Timestamp::new(-60, 0).expect("in range");
+        assert_eq!(legacy_scheduled_workflow_id("wf", whole), "sched:wf:-60");
     }
 
     #[test]
@@ -60031,7 +60229,10 @@ mod tests {
             .map(|n| herd_row(n, &format!("s{n}"), "cron:0 * * * *"))
             .collect();
         let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 10_000, 0, 0, 0);
-        assert_eq!(report.until - report.from, chrono::Duration::hours(744));
+        assert_eq!(
+            report.until - report.from,
+            jiff::SignedDuration::from_hours(744)
+        );
         assert_eq!(report.bucket_secs, 1);
         assert_eq!(report.min_herd, 2);
         assert_eq!(report.spot_count, 744);
@@ -60057,13 +60258,12 @@ mod tests {
 
     #[test]
     fn empty_preview_response_surfaces_pause_reason_when_paused() {
-        use chrono::TimeZone as _;
         let schedule = autumn_harvest::models::HarvestSchedule {
             is_paused: true,
             pause_reason: Some("operator hold".to_string()),
             ..test_harvest_schedule()
         };
-        let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let from = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
         assert!(response.is_paused);
         assert_eq!(response.pause_reason.as_deref(), Some("operator hold"));
@@ -60078,13 +60278,12 @@ mod tests {
         // A legacy pause path (e.g. PATCH /dags/{dag_name}) can clear `is_paused`
         // without clearing `pause_reason`, leaving a stale non-null reason on an
         // active schedule's row. `empty_preview_response` must not leak it.
-        use chrono::TimeZone as _;
         let schedule = autumn_harvest::models::HarvestSchedule {
             is_paused: false,
             pause_reason: Some("stale reason from a prior pause".to_string()),
             ..test_harvest_schedule()
         };
-        let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let from = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
         let response = serde_json::to_value(&response).expect("preview serializes");
         assert_eq!(response["is_paused"], serde_json::json!(false));
@@ -60098,8 +60297,7 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_no_bounds_passes_through_unchanged() {
-        use chrono::TimeZone as _;
-        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let fire = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let entries = vec![preview_entry_at(fire, true), preview_entry_at(fire, true)];
         let out = truncate_preview_entries_by_bounds(entries, None, None);
         assert_eq!(out.len(), 2, "no bounds must not truncate anything");
@@ -60107,10 +60305,9 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_drops_entries_at_or_after_end_at() {
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let t1 = t0 + chrono::Duration::hours(1);
-        let t2 = t0 + chrono::Duration::hours(2);
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + jiff::SignedDuration::from_hours(1);
+        let t2 = t0 + jiff::SignedDuration::from_hours(2);
         let entries = vec![
             preview_entry_at(t0, true),
             preview_entry_at(t1, true),
@@ -60128,10 +60325,9 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_stops_after_remaining_budget_is_exhausted() {
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let t1 = t0 + chrono::Duration::hours(1);
-        let t2 = t0 + chrono::Duration::hours(2);
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + jiff::SignedDuration::from_hours(1);
+        let t2 = t0 + jiff::SignedDuration::from_hours(2);
         let entries = vec![
             preview_entry_at(t0, true),
             preview_entry_at(t1, true),
@@ -60147,10 +60343,9 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_calendar_skipped_entries_do_not_consume_budget() {
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let t1 = t0 + chrono::Duration::hours(1);
-        let t2 = t0 + chrono::Duration::hours(2);
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + jiff::SignedDuration::from_hours(1);
+        let t2 = t0 + jiff::SignedDuration::from_hours(2);
         let entries = vec![
             preview_entry_at(t0, true),
             preview_entry_at(t1, false), // calendar-suppressed — must not consume budget
@@ -60171,9 +60366,8 @@ mod tests {
         // future concurrency. So an entry flagged `would_skip_if_active` (the
         // overlap policy could drop it at dispatch) still consumes budget here.
         // See the doc comment on `truncate_preview_entries_by_bounds`.
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let t1 = t0 + chrono::Duration::hours(1);
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + jiff::SignedDuration::from_hours(1);
         let entries = vec![preview_entry_at(t0, true), preview_entry_at(t1, true)];
         assert!(
             entries.iter().all(|e| e.would_skip_if_active),
@@ -60191,8 +60385,7 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_zero_budget_yields_no_entries() {
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let entries = vec![preview_entry_at(t0, true)];
         let out = truncate_preview_entries_by_bounds(entries, None, Some(0));
         assert!(
@@ -60207,10 +60400,9 @@ mod tests {
         // consumes no budget. But it must not slip past the budget-exhausted
         // cutoff once a prior entry spent the last unit. The schedule is
         // terminal at that point, skipped or not.
-        use chrono::TimeZone as _;
-        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
-        let t1 = t0 + chrono::Duration::hours(1);
-        let t2 = t0 + chrono::Duration::hours(2);
+        let t0 = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + jiff::SignedDuration::from_hours(1);
+        let t2 = t0 + jiff::SignedDuration::from_hours(2);
         let entries = vec![
             preview_entry_at(t0, true),  // consumes the only unit of budget
             preview_entry_at(t1, false), // calendar-suppressed — must NOT survive
@@ -60648,9 +60840,7 @@ mod tests {
         // We do not test the cursor body here (the round-trip test does that),
         // just that a `cursor` param flips the paginated flag.
         let encoded = encode_workflow_list_cursor_raw(
-            &chrono::DateTime::parse_from_rfc3339("2026-06-18T10:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            &"2026-06-18T10:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &uuid::Uuid::nil(),
         );
         let filters = parse_workflow_filters(&pairs(&[("cursor", &encoded)]))
@@ -60661,9 +60851,9 @@ mod tests {
 
     #[test]
     fn parse_workflow_filters_cursor_roundtrips() {
-        let created_at = chrono::DateTime::parse_from_rfc3339("2026-06-18T10:00:00.123456Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let created_at = "2026-06-18T10:00:00.123456Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap();
         let exec_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 
         let encoded = encode_workflow_list_cursor_raw(&created_at, &exec_id);
@@ -60683,6 +60873,36 @@ mod tests {
         let err = parse_workflow_cursor("not-a-date|550e8400-e29b-41d4-a716-446655440000")
             .expect_err("bad timestamp must error");
         assert!(err.to_string().contains("invalid cursor"));
+    }
+
+    /// A cursor reads every instant that `parse_from_rfc3339` read.
+    #[test]
+    fn cursor_parsers_read_the_chrono_rfc3339_grammar() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let expected: jiff::Timestamp = "2026-01-01T00:00:00.123456789Z".parse().unwrap();
+        let ten_digits = format!("2026-01-01T00:00:00.1234567891Z|{id}");
+        assert_eq!(
+            parse_workflow_cursor(&ten_digits).unwrap().created_at,
+            expected
+        );
+        assert_eq!(
+            parse_workflow_children_cursor(&ten_digits)
+                .unwrap()
+                .started_at,
+            expected
+        );
+        let sentinel = format!("9999-12-31T23:59:59Z|{id}");
+        assert_eq!(
+            parse_workflow_cursor(&sentinel).unwrap().created_at,
+            jiff::Timestamp::MAX
+        );
+        let minus_sign = format!("2026-01-01T00:00:00\u{2212}05:00|{id}");
+        assert_eq!(
+            parse_workflow_children_cursor(&minus_sign)
+                .unwrap()
+                .started_at,
+            "2026-01-01T05:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
     }
 
     #[test]
@@ -61443,7 +61663,7 @@ mod tests {
         use autumn_harvest::models::HarvestWorker;
         use autumn_harvest::workers::WorkerHealth;
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: worker_id.to_string(),
@@ -61980,7 +62200,7 @@ mod tests {
             parent_id: None,
             sticky_worker_id: None,
             queue_name: "default".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: jiff::Timestamp::now(),
             completed_at: None,
             execution_timeout: None,
             deadline_at: None,
@@ -61988,7 +62208,7 @@ mod tests {
             chain_deadline_at: None,
             memo: None,
             search_attrs: None,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             assigned_build_id: None,
             parent_close_policy: None,
             owner: None,
@@ -62155,9 +62375,9 @@ mod tests {
         use autumn_harvest::types::ActivityExecId;
         let act_a = ActivityExecId::new();
         let act_b = ActivityExecId::new();
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(5);
-        let t2 = t0 + chrono::Duration::seconds(9);
+        let t0 = jiff::Timestamp::now();
+        let t1 = t0 + jiff::SignedDuration::from_secs(5);
+        let t2 = t0 + jiff::SignedDuration::from_secs(9);
 
         // Only `LocalActivityFailed` events feed the map. Regular activity
         // failures come from the task-row `error` column at the join site,
@@ -62220,7 +62440,7 @@ mod tests {
     fn latest_failures_by_activity_ignores_out_of_order_lower_event_ids() {
         use autumn_harvest::types::ActivityExecId;
         let act = ActivityExecId::new();
-        let t0 = chrono::Utc::now();
+        let t0 = jiff::Timestamp::now();
         // Deliberately present the higher event_id first, then a lower one, to
         // prove the map keys off the highest event_id, not iteration order.
         let events = vec![
@@ -62252,7 +62472,7 @@ mod tests {
     fn latest_failures_by_activity_ignores_non_local_failed_events() {
         use autumn_harvest::types::ActivityExecId;
         let act = ActivityExecId::new();
-        let t0 = chrono::Utc::now();
+        let t0 = jiff::Timestamp::now();
         // A regular ActivityFailed event must NOT feed the local map. The
         // regular path reads the task row, because a retryable regular failure
         // appends no event. An event-sourced map would miss that failure.
@@ -62332,7 +62552,7 @@ mod tests {
                 error: "local boom".to_string(),
                 attempt: 2,
                 non_retryable: false,
-                failed_at: Some(chrono::Utc::now()),
+                failed_at: Some(jiff::Timestamp::now()),
                 details: None,
             }),
             ..pending_with_checkpoint(None)
@@ -62350,7 +62570,7 @@ mod tests {
                 error: "503".to_string(),
                 attempt: 2,
                 non_retryable: true,
-                failed_at: Some(chrono::Utc::now()),
+                failed_at: Some(jiff::Timestamp::now()),
                 details: Some(serde_json::json!({"status": 503})),
             }),
             ..pending_with_checkpoint(None)
@@ -62367,7 +62587,7 @@ mod tests {
         let base = PendingLocalActivity {
             activity_exec_id: "la".to_string(),
             activity_name: "checksum".to_string(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             attempt: 1,
             max_attempts: 3,
             task_status: "PENDING".to_string(),
@@ -62390,7 +62610,7 @@ mod tests {
                 error: "local boom".to_string(),
                 attempt: 2,
                 non_retryable: false,
-                failed_at: Some(chrono::Utc::now()),
+                failed_at: Some(jiff::Timestamp::now()),
                 details: None,
             }),
             ..base
@@ -62422,7 +62642,7 @@ mod tests {
             state: WorkflowResultState::Completed,
             output: Some(read_path_envelope(&serde_json::json!({"answer": 42}))),
             error: None,
-            completed_at: Some(chrono::Utc::now()),
+            completed_at: Some(jiff::Timestamp::now()),
         };
 
         // Active decoder: the JSONB output is decoded on the response copy.
@@ -62465,7 +62685,7 @@ mod tests {
                 serde_json::to_string(&read_path_envelope(&serde_json::json!("boom")))
                     .expect("serialize envelope"),
             ),
-            completed_at: Some(chrono::Utc::now()),
+            completed_at: Some(jiff::Timestamp::now()),
         };
         let response =
             respond_with_workflow_result(&api_state, &headers, exec_id, failed, Some(&codecs))
@@ -62605,14 +62825,14 @@ mod tests {
     // shard degradation ──────────────────────────────────────────────────────
 
     /// A `WorkflowExecution` stub with a deterministic id + `created_at`.
-    fn exec_at(id_byte: u8, created_at: chrono::DateTime<chrono::Utc>) -> WorkflowExecution {
+    fn exec_at(id_byte: u8, created_at: jiff::Timestamp) -> WorkflowExecution {
         let mut e = stub_workflow_execution();
         e.id = uuid::Uuid::from_bytes([id_byte; 16]);
         e.created_at = created_at;
         e
     }
 
-    fn dl_at(id_byte: u8, failed_at: chrono::DateTime<chrono::Utc>) -> DeadLetter {
+    fn dl_at(id_byte: u8, failed_at: jiff::Timestamp) -> DeadLetter {
         DeadLetter {
             id: uuid::Uuid::from_bytes([id_byte; 16]),
             original_task_id: uuid::Uuid::nil(),
@@ -62636,7 +62856,7 @@ mod tests {
         dag_name: Option<&str>,
         workflow_name: Option<&str>,
     ) -> HarvestSchedule {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         HarvestSchedule {
             id: uuid::Uuid::from_bytes([id_byte; 16]),
             dag_name: dag_name.map(ToOwned::to_owned),
@@ -62733,14 +62953,14 @@ mod tests {
     #[test]
     fn build_workflow_fanout_page_paginates_during_degradation() {
         // shard 0 returns 3 rows (> limit 2); shard 1 is down.
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let obs = vec![
             ShardObservation {
                 shard_id: 0,
                 rows: vec![
-                    exec_at(3, t),                                 // newest
-                    exec_at(1, t - chrono::Duration::seconds(20)), // oldest
-                    exec_at(2, t - chrono::Duration::seconds(10)),
+                    exec_at(3, t),                                       // newest
+                    exec_at(1, t - jiff::SignedDuration::from_secs(20)), // oldest
+                    exec_at(2, t - jiff::SignedDuration::from_secs(10)),
                 ],
                 error: None,
             },
@@ -62770,7 +62990,7 @@ mod tests {
         // therefore reach this merge step twice under the SAME id -- the
         // source's live row and the target's staged copy. The default
         // listing must show it once, as the live row.
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let mut live = exec_at(1, t);
         live.state = "RUNNING".to_string();
         let mut staged = exec_at(1, t);
@@ -62792,7 +63012,7 @@ mod tests {
         // (excluded upstream). The target is the SOLE surviving copy, still
         // `MIGRATING`. It must not also be dropped here, or the execution
         // becomes invisible for as long as that window lasts.
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let mut staged = exec_at(1, t);
         staged.state = "MIGRATING".to_string();
         let obs = vec![ShardObservation {
@@ -62811,7 +63031,7 @@ mod tests {
         // An operator who explicitly asked for both states wants to see
         // both rows. This mirrors the diagnostic `state=MIGRATED` escape
         // hatch already preserved for the sealed-source case.
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let mut live = exec_at(1, t);
         live.state = "RUNNING".to_string();
         let mut staged = exec_at(1, t);
@@ -62831,13 +63051,13 @@ mod tests {
 
     #[test]
     fn build_stalled_fanout_truncates_and_names_down_shard_during_degradation() {
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let mut r_old = StalledWorkflowRow::from(exec_at(1, t));
-        r_old.last_event_at = Some(t - chrono::Duration::seconds(30)); // oldest stall
+        r_old.last_event_at = Some(t - jiff::SignedDuration::from_secs(30)); // oldest stall
         let mut r_mid = StalledWorkflowRow::from(exec_at(2, t));
-        r_mid.last_event_at = Some(t - chrono::Duration::seconds(20));
+        r_mid.last_event_at = Some(t - jiff::SignedDuration::from_secs(20));
         let mut r_new = StalledWorkflowRow::from(exec_at(3, t));
-        r_new.last_event_at = Some(t - chrono::Duration::seconds(10));
+        r_new.last_event_at = Some(t - jiff::SignedDuration::from_secs(10));
         let obs = vec![
             ShardObservation {
                 shard_id: 0,
@@ -62855,7 +63075,7 @@ mod tests {
         assert_eq!(page.rows.len(), 2);
         assert_eq!(
             page.rows[0].last_event_at,
-            Some(t - chrono::Duration::seconds(30))
+            Some(t - jiff::SignedDuration::from_secs(30))
         );
         assert!(page.rows[0].last_event_at <= page.rows[1].last_event_at);
         // (d) partial + shard 1 named.
@@ -62866,7 +63086,7 @@ mod tests {
 
     #[test]
     fn build_history_bloat_fanout_sorts_by_count_descending_and_names_down_shard() {
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let mut r_small = StalledWorkflowRow::from(exec_at(1, t));
         r_small.history_event_count = Some(50);
         let mut r_huge = StalledWorkflowRow::from(exec_at(2, t));
@@ -62898,7 +63118,7 @@ mod tests {
 
     #[test]
     fn build_history_bloat_fanout_ties_break_on_execution_id() {
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         // Two rows with the identical count but different ids — the merge must
         // be deterministic across repeated calls, not left to sort stability.
         let mut r_a = StalledWorkflowRow::from(exec_at(9, t));
@@ -62918,14 +63138,14 @@ mod tests {
 
     #[test]
     fn build_dead_letter_fanout_truncates_and_names_down_shard_during_degradation() {
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         let obs = vec![
             ShardObservation {
                 shard_id: 0,
                 rows: vec![
-                    dl_at(1, t - chrono::Duration::seconds(20)),
+                    dl_at(1, t - jiff::SignedDuration::from_secs(20)),
                     dl_at(3, t), // newest
-                    dl_at(2, t - chrono::Duration::seconds(10)),
+                    dl_at(2, t - jiff::SignedDuration::from_secs(10)),
                 ],
                 error: None,
             },
@@ -63247,9 +63467,9 @@ mod tests {
 
     #[test]
     fn circuit_cooldown_until_derives_an_absolute_deadline() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let at = circuit_cooldown_until(now, 30.0).expect("30s is representable");
-        assert_eq!((at - now).num_seconds(), 30);
+        assert_eq!((at - now).as_secs(), 30);
     }
 
     #[test]
@@ -63257,7 +63477,7 @@ mod tests {
         // A missing `cooldown_until` is already the documented shape for a
         // force-opened breaker, so degrading is never a lie. But it must never
         // panic or wrap.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e30] {
             assert!(
                 circuit_cooldown_until(now, bad).is_none(),
@@ -63282,7 +63502,7 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: None,
-            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            scheduled_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
@@ -63300,7 +63520,7 @@ mod tests {
         let mut b = base("dead-q");
         b.has_live_worker = false;
 
-        let reasons = contributing_reasons_for(&[a, b], chrono::Utc::now());
+        let reasons = contributing_reasons_for(&[a, b], jiff::Timestamp::now());
         assert!(
             reasons.iter().any(|r| r == "queue_paused"),
             "expected queue_paused in {reasons:?}"
@@ -63323,7 +63543,7 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: None,
-            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            scheduled_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: true,
@@ -63337,7 +63557,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts], chrono::Utc::now()),
+            contributing_reasons_for(&[facts], jiff::Timestamp::now()),
             [] as [std::string::String; 0]
         );
     }
@@ -63355,7 +63575,7 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: None,
-            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            scheduled_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
@@ -63369,7 +63589,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts], chrono::Utc::now()),
+            contributing_reasons_for(&[facts], jiff::Timestamp::now()),
             vec!["no_live_worker".to_string()]
         );
     }
@@ -63389,7 +63609,7 @@ mod tests {
             claimant_is_live: Some(true),
             attempt: 1,
             last_error: None,
-            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            scheduled_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
@@ -63405,7 +63625,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert!(
-            contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty(),
+            contributing_reasons_for(&[facts], jiff::Timestamp::now()).is_empty(),
             "a held row whose own claimant is alive is progressing; \
              reporting no_live_worker would contradict `healthy_in_progress`"
         );
@@ -63425,7 +63645,7 @@ mod tests {
             claimant_is_live: Some(false),
             attempt: 1,
             last_error: None,
-            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            scheduled_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
@@ -63440,7 +63660,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts], chrono::Utc::now()),
+            contributing_reasons_for(&[facts], jiff::Timestamp::now()),
             vec!["no_live_worker".to_string()],
             "an orphan held by a dead claimant must surface no_live_worker even \
              when a live Active peer covers the queue"
@@ -63454,7 +63674,7 @@ mod tests {
         // an organic trip whose cooldown clears by the row's own effective
         // dispatch instant. The reason codes must agree, or the response
         // contradicts its documented "currently holds" contract.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let facts = PendingActivityFacts {
             activity_name: Some("charge_card".to_string()),
             queue: "billing".to_string(),
@@ -63462,14 +63682,14 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: Some("boom".to_string()),
-            scheduled_at: now - chrono::Duration::seconds(10),
+            scheduled_at: now - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
             activity_paused: false,
             has_live_worker: true,
             circuit_phase: Some(BlockingCircuitPhase::Open),
-            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_cooldown_until: Some(now - jiff::SignedDuration::from_secs(1)),
             circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
@@ -63488,7 +63708,7 @@ mod tests {
         // The converse case: a cooldown that has not yet reached the
         // effective dispatch instant still fast-fails dispatch, so
         // `circuit_open` must still be reported.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let facts = PendingActivityFacts {
             activity_name: Some("charge_card".to_string()),
             queue: "billing".to_string(),
@@ -63496,14 +63716,14 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: Some("boom".to_string()),
-            scheduled_at: now - chrono::Duration::seconds(10),
+            scheduled_at: now - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
             activity_paused: false,
             has_live_worker: true,
             circuit_phase: Some(BlockingCircuitPhase::Open),
-            circuit_cooldown_until: Some(now + chrono::Duration::seconds(60)),
+            circuit_cooldown_until: Some(now + jiff::SignedDuration::from_secs(60)),
             circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
@@ -63522,7 +63742,7 @@ mod tests {
         // A forced-open breaker never admits a probe on a timer; only
         // `force-close` clears it. A stray `cooldown_until` must not exempt
         // it the way an organic trip's does.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let facts = PendingActivityFacts {
             activity_name: Some("charge_card".to_string()),
             queue: "billing".to_string(),
@@ -63530,14 +63750,14 @@ mod tests {
             claimant_is_live: None,
             attempt: 1,
             last_error: Some("boom".to_string()),
-            scheduled_at: now - chrono::Duration::seconds(10),
+            scheduled_at: now - jiff::SignedDuration::from_secs(10),
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
             activity_paused: false,
             has_live_worker: true,
             circuit_phase: Some(BlockingCircuitPhase::Open),
-            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_cooldown_until: Some(now - jiff::SignedDuration::from_secs(1)),
             circuit_forced_open: true,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,

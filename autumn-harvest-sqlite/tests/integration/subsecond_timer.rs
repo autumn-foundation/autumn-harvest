@@ -1,12 +1,12 @@
 //! Durable timer deadlines are stored at MILLISECOND precision (issue #1069), so a
 //! timer never fires before its true sub-second deadline.
 //!
-//! The drivers once passed `now.timestamp()` (whole seconds) into the arm
+//! The drivers once passed `now.as_second()` (whole seconds) into the arm
 //! calculation. That floored the arm instant before it added `duration_secs`. A
 //! timer armed at `…000.900` with duration `1s` stored `fire_at = …001`. A poll at
 //! `…001.001` then fired it after only ~100 ms, ~900 ms EARLY. That violated "a
 //! timer never resolves before its deadline". Milliseconds throughout keep the
-//! sub-second deadline: `now.timestamp_millis()` at the seam and
+//! sub-second deadline: `now.as_millisecond()` at the seam and
 //! `duration_secs * 1000` in the arm calculation. Every internal epoch value
 //! (`fire_at`, `received_at`, `run_at`) is in epoch milliseconds. So the comparison
 //! stays self-consistent with no DDL change.
@@ -15,7 +15,7 @@
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -50,7 +50,7 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     rt.register_workflow(&one_second_timer_info());
 
     // Arm at t0 = 3_000_000.900 s. The TRUE 1-second deadline is 3_000_001.900 s.
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 900_000_000).unwrap();
+    let t0: Timestamp = Timestamp::constant(3_000_000, 900_000_000);
     let exec = rt.start_workflow("one_second_timer", json!(0)).unwrap();
 
     // Drive 1 (at t0): arms the timer and blocks.
@@ -64,7 +64,7 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     // the floored `floor(t0) + 1` whole second (pre-fix that stored 3_000_001).
     assert_eq!(
         timer_fire_at(&path, exec),
-        t0.timestamp_millis() + 1000,
+        t0.as_millisecond() + 1000,
         "fire_at must be the true sub-second deadline (now_ms + 1000), not a floored second"
     );
 
@@ -73,7 +73,7 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     // With whole-second flooring, the deadline was 3_000_001 s. This poll at
     // 3_000_001 s fired it ~900 ms early and completed the run.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::milliseconds(100))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_millis(100))
         .await
         .unwrap();
     assert!(
@@ -85,7 +85,7 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     // Drive 3 at t0 + 1 s (= 3_000_001.900 s) — exactly the true deadline. Now it
     // fires and the run completes.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(1))
         .await
         .unwrap();
     assert!(
@@ -102,19 +102,19 @@ async fn whole_second_timer_still_fires_at_its_deadline() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&one_second_timer_info());
 
-    let t0: DateTime<Utc> = DateTime::from_timestamp(4_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(4_000_000).unwrap();
     let exec = rt.start_workflow("one_second_timer", json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
     assert_eq!(
         timer_fire_at(&path, exec),
-        t0.timestamp_millis() + 1000,
+        t0.as_millisecond() + 1000,
         "a whole-second arm stores a whole-second-millis deadline"
     );
 
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::milliseconds(999))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_millis(999))
         .await
         .unwrap();
     assert!(
@@ -123,7 +123,7 @@ async fn whole_second_timer_still_fires_at_its_deadline() {
     );
 
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(1))
         .await
         .unwrap();
     assert!(

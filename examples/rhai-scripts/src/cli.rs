@@ -14,7 +14,7 @@ use autumn_harvest::{ExecutionId, WorkflowEvent};
 use autumn_harvest_sqlite::{
     ExecutionFilter, LogFilter, RunState, SqliteError, SqliteReader, SqliteRuntime, StartOptions,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use smop::prelude::{Parser, Subcommand, clap};
 use std::io::Write as _;
@@ -264,7 +264,7 @@ async fn sleep_to_next_timer(db: &Path, exec: ExecutionId) -> Result<(), String>
     let Some(due) = pending.timers.iter().map(|t| t.fire_at).min() else {
         return Ok(());
     };
-    let left = (due - Utc::now()).to_std().unwrap_or_default();
+    let left = std::time::Duration::try_from(due - Timestamp::now()).unwrap_or_default();
     eprintln!("run {exec} sleeps for {:.1}s", left.as_secs_f64());
     tokio::time::sleep(left).await;
     Ok(())

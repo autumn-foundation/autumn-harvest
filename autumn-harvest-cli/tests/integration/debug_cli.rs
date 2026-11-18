@@ -23,7 +23,7 @@ use autumn_harvest_cli::debug::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn started() -> WorkflowEvent {
-    WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now())
+    WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now())
 }
 
 /// `[started, ActivityScheduled(charge), ActivityCompleted, SignalReceived(go)]`
@@ -663,7 +663,7 @@ fn activity_breakpoint_does_not_match_a_name_prefix() {
         "wf".to_string(),
         ExecutionId::new(),
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name: "step_ab".to_string(),

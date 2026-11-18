@@ -14,6 +14,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -31,10 +32,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -382,19 +383,19 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
 
 /// Anchor the execution's `started_at` to a fixed instant so timeline durations
 /// are deterministic relative to the events we seed below.
-async fn set_started_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: DateTime<Utc>) {
+async fn set_started_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: Timestamp) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::started_at.eq(at))
+        .set(harvest_workflow_executions::started_at.eq(at.to_diesel()))
         .execute(conn)
         .await
         .unwrap();
 }
 
-async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: DateTime<Utc>) {
+async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: Timestamp) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(at)),
+            harvest_workflow_executions::completed_at.eq(Some(at).to_diesel()),
             harvest_workflow_executions::output.eq(Some(json!({"ok": true}))),
         ))
         .execute(conn)
@@ -410,7 +411,7 @@ async fn insert_event(
     exec_id: ExecutionId,
     event_id: i32,
     event: &WorkflowEvent,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) {
     let data = serde_json::to_value(event).expect("event serializes");
     let event_type = data
@@ -424,7 +425,7 @@ async fn insert_event(
             harvest_events::event_id.eq(event_id),
             harvest_events::event_type.eq(event_type),
             harvest_events::event_data.eq(data),
-            harvest_events::timestamp.eq(at),
+            harvest_events::timestamp.eq(at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -481,7 +482,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(60);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(60);
     let exec_id = seed_running(&mut conn, "completed-timeline").await;
     set_started_at(&mut conn, exec_id, t0).await;
 
@@ -502,7 +503,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(10),
+        t0 + SignedDuration::from_secs(10),
     )
     .await;
     next += 1;
@@ -514,7 +515,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(12),
+        t0 + SignedDuration::from_secs(12),
     )
     .await;
     next += 1;
@@ -526,7 +527,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             activity_id: a1,
             output: Value::Null,
         },
-        t0 + Duration::seconds(20),
+        t0 + SignedDuration::from_secs(20),
     )
     .await;
     next += 1;
@@ -539,7 +540,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             timer_id: t1.clone(),
             duration_secs: 30,
         },
-        t0 + Duration::seconds(15),
+        t0 + SignedDuration::from_secs(15),
     )
     .await;
     next += 1;
@@ -548,11 +549,11 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
         exec_id,
         next,
         &WorkflowEvent::TimerFired { timer_id: t1 },
-        t0 + Duration::seconds(45),
+        t0 + SignedDuration::from_secs(45),
     )
     .await;
 
-    mark_completed(&mut conn, exec_id, t0 + Duration::seconds(50)).await;
+    mark_completed(&mut conn, exec_id, t0 + SignedDuration::from_secs(50)).await;
 
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -608,7 +609,7 @@ async fn timeline_running_open_step_is_pending() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(30);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(30);
     let exec_id = seed_running(&mut conn, "running-timeline").await;
     set_started_at(&mut conn, exec_id, t0).await;
 
@@ -624,7 +625,7 @@ async fn timeline_running_open_step_is_pending() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(5),
+        t0 + SignedDuration::from_secs(5),
     )
     .await;
     next += 1;
@@ -637,7 +638,7 @@ async fn timeline_running_open_step_is_pending() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(6),
+        t0 + SignedDuration::from_secs(6),
     )
     .await;
 
@@ -703,7 +704,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(30);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(30);
     // A unified DAG start creates a normal execution row (same as a workflow).
     let exec_id = seed_running(&mut conn, "unified-dag-run").await;
     set_started_at(&mut conn, exec_id, t0).await;
@@ -722,7 +723,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(2),
+        t0 + SignedDuration::from_secs(2),
     )
     .await;
     next += 1;
@@ -734,7 +735,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(3),
+        t0 + SignedDuration::from_secs(3),
     )
     .await;
     next += 1;
@@ -746,11 +747,11 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             activity_id: a1,
             output: Value::Null,
         },
-        t0 + Duration::seconds(9),
+        t0 + SignedDuration::from_secs(9),
     )
     .await;
 
-    mark_completed(&mut conn, exec_id, t0 + Duration::seconds(10)).await;
+    mark_completed(&mut conn, exec_id, t0 + SignedDuration::from_secs(10)).await;
 
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK, "unified DAG is a workflow: {body}");

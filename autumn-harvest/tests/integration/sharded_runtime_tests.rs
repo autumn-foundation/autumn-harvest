@@ -36,6 +36,7 @@ use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
+use jiff_diesel::ToDiesel;
 
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1574,17 +1575,17 @@ async fn per_shard_scheduler_ha_fires_each_slot_exactly_once_under_two_replicas(
     // Each round hands every shard a *fresh, distinct* past slot and clears any
     // held claim, then races two replicas at it. Distinct slots mean distinct
     // `sched:{id}:{name}:{slot}` workflow ids, so a duplicated fire is visible.
-    let anchor =
-        chrono::Utc::now() - chrono::Duration::hours(i64::try_from(ROUNDS).expect("fits") + 10);
+    let anchor = jiff::Timestamp::now()
+        - jiff::SignedDuration::from_hours(i64::try_from(ROUNDS).expect("fits") + 10);
     for round in 0..ROUNDS {
-        let slot = anchor + chrono::Duration::hours(i64::try_from(round).expect("fits"));
+        let slot = anchor + jiff::SignedDuration::from_hours(i64::try_from(round).expect("fits"));
         for (_, conn) in &mut conns {
             diesel::sql_query(
                 "UPDATE harvest_schedules \
                  SET next_run_at = $1, fire_claim_token = NULL, fire_claimed_until = NULL \
                  WHERE workflow_name = 'shard_probe'",
             )
-            .bind::<diesel::sql_types::Timestamptz, _>(slot)
+            .bind::<diesel::sql_types::Timestamptz, _>(slot.to_diesel())
             .execute(conn)
             .await
             .expect("backdate slot");
@@ -1743,8 +1744,8 @@ async fn timeout_scanner_enforces_on_every_assigned_shard() {
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.activity_name = Some("never_polled".to_string());
         params.activity_id = Some(uuid::Uuid::new_v4());
-        params.schedule_to_start = Some(chrono::Duration::seconds(1));
-        params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
+        params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
         let task_id = autumn_harvest::queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue expired task");

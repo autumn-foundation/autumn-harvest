@@ -10,7 +10,7 @@ use uuid::Uuid;
 fn test_update_validate_deadlock() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -51,7 +51,7 @@ fn test_update_validate_deadlock() {
 async fn test_update_handler_deadlock() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

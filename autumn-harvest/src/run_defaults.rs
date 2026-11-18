@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::activity_defaults::{ActivityDefaultFields, ActivityDefaultOverride, ActivityDefaults};
 use crate::concurrency::ConcurrencyPolicy;
@@ -296,9 +296,9 @@ pub struct RunDefaultOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Default)]
@@ -573,9 +573,10 @@ mod db {
     };
     use std::time::Duration;
 
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult};
 
@@ -602,8 +603,10 @@ mod db {
         retry_max_interval_ms: Option<i64>,
         reason: Option<String>,
         updated_by: String,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        updated_at: Timestamp,
     }
 
     impl OverrideRow {
@@ -829,7 +832,7 @@ mod db {
                     .map_err(crate::error::database_error)?;
                 return Ok(None);
             }
-            let now = Utc::now();
+            let now = Timestamp::now().to_diesel();
             let sla_secs = merged.sla.map(to_secs);
             let execution_timeout_secs = merged.execution_timeout.map(to_secs);
             let chain_execution_timeout_secs = merged.chain_execution_timeout.map(to_secs);
@@ -1385,8 +1388,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1910,8 +1913,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 

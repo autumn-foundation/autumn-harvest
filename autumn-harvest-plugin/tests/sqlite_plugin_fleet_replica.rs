@@ -634,14 +634,14 @@ async fn a_point_in_time_restore_takes_both_files_back() {
 
 /// Ship a run before a point in time and a run after it, then close the
 /// tenant. Returns the two runs and the point in time.
-async fn runs_around_a_target(a: &Host) -> (String, String, chrono::DateTime<chrono::Utc>) {
+async fn runs_around_a_target(a: &Host) -> (String, String, jiff::Timestamp) {
     let key = a.key();
     drop(a.harvest().open(&key).await.expect("open acme"));
     let kept = start(&a.client, true).await;
     waiting(&a.client, &kept).await;
     a.ship().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let target = chrono::Utc::now();
+    let target = jiff::Timestamp::now();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let later = start(&a.client, true).await;
     waiting(&a.client, &later).await;

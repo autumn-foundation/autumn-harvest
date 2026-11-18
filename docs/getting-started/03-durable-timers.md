@@ -165,7 +165,7 @@ snapshot in shared state — one builder call, no per-call DB read:
 // covers, so a resolution past the data's end fails loudly instead of quietly
 // answering weekends-only.
 let holidays = calendar::load_exclusions_for_calendar(&mut conn, "us-support").await?;
-let covers_through = NaiveDate::from_ymd_opt(2027, 12, 31).expect("valid date");
+let covers_through = jiff::civil::date(2027, 12, 31);
 
 let calendars = BusinessCalendars::new()
     .with_calendar_covering("us-support", holidays, covers_through);

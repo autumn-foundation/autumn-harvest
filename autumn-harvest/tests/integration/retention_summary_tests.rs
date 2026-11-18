@@ -26,6 +26,7 @@
 //! fresh testcontainers Postgres boots with the full migration bundle
 //! (`autumn_harvest::test_init_sql()`).
 
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,10 +36,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -127,12 +128,12 @@ async fn insert_completed_full(
     workflow_name: &str,
     workflow_id: &str,
     state: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
     output: Option<serde_json::Value>,
     error: Option<&str>,
     search_attrs: Option<serde_json::Value>,
 ) -> uuid::Uuid {
-    let started_at = completed_at - chrono::Duration::seconds(5);
+    let started_at = completed_at - jiff::SignedDuration::from_secs(5);
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (workflow_name, workflow_id, shard_id, state, input, output, error,
@@ -146,8 +147,8 @@ async fn insert_completed_full(
     .bind::<Nullable<Jsonb>, _>(output)
     .bind::<Nullable<Text>, _>(error)
     .bind::<Nullable<Jsonb>, _>(search_attrs)
-    .bind::<Timestamptz, _>(started_at)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(started_at.to_diesel())
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -169,7 +170,7 @@ async fn insert_completed(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
 ) -> uuid::Uuid {
     insert_completed_full(
         conn,
@@ -214,9 +215,9 @@ async fn insert_summary(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
 ) -> uuid::Uuid {
-    let started_at = completed_at - chrono::Duration::seconds(5);
+    let started_at = completed_at - jiff::SignedDuration::from_secs(5);
     diesel::sql_query(
         "INSERT INTO harvest_execution_summaries
             (execution_id, workflow_name, workflow_id, state, started_at,
@@ -227,8 +228,8 @@ async fn insert_summary(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(started_at)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(started_at.to_diesel())
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert summary")
@@ -377,7 +378,7 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     insert_completed(&mut conn, "wf", "w1", old).await;
 
     let config = history_only(Some(Duration::from_hours(24))); // summary: None
@@ -407,7 +408,7 @@ async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_targe
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed_full(
         &mut conn,
         "wf",
@@ -487,8 +488,8 @@ async fn migration_tombstone_preserves_a_still_live_childs_parent_id() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
-    let recent = Utc::now() - chrono::Duration::seconds(1);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
+    let recent = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     let parent = insert_completed(&mut conn, "parent_wf", "migrated-parent", old).await;
     diesel::sql_query(
@@ -541,7 +542,7 @@ async fn delete_demotes_into_a_summary_row() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed_full(
         &mut conn,
         "orders",
@@ -590,7 +591,7 @@ async fn payload_capture_stores_verbatim_and_marks_oversized() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let small_output = serde_json::json!({"ok": true, "n": 7});
     let small_id = insert_completed_full(
         &mut conn,
@@ -654,7 +655,7 @@ async fn offloaded_payload_is_marked_not_stored() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let envelope = serde_json::json!({
         "_harvest_offload_envelope": 1,
         "store_id": "s3",
@@ -698,11 +699,29 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // two old summaries of the same workflow, one young summary.
-    insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
-    insert_summary(&mut conn, "gc_wf", "g2", now - chrono::Duration::days(3)).await;
-    let young = insert_summary(&mut conn, "gc_wf", "g3", now - chrono::Duration::minutes(5)).await;
+    insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g1",
+        now - autumn_harvest::time::days(2),
+    )
+    .await;
+    insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g2",
+        now - autumn_harvest::time::days(3),
+    )
+    .await;
+    let young = insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g3",
+        now - jiff::SignedDuration::from_mins(5),
+    )
+    .await;
 
     // History horizon present (so the janitor spawns) + a 1-hour summary
     // horizon. No executions exist, so history phase deletes nothing.
@@ -731,14 +750,14 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
 
 /// Inserts a delivered fire (`outcome IS NULL`) for `source`, fired at
 /// `fired_at`.
-async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at: DateTime<Utc>) {
+async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at: Timestamp) {
     diesel::sql_query(
         "INSERT INTO harvest_completion_trigger_fires
             (source_exec_id, trigger_id, fired_at)
          VALUES ($1, gen_random_uuid(), $2)",
     )
     .bind::<diesel::sql_types::Uuid, _>(source)
-    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Timestamptz, _>(fired_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert fire");
@@ -746,17 +765,13 @@ async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at:
 
 /// Inserts a fire already resolved with `outcome`, for example
 /// `admission_blocked`.
-async fn insert_resolved_fire(
-    conn: &mut AsyncPgConnection,
-    fired_at: DateTime<Utc>,
-    outcome: &str,
-) {
+async fn insert_resolved_fire(conn: &mut AsyncPgConnection, fired_at: Timestamp, outcome: &str) {
     diesel::sql_query(
         "INSERT INTO harvest_completion_trigger_fires
             (source_exec_id, trigger_id, fired_at, outcome)
          VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2)",
     )
-    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Timestamptz, _>(fired_at.to_diesel())
     .bind::<Text, _>(outcome)
     .execute(conn)
     .await
@@ -802,17 +817,17 @@ async fn summary_gc_prunes_a_delivered_fire_past_the_horizon() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     insert_fire(
         &mut conn,
         uuid::Uuid::new_v4(),
-        now - chrono::Duration::days(2),
+        now - autumn_harvest::time::days(2),
     )
     .await;
     insert_fire(
         &mut conn,
         uuid::Uuid::new_v4(),
-        now - chrono::Duration::minutes(5),
+        now - jiff::SignedDuration::from_mins(5),
     )
     .await;
 
@@ -836,7 +851,12 @@ async fn summary_gc_keeps_a_fire_that_still_has_an_outbox_row() {
     scrub(&mut conn).await;
 
     let source = uuid::Uuid::new_v4();
-    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+    insert_fire(
+        &mut conn,
+        source,
+        Timestamp::now() - autumn_harvest::time::days(2),
+    )
+    .await;
     insert_outbox_for(&mut conn, source).await;
 
     run_one_tick(
@@ -863,10 +883,15 @@ async fn summary_gc_keeps_a_fire_whose_source_execution_still_exists() {
         &mut conn,
         "src",
         "s1",
-        Utc::now() - chrono::Duration::hours(2),
+        Timestamp::now() - jiff::SignedDuration::from_hours(2),
     )
     .await;
-    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+    insert_fire(
+        &mut conn,
+        source,
+        Timestamp::now() - autumn_harvest::time::days(2),
+    )
+    .await;
 
     run_one_tick(
         pool,
@@ -894,7 +919,7 @@ async fn fire_gc_is_off_without_a_summary_horizon() {
     insert_fire(
         &mut conn,
         uuid::Uuid::new_v4(),
-        Utc::now() - chrono::Duration::days(30),
+        Timestamp::now() - autumn_harvest::time::days(30),
     )
     .await;
 
@@ -915,7 +940,7 @@ async fn fire_gc_drains_several_batches() {
         let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
         scrub(&mut conn).await;
 
-        let old = Utc::now() - chrono::Duration::days(2);
+        let old = Timestamp::now() - autumn_harvest::time::days(2);
         for _ in 0..rows {
             insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
         }
@@ -940,12 +965,12 @@ async fn fire_gc_deletes_resolved_fires_and_keeps_only_pinned_rows() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     insert_resolved_fire(&mut conn, old, "admission_blocked").await;
     insert_resolved_fire(&mut conn, old, "payload_too_large").await;
     insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
     let pinned = uuid::Uuid::new_v4();
-    insert_fire(&mut conn, pinned, old - chrono::Duration::days(1)).await;
+    insert_fire(&mut conn, pinned, old - autumn_harvest::time::days(1)).await;
     insert_outbox_for(&mut conn, pinned).await;
 
     run_one_tick(
@@ -981,7 +1006,7 @@ async fn fire_gc_does_nothing_in_dry_run() {
     insert_fire(
         &mut conn,
         uuid::Uuid::new_v4(),
-        Utc::now() - chrono::Duration::days(2),
+        Timestamp::now() - autumn_harvest::time::days(2),
     )
     .await;
     let mut config = summary_gc_config();
@@ -1009,11 +1034,17 @@ async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // An ordinary old summary (GC-eligible) and a migration-target summary
     // just as old, carrying a payload (result/error/search_attrs). The
     // test also proves the payload gets stripped rather than left intact.
-    let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
+    let ordinary = insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g1",
+        now - autumn_harvest::time::days(2),
+    )
+    .await;
     let migrated_id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_execution_summaries
             (execution_id, workflow_name, workflow_id, state, started_at,
@@ -1024,7 +1055,7 @@ async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
                  '{\"tenant\":\"acme\"}'::jsonb)
          RETURNING execution_id AS id",
     )
-    .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
+    .bind::<Timestamptz, _>((now - autumn_harvest::time::days(2)).to_diesel())
     .get_result::<IdRow>(&mut conn)
     .await
     .expect("insert migration-target summary")
@@ -1081,9 +1112,21 @@ async fn unbounded_summary_retention_never_gcs() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    insert_summary(&mut conn, "keep", "k1", now - chrono::Duration::days(3650)).await;
-    insert_summary(&mut conn, "keep", "k2", now - chrono::Duration::days(1000)).await;
+    let now = Timestamp::now();
+    insert_summary(
+        &mut conn,
+        "keep",
+        "k1",
+        now - autumn_harvest::time::days(3650),
+    )
+    .await;
+    insert_summary(
+        &mut conn,
+        "keep",
+        "k2",
+        now - autumn_harvest::time::days(1000),
+    )
+    .await;
 
     let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::unbounded());
@@ -1111,7 +1154,7 @@ async fn erase_before_gc_summary_captures_tombstone() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed_full(
         &mut conn,
         "erase_wf",
@@ -1158,7 +1201,7 @@ async fn erase_after_gc_scrubs_the_summary() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed_full(
         &mut conn,
         "erase_after",
@@ -1318,7 +1361,7 @@ async fn erase_summary_only_scrubs_lingering_completion_callback_pii() {
 
     // A summarized execution: the summary row exists, the execution row does
     // not. Seed the summary directly.
-    let exec_id = insert_summary(&mut conn, "cb_wf", "cb1", Utc::now()).await;
+    let exec_id = insert_summary(&mut conn, "cb_wf", "cb1", Timestamp::now()).await;
 
     // The two lingering PII-bearing artifacts retention leaves behind, both
     // keyed to the (now-gone) execution id.
@@ -1387,7 +1430,7 @@ async fn erase_execution_exists_still_scrubs_callback_pii() {
         "cb_wf",
         "cb1",
         "COMPLETED",
-        Utc::now(),
+        Timestamp::now(),
         Some(serde_json::json!({"ssn": "123-45-6789"})),
         None,
         None,
@@ -1419,7 +1462,7 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed(&mut conn, "held_wf", "h1", old).await;
     // Place an indefinite legal hold.
     diesel::sql_query(
@@ -1475,7 +1518,7 @@ async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let exec_id = insert_completed(&mut conn, "staged_wf", "s1", old).await;
     // Seal it exactly as `stage_copy`'s vacate does: CONTINUED_AS_NEW with
     // the real prior state carried in `staging_vacated_state`.
@@ -1535,7 +1578,7 @@ async fn erase_parent_scrubs_a_demoted_child_summary() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let parent = insert_completed_full(
         &mut conn,
         "parent_wf",
@@ -1631,7 +1674,7 @@ async fn erase_parent_recurses_into_grandchild_summary() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     let parent = insert_completed_full(
         &mut conn,
         "gp_wf",

@@ -233,7 +233,7 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
         true,
         vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -455,7 +455,8 @@ mod db_tests {
         #[diesel(sql_type = Nullable<Text>)]
         sticky_worker_id: Option<String>,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        sticky_until: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        sticky_until: Option<jiff::Timestamp>,
     }
 
     async fn read_sticky(conn: &mut AsyncPgConnection, task_id: Uuid) -> StickyColumns {
@@ -500,7 +501,7 @@ mod db_tests {
         // Sanity: sticky_until must be in the future.
         let until = cols.sticky_until.unwrap();
         assert!(
-            until > chrono::Utc::now(),
+            until > jiff::Timestamp::now(),
             "AC#1: sticky_until={until:?} must be in the future"
         );
     }
@@ -686,7 +687,7 @@ mod db_tests {
         );
         let until = cols.sticky_until.unwrap();
         assert!(
-            until > chrono::Utc::now(),
+            until > jiff::Timestamp::now(),
             "AC#4: sticky_until={until:?} must be in the future after park"
         );
     }
@@ -756,7 +757,7 @@ mod db_tests {
         // would leave it 5 s in the past and fail this assertion.
         let until_after_wake = after.sticky_until.expect("sticky_until must survive wake");
         assert!(
-            until_after_wake > chrono::Utc::now(),
+            until_after_wake > jiff::Timestamp::now(),
             "AC#1: wake must refresh sticky_until to the future; got {until_after_wake:?}"
         );
     }

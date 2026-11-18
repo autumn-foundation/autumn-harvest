@@ -36,7 +36,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -98,8 +98,8 @@ struct Entry {
     timezone: String,
     is_paused: bool,
     pause_reason: Option<String>,
-    next_run_at: Option<DateTime<Utc>>,
-    last_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
+    last_run_at: Option<Timestamp>,
     max_active_runs: u32,
     catchup: bool,
     workflow_input: Value,
@@ -174,8 +174,11 @@ struct CreateBody {
     skip_policy: Option<String>,
     #[serde(default)]
     consecutive_failure_limit: Option<u32>,
-    #[serde(default)]
-    end_at: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    end_at: Option<Timestamp>,
     #[serde(default)]
     max_runs: Option<u32>,
     #[serde(default)]
@@ -835,7 +838,7 @@ async fn trigger_inner(
     let handle = state.handle()?;
     let stored = load_one(&handle, id).await?;
     let name = stored.workflow_name.clone();
-    let triggered_at = Utc::now();
+    let triggered_at = Timestamp::now();
     let outcome = handle
         .run(move |runtime| runtime.trigger_schedule(&name, force, overlap))
         .await

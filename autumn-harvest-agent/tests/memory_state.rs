@@ -17,7 +17,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest_agent::memory::MEMORY_TOOL;
 use autumn_harvest_agent::{
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::{Reply, ScriptedModel, answer, calls, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -215,11 +215,11 @@ async fn a_tick_without_memory_writes_cannot_edit_the_state_memory() {
             .memory(AgentMemory::State)
             .heartbeat(beat);
         let mut rt = runtime(&db, AgentHarness::new(model.clone()).agent(profile));
-        let start = Utc::now();
+        let start = Timestamp::now();
         sqlite::send(&mut rt, &agent(), &AgentOp::Control(Control::Resume), None).unwrap();
         let exec = sqlite::current_run(&rt, &agent()).unwrap().unwrap();
         rt.run_until_blocked_as_of(exec, start).await.unwrap();
-        let later = start + chrono::Duration::seconds(90);
+        let later = start + SignedDuration::from_secs(90);
         rt.run_until_blocked_as_of(exec, later).await.unwrap();
 
         let state = state_of(&rt, &agent()).await;

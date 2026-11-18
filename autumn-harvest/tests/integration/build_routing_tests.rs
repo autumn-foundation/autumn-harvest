@@ -111,7 +111,7 @@ fn empty_build_id_worker_cannot_claim_a_pinned_task() {
 #[test]
 fn empty_build_worker_is_flagged_only_on_queues_with_a_policy() {
     use autumn_harvest::build_routing::{BuildPolicy, empty_build_policy_queues};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = |queue: &str| BuildPolicy {
@@ -121,8 +121,8 @@ fn empty_build_worker_is_flagged_only_on_queues_with_a_policy() {
         deployment_name: None,
         target_build_id: None,
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
     let queues = vec!["default".to_string(), "bulk".to_string()];
     let policies = vec![policy("default"), policy("other")];
@@ -263,7 +263,7 @@ fn merge_reachability_empty_input_returns_empty() {
 fn ramp_percent_zero_always_resolves_to_base_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -273,8 +273,8 @@ fn ramp_percent_zero_always_resolves_to_base_build() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(0),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..500 {
@@ -287,7 +287,7 @@ fn ramp_percent_zero_always_resolves_to_base_build() {
 fn ramp_percent_hundred_always_resolves_to_target_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -297,8 +297,8 @@ fn ramp_percent_hundred_always_resolves_to_target_build() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(100),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..500 {
@@ -311,7 +311,7 @@ fn ramp_percent_hundred_always_resolves_to_target_build() {
 fn no_ramp_configured_resolves_to_base_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -321,8 +321,8 @@ fn no_ramp_configured_resolves_to_base_build() {
         deployment_name: None,
         target_build_id: None,
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..50 {
@@ -337,7 +337,7 @@ fn cleared_ramp_percent_with_stale_target_resolves_to_base() {
     // row. Clearing the percent alone stops new starts going to the target (AC6).
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -347,8 +347,8 @@ fn cleared_ramp_percent_with_stale_target_resolves_to_base() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..50 {
@@ -363,7 +363,7 @@ fn ramp_decision_is_deterministic_for_a_given_execution_id() {
     // (AC3). The decision must be a pure function of exec_id.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -373,8 +373,8 @@ fn ramp_decision_is_deterministic_for_a_given_execution_id() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(37),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..200 {
@@ -396,7 +396,7 @@ fn ramp_decision_differs_across_two_independent_policies_with_disjoint_targets()
     // must occur across many exec_ids.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -406,8 +406,8 @@ fn ramp_decision_differs_across_two_independent_policies_with_disjoint_targets()
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(50),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     let mut saw_base = false;
@@ -436,7 +436,7 @@ fn ramp_distribution_is_within_two_percentage_points_at_various_percents() {
     // configured percentage across a large sample of distinct new starts.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     for percent in [5_i32, 25, 50, 75, 95] {
@@ -447,8 +447,8 @@ fn ramp_distribution_is_within_two_percentage_points_at_various_percents() {
             deployment_name: None,
             target_build_id: Some("canary-v2".to_string()),
             ramp_percent: Some(percent),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
 
         let total = 10_000;

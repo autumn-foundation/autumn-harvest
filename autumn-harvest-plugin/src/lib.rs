@@ -37,6 +37,9 @@ pub mod aws_kms;
 /// share (issue #1613).
 mod boot;
 pub mod canary;
+/// The `chrono` values that the `autumn-web` API still takes.
+#[cfg(any(feature = "webhooks", feature = "sqlite"))]
+mod chrono_boundary;
 pub mod config;
 /// Broker event-source connectors for workflow triggers (issue #944).
 ///

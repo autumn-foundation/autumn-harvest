@@ -160,7 +160,7 @@ async fn a_worker_without_the_app_key_fails_the_key_and_not_silently() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = chrono::Utc::now() + chrono::Duration::minutes(minute);
+        let at = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(minute);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     let report: SampleReport = match state {

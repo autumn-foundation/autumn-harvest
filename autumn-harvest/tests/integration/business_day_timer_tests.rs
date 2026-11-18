@@ -43,10 +43,11 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
-use chrono::{DateTime, NaiveDate, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff::civil::Weekday;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -222,7 +223,7 @@ fn sla_flow_handler(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
             .timer_business_days("sla", n, &calendar)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!(deadline.to_rfc3339()))
+        Ok(serde_json::json!(autumn_harvest::time::rfc3339(deadline)))
     })
 }
 
@@ -281,7 +282,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -293,7 +294,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -319,11 +320,12 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
         .expect("reload workflow execution")
 }
 
-async fn timer_fires_at(url: &str, exec_id: ExecutionId) -> DateTime<Utc> {
+async fn timer_fires_at(url: &str, exec_id: ExecutionId) -> Timestamp {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        fires_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        fires_at: Timestamp,
     }
     let mut conn = connect(url).await;
     let rows: Vec<Row> = diesel::sql_query(
@@ -358,8 +360,8 @@ async fn wait_for_timer_started(url: &str, exec_id: ExecutionId, timeout: Durati
     .unwrap_or_else(|_| panic!("timer was never armed within {timeout:?}"));
 }
 
-const fn day(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+const fn day(y: i16, m: i8, d: i8) -> jiff::civil::Date {
+    jiff::civil::date(y, m, d)
 }
 
 /// The next `count` **weekdays** strictly after `from`.
@@ -376,15 +378,12 @@ const fn day(y: i32, m: u32, d: u32) -> NaiveDate {
 /// Weekday-only by construction. It is independent of
 /// `calendar::is_business_day`, so a broken production predicate cannot also
 /// break the fixture.
-fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
+fn next_weekdays_after(from: jiff::civil::Date, count: usize) -> Vec<jiff::civil::Date> {
     let mut out = Vec::with_capacity(count);
     let mut cursor = from;
     while out.len() < count {
-        cursor = cursor.succ_opt().expect("date in range");
-        if !matches!(
-            chrono::Datelike::weekday(&cursor),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ) {
+        cursor = cursor.tomorrow().expect("date in range");
+        if !matches!(cursor.weekday(), Weekday::Saturday | Weekday::Sunday) {
             out.push(cursor);
         }
     }
@@ -399,31 +398,27 @@ fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
 /// means "the anchor if it is a business instant, else the next business
 /// instant". The anchor's time-of-day is preserved.
 fn reference_business_deadline(
-    anchor: DateTime<Utc>,
+    anchor: Timestamp,
     n: u32,
-    holidays: &[NaiveDate],
-) -> DateTime<Utc> {
-    use chrono::{Datelike, Weekday};
-
-    let is_business = |d: NaiveDate| {
-        !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&d)
+    holidays: &[jiff::civil::Date],
+) -> Timestamp {
+    let is_business = |d: jiff::civil::Date| {
+        !matches!(d.weekday(), Weekday::Saturday | Weekday::Sunday) && !holidays.contains(&d)
     };
 
-    let start = anchor.date_naive();
+    let start = autumn_harvest::time::utc_date(anchor);
     // Candidate dates, in order, starting at the anchor's own date.
     let mut business_days_seen = 0_u32;
     for offset in 0..3_650_i64 {
-        let candidate = start + chrono::Duration::days(offset);
+        let candidate = start + autumn_harvest::time::days(offset);
         if !is_business(candidate) {
             continue;
         }
         // The anchor's own date counts as business day 0.
         if business_days_seen == n {
-            return candidate
-                .and_time(anchor.time())
-                .and_local_timezone(Utc)
-                .single()
-                .expect("UTC has no ambiguous local times");
+            let time = autumn_harvest::time::utc_datetime(anchor).time();
+            return autumn_harvest::time::from_utc_datetime(candidate.to_datetime(time))
+                .expect("the deadline is inside the jiff range");
         }
         business_days_seen += 1;
     }
@@ -460,7 +455,7 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     let mut conn = connect(&url).await;
 
     // Holidays sit RELATIVE to now and on WEEKDAYS (see `next_weekdays_after`).
-    let today = Utc::now().date_naive();
+    let today = autumn_harvest::time::utc_date(Timestamp::now());
     let holidays = next_weekdays_after(today, 2);
 
     let calendars = BusinessCalendars::new().with_calendar("biz", holidays.clone());
@@ -522,9 +517,9 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     // --- FALSIFIABLE CORRECTNESS, TO THE EXACT INSTANT --------------------
     let frozen = &side_effects[0].1;
     assert_eq!(frozen["outcome"], "resolved", "frozen record: {frozen}");
-    let anchor: DateTime<Utc> =
+    let anchor: Timestamp =
         serde_json::from_value(frozen["anchor"].clone()).expect("frozen anchor deserializes");
-    let deadline: DateTime<Utc> =
+    let deadline: Timestamp =
         serde_json::from_value(frozen["deadline"].clone()).expect("frozen deadline deserializes");
 
     // The anchor is "now" (the worker's real clock), so assert the resolution
@@ -549,16 +544,13 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     );
 
     // And the resolved date must not itself be a holiday or a weekend.
-    let landed = deadline.date_naive();
+    let landed = autumn_harvest::time::utc_date(deadline);
     assert!(
         !holidays.contains(&landed),
         "resolved deadline landed ON a holiday: {landed}"
     );
     assert!(
-        !matches!(
-            chrono::Datelike::weekday(&landed),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ),
+        !matches!(landed.weekday(), Weekday::Saturday | Weekday::Sunday),
         "resolved deadline landed on a weekend: {landed}"
     );
 
@@ -567,7 +559,7 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     // differ by the sub-second time it took the worker to persist, so allow a
     // small tolerance.
     let fires_at = timer_fires_at(&url, exec_id).await;
-    let skew = (fires_at - deadline).num_seconds().abs();
+    let skew = (fires_at - deadline).as_secs().abs();
     assert!(
         skew <= 5,
         "harvest_timers.fires_at ({fires_at}) must land on the resolved deadline \
@@ -593,7 +585,7 @@ async fn business_day_calendar_loaded_from_db_resolves() {
     let cal_name = format!("biz-{}", Uuid::new_v4());
 
     // Holidays sit relative to now and on weekdays (see `next_weekdays_after`).
-    let today = Utc::now().date_naive();
+    let today = autumn_harvest::time::utc_date(Timestamp::now());
     let holidays = next_weekdays_after(today, 2);
 
     // Seed a calendar + exclusions through the shipped DB helpers.
@@ -658,9 +650,9 @@ async fn business_day_calendar_loaded_from_db_resolves() {
 
     // The DB-sourced holidays must actually have been applied: resolving the
     // same anchor with no holidays must give a strictly earlier deadline.
-    let anchor: DateTime<Utc> =
+    let anchor: Timestamp =
         serde_json::from_value(frozen["anchor"].clone()).expect("frozen anchor deserializes");
-    let deadline: DateTime<Utc> =
+    let deadline: Timestamp =
         serde_json::from_value(frozen["deadline"].clone()).expect("frozen deadline deserializes");
     assert_eq!(
         deadline,

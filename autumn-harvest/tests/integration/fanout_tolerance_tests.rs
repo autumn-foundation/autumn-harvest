@@ -16,7 +16,7 @@ use autumn_harvest::fan_out::{
 };
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, WorkerId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ struct Drive {
 fn started(input: &Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

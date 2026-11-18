@@ -1,3 +1,5 @@
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -507,9 +509,9 @@ pub async fn sync_completion_triggers(
 ) -> crate::error::HarvestResult<()> {
     use crate::models::NewCompletionTriggerDb;
     use crate::schema::harvest_completion_triggers::dsl;
-    use chrono::Utc;
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
+    use jiff::Timestamp;
 
     let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
     let triggers = triggers.to_vec();
@@ -559,7 +561,7 @@ pub async fn sync_completion_triggers(
                     dsl::queue_name.eq(&db_row.queue_name),
                     dsl::is_static.eq(true),
                     dsl::condition.eq(&db_row.condition),
-                    dsl::updated_at.eq(Utc::now()),
+                    dsl::updated_at.eq(Timestamp::now().to_diesel()),
                 ))
                 .execute(tx)
                 .await
@@ -665,18 +667,18 @@ struct Ceilings {
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TargetRunDefaults {
-    execution_timeout: Option<chrono::Duration>,
-    chain_execution_timeout: Option<chrono::Duration>,
-    sla: Option<chrono::Duration>,
-    max_execution_timeout_ceiling: Option<chrono::Duration>,
-    max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    chain_execution_timeout: Option<jiff::SignedDuration>,
+    sla: Option<jiff::SignedDuration>,
+    max_execution_timeout_ceiling: Option<jiff::SignedDuration>,
+    max_workflow_chain_timeout_ceiling: Option<jiff::SignedDuration>,
 }
 
 /// Resolve the run defaults of one target type.
 ///
 /// An operator override in `cache` wins over each declared value (issues
-/// #2387 and #2406). A value past the `chrono` range drops out. A missing
-/// cache returns the declared values.
+/// #2387 and #2406). A value past the `jiff::SignedDuration` range drops
+/// out. A missing cache returns the declared values.
 #[cfg(feature = "db")]
 fn resolve_target_run_defaults(
     workflow_name: &str,
@@ -690,14 +692,14 @@ fn resolve_target_run_defaults(
     let chain = cache.map_or(declared.chain_execution_timeout, |c| {
         c.apply_chain(workflow_name, declared.chain_execution_timeout)
     });
-    let to_chrono =
-        |d: Option<std::time::Duration>| d.and_then(|d| chrono::Duration::from_std(d).ok());
+    let to_signed =
+        |d: Option<std::time::Duration>| d.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     TargetRunDefaults {
-        execution_timeout: to_chrono(execution_timeout),
-        chain_execution_timeout: to_chrono(chain),
-        sla: to_chrono(sla),
-        max_execution_timeout_ceiling: to_chrono(ceilings.execution_timeout),
-        max_workflow_chain_timeout_ceiling: to_chrono(ceilings.chain_timeout),
+        execution_timeout: to_signed(execution_timeout),
+        chain_execution_timeout: to_signed(chain),
+        sla: to_signed(sla),
+        max_execution_timeout_ceiling: to_signed(ceilings.execution_timeout),
+        max_workflow_chain_timeout_ceiling: to_signed(ceilings.chain_timeout),
     }
 }
 
@@ -998,15 +1000,15 @@ pub async fn resolve_cross_shard_target_queue(
 /// identically-named, identically-valued constant, kept separate per file
 /// purely for log/intent clarity.
 #[cfg(feature = "db")]
-const QUOTA_REDEFER_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+const QUOTA_REDEFER_BACKOFF: jiff::SignedDuration = jiff::SignedDuration::from_secs(5);
 
 /// Convert a whole-second backoff constant to `make_interval`'s fractional-
 /// seconds argument (issue #1392). Mirrors `queue::delay_secs`, which does
 /// the same conversion for the task queue's own DB-clock backoff writes.
 #[cfg(feature = "db")]
 #[allow(clippy::cast_precision_loss)] // whole-second constants never approach 2^53
-const fn backoff_secs(delay: chrono::Duration) -> f64 {
-    delay.num_seconds() as f64
+const fn backoff_secs(delay: jiff::SignedDuration) -> f64 {
+    delay.as_secs() as f64
 }
 
 /// Cap on the number of outbox rows `enforce_completion_triggers_outbox`
@@ -1183,7 +1185,7 @@ async fn relay_gate_checked_start(
     // reader.
     //
     // Compares against Postgres's own `NOW()`, not a host-sampled
-    // `chrono::Utc::now()` (issue #1392). Every replica's clock can drift
+    // `jiff::Timestamp::now()` (issue #1392). Every replica's clock can drift
     // from every other's. Every replica reads and writes this one deadline
     // against the same DB clock instead, so that drift cannot leak in.
     let outcome = Box::pin(source_conn
@@ -1515,7 +1517,9 @@ impl DeferredTriggerStart {
                 owner: self.owner.as_deref(),
                 runbook_url: self.runbook_url.as_deref(),
                 severity: self.severity.as_deref(),
-                sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+                sla: self
+                    .sla
+                    .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
                 workflow_retry_policy: self.retry_policy.clone(),
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 start_source: crate::types::StartSource::CompletionTrigger,
@@ -1964,7 +1968,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             // Issues #2387, #2406 and #2511: the target takes its declared
             // run defaults, any operator override and the fleet ceilings.
             let run_defaults = target_run_defaults(&trigger_db.target_workflow_name);
-            let target_sla = run_defaults.sla.and_then(|d| d.to_std().ok());
+            let target_sla = run_defaults.sla.and_then(|d| std::time::Duration::try_from(d).ok());
 
             // Issue #618: completion triggers are an in-process start producer and
             // MUST honour an active admission gate. This runs INSIDE the source
@@ -2469,7 +2473,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
 /// clears on infra recovery. Nothing depends on them staying numerically
 /// equal.
 #[cfg(feature = "db")]
-const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+const OUTBOX_RELAY_FAILURE_BACKOFF: jiff::SignedDuration = jiff::SignedDuration::from_secs(5);
 
 /// [`stamp_outbox_relay_backoff`]'s write, shared with its unit tests (issue
 /// #1392) so the pinned SQL text can never drift from what actually runs.
@@ -2635,7 +2639,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     let retry_limit = OUTBOX_CLAIM_BATCH_LIMIT
         - i64::try_from(pending_tasks.len()).unwrap_or(OUTBOX_CLAIM_BATCH_LIMIT);
     // Compares against Postgres's own `NOW()`, not a host-sampled
-    // `chrono::Utc::now()` (issue #1392). Eligibility then agrees with the
+    // `jiff::Timestamp::now()` (issue #1392). Eligibility then agrees with the
     // clock the backoff was stamped on, regardless of this replica's own
     // clock drift.
     let retry_rows = outbox_dsl::harvest_completion_trigger_outbox
@@ -4000,7 +4004,7 @@ mod tests {
     // These tests pin the generated SQL text. Every eligibility check
     // compares against Postgres's own `NOW()`. Every backoff write is
     // computed by Postgres's own `clock_timestamp()`, never a host-sampled
-    // `chrono::Utc::now()`.
+    // `jiff::Timestamp::now()`.
 
     #[cfg(feature = "db")]
     #[test]
@@ -4067,8 +4071,8 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
-    fn secs(s: i64) -> chrono::Duration {
-        chrono::Duration::seconds(s)
+    fn secs(s: i64) -> jiff::SignedDuration {
+        jiff::SignedDuration::from_secs(s)
     }
 
     /// With no override, a target takes its declared values.
@@ -4177,10 +4181,10 @@ mod tests {
         );
     }
 
-    /// A value past the `chrono` range drops out and never panics.
+    /// A value past the `jiff::SignedDuration` range drops out and never panics.
     #[cfg(feature = "db")]
     #[test]
-    fn a_target_drops_a_value_past_the_chrono_range() {
+    fn a_target_drops_a_value_past_the_signed_duration_range() {
         let got = resolve_target_run_defaults(
             "wf",
             TargetDeclared {

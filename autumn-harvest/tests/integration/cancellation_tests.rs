@@ -19,6 +19,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -426,7 +427,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some("racing cancel")),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut locker)
         .await

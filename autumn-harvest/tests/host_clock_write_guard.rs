@@ -5,8 +5,10 @@
 //! that runs ahead hides stuck work. These columns must take their value from
 //! the database clock, as in `queue::record_heartbeat`.
 //!
-//! The scan is textual. It finds `.eq(..Utc::now()..)` and `column: ..Utc::now()`
-//! in non-test code. It does not follow a value through a local variable.
+//! The scan is textual. It finds `.eq(..Timestamp::now()..)` and
+//! `column: ..Timestamp::now()` in non-test code. It also finds the `chrono`
+//! spelling `Utc::now`, which Harvest used before ADR 0018. It does not follow
+//! a value through a local variable.
 //!
 //! A deliberate host-clock write carries `host-clock-ok: <reason>` on the same
 //! line or the line above.
@@ -18,6 +20,9 @@ use std::path::{Path, PathBuf};
 const SCAN_COLUMNS: &[&str] = &["last_heartbeat_at", "scheduled_at", "schedule_to_close_at"];
 
 const MARKER: &str = "host-clock-ok:";
+
+/// Host clock reads: the jiff spelling and the older `chrono` spelling.
+const HOST_CLOCK_READS: &[&str] = &["Timestamp::now", "ZonedDateTime::now", "Utc::now"];
 
 /// Upper bound on the bytes that one write expression may span.
 const STATEMENT_WINDOW: usize = 300;
@@ -203,8 +208,8 @@ fn is_write_target(code: &str, column: &str, at: usize) -> bool {
 
 /// Return `(line, text)` for each violating write in `source`.
 ///
-/// A write is a scan column followed by `.eq(`, `:` or `=`, with `Utc::now`
-/// inside the same expression. The expression can span lines.
+/// A write is a scan column followed by `.eq(`, `:` or `=`, with a host clock
+/// read inside the same expression. The expression can span lines.
 fn violations(source: &str) -> Vec<(usize, String)> {
     // A Windows checkout uses CRLF. The offset arithmetic assumes one byte.
     let source = &source.replace("\r\n", "\n");
@@ -217,7 +222,7 @@ fn violations(source: &str) -> Vec<(usize, String)> {
                 continue;
             }
             let window = expression_after(&code, at + column.len());
-            if !window.contains("Utc::now") {
+            if !HOST_CLOCK_READS.iter().any(|read| window.contains(read)) {
                 continue;
             }
             let first = line_of(&code, at);
@@ -329,6 +334,23 @@ fn scanner_accepts_a_marked_write() {
 fn scanner_skips_the_test_module() {
     let source = "#[cfg(test)]\nmod tests {\n    dsl::scheduled_at.eq(Utc::now());\n}";
     assert_clean(source);
+}
+
+#[test]
+fn scanner_flags_a_jiff_clock_write() {
+    assert_eq!(
+        violations("dsl::scheduled_at.eq(Timestamp::now().to_diesel())").len(),
+        1
+    );
+    assert_eq!(
+        violations("x.set(dsl::last_heartbeat_at.eq(Some(jiff::Timestamp::now())));").len(),
+        1
+    );
+    assert_eq!(
+        violations("Row { schedule_to_close_at: Timestamp::now() + d, other: 1 }").len(),
+        1
+    );
+    assert_clean("let my_scheduled_at = Timestamp::now();");
 }
 
 #[test]
