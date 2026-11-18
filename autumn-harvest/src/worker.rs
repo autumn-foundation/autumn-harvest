@@ -57361,8 +57361,9 @@ mod tests {
         }
     }
 
-    /// A stored timeout past the jiff range gives a NULL successor deadline.
-    /// It does not panic the worker.
+    /// A stored timeout past the jiff range does not panic the worker. A
+    /// deadline that `chrono` held saturates to `Timestamp::MAX`. A deadline
+    /// past the `chrono` range is NULL.
     #[test]
     fn same_type_successor_with_a_huge_stored_timeout_has_no_deadline() {
         let mut execution = can803_predecessor();
@@ -57372,6 +57373,14 @@ mod tests {
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
         assert_eq!(defaults.execution_timeout, execution.execution_timeout);
+        assert_eq!(defaults.deadline_at, Some(jiff::Timestamp::MAX));
+        assert_eq!(defaults.sla_deadline_at, Some(jiff::Timestamp::MAX));
+
+        let past_chrono = jiff::SignedDuration::from_millis(i64::MAX);
+        execution.execution_timeout = Some(past_chrono);
+        execution.sla = Some(past_chrono);
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
         assert_eq!(defaults.deadline_at, None);
         assert_eq!(defaults.sla_deadline_at, None);
     }
