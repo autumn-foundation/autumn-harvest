@@ -5395,12 +5395,13 @@ pub struct TestRunOutcome {
 /// The virtual clock after `events`: `start_time` plus the fired timer time.
 fn virtual_now(start_time: Timestamp, events: &[WorkflowEvent]) -> Timestamp {
     let total_secs: u64 = fired_timer_duration_secs(events);
-    start_time
-        + jiff::SignedDuration::from_secs(
-            i64::try_from(total_secs)
-                .unwrap_or(i64::MAX / 1000)
-                .min(i64::MAX / 1000),
-        )
+    let delta = jiff::SignedDuration::from_secs(
+        i64::try_from(total_secs)
+            .unwrap_or(i64::MAX / 1000)
+            .min(i64::MAX / 1000),
+    );
+    // A far timer saturates, so a "wait forever" timer never panics.
+    crate::time::checked_add_chrono_range(start_time, delta).unwrap_or(Timestamp::MAX)
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -8129,6 +8130,18 @@ mod tests {
         WorkflowEvent::TimerCancelled {
             timer_id: TimerId::new(id),
         }
+    }
+
+    #[test]
+    fn virtual_now_saturates_a_fired_timer_past_the_jiff_range() {
+        let start = Timestamp::constant(1_700_000_000, 0);
+        let forever = [ts("forever", 400_000_000_000), tf("forever")];
+        assert_eq!(virtual_now(start, &forever), Timestamp::MAX);
+        let hour = [ts("hour", 3_600), tf("hour")];
+        assert_eq!(
+            virtual_now(start, &hour),
+            start + jiff::SignedDuration::from_hours(1)
+        );
     }
 
     #[test]

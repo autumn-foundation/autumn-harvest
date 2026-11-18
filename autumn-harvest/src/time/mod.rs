@@ -107,6 +107,21 @@ pub fn checked_add_chrono_range(at: Timestamp, duration: SignedDuration) -> Opti
     }
 }
 
+/// Splits `at` into whole seconds and nanoseconds, as `chrono` did.
+///
+/// `chrono` floored the seconds, so the fraction is never negative. jiff
+/// truncates both parts toward zero, so before 1970 its fraction is
+/// negative. An id that `chrono` built keeps its bytes through this split.
+#[must_use]
+pub fn chrono_split(at: Timestamp) -> (i64, u32) {
+    let nanos = at.subsec_nanosecond();
+    if nanos < 0 {
+        (at.as_second() - 1, (nanos + 1_000_000_000).unsigned_abs())
+    } else {
+        (at.as_second(), nanos.unsigned_abs())
+    }
+}
+
 /// Nanoseconds in one second.
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
@@ -359,6 +374,21 @@ mod tests {
         let late = Timestamp::new(1_700_000_000, 600_000_000).expect("in range");
         let over = SignedDuration::new(8_208_566_876_799, 700_000_000);
         assert_eq!(checked_add_chrono_range(late, over), None);
+    }
+
+    #[test]
+    fn chrono_split_floors_the_seconds_before_the_epoch() {
+        let half_before = Timestamp::new(0, -500_000_000).expect("in range");
+        assert_eq!(chrono_split(half_before), (-1, 500_000_000));
+        let earlier = Timestamp::new(-1, -750_000_000).expect("in range");
+        assert_eq!(chrono_split(earlier), (-2, 250_000_000));
+        assert_eq!(
+            chrono_split(Timestamp::new(-3, 0).expect("in range")),
+            (-3, 0)
+        );
+        let after = Timestamp::new(1_700_000_000, 5).expect("in range");
+        assert_eq!(chrono_split(after), (1_700_000_000, 5));
+        assert_eq!(chrono_split(Timestamp::MIN).1, 0);
     }
 
     #[test]

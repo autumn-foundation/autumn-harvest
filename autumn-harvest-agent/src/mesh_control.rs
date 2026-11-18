@@ -63,7 +63,8 @@ impl BudgetPeriod {
             }
             Self::Every { secs } => {
                 let len = i64::try_from(secs.max(1)).unwrap_or(i64::MAX);
-                let at = now.as_second();
+                // The floored second keeps `now` inside the window before 1970.
+                let at = time::chrono_split(now).0;
                 let start = at - at.rem_euclid(len);
                 let from = Timestamp::from_second(start).unwrap_or(now);
                 let until = Timestamp::from_second(start.saturating_add(len)).unwrap_or(now);
@@ -227,6 +228,15 @@ mod tests {
         let (start, end) = BudgetPeriod::Every { secs: 60 }.window(at("2026-10-23T17:05:30Z"));
         assert_eq!(start, at("2026-10-23T17:05:00Z"));
         assert_eq!(end, at("2026-10-23T17:06:00Z"));
+    }
+
+    #[test]
+    fn a_fixed_window_holds_a_fractional_instant_before_the_epoch() {
+        let now = at("1969-12-31T23:59:59.5Z");
+        let (start, end) = BudgetPeriod::Every { secs: 60 }.window(now);
+        assert_eq!(start, at("1969-12-31T23:59:00Z"));
+        assert_eq!(end, at("1970-01-01T00:00:00Z"));
+        assert!(start <= now && now < end);
     }
 
     #[test]

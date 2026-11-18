@@ -3868,19 +3868,27 @@ fn scheduled_workflow_id(
 ) -> String {
     // The id keeps the `chrono` split: floored seconds and a fraction that is
     // never negative. jiff truncates both parts toward zero before 1970.
-    let (seconds, nanos) = if scheduled_for.subsec_nanosecond() < 0 {
-        (
-            scheduled_for.as_second() - 1,
-            scheduled_for.subsec_nanosecond() + 1_000_000_000,
-        )
-    } else {
-        (scheduled_for.as_second(), scheduled_for.subsec_nanosecond())
-    };
+    let (seconds, nanos) = crate::time::chrono_split(scheduled_for);
     let micros = nanos / 1_000;
     if micros == 0 {
         format!("sched:{schedule_id}:{workflow_name}:{seconds}")
     } else {
         format!("sched:{schedule_id}:{workflow_name}:{seconds}.{micros:06}")
+    }
+}
+
+/// Returns the legacy scheduled workflow id, which has no schedule id.
+///
+/// A backfill precheck uses it to match a run that older code stored. The
+/// id keeps the `chrono` split, so it matches those stored ids byte for byte.
+#[must_use]
+pub fn legacy_scheduled_workflow_id(name: &str, scheduled_for: Timestamp) -> String {
+    let (seconds, nanos) = crate::time::chrono_split(scheduled_for);
+    let micros = nanos / 1_000;
+    if micros == 0 {
+        format!("sched:{name}:{seconds}")
+    } else {
+        format!("sched:{name}:{seconds}.{micros:06}")
     }
 }
 
@@ -10813,6 +10821,25 @@ mod tests {
         assert_eq!(
             scheduled_workflow_id_pub(id, "wf", fraction),
             scheduled_workflow_id(id, "wf", fraction)
+        );
+    }
+
+    #[test]
+    fn both_scheduled_ids_keep_the_chrono_split_before_the_epoch() {
+        let id = uuid::Uuid::nil();
+        let half_before = Timestamp::new(0, -500_000_000).expect("in range");
+        assert_eq!(
+            scheduled_workflow_id(id, "wf", half_before),
+            format!("sched:{id}:wf:-1.500000")
+        );
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", half_before),
+            "sched:wf:-1.500000"
+        );
+        let earlier = Timestamp::new(-1, -750_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", earlier),
+            "sched:wf:-2.250000"
         );
     }
 

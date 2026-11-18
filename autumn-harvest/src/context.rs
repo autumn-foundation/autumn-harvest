@@ -4634,7 +4634,9 @@ impl WorkflowContext {
                     .unwrap_or(i64::MAX / 1000)
                     .min(i64::MAX / 1000),
             );
-            return self.start_time + delta;
+            // A far timer saturates, so a "wait forever" timer never panics.
+            return crate::time::checked_add_chrono_range(self.start_time, delta)
+                .unwrap_or(Timestamp::MAX);
         }
         self.start_time
     }
@@ -5327,7 +5329,9 @@ impl WorkflowContext {
                     .unwrap_or(i64::MAX / 1000)
                     .min(i64::MAX / 1000),
             );
-            return (self.start_time + delta).as_millisecond();
+            return crate::time::checked_add_chrono_range(self.start_time, delta)
+                .unwrap_or(Timestamp::MAX)
+                .as_millisecond();
         }
         Timestamp::now().as_millisecond()
     }

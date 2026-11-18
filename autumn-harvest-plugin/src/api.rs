@@ -111,9 +111,10 @@ use autumn_harvest::schedule_override::{self, ScheduleOverridePatch};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowOverrideRequest,
-    WorkflowSchedulePatch, ensure_dag_schedule, parse_schedule_from_expr_pub,
-    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
-    update_code_declared_workflow_schedule, update_workflow_schedule_with_codecs,
+    WorkflowSchedulePatch, ensure_dag_schedule, legacy_scheduled_workflow_id,
+    parse_schedule_from_expr_pub, plan_backfill_timestamps, scheduled_workflow_id_pub,
+    trigger_unified_dag, update_code_declared_workflow_schedule,
+    update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -28793,7 +28794,21 @@ pub(crate) fn effective_fire_time(
     }
     let jitter_window = std::time::Duration::from_secs(jitter_secs.cast_unsigned());
     let offset = compute_jitter_offset(schedule_id, t, jitter_window);
-    jiff::SignedDuration::try_from(offset).ok().map(|d| t + d)
+    add_jitter_offset(t, offset)
+}
+
+/// Adds a jitter offset to a fire time, as the `chrono` sum did.
+///
+/// An offset past the `chrono` duration range gives `None`. A stored fire
+/// time can read back as [`jiff::Timestamp::MAX`]. A sum past the jiff range
+/// saturates to that value, so a far fire time stays far and never panics.
+pub(crate) fn add_jitter_offset(
+    t: jiff::Timestamp,
+    offset: std::time::Duration,
+) -> Option<jiff::Timestamp> {
+    autumn_harvest::time::from_std_bounded(offset).map(|d| {
+        autumn_harvest::time::checked_add_chrono_range(t, d).unwrap_or(jiff::Timestamp::MAX)
+    })
 }
 
 /// Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
@@ -33079,19 +33094,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // Use original_slot (pre-calendar-rebase) for ID so that two distinct
                 // logical slots that calendar-adjust to the same fire_time do not collide.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &wf_name, *original_slot);
-                let legacy_workflow_id = {
-                    let micros = original_slot.subsec_microsecond();
-                    if micros == 0 {
-                        format!("sched:{}:{}", wf_name, original_slot.as_second())
-                    } else {
-                        format!(
-                            "sched:{}:{}.{:06}",
-                            wf_name,
-                            original_slot.as_second(),
-                            micros
-                        )
-                    }
-                };
+                let legacy_workflow_id = legacy_scheduled_workflow_id(&wf_name, *original_slot);
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
@@ -33649,19 +33652,7 @@ pub(crate) async fn schedule_backfill_inner(
                 };
                 // Use original_slot for ID, same as the workflow path above.
                 let workflow_id = scheduled_workflow_id_pub(schedule_id, &dag_name, *original_slot);
-                let legacy_workflow_id = {
-                    let micros = original_slot.subsec_microsecond();
-                    if micros == 0 {
-                        format!("sched:{}:{}", dag_name, original_slot.as_second())
-                    } else {
-                        format!(
-                            "sched:{}:{}.{:06}",
-                            dag_name,
-                            original_slot.as_second(),
-                            micros
-                        )
-                    }
-                };
+                let legacy_workflow_id = legacy_scheduled_workflow_id(&dag_name, *original_slot);
                 let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard_id);
                 let dag_queue = schedule
                     .queue_name
@@ -34089,14 +34080,7 @@ async fn count_existing_in_window(
                 .collect();
             let legacy_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| {
-                    let micros = ts.subsec_microsecond();
-                    if micros == 0 {
-                        format!("sched:{}:{}", name, ts.as_second())
-                    } else {
-                        format!("sched:{}:{}.{:06}", name, ts.as_second(), micros)
-                    }
-                })
+                .map(|ts| legacy_scheduled_workflow_id(name, *ts))
                 .collect();
             workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
@@ -34120,14 +34104,7 @@ async fn count_existing_in_window(
                 .collect();
             let legacy_ids: Vec<String> = timestamps
                 .iter()
-                .map(|ts| {
-                    let micros = ts.subsec_microsecond();
-                    if micros == 0 {
-                        format!("sched:{}:{}", name, ts.as_second())
-                    } else {
-                        format!("sched:{}:{}.{:06}", name, ts.as_second(), micros)
-                    }
-                })
+                .map(|ts| legacy_scheduled_workflow_id(name, *ts))
                 .collect();
             workflow_ids.extend(legacy_ids);
             for (_, shard_pool) in pool.iter_shards() {
@@ -49896,8 +49873,8 @@ pub(crate) async fn compute_schedule_preview_for(
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_window);
-                if let Ok(d) = jiff::SignedDuration::try_from(offset) {
-                    entry.effective_at = Some(t + d);
+                if let Some(jittered) = add_jitter_offset(t, offset) {
+                    entry.effective_at = Some(jittered);
                 }
             }
         }
@@ -50078,8 +50055,8 @@ async fn preview_candidate_schedule_handler(
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
-                if let Ok(d) = jiff::SignedDuration::try_from(offset) {
-                    entry.effective_at = Some(t + d);
+                if let Some(jittered) = add_jitter_offset(t, offset) {
+                    entry.effective_at = Some(jittered);
                 }
             }
         }
@@ -60193,6 +60170,39 @@ mod tests {
         assert!(fire >= end_at, "the fixture needs jitter past the end");
         let report = build_herd_report(&[row], herd_epoch(), herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 0, "the scheduler never dispatches this slot");
+    }
+
+    #[test]
+    fn a_jittered_fire_time_at_the_end_of_the_range_saturates() {
+        let row = herd_row(1, "far", "cron:0 * * * *");
+        let fire = effective_fire_time(row.id, Some(jiff::Timestamp::MAX), 3_600);
+        assert_eq!(fire, Some(jiff::Timestamp::MAX));
+        let one_second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            add_jitter_offset(jiff::Timestamp::MAX, one_second),
+            Some(jiff::Timestamp::MAX)
+        );
+        let late = jiff::Timestamp::MAX - jiff::SignedDuration::from_secs(10);
+        let year = std::time::Duration::from_hours(8_760);
+        assert_eq!(add_jitter_offset(late, year), Some(jiff::Timestamp::MAX));
+        let near = herd_epoch() + jiff::SignedDuration::from_secs(1);
+        assert_eq!(add_jitter_offset(herd_epoch(), one_second), Some(near));
+    }
+
+    #[test]
+    fn the_legacy_backfill_id_keeps_the_chrono_split_before_the_epoch() {
+        let half_before = jiff::Timestamp::new(0, -500_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", half_before),
+            "sched:wf:-1.500000"
+        );
+        let earlier = jiff::Timestamp::new(-1, -750_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", earlier),
+            "sched:wf:-2.250000"
+        );
+        let whole = jiff::Timestamp::new(-60, 0).expect("in range");
+        assert_eq!(legacy_scheduled_workflow_id("wf", whole), "sched:wf:-60");
     }
 
     #[test]

@@ -4316,10 +4316,7 @@ async fn cancel_workflow_execution_collect_mode(
             let new_sla_deadline_at = if prior_state == "PAUSED" {
                 execution
                     .sla_deadline_at
-                    .map(|d| match execution.paused_at {
-                        Some(p) if d > p => d + (completed_at - p).max(jiff::SignedDuration::ZERO),
-                        _ => d,
-                    })
+                    .map(|d| shift_sla_for_pause(d, execution.paused_at, completed_at))
             } else {
                 execution.sla_deadline_at
             };
@@ -5729,6 +5726,18 @@ struct ResumeDeadlineShifts {
     new_sla_deadline_at: Option<jiff::Timestamp>,
 }
 
+/// Returns the latest `paused_at` that the auto-resume scan resumes.
+///
+/// A ceiling past the `chrono` duration range gives `None`, as `from_std`
+/// did. A cutoff before the jiff range also gives `None`. No stored
+/// `paused_at` is that early, so the scan resumes nothing and never panics.
+fn auto_resume_cutoff(
+    now: jiff::Timestamp,
+    max_pause_duration: std::time::Duration,
+) -> Option<jiff::Timestamp> {
+    crate::time::from_std_bounded(max_pause_duration).and_then(|max| now.checked_sub(max).ok())
+}
+
 /// Pure resume-time deadline arithmetic (issues #243/#487 × #383).
 fn resume_deadline_shifts(
     execution: &WorkflowExecution,
@@ -5761,16 +5770,36 @@ fn resume_deadline_shifts(
     // after resume. It is not silently pushed into the future.
     let new_sla_deadline_at = execution
         .sla_deadline_at
-        .map(|d| match execution.paused_at {
-            Some(p) if d > p => d.checked_add(pause_span).unwrap_or(jiff::Timestamp::MAX),
-            _ => d,
-        });
+        .map(|d| shift_sla_for_pause(d, execution.paused_at, resumed_at));
 
     ResumeDeadlineShifts {
         pause_span,
         pause_duration_secs,
         new_deadline_at,
         new_sla_deadline_at,
+    }
+}
+
+/// Pushes a soft SLA deadline forward by the time a run spent paused.
+///
+/// Resume, cancel and terminate share this rule (issues #383 and #487). Only
+/// a deadline that was still ahead at `paused_at` moves. A clock skew can
+/// put `paused_at` after `at`, so the pause span is never negative. A stored
+/// deadline can read back as [`jiff::Timestamp::MAX`]. A shift past the jiff
+/// range saturates to that value, so the deadline stays "not due".
+fn shift_sla_for_pause(
+    sla_deadline_at: jiff::Timestamp,
+    paused_at: Option<jiff::Timestamp>,
+    at: jiff::Timestamp,
+) -> jiff::Timestamp {
+    match paused_at {
+        Some(p) if sla_deadline_at > p => {
+            let pause_span = (at - p).max(SignedDuration::ZERO);
+            sla_deadline_at
+                .checked_add(pause_span)
+                .unwrap_or(jiff::Timestamp::MAX)
+        }
+        _ => sla_deadline_at,
     }
 }
 
@@ -6361,12 +6390,9 @@ pub async fn auto_resume_expired_pauses(
     max_pause_duration: std::time::Duration,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
-    let now = Timestamp::now();
-    // Ceiling too large to represent: nothing can exceed it.
-    let Ok(max) = jiff::SignedDuration::try_from(max_pause_duration) else {
+    let Some(cutoff) = auto_resume_cutoff(Timestamp::now(), max_pause_duration) else {
         return Ok(0);
     };
-    let cutoff = now - max;
 
     let expired: Vec<ExecutionId> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::state.eq("PAUSED"))
@@ -6776,10 +6802,7 @@ pub async fn terminate_workflow_execution_collect(
             let new_sla_deadline_at = if execution.state == "PAUSED" {
                 execution
                     .sla_deadline_at
-                    .map(|d| match execution.paused_at {
-                        Some(p) if d > p => d + (completed_at - p).max(jiff::SignedDuration::ZERO),
-                        _ => d,
-                    })
+                    .map(|d| shift_sla_for_pause(d, execution.paused_at, completed_at))
             } else {
                 execution.sla_deadline_at
             };
@@ -10839,9 +10862,10 @@ mod non_terminal_sql_tests {
 #[cfg(test)]
 mod pause_helper_tests {
     use super::{
-        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded,
-        resume_deadline_shifts, shift_external_schedule_to_close_on_resume_query,
-        shift_schedule_to_close_on_resume_query,
+        MAX_PAUSE_SHIFT_MICROS, auto_resume_cutoff, clamped_pause_shift_micros,
+        pause_timeout_exceeded, resume_deadline_shifts,
+        shift_external_schedule_to_close_on_resume_query, shift_schedule_to_close_on_resume_query,
+        shift_sla_for_pause,
     };
     use jiff::{SignedDuration, Timestamp};
     use std::time::Duration;
@@ -10891,6 +10915,47 @@ mod pause_helper_tests {
         assert_eq!(shifts.pause_span, SignedDuration::from_hours(1));
         assert_eq!(shifts.new_deadline_at, Some(jiff::Timestamp::MAX));
         assert_eq!(shifts.new_sla_deadline_at, Some(jiff::Timestamp::MAX));
+    }
+
+    /// Cancel and terminate of a paused run shift a saturated SLA deadline.
+    /// The shift keeps it at `MAX` and does not panic.
+    #[test]
+    fn pause_shift_saturates_a_saturated_sla_deadline() {
+        let at = Timestamp::constant(1_700_000_000, 0);
+        let paused_at = Some(at - SignedDuration::from_hours(1));
+        // Postgres keeps microseconds, so a stored `MAX` reads back 999 ns early.
+        let stored_max = Timestamp::MAX - SignedDuration::from_nanos(999);
+        assert_eq!(
+            shift_sla_for_pause(stored_max, paused_at, at),
+            Timestamp::MAX
+        );
+        assert_eq!(
+            shift_sla_for_pause(Timestamp::MAX, paused_at, at),
+            Timestamp::MAX
+        );
+        let ahead = at + SignedDuration::from_hours(2);
+        assert_eq!(
+            shift_sla_for_pause(ahead, paused_at, at),
+            ahead + SignedDuration::from_hours(1)
+        );
+        let elapsed = at - SignedDuration::from_hours(2);
+        assert_eq!(shift_sla_for_pause(elapsed, paused_at, at), elapsed);
+        assert_eq!(shift_sla_for_pause(ahead, None, at), ahead);
+    }
+
+    /// A ceiling that `chrono` held, or refused, resumes nothing and does
+    /// not panic.
+    #[test]
+    fn auto_resume_cutoff_is_none_for_a_ceiling_past_the_jiff_range() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let hour = Duration::from_secs(3_600);
+        assert_eq!(
+            auto_resume_cutoff(now, hour),
+            Some(now - SignedDuration::from_hours(1))
+        );
+        let far = Duration::from_secs(1_000_000_000_000);
+        assert_eq!(auto_resume_cutoff(now, far), None);
+        assert_eq!(auto_resume_cutoff(now, Duration::MAX), None);
     }
 
     #[test]

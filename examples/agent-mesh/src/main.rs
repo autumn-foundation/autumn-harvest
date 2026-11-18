@@ -100,7 +100,14 @@ fn now(desk: &Desk) -> Timestamp {
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    Timestamp::now() + SignedDuration::from_mins(offset)
+    moved_clock(Timestamp::now(), offset)
+}
+
+/// Moves `base` on by `offset_mins` minutes. A far offset saturates, so the
+/// desk stays usable.
+fn moved_clock(base: Timestamp, offset_mins: i64) -> Timestamp {
+    autumn_harvest::time::checked_add_chrono_range(base, SignedDuration::from_mins(offset_mins))
+        .unwrap_or(Timestamp::MAX)
 }
 
 fn move_clock(desk: &Desk, minutes: i64) -> std::io::Result<()> {
@@ -293,5 +300,17 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_far_desk_clock_offset_saturates() {
+        let base = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(moved_clock(base, 5_000_000_000), Timestamp::MAX);
+        assert_eq!(moved_clock(base, 60), base + SignedDuration::from_hours(1));
     }
 }

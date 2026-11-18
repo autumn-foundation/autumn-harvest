@@ -203,7 +203,11 @@ pub fn forecast_shifted(
                 continue;
             }
             fires += 1;
-            let key = start.as_millisecond().div_euclid(width);
+            // The bucket key floors the millisecond, as `chrono` did. A
+            // truncated key puts a fire before 1970 in the next bucket.
+            let (seconds, nanos) = crate::time::chrono_split(start);
+            let millis = seconds * 1_000 + i64::from(nanos / 1_000_000);
+            let key = millis.div_euclid(width);
             let members = buckets.entry(key).or_default();
             if members.last() != Some(&index) {
                 members.push(index);
@@ -291,6 +295,26 @@ mod tests {
         assert_eq!(times, vec![at(0), at(HOUR), at(2 * HOUR)]);
         assert!(report.spots.iter().all(|s| s.schedules == ["a", "b"]));
         assert_eq!(report.peak().map(super::HerdSpot::size), Some(2));
+    }
+
+    /// A start before 1970 with a sub-millisecond fraction goes into the
+    /// bucket that holds it, as `chrono` did.
+    #[test]
+    fn a_fractional_start_before_the_epoch_keeps_its_bucket() {
+        let a = cron("* * * * *");
+        let b = cron("* * * * *");
+        let report = forecast_shifted(
+            &[("a", &a), ("b", &b)],
+            at(-120),
+            at(0),
+            Duration::from_secs(1),
+            2,
+            Duration::ZERO,
+            |_, slot| Fire::Start(slot - jiff::SignedDuration::from_micros(500)),
+        );
+        assert_eq!(report.fires, 2);
+        let times: Vec<_> = report.spots.iter().map(|s| s.at).collect();
+        assert_eq!(times, vec![at(-61)]);
     }
 
     #[test]
