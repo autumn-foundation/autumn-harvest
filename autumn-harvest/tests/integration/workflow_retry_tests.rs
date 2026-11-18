@@ -1621,8 +1621,8 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     assert_eq!(get_attempt(&mut check, retry_exec).await, 2);
 
     let (retry_timeout, retry_deadline): (
-        Option<jiff::SignedDuration>,
-        Option<jiff::Timestamp>,
+        Option<autumn_harvest::time::sql::PgDuration>,
+        Option<autumn_harvest::time::sql::SqlTimestamp>,
     ) = harvest_workflow_executions::table
         .find(retry_exec.as_uuid())
         .select((
@@ -1632,6 +1632,9 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
         .first(&mut check)
         .await
         .expect("load retry chain columns");
+    let retry_timeout = retry_timeout.map(jiff::SignedDuration::from);
+    let retry_deadline = retry_deadline.map(autumn_harvest::time::sql::SqlTimestamp::to_jiff);
+
 
     assert_eq!(
         retry_timeout,
@@ -1639,7 +1642,7 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
         "the retry carries the chain-cap DURATION"
     );
     let dl = retry_deadline.expect("retry chain deadline must be set");
-    let delta = autumn_harvest::time::num_milliseconds((dl - origin_chain_deadline)).abs();
+    let delta = autumn_harvest::time::num_milliseconds(dl - origin_chain_deadline).abs();
     assert!(
         delta < 1000,
         "the retry's chain_deadline_at must equal the origin's ABSOLUTE value \

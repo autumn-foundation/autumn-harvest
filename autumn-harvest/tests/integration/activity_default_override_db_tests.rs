@@ -605,7 +605,7 @@ fn stored(row: &TaskQueueItem) -> (i32, Duration, Duration, Duration, Duration, 
     // The worker clock sets the deadline and the database clock sets
     // `created_at`. Round to 10 seconds, which is far below the 600 s gap
     // between the code value and the override.
-    let millis = autumn_harvest::time::num_milliseconds((row.schedule_to_close_at.expect("a deadline") - created))
+    let millis = autumn_harvest::time::num_milliseconds(row.schedule_to_close_at.expect("a deadline") - created)
         .max(0)
         .unsigned_abs();
     let to_close = Duration::from_secs((millis + 5_000) / 10_000 * 10);

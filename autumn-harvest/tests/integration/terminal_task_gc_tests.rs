@@ -159,7 +159,7 @@ async fn insert_activity_rows(
          FROM generate_series(1, $3)",
     )
     .bind::<Text, _>(state)
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<BigInt, _>(count)
     .execute(conn)
     .await
@@ -215,7 +215,7 @@ async fn insert_task_for(
     .bind::<Text, _>(task_type)
     .bind::<SqlUuid, _>(exec_id)
     .bind::<Text, _>(state)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert task")

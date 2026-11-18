@@ -622,7 +622,7 @@ async fn db_clock(conn: &mut AsyncPgConnection) -> jiff::Timestamp {
     #[derive(diesel::QueryableByName)]
     struct Now {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         now: jiff::Timestamp,
     }
     diesel::sql_query("SELECT clock_timestamp() AS now")

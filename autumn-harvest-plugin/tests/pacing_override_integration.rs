@@ -26,6 +26,7 @@
 //! migrated database to run directly with `--test-threads=1`. Otherwise a
 //! fresh testcontainers Postgres boots with the full migration set.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -349,13 +350,13 @@ async fn delete_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 /// tolerance prove the two reads agree on the expiry.
 fn assert_close_instant(a: Option<&str>, b: Option<&str>, msg: &str) {
     let parse = |s: &str| {
-        s.parse::<Timestamp>()
+        s.parse::<jiff::Timestamp>()
             .unwrap_or_else(|e| panic!("{msg}: failed to parse {s:?}: {e}"))
     };
     match (a, b) {
         (Some(a), Some(b)) => {
             let (ta, tb) = (parse(a), parse(b));
-            let delta_ms = autumn_harvest::time::num_milliseconds((ta - tb)).abs();
+            let delta_ms = autumn_harvest::time::num_milliseconds(ta - tb).abs();
             assert!(
                 delta_ms < 1000,
                 "{msg}: {a} and {b} differ by {delta_ms}ms (expected sub-second precision drift only)"
@@ -1405,7 +1406,7 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
     assert_eq!(status, StatusCode::OK, "set: {body}");
     let expires_at: jiff::Timestamp = body["expires_at"]
         .as_str()
-        .and_then(|s| s.parse::<Timestamp>().ok())
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
         .expect("expires_at must be a present, parseable RFC3339 timestamp");
     let delta = (expires_at - before).as_secs();
     assert!(
@@ -1912,7 +1913,7 @@ async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_
         .bind::<diesel::sql_types::Text, _>(&key)
         .bind::<diesel::sql_types::Double, _>(5.0 / 60.0)
         .bind::<diesel::sql_types::Double, _>(1000.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed row");
@@ -1995,7 +1996,7 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
         .bind::<diesel::sql_types::Double, _>(5.0 / 60.0)
         .bind::<diesel::sql_types::Double, _>(900.0)
         .bind::<diesel::sql_types::Double, _>(1000.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed shard 0 (active)");
@@ -2117,7 +2118,7 @@ async fn list_rate_limits_reports_disagreement_across_live_shards() {
         .bind::<diesel::sql_types::Double, _>(0.001)
         .bind::<diesel::sql_types::Double, _>(1000.0)
         .bind::<diesel::sql_types::Double, _>(1000.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed shard 0 (active)");
@@ -2215,7 +2216,7 @@ async fn list_rate_limits_reports_disagreement_when_a_shard_has_no_row() {
         .bind::<diesel::sql_types::Double, _>(0.001)
         .bind::<diesel::sql_types::Double, _>(1000.0)
         .bind::<diesel::sql_types::Double, _>(1000.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed shard 0 (active)");
@@ -2299,7 +2300,7 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
         .bind::<diesel::sql_types::Double, _>(50.0)
         .bind::<diesel::sql_types::Double, _>(20.0)
         .bind::<diesel::sql_types::Double, _>(5.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed shard 0");
@@ -2322,7 +2323,7 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
         .bind::<diesel::sql_types::Double, _>(100.0)
         .bind::<diesel::sql_types::Double, _>(30.0)
         .bind::<diesel::sql_types::Double, _>(5.0)
-        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed shard 1");

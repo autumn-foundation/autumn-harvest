@@ -72,11 +72,14 @@ async fn sim_wake_order_matches_the_real_ingest() {
 
     // The clock is 100 s after the anchor. A timer is due at offset 99 or
     // less. It waits at offset 150 or more, so a slow ingest stays exact.
-    let now: jiff::Timestamp = diesel::select(diesel::dsl::now)
-        .get_result::<std::time::SystemTime>(&mut conn)
-        .await
-        .unwrap()
-        .into();
+    let now = jiff::Timestamp::try_from(
+        diesel::select(diesel::dsl::now)
+            .get_result::<std::time::SystemTime>(&mut conn)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
     let anchor = now - jiff::SignedDuration::from_secs(100);
     let at = |secs: u64| anchor + jiff::SignedDuration::from_secs(i64::try_from(secs).unwrap());
 

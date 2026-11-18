@@ -196,8 +196,8 @@ impl UsageParams {
         }
 
         let window = to.duration_since(from);
-        let ceiling_chrono = jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
-        if window > ceiling_chrono {
+        let ceiling_signed = jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
+        if window > ceiling_signed {
             let ceiling_label = format_ceiling(ceiling);
             return Err(format!(
                 "invalid window: 'to' - 'from' exceeds the {ceiling_label} usage window \
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn params_accepts_window_exactly_at_ceiling() {
-        let from = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        let from = "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         let to = from + jiff::SignedDuration::try_from(CEILING).unwrap();
         let params = UsageParams::from_query_pairs(
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn params_accepts_relative_duration_since_now() {
-        let now = ("2026-02-01T00:00:00Z").parse::<Timestamp>()
+        let now = "2026-02-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         let params =
             UsageParams::from_query_pairs(&pairs(&[("from", "24h"), ("to", "1h")]), now, CEILING)

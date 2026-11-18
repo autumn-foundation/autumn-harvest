@@ -18,7 +18,9 @@
 //! `TimerStarted` diverges deterministically.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -443,7 +445,7 @@ async fn get_nd_block_row(
     exec_id: ExecutionId,
 ) -> (bool, Option<String>, i32, Option<Value>) {
     let (blocked_at, reason, count, attrs): (
-        Option<jiff::Timestamp>,
+        Option<SqlTimestamp>,
         Option<String>,
         i32,
         Option<Value>,
@@ -465,14 +467,14 @@ async fn get_nd_block_row(
 ///
 /// One block writes both columns, so poll lag does not enter the value.
 async fn nd_requeue_delay(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> jiff::SignedDuration {
-    let blocked_at: Option<jiff::Timestamp> = harvest_workflow_executions::table
+    let blocked_at: Option<SqlTimestamp> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select(harvest_workflow_executions::nd_blocked_at)
         .first(conn)
         .await
         .expect("execution must exist");
     let (_, scheduled_at, _, _) = get_workflow_task(conn, exec_id).await;
-    scheduled_at - blocked_at.expect("nd_blocked_at must be set")
+    scheduled_at - blocked_at.expect("nd_blocked_at must be set").to_jiff()
 }
 
 /// Assert that `delay` is in the Equal-jitter band `[base/2, base]` (issue #1792).
@@ -507,7 +509,7 @@ async fn get_workflow_task(
     Option<String>,
     Option<String>,
 ) {
-    harvest_task_queue::table
+    let (state, scheduled_at, sticky_worker_id, error) = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("workflow"))
         .select((
@@ -516,9 +518,10 @@ async fn get_workflow_task(
             harvest_task_queue::sticky_worker_id,
             harvest_task_queue::error,
         ))
-        .first(conn)
+        .first::<(String, SqlTimestamp, Option<String>, Option<String>)>(conn)
         .await
-        .expect("workflow task row must exist")
+        .expect("workflow task row must exist");
+    (state, scheduled_at.to_jiff(), sticky_worker_id, error)
 }
 
 /// Wait until the execution's history contains a `TimerStarted` event —

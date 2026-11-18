@@ -78,6 +78,7 @@ use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::schema::harvest_audit_log;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 
@@ -1325,9 +1326,12 @@ async fn watermark_row(
     use autumn_harvest::schema::harvest_audit_purge_watermark::dsl as mark;
     mark::harvest_audit_purge_watermark
         .select((mark::max_purged_occurred_at, mark::purged_records))
-        .load(conn)
+        .load::<(SqlTimestamp, i64)>(conn)
         .await
         .expect("watermark rows")
+        .into_iter()
+        .map(|(at, records)| (at.to_jiff(), records))
+        .collect()
 }
 
 #[tokio::test]
@@ -1389,7 +1393,7 @@ async fn the_flag_includes_the_exact_watermark_instant() {
     let (mut conn, _c) = make_conn().await;
     export_all(&mut conn, 2).await;
     let t = jiff::Timestamp::now() - autumn_harvest::time::days(365);
-    let t = jiff::Timestamp::from_microsecond(t.as_microsecond()).ok().expect("instant");
+    let t = jiff::Timestamp::from_microsecond(t.as_microsecond()).expect("instant");
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
         .set(harvest_audit_log::occurred_at.eq(t.to_diesel()))
         .execute(&mut conn)
@@ -3634,12 +3638,13 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
         .expect("second idle tick");
     uninstall();
 
-    let refreshed: jiff::Timestamp = cur::harvest_audit_export_cursor
+    let refreshed = cur::harvest_audit_export_cursor
         .find(0)
         .select(cur::updated_at)
-        .first(&mut conn)
+        .first::<SqlTimestamp>(&mut conn)
         .await
-        .expect("cursor row");
+        .expect("cursor row")
+        .to_jiff();
     assert!(
         refreshed > stale,
         "a tick that claims nothing must still refresh the heartbeat: an idle \

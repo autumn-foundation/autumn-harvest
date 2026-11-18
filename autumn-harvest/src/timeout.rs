@@ -8697,7 +8697,7 @@ mod tests {
 
     #[test]
     fn effective_chain_timeout_truth_table() {
-        use jiff::{SignedDuration, Timestamp};
+        use jiff::SignedDuration;
         let w = SignedDuration::from_hours(10);
         let c = SignedDuration::from_hours(3);
         // both → min

@@ -25,6 +25,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -886,7 +887,7 @@ async fn seed_execution_with_deadline(
     .bind::<diesel::sql_types::Jsonb, _>(input)
     .bind::<diesel::sql_types::Text, _>(state)
     .bind::<diesel::sql_types::Double, _>(timeout_secs)
-    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at.to_diesel())
     .execute(&mut conn)
     .await
     .expect("seed execution with deadline");
@@ -904,7 +905,7 @@ fn deadline_probe_history(
     items: &[&str],
     completed: bool,
 ) -> (Value, Vec<WorkflowEvent>, jiff::Timestamp) {
-    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
     let deadline = t0 + jiff::SignedDuration::from_hours(24);
     let recorded_now = t0 + jiff::SignedDuration::from_secs(1);
     let input = json!({ "items": items });

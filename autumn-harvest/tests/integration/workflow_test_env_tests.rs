@@ -2167,7 +2167,7 @@ fn scheduled_time_reader_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let slot: Option<String> = ctx.scheduled_time().map(|t| autumn_harvest::time::rfc3339(t));
+        let slot: Option<String> = ctx.scheduled_time().map(autumn_harvest::time::rfc3339);
         Ok(json!({ "scheduled_time": slot }))
     })
 }
@@ -2184,7 +2184,6 @@ async fn test_scheduled_time_none_by_default() {
 /// Seeded `scheduled_time` is returned by the accessor.
 #[tokio::test]
 async fn test_scheduled_time_seeded_value() {
-    use jiff::Timestamp;
     let slot = autumn_harvest::time::utc_ymd_hms(2026, 3, 15, 0, 0, 0).unwrap();
     let outcome = WorkflowTestEnv::new()
         .with_scheduled_time(slot)
@@ -2202,7 +2201,6 @@ async fn test_scheduled_time_seeded_value() {
 /// Replay determinism: the seeded `scheduled_time` replays identically.
 #[tokio::test]
 async fn test_scheduled_time_replays_deterministically() {
-    use jiff::Timestamp;
     let slot = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
     let outcome = WorkflowTestEnv::new()
         .with_scheduled_time(slot)
@@ -2263,7 +2261,7 @@ fn sleep_until_future_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let t0 = ctx.now().as_second();
-        let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).ok().unwrap();
+        let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).unwrap();
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -2279,7 +2277,7 @@ fn sleep_until_past_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         // 2000-01-01T00:00:00Z — firmly in the past.
-        let deadline = jiff::Timestamp::from_second(946_684_800).ok().unwrap();
+        let deadline = jiff::Timestamp::from_second(946_684_800).unwrap();
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -2322,9 +2320,9 @@ async fn sleep_until_resolves_in_test_env_without_real_sleep() {
         })
         .expect("a TimerStarted event must be recorded");
 
-    let frozen_now = jiff::Timestamp::from_millisecond(frozen_millis).ok()
+    let frozen_now = jiff::Timestamp::from_millisecond(frozen_millis)
         .expect("frozen millis must be a valid instant");
-    let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).ok().unwrap();
+    let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).unwrap();
     let delta = deadline.duration_since(frozen_now);
     let expected =
         u64::try_from(delta.as_secs() + i64::from(delta.subsec_nanos() > 0)).unwrap();

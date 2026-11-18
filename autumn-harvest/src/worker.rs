@@ -18016,7 +18016,6 @@ mod adaptive_limit_gate_tests {
     #[test]
     fn the_deadline_check_ignores_the_host_clock() {
         use super::past_attempt_deadline;
-        use jiff::Timestamp;
         // Database timestamps far from the host clock, as under a skew.
         let started = crate::time::utc_ymd_hms(2001, 1, 1, 0, 0, 0);
         let deadline = started.map(|s| s + jiff::SignedDuration::from_millis(300));

@@ -335,7 +335,7 @@ mod tests {
         let report = DagSlackAnalyzer::new(dag.clone()).analyze();
         let plan = DagCrashPlanner::new(&dag, &report).plan(Duration::ZERO);
         assert!(plan.meets_target());
-        assert_eq!(plan.durations, Vec::new());
+        assert_eq!(plan.durations, Vec::<Duration>::new());
     }
 
     #[test]

@@ -186,7 +186,7 @@ fn t088() {}
 // `failed`, `activity_started`, `skip_marker_full`).
 
 fn ts(secs: i64) -> Timestamp {
-    Timestamp::new(1_700_000_000 + secs, 0).ok().unwrap()
+    Timestamp::new(1_700_000_000 + secs, 0).unwrap()
 }
 
 fn workflow_started() -> WorkflowEvent {

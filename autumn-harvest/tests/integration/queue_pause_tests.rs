@@ -27,6 +27,8 @@ use autumn_harvest::queue_pause::{self, MAX_QUEUE_NAME_LEN};
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use jiff_diesel::ToDiesel;
+
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -143,7 +145,7 @@ async fn scheduled_at(
     #[derive(diesel::QueryableByName)]
     struct S {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         scheduled_at: jiff::Timestamp,
     }
     diesel::sql_query("SELECT scheduled_at FROM harvest_task_queue WHERE id=$1")
@@ -195,7 +197,7 @@ async fn paused_at_of(
     #[derive(diesel::QueryableByName)]
     struct P {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         paused_at: jiff::Timestamp,
     }
     diesel::sql_query("SELECT paused_at FROM harvest_queue_pauses WHERE queue_name = $1")
@@ -746,7 +748,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     let primary_ids: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut resumer)
             .await
             .expect("primary shift");
@@ -776,7 +778,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     // pass did *not* shift, excluded by id rather than by predicate.
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
@@ -884,7 +886,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     let primary_ids: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut resumer)
             .await
             .expect("primary shift");
@@ -904,7 +906,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
 
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
@@ -2111,7 +2113,7 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     );
 
     let stored = paused_at_of(&mut conn, &q).await;
-    let lag = autumn_harvest::time::num_milliseconds((stored - before_pause));
+    let lag = autumn_harvest::time::num_milliseconds(stored - before_pause);
 
     // Tolerance is strictly SMALLER than the injected delay so it can actually
     // falsify: the frozen clock records ~0ms of lag, the live clock ~3000ms.
@@ -2751,7 +2753,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     #[derive(diesel::QueryableByName)]
     struct PausedAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         paused_at: jiff::Timestamp,
     }
 
@@ -2805,7 +2807,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     let shifted: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut driver)
             .await
             .expect("primary shift");
@@ -2825,7 +2827,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     // Pass 2, excluding exactly what pass 1 reported.
     diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut driver)
         .await
@@ -2909,7 +2911,7 @@ async fn pause_credits_the_backlog_scan_interval() {
     #[derive(diesel::QueryableByName)]
     struct NowRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         now: jiff::Timestamp,
     }
     let unblock_at: NowRow = diesel::sql_query("SELECT clock_timestamp() AS now")
@@ -2920,7 +2922,7 @@ async fn pause_credits_the_backlog_scan_interval() {
     blocker.batch_execute("COMMIT").await.expect("release");
     let outcome = pausing.await.expect("the pause task must not panic");
 
-    let lead = autumn_harvest::time::num_milliseconds((unblock_at.now - outcome.paused_at));
+    let lead = autumn_harvest::time::num_milliseconds(unblock_at.now - outcome.paused_at);
     assert!(
         lead >= (BLOCK_SECS as i64 - 1) * 1000,
         "paused_at must be stamped when the queue actually became held (at lock \

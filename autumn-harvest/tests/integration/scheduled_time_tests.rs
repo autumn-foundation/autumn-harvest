@@ -49,7 +49,7 @@ fn scheduled_time_recorder<'a>(
     Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
 > {
     Box::pin(async move {
-        let slot: Option<String> = ctx.scheduled_time().map(|t| autumn_harvest::time::rfc3339(t));
+        let slot: Option<String> = ctx.scheduled_time().map(autumn_harvest::time::rfc3339);
         Ok(json!({ "scheduled_time": slot }))
     })
 }

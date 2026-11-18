@@ -3155,7 +3155,8 @@ mod tests {
         let event = codecs
             .encode_event(&crate::event::WorkflowEvent::WorkflowStarted {
                 input,
-                timestamp: ("2026-08-29T12:00:00Z").parse::<Timestamp>()
+                timestamp: "2026-08-29T12:00:00Z"
+                    .parse::<jiff::Timestamp>()
                     .expect("fixed timestamp"),
                 last_completion_result: None,
                 last_error: None,

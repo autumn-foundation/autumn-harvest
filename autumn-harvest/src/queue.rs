@@ -17015,7 +17015,7 @@ mod tests {
 
         let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(&changeset);
+            .set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         // With `treat_none_as_null = true`, a `None` field is bound as a SQL
@@ -17070,7 +17070,7 @@ mod tests {
         assert_eq!(changeset.crash_strikes, 0);
 
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(&changeset);
+            .set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         assert!(
@@ -17109,7 +17109,7 @@ mod tests {
         );
 
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(&changeset);
+            .set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         for column in ["worker_id", "started_at", "last_heartbeat_at"] {
@@ -17154,7 +17154,7 @@ mod tests {
 
         let changeset = CleanContinuationChangeset::new(jiff::Timestamp::now());
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(&changeset);
+            .set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         assert!(
@@ -17318,7 +17318,7 @@ mod tests {
         crate::dispatch::uninstall_all();
 
         let task_id = Uuid::new_v4();
-        let updated = vec![("default".to_string(), 5, Timestamp::now())];
+        let updated = vec![("default".to_string(), 5, Timestamp::now().into())];
 
         let result = finish_workflow_backoff_requeue(task_id, updated);
 

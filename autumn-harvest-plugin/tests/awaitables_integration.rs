@@ -464,7 +464,9 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         )
         .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
         .bind::<diesel::sql_types::Timestamptz, _>(
-            autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 30, 0).unwrap(),
+            autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 30, 0)
+                .unwrap()
+                .to_diesel(),
         )
         .execute(&mut conn)
         .await

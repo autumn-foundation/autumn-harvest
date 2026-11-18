@@ -134,7 +134,7 @@ async fn insert_completed(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .bind::<Nullable<Timestamptz>, _>(hold_set_at.to_diesel())
     .bind::<Nullable<Timestamptz>, _>(hold_until.to_diesel())
     .get_result::<IdRow>(conn)

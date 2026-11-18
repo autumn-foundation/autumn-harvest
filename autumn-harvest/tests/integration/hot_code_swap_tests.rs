@@ -199,7 +199,8 @@ fn native_pipeline_v2(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
 /// `WorkflowStarted` timestamp. So the comparison checks the code, not the
 /// wall clock.
 fn anchor() -> jiff::Timestamp {
-    ("2026-07-08T00:00:00Z").parse::<Timestamp>()
+    "2026-07-08T00:00:00Z"
+        .parse::<jiff::Timestamp>()
         .expect("valid anchor")
 }
 

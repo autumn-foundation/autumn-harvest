@@ -961,7 +961,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
     let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
 
     // Back-date wf-old to 2025.
-    let old_ts = ("2025-01-01T00:00:00Z").parse::<Timestamp>()
+    let old_ts = "2025-01-01T00:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
     set_created_at(&database_url, old, old_ts).await;
 
@@ -1068,7 +1068,7 @@ async fn workflow_list_pagination_returns_envelope() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10)
                 .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
@@ -1127,7 +1127,7 @@ async fn workflow_list_pagination_asc_order() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10)
                 .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
@@ -1178,7 +1178,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_700_000_000 + i64::try_from(i).unwrap() * 10, 0)
+            jiff::Timestamp::from_second(1_700_000_000 + i64::try_from(i).unwrap() * 10)
                 .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
@@ -1203,7 +1203,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(2_000_000_000 + i64::try_from(i).unwrap(), 0).unwrap();
+            jiff::Timestamp::from_second(2_000_000_000 + i64::try_from(i).unwrap()).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1246,7 +1246,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard0_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + i64::try_from(i).unwrap() * 20, 0).unwrap(),
+            jiff::Timestamp::from_second(base_ts + i64::try_from(i).unwrap() * 20).unwrap(),
         )
         .await;
     }
@@ -1262,7 +1262,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard1_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + 10 + i64::try_from(i).unwrap() * 20, 0)
+            jiff::Timestamp::from_second(base_ts + 10 + i64::try_from(i).unwrap() * 20)
                 .unwrap(),
         )
         .await;

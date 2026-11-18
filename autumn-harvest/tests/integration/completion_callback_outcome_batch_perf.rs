@@ -197,7 +197,7 @@ async fn seed_rows(conn: &mut AsyncPgConnection, rows: &[Row]) {
         })
         .collect();
     diesel::insert_into(harvest_completion_deliveries::table)
-        .values(&new_rows)
+        .values(new_rows)
         .execute(conn)
         .await
         .expect("seed completion-delivery rows");

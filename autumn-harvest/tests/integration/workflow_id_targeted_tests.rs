@@ -591,7 +591,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_a.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(1)),
+            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(1)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -601,7 +601,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_b.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(3)),
+            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(3)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -611,7 +611,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(terminus.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(5)),
+            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

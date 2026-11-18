@@ -8034,7 +8034,7 @@ const fn tl960_child_completed(child: ExecutionId) -> autumn_harvest::WorkflowEv
 async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T10:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T10:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
@@ -8099,7 +8099,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
 async fn ui_timeline_split_only_when_present() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T11:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T11:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
 
     // An activity WITH ActivityStarted → wait/exec split. A child workflow → no split.
@@ -8154,7 +8154,7 @@ async fn ui_timeline_split_only_when_present() {
 async fn ui_timeline_slowest_highlight_and_rollup() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T12:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T12:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
 
     // A quick activity then a much slower one (the slowest step).
@@ -8215,7 +8215,7 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
 async fn ui_timeline_inflight_open_span_and_current_details() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T13:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T13:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
 
     // A running execution with a scheduled-but-not-completed activity.
@@ -8270,7 +8270,7 @@ async fn ui_timeline_unknown_execution_404() {
 async fn ui_detail_page_has_timeline_link() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T14:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T14:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
     let a = autumn_harvest::ActivityExecId::new();
     let exec_id = tl960_seed_run(
@@ -8303,7 +8303,7 @@ async fn ui_detail_page_has_timeline_link() {
 async fn ui_timeline_200_steps_under_1s() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = ("2026-07-15T15:00:00Z").parse::<Timestamp>()
+    let base = "2026-07-15T15:00:00Z".parse::<jiff::Timestamp>()
         .unwrap();
 
     // 200 activities (400 events: sched + complete each).

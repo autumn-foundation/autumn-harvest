@@ -588,7 +588,7 @@ async fn allow_all_drains_a_buffered_slot_at_max_active_runs() {
     let (url, _c) = setup().await;
     let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
     start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
-    let slot = autumn_harvest::time::rfc3339((Timestamp::now() - jiff::SignedDuration::from_secs(120)));
+    let slot = autumn_harvest::time::rfc3339(Timestamp::now() - jiff::SignedDuration::from_secs(120));
     let mut conn = connect(&url).await;
     diesel::update(dsl::harvest_schedules.find(schedule_id))
         .set((

@@ -111,7 +111,7 @@ fn order_payload(i: usize) -> Value {
 }
 
 fn fixed_timestamp() -> Timestamp {
-    ("2026-08-29T12:00:00Z").parse::<Timestamp>()
+    "2026-08-29T12:00:00Z".parse::<Timestamp>()
         .expect("fixed timestamp")
 }
 

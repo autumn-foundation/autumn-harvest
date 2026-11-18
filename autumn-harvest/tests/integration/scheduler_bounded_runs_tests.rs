@@ -6,6 +6,7 @@
 //! firings (overlap policy, calendar) do NOT consume the `max_runs` budget.
 
 use std::sync::Arc;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
 
 use autumn_harvest::info::WorkflowInfo;
@@ -170,13 +171,13 @@ async fn insert_bounded_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::end_at.eq(end_at),
+            dsl::end_at.eq(end_at.to_diesel()),
             dsl::max_runs.eq(max_runs),
         ))
         .execute(conn)
@@ -227,7 +228,7 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         "no run must be started when end_at is reached"
     );
 
-    let (exhausted_at, exhausted_reason): (Option<jiff::Timestamp>, Option<String>) =
+    let (exhausted_at, exhausted_reason): (Option<SqlTimestamp>, Option<String>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -289,7 +290,7 @@ async fn schedule_before_end_at_fires_normally() {
         "exactly one execution must be created when before end_at"
     );
 
-    let exhausted_at: Option<jiff::Timestamp> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)
@@ -347,7 +348,7 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
         "no run must be started when max_runs budget is exhausted"
     );
 
-    let (exhausted_at, exhausted_reason): (Option<jiff::Timestamp>, Option<String>) =
+    let (exhausted_at, exhausted_reason): (Option<SqlTimestamp>, Option<String>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -408,7 +409,7 @@ async fn max_runs_1_fires_once_then_exhausts() {
         "exactly one execution must be created on first tick"
     );
 
-    let (exhausted_at, runs_started): (Option<jiff::Timestamp>, i32) =
+    let (exhausted_at, runs_started): (Option<SqlTimestamp>, i32) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -466,7 +467,7 @@ async fn runs_started_incremented_per_dispatch() {
         "runs_started must be 1 after one successful dispatch"
     );
 
-    let exhausted_at: Option<jiff::Timestamp> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)
@@ -565,7 +566,7 @@ async fn schedule_without_bounds_fires_normally() {
         .expect("count executions");
     assert_eq!(exec_count, 1, "unbounded schedule must fire normally");
 
-    let exhausted_at: Option<jiff::Timestamp> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)

@@ -64,7 +64,6 @@
 
 use autumn_harvest::calendar::BusinessCalendars;
 use autumn_harvest::prelude::*;
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +153,13 @@ mod tests {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::testing::WorkflowTestEnv;
     use jiff::Timestamp;
+    use jiff::civil::Weekday;
     use serde_json::json;
+
+    /// The UTC weekday of `at`.
+    fn weekday(at: Timestamp) -> Weekday {
+        autumn_harvest::time::utc_date(at).weekday()
+    }
 
     fn ticket(n: u32) -> Ticket {
         Ticket {
@@ -166,7 +171,7 @@ mod tests {
     /// Anchor on a Thursday so a 2-business-day SLA must cross the weekend.
     fn thursday() -> Timestamp {
         let anchor = autumn_harvest::time::utc_ymd_hms(2026, 7, 9, 9, 0, 0).unwrap();
-        assert_eq!(anchor.weekday(), Weekday::Thu, "fixture must be a Thursday");
+        assert_eq!(weekday(anchor), Weekday::Thursday, "fixture must be a Thursday");
         anchor
     }
 
@@ -184,7 +189,7 @@ mod tests {
 
         // Thu 2026-07-09 + 2 business days = Mon 2026-07-13.
         let expected = autumn_harvest::time::utc_ymd_hms(2026, 7, 13, 9, 0, 0).unwrap();
-        assert_eq!(expected.weekday(), Weekday::Mon);
+        assert_eq!(weekday(expected), Weekday::Monday);
 
         let out = outcome.result.as_ref().unwrap().to_string();
         assert!(
@@ -194,7 +199,7 @@ mod tests {
 
         // A naive calendar-day wait would have landed on Saturday.
         let naive = thursday() + autumn_harvest::time::days(2);
-        assert_eq!(naive.weekday(), Weekday::Sat);
+        assert_eq!(weekday(naive), Weekday::Saturday);
         assert!(
             !out.contains(&autumn_harvest::time::rfc3339(naive)),
             "must NOT resolve to the naive calendar-day answer {naive}"
@@ -207,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn holidays_are_skipped_as_well_as_weekends() {
         let anchor = autumn_harvest::time::utc_ymd_hms(2026, 7, 2, 9, 0, 0).unwrap();
-        assert_eq!(anchor.weekday(), Weekday::Thu);
+        assert_eq!(weekday(anchor), Weekday::Thursday);
 
         let outcome = WorkflowTestEnv::new()
             .with_business_calendars(support_calendar())

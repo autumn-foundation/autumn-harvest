@@ -1267,7 +1267,7 @@ impl MermaidExporter {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
-    use jiff::{SignedDuration, Timestamp};
+    use jiff::Timestamp;
 
     #[test]
     fn test_export_mermaid_sequence_empty() {

@@ -201,8 +201,7 @@ fn event(index: usize) -> WorkflowEvent {
     if index == 0 {
         return WorkflowEvent::WorkflowStarted {
             input: payload(0),
-            timestamp: jiff::Timestamp::from_second(1_790_000_000).ok()
-                .expect("a fixed timestamp is in range"),
+            timestamp: jiff::Timestamp::constant(1_790_000_000, 0),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

@@ -21,7 +21,9 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, ensure_dag_schedule, tick_once,
 };
 use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
+
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -177,8 +179,8 @@ async fn dag_row(conn: &mut AsyncPgConnection, dag_name: &str) -> Row {
             .first::<(
                 Option<String>,
                 i32,
-                Option<Timestamp>,
-                Timestamp,
+                Option<SqlTimestamp>,
+                SqlTimestamp,
                 Option<String>,
             )>(conn)
             .await
@@ -186,8 +188,8 @@ async fn dag_row(conn: &mut AsyncPgConnection, dag_name: &str) -> Row {
     Row {
         schedule_expr,
         max_active_runs,
-        next_run_at,
-        updated_at,
+        next_run_at: next_run_at.map(SqlTimestamp::to_jiff),
+        updated_at: updated_at.to_jiff(),
         workflow_name,
     }
 }

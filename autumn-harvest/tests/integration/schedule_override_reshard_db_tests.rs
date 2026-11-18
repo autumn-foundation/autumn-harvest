@@ -33,7 +33,9 @@ use autumn_harvest::scheduler::{DagCatalog, RegisteredDag, SchedulerMonitor, tic
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
+
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -515,10 +517,11 @@ async fn schedule_row(
     dsl::harvest_schedules
         .filter(dsl::dag_name.eq(dag_name))
         .select((dsl::id, dsl::next_run_at))
-        .first(conn)
+        .first::<(uuid::Uuid, Option<SqlTimestamp>)>(conn)
         .await
         .optional()
         .expect("read schedule row")
+        .map(|(id, next_run_at)| (id, next_run_at.map(SqlTimestamp::to_jiff)))
 }
 
 /// A pool that two shards share.
@@ -1039,10 +1042,11 @@ async fn floor_of(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<Timest
         .filter(dsl::kind.eq("dag"))
         .filter(dsl::name.eq(dag_name))
         .select(dsl::row_updated_at)
-        .first(conn)
+        .first::<SqlTimestamp>(conn)
         .await
         .optional()
         .expect("read the floor")
+        .map(SqlTimestamp::to_jiff)
 }
 
 /// Set the floor of `dag_name` on this database to `at`.

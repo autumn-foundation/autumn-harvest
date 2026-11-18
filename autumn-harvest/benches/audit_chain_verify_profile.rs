@@ -45,8 +45,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn record(i: usize) -> AuditExportRecord {
     let n = i64::try_from(i).unwrap_or(0);
-    let at: Timestamp = Timestamp::new(1_780_000_000 + n, 123_456_000).ok()
-        .unwrap_or_default();
+    let at = Timestamp::new(1_780_000_000 + n, 123_456_000).unwrap_or_default();
     AuditExportRecord {
         shard: 3,
         seq: n + 1,

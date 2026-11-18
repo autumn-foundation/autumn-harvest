@@ -559,7 +559,7 @@ impl Parser {
             };
             let value_at = self.at();
             let text = self.string_literal(name)?;
-            let ts = text.parse::<Timestamp>()
+            let ts = text.parse::<jiff::Timestamp>()
                 .map_err(|_| format!("started_at at byte {value_at} needs an RFC 3339 time"))?;
             return Ok(SystemTest::Cmp(cmp, ts));
         }
@@ -764,7 +764,7 @@ enum Part {
     TextArray(Vec<String>),
     Jsonb(JsonText),
     JsonbArray(Vec<JsonText>),
-    Timestamptz(jiff::Timestamp),
+    Timestamptz(jiff_diesel::Timestamp),
 }
 
 /// A compiled filter: SQL text with bound values.
@@ -894,7 +894,7 @@ impl SqlFilter {
                     CmpOp::Lt => " < ",
                     CmpOp::Lte => " <= ",
                 });
-                self.parts.push(Part::Timestamptz(*at));
+                self.parts.push(Part::Timestamptz(jiff_diesel::Timestamp::from(*at)));
             }
         }
     }

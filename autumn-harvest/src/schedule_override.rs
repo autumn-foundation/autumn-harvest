@@ -2098,7 +2098,7 @@ mod tests {
     }
 
     fn at(micros: i64, nanos: u32) -> Timestamp {
-        Timestamp::from_microsecond(micros).ok().expect("a valid time")
+        Timestamp::from_microsecond(micros).expect("a valid time")
             + jiff::SignedDuration::from_nanos(i64::from(nanos))
     }
 

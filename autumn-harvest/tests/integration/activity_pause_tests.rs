@@ -34,6 +34,7 @@ use autumn_harvest::queue_pause;
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -927,7 +928,7 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
         use diesel_async::RunQueryDsl;
         diesel::sql_query(activity_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&activity)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut resumer)
             .await
             .expect("primary shift")
@@ -959,7 +960,7 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
         use diesel_async::RunQueryDsl;
         diesel::sql_query(activity_pause::resume_shift_late_arrivals_query())
             .bind::<diesel::sql_types::Text, _>(&activity)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
             .execute(&mut resumer)
             .await
@@ -1218,7 +1219,7 @@ async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
         let rows: Vec<ShiftedTaskIdRow> =
             diesel::sql_query(activity_pause::resume_shift_scheduled_at_query())
                 .bind::<diesel::sql_types::Text, _>(&activity)
-                .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
                 .load(&mut resumer)
                 .await
                 .expect("primary shift");
@@ -1276,7 +1277,7 @@ async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
         use diesel_async::RunQueryDsl;
         diesel::sql_query(activity_pause::resume_shift_late_arrivals_query())
             .bind::<diesel::sql_types::Text, _>(&activity)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
             .execute(&mut resumer)
             .await

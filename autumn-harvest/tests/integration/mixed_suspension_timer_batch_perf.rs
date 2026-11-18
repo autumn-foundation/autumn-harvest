@@ -516,6 +516,6 @@ async fn park_persists_the_same_timer_rows_and_events() {
     let mut fires: Vec<_> = timers.iter().map(|t| t.fires_at).collect();
     fires.sort();
     for pair in fires.windows(2) {
-        assert_eq!((pair[1] - pair[0]).num_seconds(), 1);
+        assert_eq!((pair[1] - pair[0]).as_secs(), 1);
     }
 }

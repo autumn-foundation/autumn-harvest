@@ -42,7 +42,9 @@ use autumn_harvest::{
     ExecutionId, StartWorkflowParams, WorkflowContext, cancel_workflow_execution,
     start_or_load_workflow_execution,
 };
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
+
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
@@ -307,9 +309,10 @@ async fn fire_time(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Timest
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(dsl::task_type.eq("workflow"))
         .select(dsl::scheduled_at)
-        .first(conn)
+        .first::<SqlTimestamp>(conn)
         .await
         .expect("the workflow task")
+        .to_jiff()
 }
 
 /// Wait until `done` holds for the runs of `name`, then return them.

@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::store::{AwaitMode, LineageChildRow};
 use autumn_harvest::types::ExecutionId;
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::KNOWN_WORKFLOW_STATES;

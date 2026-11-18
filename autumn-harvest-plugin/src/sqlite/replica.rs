@@ -420,6 +420,13 @@ impl Replicas {
     /// What the replica of `key` holds at `target`, or at its latest state.
     fn plan(&self, key: &FleetDbKey, target: Option<Timestamp>) -> Result<Planned, String> {
         let root = self.replica.root_for(key);
+        // `restore::plan` takes a `chrono` target.
+        let target = target
+            .map(|at| {
+                crate::chrono_boundary::to_chrono(at)
+                    .ok_or_else(|| format!("the restore target {at} of {key} has no chrono value"))
+            })
+            .transpose()?;
         match restore::plan(self.destination(), &root, target) {
             Ok(plan) => Ok(Planned::Plan(Box::new(plan))),
             Err(RestoreError::NoReplica { .. }) => Ok(Planned::NoReplica),
@@ -1060,7 +1067,7 @@ impl Target {
         }
         text.parse::<Timestamp>()
             .ok()
-            .map(|at| Self::At(at))
+            .map(Self::At)
     }
 }
 
@@ -1996,7 +2003,7 @@ mod tests {
     fn a_target_entry_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acme.harvest.db");
-        let at = ("2026-11-12T05:00:00.250Z").parse::<Timestamp>()
+        let at = "2026-11-12T05:00:00.250Z".parse::<Timestamp>()
             .unwrap();
         for written in [
             Entry::Committed {

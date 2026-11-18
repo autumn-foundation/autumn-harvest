@@ -561,7 +561,7 @@ async fn trigger_now_and_backfill_mark_only_a_schedule_policy() {
     let own = RetryPolicy::fixed(2, std::time::Duration::from_secs(1));
     // One hour-aligned slot of the `interval:3600` schedule, two hours ago.
     let hours = jiff::Timestamp::now().as_second() / 3_600 - 2;
-    let slot = jiff::Timestamp::from_second(hours * 3_600).ok().expect("a slot");
+    let slot = jiff::Timestamp::from_second(hours * 3_600).expect("a slot");
     let window_start = slot - jiff::SignedDuration::from_secs(1);
     let window_end = slot + jiff::SignedDuration::from_secs(1);
     // A type holds one schedule, so the two cases run one after the other.

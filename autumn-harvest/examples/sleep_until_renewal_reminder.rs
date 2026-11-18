@@ -55,8 +55,8 @@ pub struct Subscription {
 /// Waits until 24h before an absolute expiry instant, then "sends" a reminder.
 #[workflow]
 async fn renewal_reminder(ctx: &WorkflowContext, sub: Subscription) -> Result<String, String> {
-    let expiry = Timestamp::from_millisecond(sub.expires_at_millis).ok()
-        .ok_or_else(|| "invalid expiry".to_string())?;
+    let expiry = Timestamp::from_millisecond(sub.expires_at_millis)
+        .map_err(|_| "invalid expiry".to_string())?;
     let remind_at = expiry - SignedDuration::from_hours(24);
 
     // Durable absolute-deadline wait — replay-safe, survives worker restart.

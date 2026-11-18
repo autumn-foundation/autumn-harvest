@@ -977,7 +977,7 @@ mod envelope_tests {
     #[test]
     fn completed_envelope_has_result_and_no_error() {
         let (delivery_id, exec_id) = sample_ids();
-        let completed_at = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        let completed_at = "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         let envelope = build_envelope(
             delivery_id,
@@ -1626,7 +1626,7 @@ mod deliverer_trait_tests {
     }
 
     fn now() -> Timestamp {
-        ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap()
     }
 
@@ -1679,7 +1679,7 @@ mod deliverer_trait_tests {
     #[test]
     fn parse_retry_after_applies_the_rfc_850_cutoff_to_the_full_date() {
         // The cutoff is 50 years after `now` to the second, not to the year.
-        let now = ("2026-10-06T00:00:00Z").parse::<Timestamp>()
+        let now = "2026-10-06T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         // 2076-10-07 is past the cutoff, so `76` means 1976.
         assert_eq!(
@@ -1695,7 +1695,7 @@ mod deliverer_trait_tests {
     #[test]
     fn parse_retry_after_resolves_an_rfc_850_year_across_a_century() {
         // In 2076, `10` means 2110: 34 years ahead, inside the window.
-        let now = ("2076-01-01T00:00:00Z").parse::<Timestamp>()
+        let now = "2076-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
             .expect("a valid RFC 850 date");
@@ -1706,7 +1706,7 @@ mod deliverer_trait_tests {
     fn parse_retry_after_rejects_a_date_that_does_not_exist_in_its_year() {
         // In 2076, `00` means 2100, which has no 29 February. The parser must
         // not fall back to 2000, where the date and the weekday are valid.
-        let now = ("2076-01-01T00:00:00Z").parse::<Timestamp>()
+        let now = "2076-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         assert_eq!(
             parse_retry_after("Tuesday, 29-Feb-00 00:00:00 GMT", now),
@@ -1853,7 +1853,7 @@ mod classify_outcome_tests {
     }
 
     fn now() -> Timestamp {
-        ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap()
     }
 
@@ -2000,7 +2000,7 @@ mod classify_outcome_tests {
             else {
                 panic!("expected Backoff");
             };
-            delays.insert(crate::time::num_nanoseconds((next_attempt_at - now())));
+            delays.insert(crate::time::num_nanoseconds(next_attempt_at - now()));
         }
         assert!(
             delays.len() > 1,

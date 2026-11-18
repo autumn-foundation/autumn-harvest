@@ -5,7 +5,7 @@
 
 use autumn_harvest::schema::harvest_task_queue_ext;
 use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
+use autumn_harvest::time::sql::{NullableTimestamp, ToPgInterval};
 use autumn_harvest::table_split::SetExt;
 use std::any::Any;
 use std::collections::HashMap;
@@ -225,13 +225,13 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
                 harvest_task_queue::worker_id,
                 harvest_task_queue::started_at,
             ))
-            .first::<(String, Option<String>, Option<jiff::Timestamp>)>(conn)
+            .first::<(String, Option<String>, NullableTimestamp)>(conn)
             .await
             .optional()
             .expect("workflow task query failed")
             && state == "RUNNING"
             && worker_id.is_none()
-            && started_at.is_none()
+            && started_at.0.is_none()
         {
             return;
         }

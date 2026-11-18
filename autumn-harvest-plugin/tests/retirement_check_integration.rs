@@ -219,7 +219,7 @@ async fn insert_versioned_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -313,7 +313,7 @@ async fn insert_execution_without_marker(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await

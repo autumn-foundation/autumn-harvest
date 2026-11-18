@@ -334,7 +334,7 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_migrated_dag";
-    let logical_date = ("2026-05-14T02:00:00Z").parse::<Timestamp>()
+    let logical_date = "2026-05-14T02:00:00Z".parse::<Timestamp>()
         .expect("fixed timestamp should parse");
     let dag_conf = serde_json::json!({ "customer": "acme" });
 
@@ -387,7 +387,7 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_queued_dag";
-    let logical_date = ("2026-05-14T02:00:00Z").parse::<Timestamp>()
+    let logical_date = "2026-05-14T02:00:00Z".parse::<Timestamp>()
         .expect("fixed timestamp should parse");
 
     diesel::sql_query(
@@ -443,9 +443,9 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     let dag_name = "legacy_subsecond_dag";
     let first_run_id = Uuid::new_v4();
     let second_run_id = Uuid::new_v4();
-    let first_logical_date = ("2026-05-14T02:00:00.100000Z").parse::<Timestamp>()
+    let first_logical_date = "2026-05-14T02:00:00.100000Z".parse::<Timestamp>()
         .expect("fixed timestamp should parse");
-    let second_logical_date = ("2026-05-14T02:00:00.900000Z").parse::<Timestamp>()
+    let second_logical_date = "2026-05-14T02:00:00.900000Z".parse::<Timestamp>()
         .expect("fixed timestamp should parse");
 
     diesel::sql_query(
@@ -2243,7 +2243,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     // Cross-check the row's deadline_at is the same instant (within the µs
     // truncation Postgres applies to TIMESTAMPTZ).
     assert!(
-        autumn_harvest::time::num_milliseconds((expected_deadline - deadline_at)).abs() <= 1,
+        autumn_harvest::time::num_milliseconds(expected_deadline - deadline_at).abs() <= 1,
         "ctx.deadline() ({expected_deadline}) must match the row's deadline_at ({deadline_at})"
     );
 }
@@ -2453,7 +2453,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         .expect("deadline_at must still be set after completion");
     // The shift persisted (the worker never re-derives / overwrites deadline_at).
     assert!(
-        autumn_harvest::time::num_milliseconds((post_deadline - shifted_deadline)).abs() <= 1,
+        autumn_harvest::time::num_milliseconds(post_deadline - shifted_deadline).abs() <= 1,
         "the row's deadline_at should remain the shifted value ({shifted_deadline}), got \
          {post_deadline}"
     );
@@ -2481,7 +2481,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     };
     let nominal_deadline = started_ts + timeout;
     assert!(
-        autumn_harvest::time::num_milliseconds((ctx_deadline - nominal_deadline)).abs() <= 1,
+        autumn_harvest::time::num_milliseconds(ctx_deadline - nominal_deadline).abs() <= 1,
         "public ctx.deadline() ({ctx_deadline}) must equal the nominal start+timeout \
          ({nominal_deadline}), not the mutable deadline_at"
     );

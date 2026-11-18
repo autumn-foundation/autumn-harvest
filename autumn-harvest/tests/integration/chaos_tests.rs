@@ -40,6 +40,7 @@ use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::worker::{
     DbPool, HandlerRegistry, chaos_drive_one_workflow_task,
     chaos_drive_one_workflow_task_cancel_at_hold,
@@ -55,6 +56,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
@@ -318,7 +320,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> uui
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -375,14 +377,13 @@ async fn schedule_claim(
     id: uuid::Uuid,
 ) -> (Option<uuid::Uuid>, bool) {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let (token, until): (Option<uuid::Uuid>, Option<jiff::Timestamp>) =
-        dsl::harvest_schedules
-            .find(id)
-            .select((dsl::fire_claim_token, dsl::fire_claimed_until))
-            .first(conn)
-            .await
-            .expect("load schedule claim");
-    let live = token.is_some() && until.is_some_and(|u| u > Timestamp::now());
+    let (token, until) = dsl::harvest_schedules
+        .find(id)
+        .select((dsl::fire_claim_token, dsl::fire_claimed_until))
+        .first::<(Option<uuid::Uuid>, NullableTimestamp)>(conn)
+        .await
+        .expect("load schedule claim");
+    let live = token.is_some() && until.0.is_some_and(|u| u > Timestamp::now());
     (token, live)
 }
 

@@ -15,6 +15,7 @@
 //!   never selected.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
 use std::sync::Mutex;
 
@@ -157,16 +158,18 @@ async fn load_breach_flags(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> (bool, Option<jiff::Timestamp>, String) {
-    harvest_workflow_executions::table
+    let (breached, breached_at, state) = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select((
             harvest_workflow_executions_ext::sla_breached,
             harvest_workflow_executions_ext::sla_breached_at,
             harvest_workflow_executions::state,
         ))
-        .first(conn)
+        .first::<(bool, Option<SqlTimestamp>, String)>(conn)
         .await
-        .expect("load breach flags")
+        .expect("load breach flags");
+    (breached, breached_at.map(SqlTimestamp::to_jiff), state)
+
 }
 
 // ── AC#3 / AC#4: flip exactly once, idempotent across repeated scans ─────────

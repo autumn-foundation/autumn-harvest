@@ -365,8 +365,8 @@ fn sleep_until_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let deadline_millis = input["deadline_millis"].as_i64().unwrap_or(0);
-        let deadline = jiff::Timestamp::from_millisecond(deadline_millis).ok()
-            .ok_or_else(|| "bad deadline".to_string())?;
+        let deadline = jiff::Timestamp::from_millisecond(deadline_millis)
+            .map_err(|_| "bad deadline".to_string())?;
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -2939,7 +2939,7 @@ fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent
 /// capture that `should_continue_as_new()` records when a deadline exists (the
 /// recorded wall clock is `t0 + consumed_secs`).
 fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
-    let t0 = jiff::Timestamp::from_millisecond(t0_millis).ok().unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
     let recorded_now = t0 + jiff::SignedDuration::from_secs(consumed_secs);
     vec![
         WorkflowEvent::WorkflowStarted {
@@ -2992,7 +2992,7 @@ fn deadline_branch_history(
 /// a durable timer, but the old binary recorded NO `SideEffectRecorded{Now}`
 /// at the `should_continue_as_new()` call site.
 fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
-    let t0 = jiff::Timestamp::from_millisecond(t0_millis).ok().unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "cycle": 0 }),
@@ -3017,7 +3017,7 @@ fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
 /// `should_continue_as_new()` call site, then the durable timer. The probe
 /// must leave the user's `Now` for `ctx.system_now()`.
 fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
-    let t0 = jiff::Timestamp::from_millisecond(t0_millis).ok().unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
     // The user's recorded wall clock, well within the 30s budget. Even a buggy
     // probe that consumes it does not trip the deadline branch. That isolates
     // the failure to the stolen-`Now` divergence.

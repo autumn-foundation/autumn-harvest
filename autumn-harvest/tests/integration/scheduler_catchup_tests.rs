@@ -15,6 +15,8 @@ use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
 use jiff::Timestamp;
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -171,7 +173,7 @@ async fn insert_catchup_schedule(
             dsl::catchup.eq(catchup_bool),
             dsl::max_active_runs.eq(200),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(overdue_secs)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(overdue_secs)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("allow"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -237,7 +239,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
     assert_eq!(exec_count, 1, "MostRecent: exactly 1 execution must fire");
 
     // `last_catchup_dropped` must be > 0 (missed - 1).
-    let (dropped, last_catchup_at): (i32, Option<jiff::Timestamp>) = harvest_schedules::table
+    let (dropped, last_catchup_at): (i32, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,
@@ -268,7 +270,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
     .await
     .expect("second tick_once must succeed");
 
-    let (dropped_after, last_catchup_at_after): (i32, Option<jiff::Timestamp>) =
+    let (dropped_after, last_catchup_at_after): (i32, Option<SqlTimestamp>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -451,7 +453,7 @@ async fn window_policy_fires_only_in_window_slots() {
         "Window(1h): expected roughly 60 executions in window, got {exec_count}"
     );
 
-    let (dropped, last_catchup_at): (i32, Option<jiff::Timestamp>) = harvest_schedules::table
+    let (dropped, last_catchup_at): (i32, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,

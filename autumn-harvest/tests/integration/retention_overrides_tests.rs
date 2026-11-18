@@ -122,7 +122,7 @@ async fn insert_completed(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -513,7 +513,7 @@ async fn retention_archive_carries_deadline_metadata() {
     // Whole-second so it round-trips through Postgres `timestamptz` (microsecond
     // precision) with an exact equality check against the archived document.
     let deadline_at =
-        Timestamp::from_second(two_days_ago.as_second() + 30).ok().expect("valid deadline");
+        Timestamp::from_second(two_days_ago.as_second() + 30).expect("valid deadline");
     let exec_id = insert_completed_with_deadline(
         &mut conn,
         "deadline_wf",
@@ -726,9 +726,9 @@ async fn insert_completed_with_deadline(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .bind::<diesel::sql_types::Double, _>(f64::from(execution_timeout_secs))
-    .bind::<Timestamptz, _>(deadline_at)
+    .bind::<Timestamptz, _>(deadline_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")

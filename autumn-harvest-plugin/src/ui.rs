@@ -5086,10 +5086,10 @@ fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
         @if let Some(task_kind) = filters.task_kind.map(DeadLetterTaskKind::as_label) {
             input type="hidden" name="task_kind" value=(task_kind);
         }
-        @if let Some(failed_after) = filters.failed_after.map(|ts| autumn_harvest::time::rfc3339(ts)) {
+        @if let Some(failed_after) = filters.failed_after.map(autumn_harvest::time::rfc3339) {
             input type="hidden" name="failed_after" value=(failed_after);
         }
-        @if let Some(failed_before) = filters.failed_before.map(|ts| autumn_harvest::time::rfc3339(ts)) {
+        @if let Some(failed_before) = filters.failed_before.map(autumn_harvest::time::rfc3339) {
             input type="hidden" name="failed_before" value=(failed_before);
         }
         @if let Some(shard_id) = filters.shard_id {
@@ -7238,7 +7238,7 @@ pub(crate) fn pretty_json(value: &Value) -> String {
 pub(crate) fn format_timestamp(ts: Option<Timestamp>) -> String {
     ts.map_or_else(
         || "—".to_string(),
-        |ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        |ts| ts.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
     )
 }
 
@@ -7962,12 +7962,12 @@ impl GanttAxis {
     }
 
     fn span_ms(&self) -> i64 {
-        autumn_harvest::time::num_milliseconds((self.end - self.start)).max(1)
+        autumn_harvest::time::num_milliseconds(self.end - self.start).max(1)
     }
 
     /// The x coordinate (px, including the gutter offset) for an instant.
     fn x_for(&self, t: Timestamp) -> f64 {
-        let offset = autumn_harvest::time::num_milliseconds((t - self.start));
+        let offset = autumn_harvest::time::num_milliseconds(t - self.start);
         self.gutter + x_scale(offset, self.span_ms(), self.width)
     }
 }
@@ -10338,10 +10338,10 @@ async fn schedule_resume_ui(
         )
         .set((
             dsl::is_paused.eq(false),
-            dsl::paused_at.eq(None::<jiff::Timestamp>),
+            dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<jiff::Timestamp>),
+            dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now.to_diesel()),
         ))
@@ -10930,10 +10930,10 @@ async fn schedule_bulk_resume_ui(
         )
         .set((
             dsl::is_paused.eq(false),
-            dsl::paused_at.eq(None::<jiff::Timestamp>),
+            dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<jiff::Timestamp>),
+            dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now.to_diesel()),
         ))
@@ -12987,12 +12987,12 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                     div style="display:flex;gap:16px;align-items:center" {
                         div style="font-size:12px;color:#94a3b8" {
                             "created by " (row.created_by)
-                            " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                            " at " (row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
                             @if let Some(exp) = row.expires_at {
                                 @if is_expired {
-                                    " · expired " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    " · expired " (exp.strftime("%Y-%m-%d %H:%M:%S UTC"))
                                 } @else {
-                                    " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    " · expires " (exp.strftime("%Y-%m-%d %H:%M:%S UTC"))
                                 }
                             }
                         }
@@ -13267,7 +13267,7 @@ mod tests {
         assert_eq!(raw, "2026-01-01T00:00:00Z");
         assert!(error.is_none());
         assert_eq!(
-            parsed.map(|d| autumn_harvest::time::rfc3339(d)),
+            parsed.map(autumn_harvest::time::rfc3339),
             Some("2026-01-01T00:00:00+00:00".to_string())
         );
     }
@@ -17483,7 +17483,7 @@ mod tests {
     ];
 
     fn tl_base() -> Timestamp {
-        ("2026-07-15T12:00:00Z").parse::<Timestamp>()
+        "2026-07-15T12:00:00Z".parse::<Timestamp>()
             .unwrap()
     }
 
@@ -19013,7 +19013,7 @@ mod tests {
         assert!(label.contains("10"), "max_runs missing: {label}");
 
         let ends = HarvestSchedule {
-            end_at: ("2027-01-01T00:00:00Z").parse::<Timestamp>()
+            end_at: "2027-01-01T00:00:00Z".parse::<Timestamp>()
                 .ok(),
             ..make_schedule(Some("wf"), None, false)
         };
@@ -19037,7 +19037,7 @@ mod tests {
     /// jitter is configured, and only `next_run_at` when it is not.
     #[test]
     fn schedule_next_fire_cell_shows_effective_time_only_with_jitter() {
-        let at = ("2026-09-01T12:00:00Z").parse::<Timestamp>()
+        let at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
             .expect("valid fixture timestamp");
 
         let no_jitter = HarvestSchedule {
@@ -20584,7 +20584,7 @@ mod tests {
         let now = jiff::Timestamp::now();
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
             .expect("valid fixture uuid");
-        let next_run_at = ("2026-09-01T12:00:00Z").parse::<Timestamp>()
+        let next_run_at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
             .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
 
@@ -20594,7 +20594,7 @@ mod tests {
             std::time::Duration::from_secs(jitter_secs.cast_unsigned()),
         );
         let effective_fire_time = next_run_at
-            + jiff::SignedDuration::try_from(offset).expect("offset fits in a chrono duration");
+            + jiff::SignedDuration::try_from(offset).expect("offset fits in a jiff duration");
         assert!(
             effective_fire_time > next_run_at,
             "fixture needs a non-zero offset to exercise the jitter path"
@@ -20633,7 +20633,7 @@ mod tests {
     fn jitter_past_cutoff_row() -> HarvestSchedule {
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001568")
             .expect("valid fixture uuid");
-        let next_run_at = ("2026-09-01T12:00:00Z").parse::<Timestamp>()
+        let next_run_at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
             .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
         let effective = crate::api::effective_fire_time(id, Some(next_run_at), jitter_secs)

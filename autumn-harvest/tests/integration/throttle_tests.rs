@@ -28,6 +28,7 @@
 //! - **Operator visibility** — the per-key backlog read returns the counts.
 
 use autumn_harvest::schema::harvest_schedules_ext;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::Ext;
 use std::collections::BTreeMap;
@@ -1999,12 +2000,17 @@ async fn schedule_row(
 ) {
     use diesel_async::RunQueryDsl;
     use harvest_schedules::dsl;
-    dsl::harvest_schedules
+    let (last_run_at, next_run_at) = dsl::harvest_schedules
         .filter(dsl::id.eq(id))
         .select((harvest_schedules_ext::last_run_at, dsl::next_run_at))
-        .first(conn)
+        .first::<(Option<SqlTimestamp>, Option<SqlTimestamp>)>(conn)
         .await
-        .expect("schedule row")
+        .expect("schedule row");
+    (
+        last_run_at.map(SqlTimestamp::to_jiff),
+        next_run_at.map(SqlTimestamp::to_jiff),
+    )
+
 }
 
 /// A scheduled fire whose input exceeds the effective byte cap fails fast
@@ -2344,8 +2350,8 @@ async fn throttled_buffered_deferral_counts_against_max_active_runs() {
     // Simulate a second buffered slot arriving later (without waiting real
     // wall-clock time) by re-populating buffered_runs directly.
     diesel::sql_query("UPDATE harvest_schedules SET buffered_runs = $1 WHERE id = $2")
-        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339((jiff::Timestamp::now()
-            - jiff::SignedDuration::from_secs(10)))]))
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339(jiff::Timestamp::now()
+            - jiff::SignedDuration::from_secs(10))]))
         .bind::<diesel::sql_types::Uuid, _>(sched_id)
         .execute(&mut conn)
         .await

@@ -10,6 +10,7 @@
 //! claim path end-to-end.
 
 use std::sync::{Arc, Mutex};
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
 
 use autumn_harvest::info::WorkflowInfo;
@@ -171,7 +172,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> Uui
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
             // Due 5 seconds ago.
-            dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -234,7 +235,7 @@ async fn test_live_claim_prevents_double_fire() {
     .expect("set pre-existing claim");
 
     // Confirm the claim is in place.
-    let row: (Option<Uuid>, Option<jiff::Timestamp>) = harvest_schedules::table
+    let row: (Option<Uuid>, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::fire_claim_token,

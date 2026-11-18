@@ -2123,7 +2123,7 @@ pub mod db {
                             reason = "a step lasts seconds; microsecond counts stay far below 2^53"
                         )]
                         let secs =
-                            autumn_harvest::time::num_microseconds((at - t0_utc)).unwrap_or(i64::MAX) as f64 / 1e6;
+                            autumn_harvest::time::num_microseconds(at - t0_utc).unwrap_or(i64::MAX) as f64 / 1e6;
                         Some(secs)
                     });
                     Arrival {

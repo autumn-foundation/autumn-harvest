@@ -71,10 +71,12 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityExecutionInfo, WorkflowContext, store};
 
-use jiff::Timestamp;
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -400,7 +402,7 @@ async fn seed_running_activity_probe(
         .set((
             harvest_task_queue::state.eq("RUNNING"),
             harvest_task_queue::worker_id.eq("probe"),
-            harvest_task_queue::started_at.eq(started_at),
+            harvest_task_queue::started_at.eq(started_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -940,19 +942,18 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
     // `started_at + start_to_close`, read off the row the scanner compares
     // against. A "plausible-looking" deadline from any other anchor (e.g.
     // `scheduled_at`, or a local `Instant`) fails here.
-    let (row_started_at, row_stc): (Option<Timestamp>, Option<jiff::SignedDuration>) =
-        harvest_task_queue::table
-            .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-            .filter(harvest_task_queue::task_type.eq("activity"))
-            .select((
-                harvest_task_queue::started_at,
-                harvest_task_queue_ext::start_to_close,
-            ))
-            .first(&mut conn)
-            .await
-            .expect("load the activity task row");
-    let row_started_at = row_started_at.expect("a dispatched activity has started_at");
-    let row_stc = row_stc.expect("start_to_close was configured");
+    let (row_started_at, row_stc) = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select((
+            harvest_task_queue::started_at,
+            harvest_task_queue_ext::start_to_close,
+        ))
+        .first::<(NullableTimestamp, NullablePgDuration)>(&mut conn)
+        .await
+        .expect("load the activity task row");
+    let row_started_at = row_started_at.0.expect("a dispatched activity has started_at");
+    let row_stc = row_stc.0.expect("start_to_close was configured");
     assert_eq!(
         deadline,
         row_started_at + row_stc,
@@ -1041,14 +1042,14 @@ async fn schedule_to_close_shortens_the_reported_deadline() {
     let _ = handle.await;
 
     let deadline = observed.deadlines()[0].expect("a bounded activity has a deadline");
-    let stc_at: Option<Timestamp> = harvest_task_queue::table
+    let stc_at = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .select(harvest_task_queue::schedule_to_close_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load schedule_to_close_at");
-    let stc_at = stc_at.expect("schedule_to_close_at must be persisted");
+    let stc_at = stc_at.0.expect("schedule_to_close_at must be persisted");
 
     assert_eq!(
         deadline, stc_at,
@@ -1060,15 +1061,15 @@ async fn schedule_to_close_shortens_the_reported_deadline() {
     // `started_at + 600s`. Compare against that exact value, not against a
     // `Timestamp::now()`-relative bound — `now > started_at` makes the latter true
     // even when the shortening never happened.
-    let row_started_at: Option<Timestamp> = harvest_task_queue::table
+    let row_started_at = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .select(harvest_task_queue::started_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load started_at");
     let unshortened =
-        row_started_at.expect("a claimed row has started_at") + jiff::SignedDuration::from_secs(600);
+        row_started_at.0.expect("a claimed row has started_at") + jiff::SignedDuration::from_secs(600);
     assert!(
         deadline < unshortened,
         "min-of-two-clocks did not shorten the deadline: reported {deadline}, \

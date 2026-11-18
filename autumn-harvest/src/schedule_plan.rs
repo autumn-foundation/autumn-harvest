@@ -119,7 +119,7 @@ mod tests {
     use crate::policy::Schedule;
 
     fn at(secs: i64) -> Timestamp {
-        Timestamp::from_second(secs).ok().unwrap()
+        Timestamp::from_second(secs).unwrap()
     }
 
     #[test]

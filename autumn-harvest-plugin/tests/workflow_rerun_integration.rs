@@ -384,7 +384,7 @@ async fn seed_execution(
     .bind::<Text, _>(state)
     .bind::<Jsonb, _>(seed.input.unwrap_or_else(|| json!({})))
     .bind::<Timestamptz, _>(now.to_diesel())
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<Nullable<Jsonb>, _>(seed.output)
     .bind::<Nullable<Text>, _>(seed.error)
     .bind::<Nullable<Text>, _>(seed.queue_name)
@@ -460,7 +460,7 @@ async fn seed_retry_successor(
     .bind::<Text, _>(workflow_id)
     .bind::<Text, _>(state)
     .bind::<Timestamptz, _>(now.to_diesel())
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<Text, _>(predecessor)
     .get_result::<IdRow>(conn)
     .await
@@ -1875,7 +1875,7 @@ async fn rerun_seals_source_and_preserves_completed_at() {
     let mut conn = pool.get().await.unwrap();
 
     let wf_id = unique("rr-seal");
-    let fixed = ("2026-02-03T04:05:06Z").parse::<Timestamp>()
+    let fixed = "2026-02-03T04:05:06Z".parse::<Timestamp>()
         .unwrap();
     let source = seed_execution(
         &mut conn,

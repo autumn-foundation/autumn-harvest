@@ -311,7 +311,7 @@ struct TaskQueueStateRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     scheduled_at: jiff::Timestamp,
 }
 
@@ -4055,7 +4055,7 @@ async fn set_outbox_created_at(
 ) {
     diesel::sql_query("UPDATE harvest_completion_trigger_outbox SET created_at = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(id)
-        .bind::<diesel::sql_types::Timestamptz, _>(created_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(created_at.to_diesel())
         .execute(conn)
         .await
         .expect("stamp created_at");

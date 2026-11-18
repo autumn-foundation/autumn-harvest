@@ -3149,7 +3149,7 @@ mod tests {
 
     #[test]
     fn deadline_window_starts_after_the_slot_on_both_clocks() {
-        let db_now = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         let slot = db_now + jiff::SignedDuration::from_secs(45);
         // Host 30 s behind the database: the database-clock slot is later.
@@ -3165,7 +3165,7 @@ mod tests {
 
     #[test]
     fn to_host_clock_keeps_the_offset_across_clock_skew() {
-        let db_now = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>()
             .unwrap();
         // The host runs 30 s ahead of the database.
         let host_now = db_now + jiff::SignedDuration::from_secs(30);
@@ -3893,7 +3893,7 @@ mod tests {
 
     #[test]
     fn time_bucket_formats() {
-        let ts = ("2026-05-18T03:42:17Z").parse::<Timestamp>()
+        let ts = "2026-05-18T03:42:17Z".parse::<Timestamp>()
             .unwrap();
         assert_eq!(
             TimeBucketGranularity::Hour.format(ts),

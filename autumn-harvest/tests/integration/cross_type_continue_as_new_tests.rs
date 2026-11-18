@@ -582,7 +582,7 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
         .chain_deadline_at
         .expect("successor chain_deadline_at");
     assert!(
-        autumn_harvest::time::num_milliseconds((chain_deadline - frozen_chain_deadline))
+        autumn_harvest::time::num_milliseconds(chain_deadline - frozen_chain_deadline)
             .abs()
             < 1_000,
         "chain_deadline_at must be the predecessor's ABSOLUTE value ({frozen_chain_deadline}), \
@@ -994,11 +994,11 @@ async fn park_occupant(
         .execute(conn)
         .await
         .expect("detach the occupant from the queue");
-    let completed_at = autumn_harvest::erase::is_terminal_state(state).then(Utc::now);
+    let completed_at = autumn_harvest::erase::is_terminal_state(state).then(Timestamp::now);
     diesel::update(harvest_workflow_executions::table.find(occupant.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

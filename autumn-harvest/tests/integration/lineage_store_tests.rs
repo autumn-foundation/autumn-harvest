@@ -26,6 +26,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use jiff::{SignedDuration, Timestamp};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -118,8 +119,8 @@ async fn insert(conn: &mut AsyncPgConnection, spec: InsertSpec<'_>) -> Execution
     diesel::update(t::table.find(exec_id.as_uuid()))
         .set((
             t::state.eq(spec.state),
-            t::started_at.eq(started_at),
-            t::completed_at.eq(completed_at),
+            t::started_at.eq(started_at.to_diesel()),
+            t::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

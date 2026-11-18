@@ -24,6 +24,8 @@ use autumn_harvest::telemetry::MetricsRecorder;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
+use jiff_diesel::ToDiesel;
+
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use testcontainers::ContainerAsync;
@@ -162,7 +164,7 @@ async fn insert_running_task_of_type(
     .bind::<diesel::sql_types::Text, _>(task_type)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(workflow_exec_id)
     .bind::<diesel::sql_types::Text, _>(worker_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert running task");

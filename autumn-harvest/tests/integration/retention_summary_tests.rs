@@ -147,8 +147,8 @@ async fn insert_completed_full(
     .bind::<Nullable<Jsonb>, _>(output)
     .bind::<Nullable<Text>, _>(error)
     .bind::<Nullable<Jsonb>, _>(search_attrs)
-    .bind::<Timestamptz, _>(started_at)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(started_at.to_diesel())
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -228,8 +228,8 @@ async fn insert_summary(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(started_at)
-    .bind::<Timestamptz, _>(completed_at)
+    .bind::<Timestamptz, _>(started_at.to_diesel())
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert summary")
@@ -739,7 +739,7 @@ async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at:
          VALUES ($1, gen_random_uuid(), $2)",
     )
     .bind::<diesel::sql_types::Uuid, _>(source)
-    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Timestamptz, _>(fired_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert fire");
@@ -757,7 +757,7 @@ async fn insert_resolved_fire(
             (source_exec_id, trigger_id, fired_at, outcome)
          VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2)",
     )
-    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Timestamptz, _>(fired_at.to_diesel())
     .bind::<Text, _>(outcome)
     .execute(conn)
     .await

@@ -752,7 +752,7 @@ struct CanaryRowDb {
     #[diesel(sql_type = Text)]
     state: String,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     started_at: Timestamp,
     #[diesel(sql_type = Nullable<Timestamptz>)]
     #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]

@@ -6,12 +6,13 @@
 //! exercises `autumn_harvest::audit` insert/list/filter behaviour.
 
 use autumn_harvest::audit::{
-use jiff_diesel::ToDiesel;
     self, AuditFilters, OP_WORKFLOW_CANCEL, OP_WORKFLOW_START, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_SCHEDULE, TARGET_WORKFLOW,
 };
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::schema::harvest_audit_log;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
@@ -415,11 +416,14 @@ async fn audit_list_filter_by_target_id() {
 async fn audit_list_date_range_since() {
     let (mut conn, _c) = make_conn().await;
 
-    let before = ("2026-05-06T12:00:00Z").parse::<Timestamp>()
+    let before = "2026-05-06T12:00:00Z"
+        .parse::<Timestamp>()
         .expect("fixed before timestamp");
-    let midpoint = ("2026-05-06T12:30:00Z").parse::<Timestamp>()
+    let midpoint = "2026-05-06T12:30:00Z"
+        .parse::<Timestamp>()
         .expect("fixed midpoint timestamp");
-    let after = ("2026-05-06T13:00:00Z").parse::<Timestamp>()
+    let after = "2026-05-06T13:00:00Z"
+        .parse::<Timestamp>()
         .expect("fixed after timestamp");
 
     let before_id = audit::insert_audit(

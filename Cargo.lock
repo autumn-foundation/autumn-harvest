@@ -612,7 +612,6 @@ dependencies = [
  "aws-sdk-sqs",
  "base64 0.23.1",
  "chrono",
- "chrono-tz",
  "deadpool",
  "diesel",
  "diesel-async",

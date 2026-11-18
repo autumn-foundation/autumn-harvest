@@ -25,6 +25,7 @@
 //! `scrub()`s first for isolation.
 
 use std::sync::Arc;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
 
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
@@ -182,9 +183,10 @@ async fn updated_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> Timestamp {
     dsl::harvest_schedules
         .find(id)
         .select(dsl::updated_at)
-        .first::<Timestamp>(conn)
+        .first::<SqlTimestamp>(conn)
         .await
         .expect("updated_at")
+        .to_jiff()
 }
 
 /// Rows the firing pass (`tick_workflow_schedules`) would consider due.
@@ -700,7 +702,10 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
     // Give the squatter operator state and counters worth losing. The
     // timestamp is truncated to microseconds so the round-trip compares
     // exactly -- Postgres stores `timestamptz` at microsecond precision.
-    let pinned_next_run = (Timestamp::now() + jiff::SignedDuration::from_hours(5)).trunc_subsecs(6);
+    let pinned_next_run = Timestamp::from_microsecond(
+        (Timestamp::now() + jiff::SignedDuration::from_hours(5)).as_microsecond(),
+    )
+    .unwrap();
     diesel::update(dsl::harvest_schedules.find(squatter))
         .set((
             dsl::is_paused.eq(true),
@@ -730,11 +735,13 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
             bool,
             Option<String>,
             i32,
-            Option<Timestamp>,
+            Option<SqlTimestamp>,
             serde_json::Value,
         )>(&mut conn)
         .await
         .expect("the released row must still exist");
+    let next_run_at = next_run_at.map(SqlTimestamp::to_jiff);
+
 
     assert!(is_paused, "an operator pause must survive the release");
     assert_eq!(paused_by.as_deref(), Some("operator"));

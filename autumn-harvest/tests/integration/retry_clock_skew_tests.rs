@@ -111,7 +111,7 @@ async fn claim_one(conn: &mut AsyncPgConnection, queue: &str) -> Uuid {
 #[derive(diesel::QueryableByName)]
 struct ScheduledAtRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     scheduled_at: Timestamp,
 }
 
@@ -127,7 +127,7 @@ async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> Timestamp {
 #[derive(diesel::QueryableByName)]
 struct NowRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     now: Timestamp,
 }
 
@@ -161,7 +161,7 @@ async fn assert_scheduled_at_matches_delay_on_db_clock(
     let now = db_now(conn).await;
     let deadline = scheduled_at(conn, task_id).await;
     let held = deadline - now;
-    let drift = autumn_harvest::time::num_milliseconds((held - delay)).abs();
+    let drift = autumn_harvest::time::num_milliseconds(held - delay).abs();
     assert!(
         drift <= TOLERANCE_MS,
         "expected scheduled_at ({deadline}) to land within {TOLERANCE_MS}ms of \

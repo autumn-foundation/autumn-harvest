@@ -18937,7 +18937,7 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::shard::ShardRouter;
     use crate::types::{ActivityExecId, ShardId};
-    use jiff::{SignedDuration, Timestamp};
+    use jiff::Timestamp;
     use std::time::Duration;
 
     // ── Embedded-backend context (issue #2024) ──────────────────────────────
@@ -21873,7 +21873,7 @@ mod tests {
 
     #[test]
     fn context_now_returns_deterministic_time() {
-        let fixed_time = ("2026-01-15T10:30:00Z").parse::<Timestamp>()
+        let fixed_time = "2026-01-15T10:30:00Z".parse::<Timestamp>()
             .expect("valid timestamp");
 
         let events = vec![WorkflowEvent::WorkflowStarted {

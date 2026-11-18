@@ -36,6 +36,7 @@ use autumn_harvest::models::HarvestSchedule;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ActivityContext, StartSource, StartWorkflowParams, WorkflowContext};
@@ -571,7 +572,7 @@ impl PgWorld {
 
     /// The tick that holds a stored instant.
     fn tick_of(&self, at: Timestamp) -> u64 {
-        let virtual_ms = autumn_harvest::time::num_milliseconds((at - self.t0)) + self.shift_ms;
+        let virtual_ms = autumn_harvest::time::num_milliseconds(at - self.t0) + self.shift_ms;
         u64::try_from(virtual_ms.div_euclid(TICK_MS)).expect("an instant after the start")
     }
 
@@ -761,7 +762,7 @@ impl PgWorld {
 
     async fn read_snapshot(&mut self) -> Snapshot {
         use harvest_workflow_executions::dsl;
-        let rows: Vec<(uuid::Uuid, String, Option<Timestamp>)> =
+        let rows: Vec<(uuid::Uuid, String, NullableTimestamp)> =
             dsl::harvest_workflow_executions
                 .order((dsl::started_at.asc(), dsl::id.asc()))
                 .select((dsl::id, dsl::state, dsl::nd_blocked_at))
@@ -789,7 +790,7 @@ impl PgWorld {
             executions.push(ExecFacts {
                 label,
                 status,
-                blocked: blocked.is_some(),
+                blocked: blocked.0.is_some(),
                 expected: Some(expected),
                 events: Fact::from_events(&history.events),
             });

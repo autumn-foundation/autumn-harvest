@@ -27,6 +27,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use jiff::Timestamp;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -2373,7 +2374,7 @@ async fn seed_completion_trigger_fire(
     )
     .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(trigger_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(fired_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fired_at.to_diesel())
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(outcome)
     .execute(conn)
     .await
@@ -2399,7 +2400,7 @@ async fn seed_completion_trigger_fire_with_target(
     )
     .bind::<diesel::sql_types::Uuid, _>(source_exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(trigger_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(fired_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fired_at.to_diesel())
     .bind::<diesel::sql_types::Integer, _>(target_shard)
     .bind::<diesel::sql_types::Text, _>(target_workflow_name)
     .execute(conn)
@@ -2452,7 +2453,7 @@ async fn append_event_at(
     .bind::<diesel::sql_types::Integer, _>(event_id)
     .bind::<diesel::sql_types::Text, _>(event_type)
     .bind::<diesel::sql_types::Jsonb, _>(payload)
-    .bind::<diesel::sql_types::Timestamptz, _>(timestamp)
+    .bind::<diesel::sql_types::Timestamptz, _>(timestamp.to_diesel())
     .execute(conn)
     .await
     .expect("append event at");

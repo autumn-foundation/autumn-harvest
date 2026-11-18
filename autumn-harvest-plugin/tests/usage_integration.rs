@@ -9,6 +9,7 @@
 //! - enforces the window ceiling and merges across shards;
 //! - degrades gracefully (never a 500) when a shard is unreachable.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::models::{NewHarvestEvent, NewWorkflowExecution};
@@ -212,8 +213,8 @@ async fn seed_execution(
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -258,7 +259,7 @@ async fn seed_activity_event(
                 .filter(dsl::workflow_exec_id.eq(exec_id))
                 .filter(dsl::event_id.eq(event_id)),
         )
-        .set(dsl::timestamp.eq(timestamp))
+        .set(dsl::timestamp.eq(timestamp.to_diesel()))
         .execute(c)
         .await
     })
@@ -275,7 +276,7 @@ async fn empty_fleet_returns_complete_zero_groups() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
             autumn_harvest::time::rfc3339_opts(now, autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
@@ -349,7 +350,7 @@ async fn seed_terminal_event(
                 .filter(dsl::workflow_exec_id.eq(exec_id))
                 .filter(dsl::event_id.eq(event_id)),
         )
-        .set(dsl::timestamp.eq(timestamp))
+        .set(dsl::timestamp.eq(timestamp.to_diesel()))
         .execute(c)
         .await
     })
@@ -371,8 +372,8 @@ async fn default_group_by_is_workflow_name_and_counts_starts() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -409,8 +410,8 @@ async fn terminal_outcomes_counted_by_durable_terminal_events() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -453,7 +454,7 @@ async fn redriven_failure_still_counted_in_the_window_it_occurred() {
         diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id)))
             .set((
                 dsl::state.eq("RUNNING"),
-                dsl::completed_at.eq(None::<Timestamp>),
+                dsl::completed_at.eq(None::<jiff_diesel::Timestamp>),
             ))
             .execute(&mut conn)
             .await
@@ -464,8 +465,8 @@ async fn redriven_failure_still_counted_in_the_window_it_occurred() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -505,8 +506,8 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -554,8 +555,8 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_mins(30)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_mins(30), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -596,8 +597,8 @@ async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((started - SignedDuration::from_mins(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_mins(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(started - SignedDuration::from_mins(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_mins(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -643,8 +644,8 @@ async fn search_attr_group_by_buckets_missing_key_as_unattributed() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}&group_by=search_attr:tenant_id",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -709,8 +710,8 @@ async fn retried_activity_counts_two_executions_one_failure_final_attempt_comput
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((started - SignedDuration::from_mins(5)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(started - SignedDuration::from_mins(5), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -758,8 +759,8 @@ async fn completed_activity_contributes_compute_seconds_but_not_failure_count() 
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((started - SignedDuration::from_mins(5)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(started - SignedDuration::from_mins(5), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -785,8 +786,8 @@ async fn merges_across_shards() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -820,8 +821,8 @@ async fn one_shard_down_is_partial_not_500() {
         &app_partial,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -866,8 +867,8 @@ async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}&group_by=search_attr:tenant_id",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -899,8 +900,8 @@ async fn group_count_over_cap_is_413_naming_the_cap() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;
@@ -932,8 +933,8 @@ async fn group_count_far_over_cap_is_still_413_via_bounded_shard_query() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts((now + SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true),
+            autumn_harvest::time::rfc3339_opts(now + SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true)
         ),
     )
     .await;

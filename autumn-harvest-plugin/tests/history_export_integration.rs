@@ -245,7 +245,7 @@ async fn insert_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -309,7 +309,7 @@ async fn set_running_execution_and_event_times(
         autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time.to_diesel()),
         autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time.to_diesel()),
         autumn_harvest::schema::harvest_workflow_executions::completed_at
-            .eq(None::<jiff::Timestamp>),
+            .eq(None::<jiff_diesel::Timestamp>),
     ))
     .execute(&mut conn)
     .await
@@ -585,7 +585,7 @@ async fn batch_export_carries_deadline_metadata_for_replay() {
     // (27s of a 30s budget => 0.9 >= 0.8). A replay WITHOUT the deadline would
     // schedule `keep_working` and diverge. So a clean replay proves the export
     // carried the deadline metadata.
-    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
     let recorded_now = t0 + SignedDuration::from_secs(27);
     let activity_id = ActivityExecId::new();
     let events = vec![
@@ -743,7 +743,7 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         ShardRouter::single(),
     );
     let updated_after =
-        autumn_harvest::time::rfc3339_opts((recent_event_time - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Millis, true);
+        autumn_harvest::time::rfc3339_opts(recent_event_time - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Millis, true);
     let (status, json) = get_json(
         &app,
         format!(

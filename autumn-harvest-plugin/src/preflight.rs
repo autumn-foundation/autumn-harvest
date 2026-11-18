@@ -2093,7 +2093,7 @@ mod tests {
             scanner,
             poll_interval: Duration::from_secs(poll_interval_secs),
             tick_count,
-            last_tick_at: (tick_count > 0).then(Utc::now),
+            last_tick_at: (tick_count > 0).then(jiff::Timestamp::now),
             age: Duration::from_secs(age_secs),
             has_ticked: tick_count > 0,
             shard,

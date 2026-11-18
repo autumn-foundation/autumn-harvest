@@ -44,6 +44,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
 use jiff::Timestamp;
+use jiff::civil::Weekday;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -359,8 +360,8 @@ async fn wait_for_timer_started(url: &str, exec_id: ExecutionId, timeout: Durati
     .unwrap_or_else(|_| panic!("timer was never armed within {timeout:?}"));
 }
 
-const fn day(y: i32, m: u32, d: u32) -> jiff::civil::Date {
-    autumn_harvest::time::date_ymd(y, m, d).expect("valid date")
+const fn day(y: i16, m: i8, d: i8) -> jiff::civil::Date {
+    jiff::civil::date(y, m, d)
 }
 
 /// The next `count` **weekdays** strictly after `from`.
@@ -381,11 +382,8 @@ fn next_weekdays_after(from: jiff::civil::Date, count: usize) -> Vec<jiff::civil
     let mut out = Vec::with_capacity(count);
     let mut cursor = from;
     while out.len() < count {
-        cursor = cursor.succ_opt().expect("date in range");
-        if !matches!(
-            chrono::Datelike::weekday(&cursor),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ) {
+        cursor = cursor.tomorrow().expect("date in range");
+        if !matches!(cursor.weekday(), Weekday::Saturday | Weekday::Sunday) {
             out.push(cursor);
         }
     }
@@ -404,10 +402,8 @@ fn reference_business_deadline(
     n: u32,
     holidays: &[jiff::civil::Date],
 ) -> Timestamp {
-    use jiff::Timestamp;
-
     let is_business = |d: jiff::civil::Date| {
-        !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&d)
+        !matches!(d.weekday(), Weekday::Saturday | Weekday::Sunday) && !holidays.contains(&d)
     };
 
     let start = autumn_harvest::time::utc_date(anchor);
@@ -420,11 +416,9 @@ fn reference_business_deadline(
         }
         // The anchor's own date counts as business day 0.
         if business_days_seen == n {
-            return candidate
-                .and_time(anchor.time())
-                .and_local_timezone(Utc)
-                .single()
-                .expect("UTC has no ambiguous local times");
+            let time = autumn_harvest::time::utc_datetime(anchor).time();
+            return autumn_harvest::time::from_utc_datetime(candidate.to_datetime(time))
+                .expect("the deadline is inside the jiff range");
         }
         business_days_seen += 1;
     }
@@ -556,10 +550,7 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
         "resolved deadline landed ON a holiday: {landed}"
     );
     assert!(
-        !matches!(
-            chrono::Datelike::weekday(&landed),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ),
+        !matches!(landed.weekday(), Weekday::Saturday | Weekday::Sunday),
         "resolved deadline landed on a weekend: {landed}"
     );
 

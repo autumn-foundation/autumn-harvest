@@ -185,9 +185,9 @@ async fn insert_bucket_at(
     .bind::<Double, _>(refill_rate)
     .bind::<Double, _>(burst)
     .bind::<Double, _>(tokens)
-    .bind::<Timestamptz, _>(last_refilled_at)
-    .bind::<Timestamptz, _>(created_at)
-    .bind::<Timestamptz, _>(updated_at)
+    .bind::<Timestamptz, _>(last_refilled_at.to_diesel())
+    .bind::<Timestamptz, _>(created_at.to_diesel())
+    .bind::<Timestamptz, _>(updated_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert bucket");
@@ -212,8 +212,8 @@ async fn set_override(
           WHERE key = $1",
     )
     .bind::<Text, _>(key)
-    .bind::<Timestamptz, _>(expires_at)
-    .bind::<Timestamptz, _>(updated_at)
+    .bind::<Timestamptz, _>(expires_at.to_diesel())
+    .bind::<Timestamptz, _>(updated_at.to_diesel())
     .execute(conn)
     .await
     .expect("set override");
@@ -259,7 +259,7 @@ struct KeyRow {
 #[derive(diesel::QueryableByName)]
 struct TsRow {
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     updated_at: Timestamp,
 }
 

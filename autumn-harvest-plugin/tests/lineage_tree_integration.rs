@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -271,8 +272,8 @@ async fn insert(conn: &mut AsyncPgConnection, spec: Spec<'_>) -> ExecutionId {
     diesel::update(wfx::table.find(exec_id.as_uuid()))
         .set((
             wfx::state.eq(spec.state),
-            wfx::started_at.eq(started_at),
-            wfx::completed_at.eq(completed_at),
+            wfx::started_at.eq(started_at.to_diesel()),
+            wfx::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

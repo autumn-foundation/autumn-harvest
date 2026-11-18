@@ -43,8 +43,8 @@ fn utc(s: &str) -> Timestamp {
     s.parse::<Timestamp>().expect("valid RFC 3339 instant")
 }
 
-const fn day(y: i32, m: u32, d: u32) -> jiff::civil::Date {
-    autumn_harvest::time::date_ymd(y, m, d).expect("valid date")
+const fn day(y: i16, m: i8, d: i8) -> jiff::civil::Date {
+    jiff::civil::date(y, m, d)
 }
 
 /// The workflow under test: arm a single business-day timer, then complete.
@@ -204,7 +204,7 @@ async fn replay_business_day_1000_distinct_fixtures_all_succeed() {
         // Vary the recorded skip set too, so no two fixtures share a payload.
         // An all-identical corpus would make 1000 iterations no stronger than 1.
         let skipped: Vec<jiff::civil::Date> = (0..(i % 3))
-            .map(|k| autumn_harvest::time::utc_date((anchor + autumn_harvest::time::days(i64::from(k) + 1))))
+            .map(|k| autumn_harvest::time::utc_date(anchor + autumn_harvest::time::days(i64::from(k) + 1)))
             .collect();
         let events = history(anchor, deadline, &skipped);
 

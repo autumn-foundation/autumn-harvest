@@ -290,7 +290,7 @@ pub(crate) async fn create_token(
         tenant,
     };
     let row: ApiToken = diesel::insert_into(harvest_api_tokens::table)
-        .values(&new)
+        .values(new)
         .returning(ApiToken::as_returning())
         .get_result(conn)
         .await?;

@@ -188,7 +188,7 @@ mod tests {
     /// consumed ~90% of a 30s budget when it checked `should_continue_as_new()`.
     #[tokio::test]
     async fn crossed_deadline_replays_to_continue_as_new() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ the deadline branch tripped
         // and the run forked, carrying its state forward.
         let recorded_now = t0 + SignedDuration::from_secs(27);
@@ -235,7 +235,7 @@ mod tests {
     /// pure, event-free read of the recorded start clock.
     #[test]
     fn deadline_helpers_are_pure_and_event_free() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = WorkflowContext::for_replay(
             ExecutionId::new(),
             vec![WorkflowEvent::WorkflowStarted {

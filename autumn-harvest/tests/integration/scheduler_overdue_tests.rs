@@ -20,6 +20,7 @@ use autumn_harvest::scheduler::{
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_OVERDUE, MetricsRecorder};
 use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -126,13 +127,13 @@ async fn insert_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(max_active_runs),
             dsl::is_paused.eq(is_paused),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(exhausted_at),
+            dsl::exhausted_at.eq(exhausted_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -177,16 +178,16 @@ async fn insert_schedule_bounded(
             dsl::catchup.eq(catchup),
             dsl::max_active_runs.eq(max_active_runs),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq(overlap_policy),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(Option::<Timestamp>::None), // NULL — tick has not stamped it
+            dsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>), // NULL — tick has not stamped it
             dsl::max_runs.eq(max_runs),
             dsl::runs_started.eq(runs_started),
-            dsl::end_at.eq(end_at),
+            dsl::end_at.eq(end_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -216,7 +217,7 @@ async fn insert_calendar_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(next_run_at),
+            dsl::next_run_at.eq(next_run_at.to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),

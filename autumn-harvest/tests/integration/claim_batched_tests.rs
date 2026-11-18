@@ -31,6 +31,7 @@ use autumn_harvest::queue::{
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -665,7 +666,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() 
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            Some(deadline),
+                            Some(deadline.to_diesel()),
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -747,7 +748,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            Some(deadline),
+                            Some(deadline.to_diesel()),
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -845,7 +846,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(&worker_build)
                         .load(conn)
@@ -950,7 +951,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_capability_mismatch
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1060,7 +1061,7 @@ async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_sca
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1232,7 +1233,7 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1350,7 +1351,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            Some(deadline),
+                            Some(deadline.to_diesel()),
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1479,7 +1480,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
                             "breaker-bypassed".to_string(),
                         ])
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1739,7 +1740,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_build_incompatible_ca
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(&worker_build)
                         .load(conn)
@@ -1830,7 +1831,7 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1930,7 +1931,7 @@ async fn batched_claim_attempt_rechecks_build_routing_not_just_the_batch_scan() 
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<jiff::Timestamp>,
+                            None::<jiff_diesel::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(worker_build_id)
                         .load(conn)

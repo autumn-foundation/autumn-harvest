@@ -958,7 +958,7 @@ mod tests {
     /// A runtime at a fixed clock with two timers: 5 s and 90 s out.
     async fn two_timers(dir: &std::path::Path, t0: i64) -> SqliteRuntime {
         let mut runtime = SqliteRuntime::open(&dir.join("t.harvest.db")).expect("open");
-        runtime.set_clock(move || jiff::Timestamp::from_millisecond(t0).ok().expect("time"));
+        runtime.set_clock(move || jiff::Timestamp::from_millisecond(t0).expect("time"));
         runtime.register_workflow(&dozing_info());
         runtime
             .start_workflow("dozing", serde_json::json!(5))

@@ -173,8 +173,8 @@ async fn insert_execution(
     ))
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(created_at)
-    .bind::<diesel::sql_types::Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Timestamptz, _>(created_at.to_diesel())
+    .bind::<diesel::sql_types::Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")

@@ -35,6 +35,7 @@
 //! `HARVEST_TEST_DATABASE_URL` when set, else boots two fresh testcontainers
 //! Postgres-backed shard databases.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -297,7 +298,7 @@ async fn seed_with_state(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await

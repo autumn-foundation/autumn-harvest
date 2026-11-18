@@ -25,6 +25,8 @@ use autumn_harvest::{
     StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
 };
 use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
+
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -129,8 +131,8 @@ async fn seed_run(
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(id)))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

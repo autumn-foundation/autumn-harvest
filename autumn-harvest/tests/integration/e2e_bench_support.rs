@@ -4534,7 +4534,7 @@ pub mod db {
                 clippy::cast_precision_loss,
                 reason = "microsecond offsets on one host are far below 2^53"
             )]
-            let offset = autumn_harvest::time::num_microseconds((row.now - midpoint)).unwrap_or(0) as f64 / 1000.0;
+            let offset = autumn_harvest::time::num_microseconds(row.now - midpoint).unwrap_or(0) as f64 / 1000.0;
             samples.push(offset);
         }
         samples.sort_by(f64::total_cmp);
@@ -4985,7 +4985,7 @@ pub mod db {
                         reason = "a run lasts seconds; microsecond counts stay far below 2^53"
                     )]
                     {
-                        autumn_harvest::time::num_microseconds((*t - start)).unwrap_or(0) as f64 / 1e6
+                        autumn_harvest::time::num_microseconds(*t - start).unwrap_or(0) as f64 / 1e6
                     }
                 })
                 .collect()
@@ -5402,7 +5402,7 @@ pub mod db {
                         reason = "dispatch latencies are milliseconds, far below 2^53 microseconds"
                     )]
                     let ms =
-                        autumn_harvest::time::num_microseconds((*started - created_at)).unwrap_or(0) as f64 / 1000.0;
+                        autumn_harvest::time::num_microseconds(*started - created_at).unwrap_or(0) as f64 / 1000.0;
                     if ms < 0.0 {
                         negative += 1;
                     }

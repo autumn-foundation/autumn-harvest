@@ -36,6 +36,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::{ChildPlacement, ShardRouter, ShardedDbPool};
 use autumn_harvest::telemetry::TelemetryConfig;
+use autumn_harvest::time::sql::{NullableTimestamp, SqlTimestamp};
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
@@ -642,14 +643,14 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     }
 
     let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
-    let (created_at, chain_deadline_at): (jiff::Timestamp, Option<jiff::Timestamp>) =
+    let (SqlTimestamp(created_at), NullableTimestamp(chain_deadline_at)) =
         harvest_workflow_executions::table
             .find(child_id.as_uuid())
             .select((
                 harvest_workflow_executions::created_at,
                 harvest_workflow_executions_ext::chain_deadline_at,
             ))
-            .first(&mut *child_conn)
+            .first::<(SqlTimestamp, NullableTimestamp)>(&mut *child_conn)
             .await
             .expect("child row must exist on its target shard");
 
@@ -3129,7 +3130,7 @@ async fn a_retry_for_an_existing_child_needs_no_key() {
         .set((
             harvest_cross_shard_children::status.eq("PENDING_START"),
             harvest_cross_shard_children::attempts.eq(0),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<jiff::Timestamp>),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<jiff_diesel::Timestamp>),
         ))
         .execute(&mut *conn)
         .await

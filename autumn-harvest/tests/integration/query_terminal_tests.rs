@@ -938,11 +938,9 @@ fn deadline_probe_workflow<'a>(
 /// A start time far enough in the past that a 24h budget is nowhere near
 /// consumed, so `should_continue_as_new()`'s deadline branch never trips.
 const fn probe_t0() -> jiff::Timestamp {
-    let Some(t0) = jiff::Timestamp::from_millisecond(1_700_000_000_000).ok() else {
-        panic!("valid probe start instant")
-    };
-    t0
+    jiff::Timestamp::constant(1_700_000_000, 0)
 }
+
 
 /// A terminal history: `WorkflowStarted`, the reserved deadline probe, one
 /// scheduled/completed pair per item, then `WorkflowCompleted`.

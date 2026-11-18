@@ -23,6 +23,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use autumn_harvest::store;
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
@@ -328,7 +329,7 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
             Option<String>,
             i32,
             Option<String>,
-            jiff::Timestamp,
+            SqlTimestamp,
         )>(&mut conn)
         .await
         .optional()
@@ -339,7 +340,7 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
                 worker_id,
                 attempt,
                 error,
-                scheduled_at,
+                scheduled_at: scheduled_at.to_jiff(),
             },
         )
 }
@@ -577,9 +578,10 @@ async fn drain_stops_keeping_the_lease_once_the_claim_is_lost() {
         harvest_workers::table
             .find(&worker_a)
             .select(harvest_workers::last_heartbeat_at)
-            .first::<jiff::Timestamp>(conn)
+            .first::<SqlTimestamp>(conn)
             .await
             .expect("load the worker row")
+            .to_jiff()
     };
     let before = beat(&mut conn).await;
     tokio::time::sleep(Duration::from_secs(2)).await;

@@ -33,6 +33,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse as _, Response};
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
@@ -542,8 +543,10 @@ pub fn ttl_ms(
 ) -> Option<u64> {
     let completed_at = completed_at?;
     let retention = jiff::SignedDuration::try_from(retention?).ok()?;
-    let expires_at = completed_at.checked_add(retention).ok()?;
-    u64::try_from(autumn_harvest::time::num_milliseconds((expires_at - created_at))).ok()
+    // jiff ends in the year 9999, so a long retention cannot form the
+    // expiry instant. The sum of two durations keeps such a TTL finite.
+    let ttl = (completed_at - created_at).checked_add(retention)?;
+    u64::try_from(autumn_harvest::time::num_milliseconds(ttl)).ok()
 }
 
 /// `true` when the live run keeps the start row from retention.
@@ -1567,9 +1570,10 @@ async fn load_task(
             .filter(wfe::workflow_name.eq(&origin.workflow_name))
             .filter(wfe::workflow_id.eq(&origin.workflow_id))
             .select(diesel::dsl::max(wfe::completed_at))
-            .first::<Option<Timestamp>>(&mut conn)
+            .first::<Option<SqlTimestamp>>(&mut conn)
             .await
             .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+            .map(SqlTimestamp::to_jiff)
     } else {
         None
     };
@@ -1758,7 +1762,7 @@ async fn history_head(
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    let (position, at): (Option<i32>, Option<Timestamp>) = harvest_events::table
+    let (position, at): (Option<i32>, Option<SqlTimestamp>) = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(run))
         .select((
             diesel::dsl::max(harvest_events::event_id),
@@ -1767,7 +1771,7 @@ async fn history_head(
         .first(&mut conn)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    Ok(position.zip(at))
+    Ok(position.zip(at.map(SqlTimestamp::to_jiff)))
 }
 
 /// The open signal waits of a live run, and the time it last changed.
@@ -1834,9 +1838,12 @@ async fn open_signal_waits(
         .filter(harvest_signals::workflow_exec_id.eq(live.id))
         .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
-        .load(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
-        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(name, at)| (name, at.to_jiff()))
+        .collect();
     drop(conn);
 
     let mut last_updated_at = last_event_at;

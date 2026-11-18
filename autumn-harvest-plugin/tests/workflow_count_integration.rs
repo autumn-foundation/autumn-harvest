@@ -6,6 +6,7 @@
 //! It merges across shards and degrades gracefully (never a 500) when a shard is
 //! unreachable.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::models::NewWorkflowExecution;
@@ -205,8 +206,8 @@ async fn seed_execution(
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await

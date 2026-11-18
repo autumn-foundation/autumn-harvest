@@ -12,6 +12,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, SqlTimestamp};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -314,7 +315,7 @@ struct Deadlines {
 /// The start path takes its clock reading a few milliseconds before the row
 /// default `started_at`, so an exact comparison would be off by that gap.
 fn whole_secs(started_at: Timestamp, at: Timestamp) -> jiff::SignedDuration {
-    jiff::SignedDuration::from_secs((autumn_harvest::time::num_milliseconds((at - started_at)) + 500).div_euclid(1000))
+    jiff::SignedDuration::from_secs((autumn_harvest::time::num_milliseconds(at - started_at) + 500).div_euclid(1000))
 }
 
 impl Deadlines {
@@ -340,13 +341,9 @@ async fn deadlines(url: &str, id: Uuid) -> Deadlines {
                 dsl::deadline_at,
                 harvest_workflow_executions_ext::sla_breached,
             ))
-            .first::<(
-                Timestamp,
-                Option<Timestamp>,
-                Option<Timestamp>,
-                bool,
-            )>(&mut conn)
+            .first::<(SqlTimestamp, NullableTimestamp, NullableTimestamp, bool)>(&mut conn)
             .await
+            .map(|(a, b, c, d)| (a.0, b.0, c.0, d))
             .expect("load execution");
     Deadlines {
         started_at,
@@ -617,12 +614,9 @@ async fn chain_cap(url: &str, id: Uuid) -> (Option<jiff::SignedDuration>, Option
             harvest_workflow_executions_ext::chain_execution_timeout,
             harvest_workflow_executions_ext::chain_deadline_at,
         ))
-        .first::<(
-            Timestamp,
-            Option<jiff::SignedDuration>,
-            Option<Timestamp>,
-        )>(&mut conn)
+        .first::<(SqlTimestamp, NullablePgDuration, NullableTimestamp)>(&mut conn)
         .await
+        .map(|(a, b, c)| (a.0, b.0, c.0))
         .expect("load execution");
     (timeout, deadline.map(|at| whole_secs(started_at, at)))
 }

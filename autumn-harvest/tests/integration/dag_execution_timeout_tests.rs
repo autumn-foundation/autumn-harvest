@@ -37,6 +37,7 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::MetricsRecorder;
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::timeout;
 use autumn_harvest::types::{
     ExecutionId, Priority, ShardId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
@@ -658,10 +659,11 @@ async fn load_fired_deadline(
             harvest_workflow_executions::deadline_at,
             harvest_workflow_executions_ext::sla_deadline_at,
         ))
-        .first(conn)
+        .first::<(Uuid, NullableTimestamp, NullableTimestamp)>(conn)
         .await
         .optional()
         .expect("query fired execution")
+        .map(|(id, deadline, sla_deadline)| (id, deadline.0, sla_deadline.0))
         .expect("the tick must have fired an execution for this DAG")
 }
 

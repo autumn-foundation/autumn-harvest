@@ -18,8 +18,9 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -206,8 +207,8 @@ async fn seed_run(
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -227,7 +228,7 @@ async fn seed_schedule(url: &str, schedule_id: Uuid, next_run_at: Option<Timesta
     )
     .bind::<diesel::sql_types::Uuid, _>(schedule_id)
     .bind::<diesel::sql_types::Text, _>("nightly_etl")
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run_at.to_diesel())
     .execute(&mut conn)
     .await
     .expect("insert schedule");

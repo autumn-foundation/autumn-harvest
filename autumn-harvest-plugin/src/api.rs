@@ -3,7 +3,7 @@
 
 use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
 use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
+use autumn_harvest::time::sql::SqlTimestamp;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -3817,7 +3817,7 @@ struct HistoryExportCandidate {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     last_history_event_at: jiff::Timestamp,
     // Issue #772: the per-execution replay deadline budget. The batch export
     // carries it, so `harvest-replay` / `replay_from_json` threads the
@@ -3877,7 +3877,7 @@ struct HistorySampleCandidate {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     started_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     #[diesel(deserialize_as = autumn_harvest::time::sql::NullablePgDuration)]
@@ -13173,6 +13173,29 @@ fn load_shed_response(
     response
 }
 
+/// Returns `secs` seconds, or `None` past `i64::MAX` milliseconds.
+///
+/// That bound is the range of `chrono::Duration::try_seconds`, which the start
+/// routes used before jiff. A jiff duration holds more. The bound stays, so a
+/// start route accepts exactly the request values that it accepted before.
+fn try_seconds(secs: i64) -> Option<jiff::SignedDuration> {
+    const MAX_SECS: i64 = i64::MAX / 1_000;
+    (-MAX_SECS..=MAX_SECS)
+        .contains(&secs)
+        .then(|| jiff::SignedDuration::from_secs(secs))
+}
+
+/// Converts `duration`, or returns `None` past `i64::MAX` milliseconds.
+///
+/// That bound is the range of `chrono::Duration::from_std`. The start routes
+/// keep it, so a delay or a delay cap converts exactly as it did before jiff.
+fn std_to_chrono_range(duration: Duration) -> Option<jiff::SignedDuration> {
+    if duration > autumn_harvest::builder::MAX_WORKFLOW_DURATION {
+        return None;
+    }
+    jiff::SignedDuration::try_from(duration).ok()
+}
+
 /// Map a failed start to a response.
 ///
 /// A shed start gets [`load_shed_response`]. `map_error` cannot set a header,
@@ -13959,7 +13982,7 @@ pub(crate) fn encode_workflow_list_cursor_raw(
 ) -> String {
     format!(
         "{}|{}",
-        autumn_harvest::time::rfc3339_opts(created_at, autumn_harvest::time::SecondsFormat::Micros, true),
+        autumn_harvest::time::rfc3339_opts(*created_at, autumn_harvest::time::SecondsFormat::Micros, true),
         exec_id
     )
 }
@@ -15135,7 +15158,7 @@ type DiagnoseTaskRow = (
     String,                        // queue_name
     i32,                           // attempt
     Option<String>,                // error
-    jiff::Timestamp, // scheduled_at
+    SqlTimestamp,                  // scheduled_at
     Option<String>,                // rate_limit_key
     Option<String>,                // concurrency_key
     Option<i32>,                   // concurrency_cap
@@ -15153,7 +15176,7 @@ type WorkflowTaskRow = (
     String,                        // state
     Option<String>,                // worker_id
     String,                        // queue_name
-    jiff::Timestamp, // scheduled_at
+    SqlTimestamp,                  // scheduled_at
     Option<String>,                // required_build_id
     Option<serde_json::Value>,     // required_capabilities
     Option<uuid::Uuid>,            // session_id
@@ -15162,12 +15185,12 @@ type WorkflowTaskRow = (
     // #501: pre-upgrade rows have none). This stays `Option` for that
     // reason, even though every row this endpoint's own writes produce
     // sets it.
-    Option<jiff::Timestamp>, // created_at
+    Option<SqlTimestamp>,          // created_at
     // Issue #1402: the timer-provenance marker `is_the_missed_timer_wake`
     // checks. `scheduled_at` alone can stop proving ownership: a
     // queue-pause resume credit, an orphan reclaim, or a capability-miss
     // release can each drift it.
-    Option<jiff::Timestamp>, // timer_fires_at
+    Option<SqlTimestamp>,          // timer_fires_at
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -15707,9 +15730,10 @@ pub(crate) async fn build_diagnosis_report(
     let last_event_at: Option<jiff::Timestamp> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .select(diesel::dsl::max(harvest_events::timestamp))
-        .first::<Option<jiff::Timestamp>>(&mut conn)
+        .first::<Option<SqlTimestamp>>(&mut conn)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .map(SqlTimestamp::to_jiff);
     let last_event_age_seconds = last_event_at.map(|ts| {
         std::time::Duration::try_from(report_started_at - ts)
             .map_or(0.0, |d| d.as_secs_f64())
@@ -15826,7 +15850,7 @@ pub(crate) async fn build_diagnosis_report(
                 queue_name,
                 attempt,
                 error,
-                scheduled_at,
+                scheduled_at: scheduled_at.to_jiff(),
                 rate_limit_key,
                 concurrency_key,
                 concurrency_cap,
@@ -16137,7 +16161,7 @@ pub(crate) async fn build_diagnosis_report(
             // Authoritative, straight from the registry's own flag. It is NEVER
             // inferred from whether `circuit_cooldown_until` could be computed
             // (issue #1193). A policy cooldown outside the representable range
-            // of `chrono` ALSO makes `circuit_cooldown_until` return `None`.
+            // of `jiff` ALSO makes `circuit_cooldown_until` return `None`.
             // That happens for a breaker that was tripped organically. Without
             // the flag, it would be indistinguishable from a genuinely
             // operator-forced one.
@@ -16260,11 +16284,11 @@ pub(crate) async fn build_diagnosis_report(
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))
         .select(harvest_timers::fires_at)
-        .load::<jiff::Timestamp>(&mut conn)
+        .load::<SqlTimestamp>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
-        .map(|fires_at| PendingTimerFacts { fires_at })
+        .map(|fires_at| PendingTimerFacts { fires_at: fires_at.to_jiff() })
         .collect();
 
     let workflow_task = workflow_task_row.map(
@@ -16309,9 +16333,9 @@ pub(crate) async fn build_diagnosis_report(
                 ),
                 state,
                 queue_name,
-                scheduled_at,
-                created_at,
-                timer_fires_at,
+                scheduled_at: scheduled_at.to_jiff(),
+                created_at: created_at.map(SqlTimestamp::to_jiff),
+                timer_fires_at: timer_fires_at.map(SqlTimestamp::to_jiff),
             }
         },
     );
@@ -16586,8 +16610,9 @@ fn contributing_reasons_for(
 /// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
 /// timestamp, so the endpoint derives one. Every failure mode resolves to
 /// `None`, never a panic or a wrapped instant. The modes are a NaN, negative
-/// or huge value (`try_from_secs_f64`), a duration outside `chrono`'s range
-/// (`from_std`), and an overflowing instant (`checked_add_signed`). A missing
+/// or huge value (`try_from_secs_f64`), a duration outside the range of
+/// `jiff::SignedDuration` (`try_from`), and an overflowing instant
+/// (`checked_add`). A missing
 /// `cooldown_until` is already the documented shape for a force-opened
 /// breaker, so `None` is never a lie.
 fn circuit_cooldown_until(
@@ -17166,14 +17191,14 @@ async fn get_workflow_stack(
                 harvest_events::event_data,
                 harvest_events::timestamp,
             ))
-            .load::<(i32, serde_json::Value, jiff::Timestamp)>(&mut conn)
+            .load::<(i32, serde_json::Value, SqlTimestamp)>(&mut conn)
             .await
             .map_err(database_error)?
             .into_iter()
             .filter_map(|(event_id, data, ts)| {
                 serde_json::from_value::<WorkflowEvent>(data)
                     .ok()
-                    .map(|event| (i64::from(event_id), event, ts))
+                    .map(|event| (i64::from(event_id), event, ts.to_jiff()))
             })
             .collect::<Vec<_>>();
         latest_failures_by_activity(&failure_events)
@@ -17447,10 +17472,11 @@ async fn get_workflow_stack(
             harvest_events::event_data,
             harvest_events::timestamp,
         ))
-        .load::<(String, serde_json::Value, jiff::Timestamp)>(&mut conn)
+        .load::<(String, serde_json::Value, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
-        .into_iter();
+        .into_iter()
+        .map(|(event_type, data, ts)| (event_type, data, ts.to_jiff()));
     let mut pending_local_activities =
         fold_pending_local_activities(local_rows, &failures_by_activity);
     // Decode each SURVIVING pending local activity's `last_failure` error
@@ -17473,7 +17499,7 @@ async fn get_workflow_stack(
         .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_timers::fired.eq(false))
         .select((harvest_timers::timer_id, harvest_timers::fires_at))
-        .load::<(String, jiff::Timestamp)>(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
@@ -17481,20 +17507,21 @@ async fn get_workflow_stack(
             timer_id,
             name: None,
             created_at: None,
-            fires_at,
+            fires_at: fires_at.to_jiff(),
         })
         .collect::<Vec<_>>();
     let buffered_signals = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
         .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
-        .load::<(String, jiff::Timestamp)>(&mut conn)
+        .load::<(String, SqlTimestamp)>(&mut conn)
         .await
         .map_err(database_error)?
         .into_iter()
         .fold(
             std::collections::BTreeMap::<String, (i64, jiff::Timestamp)>::new(),
             |mut acc, (name, ts)| {
+                let ts = ts.to_jiff();
                 acc.entry(name)
                     .and_modify(|entry| {
                         entry.0 += 1;
@@ -17621,7 +17648,7 @@ fn parse_delay_duration(raw: &str) -> Result<std::time::Duration, AutumnError> {
 /// Resolve a workflow's declared default SLA, clamped against its declared
 /// `execution_timeout` (issue #487). An SLA softer than the hard timeout could
 /// never fire (the timeout kills the run first), so cap it. Returns the
-/// effective chrono SLA, or `None` when the workflow declares no SLA.
+/// effective SLA, or `None` when the workflow declares no SLA.
 pub(crate) fn clamp_info_default_sla(
     info_sla: Option<std::time::Duration>,
     info_execution_timeout: Option<std::time::Duration>,
@@ -19245,18 +19272,22 @@ pub(crate) async fn start_workflow(
             }
             return AutumnError::bad_request_msg(err_msg).into_response();
         }
-        let Ok(chrono_d) = jiff::SignedDuration::try_from(std_d) else {
+        let Some(delay) = std_to_chrono_range(std_d) else {
             return AutumnError::bad_request_msg("delay duration overflow").into_response();
         };
-        Some(chrono_d)
+        Some(delay)
     } else {
         None
     };
 
     if let Some(sa) = request.start_at {
-        let max_delay_chrono =
-            jiff::SignedDuration::try_from(max_delay).unwrap_or_else(|_| autumn_harvest::time::days(365));
-        let max_start_at = jiff::Timestamp::now() + max_delay_chrono;
+        let max_delay_bound =
+            std_to_chrono_range(max_delay).unwrap_or_else(|| autumn_harvest::time::days(365));
+        // jiff ends in the year 9999. A later cap saturates, so every
+        // `start_at` is within it, as it was under chrono.
+        let max_start_at = jiff::Timestamp::now()
+            .checked_add(max_delay_bound)
+            .unwrap_or(jiff::Timestamp::MAX);
         if sa > max_start_at {
             let err_msg = format!(
                 "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
@@ -19283,7 +19314,7 @@ pub(crate) async fn start_workflow(
         }
     }
 
-    let max_delay_chrono = jiff::SignedDuration::try_from(max_delay).ok();
+    let max_delay_bound = std_to_chrono_range(max_delay);
 
     // Issue #252: compute effective cap; enforcement happens inside
     // start_or_load_workflow_execution so duplicate-resolution (409) runs first.
@@ -19406,7 +19437,7 @@ pub(crate) async fn start_workflow(
             // clamp `None`. Reject the bad value here instead (issue #499). Negative is
             // also rejected; a non-positive deadline is never a meaningful timeout.
             if let Some(secs) = request.execution_timeout_secs
-                && (secs < 0 || Some(jiff::SignedDuration::from_secs(secs)).is_none())
+                && (secs < 0 || try_seconds(secs).is_none())
             {
                 if let Ok(pool) = api_state.storage_pool()
                     && let Ok(mut c) = acquire_conn(pool.default_pool()).await
@@ -19470,7 +19501,7 @@ pub(crate) async fn start_workflow(
             let effective_sla_secs = request
                 .sla_secs
                 .filter(|&secs| secs >= 0)
-                .and_then(chrono::Duration::try_seconds)
+                .and_then(try_seconds)
                 .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
                 .map(|sla| {
                     info_execution_timeout
@@ -19757,7 +19788,7 @@ pub(crate) async fn start_workflow(
         }
 
         if let Some(secs) = request.execution_timeout_secs
-            && (secs < 0 || Some(jiff::SignedDuration::from_secs(secs)).is_none())
+            && (secs < 0 || try_seconds(secs).is_none())
         {
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut c) = acquire_conn(pool.default_pool()).await
@@ -19817,7 +19848,7 @@ pub(crate) async fn start_workflow(
         let effective_sla_secs = request
             .sla_secs
             .filter(|&secs| secs >= 0)
-            .and_then(chrono::Duration::try_seconds)
+            .and_then(try_seconds)
             .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
             .map(|sla| {
                 info_execution_timeout
@@ -20097,7 +20128,7 @@ pub(crate) async fn start_workflow(
     // at parity with `info_execution_timeout` above. The fleet-wide ceiling from
     // `api_state.max_workflow_chain_timeout()` doubles as a default, applied by
     // `effective_chain_timeout` in the core start path.
-    let info_chain_timeout_chrono =
+    let info_chain_timeout =
         info_chain_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     let max_chain_timeout_ceiling = api_state
         .max_workflow_chain_timeout()
@@ -20113,7 +20144,7 @@ pub(crate) async fn start_workflow(
     let effective_sla = request
         .sla_secs
         .filter(|&secs| secs >= 0)
-        .and_then(chrono::Duration::try_seconds)
+        .and_then(try_seconds)
         .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
         .map(|sla| {
             info_execution_timeout
@@ -20386,7 +20417,7 @@ pub(crate) async fn start_workflow(
                 .map(|d| d.as_secs()),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling captured so the deferred fire keeps the cap.
-            chain_execution_timeout_secs: info_chain_timeout_chrono.map(|d| d.as_secs()),
+            chain_execution_timeout_secs: info_chain_timeout.map(|d| d.as_secs()),
             max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
                 .map(|d| d.as_secs()),
             max_workflow_input_bytes: Some(effective_wf_cap),
@@ -20519,11 +20550,11 @@ pub(crate) async fn start_workflow(
     if let Some(ref key) = idempotency_key {
         // Validate execution_timeout_secs BEFORE building params (issue #808). The
         // range guard inside the debounce/batch blocks is skipped for keyed starts,
-        // because they are mutually exclusive. `chrono::Duration::seconds` panics on
-        // an out-of-range i64. Mirror the existing 400 guard, so an untrusted value is
-        // a clean bad request, never a 500.
+        // because they are mutually exclusive. The guard keeps the value inside the
+        // range of `try_seconds`. Mirror the existing 400 guard, so an untrusted value
+        // is a clean bad request, never a 500.
         if let Some(secs) = request.execution_timeout_secs
-            && (secs < 0 || Some(jiff::SignedDuration::from_secs(secs)).is_none())
+            && (secs < 0 || try_seconds(secs).is_none())
         {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -20553,7 +20584,7 @@ pub(crate) async fn start_workflow(
             StartWorkflowParams {
                 execution_timeout: request
                     .execution_timeout_secs
-                    .map(chrono::Duration::seconds)
+                    .map(jiff::SignedDuration::from_secs)
                     .or_else(|| {
                         info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
                     }),
@@ -20567,7 +20598,7 @@ pub(crate) async fn start_workflow(
                     .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
                 // Chain-scoped lifetime cap (issue #617): workflow-type default +
                 // fleet-wide ceiling-as-default, at parity with the per-run timeout.
-                chain_execution_timeout: info_chain_timeout_chrono,
+                chain_execution_timeout: info_chain_timeout,
                 max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
                 concurrency_key,
                 concurrency_limit,
@@ -20577,7 +20608,7 @@ pub(crate) async fn start_workflow(
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
                 delay,
-                max_workflow_start_delay: max_delay_chrono,
+                max_workflow_start_delay: max_delay_bound,
                 owner,
                 runbook_url,
                 severity,
@@ -20784,7 +20815,7 @@ pub(crate) async fn start_workflow(
     let start_params = StartWorkflowParams {
         execution_timeout: request
             .execution_timeout_secs
-            .map(chrono::Duration::seconds)
+            .map(jiff::SignedDuration::from_secs)
             .or_else(|| info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())),
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
@@ -20796,7 +20827,7 @@ pub(crate) async fn start_workflow(
             .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
         // Chain-scoped lifetime cap (issue #617): workflow-type default +
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
-        chain_execution_timeout: info_chain_timeout_chrono,
+        chain_execution_timeout: info_chain_timeout,
         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
         concurrency_key,
         concurrency_limit,
@@ -20806,7 +20837,7 @@ pub(crate) async fn start_workflow(
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
         delay,
-        max_workflow_start_delay: max_delay_chrono,
+        max_workflow_start_delay: max_delay_bound,
         owner,
         runbook_url,
         severity,
@@ -23255,7 +23286,7 @@ pub(crate) async fn signal_with_start_workflow(
             queue_name: &queue_name,
             execution_timeout: request
                 .execution_timeout_secs
-                .map(chrono::Duration::seconds)
+                .map(jiff::SignedDuration::from_secs)
                 .or_else(|| {
                     info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
                 }),
@@ -24081,7 +24112,7 @@ async fn update_with_start_workflow(
         queue_name: &queue_name,
         execution_timeout: request
             .execution_timeout_secs
-            .map(chrono::Duration::seconds)
+            .map(jiff::SignedDuration::from_secs)
             .or_else(|| info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())),
         memo: request.memo,
         search_attrs: request.search_attrs,
@@ -30912,7 +30943,7 @@ async fn set_schedule_paused(
                 dsl::paused_at.eq(Some(now).to_diesel()),
                 dsl::paused_by.eq(Some(actor.as_str())),
                 dsl::pause_reason.eq(reason),
-                dsl::updated_at.eq(now),
+                dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(&mut conn)
             .await
@@ -30934,12 +30965,12 @@ async fn set_schedule_paused(
             )
             .set((
                 dsl::is_paused.eq(false),
-                dsl::paused_at.eq(None::<jiff::Timestamp>),
+                dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
                 dsl::paused_by.eq(None::<&str>),
                 dsl::pause_reason.eq(None::<&str>),
-                dsl::auto_paused_at.eq(None::<jiff::Timestamp>),
+                dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
                 dsl::consecutive_failure_count.eq(0),
-                dsl::updated_at.eq(now),
+                dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(&mut conn)
             .await
@@ -31835,7 +31866,7 @@ async fn trigger_schedule_now(
                         .set((
                             sdsl::exhausted_at.eq(Some(triggered_at).to_diesel()),
                             sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                            sdsl::next_run_at.eq(None::<jiff::Timestamp>),
+                            sdsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
                             sdsl::updated_at.eq(triggered_at.to_diesel()),
                         ))
                         .execute(&mut sched_conn)
@@ -32032,7 +32063,7 @@ async fn trigger_schedule_now(
             .set((
                 sdsl::exhausted_at.eq(Some(triggered_at).to_diesel()),
                 sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                sdsl::next_run_at.eq(None::<jiff::Timestamp>),
+                sdsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
                 sdsl::updated_at.eq(triggered_at.to_diesel()),
             ))
             .execute(&mut sched_conn)
@@ -32092,7 +32123,7 @@ async fn rollback_manual_trigger_budget(
             ),
     )
     .set((
-        sdsl::exhausted_at.eq(None::<jiff::Timestamp>),
+        sdsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>),
         sdsl::exhausted_reason.eq(None::<String>),
         sdsl::updated_at.eq(at.to_diesel()),
     ))
@@ -32160,7 +32191,7 @@ macro_rules! clear_stale_max_runs_exhaustion_stmt {
                 )),
         )
         .set((
-            sdsl::exhausted_at.eq(None::<jiff::Timestamp>),
+            sdsl::exhausted_at.eq(None::<jiff_diesel::Timestamp>),
             sdsl::exhausted_reason.eq(None::<String>),
             sdsl::updated_at.eq(($at).to_diesel()),
         ))
@@ -34085,7 +34116,7 @@ async fn write_backfill_log(
         completed_at: Some(jiff::Timestamp::now()),
     };
     let _ = diesel::insert_into(harvest_backfill_log::table)
-        .values(&row)
+        .values(row)
         .execute(&mut conn)
         .await;
 }
@@ -37196,7 +37227,7 @@ async fn set_start_throttle_pacing_override(
                 request.refill_per_sec,
             )
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
-            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
             .get_results::<PersistedBaseline>(&mut conn)
             .await
         {
@@ -37881,7 +37912,7 @@ fn pacing_override_expiry(ttl_secs: u64) -> Result<jiff::Timestamp, AutumnError>
     }
     let delta = jiff::SignedDuration::from_secs(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
     let now = jiff::Timestamp::now();
-    Ok(now.checked_add(delta).ok().unwrap_or(now))
+    Ok(now.checked_add(delta).unwrap_or(now))
 }
 
 /// Response body for the TTL'd pacing-override SET/CLEAR/GET routes (issue
@@ -38400,7 +38431,7 @@ async fn set_rate_limit_pacing_override(
             .bind::<diesel::sql_types::Double, _>(declared_burst)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.refill_rate)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
-            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at.to_diesel())
             .get_results::<PersistedBaseline>(&mut conn)
             .await
         {
@@ -44269,7 +44300,7 @@ fn workflow_list_query(
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     if let Some(src) = &filters.start_source {
@@ -44687,7 +44718,7 @@ pub(crate) async fn load_stalled_workflows(
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     // Honor the start_source provenance filter (issue #740) on the stalled path
@@ -44794,11 +44825,11 @@ pub(crate) async fn load_stalled_workflows(
             harvest_events::workflow_exec_id,
             max(harvest_events::timestamp),
         ))
-        .load::<(uuid::Uuid, Option<jiff::Timestamp>)>(conn)
+        .load::<(uuid::Uuid, Option<SqlTimestamp>)>(conn)
         .await
         .map_err(database_error)?
         .into_iter()
-        .filter_map(|(id, ts)| ts.map(|t| (id, t)))
+        .filter_map(|(id, ts)| ts.map(|t| (id, t.to_jiff())))
         .collect();
 
     // Issue #704 (PR #1139 review): `history_event_count` is populated ONLY
@@ -45077,7 +45108,7 @@ pub(crate) async fn load_history_bloat_workflows(
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
-                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now.to_diesel())),
             );
     }
     if let Some(src) = &filters.start_source {
@@ -45479,11 +45510,12 @@ async fn reload_execution_deadline(
         .find(exec_id.as_uuid())
         .select((dsl::execution_timeout, dsl::deadline_at))
         .first::<(
-            Option<jiff::SignedDuration>,
-            Option<jiff::Timestamp>,
+            autumn_harvest::time::sql::NullablePgDuration,
+            autumn_harvest::time::sql::NullableTimestamp,
         )>(conn)
         .await
         .optional()
+        .map(|row| row.map(|(timeout, deadline)| (timeout.into(), deadline.into())))
 }
 
 async fn export_history_candidate(
@@ -45653,10 +45685,10 @@ async fn load_history_export_candidates(
         )
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            filters.updated_after,
+            filters.updated_after.to_diesel(),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            filters.updated_before,
+            filters.updated_before.to_diesel(),
         )
         .bind::<diesel::sql_types::BigInt, _>(limit)
         .load(conn)
@@ -48925,12 +48957,13 @@ fn build_preview_entry(
     // Jitter bounds: [pre_jitter_base, pre_jitter_base + jitter_window].
     // Using the calendar-adjusted base (not raw.scheduled_at) ensures deferred
     // entries show bounds on the correct day, not the original excluded date.
-    // try_seconds + checked_add_signed guard against oversized stored values
-    // (e.g. a saturated i64::MAX written by the schedule create path).
+    // `checked_add` guards against oversized stored values (e.g. a saturated
+    // i64::MAX written by the schedule create path).
     let (jitter_earliest_at, jitter_latest_at) = if has_jitter {
         pre_jitter_base.map_or((None, None), |base| {
-            let latest =
-                Some(jiff::SignedDuration::from_secs(jitter_secs)).and_then(|d| base.checked_add(d).ok());
+            let latest = base
+                .checked_add(jiff::SignedDuration::from_secs(jitter_secs))
+                .ok();
             (Some(base), latest)
         })
     } else {
@@ -49008,10 +49041,27 @@ fn truncate_preview_entries_by_bounds(
 /// Format a UTC timestamp in the given IANA timezone as RFC 3339.
 /// Falls back to UTC representation when the timezone name is unknown.
 fn format_in_timezone(utc: jiff::Timestamp, tz_name: &str) -> String {
-    tz_name.parse::<chrono_tz::Tz>().map_or_else(
-        |_| autumn_harvest::time::rfc3339(utc),
-        |tz| autumn_harvest::time::rfc3339(utc.with_timezone(&tz)),
-    )
+    autumn_harvest::time::zone(tz_name)
+        .and_then(|tz| rfc3339_in_zone(utc, &tz))
+        .unwrap_or_else(|| autumn_harvest::time::rfc3339(utc))
+}
+
+/// Writes `at` in `tz` as `chrono::DateTime::<Tz>::to_rfc3339` wrote it.
+///
+/// The wall clock time takes the fraction digits of
+/// [`autumn_harvest::time::rfc3339`]. `chrono` rounded the offset to the
+/// nearest minute, so this function does too. It returns `None` when the
+/// wall clock time is outside the jiff range.
+fn rfc3339_in_zone(at: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Option<String> {
+    let offset = tz.to_offset(at).seconds();
+    let wall = at
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(offset)))
+        .ok()?;
+    let text = autumn_harvest::time::rfc3339(wall);
+    let body = text.strip_suffix("+00:00")?;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let minutes = (offset.abs() + 30) / 60;
+    Some(format!("{body}{sign}{:02}:{:02}", minutes / 60, minutes % 60))
 }
 
 /// Parse an optional ISO-8601 `from` string.
@@ -49029,7 +49079,7 @@ fn parse_from_param(from: Option<&str>) -> Result<jiff::Timestamp, String> {
         |s| {
             let dt = s.parse::<jiff::Timestamp>()
                 .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))?;
-            if chrono::Datelike::year(&dt) > 9000 {
+            if autumn_harvest::time::utc_date(dt).year() > 9000 {
                 return Err(format!(
                     "invalid `from` timestamp '{s}': year must be \u{2264} 9000"
                 ));
@@ -49802,7 +49852,7 @@ async fn preview_candidate_schedule_handler(
     }
 
     // Validate jitter before the i64 conversion. A u64 second count can
-    // overflow chrono::Duration::seconds and panic.
+    // overflow that conversion.
     let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
@@ -53053,10 +53103,11 @@ async fn evaluate_eligibility_for_shard(
             )
             .select(harvest_task_queue::scheduled_at)
             .order(harvest_task_queue::scheduled_at.asc())
-            .first::<jiff::Timestamp>(&mut conn)
+            .first::<SqlTimestamp>(&mut conn)
             .await
             .optional()
-            .map_err(database_error)?;
+            .map_err(database_error)?
+            .map(SqlTimestamp::to_jiff);
         oldest_scheduled.map(|ts| {
             let age = jiff::Timestamp::now().duration_since(ts);
             age.as_secs()
@@ -57996,9 +58047,8 @@ mod tests {
         // Whole seconds: Postgres `timestamptz` has microsecond precision. A
         // nanosecond `jiff::Timestamp::now()` would not round-trip exactly, and the
         // comparison below would fail on precision, not on staleness.
-        let started_at = chrono::DateTime::from_timestamp(
+        let started_at = jiff::Timestamp::from_second(
             (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2)).as_second(),
-            0,
         )
         .expect("valid timestamp");
         // The value a resume left behind: an hour further out than discovery saw.
@@ -58013,8 +58063,8 @@ mod tests {
                      '{}'::jsonb, 'default', $2, $3, $4, 1)",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(started_at)
-        .bind::<diesel::sql_types::Interval, _>(fresh_timeout.to_pg_interval())
+        .bind::<diesel::sql_types::Timestamptz, _>(started_at.to_diesel())
+        .bind::<diesel::sql_types::Interval, _>(autumn_harvest::time::sql::PgDuration(fresh_timeout))
         .bind::<diesel::sql_types::Timestamptz, _>(fresh_deadline.to_diesel())
         .bind::<diesel::sql_types::Text, _>(workflow_id.clone())
         .execute(&mut conn)
@@ -58173,7 +58223,7 @@ mod tests {
 
     #[test]
     fn sort_history_export_candidates_orders_globally_before_limit() {
-        let base = ("2026-05-08T00:00:00Z").parse::<jiff::Timestamp>()
+        let base = "2026-05-08T00:00:00Z".parse::<jiff::Timestamp>()
             .expect("valid timestamp");
         let older_shard0 =
             uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("valid uuid");
@@ -58236,7 +58286,7 @@ mod tests {
     }
 
     fn sample_base() -> jiff::Timestamp {
-        ("2026-05-08T00:00:00Z").parse::<jiff::Timestamp>()
+        "2026-05-08T00:00:00Z".parse::<jiff::Timestamp>()
             .expect("valid timestamp")
     }
 
@@ -59143,7 +59193,7 @@ mod tests {
 
     #[test]
     fn parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected() {
-        // Adding this period to a timestamp overflows chrono (issue #2048).
+        // Adding this period to a timestamp overflows (issue #2048).
         let err = parse_schedule_expr_with_tz("interval:9000000000000000", "UTC")
             .expect_err("a period over the cap must be rejected");
         assert!(err.contains("must not exceed"), "{err}");
@@ -59507,7 +59557,7 @@ mod tests {
             effective_at: Some(fire),
             reason: "Fired".to_string(),
         };
-        // i64::MAX seconds overflows chrono Duration creation; must not panic.
+        // i64::MAX seconds overflows the jitter bound. It must not panic.
         let entry = build_preview_entry(&preview, Some(fire), i64::MAX, "UTC", "skip");
         assert!(
             entry.jitter_earliest_at.is_some(),
@@ -59731,7 +59781,7 @@ mod tests {
     }
 
     fn herd_epoch() -> jiff::Timestamp {
-        jiff::Timestamp::from_second(0).ok().unwrap()
+        jiff::Timestamp::from_second(0).unwrap()
     }
 
     #[test]
@@ -60618,7 +60668,7 @@ mod tests {
         // We do not test the cursor body here (the round-trip test does that),
         // just that a `cursor` param flips the paginated flag.
         let encoded = encode_workflow_list_cursor_raw(
-            &("2026-06-18T10:00:00Z").parse::<jiff::Timestamp>()
+            &"2026-06-18T10:00:00Z".parse::<jiff::Timestamp>()
                 .unwrap(),
             &uuid::Uuid::nil(),
         );
@@ -60630,7 +60680,7 @@ mod tests {
 
     #[test]
     fn parse_workflow_filters_cursor_roundtrips() {
-        let created_at = ("2026-06-18T10:00:00.123456Z").parse::<jiff::Timestamp>()
+        let created_at = "2026-06-18T10:00:00.123456Z".parse::<jiff::Timestamp>()
             .unwrap();
         let exec_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 

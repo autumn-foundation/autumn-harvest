@@ -1020,7 +1020,7 @@ mod pure_tests {
 
     #[test]
     fn lease_expired_truth_table() {
-        let base = ("2026-07-20T12:00:00Z").parse::<Timestamp>()
+        let base = "2026-07-20T12:00:00Z".parse::<Timestamp>()
             .unwrap();
         let before = base - jiff::SignedDuration::from_secs(1);
         let after = base + jiff::SignedDuration::from_secs(1);

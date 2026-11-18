@@ -149,7 +149,7 @@ fn mutex_workflow<'a>(
 // ── History builders ──────────────────────────────────────────────────────
 
 const fn ts(offset_secs: i64) -> Timestamp {
-    Timestamp::from_second(1_750_000_000 + offset_secs).ok().expect("valid ts")
+    Timestamp::constant(1_750_000_000 + offset_secs, 0)
 }
 
 const fn started_row(at: Timestamp) -> (Timestamp, WorkflowEvent) {

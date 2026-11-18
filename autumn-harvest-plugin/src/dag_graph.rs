@@ -929,7 +929,7 @@ mod tests {
     }
 
     fn ts(secs: i64) -> Timestamp {
-        Timestamp::new(1_700_000_000 + secs, 0).ok().unwrap()
+        Timestamp::new(1_700_000_000 + secs, 0).unwrap()
     }
 
     fn sched(name: &str, id: ActivityExecId) -> WorkflowEvent {

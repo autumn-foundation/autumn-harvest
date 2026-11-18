@@ -3366,7 +3366,7 @@ struct WebhookRunDefaults {
 fn webhook_run_defaults(
     registry: Option<&autumn_harvest::worker::HandlerRegistry>,
 ) -> WebhookRunDefaults {
-    let to_chrono = |d: Option<std::time::Duration>| {
+    let to_signed = |d: Option<std::time::Duration>| {
         d.and_then(|d| autumn_harvest::jiff::SignedDuration::try_from(d).ok())
     };
     registry
@@ -3378,9 +3378,9 @@ fn webhook_run_defaults(
                     owner: wf.owner,
                     runbook_url: wf.runbook_url,
                     severity: wf.severity,
-                    execution_timeout: to_chrono(execution_timeout),
-                    chain_execution_timeout: to_chrono(registry.chain_execution_timeout(wf.name)),
-                    sla: to_chrono(sla),
+                    execution_timeout: to_signed(execution_timeout),
+                    chain_execution_timeout: to_signed(registry.chain_execution_timeout(wf.name)),
+                    sla: to_signed(sla),
                     retry_policy: wf.retry_policy.clone(),
                 }
             })

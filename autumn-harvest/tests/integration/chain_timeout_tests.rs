@@ -15,7 +15,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, ToPgInterval};
 use autumn_harvest::table_split::SetExt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -167,7 +167,7 @@ async fn set_chain_columns(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             SetExt(harvest_workflow_executions_ext::chain_execution_timeout.eq(chain_timeout.to_pg_interval())),
-            SetExt(harvest_workflow_executions_ext::chain_deadline_at.eq(chain_deadline_at)),
+            SetExt(harvest_workflow_executions_ext::chain_deadline_at.eq(chain_deadline_at.to_diesel())),
         ))
         .execute(conn)
         .await
@@ -184,8 +184,9 @@ async fn load_chain_columns(
             harvest_workflow_executions_ext::chain_execution_timeout,
             harvest_workflow_executions_ext::chain_deadline_at,
         ))
-        .first(conn)
+        .first::<(NullablePgDuration, NullableTimestamp)>(conn)
         .await
+        .map(|(timeout, deadline)| (timeout.0, deadline.0))
         .expect("load chain columns")
 }
 
@@ -413,7 +414,7 @@ async fn inherited_chain_deadline_is_used_verbatim() {
     // compare within a tiny tolerance rather than exact equality.
     let dl = chain_deadline.expect("inherited chain deadline must be set");
     assert!(
-        autumn_harvest::time::num_milliseconds((dl - frozen)).abs() < 10,
+        autumn_harvest::time::num_milliseconds(dl - frozen).abs() < 10,
         "inherited chain deadline must be copied verbatim, not recomputed: got \
          {dl}, expected {frozen}"
     );
@@ -577,7 +578,7 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     // The load truncates sub-microsecond precision on round-trip; compare within
     // a tiny tolerance rather than exact equality.
     let dl = succ_deadline.expect("successor chain deadline");
-    let delta = autumn_harvest::time::num_milliseconds((dl - frozen_chain_deadline)).abs();
+    let delta = autumn_harvest::time::num_milliseconds(dl - frozen_chain_deadline).abs();
     assert!(
         delta < 1000,
         "successor's chain_deadline_at must equal the predecessor's absolute \
@@ -741,13 +742,13 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
         .expect("resume should succeed");
 
     // Per-run deadline advanced by ~30 min pause span.
-    let run_after: Option<jiff::Timestamp> = e::table
+    let run_after = e::table
         .find(exec_id.as_uuid())
         .select(e::deadline_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load deadline_at");
-    let run_after = run_after.expect("per-run deadline must remain set");
+    let run_after = run_after.0.expect("per-run deadline must remain set");
     let expected = run_deadline_before + SignedDuration::from_mins(30);
     assert!(
         (run_after - expected).as_secs().abs() <= 5,
@@ -758,7 +759,7 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
     let (_chain_timeout, chain_after) = load_chain_columns(&mut conn, exec_id).await;
     let chain_after = chain_after.expect("chain_deadline_at must remain set");
     assert!(
-        autumn_harvest::time::num_milliseconds((chain_after - chain_deadline_before))
+        autumn_harvest::time::num_milliseconds(chain_after - chain_deadline_before)
             .abs()
             < 10,
         "chain_deadline_at must NOT be shifted by pause/resume: after={chain_after}, \
@@ -975,19 +976,18 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     .expect("scheduler tick should succeed");
 
     // Find the fired execution for this unique workflow name.
-    let row: Option<(Uuid, Option<SignedDuration>, Option<jiff::Timestamp>)> =
-        harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions_ext::chain_execution_timeout,
-                harvest_workflow_executions_ext::chain_deadline_at,
-            ))
-            .first(&mut conn)
-            .await
-            .optional()
-            .expect("query fired execution");
-    let (_id, chain_timeout, chain_deadline) =
+    let row = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions_ext::chain_execution_timeout,
+            harvest_workflow_executions_ext::chain_deadline_at,
+        ))
+        .first::<(Uuid, NullablePgDuration, NullableTimestamp)>(&mut conn)
+        .await
+        .optional()
+        .expect("query fired execution");
+    let (_id, NullablePgDuration(chain_timeout), NullableTimestamp(chain_deadline)) =
         row.expect("scheduler tick must have fired an execution for this workflow");
     assert_eq!(
         chain_timeout,
@@ -1046,7 +1046,7 @@ async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
         "3rd successor carries the chain-cap DURATION verbatim"
     );
     let dl = succ_deadline.expect("3rd successor chain deadline");
-    let delta = autumn_harvest::time::num_milliseconds((dl - frozen_chain_deadline)).abs();
+    let delta = autumn_harvest::time::num_milliseconds(dl - frozen_chain_deadline).abs();
     assert!(
         delta < 1000,
         "3rd successor chain_deadline_at must equal the origin's absolute value \

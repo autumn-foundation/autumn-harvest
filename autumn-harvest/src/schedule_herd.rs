@@ -252,7 +252,7 @@ mod tests {
     use crate::policy::Schedule;
 
     fn at(secs: i64) -> Timestamp {
-        Timestamp::from_second(secs).ok().unwrap()
+        Timestamp::from_second(secs).unwrap()
     }
 
     fn cron(expr: &str) -> Schedule {
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(report.fires, 2);
         assert_eq!(report.spots.len(), 1);
         assert_eq!(report.spots[0].at, at(HOUR));
-        let late = DateTime::from_timestamp(HOUR, 500_000_000).unwrap();
+        let late = Timestamp::new(HOUR, 500_000_000).unwrap();
         let none = forecast(&[("a", &a), ("b", &b)], late, at(2 * HOUR), MINUTE, 2);
         assert_eq!(none.fires, 0);
     }
@@ -408,7 +408,7 @@ mod tests {
         let five = cron("5 * * * * *");
         let six = cron("6 * * * * *");
         let join = forecast(&[("five", &five), ("six", &six)], at(0), at(10), width, 2);
-        let start = Timestamp::from_millisecond(5_000).ok().unwrap();
+        let start = Timestamp::from_millisecond(5_000).unwrap();
         assert_eq!(join.spots[0].at, start);
     }
 

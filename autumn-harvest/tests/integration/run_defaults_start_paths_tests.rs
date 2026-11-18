@@ -436,7 +436,7 @@ impl Site {
 /// The start reads its clock a few milliseconds before the row default
 /// `started_at`, so an exact comparison is off by that gap.
 fn whole_secs(started_at: jiff::Timestamp, at: jiff::Timestamp) -> u64 {
-    let millis = autumn_harvest::time::num_milliseconds((at - started_at)) + 500;
+    let millis = autumn_harvest::time::num_milliseconds(at - started_at) + 500;
     u64::try_from(millis.div_euclid(1000)).expect("a deadline after the start")
 }
 

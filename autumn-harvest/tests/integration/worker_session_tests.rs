@@ -57,7 +57,9 @@ mod db_tests {
     use autumn_harvest::types::ExecutionId;
     use diesel::sql_types::{Nullable, Text, Timestamptz, Uuid as SqlUuid};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff_diesel::ToDiesel;
     use std::time::Duration;
+
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
@@ -383,7 +385,7 @@ mod db_tests {
                      '{}'::jsonb, 1)",
         )
         .bind::<Text, _>(worker_id)
-        .bind::<Timestamptz, _>(last_heartbeat_at)
+        .bind::<Timestamptz, _>(last_heartbeat_at.to_diesel())
         .bind::<Text, _>(status)
         .execute(conn)
         .await

@@ -194,7 +194,7 @@ mod shapes {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: json!({}),
-            timestamp: jiff::Timestamp::from_second(1_790_000_000).ok()
+            timestamp: jiff::Timestamp::from_second(1_790_000_000)
                 .expect("a fixed timestamp is in range"),
             last_completion_result: None,
             last_error: None,

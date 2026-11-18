@@ -193,8 +193,8 @@ async fn seed_run(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::started_at.eq(started_at),
-            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::started_at.eq(started_at.to_diesel()),
+            harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
             SetExt(
                 harvest_workflow_executions_ext::continued_from_exec_id
                     .eq(continued_from.map(|e| e.as_uuid())),

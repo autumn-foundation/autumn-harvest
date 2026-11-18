@@ -29,6 +29,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2011,7 +2012,7 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
         )
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed the timer");
@@ -2053,7 +2054,7 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
 #[derive(diesel::QueryableByName)]
 struct ScheduledAtAndTimerFiresAt {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
     scheduled_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
@@ -2099,7 +2100,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed a pre-migration-shaped armed row");
@@ -2119,7 +2120,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         )
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed the timer");
@@ -2145,7 +2146,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         // Compared against the row's own stored `scheduled_at`, not the
         // Rust-side `fires_at` the row was seeded from. Postgres
         // `TIMESTAMPTZ` rounds to microseconds, one step coarser than
-        // `chrono`'s nanosecond value. The two never compare equal
+        // the nanosecond value of `jiff`. The two never compare equal
         // directly, even though the backfill copied one from the other.
         assert_eq!(
             row.timer_fires_at,

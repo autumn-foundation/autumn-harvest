@@ -5,7 +5,9 @@
 #![allow(clippy::items_after_statements)]
 
 use std::pin::Pin;
+use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -221,12 +223,13 @@ async fn pause_columns(
     Option<String>,
 ) {
     use autumn_harvest::schema::harvest_workflow_executions as e;
-    e::table
+    let (paused_at, reason, actor) = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select((e::paused_at, e::pause_reason, e::pause_actor))
-        .first(conn)
+        .first::<(Option<SqlTimestamp>, Option<String>, Option<String>)>(conn)
         .await
-        .expect("execution must exist")
+        .expect("execution must exist");
+    (paused_at.map(SqlTimestamp::to_jiff), reason, actor)
 }
 
 async fn history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
@@ -420,14 +423,16 @@ async fn resume_extends_deadline_by_pause_duration() {
         .await
         .expect("resume should succeed");
 
-    let deadline_after: Option<jiff::Timestamp> = e::table
+    let deadline_after: Option<SqlTimestamp> = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select(e::deadline_at)
         .first(&mut conn)
         .await
         .expect("execution must exist");
 
-    let deadline_after = deadline_after.expect("deadline_at must remain set after resume");
+    let deadline_after = deadline_after
+        .expect("deadline_at must remain set after resume")
+        .to_jiff();
     // Expected ≈ deadline_before + 30min pause span. Allow a few seconds of
     // slack for the wall-clock read inside resume.
     let expected = deadline_before + jiff::SignedDuration::from_mins(30);
@@ -455,7 +460,7 @@ async fn resume_without_deadline_leaves_it_null() {
         .await
         .expect("resume should succeed");
 
-    let deadline_after: Option<jiff::Timestamp> = e::table
+    let deadline_after: Option<SqlTimestamp> = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select(e::deadline_at)
         .first(&mut conn)
@@ -487,7 +492,7 @@ async fn insert_pending_activity_task(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending activity task");
@@ -582,13 +587,13 @@ async fn resume_shifts_schedule_to_close_at_by_pause_span() {
         .expect("resume should succeed");
 
     use autumn_harvest::schema::harvest_task_queue as t;
-    let deadline_after: Option<jiff::Timestamp> = t::table
+    let deadline_after: Option<SqlTimestamp> = t::table
         .filter(t::id.eq(task_id))
         .select(t::schedule_to_close_at)
         .first(&mut conn)
         .await
         .expect("task must exist");
-    let deadline_after = deadline_after.expect("deadline must remain set");
+    let deadline_after = deadline_after.expect("deadline must remain set").to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
         shift >= jiff::SignedDuration::from_mins(29) && shift <= jiff::SignedDuration::from_mins(31),
@@ -618,8 +623,8 @@ async fn insert_pending_activity_task_with_schedule(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(schedule_to_close_at)
-    .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(schedule_to_close_at.to_diesel())
+    .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at.to_diesel())
     .bind::<diesel::sql_types::BigInt, _>(schedule_to_start_secs)
     .execute(conn)
     .await
@@ -645,7 +650,7 @@ async fn insert_pending_external_task(
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending external task");
@@ -661,12 +666,17 @@ async fn task_timing_columns(
     Option<jiff::Timestamp>,
 ) {
     use autumn_harvest::schema::harvest_task_queue as t;
-    t::table
+    let (state, scheduled_at, schedule_to_close_at) = t::table
         .filter(t::id.eq(task_id))
         .select((t::state, t::scheduled_at, t::schedule_to_close_at))
-        .first(conn)
+        .first::<(String, SqlTimestamp, Option<SqlTimestamp>)>(conn)
         .await
-        .expect("task must exist")
+        .expect("task must exist");
+    (
+        state,
+        scheduled_at.to_jiff(),
+        schedule_to_close_at.map(SqlTimestamp::to_jiff),
+    )
 }
 
 #[tokio::test]
@@ -776,12 +786,13 @@ async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
         .expect("resume should succeed");
 
     use autumn_harvest::schema::harvest_external_tasks as ext;
-    let deadline_after: jiff::Timestamp = ext::table
+    let deadline_after = ext::table
         .filter(ext::id.eq(ext_id))
         .select(ext::schedule_to_close_at)
-        .first(&mut conn)
+        .first::<SqlTimestamp>(&mut conn)
         .await
-        .expect("external task must exist");
+        .expect("external task must exist")
+        .to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
         shift >= jiff::SignedDuration::from_mins(29) && shift <= jiff::SignedDuration::from_mins(31),
@@ -946,7 +957,7 @@ async fn insert_pending_activity_task_with_id(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(activity_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending activity task");
@@ -1356,13 +1367,14 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     use autumn_harvest::schema::harvest_task_queue as t;
     let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
     let (state, error, scheduled_at) = loop {
-        let (state, error, scheduled_at): (String, Option<String>, jiff::Timestamp) =
+        let (state, error, scheduled_at): (String, Option<String>, SqlTimestamp) =
             t::table
                 .filter(t::id.eq(task_id))
                 .select((t::state, t::error, t::scheduled_at))
                 .first(&mut conn)
                 .await
                 .expect("task must exist");
+        let scheduled_at = scheduled_at.to_jiff();
         let resolved = state == "FAILED" || (state == "PENDING" && error.is_some());
         if resolved || std::time::Instant::now() > poll_deadline {
             break (state, error, scheduled_at);

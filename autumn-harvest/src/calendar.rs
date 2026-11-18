@@ -1206,7 +1206,7 @@ mod tests {
                 !is_excluded_impl(d, &list, true),
                 "weekend/holiday semantics disagree on {d}"
             );
-            d = d.succ_opt().expect("in range");
+            d = d.tomorrow().expect("in range");
         }
     }
 
@@ -2164,7 +2164,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(ft)).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(*ft)).collect();
             assert!(
                 !dates.contains(&date("2026-07-04")),
                 "Jul 4 should be excluded"
@@ -2195,7 +2195,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(ft)).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(*ft)).collect();
             assert!(
                 dates.iter().filter(|&&d| d == date("2026-07-05")).count() >= 1,
                 "Jul 5 should appear (as adjusted Jul 4 and/or natural Jul 5)"

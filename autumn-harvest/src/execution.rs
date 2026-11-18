@@ -3344,7 +3344,7 @@ mod active_conflict_tests {
 mod resolve_by_workflow_id_tests {
     use super::{ResolvedRun, select_resolved_run};
     use crate::types::ExecutionId;
-    use jiff::{SignedDuration, Timestamp};
+    use jiff::Timestamp;
 
     fn run(state: &str, minute: u32) -> ResolvedRun {
         ResolvedRun {

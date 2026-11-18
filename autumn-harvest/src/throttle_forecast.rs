@@ -341,7 +341,6 @@ pub fn steady_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jiff::Timestamp;
 
     fn policy(rate: &str, burst: Option<f64>, sts: Option<Duration>) -> ThrottlePolicy {
         ThrottlePolicy::from_rate_str(rate, burst, None, sts).unwrap()

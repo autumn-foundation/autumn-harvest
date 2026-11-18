@@ -189,8 +189,8 @@ async fn seed(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::started_at.eq(started_at),
-            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::started_at.eq(started_at.to_diesel()),
+            harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -333,8 +333,8 @@ async fn seed_terminal_raw(
     .bind::<diesel::sql_types::Text, _>(workflow_id)
     .bind::<diesel::sql_types::Jsonb, _>(json!({"n": 1}))
     .bind::<diesel::sql_types::Text, _>(state)
-    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
-    .bind::<diesel::sql_types::Timestamptz, _>(completed_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at.to_diesel())
+    .bind::<diesel::sql_types::Timestamptz, _>(completed_at.to_diesel())
     .execute(conn)
     .await
     .expect("seed terminal row");

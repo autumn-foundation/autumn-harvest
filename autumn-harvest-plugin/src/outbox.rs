@@ -622,25 +622,25 @@ pub(crate) async fn dispatch_workflow_start_request(
     let sla = info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     // The start clamps the timeout to the fleet ceiling, and the SLA to the
     // timeout, as on the API start path.
-    let to_chrono =
+    let to_signed =
         |d: std::time::Duration| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX);
-    let execution_timeout = info_execution_timeout.map(to_chrono);
+    let execution_timeout = info_execution_timeout.map(to_signed);
     let max_execution_timeout_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_execution_timeout)
-        .map(to_chrono);
+        .map(to_signed);
     // Issue #2406: an outbox start begins a new chain. It takes the chain cap
     // of the type, the operator override and the fleet chain ceiling, as the
     // API start does.
-    let to_chrono_opt = |d: std::time::Duration| jiff::SignedDuration::try_from(d).ok();
+    let to_signed_opt = |d: std::time::Duration| jiff::SignedDuration::try_from(d).ok();
     let chain_execution_timeout = registry_ext
         .as_ref()
         .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))
-        .and_then(to_chrono_opt);
+        .and_then(to_signed_opt);
     let max_workflow_chain_timeout_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_chain_timeout)
-        .and_then(to_chrono_opt);
+        .and_then(to_signed_opt);
 
     // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
     // the identity registry only when no `HandlerRegistry` extension is

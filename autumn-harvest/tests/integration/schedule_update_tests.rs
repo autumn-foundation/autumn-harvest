@@ -256,7 +256,7 @@ async fn raising_max_runs_clears_exhaustion_and_repopulates_next_run_at() {
             dsl::runs_started.eq(1),
             dsl::exhausted_at.eq(Some(Timestamp::now()).to_diesel()),
             dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-            dsl::next_run_at.eq(None::<Timestamp>),
+            dsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
         ))
         .execute(&mut conn)
         .await
@@ -968,7 +968,7 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
     .set((
         dsl::next_run_at.eq(Some(old_spec_next).to_diesel()),
         dsl::fire_claim_token.eq(None::<Uuid>),
-        dsl::fire_claimed_until.eq(None::<Timestamp>),
+        dsl::fire_claimed_until.eq(None::<jiff_diesel::Timestamp>),
     ))
     .execute(&mut conn)
     .await

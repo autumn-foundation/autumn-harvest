@@ -68,6 +68,8 @@ use autumn_harvest::shard_rebalance::{
     set_legal_hold_forwarded, stage_copy, verify_target_copy,
 };
 use autumn_harvest::stall_diagnosis;
+use jiff_diesel::ToDiesel;
+
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 
@@ -354,7 +356,7 @@ async fn park_on_timer(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     )
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert timer");
@@ -367,7 +369,7 @@ async fn park_on_timer(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     )
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert parked workflow task");
@@ -429,13 +431,23 @@ struct StagedPayload {
 #[derive(Debug, diesel::QueryableByName)]
 #[allow(clippy::struct_field_names)] // all three genuinely are timestamps
 struct TaskProvenance {
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamptz,
+        deserialize_as = autumn_harvest::time::sql::SqlTimestamp
+    )]
     scheduled_at: jiff::Timestamp,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamptz,
+        deserialize_as = autumn_harvest::time::sql::SqlTimestamp
+    )]
     created_at: jiff::Timestamp,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    #[diesel(
+        sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        deserialize_as = autumn_harvest::time::sql::NullableTimestamp
+    )]
     timer_fires_at: Option<jiff::Timestamp>,
 }
+
 
 #[derive(diesel::QueryableByName)]
 struct ScalarInt {
@@ -1601,7 +1613,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
     // verification already checked byte-for-byte.
     let fires_at = Timestamp::now() - SignedDuration::from_hours(2);
     diesel::sql_query("UPDATE harvest_timers SET fires_at = $1 WHERE workflow_exec_id = $2")
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .execute(&mut target)
         .await
@@ -9199,7 +9211,7 @@ async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
     #[derive(diesel::QueryableByName)]
     struct Stamp {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
         updated_at: jiff::Timestamp,
     }
 
