@@ -11,8 +11,8 @@
 //! (issue #2388) are tested here too, because they read these overrides.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, SqlTimestamp};
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,11 +32,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -315,7 +315,9 @@ struct Deadlines {
 /// The start path takes its clock reading a few milliseconds before the row
 /// default `started_at`, so an exact comparison would be off by that gap.
 fn whole_secs(started_at: Timestamp, at: Timestamp) -> jiff::SignedDuration {
-    jiff::SignedDuration::from_secs((autumn_harvest::time::num_milliseconds(at - started_at) + 500).div_euclid(1000))
+    jiff::SignedDuration::from_secs(
+        (autumn_harvest::time::num_milliseconds(at - started_at) + 500).div_euclid(1000),
+    )
 }
 
 impl Deadlines {
@@ -411,7 +413,10 @@ async fn the_recompute_moves_in_flight_runs_and_the_scanner_fires() {
         use harvest_workflow_executions::dsl;
         let mut conn = connect(&url).await;
         diesel::update(harvest_workflow_executions::table.find(completed))
-            .set((dsl::state.eq("COMPLETED"), dsl::completed_at.eq(Timestamp::now().to_diesel())))
+            .set((
+                dsl::state.eq("COMPLETED"),
+                dsl::completed_at.eq(Timestamp::now().to_diesel()),
+            ))
             .execute(&mut conn)
             .await
             .expect("complete one run");
@@ -604,7 +609,10 @@ async fn the_override_list_requires_admin_auth() {
 }
 
 /// The chain cap of one run, from `started_at` to `chain_deadline_at`.
-async fn chain_cap(url: &str, id: Uuid) -> (Option<jiff::SignedDuration>, Option<jiff::SignedDuration>) {
+async fn chain_cap(
+    url: &str,
+    id: Uuid,
+) -> (Option<jiff::SignedDuration>, Option<jiff::SignedDuration>) {
     use harvest_workflow_executions::dsl;
     let mut conn = connect(url).await;
     let (started_at, timeout, deadline) = harvest_workflow_executions::table
@@ -863,7 +871,10 @@ async fn fire_deferred(url: &str) {
 }
 
 /// The hard and the soft budget of a run.
-async fn budgets(url: &str, id: Uuid) -> (Option<jiff::SignedDuration>, Option<jiff::SignedDuration>) {
+async fn budgets(
+    url: &str,
+    id: Uuid,
+) -> (Option<jiff::SignedDuration>, Option<jiff::SignedDuration>) {
     let run = deadlines(url, id).await;
     (run.timeout(), run.sla())
 }

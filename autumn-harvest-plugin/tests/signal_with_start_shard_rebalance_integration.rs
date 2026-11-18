@@ -293,8 +293,8 @@ async fn seed_with_state(
     .await
     .expect("seed row");
 
-    let completed_at =
-        matches!(state, "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT").then(jiff::Timestamp::now);
+    let completed_at = matches!(state, "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT")
+        .then(jiff::Timestamp::now);
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),

@@ -133,7 +133,8 @@ fn main() {
     assert!(reps > 0, "CALENDAR_PROFILE_REPS must be at least 1, got 0");
 
     let from = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let to = from + jiff::SignedDuration::from_hours(i64::try_from(slots - 1).expect("slots fits i64"));
+    let to =
+        from + jiff::SignedDuration::from_hours(i64::try_from(slots - 1).expect("slots fits i64"));
     let schedule = Schedule::Interval(StdDuration::from_secs(3600));
     let excluded_dates = build_exclusions(autumn_harvest::time::utc_date(from), exclusions);
     // A duplicate would silently shrink the BTreeSet the fix builds from

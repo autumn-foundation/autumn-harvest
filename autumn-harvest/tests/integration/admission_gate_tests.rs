@@ -20,11 +20,7 @@ fn make_gate(scope: GateScope, reason: &str) -> AdmissionGate {
     }
 }
 
-fn make_expiring_gate(
-    scope: GateScope,
-    reason: &str,
-    expires: jiff::Timestamp,
-) -> AdmissionGate {
+fn make_expiring_gate(scope: GateScope, reason: &str, expires: jiff::Timestamp) -> AdmissionGate {
     AdmissionGate {
         id: AdmissionGateId(Uuid::new_v4()),
         scope,

@@ -18,14 +18,14 @@
 //! heartbeats, read-only UI page loads, worker fleet reads, and the audit
 //! list endpoint itself. See [`crate::audit::EXCLUDED_ROUTES`] for the full list.
 
-use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use uuid::Uuid;
 
 use crate::error::{HarvestResult, database_error};
@@ -1913,11 +1913,11 @@ pub async fn list_audit(
     match (filters.before, filters.before_id) {
         (Some(before), Some(before_id)) => {
             query = query.filter(
-                harvest_audit_log::occurred_at
-                    .lt(before.to_diesel())
-                    .or(harvest_audit_log::occurred_at
+                harvest_audit_log::occurred_at.lt(before.to_diesel()).or(
+                    harvest_audit_log::occurred_at
                         .eq(before.to_diesel())
-                        .and(harvest_audit_log::id.lt(before_id))),
+                        .and(harvest_audit_log::id.lt(before_id)),
+                ),
             );
         }
         (Some(before), None) => {
@@ -2302,7 +2302,10 @@ mod tests {
     #[test]
     fn audit_purge_cutoff_saturates_before_the_jiff_range() {
         let now = jiff::Timestamp::constant(1_700_000_000, 0);
-        assert_eq!(audit_purge_cutoff(now, 1), jiff::Timestamp::constant(1_699_913_600, 0));
+        assert_eq!(
+            audit_purge_cutoff(now, 1),
+            jiff::Timestamp::constant(1_699_913_600, 0)
+        );
         assert_eq!(audit_purge_cutoff(now, 10_000_000), jiff::Timestamp::MIN);
         assert_eq!(audit_purge_cutoff(now, i64::MAX), jiff::Timestamp::MIN);
     }

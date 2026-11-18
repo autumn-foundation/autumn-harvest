@@ -1322,7 +1322,9 @@ fn sim_start(env: &WorkflowTestEnv) -> Timestamp {
     if env.anchor_frozen {
         return env.simulated_now;
     }
-    Timestamp::from_second(1_704_067_200).ok().unwrap_or(env.simulated_now)
+    Timestamp::from_second(1_704_067_200)
+        .ok()
+        .unwrap_or(env.simulated_now)
 }
 
 /// The state of one simulation run.

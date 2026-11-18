@@ -53,11 +53,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -898,7 +898,8 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     let cooldown = body["blocked_on"]["cooldown_until"]
         .as_str()
         .unwrap_or_else(|| panic!("an organically tripped breaker must carry a cooldown: {body}"));
-    let parsed = cooldown.parse::<Timestamp>()
+    let parsed = cooldown
+        .parse::<Timestamp>()
         .unwrap_or_else(|e| panic!("cooldown_until must be RFC3339 ({e}): {cooldown}"));
     assert!(
         parsed > before && parsed <= before + jiff::SignedDuration::from_secs(31),

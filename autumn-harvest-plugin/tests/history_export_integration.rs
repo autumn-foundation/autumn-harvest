@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,10 +22,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -245,7 +245,8 @@ async fn insert_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -272,7 +273,8 @@ async fn set_execution_and_event_times(
     .set((
         autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time.to_diesel()),
         autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time.to_diesel()),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(row_time).to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(Some(row_time).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -527,8 +529,13 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
     )
     .await;
     set_execution_and_event_times(&shard0_url, older_shard0, base, base).await;
-    set_execution_and_event_times(&shard0_url, newer_shard0, base, base + SignedDuration::from_mins(1))
-        .await;
+    set_execution_and_event_times(
+        &shard0_url,
+        newer_shard0,
+        base,
+        base + SignedDuration::from_mins(1),
+    )
+    .await;
     set_execution_and_event_times(
         &shard1_url,
         newest_shard1,
@@ -706,7 +713,8 @@ async fn set_execution_deadline(
     .set((
         autumn_harvest::schema::harvest_workflow_executions::execution_timeout
             .eq(Some(execution_timeout).to_pg_interval()),
-        autumn_harvest::schema::harvest_workflow_executions::deadline_at.eq(Some(deadline_at).to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::deadline_at
+            .eq(Some(deadline_at).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -742,8 +750,11 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         HarvestDbPool::from(build_test_pool(&database_url)),
         ShardRouter::single(),
     );
-    let updated_after =
-        autumn_harvest::time::rfc3339_opts(recent_event_time - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Millis, true);
+    let updated_after = autumn_harvest::time::rfc3339_opts(
+        recent_event_time - SignedDuration::from_hours(1),
+        autumn_harvest::time::SecondsFormat::Millis,
+        true,
+    );
     let (status, json) = get_json(
         &app,
         format!(

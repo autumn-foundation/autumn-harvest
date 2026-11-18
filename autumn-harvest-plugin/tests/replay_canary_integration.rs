@@ -1,5 +1,4 @@
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::Ext;
 use autumn_web::reexports::axum;
 use autumn_web::reexports::http;
@@ -7,6 +6,7 @@ use axum::body::Body;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use http::{Request, StatusCode};
+use jiff_diesel::ToDiesel;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use testcontainers::ContainerAsync;
@@ -154,10 +154,10 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
     use autumn_harvest::types::{ActivityExecId, ExecutionId};
-    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
 
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);

@@ -264,10 +264,7 @@ impl ScheduleRunsParams {
     ///
     /// Returns `Err` with a human-readable message for a malformed `limit`,
     /// `since`, `until`, or `cursor` — the handler maps this to `400`, never `500`.
-    pub fn from_query_pairs(
-        pairs: &[(String, String)],
-        now: Timestamp,
-    ) -> Result<Self, String> {
+    pub fn from_query_pairs(pairs: &[(String, String)], now: Timestamp) -> Result<Self, String> {
         let mut out = Self {
             limit: DEFAULT_LIMIT,
             ..Self::default()
@@ -317,7 +314,8 @@ pub fn parse_cursor(raw: &str) -> Result<(Timestamp, Uuid), String> {
     let (ts_part, id_part) = raw
         .split_once('|')
         .ok_or_else(|| "invalid cursor; expected '<started_at>|<execution_id>'".to_string())?;
-    let started_at = ts_part.parse::<Timestamp>()
+    let started_at = ts_part
+        .parse::<Timestamp>()
         .map_err(|_| "invalid cursor: bad timestamp".to_string())?;
     let execution_id = id_part
         .parse::<Uuid>()

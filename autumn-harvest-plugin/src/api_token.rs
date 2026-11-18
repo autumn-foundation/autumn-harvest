@@ -48,8 +48,8 @@
 //! `harvest token rotate` is a client-side convenience over the create route.
 
 use autumn_web::error::AutumnError;
-use jiff_diesel::ToDiesel;
 use autumn_web::reexports::axum;
+use jiff_diesel::ToDiesel;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method};
@@ -888,8 +888,14 @@ mod tests {
     #[test]
     fn expiry_predicate() {
         let now = Timestamp::now();
-        assert!(is_expired(Some(now - jiff::SignedDuration::from_hours(1)), now));
-        assert!(!is_expired(Some(now + jiff::SignedDuration::from_hours(1)), now));
+        assert!(is_expired(
+            Some(now - jiff::SignedDuration::from_hours(1)),
+            now
+        ));
+        assert!(!is_expired(
+            Some(now + jiff::SignedDuration::from_hours(1)),
+            now
+        ));
         assert!(!is_expired(None, now));
         // Exactly-now counts as expired (boundary is inclusive).
         assert!(is_expired(Some(now), now));

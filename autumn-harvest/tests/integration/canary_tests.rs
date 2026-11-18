@@ -14,8 +14,8 @@
 //! `is_canary_workflow` matches. Like the real probe, its body dispatches one
 //! non-local activity, then waits on a short durable timer.
 
-use std::pin::Pin;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

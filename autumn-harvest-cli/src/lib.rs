@@ -13688,14 +13688,16 @@ pub fn build_bootstrap_token(
 /// Returns whether `text` has the strict RFC 3339 shape.
 ///
 /// jiff also reads shorter forms and an RFC 9557 time zone annotation.
-/// Postgres can refuse those. This check keeps the shape that `chrono` read:
-/// a full date, `T`, `t` or a space, a full time, an optional fraction, and
-/// `Z`, `z` or a `+HH:MM` offset. Like `chrono`, it refuses an offset hour
+/// Postgres can refuse those. This check keeps the shape that `chrono` read.
+/// That shape is a full date, `T`, `t` or a space, a full time, an optional
+/// fraction, and `Z`, `z` or a `+HH:MM` offset. Like `chrono`, it refuses an offset hour
 /// past 23 and an offset minute past 59. jiff reads an offset hour up to 25.
 fn has_rfc3339_shape(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
-        bytes.get(range).is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+        bytes
+            .get(range)
+            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
     };
     let at = |index: usize, allowed: &[u8]| bytes.get(index).is_some_and(|b| allowed.contains(b));
     let head = digits(0..4)
@@ -13721,7 +13723,9 @@ fn has_rfc3339_shape(text: &str) -> bool {
     }
     match rest {
         [b'Z' | b'z'] => true,
-        [b'+' | b'-', h1, h2, b':', m1, m2] if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) => {
+        [b'+' | b'-', h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) =>
+        {
             (h1 - b'0') * 10 + (h2 - b'0') <= 23 && (m1 - b'0') * 10 + (m2 - b'0') <= 59
         }
         _ => false,
@@ -18329,7 +18333,10 @@ mod token_bootstrap_tests {
             "2027-01-01 00:00:00.5+02:00",
             "2027-01-01T00:00:00.123456789-05:30",
         ] {
-            assert!(build_bootstrap_token("n", "read", Some(good), "op").is_ok(), "{good}");
+            assert!(
+                build_bootstrap_token("n", "read", Some(good), "op").is_ok(),
+                "{good}"
+            );
         }
         for bad in [
             "2027-01-01T00:00Z",
@@ -18340,7 +18347,10 @@ mod token_bootstrap_tests {
             "2027-01-01T00:00:00",
             "2027-02-30T00:00:00Z",
         ] {
-            assert!(build_bootstrap_token("n", "read", Some(bad), "op").is_err(), "{bad}");
+            assert!(
+                build_bootstrap_token("n", "read", Some(bad), "op").is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -18365,7 +18375,9 @@ mod token_bootstrap_tests {
         ])
         .expect("the chrono display form should parse");
         let Commands::Shard {
-            command: ShardCommand::Rebalance { after_created_at, .. },
+            command: ShardCommand::Rebalance {
+                after_created_at, ..
+            },
         } = cli.command
         else {
             panic!("expected shard rebalance");
@@ -18385,8 +18397,15 @@ mod token_bootstrap_tests {
             let token = build_bootstrap_token("n", "read", Some(good), "op");
             assert!(token.is_ok_and(|t| t.insert_sql.contains(good)), "{good}");
         }
-        for bad in ["2027-01-01T00:00:00+24:30", "2027-01-01T00:00:00+25:00", "2027-01-01T00:00:00+01:60"] {
-            assert!(build_bootstrap_token("n", "read", Some(bad), "op").is_err(), "{bad}");
+        for bad in [
+            "2027-01-01T00:00:00+24:30",
+            "2027-01-01T00:00:00+25:00",
+            "2027-01-01T00:00:00+01:60",
+        ] {
+            assert!(
+                build_bootstrap_token("n", "read", Some(bad), "op").is_err(),
+                "{bad}"
+            );
         }
     }
 

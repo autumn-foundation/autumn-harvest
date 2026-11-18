@@ -16,9 +16,9 @@
 //! testcontainers Postgres. Some sandboxes have no Docker, so the tests only
 //! compile there and run in CI (the #543/#544/#601 precedent).
 
-use jiff_diesel::ToDiesel;
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -270,7 +270,8 @@ async fn seed_execution(
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
         autumn_harvest::schema::harvest_workflow_executions::started_at.eq(started_at.to_diesel()),
         autumn_harvest::schema::harvest_workflow_executions::created_at.eq(started_at.to_diesel()),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -323,7 +324,8 @@ fn exported_workflow_names(body: &Value) -> Vec<String> {
 }
 
 fn base_time() -> jiff::Timestamp {
-    "2026-01-01T00:00:00Z".parse::<jiff::Timestamp>()
+    "2026-01-01T00:00:00Z"
+        .parse::<jiff::Timestamp>()
         .expect("parse base time")
 }
 

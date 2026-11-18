@@ -14,9 +14,9 @@
 //!   timeouts increment `harvest.workflow.timeout`.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, ToPgInterval};
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp, ToPgInterval};
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -43,11 +43,11 @@ use autumn_harvest::{
     ResetSignalReapplyPolicy, WorkflowContext, WorkflowInfo, WorkflowResetRequest,
     reset_workflow_execution,
 };
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -166,8 +166,14 @@ async fn set_chain_columns(
 ) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            SetExt(harvest_workflow_executions_ext::chain_execution_timeout.eq(chain_timeout.to_pg_interval())),
-            SetExt(harvest_workflow_executions_ext::chain_deadline_at.eq(chain_deadline_at.to_diesel())),
+            SetExt(
+                harvest_workflow_executions_ext::chain_execution_timeout
+                    .eq(chain_timeout.to_pg_interval()),
+            ),
+            SetExt(
+                harvest_workflow_executions_ext::chain_deadline_at
+                    .eq(chain_deadline_at.to_diesel()),
+            ),
         ))
         .execute(conn)
         .await
@@ -262,7 +268,10 @@ async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
     // but whose whole continue-as-new chain has outlived its lifetime cap.
     let now = Timestamp::now();
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::deadline_at.eq(Some(now + SignedDuration::from_hours(1)).to_diesel()))
+        .set(
+            harvest_workflow_executions::deadline_at
+                .eq(Some(now + SignedDuration::from_hours(1)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("set future per-run deadline");
@@ -759,9 +768,7 @@ async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
     let (_chain_timeout, chain_after) = load_chain_columns(&mut conn, exec_id).await;
     let chain_after = chain_after.expect("chain_deadline_at must remain set");
     assert!(
-        autumn_harvest::time::num_milliseconds(chain_after - chain_deadline_before)
-            .abs()
-            < 10,
+        autumn_harvest::time::num_milliseconds(chain_after - chain_deadline_before).abs() < 10,
         "chain_deadline_at must NOT be shifted by pause/resume: after={chain_after}, \
          before={chain_deadline_before}"
     );

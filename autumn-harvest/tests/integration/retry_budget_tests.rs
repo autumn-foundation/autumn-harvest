@@ -31,10 +31,10 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -845,10 +845,13 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
         worker_id: "rb-strikes-worker".to_string(),
         attempt: claimed.attempt,
     };
-    let write =
-        queue::defer_claimed_retry_for_budget(&mut conn, &claim, jiff::SignedDuration::from_secs(30))
-            .await
-            .expect("defer");
+    let write = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &claim,
+        jiff::SignedDuration::from_secs(30),
+    )
+    .await
+    .expect("defer");
     assert_eq!(write, queue::ClaimWrite::Applied);
 
     let row: TaskQueueItem = harvest_task_queue::table
@@ -912,10 +915,13 @@ async fn budget_deferral_reports_applied_when_only_the_notify_fails() {
         attempt: claimed.attempt,
     };
 
-    let write =
-        queue::defer_claimed_retry_for_budget(&mut conn, &claim, jiff::SignedDuration::from_secs(30))
-            .await
-            .expect("an applied deferral is not an error when only the NOTIFY fails");
+    let write = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &claim,
+        jiff::SignedDuration::from_secs(30),
+    )
+    .await
+    .expect("an applied deferral is not an error when only the NOTIFY fails");
     assert_eq!(write, queue::ClaimWrite::Applied);
 
     let row: TaskQueueItem = harvest_task_queue::table

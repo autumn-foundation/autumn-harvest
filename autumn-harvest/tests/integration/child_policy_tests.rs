@@ -4,9 +4,9 @@
 #![allow(clippy::items_after_statements)]
 
 use autumn_harvest::schema::harvest_task_queue_ext;
-use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::{NullableTimestamp, ToPgInterval};
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::{NullableTimestamp, ToPgInterval};
+use jiff_diesel::ToDiesel;
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -25,11 +25,11 @@ use autumn_harvest::{
     TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, WorkflowResetRequest,
     cancel_workflow_execution, reset_workflow_execution, start_or_load_workflow_execution, timeout,
 };
-use jiff::Timestamp;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -954,8 +954,8 @@ async fn detached_spawn_before_local_activity_is_persisted() {
 #[tokio::test]
 async fn detached_child_execution_timeout_does_not_wake_parent() {
     use autumn_harvest::schema::harvest_workflow_executions;
-    use jiff::Timestamp;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
 
     let (url, _container) = setup_test_db_url().await;
     let mut conn = AsyncPgConnection::establish(&url)
@@ -1286,7 +1286,8 @@ async fn workflow_task_timeout_cascades_detached_children() {
                 .filter(harvest_task_queue::task_type.eq("workflow")),
         )
         .set((
-            harvest_task_queue::scheduled_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+            harvest_task_queue::scheduled_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             SetExt(
                 harvest_task_queue_ext::schedule_to_start
                     .eq(Some(jiff::SignedDuration::from_millis(1)).to_pg_interval()),

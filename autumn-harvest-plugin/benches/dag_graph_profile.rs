@@ -858,11 +858,10 @@ fn build_events(def: &DagDefinition) -> Vec<(Timestamp, WorkflowEvent)> {
     let tasks = def.tasks();
     let mut events: Vec<(Timestamp, WorkflowEvent)> = Vec::with_capacity(tasks.len() * 3 + 8);
     let mut t: i64 = 0;
-    let push =
-        |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
-            events.push((ts(*t), ev));
-            *t += 1;
-        };
+    let push = |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
+        events.push((ts(*t), ev));
+        *t += 1;
+    };
 
     push(&mut t, &mut events, workflow_started());
 
@@ -984,11 +983,10 @@ fn push_gate_resolution(
     gate: &DagSignalGate,
     scenario: usize,
 ) -> bool {
-    let push =
-        |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
-            events.push((ts(*t), ev));
-            *t += 1;
-        };
+    let push = |t: &mut i64, events: &mut Vec<(Timestamp, WorkflowEvent)>, ev: WorkflowEvent| {
+        events.push((ts(*t), ev));
+        *t += 1;
+    };
     match scenario {
         // gate_0, gate_2 (plain `signal_gate`) and gate_3
         // (`signal_gate_with_timeout`, resolved by its signal arriving

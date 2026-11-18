@@ -809,7 +809,7 @@ mod tests {
     use super::*;
     use crate::context::{WorkflowCommand, WorkflowContext};
     use crate::types::{ActivityExecId, TimerId};
-        use serde_json::json;
+    use serde_json::json;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -826,8 +826,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: crate::time::utc_ymd_hms(2026, 10, 3, 0, 0, 0)
-                .expect("valid timestamp"),
+            timestamp: crate::time::utc_ymd_hms(2026, 10, 3, 0, 0, 0).expect("valid timestamp"),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

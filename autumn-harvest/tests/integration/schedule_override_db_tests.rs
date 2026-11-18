@@ -20,8 +20,8 @@ use autumn_harvest::schedule_override::{
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, ensure_dag_schedule, tick_once,
 };
-use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::time::sql::SqlTimestamp;
+use autumn_harvest::worker::HandlerRegistry;
 use jiff::Timestamp;
 
 use diesel::prelude::*;

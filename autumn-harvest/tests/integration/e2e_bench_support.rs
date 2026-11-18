@@ -3009,9 +3009,9 @@ pub mod db {
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Instant;
 
-    use jiff::Timestamp;
     use diesel::QueryableByName;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+    use jiff::Timestamp;
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
@@ -4534,7 +4534,9 @@ pub mod db {
                 clippy::cast_precision_loss,
                 reason = "microsecond offsets on one host are far below 2^53"
             )]
-            let offset = autumn_harvest::time::num_microseconds(row.now - midpoint).unwrap_or(0) as f64 / 1000.0;
+            let offset = autumn_harvest::time::num_microseconds(row.now - midpoint).unwrap_or(0)
+                as f64
+                / 1000.0;
             samples.push(offset);
         }
         samples.sort_by(f64::total_cmp);
@@ -5401,8 +5403,9 @@ pub mod db {
                         clippy::cast_precision_loss,
                         reason = "dispatch latencies are milliseconds, far below 2^53 microseconds"
                     )]
-                    let ms =
-                        autumn_harvest::time::num_microseconds(*started - created_at).unwrap_or(0) as f64 / 1000.0;
+                    let ms = autumn_harvest::time::num_microseconds(*started - created_at)
+                        .unwrap_or(0) as f64
+                        / 1000.0;
                     if ms < 0.0 {
                         negative += 1;
                     }

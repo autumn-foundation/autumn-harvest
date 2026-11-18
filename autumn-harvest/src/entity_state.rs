@@ -17,11 +17,11 @@
 //! [`SideEffectKind::EntityState`]: crate::event::SideEffectKind::EntityState
 
 #[cfg(feature = "db")]
-use jiff::Timestamp;
-#[cfg(feature = "db")]
 use diesel::sql_types::{Bool, Integer, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "db")]
+use jiff::Timestamp;
 use serde_json::Value;
 
 #[cfg(feature = "db")]

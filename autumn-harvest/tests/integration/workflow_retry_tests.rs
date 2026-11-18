@@ -6,9 +6,9 @@
 //! Non-retryable, cancelled and timed-out outcomes never retry.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1589,7 +1589,8 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
                     .eq(Some(autumn_harvest::time::days(7)).to_pg_interval()),
             ),
             SetExt(
-                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(origin_chain_deadline).to_diesel()),
+                harvest_workflow_executions_ext::chain_deadline_at
+                    .eq(Some(origin_chain_deadline).to_diesel()),
             ),
         ))
         .execute(&mut conn)
@@ -1634,7 +1635,6 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
         .expect("load retry chain columns");
     let retry_timeout = retry_timeout.map(jiff::SignedDuration::from);
     let retry_deadline = retry_deadline.map(autumn_harvest::time::sql::SqlTimestamp::to_jiff);
-
 
     assert_eq!(
         retry_timeout,

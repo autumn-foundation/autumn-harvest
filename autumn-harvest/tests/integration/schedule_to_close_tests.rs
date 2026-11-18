@@ -16,12 +16,12 @@ use autumn_harvest::store;
 use autumn_harvest::timeout;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::{RetryPolicy, TimeoutType};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -539,9 +539,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         stored_deadline.is_some(),
         "schedule_to_close_at must be persisted"
     );
-    let diff = (stored_deadline.unwrap() - future_deadline)
-        .as_secs()
-        .abs();
+    let diff = (stored_deadline.unwrap() - future_deadline).as_secs().abs();
     assert!(diff < 2, "stored deadline must match the one passed in");
 
     // Scanner must NOT fire for this task (deadline is in the future)

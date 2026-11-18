@@ -955,12 +955,17 @@ mod hvg001_clock_tests {
     use syn::visit::Visit as _;
 
     fn hvg001_count(body: &str) -> usize {
-        let src = format!("async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{ {body} Ok(()) }}");
+        let src =
+            format!("async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{ {body} Ok(()) }}");
         let item_fn: syn::ItemFn = syn::parse_str(&src).expect("test source must parse");
         let mut visitor = DeterminismVisitor::new(load_catalog_metadata());
         visitor.context_param_name = Some("ctx".to_string());
         visitor.visit_item_fn(&item_fn);
-        visitor.findings.iter().filter(|f| f.rule_id == "HVG001").count()
+        visitor
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "HVG001")
+            .count()
     }
 
     #[test]
@@ -979,7 +984,12 @@ mod hvg001_clock_tests {
 
     #[test]
     fn every_chrono_clock_read_is_still_flagged() {
-        for call in ["chrono::Utc::now()", "Utc::now()", "chrono::Local::now()", "Local::now()"] {
+        for call in [
+            "chrono::Utc::now()",
+            "Utc::now()",
+            "chrono::Local::now()",
+            "Local::now()",
+        ] {
             assert_eq!(hvg001_count(&format!("let _t = {call};")), 1, "{call}");
         }
     }

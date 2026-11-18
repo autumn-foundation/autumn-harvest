@@ -380,7 +380,8 @@ fn query_ctx_can_access_shared_state() {
     let state = std::sync::Arc::new(map);
 
     let info = __autumn_query_handler_info_read_counter();
-    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), jiff::Timestamp::now(), None, state);
+    let ctx =
+        WorkflowContext::new_for_handler(ExecutionId::new(), jiff::Timestamp::now(), None, state);
     let result = (info.handler)(ctx.as_ref(), serde_json::Value::Null).unwrap();
     assert_eq!(result, serde_json::json!(77));
 }

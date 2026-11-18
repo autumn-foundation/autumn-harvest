@@ -26,12 +26,12 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout;
 use autumn_harvest::types::ExecutionId;
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -169,7 +169,6 @@ async fn load_breach_flags(
         .await
         .expect("load breach flags");
     (breached, breached_at.map(SqlTimestamp::to_jiff), state)
-
 }
 
 // ── AC#3 / AC#4: flip exactly once, idempotent across repeated scans ─────────

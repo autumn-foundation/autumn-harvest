@@ -579,7 +579,13 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_reclaims_session_hosted_by_draining_worker() {
         let (mut conn, _c) = setup().await;
-        insert_worker(&mut conn, "worker-draining", jiff::Timestamp::now(), "Draining").await;
+        insert_worker(
+            &mut conn,
+            "worker-draining",
+            jiff::Timestamp::now(),
+            "Draining",
+        )
+        .await;
         let far_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-draining", far_future).await;

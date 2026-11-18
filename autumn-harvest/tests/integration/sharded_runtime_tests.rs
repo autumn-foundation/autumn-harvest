@@ -24,7 +24,6 @@
 //! has no `shard_id` column.
 
 use autumn_harvest::info::WorkflowInfo;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::scheduler::{SchedulerMonitor, tick_once_sharded};
@@ -37,6 +36,7 @@ use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
+use jiff_diesel::ToDiesel;
 
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1575,8 +1575,8 @@ async fn per_shard_scheduler_ha_fires_each_slot_exactly_once_under_two_replicas(
     // Each round hands every shard a *fresh, distinct* past slot and clears any
     // held claim, then races two replicas at it. Distinct slots mean distinct
     // `sched:{id}:{name}:{slot}` workflow ids, so a duplicated fire is visible.
-    let anchor =
-        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(i64::try_from(ROUNDS).expect("fits") + 10);
+    let anchor = jiff::Timestamp::now()
+        - jiff::SignedDuration::from_hours(i64::try_from(ROUNDS).expect("fits") + 10);
     for round in 0..ROUNDS {
         let slot = anchor + jiff::SignedDuration::from_hours(i64::try_from(round).expect("fits"));
         for (_, conn) in &mut conns {

@@ -9,8 +9,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to run against a local Postgres. Without
 //! it, a testcontainers Postgres starts.
 
-use std::sync::Mutex;
 use jiff_diesel::ToDiesel;
+use std::sync::Mutex;
 
 use autumn_harvest::concurrency::ConcurrencyOnConflict;
 use autumn_harvest::error::{HarvestError, PayloadKind};

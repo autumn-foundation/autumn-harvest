@@ -124,30 +124,54 @@ mod tests {
         assert_eq!(rfc3339(at(0)), "2023-11-14T22:13:20+00:00");
         assert_eq!(rfc3339(at(100_000_000)), "2023-11-14T22:13:20.100+00:00");
         assert_eq!(rfc3339(at(120_000)), "2023-11-14T22:13:20.000120+00:00");
-        assert_eq!(rfc3339(at(123_456_789)), "2023-11-14T22:13:20.123456789+00:00");
+        assert_eq!(
+            rfc3339(at(123_456_789)),
+            "2023-11-14T22:13:20.123456789+00:00"
+        );
         assert_eq!(rfc3339(at(1)), "2023-11-14T22:13:20.000000001+00:00");
     }
 
     #[test]
     fn rfc3339_opts_matches_each_chrono_seconds_format() {
         let t = at(123_456_789);
-        assert_eq!(rfc3339_opts(t, SecondsFormat::Secs, true), "2023-11-14T22:13:20Z");
-        assert_eq!(rfc3339_opts(t, SecondsFormat::Millis, true), "2023-11-14T22:13:20.123Z");
-        assert_eq!(rfc3339_opts(t, SecondsFormat::Micros, true), "2023-11-14T22:13:20.123456Z");
-        assert_eq!(rfc3339_opts(t, SecondsFormat::Nanos, true), "2023-11-14T22:13:20.123456789Z");
+        assert_eq!(
+            rfc3339_opts(t, SecondsFormat::Secs, true),
+            "2023-11-14T22:13:20Z"
+        );
+        assert_eq!(
+            rfc3339_opts(t, SecondsFormat::Millis, true),
+            "2023-11-14T22:13:20.123Z"
+        );
+        assert_eq!(
+            rfc3339_opts(t, SecondsFormat::Micros, true),
+            "2023-11-14T22:13:20.123456Z"
+        );
+        assert_eq!(
+            rfc3339_opts(t, SecondsFormat::Nanos, true),
+            "2023-11-14T22:13:20.123456789Z"
+        );
         assert_eq!(
             rfc3339_opts(at(5_000), SecondsFormat::Micros, true),
             "2023-11-14T22:13:20.000005Z"
         );
-        assert_eq!(rfc3339_opts(at(0), SecondsFormat::Micros, false), "2023-11-14T22:13:20.000000+00:00");
-        assert_eq!(rfc3339_opts(at(0), SecondsFormat::AutoSi, true), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            rfc3339_opts(at(0), SecondsFormat::Micros, false),
+            "2023-11-14T22:13:20.000000+00:00"
+        );
+        assert_eq!(
+            rfc3339_opts(at(0), SecondsFormat::AutoSi, true),
+            "2023-11-14T22:13:20Z"
+        );
     }
 
     #[test]
     fn utc_display_matches_chrono_display() {
         assert_eq!(utc_display(at(0)), "2023-11-14 22:13:20 UTC");
         assert_eq!(utc_display(at(100_000_000)), "2023-11-14 22:13:20.100 UTC");
-        assert_eq!(utc_display(at(123_456_000)), "2023-11-14 22:13:20.123456 UTC");
+        assert_eq!(
+            utc_display(at(123_456_000)),
+            "2023-11-14 22:13:20.123456 UTC"
+        );
     }
 
     #[test]
@@ -167,7 +191,13 @@ mod tests {
     #[test]
     fn years_outside_four_digits_carry_a_sign() {
         let early = Timestamp::constant(-62_198_755_200, 0);
-        assert_eq!(rfc3339_opts(early, SecondsFormat::Secs, true), "-0001-01-01T00:00:00Z");
-        assert_eq!(rfc3339_opts(Timestamp::UNIX_EPOCH, SecondsFormat::Secs, true), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339_opts(early, SecondsFormat::Secs, true),
+            "-0001-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            rfc3339_opts(Timestamp::UNIX_EPOCH, SecondsFormat::Secs, true),
+            "1970-01-01T00:00:00Z"
+        );
     }
 }

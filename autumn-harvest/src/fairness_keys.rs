@@ -15,9 +15,9 @@
 //! Each shard keeps its own weights. These functions write the shard of the
 //! connection that you pass. The admin HTTP routes write every shard.
 
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use jiff::Timestamp;
 use jiff_diesel::ToDiesel;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::queue_fairness::{

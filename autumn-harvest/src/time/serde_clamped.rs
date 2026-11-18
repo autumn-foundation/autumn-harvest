@@ -70,7 +70,11 @@ pub fn parse(text: &str) -> Result<Timestamp, jiff::Error> {
     }
     // Year 2000 is a leap year, so a valid 29 February still checks here.
     format!("2000{tail}").parse::<Timestamp>()?;
-    Ok(if sign == '-' { Timestamp::MIN } else { Timestamp::MAX })
+    Ok(if sign == '-' {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 #[cfg(test)]
@@ -95,12 +99,16 @@ mod tests {
         assert_eq!(row(r#"{"at":"2023-11-14T22:13:20.123Z"}"#).at, at);
         assert_eq!(row(r#"{"at":"2023-11-14T22:13:20.123000Z"}"#).at, at);
         assert_eq!(row(r#"{"at":"2023-11-14T22:13:20.123Z"}"#).maybe, None);
-        assert_eq!(row(r#"{"at":"2023-11-14T22:13:20.123Z","maybe":null}"#).maybe, None);
+        assert_eq!(
+            row(r#"{"at":"2023-11-14T22:13:20.123Z","maybe":null}"#).maybe,
+            None
+        );
     }
 
     #[test]
     fn clamps_a_chrono_year_past_the_jiff_range() {
-        let far = row(r#"{"at":"+12026-01-01T00:00:00Z","maybe":"+262142-12-31T23:59:59.999999999Z"}"#);
+        let far =
+            row(r#"{"at":"+12026-01-01T00:00:00Z","maybe":"+262142-12-31T23:59:59.999999999Z"}"#);
         assert_eq!(far.at, Timestamp::MAX);
         assert_eq!(far.maybe, Some(Timestamp::MAX));
         assert_eq!(row(r#"{"at":"-12026-01-01T00:00:00Z"}"#).at, Timestamp::MIN);

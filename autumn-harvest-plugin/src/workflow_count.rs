@@ -47,8 +47,8 @@ use autumn_harvest::execution::{
     WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, count_workflow_executions_grouped,
 };
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -205,23 +205,21 @@ impl WorkflowCountParams {
                     }
                 }
                 "started_after" => {
-                    let dt = autumn_harvest::time::parse::rfc3339(value.trim())
-                        .map_err(|_| {
-                            format!(
-                                "invalid started_after '{value}'; expected RFC 3339 \
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim()).map_err(|_| {
+                        format!(
+                            "invalid started_after '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
-                            )
-                        })?;
+                        )
+                    })?;
                     params.started_after = Some(dt);
                 }
                 "started_before" => {
-                    let dt = autumn_harvest::time::parse::rfc3339(value.trim())
-                        .map_err(|_| {
-                            format!(
-                                "invalid started_before '{value}'; expected RFC 3339 \
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim()).map_err(|_| {
+                        format!(
+                            "invalid started_before '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
-                            )
-                        })?;
+                        )
+                    })?;
                     params.started_before = Some(dt);
                 }
                 "limit_groups" => {

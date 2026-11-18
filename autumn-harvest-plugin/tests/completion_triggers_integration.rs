@@ -9,8 +9,8 @@
 )]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::Ext;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2004,7 +2004,10 @@ async fn test_trigger_outbox_retry_and_sweep() {
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
     )
-    .set(outbox_dsl::next_attempt_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()))
+    .set(
+        outbox_dsl::next_attempt_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(&mut conn0)
     .await
     .unwrap();

@@ -31,8 +31,8 @@
 //! against it directly (single-threaded, each test scrubs first). Otherwise a
 //! fresh testcontainers Postgres boots with the full migration bundle.
 
-use std::collections::BTreeMap;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,10 +41,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Double, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -304,10 +304,7 @@ async fn bucket_updated_at(conn: &mut AsyncPgConnection, key: &str) -> Timestamp
         .updated_at
 }
 
-async fn bucket_last_registered_at(
-    conn: &mut AsyncPgConnection,
-    key: &str,
-) -> Option<Timestamp> {
+async fn bucket_last_registered_at(conn: &mut AsyncPgConnection, key: &str) -> Option<Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct MaybeTsRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
@@ -718,7 +715,12 @@ async fn the_configured_window_is_honoured() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    insert_idle_bucket(&mut conn, "dyn-rate:t:a", jiff::SignedDuration::from_hours(3)).await;
+    insert_idle_bucket(
+        &mut conn,
+        "dyn-rate:t:a",
+        jiff::SignedDuration::from_hours(3),
+    )
+    .await;
 
     // A 24h window retains a 3h-idle bucket.
     let result = run_one_tick(
@@ -1595,7 +1597,12 @@ async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace(
     scrub(&mut conn).await;
 
     // Idle for over a year, and by every other clock instantly collectable.
-    insert_idle_bucket(&mut conn, "dyn-rate:t:ancient", autumn_harvest::time::days(400)).await;
+    insert_idle_bucket(
+        &mut conn,
+        "dyn-rate:t:ancient",
+        autumn_harvest::time::days(400),
+    )
+    .await;
 
     // Replay the real upgrade on the real table: drop the column back to its
     // pre-#1127 shape, then re-add it with the migration's OWN statements. That

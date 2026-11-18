@@ -38,8 +38,8 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::usage::{UsageGroupBy, UsageQuery, UsageShardRow};
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -196,7 +196,8 @@ impl UsageParams {
         }
 
         let window = to.duration_since(from);
-        let ceiling_signed = jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
+        let ceiling_signed =
+            jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
         if window > ceiling_signed {
             let ceiling_label = format_ceiling(ceiling);
             return Err(format!(
@@ -506,11 +507,13 @@ mod tests {
 
     #[test]
     fn params_accepts_window_exactly_at_ceiling() {
-        let from = "2026-01-01T00:00:00Z".parse::<Timestamp>()
-            .unwrap();
+        let from = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let to = from + jiff::SignedDuration::try_from(CEILING).unwrap();
         let params = UsageParams::from_query_pairs(
-            &pairs(&[("from", &autumn_harvest::time::rfc3339(from)), ("to", &autumn_harvest::time::rfc3339(to))]),
+            &pairs(&[
+                ("from", &autumn_harvest::time::rfc3339(from)),
+                ("to", &autumn_harvest::time::rfc3339(to)),
+            ]),
             at(0),
             CEILING,
         )
@@ -568,8 +571,7 @@ mod tests {
 
     #[test]
     fn params_accepts_relative_duration_since_now() {
-        let now = "2026-02-01T00:00:00Z".parse::<Timestamp>()
-            .unwrap();
+        let now = "2026-02-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let params =
             UsageParams::from_query_pairs(&pairs(&[("from", "24h"), ("to", "1h")]), now, CEILING)
                 .unwrap();

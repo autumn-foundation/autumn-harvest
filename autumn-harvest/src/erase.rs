@@ -397,13 +397,13 @@ mod db {
     use std::future::Future;
     use std::pin::Pin;
 
-    use jiff::Timestamp;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     use crate::error::{HarvestError, HarvestResult, database_error};

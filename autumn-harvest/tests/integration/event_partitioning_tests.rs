@@ -24,8 +24,8 @@
 //! against it directly (single-threaded, each test scrubs first). Otherwise a
 //! fresh testcontainers Postgres boots with the full migration bundle.
 
-use std::sync::{Arc, Mutex};
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
@@ -38,10 +38,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -1588,7 +1588,14 @@ async fn enable_sql_rechecks_a_dependent_view_created_after_the_preflight() {
     // this recheck is what caught it. The populated path never runs
     // that `DROP`, so this is the only guard standing between it and a
     // silently stranded view.
-    let exec = insert_execution(&mut conn, "race_view_wf", "race-view-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_view_wf",
+        "race-view-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1648,7 +1655,14 @@ async fn enable_sql_rechecks_an_operator_trigger_installed_after_the_preflight()
     // the legacy table as a partition rather than dropping it. See the
     // dependent-view test's sibling comment for why the empty path
     // cannot isolate this recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_trg_wf", "race-trg-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_trg_wf",
+        "race-trg-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1728,7 +1742,14 @@ async fn enable_sql_rechecks_a_unique_index_added_after_the_preflight() {
     // A populated table takes the AttachLegacy path. See the dependent-view
     // test's sibling comment for why the empty path cannot isolate this
     // recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_idx_wf", "race-idx-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_idx_wf",
+        "race-idx-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1787,7 +1808,14 @@ async fn enable_sql_rechecks_an_unreplayable_constraint_installed_after_the_pref
     // A populated table takes the AttachLegacy path. See the dependent-view
     // test's sibling comment for why the empty path cannot isolate this
     // recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_con_wf", "race-con-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_con_wf",
+        "race-con-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1855,7 +1883,14 @@ async fn a_plain_compatible_unique_index_survives_the_direct_enable_path() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "plain_idx_wf", "plain-idx-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "plain_idx_wf",
+        "plain-idx-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -4030,7 +4065,14 @@ async fn an_operators_own_function_of_the_same_name_does_not_block_conversion() 
     .await
     .expect("seed an operator's own function sharing the helper's name and signature");
 
-    let exec = insert_execution(&mut conn, "fn_collide_wf", "fn-collide-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "fn_collide_wf",
+        "fn-collide-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -4281,7 +4323,12 @@ async fn an_execution_whose_events_span_cohorts_loads_its_full_history_in_order(
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
         .await
         .expect("first append");
-    backdate_events(&mut conn, exec, Timestamp::now() - autumn_harvest::time::days(2)).await;
+    backdate_events(
+        &mut conn,
+        exec,
+        Timestamp::now() - autumn_harvest::time::days(2),
+    )
+    .await;
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 3)
         .await
         .expect("second append");
@@ -4864,8 +4911,8 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
          before={before} after={}",
         after.len()
     );
-    let horizon =
-        Timestamp::now() + autumn_harvest::time::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
+    let horizon = Timestamp::now()
+        + autumn_harvest::time::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
     assert!(
         after
             .iter()
@@ -5804,8 +5851,10 @@ fn cohort_start_floors_pre_epoch_timestamps_downward() {
 
 #[test]
 fn partition_names_are_legible_and_collision_free() {
-    let a = partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
-    let b = partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap());
+    let a =
+        partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
+    let b =
+        partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap());
     assert_ne!(a, b);
     assert!(a.starts_with("harvest_events_p_"), "got {a}");
     assert!(
@@ -6096,7 +6145,12 @@ async fn a_duplicate_event_id_is_rejected_even_across_cohorts() {
     // cohort: a stale worker whose task was reclaimed, or a retried workflow
     // task. Without a cross-partition check, the engine's split-brain detector
     // silently stops firing for every execution that existed at conversion.
-    backdate_events(&mut conn, exec, Timestamp::now() - autumn_harvest::time::days(3)).await;
+    backdate_events(
+        &mut conn,
+        exec,
+        Timestamp::now() - autumn_harvest::time::days(3),
+    )
+    .await;
 
     let clash = autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0).await;
     assert!(
@@ -7831,7 +7885,14 @@ async fn enable_sql_rechecks_row_security_enabled_after_the_preflight() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "race_rls_wf", "race-rls-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_rls_wf",
+        "race-rls-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -7897,7 +7958,14 @@ async fn enable_sql_rechecks_a_publication_added_after_the_preflight() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "race_pub_wf", "race-pub-1", Timestamp::now(), None).await;
+    let exec = insert_execution(
+        &mut conn,
+        "race_pub_wf",
+        "race-pub-1",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -8109,10 +8177,11 @@ async fn phase_4_holds_access_exclusive_before_the_dependent_view_recheck() {
     reset_to_unpartitioned(&mut conn).await;
     run_plan_phases(&mut conn, 1..=3).await;
 
-    let steps: Vec<_> = partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
-        .into_iter()
-        .filter(|s| s.phase == 4)
-        .collect();
+    let steps: Vec<_> =
+        partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
+            .into_iter()
+            .filter(|s| s.phase == 4)
+            .collect();
     let lock_pos = steps
         .iter()
         .position(|s| {
@@ -9983,7 +10052,14 @@ async fn a_drain_pass_bounds_the_ddl_it_runs_under_the_parent_lock() {
         0,
         "every parked row must end up in a real cohort partition"
     );
-    let live = insert_execution(&mut conn, "drain_wf", "drain-ddl-live", Timestamp::now(), None).await;
+    let live = insert_execution(
+        &mut conn,
+        "drain_wf",
+        "drain-ddl-live",
+        Timestamp::now(),
+        None,
+    )
+    .await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(live),

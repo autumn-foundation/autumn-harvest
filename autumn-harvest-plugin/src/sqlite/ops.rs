@@ -174,7 +174,10 @@ struct CreateBody {
     skip_policy: Option<String>,
     #[serde(default)]
     consecutive_failure_limit: Option<u32>,
-    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
     end_at: Option<Timestamp>,
     #[serde(default)]
     max_runs: Option<u32>,

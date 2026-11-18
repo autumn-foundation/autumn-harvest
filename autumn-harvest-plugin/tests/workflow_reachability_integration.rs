@@ -4,8 +4,8 @@
 //! the `?workflow_type=` filter. Also covers the admin auth boundary and
 //! cross-shard aggregation, with an unreachable shard reported as `partial`.
 
-use std::collections::BTreeSet;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -32,10 +32,10 @@ use autumn_harvest_plugin::workflow_reachability::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -239,7 +239,8 @@ async fn insert_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -796,7 +797,8 @@ async fn gate_is_side_effect_free_orphan_task_untouched() {
                 harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())),
                 harvest_task_queue::input.eq(json!({})),
                 harvest_task_queue::max_attempts.eq(1),
-                harvest_task_queue::scheduled_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+                harvest_task_queue::scheduled_at
+                    .eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             ))
             .execute(&mut conn)
             .await

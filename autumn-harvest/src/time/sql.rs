@@ -50,10 +50,10 @@ impl From<PgDuration> for SignedDuration {
 
 /// Converts a duration to the `interval` parts that Diesel `chrono` wrote.
 fn to_interval(duration: SignedDuration) -> Result<PgInterval, &'static str> {
-    let micros = super::num_microseconds(duration)
-        .ok_or("Failed to create microseconds by overflow")?;
-    let days = i32::try_from(super::num_days(duration))
-        .map_err(|_| "Failed to get i32 days from i64")?;
+    let micros =
+        super::num_microseconds(duration).ok_or("Failed to create microseconds by overflow")?;
+    let days =
+        i32::try_from(super::num_days(duration)).map_err(|_| "Failed to get i32 days from i64")?;
     Ok(PgInterval {
         microseconds: micros % MICROS_PER_DAY,
         days,
@@ -136,7 +136,11 @@ const PG_EPOCH_MICROS: i128 = 946_684_800_000_000;
 /// Reads a Postgres `timestamptz` value, clamped into the jiff range.
 fn from_pg_micros(micros: i64) -> Timestamp {
     let nanos = (PG_EPOCH_MICROS + i128::from(micros)) * 1_000;
-    Timestamp::from_nanosecond(nanos).unwrap_or(if nanos < 0 { Timestamp::MIN } else { Timestamp::MAX })
+    Timestamp::from_nanosecond(nanos).unwrap_or(if nanos < 0 {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// A [`Timestamp`] that Diesel reads from a `timestamptz`, clamped into the
@@ -292,7 +296,10 @@ mod tests {
     fn a_date_past_the_jiff_range_reads_as_none() {
         assert_eq!(from_pg_days(0), Some(jiff::civil::date(2000, 1, 1)));
         assert_eq!(from_pg_days(-1), Some(jiff::civil::date(1999, 12, 31)));
-        let last = jiff::civil::Date::MAX.since(jiff::civil::date(2000, 1, 1)).unwrap().get_days();
+        let last = jiff::civil::Date::MAX
+            .since(jiff::civil::date(2000, 1, 1))
+            .unwrap()
+            .get_days();
         assert_eq!(from_pg_days(last), Some(jiff::civil::Date::MAX));
         assert_eq!(from_pg_days(last + 1), None);
         assert_eq!(from_pg_days(i32::MAX), None);
@@ -320,7 +327,11 @@ mod tests {
 
     #[test]
     fn a_read_counts_a_month_as_thirty_days() {
-        let interval = PgInterval { microseconds: 5, days: 1, months: 2 };
+        let interval = PgInterval {
+            microseconds: 5,
+            days: 1,
+            months: 2,
+        };
         assert_eq!(
             from_interval(interval),
             SignedDuration::from_hours(61 * 24) + SignedDuration::from_micros(5)
@@ -339,7 +350,10 @@ mod tests {
     #[test]
     fn a_stored_timestamp_past_the_jiff_range_reads_clamped() {
         assert_eq!(from_pg_micros(0), Timestamp::constant(946_684_800, 0));
-        assert_eq!(from_pg_micros(-1), Timestamp::constant(946_684_799, 999_999_000));
+        assert_eq!(
+            from_pg_micros(-1),
+            Timestamp::constant(946_684_799, 999_999_000)
+        );
         // Postgres `infinity` and `-infinity`.
         assert_eq!(from_pg_micros(i64::MAX), Timestamp::MAX);
         assert_eq!(from_pg_micros(i64::MIN), Timestamp::MIN);

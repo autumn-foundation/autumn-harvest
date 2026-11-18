@@ -20,8 +20,8 @@
 // suites (`start_idempotency_integration.rs`, `admission_gate_authoritative_localpg.rs`).
 #![allow(clippy::await_holding_lock)]
 
-use std::pin::Pin;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -35,10 +35,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -1875,8 +1875,7 @@ async fn rerun_seals_source_and_preserves_completed_at() {
     let mut conn = pool.get().await.unwrap();
 
     let wf_id = unique("rr-seal");
-    let fixed = "2026-02-03T04:05:06Z".parse::<Timestamp>()
-        .unwrap();
+    let fixed = "2026-02-03T04:05:06Z".parse::<Timestamp>().unwrap();
     let source = seed_execution(
         &mut conn,
         wf,

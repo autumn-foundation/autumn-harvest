@@ -1,7 +1,6 @@
 #![cfg(feature = "db")]
 
 use autumn_harvest::event::WorkflowEvent;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::models::{TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
@@ -20,6 +19,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;

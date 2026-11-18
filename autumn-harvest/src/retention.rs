@@ -11,7 +11,6 @@ use std::time::Duration;
 #[cfg(feature = "db")]
 use std::{collections::HashMap, time::Instant};
 
-use jiff::Timestamp;
 #[cfg(feature = "db")]
 use diesel::prelude::*;
 #[cfg(feature = "db")]
@@ -20,6 +19,7 @@ use diesel::sql_types::{Array, BigInt, Interval, Nullable, Text, Timestamptz, Uu
 use diesel_async::{AsyncConnection, RunQueryDsl};
 #[cfg(feature = "db")]
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 #[cfg(feature = "db")]
 use tokio::sync::mpsc;
@@ -3106,7 +3106,9 @@ async fn run_shard_tick(
                 let rows = if let Some(fallback) = global_fallback {
                     query
                         .bind::<Timestamptz, _>(fallback.to_diesel())
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at).to_diesel())
+                        .bind::<Nullable<Timestamptz>, _>(
+                            cursor.map(|it| it.completed_at).to_diesel(),
+                        )
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
                         .bind::<Array<Text>, _>(tenant_names_inner)
@@ -3115,7 +3117,9 @@ async fn run_shard_tick(
                         .await
                 } else {
                     query
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at).to_diesel())
+                        .bind::<Nullable<Timestamptz>, _>(
+                            cursor.map(|it| it.completed_at).to_diesel(),
+                        )
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
                         .bind::<Array<Text>, _>(tenant_names_inner)
@@ -3794,7 +3798,10 @@ type HoldTimestamps = (Option<Timestamp>, Option<Timestamp>);
 
 /// [`HoldTimestamps`] as Diesel loads them.
 #[cfg(feature = "db")]
-type HoldTimestampsRow = (Option<crate::time::sql::SqlTimestamp>, Option<crate::time::sql::SqlTimestamp>);
+type HoldTimestampsRow = (
+    Option<crate::time::sql::SqlTimestamp>,
+    Option<crate::time::sql::SqlTimestamp>,
+);
 
 /// Best-effort, non-locking read of a candidate's legal-hold columns, used for
 /// the pre-archival re-read gate (issue #747 BLOCKER 1). A concurrently-deleted
@@ -3997,7 +4004,8 @@ async fn delete_candidate_execution(
                 let completed = completed_at.unwrap_or(started_at);
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
-                let duration_ms = Some(crate::time::num_milliseconds(completed - started_at).max(0));
+                let duration_ms =
+                    Some(crate::time::num_milliseconds(completed - started_at).max(0));
                 // Payload capture is opt-in (AC3), and only ever happens
                 // under an explicit policy that asked for it. The
                 // migration-target tombstone case has no policy, so it
@@ -4177,18 +4185,18 @@ async fn delete_candidate_execution(
 type SummarySourceRow = (
     Option<crate::time::sql::SqlTimestamp>, // legal_hold_set_at
     Option<crate::time::sql::SqlTimestamp>, // legal_hold_until
-    String,                         // workflow_name
-    String,                         // workflow_id
-    String,                         // state
+    String,                                 // workflow_name
+    String,                                 // workflow_id
+    String,                                 // state
     crate::time::sql::SqlTimestamp,         // started_at
     Option<crate::time::sql::SqlTimestamp>, // completed_at
-    i32,                            // shard_id
-    Option<serde_json::Value>, // output
-    Option<String>,            // error
-    Option<serde_json::Value>, // search_attrs
-    Option<uuid::Uuid>,        // parent_id
-    Option<serde_json::Value>, // migrated_from_shards
-    Option<String>,            // staging_vacated_state
+    i32,                                    // shard_id
+    Option<serde_json::Value>,              // output
+    Option<String>,                         // error
+    Option<serde_json::Value>,              // search_attrs
+    Option<uuid::Uuid>,                     // parent_id
+    Option<serde_json::Value>,              // migrated_from_shards
+    Option<String>,                         // staging_vacated_state
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue
@@ -4848,7 +4856,10 @@ mod legal_hold_db {
 
                 diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                     .set((
-                        SetExt(harvest_workflow_executions_ext::legal_hold_set_at.eq(Some(now).to_diesel())),
+                        SetExt(
+                            harvest_workflow_executions_ext::legal_hold_set_at
+                                .eq(Some(now).to_diesel()),
+                        ),
                         harvest_workflow_executions::legal_hold_until.eq(hold_until.to_diesel()),
                         SetExt(
                             harvest_workflow_executions_ext::legal_hold_reason.eq(stored_reason),
@@ -4915,11 +4926,17 @@ mod legal_hold_db {
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                         .set((
                             SetExt(
-                                harvest_workflow_executions_ext::legal_hold_set_at
-                                    .eq::<Option<crate::time::sql::SqlTimestamp>>(None),
+                                harvest_workflow_executions_ext::legal_hold_set_at.eq::<Option<
+                                    crate::time::sql::SqlTimestamp,
+                                >>(
+                                    None
+                                ),
                             ),
-                            harvest_workflow_executions::legal_hold_until
-                                .eq::<Option<crate::time::sql::SqlTimestamp>>(None),
+                            harvest_workflow_executions::legal_hold_until.eq::<Option<
+                                crate::time::sql::SqlTimestamp,
+                            >>(
+                                None
+                            ),
                             SetExt(
                                 harvest_workflow_executions_ext::legal_hold_reason
                                     .eq::<Option<String>>(None),

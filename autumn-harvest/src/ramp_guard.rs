@@ -12,9 +12,9 @@
 //!
 //! `docs/operations/build-ramp-guard.md` is the specification.
 
-use std::time::Duration;
 #[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
+use std::time::Duration;
 
 /// The default time between two guard passes.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);

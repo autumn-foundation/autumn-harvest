@@ -159,10 +159,7 @@ pub const fn broken_session_reason(
 
 /// Pure lease-expiry check: has `now` reached or passed `expires_at`?
 #[must_use]
-pub fn lease_expired(
-    now: jiff::Timestamp,
-    expires_at: jiff::Timestamp,
-) -> bool {
+pub fn lease_expired(now: jiff::Timestamp, expires_at: jiff::Timestamp) -> bool {
     now >= expires_at
 }
 
@@ -692,7 +689,8 @@ async fn resolve_broken_reason(
         // can be de-registered/GC'd without ever transitioning to Stopped).
         None => (true, false),
         Some((last_heartbeat_at, status)) => {
-            let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(worker_stale_secs);
+            let cutoff =
+                jiff::Timestamp::now() - jiff::SignedDuration::from_secs(worker_stale_secs);
             (
                 last_heartbeat_at.to_jiff() <= cutoff,
                 status == "Draining" || status == "Stopped",

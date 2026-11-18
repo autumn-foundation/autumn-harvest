@@ -17,10 +17,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -237,7 +237,8 @@ async fn insert_version_execution_with_markers(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await

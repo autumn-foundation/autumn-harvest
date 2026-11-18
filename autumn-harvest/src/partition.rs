@@ -426,7 +426,10 @@ pub fn cohort_start(ts: Timestamp, width_secs: i64) -> Timestamp {
 /// any width down to one second.
 #[must_use]
 pub fn partition_name(cohort_start: Timestamp) -> String {
-    format!("{PARTITION_PREFIX}{}", cohort_start.strftime("%Y%m%d%H%M%S"))
+    format!(
+        "{PARTITION_PREFIX}{}",
+        cohort_start.strftime("%Y%m%d%H%M%S")
+    )
 }
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -880,10 +883,7 @@ fn parse_bound_literal(raw: &str) -> Option<Timestamp> {
     }
     // A space in a jiff format matches zero or more whitespace. `%:::z` reads
     // `+HH`, `+HH:MM` and `+HH:MM:SS`. `%z` reads `+HHMM`.
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f %:::z",
-        "%Y-%m-%d %H:%M:%S%.f %z",
-    ] {
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f %:::z", "%Y-%m-%d %H:%M:%S%.f %z"] {
         if let Ok(ts) = Timestamp::strptime(fmt, inner) {
             return Some(ts);
         }
@@ -1036,7 +1036,10 @@ async fn ensure_cohort_with_width(
     lock_timeout: Duration,
 ) -> HarvestResult<(String, bool)> {
     let lower = cohort_start(ts, width);
-    let Some(upper) = lower.checked_add(jiff::SignedDuration::from_secs(width)).ok() else {
+    let Some(upper) = lower
+        .checked_add(jiff::SignedDuration::from_secs(width))
+        .ok()
+    else {
         return Err(HarvestError::Database(format!(
             "cohort starting at {} overflows when advanced by {width}s",
             crate::time::utc_display(lower)
@@ -1260,7 +1263,10 @@ async fn ensure_partitions_inner(
     let mut blocked: Vec<String> = Vec::new();
     let mut attempted = 0usize;
     for step in 0..=i64::from(lookahead_cohorts) {
-        let Some(at) = now.checked_add(jiff::SignedDuration::from_secs(width * step)).ok() else {
+        let Some(at) = now
+            .checked_add(jiff::SignedDuration::from_secs(width * step))
+            .ok()
+        else {
             break;
         };
         attempted += 1;
@@ -5118,7 +5124,10 @@ async fn delete_orphan_rows(
                 .bind::<Timestamptz, _>(upper.to_diesel())
                 .bind::<BigInt, _>(batch);
             let deleted = if let Some(lower) = lower {
-                query.bind::<Timestamptz, _>(lower.to_diesel()).execute(conn).await
+                query
+                    .bind::<Timestamptz, _>(lower.to_diesel())
+                    .execute(conn)
+                    .await
             } else {
                 query.execute(conn).await
             }
@@ -7079,9 +7088,21 @@ mod tests {
         let upper = Timestamp::constant(1_700_000_000, 0);
         let now = upper + jiff::SignedDuration::from_secs(120);
         assert!(straggler_grace_elapsed(upper, Duration::from_secs(60), now));
-        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(600), now));
-        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(400_000_000_000), now));
-        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(i64::MAX as u64), now));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(600),
+            now
+        ));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(400_000_000_000),
+            now
+        ));
+        assert!(!straggler_grace_elapsed(
+            upper,
+            Duration::from_secs(i64::MAX as u64),
+            now
+        ));
     }
 
     /// Each layout path installs the entity projection trigger next to the
@@ -7227,7 +7248,10 @@ mod tests {
             lo,
             Some(crate::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap())
         );
-        assert_eq!(hi, Some(crate::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap()));
+        assert_eq!(
+            hi,
+            Some(crate::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]

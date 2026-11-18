@@ -535,7 +535,10 @@ fn every_pub_async_method_on_durable_promise_is_a_sink() {
 fn sources_never_shadowed_by_trusted_crates() {
     // (trusted crate, a source/forbidden row that must exist for it)
     const CARVE_OUTS: &[(&str, &[&str])] = &[
-        ("jiff", &["Timestamp::now", "ZonedDateTime::now", "TimeZone::system"]),
+        (
+            "jiff",
+            &["Timestamp::now", "ZonedDateTime::now", "TimeZone::system"],
+        ),
         ("chrono", &["Utc::now", "Local::now"]),
         ("uuid", &["Uuid::new_v4", "Uuid::now_v7"]),
         ("rand", &["thread_rng", "random", "Rng::gen_range"]),

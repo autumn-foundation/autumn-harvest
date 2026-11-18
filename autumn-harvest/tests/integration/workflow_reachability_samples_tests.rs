@@ -16,10 +16,10 @@ use std::collections::BTreeSet;
 use autumn_harvest::execution::{REACHABILITY_SAMPLE_CAP, non_terminal_counts_by_workflow_name};
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -110,7 +110,8 @@ async fn insert_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(conn)
     .await
@@ -195,7 +196,10 @@ async fn non_terminal_counts_samples_are_oldest_first() {
         diesel::update(
             autumn_harvest::schema::harvest_workflow_executions::table.find(id.as_uuid()),
         )
-        .set(autumn_harvest::schema::harvest_workflow_executions::started_at.eq(started_at.to_diesel()))
+        .set(
+            autumn_harvest::schema::harvest_workflow_executions::started_at
+                .eq(started_at.to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("set started_at");

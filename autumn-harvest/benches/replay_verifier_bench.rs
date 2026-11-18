@@ -14,8 +14,8 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{HistorySnapshot, ReplayVerifier};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use jiff::Timestamp;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use jiff::Timestamp;
 use serde_json::Value;
 
 /// Workflow that executes N sequential activities.

@@ -16,10 +16,10 @@
 //! `WorkflowEvent` variant, no core migration.**
 
 use async_trait::async_trait;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::telemetry::PoisonReason;
-use jiff::Timestamp;
 use diesel_async::AsyncPgConnection;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use uuid::Uuid;
 
 use super::source::{ConnectorError, ConnectorFuture};

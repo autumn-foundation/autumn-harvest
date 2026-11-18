@@ -18,8 +18,8 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::future::Future;
 use jiff_diesel::ToDiesel;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -42,10 +42,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -633,7 +633,8 @@ async fn resolves_to_running_successor_after_continue_as_new() {
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq((Timestamp::now() - SignedDuration::from_mins(10)).to_diesel()),
+            harvest_workflow_executions::started_at
+                .eq((Timestamp::now() - SignedDuration::from_mins(10)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

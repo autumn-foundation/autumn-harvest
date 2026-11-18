@@ -622,8 +622,9 @@ pub(crate) async fn dispatch_workflow_start_request(
     let sla = info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     // The start clamps the timeout to the fleet ceiling, and the SLA to the
     // timeout, as on the API start path.
-    let to_signed =
-        |d: std::time::Duration| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX);
+    let to_signed = |d: std::time::Duration| {
+        jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)
+    };
     let execution_timeout = info_execution_timeout.map(to_signed);
     let max_execution_timeout_ceiling = registry_ext
         .as_ref()
@@ -888,7 +889,7 @@ pub(crate) fn retry_delay_for_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     /// `outbox_mark_flush_remaining` picks the soonest of its three
     /// candidate deadlines (issue #1620). The fixed bound, the earliest
     /// failed-row deadline, and the claim deadline -- the last one only

@@ -4,10 +4,8 @@
 //! start semantics scoped to `(workflow_name, workflow_id)`.
 
 use crate::cached_stmt::CachePreparedDsl as _;
-use jiff_diesel::ToDiesel;
 use crate::schema::harvest_workflow_executions_ext;
 use crate::table_split::SetExt;
-use jiff::{SignedDuration, Timestamp};
 use diesel::ExpressionMethods;
 use diesel::NullableExpressionMethods;
 use diesel::OptionalExtension;
@@ -16,6 +14,8 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use uuid::Uuid;
 
 use crate::build_routing;
@@ -1448,7 +1448,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         let max_start_at = now.checked_add(max_delay).unwrap_or(Timestamp::MAX);
         if sa > max_start_at {
             // The text keeps the `Debug` form that `chrono` printed.
-            let debug = |at| crate::time::rfc3339_opts(at, crate::time::SecondsFormat::AutoSi, true);
+            let debug =
+                |at| crate::time::rfc3339_opts(at, crate::time::SecondsFormat::AutoSi, true);
             return Err(HarvestError::Config(format!(
                 "Requested start_at ({}) exceeds maximum permitted delay ({})",
                 debug(sa),
@@ -1730,8 +1731,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // `Timestamp + SignedDuration` panics past the jiff range, which ends in
     // year 9999. A timeout that passes it gives no deadline, as the chain cap
     // below does. The builder accepts a timeout of up to 292 million years.
-    let deadline_at =
-        effective_timeout.and_then(|d| target_start_time.checked_add(d).ok());
+    let deadline_at = effective_timeout.and_then(|d| target_start_time.checked_add(d).ok());
 
     // Clamp the SLA down to the hard timeout when sla > deadline (issue #487).
     // The hard timeout fires first, so the soft signal could never fire.
@@ -1833,7 +1833,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // A fresh admission yields to continuations at claim (issue #1824). A
     // workflow retry continues a failed run, so it does not yield.
     enqueue.new_start = request.retry_of_exec_id.is_none();
-    if request.delay.is_some_and(|d| d > jiff::SignedDuration::ZERO) || request.start_at.is_some() {
+    if request
+        .delay
+        .is_some_and(|d| d > jiff::SignedDuration::ZERO)
+        || request.start_at.is_some()
+    {
         enqueue.scheduled_at = target_start_time;
     }
 
@@ -3355,8 +3359,7 @@ mod resolve_by_workflow_id_tests {
     }
 
     fn at(minute: u32) -> Timestamp {
-        crate::time::utc_ymd_hms(2026, 1, 1, 0, minute, 0)
-            .unwrap()
+        crate::time::utc_ymd_hms(2026, 1, 1, 0, minute, 0).unwrap()
     }
 
     #[test]
@@ -3854,7 +3857,9 @@ async fn replace_execution(
         new_exec_id,
     )
     .await?;
-    let start_timestamp = if request.delay.is_some_and(|d| d > jiff::SignedDuration::ZERO)
+    let start_timestamp = if request
+        .delay
+        .is_some_and(|d| d > jiff::SignedDuration::ZERO)
         || request.start_at.is_some()
     {
         enqueue.scheduled_at
@@ -4276,7 +4281,10 @@ async fn cancel_workflow_execution_collect_mode(
                     )
                     .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
                     .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
-                    .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Timestamp::now().to_diesel())),
+                    .filter(
+                        crate::schema::harvest_task_queue::scheduled_at
+                            .gt(Timestamp::now().to_diesel()),
+                    ),
             )
             .execute(conn)
             .await
@@ -4316,13 +4324,15 @@ async fn cancel_workflow_execution_collect_mode(
                         harvest_workflow_executions::state.eq("CANCELLED"),
                         harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                         harvest_workflow_executions::error.eq(Some(reason.clone())),
-                        harvest_workflow_executions::completed_at.eq(Some(completed_at).to_diesel()),
+                        harvest_workflow_executions::completed_at
+                            .eq(Some(completed_at).to_diesel()),
                         SetExt(
                             harvest_workflow_executions_ext::sla_deadline_at
                                 .eq(new_sla_deadline_at.to_diesel()),
                         ),
                         // Cancellation wins: clear the pending pause record.
-                        harvest_workflow_executions::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
+                        harvest_workflow_executions::paused_at
+                            .eq(None::<crate::time::sql::SqlTimestamp>),
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
                         harvest_workflow_executions::pause_actor.eq(None::<String>),
                     ))
@@ -5726,7 +5736,8 @@ fn resume_deadline_shifts(
         .map(|p| resumed_at - p)
         .filter(|span| *span > SignedDuration::ZERO)
         .unwrap_or(SignedDuration::ZERO);
-    let pause_duration_secs = std::time::Duration::try_from(pause_span).map_or(0.0, |d| d.as_secs_f64());
+    let pause_duration_secs =
+        std::time::Duration::try_from(pause_span).map_or(0.0, |d| d.as_secs_f64());
 
     // Pause suspends the SLA clock (issue #383 × #243). Push the absolute
     // execution deadline forward by the time spent paused, so paused
@@ -5906,7 +5917,8 @@ pub async fn resume_workflow_execution(
                     .filter(harvest_workflow_executions::state.eq("PAUSED"))
                     .set((
                         harvest_workflow_executions::state.eq("RUNNING"),
-                        harvest_workflow_executions::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
+                        harvest_workflow_executions::paused_at
+                            .eq(None::<crate::time::sql::SqlTimestamp>),
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
                         harvest_workflow_executions::pause_actor.eq(None::<String>),
                         harvest_workflow_executions::deadline_at.eq(new_deadline_at.to_diesel()),
@@ -6296,10 +6308,14 @@ pub async fn reactivate_failed_execution_at(
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
             harvest_workflow_executions::deadline_at.eq(new_deadline_at.to_diesel()),
-            SetExt(harvest_workflow_executions_ext::sla_deadline_at.eq(new_sla_deadline_at.to_diesel())),
+            SetExt(
+                harvest_workflow_executions_ext::sla_deadline_at
+                    .eq(new_sla_deadline_at.to_diesel()),
+            ),
             SetExt(harvest_workflow_executions_ext::sla_breached.eq(false)),
             SetExt(
-                harvest_workflow_executions_ext::sla_breached_at.eq(None::<crate::time::sql::SqlTimestamp>),
+                harvest_workflow_executions_ext::sla_breached_at
+                    .eq(None::<crate::time::sql::SqlTimestamp>),
             ),
         ))
         .execute(conn)
@@ -6768,11 +6784,13 @@ pub async fn terminate_workflow_execution_collect(
                     harvest_workflow_executions::error.eq(Some(reason.clone())),
                     harvest_workflow_executions::completed_at.eq(Some(completed_at).to_diesel()),
                     SetExt(
-                        harvest_workflow_executions_ext::sla_deadline_at.eq(new_sla_deadline_at.to_diesel()),
+                        harvest_workflow_executions_ext::sla_deadline_at
+                            .eq(new_sla_deadline_at.to_diesel()),
                     ),
                     // Clear active-pause metadata when terminating a paused
                     // run so it does not appear terminal-and-paused (#383).
-                    harvest_workflow_executions::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
+                    harvest_workflow_executions::paused_at
+                        .eq(None::<crate::time::sql::SqlTimestamp>),
                     harvest_workflow_executions::pause_reason.eq(None::<String>),
                     harvest_workflow_executions::pause_actor.eq(None::<String>),
                 ))
@@ -10812,8 +10830,9 @@ mod non_terminal_sql_tests {
 #[cfg(test)]
 mod pause_helper_tests {
     use super::{
-        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded, resume_deadline_shifts,
-        shift_external_schedule_to_close_on_resume_query, shift_schedule_to_close_on_resume_query,
+        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded,
+        resume_deadline_shifts, shift_external_schedule_to_close_on_resume_query,
+        shift_schedule_to_close_on_resume_query,
     };
     use jiff::{SignedDuration, Timestamp};
     use std::time::Duration;

@@ -1557,7 +1557,8 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
     params_b.activity_id = Some(Uuid::new_v4());
     params_b.priority = 1;
     params_b.rate_limit_key = Some(bucket_b.clone());
-    params_b.schedule_to_close_at = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_millis(300));
+    params_b.schedule_to_close_at =
+        Some(jiff::Timestamp::now() + jiff::SignedDuration::from_millis(300));
     let task_b = queue::enqueue(&mut conn, &params_b)
         .await
         .expect("enqueue b");

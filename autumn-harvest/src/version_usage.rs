@@ -1,9 +1,9 @@
 //! Read-only inventory for recorded workflow version-gate markers.
 
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarvestError, HarvestResult, database_error};

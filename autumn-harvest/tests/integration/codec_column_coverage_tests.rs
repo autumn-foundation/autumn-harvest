@@ -2640,10 +2640,7 @@ fn secret_schedule(name: &str) -> autumn_harvest::WorkflowSchedule {
     ws
 }
 
-async fn schedule_cell(
-    conn: &mut AsyncPgConnection,
-    name: &str,
-) -> (Value, jiff::Timestamp) {
+async fn schedule_cell(conn: &mut AsyncPgConnection, name: &str) -> (Value, jiff::Timestamp) {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Jsonb)]

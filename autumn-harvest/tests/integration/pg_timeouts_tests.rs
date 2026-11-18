@@ -10,8 +10,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise the suite starts a testcontainers Postgres.
 
-use std::collections::HashMap;
 use jiff_diesel::ToDiesel;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,9 @@ use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
-use jiff::Timestamp;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

@@ -27,8 +27,8 @@
 //! with `--test-threads=1`: each test empties the shared tables. Otherwise
 //! the suite starts a testcontainers Postgres.
 
-use std::collections::BTreeMap;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,10 +39,10 @@ use autumn_harvest::retention::{
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

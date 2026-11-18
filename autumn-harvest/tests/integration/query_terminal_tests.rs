@@ -941,7 +941,6 @@ const fn probe_t0() -> jiff::Timestamp {
     jiff::Timestamp::constant(1_700_000_000, 0)
 }
 
-
 /// A terminal history: `WorkflowStarted`, the reserved deadline probe, one
 /// scheduled/completed pair per item, then `WorkflowCompleted`.
 ///

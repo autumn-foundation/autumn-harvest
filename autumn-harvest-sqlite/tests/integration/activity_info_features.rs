@@ -207,9 +207,7 @@ async fn a_successful_body_finalized_past_the_total_deadline_records_timed_out_n
     let t0: i64 = 5_000_000_000;
     let clock = Arc::new(AtomicI64::new(t0));
     let clock_for_rt = Arc::clone(&clock);
-    rt.set_clock(move || {
-        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap());
 
     // The body SUCCEEDS but moves the clock 5s past the 1s deadline BEFORE it returns.
     // The claim check (t0) lets it run. The finalize clock (t0+5s) is past the cap.
@@ -321,9 +319,7 @@ async fn a_queued_activity_whose_deadline_elapsed_while_an_earlier_body_ran_is_t
     let t0: i64 = 5_000_000_000;
     let clock = Arc::new(AtomicI64::new(t0));
     let clock_for_rt = Arc::clone(&clock);
-    rt.set_clock(move || {
-        Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || Timestamp::from_millisecond(clock_for_rt.load(Ordering::SeqCst)).unwrap());
 
     // `earlier_body` (seq 0, drained FIRST) moves the clock to t0+5s, then completes.
     // That is past the deadline of `queued_side_effect` (t0+1000). It has no

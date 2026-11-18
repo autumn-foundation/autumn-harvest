@@ -391,7 +391,8 @@ mod db {
         job_id: Uuid,
         total: i64,
     ) -> HarvestResult<bool> {
-        let lease_threshold = Timestamp::now() - jiff::SignedDuration::from_secs(BATCH_JOB_LEASE_SECS);
+        let lease_threshold =
+            Timestamp::now() - jiff::SignedDuration::from_secs(BATCH_JOB_LEASE_SECS);
         let claimed: Option<Uuid> = diesel::sql_query(
             "UPDATE harvest_batch_jobs \
              SET status = 'Running', \

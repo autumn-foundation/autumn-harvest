@@ -948,7 +948,10 @@ async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
         "virtual clock must advance only for the FIRED arm (300), not the \
          cancelled-arm + fired-arm sum (600)"
     );
-    assert_eq!(outcome.final_now(), start + jiff::SignedDuration::from_secs(300));
+    assert_eq!(
+        outcome.final_now(),
+        start + jiff::SignedDuration::from_secs(300)
+    );
 }
 
 /// Issue #768: a cancelled timer never fired, so the
@@ -2324,8 +2327,7 @@ async fn sleep_until_resolves_in_test_env_without_real_sleep() {
         .expect("frozen millis must be a valid instant");
     let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).unwrap();
     let delta = deadline.duration_since(frozen_now);
-    let expected =
-        u64::try_from(delta.as_secs() + i64::from(delta.subsec_nanos() > 0)).unwrap();
+    let expected = u64::try_from(delta.as_secs() + i64::from(delta.subsec_nanos() > 0)).unwrap();
     assert_eq!(
         timer_secs, expected,
         "recorded timer duration must equal remaining_secs_until(deadline, frozen_now)"

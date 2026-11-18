@@ -24,9 +24,9 @@
 //! testcontainers Postgres 16 starts per test. On a shared DB each test
 //! `scrub()`s first for isolation.
 
-use std::sync::Arc;
 use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+use std::sync::Arc;
 
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::scheduler::{
@@ -34,13 +34,13 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::worker::HandlerRegistry;
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -742,7 +742,6 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
         .expect("the released row must still exist");
     let next_run_at = next_run_at.map(SqlTimestamp::to_jiff);
 
-
     assert!(is_paused, "an operator pause must survive the release");
     assert_eq!(paused_by.as_deref(), Some("operator"));
     assert_eq!(runs_started, 7, "bounded-run counters must survive");
@@ -861,7 +860,10 @@ async fn a_stale_row_is_collected_even_while_a_peer_holds_the_lock() {
     {
         use autumn_harvest::schema::harvest_schedules::dsl;
         diesel::update(dsl::harvest_schedules.find(stale))
-            .set(dsl::next_run_at.eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()))
+            .set(
+                dsl::next_run_at
+                    .eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()),
+            )
             .execute(&mut conn)
             .await
             .expect("make the stale row due");
@@ -1036,7 +1038,10 @@ async fn seed_due_stale_row(conn: &mut AsyncPgConnection, name: &str) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let id = insert_raw_row(conn, Some(name), Some(name), "cron:0 1 * * *").await;
     diesel::update(dsl::harvest_schedules.find(id))
-        .set(dsl::next_run_at.eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()))
+        .set(
+            dsl::next_run_at
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()),
+        )
         .execute(conn)
         .await
         .expect("make the stale row due");

@@ -87,7 +87,9 @@ impl AuthStore {
                 Ok(crate::api_token::touch_last_used(&mut conn, id).await?)
             }
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(store) => blocking(store, move |s| s.touch_token(id, Timestamp::now())).await,
+            Self::Sqlite(store) => {
+                blocking(store, move |s| s.touch_token(id, Timestamp::now())).await
+            }
         }
     }
 
@@ -205,7 +207,9 @@ impl AuthSession {
         match self {
             Self::Postgres(conn) => Ok(crate::api_token::revoke_token(conn, id).await?),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(store) => blocking(store, move |s| s.revoke_token(id, Timestamp::now())).await,
+            Self::Sqlite(store) => {
+                blocking(store, move |s| s.revoke_token(id, Timestamp::now())).await
+            }
         }
     }
 

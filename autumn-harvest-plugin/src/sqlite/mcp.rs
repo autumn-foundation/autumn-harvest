@@ -27,8 +27,8 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use jiff::Timestamp;
 use futures::SinkExt as _;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::api::{ApiState, NameParams, SignalParams, UpdateParams, map_error};

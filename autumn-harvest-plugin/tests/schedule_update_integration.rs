@@ -6,8 +6,8 @@
 //! immutability, DAG-row rejection, the #350 fire-claim 409, audit rows, and
 //! immediate list visibility.
 
-use std::sync::Arc;
 use jiff_diesel::ToDiesel;
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::builder::WorkerConfig;
@@ -27,11 +27,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -257,7 +257,10 @@ async fn arm_slot(url: &str, id: Uuid, secs_ago: i64) {
     use harvest_schedules::dsl;
     let mut conn = connect(url).await;
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()))
+        .set(
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("arm slot");
@@ -634,7 +637,8 @@ async fn live_fire_claim_returns_409_until_expired() {
     diesel::update(harvest_schedules::table.find(id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -654,7 +658,10 @@ async fn live_fire_claim_returns_409_until_expired() {
 
     // Expire the claim — the edit proceeds.
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::fire_claimed_until.eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()))
+        .set(
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("expire claim");

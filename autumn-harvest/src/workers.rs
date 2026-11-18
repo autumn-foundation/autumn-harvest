@@ -140,9 +140,9 @@ impl WorkerHealth {
         // Negative durations arise from clock skew (worker host slightly ahead of
         // the API host). Treat them as zero elapsed time so a freshly-heartbeating
         // worker is never misclassified as stale.
-        let elapsed = std::time::Duration::try_from(Timestamp::now()
-            .duration_since(last_heartbeat_at))
-            .unwrap_or(Duration::ZERO);
+        let elapsed =
+            std::time::Duration::try_from(Timestamp::now().duration_since(last_heartbeat_at))
+                .unwrap_or(Duration::ZERO);
         if elapsed > stale_threshold {
             Self::Stale
         } else {
@@ -2582,13 +2582,13 @@ pub async fn list_pinned_executions(
     use diesel::sql_types::Timestamptz;
 
     type Row = (
-        Uuid,                           // harvest_task_queue.workflow_exec_id
+        Uuid,                                   // harvest_task_queue.workflow_exec_id
         Option<crate::time::sql::SqlTimestamp>, // harvest_task_queue.sticky_until
-        Uuid,                           // harvest_workflow_executions.id
-        String,                         // workflow_name
-        String,                         // workflow_id
-        String,                         // state
-        String,                         // queue_name (from execution)
+        Uuid,                                   // harvest_workflow_executions.id
+        String,                                 // workflow_name
+        String,                                 // workflow_id
+        String,                                 // state
+        String,                                 // queue_name (from execution)
         crate::time::sql::SqlTimestamp,         // started_at
     );
 
@@ -3404,8 +3404,7 @@ async fn sync_drain_deadline(
         if !classify_drain_deadline(&mut max_guard, deadline) {
             return;
         }
-        let remaining = std::time::Duration::try_from(deadline
-            .duration_since(Timestamp::now()))
+        let remaining = std::time::Duration::try_from(deadline.duration_since(Timestamp::now()))
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
         // Update the cell while still holding `max_guard`. Then two shards that

@@ -33,8 +33,8 @@
 //! [`ModuleRegistry::load_module`]: crate::hot_swap::ModuleRegistry::load_module
 //! [`ModuleRegistry::unload_build`]: crate::hot_swap::ModuleRegistry::unload_build
 
-use jiff::Timestamp;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
 use std::sync::Arc;

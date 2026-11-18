@@ -1102,7 +1102,10 @@ pub mod db {
                 .find(gate_id)
                 .filter(g::lifted_at.is_null()),
         )
-        .set((g::lifted_at.eq(Some(now).to_diesel()), g::lifted_by.eq(Some(actor))))
+        .set((
+            g::lifted_at.eq(Some(now).to_diesel()),
+            g::lifted_by.eq(Some(actor)),
+        ))
         .get_result(conn)
         .await
         .optional()

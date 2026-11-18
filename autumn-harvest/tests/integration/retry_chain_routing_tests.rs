@@ -13,8 +13,8 @@
 //! **live attempt**: the deepest execution reachable by following
 //! `retry_of_exec_id` successors from `FAILED` rows.
 
-use std::any::TypeId;
 use jiff_diesel::ToDiesel;
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};

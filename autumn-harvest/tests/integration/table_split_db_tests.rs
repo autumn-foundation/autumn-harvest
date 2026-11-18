@@ -18,9 +18,9 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::table_split::SetExt;
 
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -122,7 +122,10 @@ async fn an_execution_round_trips_every_extension_field() {
     let read = load_execution(&mut conn, id).await;
     assert_eq!(read.run_id, parent);
     assert_eq!(read.workflow_attempt, 3);
-    assert_eq!(read.chain_execution_timeout, Some(SignedDuration::from_secs(90)));
+    assert_eq!(
+        read.chain_execution_timeout,
+        Some(SignedDuration::from_secs(90))
+    );
     assert_eq!(read.memo, Some(json!({"memo": true})));
     assert_eq!(read.assigned_build_id.as_deref(), Some("build-7"));
     assert_eq!(

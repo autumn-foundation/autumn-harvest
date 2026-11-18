@@ -51,9 +51,9 @@
 //!
 //! [`WorkerConfig::default_debounce_max_wait`]: crate::builder::WorkerConfig::default_debounce_max_wait
 
-use std::time::Duration;
 #[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
+use std::time::Duration;
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
@@ -117,9 +117,7 @@ pub fn compute_fire_deadline(
         crate::time::from_std_bounded(max_wait).unwrap_or_else(|| crate::time::days(365 * 100));
 
     let trailing_edge = now.checked_add(window_dur).unwrap_or(now);
-    let cap = first_seen
-        .checked_add(max_wait_dur)
-        .unwrap_or(first_seen);
+    let cap = first_seen.checked_add(max_wait_dur).unwrap_or(first_seen);
 
     trailing_edge.min(cap)
 }
@@ -416,10 +414,7 @@ pub async fn admit_debounced_start_with_codecs(
         .unwrap_or_else(|| crate::time::days(365 * 100));
 
     let max_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
-    let initial_fire_at = now
-        .checked_add(window_dur)
-        .unwrap_or(now)
-        .min(max_fire_at);
+    let initial_fire_at = now.checked_add(window_dur).unwrap_or(now).min(max_fire_at);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -1030,11 +1025,7 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`, used
 /// throughout this crate for exactly that shape.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
-fn redefer_target(
-    now: Timestamp,
-    max_fire_at: Timestamp,
-    proposed: Timestamp,
-) -> Timestamp {
+fn redefer_target(now: Timestamp, max_fire_at: Timestamp, proposed: Timestamp) -> Timestamp {
     if max_fire_at < now {
         proposed
     } else {
@@ -1316,9 +1307,7 @@ pub(crate) fn decode_deferred_admission_fields(
             .as_deref()
             .and_then(parse_reuse_policy)
             .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate),
-        execution_timeout: opts
-            .execution_timeout_secs
-            .and_then(duration_from_secs),
+        execution_timeout: opts.execution_timeout_secs.and_then(duration_from_secs),
         sla: opts.sla_secs.and_then(duration_from_secs),
         max_execution_timeout_ceiling: opts
             .max_execution_timeout_ceiling_secs

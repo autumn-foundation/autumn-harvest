@@ -26,10 +26,10 @@
 //! with the full migration bundle.
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use jiff::{SignedDuration, Timestamp};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

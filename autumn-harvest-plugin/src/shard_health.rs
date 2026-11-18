@@ -9,12 +9,12 @@ use autumn_harvest::scheduler::SchedulerMonitor;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
-use jiff::Timestamp;
 use diesel::migration::MigrationSource;
 use diesel::pg::Pg;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{HarvestApiRuntime, HarvestApiState};
@@ -914,8 +914,7 @@ fn push_health_freshness_blocker(
         blocking_reasons.push("no worker health data recorded on shard".to_string());
         return;
     };
-    let elapsed = std::time::Duration::try_from(observed_at
-        .duration_since(last_seen))
+    let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_seen))
         .unwrap_or(Duration::ZERO);
     if elapsed > freshness_window {
         push_reason_code(reason_codes, REASON_WORKER_HEALTH_STALE);
@@ -1203,8 +1202,7 @@ fn scheduler_coverage(
     if !snapshot.running {
         error = Some("scheduler coverage is required but scheduler is not running".to_string());
     } else if let Some(last_tick_at) = snapshot.last_tick_at {
-        let elapsed = std::time::Duration::try_from(observed_at
-            .duration_since(last_tick_at))
+        let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_tick_at))
             .unwrap_or(Duration::ZERO);
         if elapsed > scheduler_window {
             error = Some(format!(

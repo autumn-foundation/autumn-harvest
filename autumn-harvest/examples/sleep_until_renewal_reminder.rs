@@ -64,7 +64,10 @@ async fn renewal_reminder(ctx: &WorkflowContext, sub: Subscription) -> Result<St
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("reminder sent for expiry {}", autumn_harvest::time::rfc3339(expiry)))
+    Ok(format!(
+        "reminder sent for expiry {}",
+        autumn_harvest::time::rfc3339(expiry)
+    ))
 }
 
 fn main() {
@@ -125,7 +128,8 @@ mod tests {
         // Expiry already in the past → the 24h-before deadline is also past →
         // zero-duration timer, no real sleep, run completes.
         let sub = Subscription {
-            expires_at_millis: (Timestamp::now() - autumn_harvest::time::days(365)).as_millisecond(),
+            expires_at_millis: (Timestamp::now() - autumn_harvest::time::days(365))
+                .as_millisecond(),
         };
         let outcome = WorkflowTestEnv::new()
             .run(renewal_reminder_info().handler, json!(sub))

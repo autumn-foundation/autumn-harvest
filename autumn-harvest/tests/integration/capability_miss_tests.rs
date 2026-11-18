@@ -42,8 +42,8 @@
 //! with the full migration bundle.
 
 use autumn_harvest::schema::harvest_task_queue_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -71,10 +71,10 @@ use autumn_harvest::worker::{
 };
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -2546,7 +2546,12 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     // Phase 1: `pod-a` restarts onto a build that DOES register the handler.
     // Deferred out of claim range so it registers without claiming — a claim
     // would simply run the workflow and never reach the decision under test.
-    set_task_scheduled_at(&url, exec_id, Timestamp::now() + jiff::SignedDuration::from_hours(1)).await;
+    set_task_scheduled_at(
+        &url,
+        exec_id,
+        Timestamp::now() + jiff::SignedDuration::from_hours(1),
+    )
+    .await;
     let restart_metrics = Arc::new(CapabilityMetrics::default());
     let pod_a = build_worker(
         "pod-a",
@@ -2592,7 +2597,12 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
 
     // Phase 2: the task becomes eligible and the still-incapable `pod-b` wins
     // the claim. `pod-a` remains a live peer (fresh heartbeat, shut down or not).
-    set_task_scheduled_at(&url, exec_id, Timestamp::now() - jiff::SignedDuration::from_secs(5)).await;
+    set_task_scheduled_at(
+        &url,
+        exec_id,
+        Timestamp::now() - jiff::SignedDuration::from_secs(5),
+    )
+    .await;
     let metrics = Arc::new(CapabilityMetrics::default());
     let pod_b = build_worker(
         "pod-b",

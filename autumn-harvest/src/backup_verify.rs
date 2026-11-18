@@ -1449,10 +1449,10 @@ impl VerifyOptions {
 mod probes {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use jiff::Timestamp;
     use diesel::OptionalExtension as _;
     use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     use super::{
@@ -4531,7 +4531,11 @@ mod tests {
             "no timestamp signal at all must not be treated as proof of loss"
         );
         assert!(
-            absence_is_decisive_loss(fired_at, Some(fired_at - jiff::SignedDuration::from_secs(1)), 0),
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - jiff::SignedDuration::from_secs(1)),
+                0
+            ),
             "a target restore point strictly before the fire proves the loss"
         );
         assert!(
@@ -4539,7 +4543,11 @@ mod tests {
             "a restore point exactly at the fire is not proof of loss"
         );
         assert!(
-            !absence_is_decisive_loss(fired_at, Some(fired_at + jiff::SignedDuration::from_secs(1)), 0),
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at + jiff::SignedDuration::from_secs(1)),
+                0
+            ),
             "a target shard that progressed past the fire may simply have \
              retained and collected the run"
         );
@@ -4589,7 +4597,11 @@ mod tests {
              regardless of a negative configured tolerance"
         );
         assert!(
-            absence_is_decisive_loss(fired_at, Some(fired_at - jiff::SignedDuration::from_secs(1)), -60),
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - jiff::SignedDuration::from_secs(1)),
+                -60
+            ),
             "a negative tolerance floors to zero, so any positive gap is still \
              decisive loss"
         );

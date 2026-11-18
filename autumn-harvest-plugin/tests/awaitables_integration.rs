@@ -28,8 +28,8 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::future::Future;
 use jiff_diesel::ToDiesel;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 

@@ -27,9 +27,9 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

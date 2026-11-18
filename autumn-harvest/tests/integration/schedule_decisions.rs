@@ -5,11 +5,11 @@ use autumn_harvest::schedule_decision::record_decision_graceful;
 use autumn_harvest::schema::harvest_schedule_decisions;
 use autumn_harvest::telemetry::MetricsRecorder;
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use std::sync::{Arc, Mutex};
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

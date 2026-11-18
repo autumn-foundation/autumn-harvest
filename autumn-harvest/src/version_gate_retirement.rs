@@ -5,10 +5,10 @@
 //! the caller-supplied `min_safe_version`. It joins back to
 //! `harvest_workflow_executions` for execution state and start timestamp.
 
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 

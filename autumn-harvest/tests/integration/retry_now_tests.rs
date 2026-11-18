@@ -7,11 +7,11 @@
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType, force_retry_activity_now};
 use autumn_harvest::schema::harvest_task_queue;
-use jiff::{SignedDuration, Timestamp};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;

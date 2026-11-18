@@ -8,16 +8,16 @@
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
-#[cfg(feature = "db")]
-use jiff_diesel::ToDiesel;
 use crate::debounce::DebounceStartOptions;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::types::ExecutionId;
-use jiff::Timestamp;
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -730,7 +730,8 @@ async fn fire_claimed_batch_row(
                 error_kind = crate::codec_rotation::sweep_error_kind(&error),
                 "batch payload or headers could not be decoded; the row moves back"
             );
-            redefer_event_batch_row(conn, row.id, Timestamp::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
+            redefer_event_batch_row(conn, row.id, Timestamp::now() + UNDECODABLE_REDEFER_BACKOFF)
+                .await?;
             moved_back.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(None);
         }

@@ -5,21 +5,21 @@
 //! correctly terminate schedules after the configured boundary, and that skipped
 //! firings (overlap policy, calendar) do NOT consume the `max_runs` budget.
 
-use std::sync::Arc;
 use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+use std::sync::Arc;
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::{harvest_schedule_decisions, harvest_schedules};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -409,16 +409,15 @@ async fn max_runs_1_fires_once_then_exhausts() {
         "exactly one execution must be created on first tick"
     );
 
-    let (exhausted_at, runs_started): (Option<SqlTimestamp>, i32) =
-        harvest_schedules::table
-            .find(sched_id)
-            .select((
-                harvest_schedules::dsl::exhausted_at,
-                harvest_schedules::dsl::runs_started,
-            ))
-            .first(&mut check)
-            .await
-            .expect("select after first tick");
+    let (exhausted_at, runs_started): (Option<SqlTimestamp>, i32) = harvest_schedules::table
+        .find(sched_id)
+        .select((
+            harvest_schedules::dsl::exhausted_at,
+            harvest_schedules::dsl::runs_started,
+        ))
+        .first(&mut check)
+        .await
+        .expect("select after first tick");
     assert!(
         exhausted_at.is_some(),
         "schedule must be exhausted after consuming max_runs=1"

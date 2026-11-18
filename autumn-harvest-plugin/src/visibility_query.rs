@@ -894,7 +894,8 @@ impl SqlFilter {
                     CmpOp::Lt => " < ",
                     CmpOp::Lte => " <= ",
                 });
-                self.parts.push(Part::Timestamptz(jiff_diesel::Timestamp::from(*at)));
+                self.parts
+                    .push(Part::Timestamptz(jiff_diesel::Timestamp::from(*at)));
             }
         }
     }

@@ -40,10 +40,10 @@ use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ActivityContext, StartSource, StartWorkflowParams, WorkflowContext};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::integration_e2e::{build_test_pool, runtime_config, setup_test_database_url_or_env};
@@ -662,9 +662,10 @@ impl PgWorld {
 
     /// The due schedules, by the query of the scheduler tick.
     async fn scan(&mut self, s: usize) -> Effect {
-        let due = autumn_harvest::scheduler::due_workflow_schedules(&mut self.conn, Timestamp::now())
-            .await
-            .expect("scan the schedules");
+        let due =
+            autumn_harvest::scheduler::due_workflow_schedules(&mut self.conn, Timestamp::now())
+                .await
+                .expect("scan the schedules");
         let count = due.len();
         match due.into_iter().next() {
             Some(schedule) => {
@@ -762,13 +763,12 @@ impl PgWorld {
 
     async fn read_snapshot(&mut self) -> Snapshot {
         use harvest_workflow_executions::dsl;
-        let rows: Vec<(uuid::Uuid, String, NullableTimestamp)> =
-            dsl::harvest_workflow_executions
-                .order((dsl::started_at.asc(), dsl::id.asc()))
-                .select((dsl::id, dsl::state, dsl::nd_blocked_at))
-                .load(&mut self.conn)
-                .await
-                .expect("read executions");
+        let rows: Vec<(uuid::Uuid, String, NullableTimestamp)> = dsl::harvest_workflow_executions
+            .order((dsl::started_at.asc(), dsl::id.asc()))
+            .select((dsl::id, dsl::state, dsl::nd_blocked_at))
+            .load(&mut self.conn)
+            .await
+            .expect("read executions");
         let mut executions = Vec::new();
         for (id, status, blocked) in rows {
             // Only the schedule starts executions after the start.

@@ -123,7 +123,9 @@ fn build_chain(n: usize) -> (Vec<RunChainRow>, Uuid) {
             completed_at: if is_tail {
                 None
             } else {
-                Some(day(i64::try_from(i).unwrap_or(i64::MAX)) + jiff::SignedDuration::from_hours(1))
+                Some(
+                    day(i64::try_from(i).unwrap_or(i64::MAX)) + jiff::SignedDuration::from_hours(1),
+                )
             },
             continued_from_exec_id: previous_exec_id,
             first_exec_id: if i == 0 { None } else { Some(origin_exec_id) },

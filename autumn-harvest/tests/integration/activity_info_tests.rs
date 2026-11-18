@@ -952,7 +952,9 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
         .first::<(NullableTimestamp, NullablePgDuration)>(&mut conn)
         .await
         .expect("load the activity task row");
-    let row_started_at = row_started_at.0.expect("a dispatched activity has started_at");
+    let row_started_at = row_started_at
+        .0
+        .expect("a dispatched activity has started_at");
     let row_stc = row_stc.0.expect("start_to_close was configured");
     assert_eq!(
         deadline,
@@ -1068,8 +1070,8 @@ async fn schedule_to_close_shortens_the_reported_deadline() {
         .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load started_at");
-    let unshortened =
-        row_started_at.0.expect("a claimed row has started_at") + jiff::SignedDuration::from_secs(600);
+    let unshortened = row_started_at.0.expect("a claimed row has started_at")
+        + jiff::SignedDuration::from_secs(600);
     assert!(
         deadline < unshortened,
         "min-of-two-clocks did not shorten the deadline: reported {deadline}, \

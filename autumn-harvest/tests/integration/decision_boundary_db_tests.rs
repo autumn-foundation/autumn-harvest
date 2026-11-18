@@ -24,9 +24,9 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -424,7 +424,10 @@ async fn seed(
     store::append_events(
         conn,
         exec_id,
-        &[WorkflowEvent::workflow_started(input.clone(), Timestamp::now())],
+        &[WorkflowEvent::workflow_started(
+            input.clone(),
+            Timestamp::now(),
+        )],
         0,
     )
     .await

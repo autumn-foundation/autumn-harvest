@@ -4,9 +4,9 @@
 #![cfg(feature = "db")]
 #![allow(clippy::items_after_statements)]
 
-use std::pin::Pin;
 use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,11 +217,7 @@ async fn get_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String
 async fn pause_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (
-    Option<jiff::Timestamp>,
-    Option<String>,
-    Option<String>,
-) {
+) -> (Option<jiff::Timestamp>, Option<String>, Option<String>) {
     use autumn_harvest::schema::harvest_workflow_executions as e;
     let (paused_at, reason, actor) = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
@@ -596,7 +592,8 @@ async fn resume_shifts_schedule_to_close_at_by_pause_span() {
     let deadline_after = deadline_after.expect("deadline must remain set").to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
-        shift >= jiff::SignedDuration::from_mins(29) && shift <= jiff::SignedDuration::from_mins(31),
+        shift >= jiff::SignedDuration::from_mins(29)
+            && shift <= jiff::SignedDuration::from_mins(31),
         "schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
     );
 }
@@ -623,7 +620,9 @@ async fn insert_pending_activity_task_with_schedule(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(schedule_to_close_at.to_diesel())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+        schedule_to_close_at.to_diesel(),
+    )
     .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at.to_diesel())
     .bind::<diesel::sql_types::BigInt, _>(schedule_to_start_secs)
     .execute(conn)
@@ -660,11 +659,7 @@ async fn insert_pending_external_task(
 async fn task_timing_columns(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
-) -> (
-    String,
-    jiff::Timestamp,
-    Option<jiff::Timestamp>,
-) {
+) -> (String, jiff::Timestamp, Option<jiff::Timestamp>) {
     use autumn_harvest::schema::harvest_task_queue as t;
     let (state, scheduled_at, schedule_to_close_at) = t::table
         .filter(t::id.eq(task_id))
@@ -795,7 +790,8 @@ async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
         .to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
-        shift >= jiff::SignedDuration::from_mins(29) && shift <= jiff::SignedDuration::from_mins(31),
+        shift >= jiff::SignedDuration::from_mins(29)
+            && shift <= jiff::SignedDuration::from_mins(31),
         "external schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
     );
 }
@@ -909,8 +905,8 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
             && frozen_shift <= jiff::SignedDuration::from_mins(31),
         "the frozen row's scheduled_at must shift by the ~30-minute pause span, got {frozen_shift:?}"
     );
-    let frozen_deadline_shift =
-        frozen_deadline.expect("deadline must remain set") - (now - jiff::SignedDuration::from_mins(5));
+    let frozen_deadline_shift = frozen_deadline.expect("deadline must remain set")
+        - (now - jiff::SignedDuration::from_mins(5));
     assert!(
         frozen_deadline_shift >= jiff::SignedDuration::from_mins(29)
             && frozen_deadline_shift <= jiff::SignedDuration::from_mins(31),
@@ -1314,7 +1310,8 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     params.activity_name = Some("deadline_shifting_activity".to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.schedule_to_close_at = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
+    params.schedule_to_close_at =
+        Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
     params.retry_policy = Some(
         serde_json::to_value(
             RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
@@ -1367,13 +1364,12 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     use autumn_harvest::schema::harvest_task_queue as t;
     let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
     let (state, error, scheduled_at) = loop {
-        let (state, error, scheduled_at): (String, Option<String>, SqlTimestamp) =
-            t::table
-                .filter(t::id.eq(task_id))
-                .select((t::state, t::error, t::scheduled_at))
-                .first(&mut conn)
-                .await
-                .expect("task must exist");
+        let (state, error, scheduled_at): (String, Option<String>, SqlTimestamp) = t::table
+            .filter(t::id.eq(task_id))
+            .select((t::state, t::error, t::scheduled_at))
+            .first(&mut conn)
+            .await
+            .expect("task must exist");
         let scheduled_at = scheduled_at.to_jiff();
         let resolved = state == "FAILED" || (state == "PENDING" && error.is_some());
         if resolved || std::time::Instant::now() > poll_deadline {
@@ -1578,7 +1574,8 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     params.activity_name = Some("self_pausing_activity".to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.schedule_to_close_at = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
+    params.schedule_to_close_at =
+        Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
     params.retry_policy = Some(
         serde_json::to_value(
             RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
@@ -1915,7 +1912,11 @@ async fn auto_resume_expired_pauses_force_resumes() {
     // Backdate paused_at so the pause is well past the ceiling.
     use autumn_harvest::schema::harvest_workflow_executions as e;
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
-        .set(e::paused_at.eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48)).to_diesel()))
+        .set(
+            e::paused_at.eq(
+                Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48)).to_diesel(),
+            ),
+        )
         .execute(&mut conn)
         .await
         .unwrap();

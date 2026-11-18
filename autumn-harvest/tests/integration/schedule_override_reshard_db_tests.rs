@@ -20,8 +20,8 @@
 //! load-bearing: a shard is the pool that it reads. The colocated tests
 //! share one database on purpose.
 
-use std::collections::BTreeMap;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,9 +31,9 @@ use autumn_harvest::schedule_override::{
 };
 use autumn_harvest::scheduler::{DagCatalog, RegisteredDag, SchedulerMonitor, tick_once_sharded};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
 
 use diesel::prelude::*;
@@ -1472,7 +1472,12 @@ async fn a_set_takes_a_version_above_the_floor() {
         schedule: Some(Some(Schedule::Interval(Duration::from_secs(3600)))),
         ..ScheduleOverridePatch::default()
     };
-    put_floor_over(&mut conn, &dag.name, floor + jiff::SignedDuration::from_hours(1)).await;
+    put_floor_over(
+        &mut conn,
+        &dag.name,
+        floor + jiff::SignedDuration::from_hours(1),
+    )
+    .await;
     update_dag_override(&mut conn, &dag, &hourly, "ops", None)
         .await
         .expect("replace");

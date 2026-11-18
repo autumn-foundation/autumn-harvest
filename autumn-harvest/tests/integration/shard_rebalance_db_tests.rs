@@ -73,9 +73,9 @@ use jiff_diesel::ToDiesel;
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -447,7 +447,6 @@ struct TaskProvenance {
     )]
     timer_fires_at: Option<jiff::Timestamp>,
 }
-
 
 #[derive(diesel::QueryableByName)]
 struct ScalarInt {
@@ -7192,7 +7191,9 @@ async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
 
     let pool = shards.pool.clone();
     let write_task = seal_mid_flight(&shards, exec_id, || {
-        tokio::spawn(async move { release_legal_hold_forwarded(&pool, exec_id, Timestamp::now()).await })
+        tokio::spawn(
+            async move { release_legal_hold_forwarded(&pool, exec_id, Timestamp::now()).await },
+        )
     })
     .await;
 

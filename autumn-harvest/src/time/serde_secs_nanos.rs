@@ -45,7 +45,10 @@ fn from_parts<E: serde::de::Error>((seconds, nanos): (i64, i32)) -> Result<Signe
 /// # Errors
 ///
 /// Returns the error of the serializer.
-pub fn serialize<S: Serializer>(duration: &SignedDuration, serializer: S) -> Result<S::Ok, S::Error> {
+pub fn serialize<S: Serializer>(
+    duration: &SignedDuration,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     parts(*duration).serialize(serializer)
 }
 
@@ -61,7 +64,9 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SignedD
 
 /// The same format for an `Option<SignedDuration>`. `None` is `null`.
 pub mod option {
-    use super::{Deserialize, Deserializer, Serialize, Serializer, SignedDuration, from_parts, parts};
+    use super::{
+        Deserialize, Deserializer, Serialize, Serializer, SignedDuration, from_parts, parts,
+    };
 
     /// Writes `Some(duration)` as `[seconds, nanoseconds]`, and `None` as `null`.
     ///
@@ -112,8 +117,14 @@ mod tests {
         let json = serde_json::to_string(&row).unwrap();
         assert_eq!(json, r#"{"bare":[3600,0],"maybe":[-1,999999999]}"#);
         assert_eq!(serde_json::from_str::<Row>(&json).unwrap(), row);
-        let none = Row { bare: SignedDuration::ZERO, maybe: None };
-        assert_eq!(serde_json::to_string(&none).unwrap(), r#"{"bare":[0,0],"maybe":null}"#);
+        let none = Row {
+            bare: SignedDuration::ZERO,
+            maybe: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&none).unwrap(),
+            r#"{"bare":[0,0],"maybe":null}"#
+        );
     }
 
     #[test]
@@ -130,6 +141,9 @@ mod tests {
         assert!(serde_json::from_str::<Row>(r#"{"bare":[9223372036854775807,0]}"#).is_err());
         assert!(serde_json::from_str::<Row>(r#"{"bare":"PT1H"}"#).is_err());
         let max = r#"{"bare":[9223372036854775,807000000]}"#;
-        assert_eq!(serde_json::from_str::<Row>(max).unwrap().bare, CHRONO_MAX_DURATION);
+        assert_eq!(
+            serde_json::from_str::<Row>(max).unwrap().bare,
+            CHRONO_MAX_DURATION
+        );
     }
 }

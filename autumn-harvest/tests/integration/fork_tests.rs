@@ -12,8 +12,8 @@
 //! suite starts a testcontainers Postgres 16.
 
 use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -34,9 +34,9 @@ use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use uuid::Uuid;
 

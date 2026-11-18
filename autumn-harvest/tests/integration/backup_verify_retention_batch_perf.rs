@@ -23,11 +23,11 @@
 //! `backup_verify_refs_batch_perf.rs`.
 
 use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};
-use jiff_diesel::ToDiesel;
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use jiff::Timestamp;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;

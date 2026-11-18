@@ -15,8 +15,8 @@
 //!   child row is sealed `CANCELLED` (R1/R6/R8).
 //! - child fails before the deadline → parent gets a typed `Err` (R13).
 
-use std::pin::Pin;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use autumn_harvest::WorkflowContext;

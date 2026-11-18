@@ -12,7 +12,6 @@
 //! stack against a real database.
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
-use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
@@ -31,14 +30,15 @@ use autumn_harvest::{
     register_workflow_schedules, start_or_load_workflow_execution, terminate_workflow_execution,
     tick_once, timeout,
 };
+use jiff_diesel::ToDiesel;
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::path::Path;
@@ -334,7 +334,8 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_migrated_dag";
-    let logical_date = "2026-05-14T02:00:00Z".parse::<Timestamp>()
+    let logical_date = "2026-05-14T02:00:00Z"
+        .parse::<Timestamp>()
         .expect("fixed timestamp should parse");
     let dag_conf = serde_json::json!({ "customer": "acme" });
 
@@ -387,7 +388,8 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_queued_dag";
-    let logical_date = "2026-05-14T02:00:00Z".parse::<Timestamp>()
+    let logical_date = "2026-05-14T02:00:00Z"
+        .parse::<Timestamp>()
         .expect("fixed timestamp should parse");
 
     diesel::sql_query(
@@ -443,9 +445,11 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     let dag_name = "legacy_subsecond_dag";
     let first_run_id = Uuid::new_v4();
     let second_run_id = Uuid::new_v4();
-    let first_logical_date = "2026-05-14T02:00:00.100000Z".parse::<Timestamp>()
+    let first_logical_date = "2026-05-14T02:00:00.100000Z"
+        .parse::<Timestamp>()
         .expect("fixed timestamp should parse");
-    let second_logical_date = "2026-05-14T02:00:00.900000Z".parse::<Timestamp>()
+    let second_logical_date = "2026-05-14T02:00:00.900000Z"
+        .parse::<Timestamp>()
         .expect("fixed timestamp should parse");
 
     diesel::sql_query(
@@ -8476,7 +8480,8 @@ async fn workflow_schedule_pause_and_resume() {
         diesel::update(sched_dsl::harvest_schedules.filter(sched_dsl::workflow_name.eq(wf_name)))
             .set((
                 sched_dsl::is_paused.eq(false),
-                sched_dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                sched_dsl::next_run_at
+                    .eq((Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
                 sched_dsl::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(&mut conn)

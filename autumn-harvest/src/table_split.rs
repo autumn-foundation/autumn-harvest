@@ -244,16 +244,24 @@ macro_rules! split_queryable {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __split_row_ty {
-    ($field:ty) => { $field };
-    ($field:ty, $wrapper:ty) => { $wrapper };
+    ($field:ty) => {
+        $field
+    };
+    ($field:ty, $wrapper:ty) => {
+        $wrapper
+    };
 }
 
 /// Converts one `split_queryable!` row value to its field type.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __split_from_row {
-    ($value:ident) => { $value };
-    ($value:ident, $wrapper:ty) => { ::core::convert::From::<$wrapper>::from($value) };
+    ($value:ident) => {
+        $value
+    };
+    ($value:ident, $wrapper:ty) => {
+        ::core::convert::From::<$wrapper>::from($value)
+    };
 }
 
 /// Insert a flat struct through a core and an extension declaration.

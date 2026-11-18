@@ -19,13 +19,13 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_OVERDUE, MetricsRecorder};
-use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -529,9 +529,9 @@ async fn non_deferring_policy_at_capacity_is_overdue() {
         &mut conn,
         "cancel_wf",
         now - jiff::SignedDuration::from_secs(5000), // stale
-        1,                                     // max_active_runs = 1
-        "cancel_other",                        // NON-deferring policy
-        true,                                  // catchup on, but cancel_other still advances
+        1,                                           // max_active_runs = 1
+        "cancel_other",                              // NON-deferring policy
+        true,                                        // catchup on, but cancel_other still advances
         None,
         0,
         None,

@@ -26,7 +26,12 @@ mod tests {
 
     #[test]
     fn every_instant_keeps_its_nanoseconds() {
-        for (secs, nanos) in [(1_700_000_000, 123_456_789), (0, 0), (-1, -1), (-5, -500_000_000)] {
+        for (secs, nanos) in [
+            (1_700_000_000, 123_456_789),
+            (0, 0),
+            (-1, -1),
+            (-5, -500_000_000),
+        ] {
             let at = jiff::Timestamp::new(secs, nanos).unwrap();
             let converted = to_chrono(at).unwrap();
             assert_eq!(

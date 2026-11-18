@@ -13,8 +13,8 @@
 //! testcontainers Postgres 16. Each test names its workflow types with a
 //! fresh suffix, so a shared cluster needs no scrub.
 
-use std::pin::Pin;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -34,6 +34,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::store;
 use autumn_harvest::table_split::Ext;
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::workflow_retry::{
     RetryLimits, RetryLimitsPatch, RetryPolicySource, SCHEDULE_SOURCE, SOURCE_KEY, encode_stored,
@@ -42,7 +43,6 @@ use autumn_harvest::{
     ExecutionId, StartWorkflowParams, WorkflowContext, cancel_workflow_execution,
     start_or_load_workflow_execution,
 };
-use autumn_harvest::time::sql::SqlTimestamp;
 use jiff::Timestamp;
 
 use diesel::prelude::*;
@@ -969,7 +969,8 @@ async fn insert_due_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),

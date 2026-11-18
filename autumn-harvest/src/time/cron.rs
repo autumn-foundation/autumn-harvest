@@ -96,10 +96,15 @@ impl CronDateTime for CronZoned {
         let ambiguous = self.0.time_zone().to_ambiguous_zoned_datetime(datetime);
         Ok(match ambiguous.offset() {
             AmbiguousOffset::Unambiguous { .. } => Resolution::Single(Self(
-                ambiguous.unambiguous().map_err(|_| CronError::InvalidTime)?,
+                ambiguous
+                    .unambiguous()
+                    .map_err(|_| CronError::InvalidTime)?,
             )),
             AmbiguousOffset::Fold { .. } => {
-                let earlier = ambiguous.clone().earlier().map_err(|_| CronError::InvalidTime)?;
+                let earlier = ambiguous
+                    .clone()
+                    .earlier()
+                    .map_err(|_| CronError::InvalidTime)?;
                 let later = ambiguous.later().map_err(|_| CronError::InvalidTime)?;
                 Resolution::Ambiguous(Self(earlier), Self(later))
             }
@@ -108,7 +113,10 @@ impl CronDateTime for CronZoned {
     }
 
     fn checked_add_seconds(&self, seconds: i64) -> Option<Self> {
-        self.0.checked_add(SignedDuration::from_secs(seconds)).ok().map(Self)
+        self.0
+            .checked_add(SignedDuration::from_secs(seconds))
+            .ok()
+            .map(Self)
     }
 
     fn cmp_instant(&self, other: &Self) -> Ordering {
@@ -133,7 +141,10 @@ mod tests {
         let start = CronZoned::utc(Timestamp::constant(1_700_000_000, 0));
         let next = cron.and_then(|c| c.find_next_occurrence(&start, false).ok());
         // 2023-11-15T00:00:00Z.
-        assert_eq!(next.map(|n| n.timestamp()), Some(Timestamp::constant(1_700_006_400, 0)));
+        assert_eq!(
+            next.map(|n| n.timestamp()),
+            Some(Timestamp::constant(1_700_006_400, 0))
+        );
     }
 
     #[test]

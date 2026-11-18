@@ -1,7 +1,7 @@
 //! Integration tests for the Vantage dashboard UI.
 
-use std::collections::{BTreeMap, HashMap};
 use jiff_diesel::ToDiesel;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
@@ -6057,7 +6057,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
+    let deadline_delta =
+        (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
         autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}"
@@ -6161,7 +6162,10 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     );
     let chain_deadline_at = second.chain_deadline_at.expect("a chain deadline");
     let delta = (chain_deadline_at - second.started_at) - jiff::SignedDuration::from_secs(1800);
-    assert!(autumn_harvest::time::num_milliseconds(delta).abs() < 2000, "delta={delta}");
+    assert!(
+        autumn_harvest::time::num_milliseconds(delta).abs() < 2000,
+        "delta={delta}"
+    );
 
     // The ceiling caps an override above it.
     registry.run_defaults().write_through(
@@ -7935,12 +7939,21 @@ async fn tl960_seed_run(
 
     // Apply the row overrides (state, completion, pause/ND-block, current_details).
     let mut sets: Vec<String> = vec![format!("state = '{state}'")];
-    sets.push(format!("started_at = '{}'", autumn_harvest::time::rfc3339(base)));
+    sets.push(format!(
+        "started_at = '{}'",
+        autumn_harvest::time::rfc3339(base)
+    ));
     if let Some(c) = completed_at {
-        sets.push(format!("completed_at = '{}'", autumn_harvest::time::rfc3339(c)));
+        sets.push(format!(
+            "completed_at = '{}'",
+            autumn_harvest::time::rfc3339(c)
+        ));
     }
     if let Some(p) = paused_at {
-        sets.push(format!("paused_at = '{}'", autumn_harvest::time::rfc3339(p)));
+        sets.push(format!(
+            "paused_at = '{}'",
+            autumn_harvest::time::rfc3339(p)
+        ));
     }
     if let Some(r) = pause_reason {
         sets.push(format!("pause_reason = '{r}'"));
@@ -7949,7 +7962,10 @@ async fn tl960_seed_run(
         sets.push(format!("pause_actor = '{a}'"));
     }
     if let Some(nd) = nd_blocked_at {
-        sets.push(format!("nd_blocked_at = '{}'", autumn_harvest::time::rfc3339(nd)));
+        sets.push(format!(
+            "nd_blocked_at = '{}'",
+            autumn_harvest::time::rfc3339(nd)
+        ));
     }
     if let Some(r) = nd_block_reason {
         sets.push(format!("nd_block_reason = '{r}'"));
@@ -8034,8 +8050,7 @@ const fn tl960_child_completed(child: ExecutionId) -> autumn_harvest::WorkflowEv
 async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
     // so `derive_timeline` counts the 3 starts (issue #1809) → a "×3" badge.
@@ -8099,8 +8114,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
 async fn ui_timeline_split_only_when_present() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T11:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T11:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
     // An activity WITH ActivityStarted → wait/exec split. A child workflow → no split.
     let a = autumn_harvest::ActivityExecId::new();
@@ -8154,8 +8168,7 @@ async fn ui_timeline_split_only_when_present() {
 async fn ui_timeline_slowest_highlight_and_rollup() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T12:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
     // A quick activity then a much slower one (the slowest step).
     let a1 = autumn_harvest::ActivityExecId::new();
@@ -8215,8 +8228,7 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
 async fn ui_timeline_inflight_open_span_and_current_details() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T13:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T13:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
     // A running execution with a scheduled-but-not-completed activity.
     let a = autumn_harvest::ActivityExecId::new();
@@ -8270,8 +8282,7 @@ async fn ui_timeline_unknown_execution_404() {
 async fn ui_detail_page_has_timeline_link() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T14:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T14:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let a = autumn_harvest::ActivityExecId::new();
     let exec_id = tl960_seed_run(
         &database_url,
@@ -8303,8 +8314,7 @@ async fn ui_detail_page_has_timeline_link() {
 async fn ui_timeline_200_steps_under_1s() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = "2026-07-15T15:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let base = "2026-07-15T15:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
     // 200 activities (400 events: sched + complete each).
     let mut events = Vec::with_capacity(400);

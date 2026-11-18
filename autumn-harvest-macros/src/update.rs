@@ -173,14 +173,13 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // over an operator override, which wins over the declared value. See
     // `optional_duration_tokens`'s doc comment for the clone class this
     // and `workflow.rs`'s two typed stubs share.
-    let update_with_start_execution_timeout_tokens =
-        crate::attr_util::optional_duration_tokens(
-            "execution_timeout",
-            &quote! {
-                opts.execution_timeout
-                    .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
-            },
-        );
+    let update_with_start_execution_timeout_tokens = crate::attr_util::optional_duration_tokens(
+        "execution_timeout",
+        &quote! {
+            opts.execution_timeout
+                .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
+        },
+    );
     let update_with_start_max_execution_timeout_ceiling_tokens =
         crate::attr_util::optional_duration_tokens(
             "max_execution_timeout_ceiling",

@@ -2032,9 +2032,7 @@ async fn a_late_child_loses_to_a_due_deadline() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let bump = Arc::clone(&clock);
     rt.register_activity_raw(
         "slow",
@@ -2242,9 +2240,7 @@ async fn a_query_on_a_child_sees_its_parent() {
 #[tokio::test]
 async fn a_long_terminal_cycle_loses_to_a_due_deadline() {
     let mut rt = runtime();
-    rt.set_clock(|| {
-        jiff::Timestamp::from_millisecond(BUSY_CLOCK.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(|| jiff::Timestamp::from_millisecond(BUSY_CLOCK.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_child_timeout_busy", json!(0))
         .unwrap();
@@ -2326,9 +2322,7 @@ async fn a_signal_sent_after_a_deadline_loses_to_it() {
 #[tokio::test]
 async fn a_long_final_panic_loses_to_a_due_deadline() {
     let mut rt = runtime();
-    rt.set_clock(|| {
-        jiff::Timestamp::from_millisecond(PANIC_CLOCK.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(|| jiff::Timestamp::from_millisecond(PANIC_CLOCK.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_child_timeout_panic", json!(0))
         .unwrap();
@@ -2450,9 +2444,7 @@ async fn a_timed_out_parent_applies_its_close_policy() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("spawns_then_times_out", json!(0))
         .unwrap();
@@ -2487,9 +2479,7 @@ async fn an_awaited_child_times_out_by_its_declared_timeout() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_reports_child_failure", json!("timed_child"))
         .unwrap();

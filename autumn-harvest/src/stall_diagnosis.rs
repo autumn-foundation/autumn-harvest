@@ -5774,8 +5774,7 @@ mod tests {
         /// `scheduled_at` (`t(10)`), or AFTER it. So the sweep exercises the
         /// `organic_cooldown_clears_by_dispatch` guard's boundary in every case,
         /// not at a single hardcoded `None`.
-        fn circuit_cooldown_until() -> impl Strategy<Value = Option<jiff::Timestamp>>
-        {
+        fn circuit_cooldown_until() -> impl Strategy<Value = Option<jiff::Timestamp>> {
             prop_oneof![
                 Just(None),
                 Just(Some(t(-5))),

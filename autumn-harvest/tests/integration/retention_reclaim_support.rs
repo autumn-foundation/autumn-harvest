@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Double};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 
 // ── Scale ──────────────────────────────────────────────────────────────────
 

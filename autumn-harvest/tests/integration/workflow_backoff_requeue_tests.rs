@@ -7,10 +7,10 @@
 //! panic release sticky affinity, quota retry keeps it.
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use jiff::SignedDuration;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::SignedDuration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -57,7 +57,13 @@ impl Path {
         !matches!(self, Self::QuotaRetry)
     }
 
-    async fn run(self, conn: &mut AsyncPgConnection, task: Uuid, delay: SignedDuration, reason: &str) {
+    async fn run(
+        self,
+        conn: &mut AsyncPgConnection,
+        task: Uuid,
+        delay: SignedDuration,
+        reason: &str,
+    ) {
         match self {
             Self::NdBlocked => queue::requeue_workflow_task_nd_blocked(conn, task, delay, reason)
                 .await
@@ -266,8 +272,13 @@ async fn every_backoff_requeue_rejects_a_pending_task() {
 
         let result = match path {
             Path::NdBlocked => {
-                queue::requeue_workflow_task_nd_blocked(&mut conn, task, SignedDuration::from_secs(60), "x")
-                    .await
+                queue::requeue_workflow_task_nd_blocked(
+                    &mut conn,
+                    task,
+                    SignedDuration::from_secs(60),
+                    "x",
+                )
+                .await
             }
             Path::AfterPanic => {
                 queue::requeue_workflow_task_after_panic(

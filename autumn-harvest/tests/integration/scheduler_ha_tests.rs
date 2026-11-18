@@ -9,22 +9,22 @@
 //! The tests use a real Postgres container (testcontainers) to exercise the
 //! claim path end-to-end.
 
-use std::sync::{Arc, Mutex};
 use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_FIRE_ATTEMPTS, MetricsRecorder};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -421,7 +421,8 @@ async fn insert_buffered_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq((Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_diesel()),
+            dsl::next_run_at
+                .eq((Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("buffer_one"),
             dsl::buffered_runs.eq(serde_json::json!([autumn_harvest::time::rfc3339(slot)])),
@@ -691,7 +692,9 @@ async fn test_buffered_drain_releases_its_claim() {
     diesel::sql_query(
         "UPDATE harvest_schedules SET max_active_runs = 1, buffered_runs = $1 WHERE id = $2",
     )
-    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339(next_slot)]))
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339(
+        next_slot
+    )]))
     .bind::<diesel::sql_types::Uuid, _>(sched_id)
     .execute(&mut conn)
     .await

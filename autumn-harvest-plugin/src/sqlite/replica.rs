@@ -2003,8 +2003,7 @@ mod tests {
     fn a_target_entry_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acme.harvest.db");
-        let at = "2026-11-12T05:00:00.250Z".parse::<Timestamp>()
-            .unwrap();
+        let at = "2026-11-12T05:00:00.250Z".parse::<Timestamp>().unwrap();
         for written in [
             Entry::Committed {
                 target: Target::At(at),

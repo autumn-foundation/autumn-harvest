@@ -13,8 +13,8 @@
 //! deterministically in the `WorkflowStarted` event. Skipped and manual starts
 //! never advance carryover.
 
-use std::sync::Arc;
 use jiff_diesel::ToDiesel;
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::info::WorkflowInfo;
@@ -28,13 +28,13 @@ use autumn_harvest::{
     DagCatalog, SchedulerMonitor, StartWorkflowParams, WorkflowContext, WorkflowIdReusePolicy,
     register_workflow_schedules, start_or_load_workflow_execution, tick_once,
 };
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use testcontainers::ContainerAsync;
@@ -117,7 +117,10 @@ async fn arm_slot(conn: &mut AsyncPgConnection, wf_name: &str, secs_ago: i64) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     diesel::update(dsl::harvest_schedules)
         .filter(dsl::workflow_name.eq(wf_name))
-        .set(dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()))
+        .set(
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()),
+        )
         .execute(conn)
         .await
         .expect("arm next_run_at slot");

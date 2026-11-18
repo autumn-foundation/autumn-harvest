@@ -44,10 +44,10 @@
 //! - Placement never falls back silently: an unreachable target shard fails the
 //!   spawn with the typed, retryable [`HarvestError::ShardUnavailable`].
 
-use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
@@ -438,7 +438,8 @@ pub async fn request_cross_shard_cancel(
                 harvest_cross_shard_children::cancel_reason,
                 reason,
             )),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<crate::time::sql::SqlTimestamp>),
+            harvest_cross_shard_children::last_attempt_at
+                .eq(None::<crate::time::sql::SqlTimestamp>),
             harvest_cross_shard_children::attempts.eq(0),
         ))
         .execute(conn)

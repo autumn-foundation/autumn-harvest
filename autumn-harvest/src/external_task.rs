@@ -6,10 +6,10 @@
 //! in O(log n) through the `idx_harvest_ext_token` index. It then appends the
 //! terminal event and wakes the workflow.
 
-use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
@@ -32,7 +32,9 @@ fn external_deadline(now: Timestamp, dur: jiff::SignedDuration) -> HarvestResult
         Err(_) if now.as_second().saturating_add(dur.as_secs()) <= CHRONO_MAX_UTC_SECOND => {
             Ok(Timestamp::MAX)
         }
-        Err(_) => Err(HarvestError::Database("Datetime addition overflow".to_string())),
+        Err(_) => Err(HarvestError::Database(
+            "Datetime addition overflow".to_string(),
+        )),
     }
 }
 
@@ -269,7 +271,8 @@ pub async fn list_external_handoffs(
         query = query.filter(harvest_workflow_executions::shard_id.eq(shard_id));
     }
     if let Some(due_before) = filters.due_before {
-        query = query.filter(harvest_external_tasks::schedule_to_close_at.le(due_before.to_diesel()));
+        query =
+            query.filter(harvest_external_tasks::schedule_to_close_at.le(due_before.to_diesel()));
     }
     if let Some(updated_before) = filters.updated_before {
         query = query.filter(harvest_external_tasks::updated_at.le(updated_before.to_diesel()));

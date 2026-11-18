@@ -63,8 +63,8 @@
 )]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -4009,10 +4009,7 @@ async fn insert_outbox_row(
         .id
 }
 
-async fn outbox_next_attempt_at(
-    conn: &mut AsyncPgConnection,
-    id: Uuid,
-) -> Option<jiff::Timestamp> {
+async fn outbox_next_attempt_at(conn: &mut AsyncPgConnection, id: Uuid) -> Option<jiff::Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
@@ -4138,7 +4135,8 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
+            base_created_at
+                + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         blocked_outbox_ids.push(id);
@@ -4149,7 +4147,9 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         &mut conn,
         free_outbox_id,
         base_created_at
-            + jiff::SignedDuration::from_secs(i64::try_from(BLOCKED_ROW_COUNT).expect("small count")),
+            + jiff::SignedDuration::from_secs(
+                i64::try_from(BLOCKED_ROW_COUNT).expect("small count"),
+            ),
     )
     .await;
 
@@ -4215,7 +4215,9 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(oldest_blocked_outbox_id)
-    .bind::<diesel::sql_types::Timestamptz, _>((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel())
+    .bind::<diesel::sql_types::Timestamptz, _>(
+        (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel(),
+    )
     .execute(&mut conn)
     .await
     .expect("force backoff elapsed");
@@ -4473,7 +4475,8 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
+            base_created_at
+                + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         diesel::sql_query(
@@ -4569,7 +4572,9 @@ async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows(
         "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(retry_outbox_id)
-    .bind::<diesel::sql_types::Timestamptz, _>((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel())
+    .bind::<diesel::sql_types::Timestamptz, _>(
+        (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel(),
+    )
     .execute(&mut conn)
     .await
     .expect("stamp an already-expired, now-eligible backoff");
@@ -4693,7 +4698,8 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
+            base_created_at
+                + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         unreachable_ids.push(id);
@@ -4704,7 +4710,9 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
         &mut conn,
         healthy_id,
         base_created_at
-            + jiff::SignedDuration::from_secs(i64::try_from(UNREACHABLE_ROW_COUNT).expect("small count")),
+            + jiff::SignedDuration::from_secs(
+                i64::try_from(UNREACHABLE_ROW_COUNT).expect("small count"),
+            ),
     )
     .await;
 

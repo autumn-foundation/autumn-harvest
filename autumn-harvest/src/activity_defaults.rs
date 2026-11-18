@@ -297,9 +297,9 @@ mod db {
     };
     use std::time::Duration;
 
-    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
     use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult};

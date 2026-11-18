@@ -33,9 +33,9 @@
 //! against it, otherwise a testcontainers instance is booted.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -52,9 +52,9 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::worker::{HandlerRegistry, NO_CAPABLE_WORKER_PREFIX};
 use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -520,8 +520,10 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     let frozen_chain_deadline = Timestamp::now() + SignedDuration::from_hours(6);
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
-            harvest_workflow_executions::sla.eq(Some(SignedDuration::from_secs(300)).to_pg_interval()),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+            harvest_workflow_executions::sla
+                .eq(Some(SignedDuration::from_secs(300)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
             harvest_workflow_executions::severity.eq(Some("SEV3")),
             SetExt(
@@ -529,7 +531,8 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
                     .eq(Some(autumn_harvest::time::days(7)).to_pg_interval()),
             ),
             SetExt(
-                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(frozen_chain_deadline).to_diesel()),
+                harvest_workflow_executions_ext::chain_deadline_at
+                    .eq(Some(frozen_chain_deadline).to_diesel()),
             ),
         ))
         .execute(&mut conn)
@@ -582,8 +585,7 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
         .chain_deadline_at
         .expect("successor chain_deadline_at");
     assert!(
-        autumn_harvest::time::num_milliseconds(chain_deadline - frozen_chain_deadline)
-            .abs()
+        autumn_harvest::time::num_milliseconds(chain_deadline - frozen_chain_deadline).abs()
             < 1_000,
         "chain_deadline_at must be the predecessor's ABSOLUTE value ({frozen_chain_deadline}), \
          not re-anchored — got {chain_deadline}"
@@ -611,7 +613,8 @@ async fn successor_without_declared_defaults_does_not_inherit_the_predecessors()
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -879,7 +882,8 @@ async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
             harvest_schedules::dsl::catchup.eq(false),
             harvest_schedules::dsl::max_active_runs.eq(10),
             harvest_schedules::dsl::is_paused.eq(false),
-            harvest_schedules::dsl::next_run_at.eq((Timestamp::now() - SignedDuration::from_secs(5)).to_diesel()),
+            harvest_schedules::dsl::next_run_at
+                .eq((Timestamp::now() - SignedDuration::from_secs(5)).to_diesel()),
             harvest_schedules::dsl::jitter_secs.eq(0_i64),
             harvest_schedules::dsl::overlap_policy.eq("skip"),
             harvest_schedules::dsl::buffered_runs.eq(serde_json::json!([])),
@@ -1183,7 +1187,10 @@ async fn naming_the_current_type_continues_normally_instead_of_self_blocking() {
     )
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()))
+        .set(
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+        )
         .execute(&mut conn)
         .await
         .expect("stamp a per-start override the type never declared");
@@ -1921,7 +1928,8 @@ async fn same_type_continue_as_new_is_unchanged() {
     // verbatim, which is exactly what distinguishes the same-type path.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(900)).to_pg_interval()),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(900)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -2011,7 +2019,9 @@ async fn stamp_type_agnostic_carryover(
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::schedule_id.eq(Some(carried.schedule_id)),
-            SetExt(harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot).to_diesel())),
+            SetExt(
+                harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot).to_diesel()),
+            ),
             SetExt(harvest_workflow_executions_ext::memo.eq(Some(carried.memo.clone()))),
             harvest_workflow_executions::search_attrs.eq(Some(carried.search_attrs.clone())),
             SetExt(

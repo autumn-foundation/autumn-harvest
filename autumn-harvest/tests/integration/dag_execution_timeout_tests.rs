@@ -25,8 +25,8 @@
 //!   deadlines end to end (zero regression).
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -44,11 +44,11 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{DagBuilder, DagInfo, OverlapPolicy, WorkflowInfo};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{build_test_pool, setup_test_database_url_or_env};
@@ -195,10 +195,9 @@ async fn backdate_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId
 
 async fn backdate_sla_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(SetExt(
-            harvest_workflow_executions_ext::sla_deadline_at
-                .eq(Some(Timestamp::now() - SignedDuration::from_mins(5)).to_diesel()),
-        ))
+        .set(SetExt(harvest_workflow_executions_ext::sla_deadline_at.eq(
+            Some(Timestamp::now() - SignedDuration::from_mins(5)).to_diesel(),
+        )))
         .execute(conn)
         .await
         .expect("backdate sla_deadline_at");
@@ -517,14 +516,16 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
 
     // Both must be clamped to started_at + 1h (the ceiling), NOT + 10h.
     assert!(
-        dag_deadline_at <= dag_before + SignedDuration::from_hours(1) + SignedDuration::from_secs(5)
+        dag_deadline_at
+            <= dag_before + SignedDuration::from_hours(1) + SignedDuration::from_secs(5)
             && dag_deadline_at
                 >= dag_before + SignedDuration::from_hours(1) - SignedDuration::from_secs(5),
         "the DAG-declared 10h timeout must be clamped to the 1h ceiling"
     );
     assert!(
         wf_deadline_at <= wf_before + SignedDuration::from_hours(1) + SignedDuration::from_secs(5)
-            && wf_deadline_at >= wf_before + SignedDuration::from_hours(1) - SignedDuration::from_secs(5),
+            && wf_deadline_at
+                >= wf_before + SignedDuration::from_hours(1) - SignedDuration::from_secs(5),
         "the workflow-declared 10h timeout must be clamped to the 1h ceiling identically"
     );
     let dag_delta = dag_deadline_at - dag_before;
@@ -627,11 +628,7 @@ async fn insert_manual_workflow_schedule(
         .expect("register schedule");
 }
 
-async fn seed_buffered_run(
-    conn: &mut AsyncPgConnection,
-    dag_name: &str,
-    fire_at: jiff::Timestamp,
-) {
+async fn seed_buffered_run(conn: &mut AsyncPgConnection, dag_name: &str, fire_at: jiff::Timestamp) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     diesel::update(dsl::harvest_schedules.filter(dsl::workflow_name.eq(dag_name)))
         .set(
@@ -647,11 +644,7 @@ async fn seed_buffered_run(
 async fn load_fired_deadline(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
-) -> (
-    Uuid,
-    Option<jiff::Timestamp>,
-    Option<jiff::Timestamp>,
-) {
+) -> (Uuid, Option<jiff::Timestamp>, Option<jiff::Timestamp>) {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .select((
@@ -755,7 +748,12 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     // overlap-collision path, which needs a still-running prior execution.
     // Only the buffered-drain CODE PATH is under test here, not the
     // collision detection that populates `buffered_runs` in production.
-    seed_buffered_run(&mut conn, dag_name, Timestamp::now() - SignedDuration::from_secs(1)).await;
+    seed_buffered_run(
+        &mut conn,
+        dag_name,
+        Timestamp::now() - SignedDuration::from_secs(1),
+    )
+    .await;
 
     let pool = build_test_pool(&url);
     let before = Timestamp::now();
@@ -776,7 +774,8 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     );
     assert!(
         deadline_at >= before + SignedDuration::from_hours(2)
-            && deadline_at <= before + SignedDuration::from_hours(2) + SignedDuration::from_secs(10),
+            && deadline_at
+                <= before + SignedDuration::from_hours(2) + SignedDuration::from_secs(10),
         "deadline_at must be ~started_at + 2h (the DagInfo's declared execution_timeout): got {deadline_at}"
     );
 }
@@ -869,7 +868,8 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     let deadline_at = deadline_at.expect("execution_timeout must be set (ceiling-derived)");
     assert!(
         deadline_at <= before + SignedDuration::from_hours(1) + SignedDuration::from_secs(10)
-            && deadline_at >= before + SignedDuration::from_hours(1) - SignedDuration::from_secs(10),
+            && deadline_at
+                >= before + SignedDuration::from_hours(1) - SignedDuration::from_secs(10),
         "the DAG's declared 10h timeout must be clamped to the 1h fleet-wide ceiling \
          for a scheduler-tick-fired run, exactly like a manual/HTTP start: got {deadline_at}"
     );

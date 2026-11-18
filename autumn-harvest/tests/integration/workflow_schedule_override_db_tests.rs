@@ -22,8 +22,8 @@ use autumn_harvest::scheduler::{
     WorkflowOverrideRequest, WorkflowOverrideUpdate, WorkflowSchedulePatch, registration_lock_stmt,
     tick_once, update_code_declared_workflow_schedule,
 };
-use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::time::sql::SqlTimestamp;
+use autumn_harvest::worker::HandlerRegistry;
 use jiff::Timestamp;
 
 use diesel::prelude::*;

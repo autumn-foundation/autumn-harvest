@@ -160,10 +160,7 @@ pub fn expected_shards_for(
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
 #[must_use]
 pub fn age_secs(observed_at: Timestamp, started_at: Timestamp) -> i64 {
-    observed_at
-        .duration_since(started_at)
-        .as_secs()
-        .max(0)
+    observed_at.duration_since(started_at).as_secs().max(0)
 }
 
 /// Whether `worker`'s registered `shard_assignments` cover `shard_id`.

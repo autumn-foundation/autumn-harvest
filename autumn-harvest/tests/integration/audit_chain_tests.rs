@@ -285,9 +285,14 @@ async fn a_redrive_reexports_the_same_bytes() {
     insert_rows(&mut conn, 2).await;
     let first = export_tick(&mut conn, Some(&key())).await;
 
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
-        .await
-        .expect("rewind");
+    rewind_cursor(
+        &mut conn,
+        SHARD,
+        RewindRequest::Seq(0),
+        jiff::Timestamp::now(),
+    )
+    .await
+    .expect("rewind");
     let again = export_tick(&mut conn, Some(&key())).await;
     assert_eq!(first, again, "a redrive must be byte-identical");
 }
@@ -1010,9 +1015,14 @@ async fn reanchoring_never_changes_a_sequenced_row() {
     export_tick(&mut conn, Some(&key())).await;
     insert_rows(&mut conn, 1).await;
     export_tick(&mut conn, None).await;
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
-        .await
-        .expect("rewind");
+    rewind_cursor(
+        &mut conn,
+        SHARD,
+        RewindRequest::Seq(0),
+        jiff::Timestamp::now(),
+    )
+    .await
+    .expect("rewind");
     let before = export_tick(&mut conn, None).await;
     let columns = chain_columns(&mut conn).await;
 
@@ -1024,9 +1034,14 @@ async fn reanchoring_never_changes_a_sequenced_row() {
     assert_eq!(chain_columns(&mut conn).await, columns);
 
     // A redrive of the rows sequenced before the re-anchor is byte-identical.
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
-        .await
-        .expect("rewind");
+    rewind_cursor(
+        &mut conn,
+        SHARD,
+        RewindRequest::Seq(0),
+        jiff::Timestamp::now(),
+    )
+    .await
+    .expect("rewind");
     assert_eq!(export_tick(&mut conn, Some(&key())).await, before);
 }
 
@@ -1103,8 +1118,13 @@ async fn another_shard_never_exports_links_this_shard_stamped() {
     }
 
     // The stamping shard's redrive stays byte-identical.
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
-        .await
-        .expect("rewind");
+    rewind_cursor(
+        &mut conn,
+        SHARD,
+        RewindRequest::Seq(0),
+        jiff::Timestamp::now(),
+    )
+    .await
+    .expect("rewind");
     assert_eq!(export_tick(&mut conn, None).await, first);
 }

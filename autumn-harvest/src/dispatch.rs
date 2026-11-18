@@ -3205,7 +3205,10 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_promotes_a_delayed_reference_when_it_is_due() {
         let channel = MemoryDispatch::new();
-        let soon = hint("q", Timestamp::now() + jiff::SignedDuration::from_millis(60));
+        let soon = hint(
+            "q",
+            Timestamp::now() + jiff::SignedDuration::from_millis(60),
+        );
         channel
             .publish(std::slice::from_ref(&soon))
             .await
@@ -3435,7 +3438,10 @@ mod tests {
 
         let wanted = with_bound_channel(None, async { hints_wanted() }).await;
         with_bound_channel(None, publish_now(vec![hint("q", Timestamp::now())])).await;
-        with_bound_channel(None, async { publish_in_background(hint("q", Timestamp::now())) }).await;
+        with_bound_channel(None, async {
+            publish_in_background(hint("q", Timestamp::now()))
+        })
+        .await;
         // The publisher queue is FIFO. A leaked hint lands before this one.
         let sentinel = hint("q", Timestamp::now());
         publish_in_background(sentinel.clone());

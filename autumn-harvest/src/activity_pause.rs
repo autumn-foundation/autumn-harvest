@@ -58,13 +58,13 @@
 
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
-#[cfg(feature = "db")]
-use jiff_diesel::ToDiesel;
 use crate::error::HarvestResult;
+#[cfg(feature = "db")]
+use diesel_async::AsyncPgConnection;
 #[cfg(feature = "db")]
 use jiff::Timestamp;
 #[cfg(feature = "db")]
-use diesel_async::AsyncPgConnection;
+use jiff_diesel::ToDiesel;
 
 /// Upper bound on a pausable activity name.
 ///

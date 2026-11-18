@@ -57,10 +57,10 @@ use autumn_harvest::types::{
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{TransactionalStartOptions, TransactionalStartOutcome};
 
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;

@@ -171,7 +171,11 @@ mod tests {
     /// Anchor on a Thursday so a 2-business-day SLA must cross the weekend.
     fn thursday() -> Timestamp {
         let anchor = autumn_harvest::time::utc_ymd_hms(2026, 7, 9, 9, 0, 0).unwrap();
-        assert_eq!(weekday(anchor), Weekday::Thursday, "fixture must be a Thursday");
+        assert_eq!(
+            weekday(anchor),
+            Weekday::Thursday,
+            "fixture must be a Thursday"
+        );
         anchor
     }
 
@@ -337,8 +341,10 @@ mod tests {
                 _ => None,
             })
             .expect("a business-day freeze must be recorded");
-        let hostile = BusinessCalendars::new()
-            .with_calendar("us-support", vec![autumn_harvest::time::utc_date(frozen_deadline)]);
+        let hostile = BusinessCalendars::new().with_calendar(
+            "us-support",
+            vec![autumn_harvest::time::utc_date(frozen_deadline)],
+        );
         let hostile_report = autumn_harvest::testing::WorkflowReplayer::new()
             .with_state(hostile)
             .register_fn("ticket_sla", ticket_sla_info().handler)

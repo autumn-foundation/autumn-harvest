@@ -8,7 +8,6 @@ use crate::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 
-use jiff::Timestamp;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -16,6 +15,7 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -534,11 +534,7 @@ async fn slot_on_host_clock(
 /// both clocks, so a window that starts there never expires before the task
 /// becomes due. Clock skew can only add time to the window.
 #[must_use]
-fn deadline_window_start(
-    slot: Timestamp,
-    db_now: Timestamp,
-    host_now: Timestamp,
-) -> Timestamp {
+fn deadline_window_start(slot: Timestamp, db_now: Timestamp, host_now: Timestamp) -> Timestamp {
     slot.max(to_host_clock(slot, db_now, host_now))
 }
 
@@ -558,11 +554,7 @@ async fn deadline_slot(
 ///
 /// The result is as far after `host_now` as `at` is after `db_now`.
 #[must_use]
-fn to_host_clock(
-    at: Timestamp,
-    db_now: Timestamp,
-    host_now: Timestamp,
-) -> Timestamp {
+fn to_host_clock(at: Timestamp, db_now: Timestamp, host_now: Timestamp) -> Timestamp {
     host_now + (at - db_now)
 }
 
@@ -2047,10 +2039,7 @@ impl DlqAggregateParams {
     ///
     /// Returns a human-readable error message string on any invalid parameter
     /// value, or when no `group_by` dimension is supplied.
-    pub fn from_query_pairs(
-        pairs: &[(String, String)],
-        now: Timestamp,
-    ) -> Result<Self, String> {
+    pub fn from_query_pairs(pairs: &[(String, String)], now: Timestamp) -> Result<Self, String> {
         let mut params = Self::default();
 
         for (key, value) in pairs {
@@ -2148,11 +2137,7 @@ fn set_filter(slot: &mut Option<String>, value: &str) {
     }
 }
 
-pub fn parse_instant(
-    field: &str,
-    value: &str,
-    now: Timestamp,
-) -> Result<Timestamp, String> {
+pub fn parse_instant(field: &str, value: &str, now: Timestamp) -> Result<Timestamp, String> {
     let trimmed = value.trim();
     if let Ok(parsed) = crate::time::parse::rfc3339(trimmed) {
         return Ok(parsed);
@@ -2538,9 +2523,19 @@ pub async fn aggregate_dead_letters(
         .await
         .map_err(crate::error::database_error)?
         .into_iter()
-        .map(|(id, exec_id, activity, queue, task_type, failed_at, error)| {
-            (id, exec_id, activity, queue, task_type, failed_at.to_jiff(), error)
-        })
+        .map(
+            |(id, exec_id, activity, queue, task_type, failed_at, error)| {
+                (
+                    id,
+                    exec_id,
+                    activity,
+                    queue,
+                    task_type,
+                    failed_at.to_jiff(),
+                    error,
+                )
+            },
+        )
         .collect();
 
     let filtered_total = i64::try_from(rows.len()).unwrap_or(i64::MAX);
@@ -2589,7 +2584,10 @@ mod tests {
     #[test]
     fn parse_instant_reads_what_chrono_read() {
         let now = Timestamp::constant(1_700_000_000, 0);
-        assert_eq!(parse_instant("until", "9999-12-31T23:59:59Z", now), Ok(Timestamp::MAX));
+        assert_eq!(
+            parse_instant("until", "9999-12-31T23:59:59Z", now),
+            Ok(Timestamp::MAX)
+        );
         assert_eq!(
             parse_instant("since", "2026-01-01T00:00:00.1234567891Z", now),
             Ok(Timestamp::constant(1_767_225_600, 123_456_789))
@@ -3162,8 +3160,7 @@ mod tests {
 
     #[test]
     fn deadline_window_starts_after_the_slot_on_both_clocks() {
-        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>()
-            .unwrap();
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let slot = db_now + jiff::SignedDuration::from_secs(45);
         // Host 30 s behind the database: the database-clock slot is later.
         let behind = db_now - jiff::SignedDuration::from_secs(30);
@@ -3178,8 +3175,7 @@ mod tests {
 
     #[test]
     fn to_host_clock_keeps_the_offset_across_clock_skew() {
-        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>()
-            .unwrap();
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         // The host runs 30 s ahead of the database.
         let host_now = db_now + jiff::SignedDuration::from_secs(30);
         let at = db_now + jiff::SignedDuration::from_secs(45);
@@ -3547,9 +3543,11 @@ mod tests {
             vec![DlqGroupDimension::DlqReason, DlqGroupDimension::ErrorClass]
         );
 
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Timestamp::now())
-                .expect_err("unknown dim must still error");
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "bogus_dim")]),
+            Timestamp::now(),
+        )
+        .expect_err("unknown dim must still error");
         assert!(
             err.contains("dlq_reason"),
             "message should list new dims: {err}"
@@ -3636,17 +3634,21 @@ mod tests {
 
     #[test]
     fn params_require_at_least_one_group_by() {
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("limit_groups", "10")]), Timestamp::now())
-                .unwrap_err();
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("limit_groups", "10")]),
+            Timestamp::now(),
+        )
+        .unwrap_err();
         assert!(err.contains("at least one group_by"), "{err}");
     }
 
     #[test]
     fn params_reject_unknown_group_by() {
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "tenant_id")]), Timestamp::now())
-                .unwrap_err();
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "tenant_id")]),
+            Timestamp::now(),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown group_by dimension"), "{err}");
     }
 
@@ -3721,8 +3723,7 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(
-            crate::time::rfc3339_opts(p.since
-                .unwrap(), crate::time::SecondsFormat::Secs, true),
+            crate::time::rfc3339_opts(p.since.unwrap(), crate::time::SecondsFormat::Secs, true),
             "2026-05-18T03:00:00Z"
         );
     }
@@ -3906,8 +3907,7 @@ mod tests {
 
     #[test]
     fn time_bucket_formats() {
-        let ts = "2026-05-18T03:42:17Z".parse::<Timestamp>()
-            .unwrap();
+        let ts = "2026-05-18T03:42:17Z".parse::<Timestamp>().unwrap();
         assert_eq!(
             TimeBucketGranularity::Hour.format(ts),
             "2026-05-18T03:00:00Z"

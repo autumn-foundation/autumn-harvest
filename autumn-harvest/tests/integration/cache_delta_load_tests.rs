@@ -23,8 +23,8 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 
-use jiff::Timestamp;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

@@ -17,8 +17,8 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::pin::Pin;
 use jiff_diesel::ToDiesel;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 

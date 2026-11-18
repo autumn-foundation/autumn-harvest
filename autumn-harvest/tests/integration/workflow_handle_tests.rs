@@ -1,7 +1,7 @@
 //! `WorkflowHandle` request/response embedding tests.
 
-use std::time::Duration;
 use jiff_diesel::ToDiesel;
+use std::time::Duration;
 
 use autumn_harvest::error::{HarvestError, TimeoutType};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};

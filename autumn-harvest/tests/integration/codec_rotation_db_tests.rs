@@ -72,8 +72,8 @@
 //! per-test Postgres container. Each test gets its own throwaway database,
 //! because the rotation census is shard-wide by design.
 
-use std::sync::{Arc, Mutex};
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
@@ -97,9 +97,9 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;

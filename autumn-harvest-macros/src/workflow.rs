@@ -1144,11 +1144,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
         },
     );
-    let stub_max_execution_timeout_ceiling_tokens =
-        crate::attr_util::optional_duration_tokens(
-            "max_execution_timeout_ceiling",
-            &quote! { client.max_workflow_execution_timeout() },
-        );
+    let stub_max_execution_timeout_ceiling_tokens = crate::attr_util::optional_duration_tokens(
+        "max_execution_timeout_ceiling",
+        &quote! { client.max_workflow_execution_timeout() },
+    );
     // Shared by `start_with_options` and `signal_with_start` (issue #2406).
     // `update.rs` resolves the same values for `update_with_start` (issue
     // #2511). The operator override of the chain cap wins.
@@ -1156,11 +1155,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         "chain_execution_timeout",
         &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
     );
-    let stub_max_workflow_chain_timeout_ceiling_tokens =
-        crate::attr_util::optional_duration_tokens(
-            "max_workflow_chain_timeout_ceiling",
-            &quote! { client.max_workflow_chain_timeout() },
-        );
+    let stub_max_workflow_chain_timeout_ceiling_tokens = crate::attr_util::optional_duration_tokens(
+        "max_workflow_chain_timeout_ceiling",
+        &quote! { client.max_workflow_chain_timeout() },
+    );
 
     quote! {
         #warnings_tokens

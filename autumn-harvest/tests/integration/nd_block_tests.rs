@@ -466,7 +466,10 @@ async fn get_nd_block_row(
 /// The requeue delay of the latest block: `scheduled_at - nd_blocked_at`.
 ///
 /// One block writes both columns, so poll lag does not enter the value.
-async fn nd_requeue_delay(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> jiff::SignedDuration {
+async fn nd_requeue_delay(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> jiff::SignedDuration {
     let blocked_at: Option<SqlTimestamp> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select(harvest_workflow_executions::nd_blocked_at)
@@ -503,12 +506,7 @@ async fn get_history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<
 async fn get_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (
-    String,
-    jiff::Timestamp,
-    Option<String>,
-    Option<String>,
-) {
+) -> (String, jiff::Timestamp, Option<String>, Option<String>) {
     let (state, scheduled_at, sticky_worker_id, error) = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("workflow"))
@@ -547,7 +545,10 @@ async fn fire_timer_now(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
             .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
             .filter(harvest_timers::fired.eq(false)),
     )
-    .set(harvest_timers::fires_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()))
+    .set(
+        harvest_timers::fires_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("backdate timer");
@@ -561,7 +562,10 @@ async fn make_task_claimable_now(conn: &mut AsyncPgConnection, exec_id: Executio
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(harvest_task_queue::task_type.eq("workflow")),
     )
-    .set(harvest_task_queue::scheduled_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()))
+    .set(
+        harvest_task_queue::scheduled_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("backdate task scheduled_at");

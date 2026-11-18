@@ -18,11 +18,11 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -323,8 +323,22 @@ async fn started_after_and_before_bound_the_window() {
     let base = Timestamp::now() - SignedDuration::from_hours(3);
 
     seed_execution(&url, 0, "onboarding", "RUNNING", base).await;
-    seed_execution(&url, 0, "onboarding", "RUNNING", base + SignedDuration::from_hours(1)).await;
-    seed_execution(&url, 0, "onboarding", "RUNNING", base + SignedDuration::from_hours(2)).await;
+    seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "RUNNING",
+        base + SignedDuration::from_hours(1),
+    )
+    .await;
+    seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "RUNNING",
+        base + SignedDuration::from_hours(2),
+    )
+    .await;
 
     let after = base + SignedDuration::from_mins(30);
     let before = base + SignedDuration::from_hours(1) + SignedDuration::from_mins(30);
@@ -332,8 +346,16 @@ async fn started_after_and_before_bound_the_window() {
         &app,
         &format!(
             "/workflows/count?started_after={}&started_before={}",
-            autumn_harvest::time::rfc3339_opts(after, autumn_harvest::time::SecondsFormat::Secs, true),
-            autumn_harvest::time::rfc3339_opts(before, autumn_harvest::time::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                after,
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                before,
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;

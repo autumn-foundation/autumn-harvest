@@ -13,8 +13,8 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
 use jiff_diesel::ToDiesel;
+use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::harvest_execution_summaries;
@@ -27,10 +27,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -165,7 +165,8 @@ async fn seed_summary(
             harvest_execution_summaries::workflow_name.eq(workflow_name),
             harvest_execution_summaries::workflow_id.eq(workflow_id),
             harvest_execution_summaries::state.eq(state),
-            harvest_execution_summaries::started_at.eq((completed_at - SignedDuration::from_secs(5)).to_diesel()),
+            harvest_execution_summaries::started_at
+                .eq((completed_at - SignedDuration::from_secs(5)).to_diesel()),
             harvest_execution_summaries::completed_at.eq(completed_at.to_diesel()),
             harvest_execution_summaries::duration_ms.eq(Some(5_000i64)),
             harvest_execution_summaries::shard_id.eq(0i32),
@@ -287,7 +288,11 @@ async fn list_applies_filters() {
     // Filter by completed_after (only the two most recent). Use the Z-suffixed
     // RFC 3339 form so the timezone offset carries no `+` (axum's query parser
     // decodes a raw `+` as a space).
-    let cutoff = autumn_harvest::time::rfc3339_opts(now - SignedDuration::from_hours(1), autumn_harvest::time::SecondsFormat::Secs, true);
+    let cutoff = autumn_harvest::time::rfc3339_opts(
+        now - SignedDuration::from_hours(1),
+        autumn_harvest::time::SecondsFormat::Secs,
+        true,
+    );
     let (status, body) = get_json(
         &app,
         &format!("/workflows/summaries?completed_after={cutoff}"),

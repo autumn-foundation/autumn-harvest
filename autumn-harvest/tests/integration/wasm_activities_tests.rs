@@ -46,11 +46,11 @@ use autumn_harvest::wasm_store::{
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1023,7 +1023,10 @@ async fn seed_workflow(
     store::append_events(
         conn,
         exec_id,
-        &[WorkflowEvent::workflow_started(input.clone(), Timestamp::now())],
+        &[WorkflowEvent::workflow_started(
+            input.clone(),
+            Timestamp::now(),
+        )],
         0,
     )
     .await

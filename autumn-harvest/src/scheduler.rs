@@ -1,19 +1,19 @@
 //! DAG scheduler and runtime execution.
 
 use crate::schema::{harvest_schedules_ext, harvest_workflow_executions_ext};
-use jiff_diesel::ToDiesel;
 use crate::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use jiff::Timestamp;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel::{BoolExpressionMethods, ExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -241,7 +241,8 @@ pub fn plan_backfill_timestamps(
             Ok(timestamps)
         }
         Some(Schedule::Interval(interval)) => {
-            let dur = jiff::SignedDuration::try_from(*interval).unwrap_or(jiff::SignedDuration::MAX);
+            let dur =
+                jiff::SignedDuration::try_from(*interval).unwrap_or(jiff::SignedDuration::MAX);
             let mut timestamps = Vec::new();
             let mut cursor = from;
             loop {
@@ -875,7 +876,11 @@ async fn dag_registration_is_converged(
         return Ok(false);
     }
 
-    Ok(dag_schedule_row_is_converged(&existing, dag, Timestamp::now()))
+    Ok(dag_schedule_row_is_converged(
+        &existing,
+        dag,
+        Timestamp::now(),
+    ))
 }
 
 /// Read-only probe: is this workflow schedule's row already exactly what
@@ -937,9 +942,10 @@ async fn find_converged_workflow_schedule(
         return Ok(None);
     }
 
-    let converged = workflow_schedule_row_is_converged_with(&existing, ws, Timestamp::now(), |stored| {
-        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
-    });
+    let converged =
+        workflow_schedule_row_is_converged_with(&existing, ws, Timestamp::now(), |stored| {
+            stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+        });
     Ok(converged.then_some(existing))
 }
 
@@ -3890,10 +3896,7 @@ pub fn scheduled_workflow_id_pub(
 
 /// Public re-export of `next_run_after` for use in [`crate::calendar`] preview helpers.
 #[must_use]
-pub fn next_run_after_pub(
-    schedule: Option<&Schedule>,
-    reference: Timestamp,
-) -> Option<Timestamp> {
+pub fn next_run_after_pub(schedule: Option<&Schedule>, reference: Timestamp) -> Option<Timestamp> {
     next_run_after(schedule, reference)
 }
 
@@ -4296,7 +4299,9 @@ pub async fn claim_and_fire_workflow_schedule(
                      fire_claimed_until = NULL \
                  WHERE id = $3 AND fire_claim_token = $4",
             )
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run.to_diesel())
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                next_run.to_diesel(),
+            )
             .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::Uuid, _>(schedule.id)
             .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
@@ -6084,8 +6089,8 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     let Some(step) = cadence_step(inputs.schedule, next_run_at) else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    let jitter =
-        jiff::SignedDuration::try_from(inputs.jitter).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+    let jitter = jiff::SignedDuration::try_from(inputs.jitter)
+        .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
     let tick = jiff::SignedDuration::try_from(inputs.tick_interval)
         .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
     // `jiff::SignedDuration`'s `+` panics on overflow; a pathological (near-i64-seconds)
@@ -6512,8 +6517,8 @@ pub async fn overdue_schedule_pass(
             && s.auto_paused_at.is_none()
             && s.exhausted_at.is_none()
             && let Some(anchor) = s.next_run_at
-            && let Some(step) =
-                cadence_step(schedule.as_ref(), anchor).and_then(|d| std::time::Duration::try_from(d).ok())
+            && let Some(step) = cadence_step(schedule.as_ref(), anchor)
+                .and_then(|d| std::time::Duration::try_from(d).ok())
         {
             min_cadence_step = Some(min_cadence_step.map_or(step, |cur| cur.min(step)));
         }
@@ -8088,9 +8093,15 @@ mod tests {
             Timestamp::constant(1_699_999_940, 0)
         );
         // A window before year -9999 keeps every missed slot.
-        assert_eq!(catchup_window_cutoff(now, Duration::from_secs(400_000_000_000)), Timestamp::MIN);
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(400_000_000_000)),
+            Timestamp::MIN
+        );
         // chrono refused a window past `i64::MAX` milliseconds and used zero.
-        assert_eq!(catchup_window_cutoff(now, Duration::from_secs(i64::MAX as u64)), now);
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(i64::MAX as u64)),
+            now
+        );
     }
 
     /// Pins a hazard for a failed batched `calendar::load_exclusions_for_calendars`.
@@ -8513,8 +8524,7 @@ mod tests {
     }
 
     fn parse_utc(value: &str) -> Timestamp {
-        value.parse::<Timestamp>()
-            .expect("timestamp should parse")
+        value.parse::<Timestamp>().expect("timestamp should parse")
     }
 
     #[test]
@@ -8789,7 +8799,10 @@ mod tests {
         assert_eq!(plan.run_dates[0], now, "fires the slot at exactly now");
         // total slots = intervals + 1 (slot at now); dropped = total - 1.
         assert_eq!(plan.dropped, total, "dropped = (intervals + 1) - 1");
-        assert_eq!(plan.next_run_at, Some(now + jiff::SignedDuration::from_secs(1)));
+        assert_eq!(
+            plan.next_run_at,
+            Some(now + jiff::SignedDuration::from_secs(1))
+        );
     }
 
     #[test]
@@ -9082,9 +9095,8 @@ mod tests {
         let schedule = Schedule::Interval(Duration::from_secs(60));
         let from = Timestamp::MAX - jiff::SignedDuration::from_secs(30);
 
-        let timestamps =
-            plan_backfill_timestamps(Some(&schedule), from, Timestamp::MAX, 100)
-                .expect("the end of time must not fail the plan");
+        let timestamps = plan_backfill_timestamps(Some(&schedule), from, Timestamp::MAX, 100)
+            .expect("the end of time must not fail the plan");
 
         assert_eq!(timestamps, vec![from]);
     }
@@ -9302,10 +9314,7 @@ mod tests {
     #[test]
     fn next_run_after_interval_at_the_end_of_time_is_none() {
         let schedule = Schedule::Interval(Duration::from_secs(1));
-        assert_eq!(
-            next_run_after(Some(&schedule), Timestamp::MAX),
-            None
-        );
+        assert_eq!(next_run_after(Some(&schedule), Timestamp::MAX), None);
     }
 
     #[test]
@@ -10474,7 +10483,9 @@ mod tests {
             // outside the changeset AND does not bump `updated_at`. A
             // changeset-shaped comparison misses it entirely. A row left
             // auto-paused then stays silently disabled forever.
-            ("auto_paused_at", |r| r.auto_paused_at = Some(Timestamp::now())),
+            ("auto_paused_at", |r| {
+                r.auto_paused_at = Some(Timestamp::now())
+            }),
         ];
 
         for (column, mutate) in mutators {
@@ -10498,7 +10509,11 @@ mod tests {
         let (mut row, ws) = converged_pair();
         assert!(ws.dag_name.is_none());
         row.dag_name = Some("adopted".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10508,10 +10523,18 @@ mod tests {
         let (mut row, mut ws) = converged_pair();
         ws.dag_name = Some("nightly_report".to_string());
         row.dag_name = Some("nightly_report".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
 
         row.dag_name = Some("someone_elses_dag".to_string());
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10520,7 +10543,11 @@ mod tests {
         // convergence impossible and reinstate the 1 Hz storm.
         let (mut row, ws) = converged_pair();
         row.updated_at = Timestamp::now() - crate::time::days(30);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10532,7 +10559,11 @@ mod tests {
         row.is_paused = true;
         row.paused_at = Some(Timestamp::now());
         row.paused_by = Some("operator".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     /// A `Manual` schedule's `next_run_at` is permanently NULL. With a bare
@@ -10941,9 +10972,17 @@ mod tests {
         ws.overlap_policy = OverlapPolicy::BufferOne;
         row.overlap_policy = OverlapPolicy::BufferOne.as_str().to_string();
         row.buffered_runs = buffered(1);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
         row.buffered_runs = buffered(2);
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10954,9 +10993,17 @@ mod tests {
         row.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
         row.buffer_all_max = 2;
         row.buffered_runs = buffered(2);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
         row.buffered_runs = buffered(3);
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10965,7 +11012,11 @@ mod tests {
         ws.consecutive_failure_limit = Some(3);
         row.consecutive_failure_limit = Some(3);
         row.auto_paused_at = Some(Timestamp::now());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]

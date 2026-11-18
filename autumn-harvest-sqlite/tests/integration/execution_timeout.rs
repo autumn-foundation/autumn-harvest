@@ -435,9 +435,7 @@ async fn a_body_that_ends_past_the_deadline_times_out() {
     let info = finishes_late_info();
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&info);
-    rt.set_clock(|| {
-        Timestamp::new(LATE_CLOCK.load(Ordering::SeqCst), 0).unwrap()
-    });
+    rt.set_clock(|| Timestamp::new(LATE_CLOCK.load(Ordering::SeqCst), 0).unwrap());
     let exec = rt.start_workflow(info.name, json!(1)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -561,9 +559,7 @@ async fn an_update_that_ends_past_the_deadline_is_refused() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&info);
     rt.register_update(&slow_update_info());
-    rt.set_clock(|| {
-        Timestamp::new(UPDATE_CLOCK.load(Ordering::SeqCst), 0).unwrap()
-    });
+    rt.set_clock(|| Timestamp::new(UPDATE_CLOCK.load(Ordering::SeqCst), 0).unwrap());
     let exec = rt.start_workflow(info.name, json!(1)).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
 

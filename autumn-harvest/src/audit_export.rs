@@ -2352,7 +2352,8 @@ pub async fn claim_shard_chained(
     use crate::schema::harvest_audit_log::dsl as log;
 
     let batch_size = batch_size.clamp(1, MAX_EXPORT_BATCH_SIZE);
-    let lease = jiff::SignedDuration::try_from(lease).unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
+    let lease = jiff::SignedDuration::try_from(lease)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
     let lease_until = now.checked_add(lease).unwrap_or(Timestamp::MAX);
 
     Box::pin(
@@ -3426,7 +3427,14 @@ async fn export_once_on_conn(
         Timestamp::now(),
     );
 
-    let applied = apply_outcome(conn, shard_id, claim.claim_epoch, &outcome, Timestamp::now()).await?;
+    let applied = apply_outcome(
+        conn,
+        shard_id,
+        claim.claim_epoch,
+        &outcome,
+        Timestamp::now(),
+    )
+    .await?;
 
     let delivered = match &outcome {
         ExportOutcome::Advance { .. } if applied => {
@@ -4052,7 +4060,13 @@ async fn export_once_via_pool(
     // lost.
     let applied = match tokio::time::timeout(
         ack_bound,
-        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Timestamp::now()),
+        apply_outcome(
+            &mut conn,
+            shard_id,
+            claim.claim_epoch,
+            &outcome,
+            Timestamp::now(),
+        ),
     )
     .await
     {

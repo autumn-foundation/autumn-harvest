@@ -1,7 +1,7 @@
 use autumn_harvest::schema::harvest_task_queue_ext;
-use jiff_diesel::ToDiesel;
-use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -3578,10 +3578,13 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
                 // One attempt keeps the terminal timeout, which appends an
                 // event, as the path under test.
                 harvest_task_queue::max_attempts.eq(1),
-                harvest_task_queue::started_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60)).to_diesel()),
+                harvest_task_queue::started_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60),
+                )
+                .to_diesel()),
                 SetExt(
-                    harvest_task_queue_ext::start_to_close.eq(Some(jiff::SignedDuration::from_secs(1)).to_pg_interval()),
+                    harvest_task_queue_ext::start_to_close
+                        .eq(Some(jiff::SignedDuration::from_secs(1)).to_pg_interval()),
                 ),
             ))
             .execute(&mut setup_conn)
@@ -5215,7 +5218,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
     }
     let schedule = load_schedule_from_url(&database_url, dag_name).await;
 
-    let backfill_at = "2026-05-14T02:00:00.123456Z".parse::<jiff::Timestamp>()
+    let backfill_at = "2026-05-14T02:00:00.123456Z"
+        .parse::<jiff::Timestamp>()
         .expect("fixed timestamp should parse");
     let migrated_workflow_id = format!(
         "sched:{dag_name}:{}.{:06}",
@@ -5514,10 +5518,8 @@ async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_on
 
     // A 3-hour hourly window → 4 candidate slots, more than the single remaining
     // slot, so two concurrent requests both have work to dispatch.
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let uri = format!("/admin/schedules/{}/backfill", schedule.id);
     let body = json!({ "from": from, "to": to });
 
@@ -5587,10 +5589,8 @@ async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
     // reserve + transition budget path on the single shared connection.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
-    let from = "2026-05-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-05-01T12:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-05-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-05-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let uri = format!("/admin/schedules/{}/backfill", schedule.id);
     let body = json!({ "from": from, "to": to });
 
@@ -5641,10 +5641,8 @@ async fn backfill_records_backfill_source_referencing_schedule_id() {
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
     // A 1-hour hourly window → 2 candidate slots (10:00, 11:00), both dispatch.
-    let from = "2026-06-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-06-01T11:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-06-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-06-01T11:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5707,10 +5705,8 @@ async fn backfill_release_on_oversized_input_leaves_budget_intact() {
         setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
 
     // A 1-hour hourly window → 2 candidate slots (10:00, 11:00).
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T11:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T11:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5759,10 +5755,8 @@ async fn backfill_over_window_dispatches_only_remaining_budget() {
     // Two slots of budget, a four-slot window.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(2)).await;
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5799,10 +5793,8 @@ async fn backfill_unlimited_schedule_increments_runs_started() {
     // still increments for observability, exhausted_at stays NULL.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T12:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5866,10 +5858,8 @@ async fn backfill_max_runs_zero_is_treated_as_unlimited() {
             .expect("forcing max_runs = 0 must succeed");
     }
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T12:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5985,10 +5975,8 @@ async fn backfill_budget_reserve_and_release_touch_only_their_schedule() {
         setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
     let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T11:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T11:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6084,10 +6072,8 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
     ));
     let app = harvest_api_router(api_state);
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T13:00:00Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6210,13 +6196,11 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     ));
     let app = harvest_api_router(api_state);
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
     // Window boundaries are inclusive on both ends, so keep `to` just past
     // `from` to land only the 10:00 slot. A wider window would also dispatch
     // an irrelevant 11:00 slot.
-    let to = "2026-04-01T10:00:01Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let to = "2026-04-01T10:00:01Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6246,7 +6230,8 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
+    let deadline_delta =
+        (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
         autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
@@ -6344,10 +6329,8 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
     ));
     let app = harvest_api_router(api_state);
 
-    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
-    let to = "2026-04-01T10:00:01Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let from = "2026-04-01T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let to = "2026-04-01T10:00:01Z".parse::<jiff::Timestamp>().unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6370,7 +6353,8 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
+    let deadline_delta =
+        (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
         autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
@@ -6475,8 +6459,10 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             .expect("failed to connect for forcing due interval schedule");
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -6570,8 +6556,10 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             .expect("failed to connect for forcing due interval schedule");
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -6907,7 +6895,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         retry_policy: None,
         all_writable_shards: false,
     };
-    let paused_at = "2026-05-14T02:00:00.123456Z".parse::<jiff::Timestamp>()
+    let paused_at = "2026-05-14T02:00:00.123456Z"
+        .parse::<jiff::Timestamp>()
         .expect("fixed pause timestamp should parse");
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![DagInfo {
@@ -7179,7 +7168,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
 async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split_legacy_rows() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_paused_legacy_dag";
-    let paused_at = "2026-05-14T02:00:00.654321Z".parse::<jiff::Timestamp>()
+    let paused_at = "2026-05-14T02:00:00.654321Z"
+        .parse::<jiff::Timestamp>()
         .expect("fixed pause timestamp should parse");
     let classic_dag = compile_dag_catalog(vec![DagInfo {
         name: dag_name,
@@ -7376,8 +7366,10 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             .expect("failed to connect to shard 1 for forcing due schedule");
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7484,8 +7476,10 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         let stale = load_schedule_from_url(&shard0_url, dag_name).await;
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7618,8 +7612,10 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             .expect("legacy workflow-only schedule should exist on shard 0");
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7749,8 +7745,10 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         );
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7823,8 +7821,10 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         let schedule = load_schedule_from_url(&database_url, dag_name).await;
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8321,8 +8321,10 @@ async fn scheduler_tick_preserves_dag_metadata() {
         let schedule = load_schedule_from_url(&database_url, dag_name).await;
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
-                harvest_schedules::next_run_at
-                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                harvest_schedules::next_run_at.eq(Some(
+                    jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
+                )
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8657,8 +8659,9 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
         // interval:60). A same-cadence re-register preserves this value.
         diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
             .set(
-                harvest_schedules::next_run_at
-                    .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(300)).to_diesel()),
+                harvest_schedules::next_run_at.eq((jiff::Timestamp::now()
+                    - jiff::SignedDuration::from_secs(300))
+                .to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8777,8 +8780,10 @@ async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uui
     }
 
     // next_run_at = slot_date at midnight (a daily-cron slot 3 days in the past).
-    let next_run_at = autumn_harvest::time::from_utc_datetime(slot_date.to_datetime(jiff::civil::Time::midnight()))
-        .expect("midnight");
+    let next_run_at = autumn_harvest::time::from_utc_datetime(
+        slot_date.to_datetime(jiff::civil::Time::midnight()),
+    )
+    .expect("midnight");
 
     let mut deferred_id = uuid::Uuid::nil();
     let mut control_id = uuid::Uuid::nil();

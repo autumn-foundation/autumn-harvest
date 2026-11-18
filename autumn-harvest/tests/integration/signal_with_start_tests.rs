@@ -7,7 +7,6 @@
 #![cfg(feature = "db")]
 
 use autumn_harvest::error::HarvestError;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{
     SignalWithStartOutcome, SignalWithStartParams, signal_with_start_workflow_execution,
@@ -19,6 +18,7 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;

@@ -12,9 +12,9 @@
 //! reports can sum it without a key. The model id and the counts are in
 //! clear. See `docs/security-posture.md`.
 
-use std::time::{Duration, Instant};
 #[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
+use std::time::{Duration, Instant};
 
 /// The longest model id the ledger accepts, in bytes.
 pub const MAX_MODEL_ID_BYTES: usize = 200;

@@ -6,8 +6,8 @@
 //! works in network-restricted environments.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::fmt::Write as _;
 use jiff_diesel::ToDiesel;
+use std::fmt::Write as _;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -23,12 +23,12 @@ use axum::Router;
 use axum::middleware;
 use axum::response::IntoResponse as _;
 use axum::routing::{get, post};
-use jiff::Timestamp;
 use diesel::BoolExpressionMethods;
 use diesel::dsl::sql;
 use diesel::sql_types::{Bool, Text};
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::Value;
@@ -5623,8 +5623,7 @@ fn worker_status_badge(status: &str, stale: bool) -> Markup {
 
 /// Format a `Timestamp` as a human-readable relative time string.
 fn relative_time(ts: Timestamp) -> String {
-    let elapsed = std::time::Duration::try_from(Timestamp::now()
-        .duration_since(ts))
+    let elapsed = std::time::Duration::try_from(Timestamp::now().duration_since(ts))
         .unwrap_or(std::time::Duration::ZERO);
     let secs = elapsed.as_secs();
     if secs < 5 {
@@ -8166,11 +8165,7 @@ fn render_timeline_row(
 /// outline. Pause and ND-block bands overlay the axis, sourced from the
 /// execution row. maud auto-escapes every text/attribute interpolation.
 #[allow(clippy::too_many_lines)]
-fn render_timeline_gantt(
-    timeline: &Timeline,
-    exec: &WorkflowExecution,
-    now: Timestamp,
-) -> Markup {
+fn render_timeline_gantt(timeline: &Timeline, exec: &WorkflowExecution, now: Timestamp) -> Markup {
     // Lane-group the steps (stable, in TIMELINE_LANES order), marking the first
     // of each present lane so the lane label renders once per group.
     let mut order: Vec<(StepKind, usize, bool)> = Vec::new();
@@ -12485,13 +12480,12 @@ impl BackfillFormParams {
         include_paused: bool,
     ) -> Result<Self, String> {
         let parse_one = |label: &str, raw: &str| {
-            autumn_harvest::time::parse::rfc3339(raw.trim())
-                .map_err(|_| {
-                    format!(
-                        "invalid {label} '{raw}': expected an RFC 3339 instant, \
+            autumn_harvest::time::parse::rfc3339(raw.trim()).map_err(|_| {
+                format!(
+                    "invalid {label} '{raw}': expected an RFC 3339 instant, \
                          e.g. 2026-08-01T00:00:00Z"
-                    )
-                })
+                )
+            })
         };
         let from_at = parse_one("start", from)?;
         let to_at = parse_one("end", to)?;
@@ -12504,8 +12498,16 @@ impl BackfillFormParams {
         // `…00Z` shifts every slot in the plan. `AutoSi` keeps a whole-second
         // window spelled `…:00Z` and preserves fractional digits when present.
         Ok(Self {
-            from: autumn_harvest::time::rfc3339_opts(from_at, autumn_harvest::time::SecondsFormat::AutoSi, true),
-            to: autumn_harvest::time::rfc3339_opts(to_at, autumn_harvest::time::SecondsFormat::AutoSi, true),
+            from: autumn_harvest::time::rfc3339_opts(
+                from_at,
+                autumn_harvest::time::SecondsFormat::AutoSi,
+                true,
+            ),
+            to: autumn_harvest::time::rfc3339_opts(
+                to_at,
+                autumn_harvest::time::SecondsFormat::AutoSi,
+                true,
+            ),
             max_count,
             include_paused,
         })
@@ -17483,8 +17485,7 @@ mod tests {
     ];
 
     fn tl_base() -> Timestamp {
-        "2026-07-15T12:00:00Z".parse::<Timestamp>()
-            .unwrap()
+        "2026-07-15T12:00:00Z".parse::<Timestamp>().unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19013,8 +19014,7 @@ mod tests {
         assert!(label.contains("10"), "max_runs missing: {label}");
 
         let ends = HarvestSchedule {
-            end_at: "2027-01-01T00:00:00Z".parse::<Timestamp>()
-                .ok(),
+            end_at: "2027-01-01T00:00:00Z".parse::<Timestamp>().ok(),
             ..make_schedule(Some("wf"), None, false)
         };
         assert!(schedule_bounded_runs_label(&ends).contains("2027-01-01"));
@@ -19037,7 +19037,8 @@ mod tests {
     /// jitter is configured, and only `next_run_at` when it is not.
     #[test]
     fn schedule_next_fire_cell_shows_effective_time_only_with_jitter() {
-        let at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
+        let at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid fixture timestamp");
 
         let no_jitter = HarvestSchedule {
@@ -19158,10 +19159,7 @@ mod tests {
         effective_at: Option<&str>,
         reason: &str,
     ) -> crate::api::ScheduleFirePreviewEntry {
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let effective = effective_at.map(parse);
         crate::api::ScheduleFirePreviewEntry {
             scheduled_at: parse(scheduled_at),
@@ -19281,10 +19279,7 @@ mod tests {
         origin: &str,
         nominal: Option<&str>,
     ) -> crate::schedule_runs::ScheduleRunEntry {
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         crate::schedule_runs::ScheduleRunEntry {
             execution_id: uuid::Uuid::new_v4(),
             nominal_fire_time: nominal.map(parse),
@@ -19517,10 +19512,7 @@ mod tests {
     fn backfill_confirm_shows_planned_count_before_dispatch() {
         let row = make_schedule(Some("payments"), None, false);
         let id = row.id.to_string();
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -19579,10 +19571,7 @@ mod tests {
     #[test]
     fn backfill_confirm_disables_dispatch_for_an_empty_window() {
         let row = make_schedule(Some("payments"), None, false);
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -19756,8 +19745,14 @@ mod tests {
         )
         .expect("a well-formed window parses");
         let request = params.to_request(true).expect("converts");
-        assert_eq!(autumn_harvest::time::rfc3339(request.from), "2026-08-01T00:00:00+00:00");
-        assert_eq!(autumn_harvest::time::rfc3339(request.to), "2026-08-02T06:30:00+00:00");
+        assert_eq!(
+            autumn_harvest::time::rfc3339(request.from),
+            "2026-08-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            autumn_harvest::time::rfc3339(request.to),
+            "2026-08-02T06:30:00+00:00"
+        );
         assert_eq!(request.max_count, Some(42));
         assert!(request.include_paused);
         // And the normalised strings the confirmation round-trips are the same
@@ -20091,10 +20086,7 @@ mod tests {
     #[test]
     fn backfill_confirm_refuses_to_offer_a_commit_for_a_paused_dag() {
         let row = make_schedule(None, Some("nightly_etl"), true);
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -20584,7 +20576,8 @@ mod tests {
         let now = jiff::Timestamp::now();
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
             .expect("valid fixture uuid");
-        let next_run_at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
+        let next_run_at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
 
@@ -20633,7 +20626,8 @@ mod tests {
     fn jitter_past_cutoff_row() -> HarvestSchedule {
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001568")
             .expect("valid fixture uuid");
-        let next_run_at = "2026-09-01T12:00:00Z".parse::<Timestamp>()
+        let next_run_at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
         let effective = crate::api::effective_fire_time(id, Some(next_run_at), jitter_secs)
@@ -20796,10 +20790,7 @@ mod tests {
     #[test]
     fn backfill_confirm_handler_carries_only_escaped_identifiers() {
         let row = make_schedule(Some("evil'); alert(1);//"), None, false);
-        let parse = |s: &str| {
-            s.parse::<Timestamp>()
-                .expect("valid fixture timestamp")
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,

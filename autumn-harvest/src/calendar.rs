@@ -39,7 +39,11 @@ pub fn is_excluded_date(date: jiff::civil::Date, excluded_dates: &[jiff::civil::
 
 /// Internal helper: returns `true` if `date` should be treated as excluded,
 /// checking both the explicit exclusion list and the weekend flag.
-fn is_excluded_impl(date: jiff::civil::Date, excluded_dates: &[jiff::civil::Date], exclude_weekends: bool) -> bool {
+fn is_excluded_impl(
+    date: jiff::civil::Date,
+    excluded_dates: &[jiff::civil::Date],
+    exclude_weekends: bool,
+) -> bool {
     (exclude_weekends && is_weekend(date)) || excluded_dates.contains(&date)
 }
 
@@ -205,7 +209,10 @@ pub const MAX_BUSINESS_DAYS: u32 = 3650;
 /// `holidays` is a [`BTreeSet`](std::collections::BTreeSet), so a lookup in
 /// the scan loop is O(log n), not the O(n) slice scan of [`is_excluded_date`].
 #[must_use]
-pub fn is_business_day(date: jiff::civil::Date, holidays: &std::collections::BTreeSet<jiff::civil::Date>) -> bool {
+pub fn is_business_day(
+    date: jiff::civil::Date,
+    holidays: &std::collections::BTreeSet<jiff::civil::Date>,
+) -> bool {
     !is_weekend(date) && !holidays.contains(&date)
 }
 
@@ -791,7 +798,8 @@ pub fn plan_backfill_with_calendar(
     }
     // Indexed once for the whole backfill: `apply_skip_policy_indexed` below
     // is called once per raw slot (up to `max_count`) against this same list.
-    let excluded: std::collections::BTreeSet<jiff::civil::Date> = excluded_dates.iter().copied().collect();
+    let excluded: std::collections::BTreeSet<jiff::civil::Date> =
+        excluded_dates.iter().copied().collect();
     let pairs = raw
         .into_iter()
         .filter_map(|ts| {
@@ -1218,7 +1226,11 @@ mod tests {
         // 2026-07-02 is a Thursday; +2 business days steps over Sat 07-04 / Sun 07-05.
         let res = add_business_days(utc("2026-07-02T09:00:00Z"), 2, &holidays(&[]))
             .expect("resolves within the scan bound");
-        assert_eq!(crate::time::utc_date(res.deadline), date("2026-07-06"), "Monday");
+        assert_eq!(
+            crate::time::utc_date(res.deadline),
+            date("2026-07-06"),
+            "Monday"
+        );
     }
 
     #[test]
@@ -1226,7 +1238,11 @@ mod tests {
         // Same anchor, but Monday 2026-07-06 is a holiday -> lands Tuesday.
         let res = add_business_days(utc("2026-07-02T09:00:00Z"), 2, &holidays(&["2026-07-06"]))
             .expect("resolves within the scan bound");
-        assert_eq!(crate::time::utc_date(res.deadline), date("2026-07-07"), "Tuesday");
+        assert_eq!(
+            crate::time::utc_date(res.deadline),
+            date("2026-07-07"),
+            "Tuesday"
+        );
     }
 
     #[test]
@@ -1641,7 +1657,11 @@ mod tests {
             Some(date("2026-12-31")),
         )
         .expect("Mon -> Wed is inside coverage");
-        assert_eq!(crate::time::utc_date(res.deadline), date("2026-12-30"), "Wednesday");
+        assert_eq!(
+            crate::time::utc_date(res.deadline),
+            date("2026-12-30"),
+            "Wednesday"
+        );
     }
 
     #[test]
@@ -1919,9 +1939,7 @@ mod tests {
             expr: "0 8 * * 1-5".into(),
             tz: name.into(),
         };
-        let ts = "2026-01-04T23:00:00Z"
-            .parse::<jiff::Timestamp>()
-            .unwrap();
+        let ts = "2026-01-04T23:00:00Z".parse::<jiff::Timestamp>().unwrap();
         assert_eq!(
             schedule_local_date(ts, Some(&tz("Asia/Tokyo"))),
             date("2026-01-05")
@@ -1935,9 +1953,7 @@ mod tests {
     #[test]
     fn schedule_local_date_falls_back_to_utc() {
         use crate::policy::Schedule;
-        let ts = "2026-01-04T23:00:00Z"
-            .parse::<jiff::Timestamp>()
-            .unwrap();
+        let ts = "2026-01-04T23:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let bad_tz = Schedule::CronInTimezone {
             expr: "0 8 * * 1-5".into(),
             tz: "Not/AZone".into(),
@@ -2072,9 +2088,7 @@ mod tests {
 
         #[test]
         fn preview_firings_no_calendar_all_fired() {
-            let from = "2026-07-01T00:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let previews =
                 preview_schedule_firings(&schedule, from, 3, None, &[], SkipPolicy::Skip);
@@ -2087,9 +2101,7 @@ mod tests {
 
         #[test]
         fn preview_firings_skip_excluded() {
-            let from = "2026-07-03T10:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-03T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
             let previews = preview_schedule_firings(
@@ -2115,9 +2127,7 @@ mod tests {
 
         #[test]
         fn preview_firings_deferred_next() {
-            let from = "2026-07-03T10:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-03T10:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
             let previews = preview_schedule_firings(
@@ -2149,12 +2159,8 @@ mod tests {
 
         #[test]
         fn backfill_skip_drops_excluded_dates() {
-            let from = "2026-07-01T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
-            let to = "2026-07-05T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-01T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
+            let to = "2026-07-05T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
             let result = plan_backfill_with_calendar(
@@ -2167,7 +2173,10 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(*ft)).collect();
+            let dates: Vec<_> = result
+                .iter()
+                .map(|(_, ft)| crate::time::utc_date(*ft))
+                .collect();
             assert!(
                 !dates.contains(&date("2026-07-04")),
                 "Jul 4 should be excluded"
@@ -2180,12 +2189,8 @@ mod tests {
 
         #[test]
         fn backfill_next_business_day_adjusts_excluded_date() {
-            let from = "2026-07-01T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
-            let to = "2026-07-05T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-01T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
+            let to = "2026-07-05T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
             let result = plan_backfill_with_calendar(
@@ -2198,7 +2203,10 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(*ft)).collect();
+            let dates: Vec<_> = result
+                .iter()
+                .map(|(_, ft)| crate::time::utc_date(*ft))
+                .collect();
             assert!(
                 dates.iter().filter(|&&d| d == date("2026-07-05")).count() >= 1,
                 "Jul 5 should appear (as adjusted Jul 4 and/or natural Jul 5)"
@@ -2211,12 +2219,8 @@ mod tests {
 
         #[test]
         fn backfill_no_exclusions_passes_through() {
-            let from = "2026-07-01T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
-            let to = "2026-07-03T09:00:00Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap();
+            let from = "2026-07-01T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
+            let to = "2026-07-03T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let plain =
                 crate::scheduler::plan_backfill_timestamps(Some(&schedule), from, to, 100).unwrap();

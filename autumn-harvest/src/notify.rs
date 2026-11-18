@@ -45,17 +45,17 @@
 //! Polling stays the correctness floor. A lost wake costs latency, not work.
 //! [`send_failures`] counts lost wakes.
 
-use std::collections::HashMap;
 use jiff_diesel::ToDiesel;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
 use deadpool::managed::WeakPool;
 use diesel::sql_types::Text;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::cached_stmt::CachePreparedDsl as _;

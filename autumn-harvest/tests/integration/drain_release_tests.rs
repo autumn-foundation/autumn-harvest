@@ -27,9 +27,9 @@ use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -324,13 +324,7 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
             harvest_task_queue::error,
             harvest_task_queue::scheduled_at,
         ))
-        .first::<(
-            String,
-            Option<String>,
-            i32,
-            Option<String>,
-            SqlTimestamp,
-        )>(&mut conn)
+        .first::<(String, Option<String>, i32, Option<String>, SqlTimestamp)>(&mut conn)
         .await
         .optional()
         .expect("load activity row")

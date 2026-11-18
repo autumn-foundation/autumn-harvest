@@ -9,8 +9,8 @@
 //! suite starts a testcontainers Postgres 16.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -27,10 +27,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;

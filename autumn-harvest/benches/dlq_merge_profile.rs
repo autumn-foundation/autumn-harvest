@@ -94,8 +94,10 @@ fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> Dl
     let count_per_group = 100 + i64::try_from(shard_id).unwrap_or(0);
     let rows: Vec<DlqRawGroup> = (0..groups)
         .map(|g| {
-            let failed_at =
-                base + jiff::SignedDuration::from_secs(i64::try_from(shard_id * groups + g).unwrap_or(0));
+            let failed_at = base
+                + jiff::SignedDuration::from_secs(
+                    i64::try_from(shard_id * groups + g).unwrap_or(0),
+                );
             DlqRawGroup {
                 key: vec![
                     Some(format!("workflow_{g}")),

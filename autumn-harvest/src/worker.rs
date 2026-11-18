@@ -10,8 +10,8 @@
 //! (replay, retries, heartbeats) live in the executor and context modules.
 
 use crate::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use crate::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1883,7 +1883,8 @@ impl HandlerRegistry {
             info.and_then(|info| info.execution_timeout),
             info.and_then(|info| info.sla),
         );
-        let execution_timeout = execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        let execution_timeout =
+            execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
         let sla = sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
         let max_execution_timeout_ceiling = self
             .max_workflow_execution_timeout
@@ -5907,8 +5908,7 @@ async fn run_local_activity_inline(
 ///
 /// jiff holds a longer one. The activity duration checks keep the old bound,
 /// so a value that `chrono` refused still fails.
-const MAX_ACTIVITY_DURATION: jiff::SignedDuration =
-    jiff::SignedDuration::from_millis(i64::MAX);
+const MAX_ACTIVITY_DURATION: jiff::SignedDuration = jiff::SignedDuration::from_millis(i64::MAX);
 
 fn bounded_duration_from_std(
     duration: Duration,
@@ -6092,9 +6092,7 @@ pub(crate) fn signed_duration_from_secs(
     Some(jiff::SignedDuration::from_secs(seconds))
         .filter(|duration| *duration <= MAX_ACTIVITY_DURATION)
         .ok_or_else(|| {
-            HarvestError::Config(format!(
-                "activity {field_name} exceeds the duration bounds"
-            ))
+            HarvestError::Config(format!("activity {field_name} exceeds the duration bounds"))
         })
 }
 
@@ -6153,7 +6151,10 @@ fn next_retry_delay(
 /// `None` means the timeout is terminal. A retry policy that does not parse
 /// is terminal too. The worker fails the execution in that case, but the
 /// enforcer only fails the activity, which the workflow can handle.
-pub(crate) fn timeout_retry_delay(task: &TaskQueueItem, error: &str) -> Option<jiff::SignedDuration> {
+pub(crate) fn timeout_retry_delay(
+    task: &TaskQueueItem,
+    error: &str,
+) -> Option<jiff::SignedDuration> {
     let policy = configured_retry_policy(task)
         .inspect_err(|e| {
             tracing::warn!(
@@ -10685,10 +10686,8 @@ fn collect_update_result_metrics(
     // is not in the loaded history yields name "unknown" AND a `None` timestamp
     // together. So its histogram sample is skipped rather than fabricated. That
     // should not happen, because admission always precedes the result.
-    let mut admitted: std::collections::HashMap<
-        crate::types::UpdateId,
-        (&str, jiff::Timestamp),
-    > = std::collections::HashMap::new();
+    let mut admitted: std::collections::HashMap<crate::types::UpdateId, (&str, jiff::Timestamp)> =
+        std::collections::HashMap::new();
     for event in history_events {
         if let WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -11513,8 +11512,9 @@ async fn process_mutex_releases_from_commands(
                     && metrics_enabled
                 {
                     #[allow(clippy::cast_precision_loss)]
-                    let secs =
-                        (crate::time::num_milliseconds(jiff::Timestamp::now() - acquired_at) as f64) / 1000.0;
+                    let secs = (crate::time::num_milliseconds(jiff::Timestamp::now() - acquired_at)
+                        as f64)
+                        / 1000.0;
                     held.push(secs.max(0.0));
                 }
             }
@@ -11631,8 +11631,9 @@ async fn persist_mutex_acquire_park(
                         match crate::mutex::waiter_wait_metrics(conn, &key, exec_id).await? {
                             Some((requested_at, count)) => {
                                 #[allow(clippy::cast_precision_loss)]
-                                let secs = (crate::time::num_milliseconds(jiff::Timestamp::now() - requested_at)
-                                    as f64)
+                                let secs = (crate::time::num_milliseconds(
+                                    jiff::Timestamp::now() - requested_at,
+                                ) as f64)
                                     / 1000.0;
                                 (Some(secs.max(0.0)), u64::try_from(count).ok())
                             }
@@ -12140,8 +12141,10 @@ fn build_activity_enqueue_plan(
             builder_stc_default,
         );
         if let Some(timeout) = effective_stc {
-            params.start_to_close =
-                Some(bounded_duration_from_std(timeout, "start_to_close timeout")?);
+            params.start_to_close = Some(bounded_duration_from_std(
+                timeout,
+                "start_to_close timeout",
+            )?);
         }
         // Issue #606: a per-call schedule_to_start override takes priority over
         // the activity's registered default, like retry_policy_override /
@@ -13735,7 +13738,10 @@ fn build_child_row<'p>(
     // immediate-use caller.
     let now = jiff::Timestamp::now();
     // A deadline past the jiff range is stored as NULL, as at the start path.
-    let deadline_at = plan.defaults.execution_timeout.and_then(|d| now.checked_add(d).ok());
+    let deadline_at = plan
+        .defaults
+        .execution_timeout
+        .and_then(|d| now.checked_add(d).ok());
     let sla_deadline_at = plan.defaults.sla.and_then(|d| now.checked_add(d).ok());
     let chain_deadline_at = plan
         .defaults
@@ -14718,8 +14724,7 @@ async fn persist_mixed_suspension_batch(
         // Postgres `NOW()`. So the chronological wake ingest
         // (`merge_wake_events`) compares instants from one clock, whatever the
         // worker skew.
-        let mut timer_fire_instants: Vec<jiff::Timestamp> =
-            Vec::with_capacity(batch.timers.len());
+        let mut timer_fire_instants: Vec<jiff::Timestamp> = Vec::with_capacity(batch.timers.len());
         let mut new_timer_rows: Vec<(TimerId, jiff::Timestamp)> = Vec::new();
         let mut timer_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
             std::collections::VecDeque::with_capacity(batch.timers.len());
@@ -16685,7 +16690,8 @@ async fn create_detached_child_executions(
         // detached child resolves no `execution_timeout`, so only the SLA applies.
         let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
         let child_sla = child_sla.and_then(crate::time::from_std_bounded);
-        let child_sla_deadline_at = child_sla.and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        let child_sla_deadline_at =
+            child_sla.and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
         // A detached child accumulates its own history/DLQ/active-execution
         // footprint exactly like any other registry-aware start. So it is
         // resolved against and enforced under its OWN declared quota (issue
@@ -17017,7 +17023,9 @@ async fn task_state_and_deadline_for_update(
         .await
         .optional()
         .map(|row| {
-            row.map(|(state, deadline)| (state, deadline.map(crate::time::sql::SqlTimestamp::to_jiff)))
+            row.map(|(state, deadline)| {
+                (state, deadline.map(crate::time::sql::SqlTimestamp::to_jiff))
+            })
         })
         .map_err(crate::error::database_error)
 }
@@ -18338,7 +18346,8 @@ async fn defer_unstarted_claim(
     delay: Duration,
     write_name: &str,
 ) -> HarvestResult<bool> {
-    let delay = jiff::SignedDuration::try_from(delay).unwrap_or_else(|_| jiff::SignedDuration::from_secs(1));
+    let delay = jiff::SignedDuration::try_from(delay)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(1));
     let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
     if write == queue::ClaimWrite::LeaseLost {
         log_lease_lost(task, write_name);
@@ -19046,14 +19055,12 @@ async fn handle_session_acquire(
     // capacity for longer than one backoff interval. The same holds for
     // workers with the default `max_concurrent_sessions = 0`.
     let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
-    let acquisition_timeout_exceeded = task
-        .schedule_to_start
-        .is_some_and(|budget| {
-            // A due time past the jiff range is never reached, as under chrono.
-            eligible_since
-                .checked_add(budget)
-                .is_ok_and(|due| jiff::Timestamp::now() >= due)
-        });
+    let acquisition_timeout_exceeded = task.schedule_to_start.is_some_and(|budget| {
+        // A due time past the jiff range is never reached, as under chrono.
+        eligible_since
+            .checked_add(budget)
+            .is_ok_and(|due| jiff::Timestamp::now() >= due)
+    });
     if acquisition_timeout_exceeded {
         return record_session_acquire_schedule_to_start_timeout(
             &mut conn,
@@ -20431,7 +20438,10 @@ async fn process_activity_task(
     .with_context_headers(activity_context_headers)
     // Issue #682: surface the activity's heartbeat timeout so a handler can
     // opt into `ctx.start_auto_heartbeat_default()`.
-    .with_heartbeat_timeout_opt(task.heartbeat_timeout.and_then(|d| std::time::Duration::try_from(d).ok()))
+    .with_heartbeat_timeout_opt(
+        task.heartbeat_timeout
+            .and_then(|d| std::time::Duration::try_from(d).ok()),
+    )
     .with_metrics(registry.telemetry().metrics.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
@@ -22319,10 +22329,7 @@ async fn plan_timer_lifecycle(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
-) -> HarvestResult<(
-    Vec<Option<WorkflowEvent>>,
-    Option<jiff::Timestamp>,
-)> {
+) -> HarvestResult<(Vec<Option<WorkflowEvent>>, Option<jiff::Timestamp>)> {
     use crate::schema::harvest_timers;
 
     if !commands.iter().any(|c| {
@@ -22969,10 +22976,15 @@ async fn requeue_child_spawn_admission_error(
         "child spawn could not be admitted; deferring the retry with a bounded \
          jittered backoff rather than failing the execution or hot-spinning",
     );
-    let backoff_duration =
-        jiff::SignedDuration::try_from(backoff).unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_duration, &error.to_string())
-        .await?;
+    let backoff_duration = jiff::SignedDuration::try_from(backoff)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
+    queue::requeue_workflow_task_for_quota_retry(
+        conn,
+        task_id,
+        backoff_duration,
+        &error.to_string(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -23065,10 +23077,15 @@ async fn recover_from_child_quota_exceeded(
          a bounded jittered backoff rather than immediately re-driving it or \
          failing the execution over an unrelated tenant's quota",
     );
-    let backoff_duration =
-        jiff::SignedDuration::try_from(backoff).unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_duration, &error.to_string())
-        .await?;
+    let backoff_duration = jiff::SignedDuration::try_from(backoff)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
+    queue::requeue_workflow_task_for_quota_retry(
+        conn,
+        task_id,
+        backoff_duration,
+        &error.to_string(),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -24813,7 +24830,9 @@ fn resolve_continue_as_new_successor_defaults<'a>(
             execution_timeout: execution.execution_timeout,
             // The start path stores a deadline past the jiff range as NULL and
             // keeps the duration. The successor follows the same rule.
-            deadline_at: execution.execution_timeout.and_then(|d| now.checked_add(d).ok()),
+            deadline_at: execution
+                .execution_timeout
+                .and_then(|d| now.checked_add(d).ok()),
             sla: execution.sla,
             sla_deadline_at: execution.sla.and_then(|d| now.checked_add(d).ok()),
             owner: execution.owner.as_deref(),
@@ -25243,7 +25262,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                 harvest_workflow_executions::error.eq(None::<String>),
                 harvest_workflow_executions::sticky_worker_id.eq(Some(worker_id.to_string())),
-                harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
+                harvest_workflow_executions::completed_at
+                    .eq(Some(jiff::Timestamp::now()).to_diesel()),
             ))
             .cache_prepared()
             .execute(conn)
@@ -29332,19 +29352,20 @@ async fn process_workflow_task(
     // absorbing that unrelated later latency would inflate them and distort
     // executor-latency SLOs.
     let duration_secs = started_at.elapsed().as_secs_f64();
-    let canary_roundtrip_secs =
-        if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. }) {
-            // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
-            // clock-skew negative delta to 0 (the std conversion errs on a negative
-            // signed duration), mirroring the update-duration clamping
-            // precedent.
-            Some(
-                std::time::Duration::try_from(jiff::Timestamp::now() - prepared.execution.started_at)
-                    .map_or(0.0, |delta| delta.as_secs_f64()),
-            )
-        } else {
-            None
-        };
+    let canary_roundtrip_secs = if is_canary
+        && matches!(&outcome, WorkflowOutcome::Completed { .. })
+    {
+        // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
+        // clock-skew negative delta to 0 (the std conversion errs on a negative
+        // signed duration), mirroring the update-duration clamping
+        // precedent.
+        Some(
+            std::time::Duration::try_from(jiff::Timestamp::now() - prepared.execution.started_at)
+                .map_or(0.0, |delta| delta.as_secs_f64()),
+        )
+    } else {
+        None
+    };
     let mut pending_workflow_metrics = PendingWorkflowMetrics {
         status,
         is_canary,
@@ -48097,7 +48118,10 @@ mod tests {
         let events = merge_wake_events(
             vec![
                 (TimerId::new("t1"), base),
-                (TimerId::new("t2"), base + jiff::SignedDuration::from_secs(10)),
+                (
+                    TimerId::new("t2"),
+                    base + jiff::SignedDuration::from_secs(10),
+                ),
             ],
             vec![
                 (
@@ -56328,7 +56352,12 @@ mod tests {
     fn recheck_missing_task_row_is_handled() {
         let now = jiff::Timestamp::now();
         assert_eq!(
-            schedule_to_close_recheck_outcome("RUNNING", None, now, jiff::SignedDuration::from_secs(1)),
+            schedule_to_close_recheck_outcome(
+                "RUNNING",
+                None,
+                now,
+                jiff::SignedDuration::from_secs(1)
+            ),
             Some(ScheduleToCloseTimeoutOutcome::Handled)
         );
     }
@@ -56338,7 +56367,10 @@ mod tests {
         // A task another writer already resolved must never be requeued —
         // Handled wins over the PAUSED check.
         let now = jiff::Timestamp::now();
-        let row = ("FAILED".to_string(), Some(now - jiff::SignedDuration::from_hours(1)));
+        let row = (
+            "FAILED".to_string(),
+            Some(now - jiff::SignedDuration::from_hours(1)),
+        );
         assert_eq!(
             schedule_to_close_recheck_outcome(
                 "PAUSED",
@@ -56912,7 +56944,8 @@ mod tests {
         ] {
             assert!(circuit_defer_delay(None, cooldown, &task) >= floor);
         }
-        let max = jiff::SignedDuration::try_from(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
+        let max =
+            jiff::SignedDuration::try_from(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
         assert!(circuit_defer_delay(None, Duration::from_secs(3600), &task) <= max);
     }
 
@@ -57050,7 +57083,10 @@ mod tests {
                 .unwrap()
                 .expect("an attempt is still available");
             assert!(delay >= jiff::SignedDuration::ZERO);
-            assert!(delay <= jiff::SignedDuration::from_secs(1), "{delay:?} > 1s");
+            assert!(
+                delay <= jiff::SignedDuration::from_secs(1),
+                "{delay:?} > 1s"
+            );
             delays.insert(delay);
         }
         assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
@@ -57069,7 +57105,10 @@ mod tests {
             let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_mins(15))
                 .unwrap()
                 .expect("an attempt is still available");
-            assert!(delay <= jiff::SignedDuration::from_secs(1), "{delay:?} > 1s");
+            assert!(
+                delay <= jiff::SignedDuration::from_secs(1),
+                "{delay:?} > 1s"
+            );
             delays.insert(delay);
         }
         assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
@@ -57299,7 +57338,9 @@ mod tests {
             started_by: None,
             current_details: None,
             chain_execution_timeout: Some(jiff::SignedDuration::from_secs(86_400)),
-            chain_deadline_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(80_000)),
+            chain_deadline_at: Some(
+                jiff::Timestamp::now() + jiff::SignedDuration::from_secs(80_000),
+            ),
             history_bloat_warned_at: None,
             triage_note: None,
             quota_key: None,
@@ -57691,7 +57732,10 @@ mod tests {
             Some(jiff::SignedDuration::from_hours(1)),
             "the declared 30d must clamp down to the operator's 1h ceiling"
         );
-        assert_eq!(defaults.deadline_at, Some(now + jiff::SignedDuration::from_hours(1)));
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + jiff::SignedDuration::from_hours(1))
+        );
 
         // A declaration already under the ceiling is untouched.
         target.execution_timeout = Some(Duration::from_secs(60));
@@ -57702,7 +57746,10 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(under.execution_timeout, Some(jiff::SignedDuration::from_secs(60)));
+        assert_eq!(
+            under.execution_timeout,
+            Some(jiff::SignedDuration::from_secs(60))
+        );
     }
 
     /// The fleet-wide workflow-attempts ceiling (#523) applies to a cross-type
@@ -59298,10 +59345,7 @@ mod tests {
         }
     }
 
-    fn probe(
-        state: &str,
-        scheduled_at: jiff::Timestamp,
-    ) -> crate::queue::DispatchProbe {
+    fn probe(state: &str, scheduled_at: jiff::Timestamp) -> crate::queue::DispatchProbe {
         crate::queue::DispatchProbe {
             state: state.to_string(),
             scheduled_at,

@@ -1069,10 +1069,7 @@ impl WorkflowEvent {
     /// `None`. Gives downstream code a non-breaking construction path across future
     /// additive field additions to this variant (issue #688).
     #[must_use]
-    pub const fn workflow_started(
-        input: serde_json::Value,
-        timestamp: jiff::Timestamp,
-    ) -> Self {
+    pub const fn workflow_started(input: serde_json::Value, timestamp: jiff::Timestamp) -> Self {
         Self::WorkflowStarted {
             input,
             timestamp,
@@ -1383,7 +1380,9 @@ mod tests {
             "data": {"retry_exec_id": id, "attempt": 2, "fire_at": "+12026-01-01T00:00:00Z"},
         });
         let event: WorkflowEvent = serde_json::from_value(json).unwrap();
-        assert!(matches!(event, WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } if fire_at == Timestamp::MAX));
+        assert!(
+            matches!(event, WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } if fire_at == Timestamp::MAX)
+        );
         let json = serde_json::json!({
             "type": "WorkflowStarted",
             "data": {
@@ -1403,7 +1402,13 @@ mod tests {
             "data": {"input": {}, "timestamp": "2026-01-01T00:00:00Z"},
         });
         let event: WorkflowEvent = serde_json::from_value(json).unwrap();
-        assert!(matches!(event, WorkflowEvent::WorkflowStarted { scheduled_time: None, .. }));
+        assert!(matches!(
+            event,
+            WorkflowEvent::WorkflowStarted {
+                scheduled_time: None,
+                ..
+            }
+        ));
     }
 
     /// Issue #2253: a state change evicts the owner's cache entry. A plain
@@ -1717,10 +1722,7 @@ mod tests {
         };
         assert_eq!(key, "ledger:acct-42");
         assert_eq!(lock_seq, 7);
-        assert_eq!(
-            acquired_at,
-            Timestamp::from_second(1_700_000_000).unwrap()
-        );
+        assert_eq!(acquired_at, Timestamp::from_second(1_700_000_000).unwrap());
         Ok(())
     }
 

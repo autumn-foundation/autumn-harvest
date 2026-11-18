@@ -23,8 +23,8 @@
 //!   [`replay_of_a_history_with_llm_steps_is_unchanged`].
 //! - Retention — [`retention_deletes_the_ledger_rows_with_the_run`].
 
-use std::collections::HashMap;
 use jiff_diesel::ToDiesel;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,10 +42,10 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfi
 use autumn_harvest::{ActivityContext, ExecutionId, ShardId, StartWorkflowParams, WorkflowContext};
 
 use crate::integration_e2e::{insert_workflow_execution, setup_test_database_url_or_env};
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1073,7 +1073,9 @@ async fn seed_ledger_row(
     .bind::<BigInt, _>(output_tokens)
     .bind::<Nullable<BigInt>, _>(cost)
     .bind::<BigInt, _>(latency_ms)
-    .bind::<diesel::sql_types::Timestamptz, _>((Timestamp::now() - jiff::SignedDuration::from_hours(hours_ago)).to_diesel())
+    .bind::<diesel::sql_types::Timestamptz, _>(
+        (Timestamp::now() - jiff::SignedDuration::from_hours(hours_ago)).to_diesel(),
+    )
     .execute(conn)
     .await
     .expect("seed ledger row");

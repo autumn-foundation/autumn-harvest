@@ -42,7 +42,9 @@ impl Clock {
     fn install(&self, rt: &mut SqliteRuntime) {
         let millis = Arc::clone(&self.0);
         rt.set_clock(move || {
-            Timestamp::from_millisecond(millis.load(Ordering::SeqCst)).ok().unwrap_or_default()
+            Timestamp::from_millisecond(millis.load(Ordering::SeqCst))
+                .ok()
+                .unwrap_or_default()
         });
     }
 }

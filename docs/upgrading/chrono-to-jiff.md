@@ -42,10 +42,12 @@ manifest if you name its types directly.
 | `t.timestamp()`, `timestamp_millis()` | `t.as_second()`, `t.as_millisecond()` |
 | `DateTime::from_timestamp_millis(ms)` | `Timestamp::from_millisecond(ms).ok()` |
 | `Utc.with_ymd_and_hms(..).single()` | `autumn_harvest::time::utc_ymd_hms(..)` |
-| `DateTime::parse_from_rfc3339(s)` | `s.parse::<Timestamp>()` |
+| `DateTime::parse_from_rfc3339(s)` | `autumn_harvest::time::parse::rfc3339(s)` |
+| `s.parse::<DateTime<Utc>>()` | `autumn_harvest::time::parse::relaxed(s)` |
+| `s.parse::<NaiveDate>()` | `autumn_harvest::time::parse::date(s)` |
 | `t.to_rfc3339()` | `autumn_harvest::time::rfc3339(t)` |
 | `t.to_rfc3339_opts(f, z)` | `autumn_harvest::time::rfc3339_opts(t, f, z)` |
-| `"Europe/Paris".parse::<Tz>()` | `TimeZone::get("Europe/Paris")` |
+| `"Europe/Paris".parse::<Tz>()` | `autumn_harvest::time::zone("Europe/Paris")` |
 
 The `autumn_harvest::time` helpers keep the exact results of the `chrono`
 calls. Use them where the old text or the old `i64` is a contract.
@@ -57,7 +59,8 @@ calls. Use them where the old text or the old `i64` is a contract.
 `s.parse::<Timestamp>()` refuses some text that `parse_from_rfc3339`
 read: more than 9 fraction digits, and a U+2212 minus sign in the offset.
 It also refuses an instant after `9999-12-30T22:00:00.999999999Z`, the
-end of the jiff range.
+end of the jiff range. `autumn_harvest::time::parse::rfc3339` reads that
+text. It clamps an instant past the jiff range to the nearest end.
 
 ## 3. Text and JSON
 
@@ -70,6 +73,13 @@ end of the jiff range.
   need the old form.
 - **Fields that Harvest pins.** The audit chain, cursors and the API fields
   that `chrono` formatted with a fixed format keep their exact bytes.
+- **Input.** A timestamp in a request body, a query parameter or a CLI flag
+  reads every text that `chrono` read. That includes the `chrono` display
+  form, one-digit fields and a far-future sentinel such as
+  `9999-12-31T23:59:59Z`. A sentinel past the jiff range clamps to
+  `Timestamp::MAX`. The jiff forms, such as an RFC 9557 `[zone]`
+  annotation, also parse. A calendar exclusion date reads `Y-M-D` only, as
+  `chrono` did. A date with a time is refused.
 - **Durations.** A duration in a Harvest model, such as
   `WorkflowExecution::execution_timeout`, keeps the `chrono` JSON form
   `[seconds, nanoseconds]`. jiff writes a `SignedDuration` as an ISO 8601

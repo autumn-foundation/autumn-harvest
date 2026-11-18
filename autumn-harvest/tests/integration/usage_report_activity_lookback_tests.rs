@@ -47,9 +47,9 @@
 //!   sets.
 
 use diesel::QueryableByName;
-use jiff_diesel::ToDiesel;
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::usage::{UsageGroupBy, UsageQuery, load_usage_grouped, usage_sql};
 
@@ -94,7 +94,9 @@ async fn run_usage_query(conn: &mut AsyncPgConnection, row_limit: i64) -> Vec<Us
         .bind::<Integer, _>(SHARD_ID)
         .bind::<Nullable<Text>, _>(None::<String>)
         .bind::<Timestamptz, _>(jiff::Timestamp::UNIX_EPOCH.to_diesel())
-        .bind::<Timestamptz, _>((jiff::Timestamp::now() + autumn_harvest::time::days(1)).to_diesel())
+        .bind::<Timestamptz, _>(
+            (jiff::Timestamp::now() + autumn_harvest::time::days(1)).to_diesel(),
+        )
         .bind::<BigInt, _>(row_limit)
         .load(conn)
         .await

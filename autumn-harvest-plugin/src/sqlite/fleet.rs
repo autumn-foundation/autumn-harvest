@@ -322,7 +322,9 @@ impl HarvestFleet {
         let fleet_target = target
             .map(|at| {
                 crate::chrono_boundary::to_chrono(at).ok_or_else(|| {
-                    HarvestSqliteError::Tenant(format!("the restore target {at} has no chrono value"))
+                    HarvestSqliteError::Tenant(format!(
+                        "the restore target {at} has no chrono value"
+                    ))
                 })
             })
             .transpose()?;

@@ -65,7 +65,10 @@ fn det001_flags_each_jiff_clock_read() {
     ] {
         let src = wf(&format!("let _t = {call};"));
         let report = check_source(&src, "test.rs");
-        assert!(report.findings.iter().any(|f| f.rule_id == "DET001"), "{call}");
+        assert!(
+            report.findings.iter().any(|f| f.rule_id == "DET001"),
+            "{call}"
+        );
     }
 }
 

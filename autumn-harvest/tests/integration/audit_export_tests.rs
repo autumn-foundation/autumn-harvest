@@ -61,8 +61,8 @@
 //!   timeout checker's cadence and connection. A shard pool sized for one
 //!   connection can still export.
 
-use std::sync::{Arc, Mutex};
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::audit::{
     self, OP_WORKFLOW_CANCEL, STATUS_SUCCEEDED, TARGET_WORKFLOW, purge_old_audit_records,
@@ -1111,7 +1111,10 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
 
     // Records 1-3 are old enough to purge; 4-5 are not.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.le(3)))
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows 1-3");
@@ -1165,7 +1168,10 @@ async fn age_rows(conn: &mut diesel_async::AsyncPgConnection, lo: i64, hi: i64, 
             .filter(harvest_audit_log::export_seq.gt(lo))
             .filter(harvest_audit_log::export_seq.le(hi)),
     )
-    .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(days)).to_diesel()))
+    .set(
+        harvest_audit_log::occurred_at
+            .eq((jiff::Timestamp::now() - autumn_harvest::time::days(days)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("age rows");
@@ -1305,7 +1311,10 @@ async fn purging_unsequenced_records_leaves_no_watermark() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1320,9 +1329,7 @@ async fn purging_unsequenced_records_leaves_no_watermark() {
     assert!(!window_truncated(&mut conn, request, outcome).await);
 }
 
-async fn watermark_row(
-    conn: &mut diesel_async::AsyncPgConnection,
-) -> Vec<(jiff::Timestamp, i64)> {
+async fn watermark_row(conn: &mut diesel_async::AsyncPgConnection) -> Vec<(jiff::Timestamp, i64)> {
     use autumn_harvest::schema::harvest_audit_purge_watermark::dsl as mark;
     mark::harvest_audit_purge_watermark
         .select((mark::max_purged_occurred_at, mark::purged_records))
@@ -1418,7 +1425,8 @@ async fn a_record_the_purge_spares_never_moves_the_watermark() {
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
         .set((
             harvest_audit_log::operation.eq(audit::OP_AUDIT_EXPORT_DECOMMISSION),
-            harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(300)).to_diesel()),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(300)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1526,7 +1534,10 @@ async fn retention_never_purges_an_unexported_record() {
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1565,7 +1576,10 @@ async fn retention_is_unchanged_when_export_is_unconfigured() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1658,14 +1672,18 @@ async fn lag_is_the_age_of_the_oldest_unacknowledged_record_not_the_newest() {
         .await
         .expect("first row");
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(oldest_id)))
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(120)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(120)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("backdate");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 100.0,
         "lag must track the OLDEST unacknowledged record (~120s); a \
@@ -1694,7 +1712,10 @@ async fn lag_covers_records_that_are_sequenced_but_not_yet_acknowledged() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 2).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(90)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(90)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1747,7 +1768,8 @@ async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
     // because it became visible to the exporter later.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(old_row)))
         .set((
-            harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(200)).to_diesel()),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(200)).to_diesel()),
             harvest_audit_log::export_seq.eq(2),
         ))
         .execute(&mut conn)
@@ -1757,16 +1779,18 @@ async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
     // The short transaction: recent `occurred_at`, LOWER sequence.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(new_row)))
         .set((
-            harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             harvest_audit_log::export_seq.eq(1),
         ))
         .execute(&mut conn)
         .await
         .expect("sequence the short transaction");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 150.0,
         "the oldest pending record is ~200s old even though it holds the \
@@ -1827,9 +1851,10 @@ async fn lag_window_still_catches_skew_at_its_last_covered_position() {
     .await
     .expect("insert the skewed row");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 400.0,
         "the skewed row sits at the last position the window covers and \
@@ -1873,9 +1898,10 @@ async fn lag_window_does_not_reach_skew_just_beyond_it() {
     .await
     .expect("insert the skewed row");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag < 30.0,
         "the skewed row sits one position past the window and is not, by \
@@ -2068,7 +2094,10 @@ async fn retention_purges_nothing_when_export_is_configured_but_has_not_run_yet(
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2111,7 +2140,10 @@ async fn removing_the_sink_alone_does_not_resume_retention() {
     uninstall();
     insert_audit_rows(&mut conn, 2).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2728,7 +2760,10 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2767,7 +2802,10 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     uninstall();
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2777,7 +2815,10 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     {
         use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
         diesel::update(cur::harvest_audit_export_cursor.find(0))
-            .set(cur::updated_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(400)).to_diesel()))
+            .set(
+                cur::updated_at
+                    .eq((jiff::Timestamp::now() - autumn_harvest::time::days(400)).to_diesel()),
+            )
             .execute(&mut conn)
             .await
             .expect("age heartbeat");
@@ -2823,7 +2864,10 @@ async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2873,7 +2917,10 @@ async fn retention_decommission_alone_does_not_resume_purging_while_the_flag_is_
         .await
         .expect("decommission");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2934,7 +2981,10 @@ async fn decommission_releases_its_shards_backlog_even_while_export_stays_config
     );
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2976,7 +3026,10 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
     // happening regardless.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3036,7 +3089,10 @@ async fn is_configured_alone_does_not_protect_a_re_enabling_shards_retired_curso
     // cursor stays retired. New audit activity keeps happening regardless.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3085,7 +3141,10 @@ async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shar
     // for it exists at all.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3135,7 +3194,10 @@ async fn retention_protects_a_row_a_live_unlisted_shards_cursor_has_not_acknowle
     ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3187,7 +3249,10 @@ async fn retention_protects_a_stamped_row_when_its_cursor_row_is_gone() {
         .await
         .expect("delete cursor");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3217,7 +3282,10 @@ async fn retention_still_purges_acknowledged_rows_when_protect_unexported_audit_
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3257,7 +3325,10 @@ async fn retention_protects_rows_until_every_colocated_shard_has_a_cursor() {
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     uninstall();
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3311,7 +3382,10 @@ async fn retention_ignores_an_unrelated_shards_lingering_cursor_row() {
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3362,7 +3436,10 @@ async fn retention_ignores_an_excluded_shards_stale_acknowledgment() {
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3400,7 +3477,10 @@ async fn retention_still_protects_an_exempted_shards_own_unacknowledged_rows_bef
     uninstall();
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3472,7 +3552,10 @@ async fn a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_
         .expect("audit insert");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3545,7 +3628,10 @@ async fn retention_resumes_purging_once_a_colocated_shard_is_decommissioned_unde
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3597,7 +3683,10 @@ async fn retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_pro
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3735,7 +3824,10 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
         .await
         .expect("decommission");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -4187,8 +4279,12 @@ async fn a_failed_audit_write_rolls_the_decommission_back() {
     use diesel_async::AsyncConnection as _;
     let result = Box::pin(
         conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
-            autumn_harvest::audit_export::decommission_cursor_locked(conn, 0, jiff::Timestamp::now())
-                .await?;
+            autumn_harvest::audit_export::decommission_cursor_locked(
+                conn,
+                0,
+                jiff::Timestamp::now(),
+            )
+            .await?;
             // A NULL `operation` violates the table's NOT NULL, standing in
             // for any reason the audit write could fail.
             diesel::sql_query(

@@ -10,8 +10,8 @@
 //! A background reclaimer in the same database can therefore race only on
 //! A's requeue, and the helper accepts that outcome.
 
-use std::time::Duration;
 use jiff_diesel::ToDiesel;
+use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem};
@@ -27,10 +27,10 @@ use autumn_harvest::worker::{
     observe_task_cancellation, preload_failure_history,
     requeue_workflow_task_after_event_id_conflict,
 };
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

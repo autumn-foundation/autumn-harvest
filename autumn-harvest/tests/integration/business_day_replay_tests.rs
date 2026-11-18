@@ -204,13 +204,18 @@ async fn replay_business_day_1000_distinct_fixtures_all_succeed() {
         // Vary the recorded skip set too, so no two fixtures share a payload.
         // An all-identical corpus would make 1000 iterations no stronger than 1.
         let skipped: Vec<jiff::civil::Date> = (0..(i % 3))
-            .map(|k| autumn_harvest::time::utc_date(anchor + autumn_harvest::time::days(i64::from(k) + 1)))
+            .map(|k| {
+                autumn_harvest::time::utc_date(
+                    anchor + autumn_harvest::time::days(i64::from(k) + 1),
+                )
+            })
             .collect();
         let events = history(anchor, deadline, &skipped);
 
         // A calendar that excludes the frozen deadline's own date guarantees a
         // recompute would differ.
-        let hostile = BusinessCalendars::new().with_calendar("biz", [autumn_harvest::time::utc_date(deadline)]);
+        let hostile = BusinessCalendars::new()
+            .with_calendar("biz", [autumn_harvest::time::utc_date(deadline)]);
 
         let report = replayer(Some(hostile)).replay_from_events(events).await;
         assert!(

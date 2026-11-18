@@ -6,8 +6,8 @@
 //! `EXPLAIN`.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::schema::harvest_workflow_executions;
@@ -912,11 +912,7 @@ async fn workflow_list_filter_nd_blocked() {
 
 /// Stamp `created_at` directly on an already-inserted execution so tests can
 /// control insertion order without relying on `NOW()` timing.
-async fn set_created_at(
-    database_url: &str,
-    exec_id: ExecutionId,
-    ts: jiff::Timestamp,
-) {
+async fn set_created_at(database_url: &str, exec_id: ExecutionId, ts: jiff::Timestamp) {
     use diesel::ExpressionMethods;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -961,8 +957,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
     let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
 
     // Back-date wf-old to 2025.
-    let old_ts = "2025-01-01T00:00:00Z".parse::<jiff::Timestamp>()
-        .unwrap();
+    let old_ts = "2025-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
     set_created_at(&database_url, old, old_ts).await;
 
     // Also stamp started_at so the filter on started_at works.
@@ -1068,8 +1063,7 @@ async fn workflow_list_pagination_returns_envelope() {
         )
         .await;
         let ts =
-            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10)
-                .unwrap();
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1127,8 +1121,7 @@ async fn workflow_list_pagination_asc_order() {
         )
         .await;
         let ts =
-            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10)
-                .unwrap();
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1178,8 +1171,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
         )
         .await;
         let ts =
-            jiff::Timestamp::from_second(1_700_000_000 + i64::try_from(i).unwrap() * 10)
-                .unwrap();
+            jiff::Timestamp::from_second(1_700_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1202,8 +1194,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
             None,
         )
         .await;
-        let ts =
-            jiff::Timestamp::from_second(2_000_000_000 + i64::try_from(i).unwrap()).unwrap();
+        let ts = jiff::Timestamp::from_second(2_000_000_000 + i64::try_from(i).unwrap()).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1262,8 +1253,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard1_url,
             exec_id,
-            jiff::Timestamp::from_second(base_ts + 10 + i64::try_from(i).unwrap() * 20)
-                .unwrap(),
+            jiff::Timestamp::from_second(base_ts + 10 + i64::try_from(i).unwrap() * 20).unwrap(),
         )
         .await;
     }

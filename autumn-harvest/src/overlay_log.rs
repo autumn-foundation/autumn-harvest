@@ -1192,8 +1192,7 @@ mod tests {
 
     #[test]
     fn a_utc_day_runs_from_midnight_to_midnight() {
-        let at = ("2026-11-03T23:59:59Z").parse::<Timestamp>()
-            .expect("time");
+        let at = ("2026-11-03T23:59:59Z").parse::<Timestamp>().expect("time");
         let (start, end) = utc_day(at);
         assert_eq!(crate::time::rfc3339(start), "2026-11-03T00:00:00+00:00");
         assert_eq!(crate::time::rfc3339(end), "2026-11-04T00:00:00+00:00");

@@ -5,8 +5,8 @@
 #![cfg(all(feature = "db", feature = "testing"))]
 
 use autumn_harvest::types::ExecutionId;
-use jiff_diesel::ToDiesel;
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

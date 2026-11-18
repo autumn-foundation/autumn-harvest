@@ -90,10 +90,10 @@ pub use pg::{list_agent_policy_audit, read_agent_policy, write_agent_policy};
 /// `SamplingPolicyStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
-    use jiff::Timestamp;
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
 
     use super::{
         ACTION_RESET, ACTION_SET, PolicyAuditRow, PolicyChangeRow, PolicyRow, next_policy_revision,

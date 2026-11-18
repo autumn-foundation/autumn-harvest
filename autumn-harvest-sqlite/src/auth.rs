@@ -983,7 +983,9 @@ mod tests {
         let old = Timestamp::now() - autumn_harvest::time::days(10);
         let store = SqliteAuthStore::open(&path).unwrap();
         store.insert_audit(&audit("a", "old", old)).unwrap();
-        store.insert_audit(&audit("a", "new", Timestamp::now())).unwrap();
+        store
+            .insert_audit(&audit("a", "new", Timestamp::now()))
+            .unwrap();
         drop(store);
 
         let ops = |store: &SqliteAuthStore| -> Vec<String> {
@@ -1007,14 +1009,18 @@ mod tests {
 
         // The write that ends a batch of `PURGE_EVERY` runs the purge.
         for _ in 0..PURGE_EVERY - 2 {
-            store.insert_audit(&audit("a", "fill", Timestamp::now())).unwrap();
+            store
+                .insert_audit(&audit("a", "fill", Timestamp::now()))
+                .unwrap();
         }
         store.insert_audit(&audit("a", "late", old)).unwrap();
         assert!(
             ops(&store).contains(&"late".to_owned()),
             "before the batch ends"
         );
-        store.insert_audit(&audit("a", "end", Timestamp::now())).unwrap();
+        store
+            .insert_audit(&audit("a", "end", Timestamp::now()))
+            .unwrap();
         assert!(
             !ops(&store).contains(&"late".to_owned()),
             "the batch purges it"

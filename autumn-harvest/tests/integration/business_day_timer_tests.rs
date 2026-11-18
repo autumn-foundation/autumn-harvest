@@ -43,11 +43,11 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
-use jiff::Timestamp;
-use jiff::civil::Weekday;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff::civil::Weekday;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

@@ -20,7 +20,6 @@
 //      cross-shard routing, the grace window, and self-targeting rejection.
 
 use autumn_harvest::error::HarvestError;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{self, ByIdCancelOutcome};
 use autumn_harvest::info::WorkflowInfo;
@@ -36,6 +35,7 @@ use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
+use jiff_diesel::ToDiesel;
 
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -591,7 +591,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_a.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(1)).to_diesel()),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(1)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -601,7 +602,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_b.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(3)).to_diesel()),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(3)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -611,7 +613,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(terminus.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::started_at.eq((now - jiff::SignedDuration::from_hours(5)).to_diesel()),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -651,8 +654,11 @@ async fn resolver_never_returns_a_reconciled_seal() {
         .set((
             harvest_workflow_executions::state.eq("MIGRATED"),
             SetExt(harvest_workflow_executions_ext::migrated_to_shard.eq(1)),
-            SetExt(harvest_workflow_executions_ext::migrated_at.eq(jiff::Timestamp::now().to_diesel())),
-            harvest_workflow_executions::migrated_run_terminal_at.eq(jiff::Timestamp::now().to_diesel()),
+            SetExt(
+                harvest_workflow_executions_ext::migrated_at.eq(jiff::Timestamp::now().to_diesel()),
+            ),
+            harvest_workflow_executions::migrated_run_terminal_at
+                .eq(jiff::Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await

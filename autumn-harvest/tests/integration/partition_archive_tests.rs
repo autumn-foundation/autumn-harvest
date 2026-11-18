@@ -8,8 +8,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a testcontainers Postgres starts with the full migration bundle.
 
-use std::collections::HashMap;
 use jiff_diesel::ToDiesel;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,10 +23,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -381,11 +381,7 @@ fn typed(rows: Vec<serde_json::Value>) -> Vec<partition_archive::ArchivedEventRo
 }
 
 /// The manifest key that the drop log names for this partition.
-async fn dropped_manifest(
-    conn: &mut AsyncPgConnection,
-    name: &str,
-    upper: Timestamp,
-) -> String {
+async fn dropped_manifest(conn: &mut AsyncPgConnection, name: &str, upper: Timestamp) -> String {
     partition_archive::dropped_manifest_key(conn, name, upper)
         .await
         .expect("read the drop log")
@@ -469,7 +465,12 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
-    let runs = seed_runs_in_place(&mut conn, Timestamp::now() - autumn_harvest::time::days(3), 2).await;
+    let runs = seed_runs_in_place(
+        &mut conn,
+        Timestamp::now() - autumn_harvest::time::days(3),
+        2,
+    )
+    .await;
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("enable on a populated table");
@@ -918,10 +919,15 @@ async fn the_export_budget_spreads_a_backlog_over_passes() {
     assert_eq!(first.dropped, vec![older.name], "{first:?}");
     assert!(first.truncated, "{first:?}");
     assert!(exists(&mut conn, &newer.name).await);
-    let second =
-        partition::sweep_exporting(&mut conn, Timestamp::now(), &opts, first.next_resume, &export)
-            .await
-            .expect("sweep");
+    let second = partition::sweep_exporting(
+        &mut conn,
+        Timestamp::now(),
+        &opts,
+        first.next_resume,
+        &export,
+    )
+    .await
+    .expect("sweep");
     assert_eq!(second.dropped, vec![newer.name], "{second:?}");
 }
 

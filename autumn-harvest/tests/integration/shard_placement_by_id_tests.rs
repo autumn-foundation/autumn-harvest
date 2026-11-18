@@ -29,7 +29,6 @@
 //! duplicate them.
 
 use autumn_harvest::error::HarvestError;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::external_target_location::{TargetLocation, resolve_location_by_workflow_id};
 use autumn_harvest::info::WorkflowInfo;
@@ -47,6 +46,7 @@ use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
+use jiff_diesel::ToDiesel;
 
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;

@@ -1026,7 +1026,9 @@ async fn refill_lanes(
     let clocks: Vec<_> = earlier()
         .map(|c| c.clock.unwrap_or(as_of).to_diesel())
         .collect();
-    let keys: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.0.to_diesel())).collect();
+    let keys: Vec<_> = earlier()
+        .map(|c| c.read_to.map(|r| r.0.to_diesel()))
+        .collect();
     let ids: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.1)).collect();
     let (held, owners): (Vec<uuid::Uuid>, Vec<i32>) = (0_i32..)
         .zip(earlier())
@@ -3410,7 +3412,10 @@ pub async fn enforce_workflow_execution_timeouts(
                 .and(harvest_workflow_executions::deadline_at.lt(Some(now).to_diesel()))
                 .or(harvest_workflow_executions_ext::chain_deadline_at
                     .is_not_null()
-                    .and(harvest_workflow_executions_ext::chain_deadline_at.lt(Some(now).to_diesel()))),
+                    .and(
+                        harvest_workflow_executions_ext::chain_deadline_at
+                            .lt(Some(now).to_diesel()),
+                    )),
         )
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -4338,7 +4343,9 @@ async fn attempt_signal_delivery(
 /// exclusion list. It is not reclaimed this sweep, but it is not lost
 /// either: the next full sweep tick reclaims it with a fresh, larger `age`.
 #[derive(Clone, Debug, Default)]
-struct OldestPendingIndeterminateAge(std::sync::Arc<std::sync::Mutex<Option<jiff::SignedDuration>>>);
+struct OldestPendingIndeterminateAge(
+    std::sync::Arc<std::sync::Mutex<Option<jiff::SignedDuration>>>,
+);
 
 impl OldestPendingIndeterminateAge {
     fn new() -> Self {
@@ -4360,7 +4367,9 @@ impl OldestPendingIndeterminateAge {
             .lock()
             .ok()
             .and_then(|guard| *guard)
-            .map_or(0.0, |age| crate::time::num_milliseconds(age) as f64 / 1000.0)
+            .map_or(0.0, |age| {
+                crate::time::num_milliseconds(age) as f64 / 1000.0
+            })
     }
 }
 
@@ -8042,7 +8051,9 @@ mod tests {
         assert_eq!(refill_groups(&lanes), [vec![0, 1], vec![2], vec![3]]);
         // A lane with another sweep clock is at another position too.
         let mut lanes = lanes_in_step();
-        lanes[1].as_of = lanes[0].as_of.map(|t| t - jiff::SignedDuration::from_secs(1));
+        lanes[1].as_of = lanes[0]
+            .as_of
+            .map(|t| t - jiff::SignedDuration::from_secs(1));
         assert_eq!(refill_groups(&lanes), [vec![0], vec![1], vec![2, 3]]);
     }
 
@@ -8581,7 +8592,11 @@ mod tests {
     fn external_task_recheck_enforces_a_still_open_expired_row() {
         let now = Timestamp::now();
         assert!(
-            external_task_timeout_still_due("PENDING", now - jiff::SignedDuration::from_secs(1), now),
+            external_task_timeout_still_due(
+                "PENDING",
+                now - jiff::SignedDuration::from_secs(1),
+                now
+            ),
             "a still-PENDING row past its deadline is an enforceable timeout"
         );
     }

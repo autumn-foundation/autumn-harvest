@@ -5,12 +5,11 @@
 //! workers claim the same task.
 
 use crate::schema::harvest_task_queue_ext;
-use jiff_diesel::ToDiesel;
-use crate::time::sql::ToPgInterval;
 use crate::table_split::SetExt;
+use crate::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::time::Duration as StdDuration;
 
-use jiff::{SignedDuration, Timestamp};
 use diesel::AsChangeset;
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
@@ -18,6 +17,7 @@ use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::cached_stmt::CachePreparedDsl as _;
@@ -720,8 +720,7 @@ pub fn schedule_to_start_secs(
     claimed_at: Timestamp,
 ) -> f64 {
     let eligible = created_at.map_or(scheduled_at, |c| scheduled_at.max(c));
-    std::time::Duration::try_from((claimed_at - eligible)
-        .max(SignedDuration::ZERO))
+    std::time::Duration::try_from((claimed_at - eligible).max(SignedDuration::ZERO))
         .unwrap_or_default()
         .as_secs_f64()
 }
@@ -6273,7 +6272,11 @@ pub(crate) async fn task_deadline_for_claim(
             claim_held(&claim.worker_id, claim.attempt),
             dsl::schedule_to_close_at,
         ))
-        .first::<(Option<String>, Option<bool>, Option<crate::time::sql::SqlTimestamp>)>(conn)
+        .first::<(
+            Option<String>,
+            Option<bool>,
+            Option<crate::time::sql::SqlTimestamp>,
+        )>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
@@ -8296,7 +8299,13 @@ async fn requeue_claimed_workflow_task_with_backoff(
             sql::<diesel::sql_types::Bool>("scheduled_at <= clock_timestamp()"),
         ))
         .cache_prepared()
-        .get_results::<(String, i32, crate::time::sql::SqlTimestamp, Option<Uuid>, bool)>(conn)
+        .get_results::<(
+            String,
+            i32,
+            crate::time::sql::SqlTimestamp,
+            Option<Uuid>,
+            bool,
+        )>(conn)
         .await
         .map_err(crate::error::database_error)?;
     if updated.is_empty() {
@@ -10222,7 +10231,9 @@ async fn primary_repend_workflow_task(
 ) -> HarvestResult<Vec<PendingHintRow>> {
     let rows: Vec<PendingHintRow> = diesel::sql_query(primary_repend_workflow_task_query())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>((Timestamp::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE).to_diesel())
+        .bind::<diesel::sql_types::Timestamptz, _>(
+            (Timestamp::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE).to_diesel(),
+        )
         .cache_prepared()
         .load(conn)
         .await
@@ -17014,8 +17025,8 @@ mod tests {
         use diesel::pg::Pg;
 
         let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
-        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(changeset);
+        let query =
+            diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING"))).set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         // With `treat_none_as_null = true`, a `None` field is bound as a SQL
@@ -17069,8 +17080,8 @@ mod tests {
         );
         assert_eq!(changeset.crash_strikes, 0);
 
-        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(changeset);
+        let query =
+            diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING"))).set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         assert!(
@@ -17108,8 +17119,8 @@ mod tests {
             "poison-pill streak must reset to 0 on a clean continuation (issue #367)"
         );
 
-        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(changeset);
+        let query =
+            diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING"))).set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         for column in ["worker_id", "started_at", "last_heartbeat_at"] {
@@ -17153,8 +17164,8 @@ mod tests {
         use diesel::pg::Pg;
 
         let changeset = CleanContinuationChangeset::new(jiff::Timestamp::now());
-        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
-            .set(changeset);
+        let query =
+            diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING"))).set(changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         assert!(
@@ -17176,7 +17187,11 @@ mod tests {
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
         let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
-        let sql = workflow_backoff_sql(changeset, SignedDuration::from_secs(5), Some(StickyRelease::new()));
+        let sql = workflow_backoff_sql(
+            changeset,
+            SignedDuration::from_secs(5),
+            Some(StickyRelease::new()),
+        );
 
         // `debug_query` emits every column as a bound parameter (`= $N`), as
         // in the `pending_requeue_changeset` shape test. The sticky and

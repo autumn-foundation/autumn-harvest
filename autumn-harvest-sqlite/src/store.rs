@@ -129,12 +129,7 @@ impl RunConfig {
     /// The timeout and the deadline that a workflow context gets, so
     /// `ctx.deadline()` reads the same values on a drive, an update and a
     /// query.
-    pub fn context_deadline(
-        &self,
-    ) -> (
-        Option<jiff::SignedDuration>,
-        Option<jiff::Timestamp>,
-    ) {
+    pub fn context_deadline(&self) -> (Option<jiff::SignedDuration>, Option<jiff::Timestamp>) {
         (
             self.execution_timeout_ms
                 .map(jiff::SignedDuration::from_millis),

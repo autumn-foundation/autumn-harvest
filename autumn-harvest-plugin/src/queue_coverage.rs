@@ -58,8 +58,8 @@
 //! poller. A paused queue with live pollers is not listed there: it would
 //! not have been uncovered anyway.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
 use jiff_diesel::ToDiesel;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use autumn_harvest::error::HarvestResult;
@@ -67,9 +67,9 @@ use autumn_harvest::queue::{self, PendingQueueDemand};
 use autumn_harvest::queue_pause;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerHealth, WorkerRow, WorkerStatus};
-use jiff::Timestamp;
 use diesel_async::AsyncPgConnection;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

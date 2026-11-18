@@ -65,10 +65,10 @@
 //! can. This control protects against database-level tampering, not against
 //! a compromised Harvest process.
 
+use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 #[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::audit_export::AuditExportRecord;

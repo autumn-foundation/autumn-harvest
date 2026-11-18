@@ -10,8 +10,8 @@
 #![cfg(feature = "db")]
 #![allow(clippy::too_many_lines)]
 
-use std::future::Future;
 use jiff_diesel::ToDiesel;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,9 +29,9 @@ use autumn_harvest::{
     DagCatalog, SchedulerMonitor, StartSource, StartWorkflowParams,
     start_or_load_workflow_execution, tick_once,
 };
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -397,7 +397,8 @@ async fn insert_schedule_with(
             dsl::catchup.eq(catchup),
             dsl::max_active_runs.eq(1),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(lag)).to_diesel()),
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(lag)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq(overlap_policy),
             dsl::buffered_runs.eq(json!([])),
@@ -415,7 +416,10 @@ async fn make_due(url: &str, schedule_id: Uuid) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let mut conn = connect(url).await;
     diesel::update(dsl::harvest_schedules.find(schedule_id))
-        .set(dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()))
+        .set(
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("make schedule due");
@@ -588,12 +592,14 @@ async fn allow_all_drains_a_buffered_slot_at_max_active_runs() {
     let (url, _c) = setup().await;
     let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
     start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
-    let slot = autumn_harvest::time::rfc3339(Timestamp::now() - jiff::SignedDuration::from_secs(120));
+    let slot =
+        autumn_harvest::time::rfc3339(Timestamp::now() - jiff::SignedDuration::from_secs(120));
     let mut conn = connect(&url).await;
     diesel::update(dsl::harvest_schedules.find(schedule_id))
         .set((
             dsl::buffered_runs.eq(json!([slot])),
-            dsl::next_run_at.eq((Timestamp::now() + jiff::SignedDuration::from_secs(600)).to_diesel()),
+            dsl::next_run_at
+                .eq((Timestamp::now() + jiff::SignedDuration::from_secs(600)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

@@ -13,8 +13,8 @@
 //! the seeds, as for the `dst` target. `docs/testing/simulation.md`
 //! describes the harness.
 
-use std::collections::BTreeMap;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 
 use autumn_harvest::dst::{
     self, Claim, Fencing, Invariant, Op, Orphan, Outcome, Row, SeedPlan, SimConfig, SimReport,
@@ -29,10 +29,10 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{append_activity_started_for_test, finalize_activity_completion};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;

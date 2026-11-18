@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use jiff_diesel::ToDiesel;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use autumn_harvest::WorkflowEvent;
@@ -17,10 +17,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::Timestamp;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -219,7 +219,8 @@ async fn insert_versioned_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -313,7 +314,8 @@ async fn insert_execution_without_marker(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -445,7 +447,8 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq("COMPLETED"),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await

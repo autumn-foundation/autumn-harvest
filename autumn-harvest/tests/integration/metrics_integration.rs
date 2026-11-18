@@ -42,9 +42,9 @@ use autumn_harvest::telemetry::{
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------

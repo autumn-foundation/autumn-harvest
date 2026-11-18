@@ -89,15 +89,15 @@
 //! choosing a `search_attr:<key>` should avoid keys whose legitimate values
 //! could collide with the sentinel string.
 
-use jiff::Timestamp;
-#[cfg(feature = "db")]
-use jiff_diesel::ToDiesel;
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 #[cfg(feature = "db")]
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::error::{HarvestResult, database_error};

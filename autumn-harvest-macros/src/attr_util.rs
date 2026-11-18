@@ -319,11 +319,8 @@ mod optional_duration_tokens_tests {
     /// the source expression, not the shared match shape.
     #[test]
     fn reproduces_the_execution_timeout_match_update_with_start_variant() {
-        let out = optional_duration_tokens(
-            "execution_timeout",
-            &quote! { opts.execution_timeout },
-        )
-        .to_string();
+        let out = optional_duration_tokens("execution_timeout", &quote! { opts.execution_timeout })
+            .to_string();
         let expected = quote! {
             match opts.execution_timeout {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
@@ -413,10 +410,7 @@ mod optional_duration_tokens_tests {
     #[test]
     fn error_message_names_the_field() {
         let out = optional_duration_tokens("sla", &quote! { opts.sla }).to_string();
-        assert!(
-            out.contains("\"sla exceeds the duration range\""),
-            "{out}"
-        );
+        assert!(out.contains("\"sla exceeds the duration range\""), "{out}");
     }
 }
 

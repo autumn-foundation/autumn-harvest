@@ -997,10 +997,7 @@ impl SqliteRuntime {
     pub fn register_activity_with_ledger(
         &mut self,
         info: &ActivityInfo,
-        body: impl Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String>
-        + Send
-        + Sync
-        + 'static,
+        body: impl Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static,
     ) {
         self.register_audited_activity(info, ActivityRunner::Ledger(Box::new(body)));
     }
@@ -1576,7 +1573,15 @@ impl SqliteRuntime {
                 workflow_name: workflow_name.to_string(),
                 workflow_id: workflow_id.to_string(),
             })?;
-        let delivered = stage_keyed(&tx, exec, name, &payload, key, Timestamp::now(), check.as_ref())?;
+        let delivered = stage_keyed(
+            &tx,
+            exec,
+            name,
+            &payload,
+            key,
+            Timestamp::now(),
+            check.as_ref(),
+        )?;
         tx.commit()?;
         Ok(SignalDelivery {
             exec_id: exec,
@@ -5449,14 +5454,7 @@ fn stage_keyed(
     // `received_at` with a deadline timer's `fire_at`. Both are epoch
     // milliseconds. A whole-second floor can move an on-time signal past its
     // deadline.
-    store::stage_signal(
-        conn,
-        exec,
-        name,
-        payload,
-        received_at.as_millisecond(),
-        key,
-    )?;
+    store::stage_signal(conn, exec, name, payload, received_at.as_millisecond(), key)?;
     Ok(true)
 }
 

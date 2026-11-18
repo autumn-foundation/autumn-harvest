@@ -8,22 +8,22 @@
 //! The tests use a real Postgres container (testcontainers) to exercise the
 //! scheduler tick path end-to-end.
 
-use std::sync::{Arc, Mutex};
 use autumn_harvest::time::sql::SqlTimestamp;
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_AUTO_PAUSED, MetricsRecorder};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -350,16 +350,15 @@ async fn schedule_resumes_and_resets_failure_count() {
         .expect("resume schedule");
 
     // Verify the schedule is no longer auto-paused and count is reset.
-    let (auto_paused_at, failure_count): (Option<SqlTimestamp>, i32) =
-        harvest_schedules::table
-            .find(sched_id)
-            .select((
-                harvest_schedules::dsl::auto_paused_at,
-                harvest_schedules::dsl::consecutive_failure_count,
-            ))
-            .first(&mut conn)
-            .await
-            .expect("select after resume");
+    let (auto_paused_at, failure_count): (Option<SqlTimestamp>, i32) = harvest_schedules::table
+        .find(sched_id)
+        .select((
+            harvest_schedules::dsl::auto_paused_at,
+            harvest_schedules::dsl::consecutive_failure_count,
+        ))
+        .first(&mut conn)
+        .await
+        .expect("select after resume");
     assert!(
         auto_paused_at.is_none(),
         "auto_paused_at must be NULL after resume"

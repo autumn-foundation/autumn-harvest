@@ -895,9 +895,7 @@ fn text(value: ValueRef<'_>) -> Stored<String> {
 fn time(value: ValueRef<'_>) -> Stored<Timestamp> {
     match value {
         ValueRef::Null => Stored::Null,
-        ValueRef::Integer(us) => {
-            Stored::Value(autumn_harvest::time::from_microsecond_clamped(us))
-        }
+        ValueRef::Integer(us) => Stored::Value(autumn_harvest::time::from_microsecond_clamped(us)),
         ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => Stored::Unreadable,
     }
 }

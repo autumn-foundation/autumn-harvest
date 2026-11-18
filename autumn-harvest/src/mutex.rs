@@ -463,9 +463,9 @@ mod db_ops {
     use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
-    use jiff::Timestamp;
     use diesel::OptionalExtension;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
     use std::time::Duration;
 
     #[derive(diesel::QueryableByName)]
@@ -1020,8 +1020,7 @@ mod pure_tests {
 
     #[test]
     fn lease_expired_truth_table() {
-        let base = "2026-07-20T12:00:00Z".parse::<Timestamp>()
-            .unwrap();
+        let base = "2026-07-20T12:00:00Z".parse::<Timestamp>().unwrap();
         let before = base - jiff::SignedDuration::from_secs(1);
         let after = base + jiff::SignedDuration::from_secs(1);
         assert!(!lease_expired(base, before));

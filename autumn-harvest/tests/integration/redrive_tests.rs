@@ -27,8 +27,8 @@
 //! - AC8 — the `harvest.dlq.redriven{queue, outcome}` metric is emitted.
 //! - Issue #1832 — a bulk redrive spreads `scheduled_at` across a window.
 
-use std::sync::Mutex;
 use jiff_diesel::ToDiesel;
+use std::sync::Mutex;
 
 use autumn_harvest::dlq::{
     BulkDlqFilter, NewDeadLetterEntry, RedriveFilter, RedriveOutcome, bulk_replay_dead_letters,
@@ -806,7 +806,8 @@ async fn redrive_deadline_starts_at_the_spread_slot() {
     .expect("deadlines");
     let slack = jiff::SignedDuration::from_millis(1);
     assert!(
-        row.deadline_at.expect("deadline") >= not_before + jiff::SignedDuration::from_secs(10) - slack,
+        row.deadline_at.expect("deadline")
+            >= not_before + jiff::SignedDuration::from_secs(10) - slack,
         "the timeout must start at the slot {not_before}, got {:?}",
         row.deadline_at
     );

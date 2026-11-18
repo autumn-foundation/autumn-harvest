@@ -11,8 +11,8 @@
 //! - validate-before-commit atomicity.
 
 use autumn_harvest::schema::harvest_schedules_ext;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::models::HarvestSchedule;
@@ -26,12 +26,12 @@ use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::HandlerRegistry;
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -340,7 +340,8 @@ async fn live_fire_claim_blocks_update_with_claim_live_outcome() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -382,7 +383,8 @@ async fn expired_fire_claim_does_not_block_update() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -933,7 +935,8 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(stale_token)),
-            dsl::fire_claimed_until.eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

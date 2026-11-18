@@ -27,11 +27,11 @@ use autumn_harvest::workers::{
     LiveWorkerTaskStats, WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers,
     load_live_worker_task_stats_per_cohort,
 };
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{HarvestApiState, dedup_workers_by_freshest};

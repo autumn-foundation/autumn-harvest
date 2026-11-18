@@ -463,10 +463,20 @@ async fn resume_credits_the_held_time_only_not_the_whole_wait() {
     // Both tasks waited the same 600s wall-clock, and 595s of that was under
     // the hold. So each accrued only ~5s of wait outside the hold. They differ
     // only in whether that 5s fits their budget.
-    let within_budget =
-        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(60))).await;
-    let already_blown =
-        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(2))).await;
+    let within_budget = enqueue_activity(
+        &mut conn,
+        &q,
+        &act,
+        Some(jiff::SignedDuration::from_secs(60)),
+    )
+    .await;
+    let already_blown = enqueue_activity(
+        &mut conn,
+        &q,
+        &act,
+        Some(jiff::SignedDuration::from_secs(2)),
+    )
+    .await;
 
     pause(&mut conn, &act).await;
     backdate_scheduled_at(&mut conn, within_budget, 600).await;
@@ -1051,8 +1061,13 @@ async fn overlapping_queue_and_activity_holds_over_credit_but_never_starve() {
     // Identical shape to the single-hold control: 600s of wall-clock wait, 595s
     // of it held. That leaves 5s of genuine wait against a 2s budget, so
     // union-correct behaviour is to time out.
-    let doubly_held =
-        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(2))).await;
+    let doubly_held = enqueue_activity(
+        &mut conn,
+        &q,
+        &act,
+        Some(jiff::SignedDuration::from_secs(2)),
+    )
+    .await;
 
     queue_pause::pause_queue(&mut conn, &q, "downstream outage", "oncall", None)
         .await

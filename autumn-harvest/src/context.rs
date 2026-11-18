@@ -2571,10 +2571,7 @@ pub(crate) enum FrozenBusinessDayOutcome {
         coverage_end: Option<jiff::civil::Date>,
     },
     /// The named calendar is not in the registered snapshot.
-    UnknownCalendar {
-        anchor: Timestamp,
-        calendar: String,
-    },
+    UnknownCalendar { anchor: Timestamp, calendar: String },
     /// The calendar could not cover the requested span.
     Rejected {
         anchor: Timestamp,
@@ -20138,7 +20135,10 @@ mod tests {
     fn deadline_returns_start_plus_timeout() {
         let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
-        assert_eq!(ctx.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
+        assert_eq!(
+            ctx.deadline(),
+            Some(t0 + jiff::SignedDuration::from_secs(30))
+        );
     }
 
     #[test]
@@ -20287,7 +20287,10 @@ mod tests {
         let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let parent = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
         // Sanity: the parent workflow context itself sees the deadline.
-        assert_eq!(parent.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
+        assert_eq!(
+            parent.deadline(),
+            Some(t0 + jiff::SignedDuration::from_secs(30))
+        );
 
         parent.register_declarative_update_handler(&info);
         let fut = parent
@@ -21873,7 +21876,8 @@ mod tests {
 
     #[test]
     fn context_now_returns_deterministic_time() {
-        let fixed_time = "2026-01-15T10:30:00Z".parse::<Timestamp>()
+        let fixed_time = "2026-01-15T10:30:00Z"
+            .parse::<Timestamp>()
             .expect("valid timestamp");
 
         let events = vec![WorkflowEvent::WorkflowStarted {
@@ -23621,10 +23625,8 @@ mod tests {
 
     #[tokio::test]
     async fn timer_business_days_skips_a_holiday() {
-        let cals = crate::calendar::BusinessCalendars::new().with_calendar(
-            "biz",
-            [crate::time::date_ymd(2026, 7, 6).expect("valid")],
-        );
+        let cals = crate::calendar::BusinessCalendars::new()
+            .with_calendar("biz", [crate::time::date_ymd(2026, 7, 6).expect("valid")]);
         let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
 
         bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
@@ -32839,7 +32841,8 @@ mod tests {
     #[test]
     fn info_is_graceful_for_new_for_handler_context() {
         let exec_id = ExecutionId::new();
-        let ctx = WorkflowContext::new_for_handler(exec_id, Timestamp::now(), None, empty_shared_state());
+        let ctx =
+            WorkflowContext::new_for_handler(exec_id, Timestamp::now(), None, empty_shared_state());
         let info = ctx.info();
         assert_eq!(info.execution_id, exec_id);
         assert_eq!(info.workflow_id, "");
@@ -33270,10 +33273,7 @@ pub(crate) fn time_remaining_from(
     now: Timestamp,
 ) -> Option<std::time::Duration> {
     let deadline = deadline?;
-    Some(
-        std::time::Duration::try_from(deadline - now)
-            .unwrap_or(std::time::Duration::ZERO),
-    )
+    Some(std::time::Duration::try_from(deadline - now).unwrap_or(std::time::Duration::ZERO))
 }
 
 /// Whether an activity should stop and checkpoint: `true` iff the attempt has a
@@ -33298,8 +33298,7 @@ mod activity_deadline_helper_tests {
     use std::time::Duration;
 
     fn at(secs: i64) -> jiff::Timestamp {
-        Timestamp::new(1_700_000_000 + secs, 0)
-            .expect("valid timestamp")
+        Timestamp::new(1_700_000_000 + secs, 0).expect("valid timestamp")
     }
 
     #[test]

@@ -44,9 +44,9 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest::scheduler::overdue_schedule_pass;
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

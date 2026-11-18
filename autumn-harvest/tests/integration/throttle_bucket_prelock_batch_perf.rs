@@ -29,10 +29,10 @@
 //! uniquely-named database.
 
 use autumn_harvest::telemetry::MetricsRecorder;
-use jiff_diesel::ToDiesel;
 use autumn_harvest::throttle::{THROTTLE_FIRE_BATCH_SIZE, bucket_key, fire_due_throttled_starts};
-use jiff::{SignedDuration, Timestamp};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 

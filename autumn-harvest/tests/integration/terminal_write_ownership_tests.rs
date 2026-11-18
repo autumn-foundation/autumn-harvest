@@ -19,8 +19,8 @@
 //!   - leave the task row exactly as `"thief"` left it (state and
 //!     `worker_id` both unchanged).
 
-use std::time::Duration;
 use jiff_diesel::ToDiesel;
+use std::time::Duration;
 
 use autumn_harvest::dlq::DeadLetterReason;
 use autumn_harvest::event::WorkflowEvent;
@@ -37,9 +37,9 @@ use autumn_harvest::worker::{
     persist_workflow_failure,
 };
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;

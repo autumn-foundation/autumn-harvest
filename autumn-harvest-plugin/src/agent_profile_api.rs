@@ -16,8 +16,8 @@
 //! with its old and new value. The design is in
 //! `docs/design/DESIGN-2394.md`.
 
-use std::sync::Arc;
 use jiff::Timestamp;
+use std::sync::Arc;
 
 use autumn_harvest::audit::{
     self, OP_AGENT_PROFILE_ACTIVATE, OP_AGENT_PROFILE_POLICY_RESET, OP_AGENT_PROFILE_POLICY_SET,

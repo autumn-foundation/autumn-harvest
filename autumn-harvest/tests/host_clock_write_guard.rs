@@ -338,9 +338,18 @@ fn scanner_skips_the_test_module() {
 
 #[test]
 fn scanner_flags_a_jiff_clock_write() {
-    assert_eq!(violations("dsl::scheduled_at.eq(Timestamp::now().to_diesel())").len(), 1);
-    assert_eq!(violations("x.set(dsl::last_heartbeat_at.eq(Some(jiff::Timestamp::now())));").len(), 1);
-    assert_eq!(violations("Row { schedule_to_close_at: Timestamp::now() + d, other: 1 }").len(), 1);
+    assert_eq!(
+        violations("dsl::scheduled_at.eq(Timestamp::now().to_diesel())").len(),
+        1
+    );
+    assert_eq!(
+        violations("x.set(dsl::last_heartbeat_at.eq(Some(jiff::Timestamp::now())));").len(),
+        1
+    );
+    assert_eq!(
+        violations("Row { schedule_to_close_at: Timestamp::now() + d, other: 1 }").len(),
+        1
+    );
     assert_clean("let my_scheduled_at = Timestamp::now();");
 }
 

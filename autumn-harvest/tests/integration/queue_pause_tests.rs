@@ -137,10 +137,7 @@ async fn task_state(conn: &mut AsyncPgConnection, id: Uuid) -> String {
         .state
 }
 
-async fn scheduled_at(
-    conn: &mut AsyncPgConnection,
-    id: Uuid,
-) -> jiff::Timestamp {
+async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> jiff::Timestamp {
     use diesel_async::RunQueryDsl;
     #[derive(diesel::QueryableByName)]
     struct S {
@@ -189,10 +186,7 @@ async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64
 
 /// Read a pause's `paused_at`, so a hand-driven resume binds exactly what
 /// `resume_queue` binds.
-async fn paused_at_of(
-    conn: &mut AsyncPgConnection,
-    queue: &str,
-) -> jiff::Timestamp {
+async fn paused_at_of(conn: &mut AsyncPgConnection, queue: &str) -> jiff::Timestamp {
     use diesel_async::RunQueryDsl;
     #[derive(diesel::QueryableByName)]
     struct P {

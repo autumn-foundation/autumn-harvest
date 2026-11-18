@@ -1474,9 +1474,9 @@ pub mod db {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use jiff::Timestamp;
     use diesel::QueryableByName;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -1972,7 +1972,8 @@ pub mod db {
         // monotonic clock and stamped on the host wall clock.
         let t0 = Instant::now() + STEP_LEAD;
         let t0_utc = Timestamp::now()
-            + jiff::SignedDuration::try_from(STEP_LEAD).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+            + jiff::SignedDuration::try_from(STEP_LEAD)
+                .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
 
         // A `JoinSet` aborts every arrival if one panics. Each arrival holds
         // a census guard, so a forced abort can wait for its connection.
@@ -2122,8 +2123,9 @@ pub mod db {
                             clippy::cast_precision_loss,
                             reason = "a step lasts seconds; microsecond counts stay far below 2^53"
                         )]
-                        let secs =
-                            autumn_harvest::time::num_microseconds(at - t0_utc).unwrap_or(i64::MAX) as f64 / 1e6;
+                        let secs = autumn_harvest::time::num_microseconds(at - t0_utc)
+                            .unwrap_or(i64::MAX) as f64
+                            / 1e6;
                         Some(secs)
                     });
                     Arrival {

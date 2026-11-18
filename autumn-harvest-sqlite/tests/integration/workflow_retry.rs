@@ -364,9 +364,7 @@ async fn slow_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
 async fn the_retry_delay_counts_from_the_failure() {
     let info = slow_failure_info();
     let mut rt = runtime(&info);
-    rt.set_clock(|| {
-        Timestamp::new(SLOW_CLOCK.load(Ordering::SeqCst), 0).unwrap()
-    });
+    rt.set_clock(|| Timestamp::new(SLOW_CLOCK.load(Ordering::SeqCst), 0).unwrap());
     let first = rt.start_workflow(info.name, json!(0)).unwrap();
     let start = SLOW_CLOCK.load(Ordering::SeqCst);
     rt.run_until_blocked(first).await.unwrap();

@@ -26,8 +26,8 @@
 //! fresh testcontainers Postgres boots with the full migration bundle
 //! (`autumn_harvest::test_init_sql()`).
 
-use std::sync::{Arc, Mutex};
 use jiff_diesel::ToDiesel;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::erase::erase_workflow_payloads;
@@ -36,10 +36,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -701,9 +701,27 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
 
     let now = Timestamp::now();
     // two old summaries of the same workflow, one young summary.
-    insert_summary(&mut conn, "gc_wf", "g1", now - autumn_harvest::time::days(2)).await;
-    insert_summary(&mut conn, "gc_wf", "g2", now - autumn_harvest::time::days(3)).await;
-    let young = insert_summary(&mut conn, "gc_wf", "g3", now - jiff::SignedDuration::from_mins(5)).await;
+    insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g1",
+        now - autumn_harvest::time::days(2),
+    )
+    .await;
+    insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g2",
+        now - autumn_harvest::time::days(3),
+    )
+    .await;
+    let young = insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g3",
+        now - jiff::SignedDuration::from_mins(5),
+    )
+    .await;
 
     // History horizon present (so the janitor spawns) + a 1-hour summary
     // horizon. No executions exist, so history phase deletes nothing.
@@ -747,11 +765,7 @@ async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at:
 
 /// Inserts a fire already resolved with `outcome`, for example
 /// `admission_blocked`.
-async fn insert_resolved_fire(
-    conn: &mut AsyncPgConnection,
-    fired_at: Timestamp,
-    outcome: &str,
-) {
+async fn insert_resolved_fire(conn: &mut AsyncPgConnection, fired_at: Timestamp, outcome: &str) {
     diesel::sql_query(
         "INSERT INTO harvest_completion_trigger_fires
             (source_exec_id, trigger_id, fired_at, outcome)
@@ -837,7 +851,12 @@ async fn summary_gc_keeps_a_fire_that_still_has_an_outbox_row() {
     scrub(&mut conn).await;
 
     let source = uuid::Uuid::new_v4();
-    insert_fire(&mut conn, source, Timestamp::now() - autumn_harvest::time::days(2)).await;
+    insert_fire(
+        &mut conn,
+        source,
+        Timestamp::now() - autumn_harvest::time::days(2),
+    )
+    .await;
     insert_outbox_for(&mut conn, source).await;
 
     run_one_tick(
@@ -867,7 +886,12 @@ async fn summary_gc_keeps_a_fire_whose_source_execution_still_exists() {
         Timestamp::now() - jiff::SignedDuration::from_hours(2),
     )
     .await;
-    insert_fire(&mut conn, source, Timestamp::now() - autumn_harvest::time::days(2)).await;
+    insert_fire(
+        &mut conn,
+        source,
+        Timestamp::now() - autumn_harvest::time::days(2),
+    )
+    .await;
 
     run_one_tick(
         pool,
@@ -1014,7 +1038,13 @@ async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
     // An ordinary old summary (GC-eligible) and a migration-target summary
     // just as old, carrying a payload (result/error/search_attrs). The
     // test also proves the payload gets stripped rather than left intact.
-    let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - autumn_harvest::time::days(2)).await;
+    let ordinary = insert_summary(
+        &mut conn,
+        "gc_wf",
+        "g1",
+        now - autumn_harvest::time::days(2),
+    )
+    .await;
     let migrated_id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_execution_summaries
             (execution_id, workflow_name, workflow_id, state, started_at,
@@ -1083,8 +1113,20 @@ async fn unbounded_summary_retention_never_gcs() {
     scrub(&mut conn).await;
 
     let now = Timestamp::now();
-    insert_summary(&mut conn, "keep", "k1", now - autumn_harvest::time::days(3650)).await;
-    insert_summary(&mut conn, "keep", "k2", now - autumn_harvest::time::days(1000)).await;
+    insert_summary(
+        &mut conn,
+        "keep",
+        "k1",
+        now - autumn_harvest::time::days(3650),
+    )
+    .await;
+    insert_summary(
+        &mut conn,
+        "keep",
+        "k2",
+        now - autumn_harvest::time::days(1000),
+    )
+    .await;
 
     let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::unbounded());

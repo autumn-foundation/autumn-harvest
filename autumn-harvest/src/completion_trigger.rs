@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 #[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -509,9 +509,9 @@ pub async fn sync_completion_triggers(
 ) -> crate::error::HarvestResult<()> {
     use crate::models::NewCompletionTriggerDb;
     use crate::schema::harvest_completion_triggers::dsl;
-    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
+    use jiff::Timestamp;
 
     let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
     let triggers = triggers.to_vec();
@@ -1517,7 +1517,9 @@ impl DeferredTriggerStart {
                 owner: self.owner.as_deref(),
                 runbook_url: self.runbook_url.as_deref(),
                 severity: self.severity.as_deref(),
-                sla: self.sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                sla: self
+                    .sla
+                    .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
                 workflow_retry_policy: self.retry_policy.clone(),
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 start_source: crate::types::StartSource::CompletionTrigger,

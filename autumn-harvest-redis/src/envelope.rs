@@ -196,7 +196,10 @@ pub struct TaskEnvelope {
     #[serde(default)]
     pub sticky_worker_id: Option<String>,
     /// Sticky deadline as ISO-8601 timestamp.
-    #[serde(default, deserialize_with = "autumn_harvest::time::serde_clamped::option::deserialize")]
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::serde_clamped::option::deserialize"
+    )]
     pub sticky_until: Option<Timestamp>,
     /// Sticky timeout in milliseconds.
     #[serde(default)]
@@ -210,7 +213,9 @@ impl TaskEnvelope {
     /// Build an envelope from `EnqueueParams`, generating a new `task_id`.
     pub(crate) fn from_params(params: EnqueueParams, task_id: Uuid) -> RedisAdapterResult<Self> {
         let sticky_until = match (params.sticky_worker_id.as_ref(), params.sticky_timeout) {
-            (Some(_), Some(timeout)) => Some(due_after(Timestamp::now(), timeout, "sticky_timeout")?),
+            (Some(_), Some(timeout)) => {
+                Some(due_after(Timestamp::now(), timeout, "sticky_timeout")?)
+            }
             _ => None,
         };
 
@@ -268,7 +273,10 @@ mod tests {
     fn due_after_refuses_a_delay_past_the_chrono_bound() {
         let now = Timestamp::constant(1_700_000_000, 0);
         let max_ms = Duration::from_millis(u64::try_from(i64::MAX).unwrap());
-        assert_eq!(due_after(now, max_ms, "retry delay").unwrap(), Timestamp::MAX);
+        assert_eq!(
+            due_after(now, max_ms, "retry delay").unwrap(),
+            Timestamp::MAX
+        );
         let past = Duration::from_secs(10_000_000_000_000_000);
         assert!(matches!(
             due_after(now, past, "retry delay"),
@@ -307,7 +315,8 @@ mod tests {
     fn a_chrono_year_past_the_jiff_range_reads_clamped() {
         let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
         let envelope = TaskEnvelope::from_params(params, Uuid::new_v4()).unwrap();
-        let mut value = serde_json::from_str::<serde_json::Value>(&envelope.to_payload().unwrap()).unwrap();
+        let mut value =
+            serde_json::from_str::<serde_json::Value>(&envelope.to_payload().unwrap()).unwrap();
         value["scheduled_at"] = serde_json::json!("+12026-01-01T00:00:00Z");
         value["sticky_until"] = serde_json::json!("+12026-01-01T00:00:00Z");
         let decoded = TaskEnvelope::from_payload(&value.to_string(), "0-0").unwrap();

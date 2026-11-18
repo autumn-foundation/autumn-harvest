@@ -165,14 +165,22 @@ pub fn utc_ymd_hms(
 /// [`Timestamp::MAX`], so an old row still loads.
 #[must_use]
 pub fn from_millisecond_clamped(millis: i64) -> Timestamp {
-    Timestamp::from_millisecond(millis).unwrap_or(if millis < 0 { Timestamp::MIN } else { Timestamp::MAX })
+    Timestamp::from_millisecond(millis).unwrap_or(if millis < 0 {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// Returns the instant `micros` microseconds after the Unix epoch, clamped
 /// into the jiff range. See [`from_millisecond_clamped`].
 #[must_use]
 pub fn from_microsecond_clamped(micros: i64) -> Timestamp {
-    Timestamp::from_microsecond(micros).unwrap_or(if micros < 0 { Timestamp::MIN } else { Timestamp::MAX })
+    Timestamp::from_microsecond(micros).unwrap_or(if micros < 0 {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// Returns a calendar date, or `None` for a field out of range.
@@ -239,20 +247,38 @@ mod tests {
     #[test]
     fn clamped_reads_keep_old_chrono_sentinels_loadable() {
         // chrono's `DateTime::<Utc>::MAX_UTC.timestamp_millis()`.
-        assert_eq!(from_millisecond_clamped(8_210_266_876_799_999), Timestamp::MAX);
+        assert_eq!(
+            from_millisecond_clamped(8_210_266_876_799_999),
+            Timestamp::MAX
+        );
         assert_eq!(from_millisecond_clamped(i64::MIN), Timestamp::MIN);
         assert_eq!(from_microsecond_clamped(i64::MAX), Timestamp::MAX);
-        assert_eq!(from_millisecond_clamped(1_700_000_000_123), Timestamp::constant(1_700_000_000, 123_000_000));
-        assert_eq!(from_microsecond_clamped(-1), Timestamp::constant(-1, 999_999_000));
+        assert_eq!(
+            from_millisecond_clamped(1_700_000_000_123),
+            Timestamp::constant(1_700_000_000, 123_000_000)
+        );
+        assert_eq!(
+            from_microsecond_clamped(-1),
+            Timestamp::constant(-1, 999_999_000)
+        );
     }
 
     #[test]
     fn from_std_bounded_keeps_the_chrono_range() {
         let max_ms = std::time::Duration::from_millis(u64::try_from(i64::MAX).unwrap());
         assert_eq!(from_std_bounded(max_ms), Some(CHRONO_MAX_DURATION));
-        assert_eq!(from_std_bounded(max_ms + std::time::Duration::from_millis(1)), None);
-        assert_eq!(from_std_bounded(std::time::Duration::from_secs(i64::MAX as u64)), None);
-        assert_eq!(from_std_bounded(std::time::Duration::from_secs(5)), Some(SignedDuration::from_secs(5)));
+        assert_eq!(
+            from_std_bounded(max_ms + std::time::Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            from_std_bounded(std::time::Duration::from_secs(i64::MAX as u64)),
+            None
+        );
+        assert_eq!(
+            from_std_bounded(std::time::Duration::from_secs(5)),
+            Some(SignedDuration::from_secs(5))
+        );
     }
 
     #[test]
@@ -279,10 +305,19 @@ mod tests {
 
     #[test]
     fn num_micros_and_nanos_overflow_to_none() {
-        assert_eq!(num_microseconds(SignedDuration::from_millis(3)), Some(3_000));
+        assert_eq!(
+            num_microseconds(SignedDuration::from_millis(3)),
+            Some(3_000)
+        );
         assert_eq!(num_microseconds(SignedDuration::MAX), None);
-        assert_eq!(num_nanoseconds(SignedDuration::from_secs(1)), Some(1_000_000_000));
-        assert_eq!(num_nanoseconds(SignedDuration::from_secs(10_000_000_000)), None);
+        assert_eq!(
+            num_nanoseconds(SignedDuration::from_secs(1)),
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            num_nanoseconds(SignedDuration::from_secs(10_000_000_000)),
+            None
+        );
     }
 
     #[test]

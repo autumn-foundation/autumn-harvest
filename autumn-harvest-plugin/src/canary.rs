@@ -28,10 +28,10 @@ use std::time::Duration;
 use autumn_harvest::policy::MAX_INTERVAL_PERIOD;
 use autumn_harvest::prelude::*;
 use autumn_harvest::worker::DbPool;
-use jiff::Timestamp;
 use diesel::sql_types::{Nullable, Text, Timestamptz};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -696,9 +696,9 @@ pub fn build_canary_report(
             {
                 Some((completed, started)) => {
                     let age = shard_fanout::age_secs(now, completed);
-                    let latency = autumn_harvest::time::num_milliseconds(completed
-                        .duration_since(started))
-                        .max(0);
+                    let latency =
+                        autumn_harvest::time::num_milliseconds(completed.duration_since(started))
+                            .max(0);
                     (Some(completed), Some(age), Some(latency))
                 }
                 None => (None, None, None),

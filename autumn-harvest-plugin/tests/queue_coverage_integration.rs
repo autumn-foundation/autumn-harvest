@@ -13,8 +13,8 @@
 //!   gate alone (AC4).
 //! - The route is admin-gated.
 
-use std::collections::{BTreeSet, HashMap};
 use jiff_diesel::ToDiesel;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -38,10 +38,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jiff::{SignedDuration, Timestamp};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -755,7 +755,10 @@ async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
     diesel::update(
         harvest_workers::table.filter(harvest_workers::worker_id.eq_any(&stale_worker_ids)),
     )
-    .set(harvest_workers::last_heartbeat_at.eq((Timestamp::now() - SignedDuration::from_secs(60)).to_diesel()))
+    .set(
+        harvest_workers::last_heartbeat_at
+            .eq((Timestamp::now() - SignedDuration::from_secs(60)).to_diesel()),
+    )
     .execute(&mut conn)
     .await
     .expect("failed to bulk-backdate stale workers");
