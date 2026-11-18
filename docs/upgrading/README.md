@@ -12,6 +12,11 @@ Each release also has its own guide:
 - [0.5.0 to 0.6.0](0.6.0.md)
 - [0.4.0 to 0.5.0](0.5.0.md)
 
+One change has its own guide:
+
+- [`chrono` to `jiff`](chrono-to-jiff.md): the date and time types of the
+  public API ([ADR 0018](../adr/0018-jiff-date-and-time.md)).
+
 Read [Lock-safe online migrations](online-migrations.md) before you write a
 migration.
 
